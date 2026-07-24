@@ -737,6 +737,38 @@ for v in squares(6) do sq[#sq + 1] = v end
 print("squares:", table.concat(sq, " "))
 `,
   },
+  'C compiler (chibicc → SVM — compile & run)': {
+    kind: 'chibicc',
+    jit: false, // chibicc uses floats (the %.17g path) → bytecode engine, not the integer-only wasm-JIT
+    editable: true,
+    lang: 'c',
+    url: './assets/chibicc.svmb',
+    mode: 'io',
+    desc: 'A real C compiler — chibicc, itself compiled through the LLVM on-ramp — running client-side ' +
+      'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.svmb over your source ' +
+      '(seeded on an fs capability at /in.c), which emits SVM IR (shown below as stdout); the page then ' +
+      'svm_parse-es that IR into a module and runs it. The result is your program’s main() return value. ' +
+      'Compile a program and run it, entirely in the browser, on top of the SVM. (Header-free sources; ' +
+      'the result is a value, so #include and printf aren’t needed — that’s a later step.)',
+    src: `// Write C here, then click Run. The result is main()'s return value.
+// The emitted SVM IR appears in the stdout pane.
+
+int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+
+int main(void) {
+  // Bubble-sort a small array, then return a position-weighted checksum.
+  int a[8] = {42, 7, 13, 99, 1, 64, 28, 5};
+  int n = 8;
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n - 1 - i; j++)
+      if (a[j] > a[j + 1]) { int t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }
+
+  int sum = 0;
+  for (int i = 0; i < n; i++) sum += a[i] * (i + 1);
+  return (sum + fib(10)) % 256;
+}
+`,
+  },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
@@ -906,6 +938,9 @@ function presentFrame(c, w, h) {
 const readModuleStdout = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.svm_stdout_ptr(), eng.ex.svm_stdout_ptr() + eng.ex.svm_stdout_len()));
+const readModuleStderr = () =>
+  new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
+    eng.ex.svm_stderr_ptr(), eng.ex.svm_stderr_ptr() + eng.ex.svm_stderr_len()));
 
 // Run a pre-built on-ramp module single-shot on the interpreter: alloc a buffer, copy the module in
 // (plus optional stdin), `svm_run_onramp` (the fixed §3e powerbox — stdout/stdin/exit/memory), read
@@ -988,6 +1023,77 @@ async function runModule(c) {
   } else {
     setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `module run (${tier}) status ${status}`);
+  }
+}
+
+// The in-browser C compiler (SELFHOST_C.md §7 step 5) — two SVM passes in the sandbox:
+//   1. compile: run `chibicc.svmb` over the editor's C, seeded on an `fs` cap at `/in.c`
+//      (`svm_run_onramp_fs`), and capture the emitted SVM-IR *text* on stdout;
+//   2. encode + run: `svm_parse` that text into a module, then run it (`moduleInterp`) — the compiled
+//      program's result is its `main` return value.
+// chibicc uses floats (the %.17g path), so it runs on the bytecode interpreter, not the integer-only
+// wasm-JIT tier — hence `jit:false` (no toggle). Header-free sources compile with an empty header
+// image; the demo corpus is return-value programs whose result is the value shown.
+async function runChibicc(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching compiler…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  let compiler;
+  try {
+    compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    logTo(c, `fetch failed: ${e.message}`);
+    return;
+  }
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); return; }
+
+  // Pass 1 — compile. Alloc both buffers before writing (svm_alloc may detach linear memory), pass an
+  // empty header image (0,0), and run chibicc; its emitted IR text is on the stdout stash.
+  setState(c, 'running', 'compiling…');
+  const t0 = performance.now();
+  const p = eng.ex.svm_alloc(compiler.length);
+  const sp = eng.ex.svm_alloc(srcBytes.length);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(compiler, p);
+  view.set(srcBytes, sp);
+  eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length);
+  const cstatus = eng.ex.svm_status();
+  const ir = readModuleStdout();
+  const cstderr = readModuleStderr();
+  eng.ex.svm_dealloc(p, compiler.length);
+  eng.ex.svm_dealloc(sp, srcBytes.length);
+  c.el.stdout.textContent = ir; // show the emitted SVM IR
+  logTo(c, `compiled: ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
+  if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
+    setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
+    return;
+  }
+
+  // Pass 2 — encode the IR (svm_parse: parse + verify + encode) into a runnable module, then run it.
+  const irBytes = new TextEncoder().encode(ir);
+  const ip = eng.ex.svm_alloc(irBytes.length);
+  new Uint8Array(eng.memory.buffer).set(irBytes, ip);
+  const ok = eng.ex.svm_parse(ip, irBytes.length);
+  const parsed = new Uint8Array(eng.memory.buffer).slice(
+    eng.ex.svm_parse_ptr(), eng.ex.svm_parse_ptr() + eng.ex.svm_parse_len());
+  eng.ex.svm_dealloc(ip, irBytes.length);
+  if (ok !== 1) {
+    setState(c, 'error', `encode failed: ${new TextDecoder().decode(parsed)}`);
+    return;
+  }
+  const r = moduleInterp(parsed, null);
+  const ms = (performance.now() - t0).toFixed(0);
+  c.el.result.textContent = `${r.rv}`;
+  if (r.status === 0 || r.status === 5) {
+    setState(c, 'done', `compiled & ran · returned ${r.rv} · ${ms}ms`);
+    logTo(c, `ran compiled program → ${r.rv} (status ${r.status})`);
+  } else {
+    setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
+    logTo(c, `compiled program status ${r.status}`);
   }
 }
 
@@ -1791,6 +1897,7 @@ async function runDemo(c) {
   const ex = c.ex;
   if (ex.kind === 'reactor') return runReactor(c);
   if (ex.kind === 'pg') return runPg(c);
+  if (ex.kind === 'chibicc') return runChibicc(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
 }
