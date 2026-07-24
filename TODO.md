@@ -53,6 +53,6 @@ with rationale, and leave when a BUILT block lands in the owning doc.
 
 | item | owner | status |
 |---|---|---|
-| **Self-hosting C compiler** — chibicc compiled *to* SVM IR (via the LLVM on-ramp, artifact kept for speed) and run as a guest that compiles C → SVM IR in-sandbox; browser playground (W5) is one deployment | SELFHOST_C.md | **step 1 (libc audit) done 2026-07-24** — Appendix A: fill is guest-side (one libc `.c` incl. `%.17g` dtoa; `calloc` wrapper; one `realloc` choice; cc1-only build set), **no substrate changes**; capstone = playground demo (compile + run C in-browser). Next: step 2, build `chibicc.svmb` via the on-ramp |
+| **Self-hosting C compiler** — chibicc compiled *to* SVM IR (via the LLVM on-ramp, artifact kept for speed) and run as a guest that compiles C → SVM IR in-sandbox; browser playground (W5) is one deployment | SELFHOST_C.md | **steps 1–2 done 2026-07-24** — libc audit (App. A) + `chibicc.svmb` builds via the on-ramp (`demos/chibicc_selfhost/`: 258 funcs, ~287 KB, verifies + bytecode-compiles; measured 41-symbol fill-list in App. A.5; stub-audit gate). **No substrate changes**; capstone = playground demo (compile + run C in-browser). Next: step 3, the self-host guest libc |
 | §3 substrate generalization (`create(module, window, budget)` subsuming the op-15 surface) | PROCESS.md §3 | future; op-15 chosen deliberately as the incremental form |
 | `Budget` charging at create (the passable object exists; per-domain charging is the follow-up) | PROCESS.md §5 / cap_id::BUDGET docs | todo |

@@ -163,6 +163,12 @@ compiler bug is a clean error, never an escape.
    `FILE*`/formatting ops. Cheap, decides the size of B.
 2. **Build `chibicc.svmb`** via the on-ramp (§5 A), a `build-chibicc-asset` script mirroring
    `build-pg-assets.mjs`; run it (no libc yet) to shake out translation.
+   **→ Done 2026-07-24** — `crates/svm-run/demos/chibicc_selfhost/` (`build_chibicc_svmb.sh` +
+   `cc1_main.c`, the driver-free guest entry). The full cc1 TU set translates through the on-ramp
+   on the first pass: **258 functions, ~287 KB `.svmb`, verifies, bytecode-compiles** (decode 6 ms /
+   verify 1.2 ms / bc-compile 4.3 ms via `prep_svmb`). Translated with `--stub-externs`
+   (step-3 libc pending) + `--host-page 65536` (browser target) + `-mlong-double-64` (F3).
+   Ground truth of what must be filled is now measured, not scanned: Appendix A.5.
 3. **Fill libc** (§5 B) until chibicc-the-guest compiles a trivial C file to text IR against
    memfs-seeded source (§5 C), matching native `--emit-ir`.
 4. **Close the loop** (§5 D) — v1: embedder assembles/loads the output (no new code beyond glue);
@@ -272,3 +278,33 @@ driver branches and `codegen.c` excluded (`--emit-ir` never calls it).
 **Net:** the fill is small and almost entirely guest-side — one libc `.c` (strings/ctype/`FILE*`/
 printf-with-`%.17g`), a `calloc` wrapper, one `realloc` decision, and a cc1-only build set. No SVM
 substrate change anywhere; at most one *personality* op (`OP_REALLOC`).
+
+### A.5 Step-2 ground truth — the measured stub list (supersedes the source scan where they differ)
+
+The step-2 build (`build_chibicc_svmb.sh`) links the real cc1 bitcode and reports every undefined
+symbol — the exact fill-set step 3 must provide, measured (41 symbols), not grepped:
+
+> `__assert_fail` `__ctype_b_loc` `__errno_location` `bcmp` `calloc` `ctime_r` `dirname` `exit`
+> `fclose` `fflush` `fopen` `fprintf` `fputc` `fread` `free` `fwrite` `localtime` `memchr`
+> `open_memstream` `puts` `realloc` `snprintf` `stat` `stderr` `stdin` `stdout` `strchr` `strcmp`
+> `strdup` `strerror` `strlen` `strncasecmp` `strncmp` `strncpy` `strndup` `strstr` `strtold`
+> `strtoul` `time` `vfprintf` `vsnprintf`
+
+Deltas vs the A.1/A.2 source scan, all explained:
+- **glibc lowerings**: `assert` → `__assert_fail`; the ctype macros → `__ctype_b_loc` (one table
+  accessor covers all `is*`); error paths → `__errno_location` + `strerror`; `-O2` rewrites
+  `memcmp`→`bcmp` and simple `printf`→`puts`. The guest libc provides these *names* (or step 3
+  compiles against its own non-glibc headers, making the plain names reappear).
+- **`open_memstream`** — missed by the source scan: `strings.c`'s `format()` (used everywhere)
+  builds strings through a memory `FILE*`. The guest `FILE` layer needs a memstream mode.
+- **`time`/`localtime`/`ctime_r`** — the `__DATE__`/`__TIME__`/`__TIMESTAMP__` macros. Stub to a
+  fixed epoch: deterministic builds (F4).
+- **`strncasecmp`** (preprocessor), trivial.
+- `str.*`/`mem.*` inlining means `memcpy`/`memset`/`malloc` don't appear by name at `-O2` — clang
+  emits intrinsics the on-ramp already lowers; do not be surprised the list is *shorter* than A.2.
+
+**Lesson wired into the build**: `--stub-externs` also stubs *chibicc's own* functions if a
+defining TU is missing — `align_to` (owned by the excluded `codegen.c`, called 15× for struct
+layout) translated and verified fine as a trap-stub time bomb. `cc1_main.c` now defines it, and
+the script's **step 2a stub audit fails on any undefined symbol outside the allowlist above**, so
+an excluded-TU gap can never reach the artifact again.
