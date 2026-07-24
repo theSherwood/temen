@@ -13,6 +13,10 @@ sandbox.** The browser playground (INTERACTIVE_EMBEDDING.md W5) is one deploymen
 point — the same guest artifact runs under `svm-run` natively, in a `domain_exec` child, or in the
 wasm build.
 
+**The capstone is a playground demo**: in the browser, pick or edit any of several real C
+programs, compile them **in-browser** (`chibicc.svmb` running on the bytecode engine), run the
+result, and see its output — the full edit → compile → run loop, client-side, no server (§7 step 5).
+
 "Self-hosting" here means **the toolchain runs on the platform it targets** — SVM hosts its own
 C→IR compiler — *not* that the compiler is bootstrapped by compiling itself. That distinction is
 deliberate; see the decision in §3.
@@ -90,6 +94,10 @@ calls (`glob`, `mkstemp`, `unlink`) are **avoidable** in `-cc1 --emit-ir` mode.
 - **Gap to audit first:** buffered `FILE*` stdio and the full `printf`-formatting family against the
   current personality. Much overlaps what **Postgres already needed** (`snprintf`/`strtod`
   byte-exact) — so this is an audit-and-fill, not a greenfield libc.
+- **→ Audit done — see Appendix A** (2026-07-24): the verified per-call inventory, what the
+  personality already serves, the fill-list, and four concrete findings (missing
+  `calloc`/`realloc`; `%.17g` float formatting is required; a `long double` on-ramp risk with its
+  mitigation; driver-only externs are load-fatal and must be excluded from the guest build).
 
 ### C. Source + includes in the guest filesystem
 Seed **memfs** with the user's `.c` and the bundled `frontend/chibicc/include/*.h`, so the
@@ -160,9 +168,15 @@ compiler bug is a clean error, never an escape.
 4. **Close the loop** (§5 D) — v1: embedder assembles/loads the output (no new code beyond glue);
    then the in-guest layer: a binary emitter in `codegen_ir.c` feeding the existing `vm_dlopen`;
    end-to-end compile-and-run inside SVM (§5 E).
-5. **Browser deployment** — ship `chibicc.svmb` as a static asset and wire the W5 surface
-   (INTERACTIVE_EMBEDDING.md); the encode step reuses the cdylib's existing `svm_parse`.
-6. **(optional) stage-2 conformance** differential (§7 E).
+5. **Browser deployment — the capstone playground demo.** Ship `chibicc.svmb` as a playground
+   asset and wire the W5 surface (INTERACTIVE_EMBEDDING.md): a demo where the user picks or edits
+   **various real C programs** (seed with the proven demo corpus — hello, calc, sha256, sortvec,
+   tiny-regex, raytrace, …), compiles them **in the browser** (`chibicc.svmb` on the bytecode
+   engine, source + `include/*.h` seeded into memfs), runs the compiled module, and sees its
+   output in the pane. The encode step reuses the cdylib's existing `svm_parse`. Gated by a
+   Playwright test in the `real-browser` CI job (the `browser-play-editor-test.mjs` pattern):
+   compile ≥2 corpus programs in Chromium, run them, assert output matches the native build's.
+6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
 
@@ -170,9 +184,12 @@ compiler bug is a clean error, never an escape.
   the guest text-only and let the embedder assemble everywhere? Text-only defers the encoder but
   caps the in-guest story at layer 1; the encoder is small (the format is a deliberate single-pass
   design) and unlocks `vm_dlopen`. Decide when layer 2 has a consumer.
-- Where the pure-libc bulk lives — compiled into `chibicc.svmb` as guest C (simplest, self-contained
-  artifact) vs. shared personality ops (dedup with the shell/Postgres). Lean guest-C for the first
-  cut; dedup later if a second consumer wants the same ops.
+- ~~Where the pure-libc bulk lives~~ — **settled by the step-1 audit (Appendix A): guest C**, one
+  small self-host libc translation unit compiled alongside chibicc at the `clang` step. The one
+  remaining allocator sub-question: `realloc` needs the old block size — either a personality
+  `OP_REALLOC` (host allocator owns block metadata, matching the POSIX.md split; personality
+  growth, not substrate) or a guest size-header shim over the existing `malloc` op. Decide at
+  implementation; both are small.
 - `-g` cost in the guest: always emit debug info, or a flag? Always-on pairs with the W1 debugger;
   measure the size hit on `chibicc.svmb`.
 
@@ -183,3 +200,75 @@ compiler bug is a clean error, never an escape.
 - Matching GCC/Clang language breadth. chibicc's C99 + the frontend's proven coverage is the bar;
   heavy C/C++ stays on the AOT on-ramp lane (`LLVM.md`), which is not a runtime guest.
 - Making the chibicc frontend self-compile as the shipping path (§3 — LLVM-built artifact ships).
+
+---
+
+## Appendix A — step-1 libc-coverage audit (done 2026-07-24)
+
+**Method.** Verified extern scan of the `-cc1 --emit-ir` compilation set — `tokenize.c`,
+`preprocess.c`, `parse.c`, `type.c`, `codegen_ir.c`, `strings.c`, `hashmap.c`, `unicode.c`, plus
+`main.c`'s cc1 slice — diffed against the personality's op surface (`svm-posix` ops 0–20 and its
+`resolve()` name map). Naive greps overcount (`glob` matches `global`, `access`/`stat` match
+prose); every row below is a checked call site.
+
+### A.1 Authority-bearing calls → personality ops
+
+| call | where (cc1 path) | personality today | plan |
+|---|---|---|---|
+| `read` / `write` (fd-aware) | FILE* layer below | **✓** ops 0/1 (fd table, distinct stderr) | use as-is |
+| `open` / `close` / `lseek` | FILE* layer | **✓** ops 5/6/7 | use as-is |
+| `exit` | tokenize (`error`), codegen_ir | **✓** op 4 (`exit`/`_exit`/`_Exit`) | use as-is |
+| `malloc` / `free` | codegen_ir, strings | **✓** ops 2/3 (window-offset allocator) | use as-is |
+| `calloc` | **the workhorse** — 36 verified sites (tokenize 5, preprocess 10, parse 14, type 2, codegen_ir 1, strings 1, hashmap 3) | **✗ missing** | guest wrapper: `malloc` + `memset` — no host change |
+| `realloc` | tokenize 1, codegen_ir 8, strings 1 | **✗ missing** | needs old block size: personality `OP_REALLOC` **or** guest size-header shim (§8) |
+| `stat` | preprocess.c:1032 — only `__TIMESTAMP__` | **✓** op 13 | use as-is; memfs mtime=0 ⇒ the macro's `"??? ..."` fallback — deterministic builds, arguably a feature |
+| `getenv` / `argc` / `argv` | arg delivery (crt) | **✓** ops 11/17/18 | use as-is |
+
+### A.2 Pure-computation calls → guest C (one self-host libc translation unit, compiled with chibicc at the `clang` step)
+
+- **Strings/memory:** `strcmp` (62 sites in codegen_ir alone), `strncmp`, `strlen`, `strdup`,
+  `strndup`, `strncpy`, `strchr`, `strstr`, `memcpy`, `memset`, `memcmp`. Trivial C.
+- **ctype:** `isdigit`, `isxdigit`, `isspace`, `ispunct`, `isalnum`. Trivial.
+- **Conversions:** `strtoul`; `strtold` (see F3).
+- **`FILE*` stdio over the fd ops:** `fopen`/`fclose`/`fread`/`fwrite`/`fflush`/`fputc`, with
+  `stdin`/`stdout`/`stderr` as fds 0/1/2 (the personality's fd table already maps them). A small
+  buffered-`FILE` struct over ops 0/1/5/6/7.
+- **Formatting:** `fprintf`/`vfprintf`/`printf`/`snprintf`/`vsnprintf`. Format spectrum actually
+  used: `%d`/`%ld`/`%u`/`%x`, `%s`, `%c`, `%.*s`, and — the hard one — **`%.17g`**: every float
+  constant is emitted through it (`codegen_ir.c:1552`, `cg("... %.17g", (double)node->fval)`).
+  See F2.
+- **Misc:** `dirname` (relative `#include` resolution — pure string), `ctime_r` (only
+  `__TIMESTAMP__`; stub), `assert` (macro → `exit`), `va_start`/`va_arg`/`va_end`
+  (compiler-lowered; the on-ramp already handles varargs — QuickJS/Postgres).
+
+### A.3 Driver-only externs — **must be excluded from the guest build (load-fatal otherwise)**
+
+`glob`, `mkstemp`, `unlink`, `fork`, `execvp`, `basename` and the rest of `main.c`'s driver slice
+(plus all of `codegen.c`, the x86 backend). This is not just hygiene: **import resolution is
+fail-closed** — `svm_posix::resolve()` returns `None` for unknown names and every named import
+must bind at load — so a linked-in-but-never-called `fork` **fails the module load**. The guest
+build therefore compiles only the cc1-path files, with a small `#ifdef`/stub for `main.c`'s
+driver branches and `codegen.c` excluded (`--emit-ir` never calls it).
+
+### A.4 Findings
+
+- **F1 — `calloc`/`realloc` are the only missing authority ops.** `calloc` is a guest wrapper;
+  `realloc` is the one real choice (§8). Everything else chibicc needs from the host is already
+  served by ops 0–20.
+- **F2 — the guest printf needs real float formatting.** `%.17g` (shortest-round-trip double) is
+  load-bearing for IR emission, so the existing mini-printf (known `%`-width/precision gaps,
+  FRONTEND.md) is insufficient — the self-host libc needs a correct `%g`/precision dtoa. This is
+  the single hardest piece of A.2; budget it accordingly (or port a compact proven dtoa).
+- **F3 — `long double` on-ramp risk, with mitigation.** `tokenize.c:434` parses every float
+  literal with `strtold` into a `long double fval` (x86 `fp80`), which the on-ramp likely can't
+  lower. Mitigation: build the guest with **`-mlong-double-64`**. Divergence window: `fval` is
+  cast to `double` at emission (`codegen_ir.c:1552`), so only literal-parsing **double-rounding**
+  edge cases can differ from the native (fp80) oracle. Pin with a literal-edge-case differential;
+  accept and document any residual ULP cases.
+- **F4 — deterministic `__TIMESTAMP__`.** Via memfs, `stat` yields fixed mtimes ⇒ reproducible
+  output where native chibicc's is time-dependent. Note it in the oracle comparison (mask the
+  macro, or seed a fixed mtime).
+
+**Net:** the fill is small and almost entirely guest-side — one libc `.c` (strings/ctype/`FILE*`/
+printf-with-`%.17g`), a `calloc` wrapper, one `realloc` decision, and a cc1-only build set. No SVM
+substrate change anywhere; at most one *personality* op (`OP_REALLOC`).

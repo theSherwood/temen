@@ -53,6 +53,6 @@ with rationale, and leave when a BUILT block lands in the owning doc.
 
 | item | owner | status |
 |---|---|---|
-| **Self-hosting C compiler** — chibicc compiled *to* SVM IR (via the LLVM on-ramp, artifact kept for speed) and run as a guest that compiles C → SVM IR in-sandbox; browser playground (W5) is one deployment | SELFHOST_C.md | scoped 2026-07-24; not scheduled — build order in the doc (libc-coverage audit → `chibicc.svmb` via on-ramp → fill libc → close the loop over existing seams: embedder-assemble, then §22 `vm_dlopen`; **no substrate changes**) |
+| **Self-hosting C compiler** — chibicc compiled *to* SVM IR (via the LLVM on-ramp, artifact kept for speed) and run as a guest that compiles C → SVM IR in-sandbox; browser playground (W5) is one deployment | SELFHOST_C.md | **step 1 (libc audit) done 2026-07-24** — Appendix A: fill is guest-side (one libc `.c` incl. `%.17g` dtoa; `calloc` wrapper; one `realloc` choice; cc1-only build set), **no substrate changes**; capstone = playground demo (compile + run C in-browser). Next: step 2, build `chibicc.svmb` via the on-ramp |
 | §3 substrate generalization (`create(module, window, budget)` subsuming the op-15 surface) | PROCESS.md §3 | future; op-15 chosen deliberately as the incremental form |
 | `Budget` charging at create (the passable object exists; per-domain charging is the follow-up) | PROCESS.md §5 / cap_id::BUDGET docs | todo |
