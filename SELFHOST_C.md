@@ -356,6 +356,18 @@ import — `__vm_host_call`/`__vm_cap_resolve`/`malloc`). Bottom edge is the **`
 `svm-posix` name-binding): the on-ramp recognizes `__vm_host_call`, and the `fs` cap already backs a
 memfs (`crates/svm-run/src/fs.rs`), so source + `include/*.h` seed straight in (§5 C).
 
+**→ Slice 1 done 2026-07-24 — the libc links and the module is trap-free.**
+`chibicc_libc.c` (the aggregator, in-place `#include` of `../postgres/{mem,os,libc,printf}_shim.c` +
+`shim_errno.h` + `../strtod/strtod.c`) + `chibicc_extra.c` (the ~15 remainder: a size-header arena
+allocator, `FILE*` with an `open_memstream` memory mode composing with `printf_shim`'s `vfprintf`,
+`strchr`/`memchr`/`strndup`/`strncasecmp`, `strtold`→`strtod`, `dirname`, fixed-epoch time, and
+`__assert_fail`). The build now **translates WITHOUT `--stub-externs`** — every call resolves to the
+guest libc or an on-ramp-recognized primitive (`__vm_*`, `bcmp`→memcmp synth, `exit`→Exit powerbox);
+**no trap stubs**. The 333-function module decodes / verifies / bytecode-compiles. Decision settled:
+the `%.17g` path really is free (`printf_shim` → `__vm_fmt_gen`), and the powerbox is auto-synthesized
+for the `main`-having module (so `exit`/stderr lower fine; the arena sidesteps needing `malloc` from
+the Memory cap for v1). **Not yet validated at runtime** — that is slice 2.
+
 **Open decision — where the shared guest libc lives.** These shims are now wanted by a *second*
 consumer (chibicc), which is exactly the project's stated trigger to dedup (§8). Three options:
 (a) **factor** the reusable shims into a shared `demos/_guestlibc/` (or `crates/svm-run/guestlibc/`)
@@ -366,8 +378,9 @@ duplicated lines that will drift. Recommendation: **(b) for the first chibicc br
 proves the reuse), then **(a)** once both guests are green (factor with two proven consumers, not
 one). Owner call before implementing.
 
-**Validation (the real gate, next slice).** A run harness instantiates `chibicc.svmb` on the `fs`
-cap with memfs seeded (source `.c` + `/include`), runs `main`, captures the emitted IR, and asserts
-it **byte-matches native `chibicc --emit-ir`** — starting with an integer-only program (never
-touches `%.17g`), then floats, then the demo corpus (§7 step 5). This is where libc bugs surface;
-budget iteration.
+**Validation (slice 2, the real gate — NOT yet done).** A run harness instantiates `chibicc.svmb`
+on the `fs` cap with memfs seeded (source `.c` + `/include`), runs `main`, captures the emitted IR,
+and asserts it **byte-matches native `chibicc --emit-ir`** — starting with an integer-only program
+(never touches `%.17g`), then floats, then the demo corpus (§7 step 5). This is where any libc bug
+(the arena allocator, the memstream `FILE*`, the fd-dispatch) surfaces; budget iteration. Slice 1
+proves the module is *well-formed and complete*; slice 2 proves it is *correct*.

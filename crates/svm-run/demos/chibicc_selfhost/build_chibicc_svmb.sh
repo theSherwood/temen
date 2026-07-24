@@ -37,9 +37,21 @@ for tu in $CC1_TUS; do
 done
 "$CLANG" $CFLAGS "$HERE/cc1_main.c" -o "$CACHE/cc1_main.bc"
 
-echo "=== [2/4] llvm-link ==="
+# The self-host guest libc (SELFHOST_C.md §5 B / Appendix B): the aggregating -DSVM_GUEST driver
+# that #includes the reused Postgres shims + chibicc_extra.c. -fno-builtin-* so clang doesn't rewrite
+# the shims' own byte-loops / allocator into self-calls (the Postgres link_shims.sh posture).
+echo "=== [1b/4] guest libc (chibicc_libc.c, -DSVM_GUEST) ==="
+"$CLANG" -O2 -emit-llvm -c -DSVM_GUEST -mlong-double-64 \
+  -fno-vectorize -fno-slp-vectorize \
+  -fno-builtin-memcpy -fno-builtin-memmove -fno-builtin-memset -fno-builtin-memcmp \
+  -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free \
+  -fno-builtin-strlen -fno-builtin-strcmp -fno-builtin-strncmp \
+  -I"$SRC" -I"$REPO/crates/svm-run/demos/postgres" \
+  "$HERE/chibicc_libc.c" -o "$CACHE/chibicc_libc.bc"
+
+echo "=== [2/4] llvm-link (cc1 + guest libc) ==="
 "$LINK" $(for tu in $CC1_TUS; do echo "$CACHE/$tu.bc"; done) "$CACHE/cc1_main.bc" \
-  -o "$CACHE/chibicc.linked.bc"
+  "$CACHE/chibicc_libc.bc" -o "$CACHE/chibicc.linked.bc"
 echo "linked: $(stat -c%s "$CACHE/chibicc.linked.bc") bytes"
 
 echo "=== [2a/4] stub audit — every undefined symbol must be expected libc ==="
@@ -51,13 +63,18 @@ echo "=== [2a/4] stub audit — every undefined symbol must be expected libc ===
 NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
 "$NM" --undefined-only "$CACHE/chibicc.linked.bc" | awk '{print $2}' | sort -u \
   > "$CACHE/undefined.txt"
-EXPECTED='^(__assert_fail|__ctype_b_loc|__errno_location|bcmp|calloc|ctime_r|dirname|exit|fclose|fflush|fopen|fprintf|fputc|fputs|fread|free|fwrite|localtime|malloc|memchr|memcmp|memcpy|memmove|memset|open_memstream|printf|puts|realloc|snprintf|sprintf|stat|stderr|stdin|stdout|strchr|strcmp|strdup|strerror|strlen|strncasecmp|strncmp|strncpy|strndup|strstr|strtol|strtold|strtoul|time|vfprintf|vsnprintf)$'
-if UNEXPECTED=$(grep -Ev "$EXPECTED" "$CACHE/undefined.txt"); then
-  echo "UNEXPECTED undefined symbols (chibicc-internal? excluded TU?):"
-  echo "$UNEXPECTED"
-  exit 1
+# With the guest libc linked in, the ONLY undefined symbols left should be names the on-ramp itself
+# recognizes and lowers (the powerbox/personality bridge + its synth helpers) — not libc, not
+# chibicc-internal. Allowlist = the recognizer set (svm-llvm/src/lib.rs): the __vm_* primitives,
+# the powerbox stream/exit names, and the synth allocator/mem/fmt family.
+echo "remaining undefined after libc link:"; cat "$CACHE/undefined.txt" | sed 's/^/  /'
+ONRAMP='^(__vm_[a-z_0-9]+|write|read|exit|_exit|_Exit|malloc|calloc|realloc|free|memcpy|memmove|memset|memcmp|bcmp|printf|puts|putchar|putc|fputc|fwrite|fputs|__svm_[a-z_0-9]+)$'
+if UNEXPECTED=$(grep -Ev "$ONRAMP" "$CACHE/undefined.txt"); then
+  echo "UNEXPECTED undefined (not on-ramp-recognized — libc gap or excluded TU):"
+  echo "$UNEXPECTED" | sed 's/^/  /'
+  echo "(these would trap under --stub-externs; provide them in chibicc_extra.c or a shim)"
+  UNRESOLVED=1
 fi
-echo "stubs ($(wc -l < "$CACHE/undefined.txt")): all in the Appendix-A libc fill-set"
 
 echo "=== [3/4] translate (svm-llvm-translate --binary --host-page 65536 --stub-externs) ==="
 TR="$REPO/crates/svm-llvm/target/release/svm-llvm-translate"
@@ -67,8 +84,18 @@ if [ ! -x "$TR" ]; then
     --manifest-path "$REPO/crates/svm-llvm/Cargo.toml"
 fi
 # --host-page 65536: the artifact ultimately ships to the browser (wasm 64 KiB pages, D40).
+# Drop --stub-externs once the libc resolves everything but on-ramp-recognized names (the goal):
+# then translation itself proves nothing is left to trap. Fall back to stubbing while gaps remain,
+# so the build still produces an inspectable module.
+if [ "${UNRESOLVED:-0}" = "1" ]; then
+  echo "(libc gaps remain — translating WITH --stub-externs so the module is still inspectable)"
+  STUB=--stub-externs
+else
+  echo "(no libc gaps — translating WITHOUT --stub-externs: every call resolves)"
+  STUB=
+fi
 "$TR" "$CACHE/chibicc.linked.bc" -o "$CACHE/chibicc_raw.svmb" \
-  --binary --host-page 65536 --stub-externs
+  --binary --host-page 65536 $STUB
 echo "raw svmb: $(stat -c%s "$CACHE/chibicc_raw.svmb") bytes"
 
 echo "=== [4/4] prep_svmb (decode → verify → bytecode-compile gate) ==="
