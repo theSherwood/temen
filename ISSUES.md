@@ -163,6 +163,14 @@ child's trap in the joiner** (interp `Pending::Join` → `out.result?`; JIT `joi
 supervision idiom is **`poll` → status `2` (trapped, non-propagating) → `detach` + respawn**;
 `join` only after `poll` reports a clean return. Any supervision pattern doc must lead with this.
 
+**Teardown now uniform (2026-07-24):** the domain-fatal rule this issue assumes is enforced
+identically on all engines as of the domain-lifetime decision (DESIGN.md §12 "Domain lifetime
+& teardown", INVARIANTS #6): exit/trap tears the whole domain down immediately — parked
+threads included — and root completion ends the batch run with daemons abandoned. Previously
+the interpreter only surfaced a spawned thread's trap at `thread.join` and the JIT never woke
+parked waiters to observe a trap (the jacl timed-wait regression, whose reported JIT/interp
+divergence was this teardown gap, not the timed wait itself).
+
 **Escalation options if the domain-fatal default proves too sharp** (recorded for the future,
 none built): (a) **poison-drain** — on a handler trap, errno the trapped dispatch's caller *and*
 every queued/parked dispatch, refuse new work, exit cleanly: converts a blast into an orderly

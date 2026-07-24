@@ -1666,6 +1666,35 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   the DPOR oracle); program *output* must not depend on *which* vCPU runs you,
   only on per-CPU state being self-consistent (the GC.md §3.2 framing).
 
+### Domain lifetime & teardown (owner, 2026-07-24)
+
+**Executors never anchor a domain's lifetime; ownership does.** A domain ends exactly two
+ways: it ends itself (`exit(n)`, or any trap — both **domain-wide**, on every engine), or
+its owner ends it (drops the Instance/Session, revokes it — authority down the grant
+graph). Spawned vCPUs and fibers are workers *inside* the domain, never lifetime anchors;
+nothing implicitly waits for them (`thread.join` is the explicit wait). The **activation**
+(one entry into the domain: a batch `_start` run, one reactor `call_export`, one inbound
+dispatch) ends when its root completes; the batch run is the degenerate case where the
+owner's interest ends with the one activation, so root return/exit/trap tears the domain
+down and parked daemons are simply abandoned. A reactor is the *same rule* with an owner
+that stays: end-of-activation quiesces, the Session keeps the domain, and "everything
+parked, nothing running" is a live domain's resting state, not termination. (Matches the C
+on-ramp — returning from `main` *is* `exit`, all threads die unjoined — and jacl's
+runtime, whose daemon pools are domain-internal.)
+
+Teardown mechanics, uniform across interpreter, explorer, and JIT (differentially
+tested): non-preemptive — a running sibling stops at its next safepoint, so post-teardown
+sibling effects are unspecified and diff harnesses compare only the root outcome + effects
+that happened-before it; parked siblings are woken/dropped by the scheduler, never left to
+a timeout (`MAX_WAIT` is an anti-wedge backstop, not semantics); in-flight host I/O
+quiesces before window read-back; cross-domain callers parked through the dying domain
+complete with a probeable errno (D37 death-is-revocation — the §3.6 machinery), never
+hang; a nested child's exit/trap ends the *child* domain only, surfacing to its owner as
+an outcome (supervision: `poll` → trapped → detach + respawn, per I37). Before this rule
+the engines had divergent incidental residues (interpreter: join-all + a 10 s wait clamp;
+JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regression report
+(2026-07-24) is the consumer that forced the decision.
+
 ### Host-call ABI: async-first
 - Blocking-capable host calls are **submit/complete** (io_uring-shaped). The
   synchronous blocking *surface* the source language sees is built by the runtime:
