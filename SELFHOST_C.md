@@ -17,18 +17,20 @@ wasm build.
 C→IR compiler — *not* that the compiler is bootstrapped by compiling itself. That distinction is
 deliberate; see the decision in §3.
 
-## 2. Two roles of chibicc — keep them separate
+## 2. One chibicc, two build forms
 
-The word "chibicc" names two different things in this plan:
+There is **one chibicc**: one source tree (`frontend/chibicc/`, including the `codegen_ir.c`
+C→SVM-IR backend), no fork, nothing maintained twice. It exists in two *build forms*:
 
-1. **chibicc-the-frontend** — `frontend/chibicc/codegen_ir.c` + `--emit-ir`: the C→SVM-IR backend
-   we maintain (`FRONTEND.md`). This is *code we build with*.
-2. **chibicc-the-guest** — the chibicc binary (including that `codegen_ir.c` backend) compiled
-   **into an SVM IR module** and run as a guest, so C can be compiled *inside* the sandbox. This is
-   the *artifact this doc is about producing*.
+1. **The native binary** (built by `cc`, as today) — a build/dev tool: the test harness
+   (`c_frontend.rs`) shells out to it, and it is the **byte-match oracle** the guest form is
+   differentially validated against (§5 E).
+2. **`chibicc.svmb`** — the *same source* compiled through the LLVM on-ramp into an SVM IR module
+   (§3). This is the artifact this doc is about: run it as a guest and C compiles *inside* the
+   sandbox, producing the same IR the native binary would.
 
-When chibicc-the-guest runs, a user hands it C source; it executes its `codegen_ir` backend and
-emits SVM IR text — the same output the native frontend produces, just computed inside SVM.
+Nothing about the plan requires divergent code paths between the two — same `main.c`, same
+`codegen_ir.c`; the native binary sticks around only because the dev/test loop uses it.
 
 ## 3. Load-bearing decision — build chibicc-the-guest with the **LLVM on-ramp**, and keep it
 
@@ -93,21 +95,37 @@ calls (`glob`, `mkstemp`, `unlink`) are **avoidable** in `-cc1 --emit-ir` mode.
 Seed **memfs** with the user's `.c` and the bundled `frontend/chibicc/include/*.h`, so the
 preprocessor resolves `#include`. memfs already supports seeding + imaging.
 
-### D. Close the loop: compiler output → runnable module *(the key open design question)*
-`codegen_ir.c` emits **text IR**; a runnable module needs **verify + encode to binary**, and both
-(`svm-verify`, `svm-encode`) are trusted host code. Options:
-1. **A host "assemble" op** (text IR → a verified module handle) — the on-SVM analog of the browser
-   cdylib's `svm_parse`. Keeps the verifier/encoder in the host (they are TCB regardless) and the
-   guest thin. **Recommended.** Pairs with `domain_exec` to run the result.
-2. **A binary-`.svmb` emitter in `codegen_ir.c`** — chibicc emits the encoded module directly; no
-   host assemble op. Heavier (a C encoder to maintain), but fully guest-contained. Safety is
-   unchanged — the loader **always re-verifies** (invariant), so a mis-encoded module is a clean
-   verify error, never an escape.
-3. `domain_exec`/loader accepts text IR — widens the load path with the text parser; least
-   preferred.
+### D. Close the loop: compiler output → running code — **no substrate changes required**
+`codegen_ir.c` emits **text IR**. Closing the loop needs *zero new SVM ops*; the existing seams
+cover every deployment shape, layered by how far "inside" the loop runs:
 
-Whichever: **the verifier runs on the guest-produced module at load** (INVARIANTS.md §9 / §2a).
-The compiler-guest is untrusted like any frontend; a compiler bug is a clean error, never an escape.
+1. **v1 — the embedder closes the loop** (exactly as it does for the native compiler today).
+   The compiler-guest reads `.c` from memfs and writes its IR output back to memfs; the *embedder*
+   picks it up, assembles/verifies/loads, and runs it — `svm-run` natively, the cdylib's existing
+   `svm_parse` in the browser. The compiler is just a program whose output is a file. Nothing new
+   anywhere.
+2. **In-guest compile-and-run — already built: the §22 `Jit` capability + `vm_dlopen`.** A guest
+   can hand serialized SVM IR from its own window to the host, which runs the fail-closed
+   **rewrite-then-verify** gate (`jit_resolve_and_validate`: `decode_module` →
+   `resolve_imports` → `verify_module` → install) and returns callable `call_indirect` slots.
+   The C-level loader (`<vm_dl.h>`: `vm_dlopen`/`vm_dlsym`/`vm_dlclose`) is **built and
+   differentially tested** (DESIGN.md §22, "In-window dynamic linking — SETTLED"). So
+   *compile → load → call, entirely in-guest,* is a composition of existing pieces. The one
+   guest-side gap: `vm_dlopen` takes **binary** serialized IR (`decode_module`), and chibicc emits
+   text — so this layer needs a small **binary emitter in `codegen_ir.c`** (guest code, the wire
+   format is the simple single-pass `svm-encode` form). No host change.
+3. **Run-as-a-child-domain** (`cc x.c && ./x` as a separate process): today's spawn surface
+   (`instantiate_module` op 5/13, `domain_exec`) takes **host-verified `Module`s** from the
+   embedder's registry, not guest-window bytes — so for now the *embedder* mediates (it watches the
+   output file, verifies, registers, and the shell spawns it by name). That is host-application
+   glue, not substrate. A bytes-taking spawn op is **explicitly not needed** for this plan and
+   stays unproposed unless a concrete consumer (the in-sandbox shell running freshly-compiled
+   commands as true child domains) demands it — at which point it is a deliberate substrate
+   discussion, not a rider on this doc.
+
+In every layer **the verifier runs on the guest-produced module at load** (INVARIANTS.md §9 /
+`DESIGN.md` §2a; §22's rewrite-then-verify). The compiler-guest is untrusted like any frontend; a
+compiler bug is a clean error, never an escape.
 
 ### E. Validation
 - **Differential vs native:** chibicc-the-guest's IR output byte-matches native
@@ -122,8 +140,9 @@ The compiler-guest is untrusted like any frontend; a compiler bug is a clean err
 
 - **The compiler-guest is untrusted.** It is a frontend (§2a): the verifier re-checks its output.
   No self-hosting convenience may bypass verification of a produced module.
-- **Host = mechanism.** `domain_exec` + the assemble op are plumbing; no compiler-specific
-  scheduling/policy in the host (INVARIANTS.md §4).
+- **No new substrate.** The loop closes over existing seams (§5 D): the embedder, and the built
+  §22 `Jit` cap / `vm_dlopen`. No new host ops for the compiler; host stays mechanism
+  (INVARIANTS.md §1/§4).
 - **libc semantics live outside the escape-TCB match** (`POSIX.md`): the personality is guest
   policy over masked host caps, not trusted core.
 - **One artifact, rebuilt on SVM-code change.** `chibicc.svmb` is code-coupled (like
@@ -138,16 +157,19 @@ The compiler-guest is untrusted like any frontend; a compiler bug is a clean err
    `build-pg-assets.mjs`; run it (no libc yet) to shake out translation.
 3. **Fill libc** (§5 B) until chibicc-the-guest compiles a trivial C file to text IR against
    memfs-seeded source (§5 C), matching native `--emit-ir`.
-4. **Close the loop** (§5 D) — land the recommended assemble op + `domain_exec` run; end-to-end
-   compile-and-run inside SVM (§5 E).
+4. **Close the loop** (§5 D) — v1: embedder assembles/loads the output (no new code beyond glue);
+   then the in-guest layer: a binary emitter in `codegen_ir.c` feeding the existing `vm_dlopen`;
+   end-to-end compile-and-run inside SVM (§5 E).
 5. **Browser deployment** — ship `chibicc.svmb` as a static asset and wire the W5 surface
    (INTERACTIVE_EMBEDDING.md); the encode step reuses the cdylib's existing `svm_parse`.
 6. **(optional) stage-2 conformance** differential (§7 E).
 
 ## 8. Open questions
 
-- The assemble op's shape (§5 D-1): a one-shot `text IR → module handle`, or a small streaming
-  surface? Start one-shot.
+- Binary emission (§5 D-2): a C encoder for the `svm-encode` wire form in `codegen_ir.c`, or keep
+  the guest text-only and let the embedder assemble everywhere? Text-only defers the encoder but
+  caps the in-guest story at layer 1; the encoder is small (the format is a deliberate single-pass
+  design) and unlocks `vm_dlopen`. Decide when layer 2 has a consumer.
 - Where the pure-libc bulk lives — compiled into `chibicc.svmb` as guest C (simplest, self-contained
   artifact) vs. shared personality ops (dedup with the shell/Postgres). Lean guest-C for the first
   cut; dedup later if a second consumer wants the same ops.
