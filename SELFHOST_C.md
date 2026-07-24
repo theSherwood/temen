@@ -193,6 +193,17 @@ compiler bug is a clean error, never an escape.
    output in the pane. The encode step reuses the cdylib's existing `svm_parse`. Gated by a
    Playwright test in the `real-browser` CI job (the `browser-play-editor-test.mjs` pattern):
    compile ≥2 corpus programs in Chromium, run them, assert output matches the native build's.
+
+   **→ Step-5 slice A done 2026-07-24 — engine parity settled (the prerequisite).** `chibicc_run.rs`
+   takes `SVM_CHIBICC_BACKEND`; `run_selfhost_diff.sh` runs every case on **treewalk / bytecode / jit**
+   and all three emit **byte-identical IR** vs native. Engine decision for the playground card:
+   **bytecode engine (`jit: false`)**. The browser's whole-module wasm-JIT tier is *integer-subset
+   only* — `svm_wasmjit::compile_module(chibicc.svmb)` fails "a function is outside the integer
+   subset" (chibicc uses floats: the `%.17g`/`__vm_fmt` path). That is expected and not a blocker: the
+   playground already runs float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
+   per-demo `jit` flag (`browser/web/play.js`); the wasm-JIT is an opt-in accelerator for integer
+   modules, not the only path. chibicc's compiled *outputs* run on bytecode too (integer-only ones may
+   opt into wasm-JIT later). No substrate change; making the wasm tier accept floats is out of scope.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

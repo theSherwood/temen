@@ -49,6 +49,16 @@ fn main() {
     let module = svm_encode::decode_module(&bytes).expect("decode .svmb");
     let inst = svm_run::instantiate(module).expect("instantiate (verifies)");
 
+    // SVM_CHIBICC_BACKEND selects the engine: treewalk (the oracle, default), bytecode (what the
+    // browser runs), or jit (Cranelift — the compiling-backend proxy for the browser's wasm-jit).
+    // The self-host differential runs all three to prove the guest compiles identically on each.
+    let backend = match std::env::var("SVM_CHIBICC_BACKEND").as_deref() {
+        Ok("bytecode") => Backend::Bytecode,
+        Ok("jit") => Backend::Jit,
+        Ok("treewalk") | Err(_) => Backend::TreeWalk,
+        Ok(other) => panic!("SVM_CHIBICC_BACKEND: unknown engine {other:?}"),
+    };
+
     let cfg = RunConfig {
         limits: Limits {
             fuel: None,
@@ -62,11 +72,7 @@ fn main() {
         env: vec![],
     };
     let run = inst
-        .run_with_caps(
-            Backend::TreeWalk,
-            &cfg,
-            &[("fs", fs::mem_fs_seeded(files, dirs))],
-        )
+        .run_with_caps(backend, &cfg, &[("fs", fs::mem_fs_seeded(files, dirs))])
         .expect("run chibicc guest");
 
     // Forward exactly what the guest produced; the script diffs our stdout against native.

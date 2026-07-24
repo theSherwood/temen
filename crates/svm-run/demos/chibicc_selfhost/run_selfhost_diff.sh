@@ -38,6 +38,13 @@ INC="$SRC/include"
 # guest gets `/in.c`; normalize that single quoted path so the rest is a true byte-for-byte compare.
 norm() { sed -E 's|^(debug\.file 0 ")[^"]*(")|\1<INPUT>\2|'; }
 
+# The browser runs a .svmb on the bytecode interpreter AND (JIT tier) the svm-wasmjit whole-module
+# compile. So the guest must emit identical IR on every engine, not just the tree-walker oracle. We
+# check all three locally runnable engines: treewalk (oracle), bytecode (browser default), jit
+# (Cranelift — the compiling-backend proxy for the browser's wasm-jit). svm-wasmjit compile-parity
+# is checked separately (check_wasmjit_compile.sh) + gated end-to-end by the real-browser CI job.
+ENGINES="${SVM_CHIBICC_ENGINES:-treewalk bytecode jit}"
+
 pass=0; fail=0
 run_case() {
   local name="$1" want_inc="$2"; shift 2
@@ -46,16 +53,20 @@ run_case() {
   # native golden: -I the real header tree (the guest uses its default /include memfs mount instead).
   ( cd "$SEED" && "$REF" "-I$INC" "$name.c" ) > "$CACHE/$name.golden" 2>"$CACHE/$name.golden.err" || {
     echo "  ✗ $name — native reference errored: $(cat "$CACHE/$name.golden.err")"; fail=$((fail+1)); return; }
-  # guest: seed /in.c (+ /include when the case needs headers)
   local incarg=(); [ "$want_inc" = inc ] && incarg=("$INC")
-  cargo run -q -p svm-run --example chibicc_run -- \
-    "$SVMB" "$cf" /in.c "${incarg[@]}" > "$CACHE/$name.guest" 2>"$CACHE/$name.guest.err" || {
-    echo "  ✗ $name — guest run errored: $(cat "$CACHE/$name.guest.err")"; fail=$((fail+1)); return; }
-  if diff <(norm < "$CACHE/$name.golden") <(norm < "$CACHE/$name.guest") >"$CACHE/$name.diff"; then
-    echo "  ✓ $name  ($(wc -l < "$CACHE/$name.guest") lines IR)"; pass=$((pass+1))
-  else
-    echo "  ✗ $name — IR MISMATCH:"; sed 's/^/      /' "$CACHE/$name.diff" | head -30; fail=$((fail+1))
-  fi
+  local engres=""
+  for eng in $ENGINES; do
+    if SVM_CHIBICC_BACKEND="$eng" cargo run -q -p svm-run --example chibicc_run -- \
+         "$SVMB" "$cf" /in.c "${incarg[@]}" > "$CACHE/$name.$eng" 2>"$CACHE/$name.$eng.err" \
+       && diff <(norm < "$CACHE/$name.golden") <(norm < "$CACHE/$name.$eng") >"$CACHE/$name.$eng.diff"; then
+      engres="$engres $eng✓"
+    else
+      engres="$engres $eng✗"; fail=$((fail+1))
+      echo "  ✗ $name [$eng] — mismatch/err:"; { sed 's/^/      /' "$CACHE/$name.$eng.diff" 2>/dev/null | head -20; sed 's/^/      /' "$CACHE/$name.$eng.err"; } | head -20
+    fi
+  done
+  echo "  $name ($(wc -l < "$CACHE/$name.golden") lines IR):$engres"
+  [ "${engres//✗/}" = "$engres" ] && pass=$((pass+1))
 }
 
 echo "=== self-host differential (guest chibicc.svmb  vs  native chibicc_ref) ==="
