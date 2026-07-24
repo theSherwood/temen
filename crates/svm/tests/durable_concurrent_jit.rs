@@ -146,9 +146,16 @@ fn thaw(
 }
 
 // Root (v0 = clock, v1 = host-fn): stash the clock for the children, spawn two children as concurrent
-// OS threads, **signal** they're spawned, then run a K-loop and store its total. The host-fn `cap.call`
-// makes the root may-suspend so its loop is instrumented (the freeze safepoint). Each child loops K and
-// stores its total to its own slot; the clock read after the loop just makes the child may-suspend too.
+// OS threads, **signal** they're spawned, then run a K-loop, **join both children**, and store its
+// total. The host-fn `cap.call` makes the root may-suspend so its loop is instrumented (the freeze
+// safepoint). Each child loops K and stores its total to its own slot; the clock read after the loop
+// just makes the child may-suspend too.
+//
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): the root's completion now ends the
+// domain — an *unjoined* child's post-return effects are unobservable (it is torn down at its next
+// safepoint). The root therefore joins its children before returning, so the children's stored
+// totals are still guaranteed observable; the freeze-time behavior is unchanged (the freeze lands
+// mid-loop, before the joins).
 const SRC_LOOPS: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -161,19 +168,21 @@ block 0 (v0: i32, v1: i32) {
   v7 = i32.const 0
   v8 = cap.call 13 0 (i32) -> (i64) v1 (v7)
   v9 = i64.const 0
-  br 1(v9)
+  br 1(v4, v6, v9)
 }
-block 1 (v10: i64) {
-  v11 = i64.const 1
-  v12 = i64.add v10 v11
-  v13 = i64.const 100000000
-  v14 = i64.lt_s v12 v13
-  br_if v14 1(v12) 2(v12)
+block 1 (v10: i32, v11: i32, v12: i64) {
+  v13 = i64.const 1
+  v14 = i64.add v12 v13
+  v15 = i64.const 100000000
+  v16 = i64.lt_s v14 v15
+  br_if v16 1(v10, v11, v14) 2(v10, v11, v14)
 }
-block 2 (v15: i64) {
-  v16 = i64.const 65536
-  i64.store v16 v15
-  return v15
+block 2 (v17: i32, v18: i32, v19: i64) {
+  v20 = thread.join v17
+  v21 = thread.join v18
+  v22 = i64.const 65536
+  i64.store v22 v19
+  return v19
   }
 }
 func (i64, i64) -> (i64) {
@@ -309,6 +318,9 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
 // freeze the child must flatten its own parked fiber — its own `freeze_drive`, the concurrent mirror of
 // `run_child_inline`'s. (Here the *child*, not the root, drives the handshake; `concurrent_freeze`'s
 // host fn flips the same flag regardless of caller.)
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): the root joins the child before
+// returning — root completion now tears down unjoined siblings, so the child's stored total (asserted
+// after the thaw) must be sequenced before the root's return. The freeze still lands mid-loop.
 const SRC_CHILD_FIBER: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -317,21 +329,22 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v5 = i64.const 0
-  br 1(v0, v5)
+  br 1(v0, v4, v5)
 }
-block 1 (v6: i32, v7: i64) {
-  v8 = i64.const 1
-  v9 = i64.add v7 v8
-  v10 = i64.const 100000000
-  v11 = i64.lt_s v9 v10
-  br_if v11 1(v6, v9) 2(v6, v9)
+block 1 (v6: i32, v7: i32, v8: i64) {
+  v9 = i64.const 1
+  v10 = i64.add v8 v9
+  v11 = i64.const 100000000
+  v12 = i64.lt_s v10 v11
+  br_if v12 1(v6, v7, v10) 2(v6, v7, v10)
 }
-block 2 (v12: i32, v13: i64) {
-  v14 = i32.const 0
-  v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
-  v16 = i64.const 65536
-  i64.store v16 v13
-  return v13
+block 2 (v13: i32, v14: i32, v15: i64) {
+  v16 = i32.const 0
+  v17 = cap.call 2 0 (i32) -> (i64) v13 (v16)
+  v18 = thread.join v14
+  v19 = i64.const 65536
+  i64.store v19 v15
+  return v15
   }
 }
 func (i64, i64) -> (i64) {
@@ -415,6 +428,10 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
 // the root unwinds separately. The thaw re-issues the child's resume, which re-enters the fiber; the
 // fiber rewinds to its mid-loop point, finishes, and suspends 5 — so the child's loop + the fiber's
 // yielded value reproduce `K + 5`, and the root reproduces `K`.
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): the root joins the child before
+// returning — without the join, the root (whose thaw-side work is only its own K-loop) finishes far
+// ahead of the child (fiber K-loop + its own K-loop, ~2K) and tears it down mid-run, making the
+// child's asserted total unobservable. The freeze still lands mid-loop, before the join.
 const SRC_CHILD_FIBER_ACTIVE: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -423,21 +440,22 @@ block 0 (v0: i32, v1: i32) {
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
   v5 = i64.const 0
-  br 1(v0, v5)
+  br 1(v0, v4, v5)
 }
-block 1 (v6: i32, v7: i64) {
-  v8 = i64.const 1
-  v9 = i64.add v7 v8
-  v10 = i64.const 100000000
-  v11 = i64.lt_s v9 v10
-  br_if v11 1(v6, v9) 2(v6, v9)
+block 1 (v6: i32, v7: i32, v8: i64) {
+  v9 = i64.const 1
+  v10 = i64.add v8 v9
+  v11 = i64.const 100000000
+  v12 = i64.lt_s v10 v11
+  br_if v12 1(v6, v7, v10) 2(v6, v7, v10)
 }
-block 2 (v12: i32, v13: i64) {
-  v14 = i32.const 0
-  v15 = cap.call 2 0 (i32) -> (i64) v12 (v14)
-  v16 = i64.const 65536
-  i64.store v16 v13
-  return v13
+block 2 (v13: i32, v14: i32, v15: i64) {
+  v16 = i32.const 0
+  v17 = cap.call 2 0 (i32) -> (i64) v13 (v16)
+  v18 = thread.join v14
+  v19 = i64.const 65536
+  i64.store v19 v15
+  return v15
   }
 }
 func (i64, i64) -> (i64) {
@@ -777,6 +795,10 @@ fn nested_concurrent_tree_freezes_and_thaws() {
 // window. On thaw the root re-issues the wait, which re-checks the value, finds `1 != 0`, and resolves
 // immediately with `WAIT_NOT_EQUAL` — no re-park, no notifier needed. This is the thaw-able case: the
 // wake landed as a value change that rode the snapshot.
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): after its wait resolves, the root
+// joins the child before returning — else the root's return would tear down the still-looping child
+// and its asserted total (`OFF_C1 = K`) would be unobservable. The freeze still lands while the root
+// is parked in the wait, before the join.
 const SRC_WAIT_WORKS: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -790,8 +812,9 @@ block 0 (v0: i32, v1: i32) {
   v8 = i32.atomic.wait v5 v6 v7
   v9 = i64.const 65536
   i32.store v9 v8
-  v10 = i64.const 0
-  return v10
+  v10 = thread.join v4
+  v11 = i64.const 0
+  return v11
   }
 }
 func (i64, i64) -> (i64) {
@@ -945,6 +968,9 @@ fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
 // re-issued `notify`, and that wakes the parked root — `WAIT_WOKEN`, no fail-closed, no hang. This is the
 // per-context thaw word (stage 1b) + concurrent driver (stage 2) paying off: the two rewinds run on
 // their own threads against their own words and re-synchronise on the real futex.
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): after the notify wakes it, the root
+// joins the producer child before returning — else the root's return races the child's trailing
+// store of `OFF_C1` and can tear it down first. The freeze still lands while the root is parked.
 const SRC_WAIT_NOTIFY: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -958,8 +984,9 @@ block 0 (v0: i32, v1: i32) {
   v8 = i32.atomic.wait v5 v6 v7
   v9 = i64.const 65536
   i32.store v9 v8
-  v10 = i64.const 0
-  return v10
+  v10 = thread.join v4
+  v11 = i64.const 0
+  return v11
   }
 }
 func (i64, i64) -> (i64) {
@@ -1235,6 +1262,10 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
 // point A is finished **and joined** (fully gone — unlike SRC_JOIN's finished-but-unjoined child, which
 // rides the artifact via `completed_result`), so only B is in the residue: 2 lifetime spawns, 1 frozen
 // vCPU. The thaw reloads A's join result (A is never re-run) and reproduces every total.
+// Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): the root also joins the *live* child B
+// before returning — root completion now tears down unjoined siblings, so B's stored total (asserted
+// after the thaw) must be sequenced before the root's return. A's join (the recycling under test) is
+// unchanged; the freeze still lands mid-loop, before B's join.
 const SRC_RECYCLE: &str = r#"
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -1248,20 +1279,21 @@ block 0 (v0: i32, v1: i32) {
   v8 = i32.const 0
   v9 = cap.call 13 0 (i32) -> (i64) v1 (v8)
   v10 = i64.const 0
-  br 1(v5, v10)
+  br 1(v5, v7, v10)
 }
-block 1 (v11: i64, v12: i64) {
-  v13 = i64.const 1
-  v14 = i64.add v12 v13
-  v15 = i64.const 100000000
-  v16 = i64.lt_s v14 v15
-  br_if v16 1(v11, v14) 2(v11, v14)
+block 1 (v11: i64, v12: i32, v13: i64) {
+  v14 = i64.const 1
+  v15 = i64.add v13 v14
+  v16 = i64.const 100000000
+  v17 = i64.lt_s v15 v16
+  br_if v17 1(v11, v12, v15) 2(v11, v12, v15)
 }
-block 2 (v17: i64, v18: i64) {
-  v19 = i64.add v18 v17
-  v20 = i64.const 65536
-  i64.store v20 v19
-  return v19
+block 2 (v18: i64, v19: i32, v20: i64) {
+  v21 = i64.add v20 v18
+  v22 = thread.join v19
+  v23 = i64.const 65536
+  i64.store v23 v21
+  return v21
   }
 }
 func (i64, i64) -> (i64) {

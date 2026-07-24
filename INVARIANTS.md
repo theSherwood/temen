@@ -59,6 +59,19 @@ serial-by-default with explicit opt-in ladders (multi-consumer serving, threadin
 cost — the threading discipline — is the guest's stated choice. *Violated by:* partial-state
 recovery, transactional handler worlds, or implicit parallelism. (IMPORTS.md §3.6; I37/I39.)
 
+**One lifetime, too (owner, 2026-07-24):** executors never anchor a domain's lifetime;
+ownership does. A domain ends itself (`exit`, or any trap — both domain-wide, on every
+engine) or its owner ends it (drop/revocation); spawned vCPUs and fibers are workers inside
+the world, never reasons to keep it alive, and nothing implicitly waits for them —
+`thread.join` is the explicit wait. Root completion ends the *activation*; in a batch run
+the owner leaves with it, so root return/exit/trap tears the domain down, parked daemons
+abandoned (non-preemptively: running siblings stop at their next safepoint, so post-teardown
+sibling effects are unspecified). Cross-domain waiters parked through a dying domain wake
+with an errno (invariant 5 / D37), never hang. *Violated by:* join-all-at-teardown
+semantics, an engine where exit/trap leaves siblings parked, or lifetime rules that differ
+between batch and reactor — a reactor is the same rule with an owner (the Session) that
+stays. (DESIGN.md §12 "Domain lifetime"; jacl timed-wait regression, 2026-07-24.)
+
 ## 7. Re-execution is recovery
 
 Parks rewind their frames, so a wake — spurious, racing, or post-thaw — simply re-executes

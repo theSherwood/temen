@@ -479,6 +479,16 @@ pub enum TrapKind {
 /// 32 bits of the `i64` cell). Distinct from every [`TrapKind`].
 pub const EXIT_CODE: u32 = 7;
 
+/// Trap-cell code `run_inner` stores at **domain teardown** when the root vCPU completed cleanly
+/// (owner decision 2026-07-24: "root completion ends the activation; the owner's departure ends the
+/// domain" — DESIGN.md §12, ISSUES.md I37). Purely internal, never surfaced: it makes every
+/// surviving sibling vCPU's trap-propagation guard unwind (parked waiters are woken to observe it,
+/// `os_thread_rt::Domain::begin_teardown`), and the outcome read maps it back to
+/// [`JitOutcome::Returned`] — the run result stays the root's own return, uncontaminated. Distinct
+/// from every [`TrapKind`] and from [`EXIT_CODE`], mirroring how the freeze unwind keeps its
+/// sentinel (the `UNWINDING` state word) out of the trap namespace.
+pub(crate) const DOMAIN_DONE_CODE: u32 = 14;
+
 impl TrapKind {
     fn from_code(c: u32) -> Option<TrapKind> {
         Some(match c {
@@ -1780,6 +1790,203 @@ mod trap_capture_tests {
             vec![loc(0, 7)],
             "duplicate adjacent positions collapse"
         );
+    }
+}
+
+/// Owner decision 2026-07-24 — **domain-teardown semantics** (DESIGN.md §12; ISSUES.md I37; D37
+/// death-is-revocation): `exit(n)` / any trap from ANY vCPU, and the **root vCPU's completion**
+/// (plain clean return included), tear the whole domain down — PARKED siblings included — and the
+/// run returns promptly with the root's outcome. Regression fixtures for the hang where a daemon
+/// parked on an indefinite `atomic.wait` (or a `thread.join`) kept `join_all` blocked forever
+/// because nothing woke it to observe the domain's end. Gated to the targets with a JIT thread
+/// runtime (like `crates/svm/tests/jit_threads.rs`).
+#[cfg(test)]
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+mod domain_teardown_tests {
+    use super::{compile_and_run, compile_and_run_with_host, JitOutcome, TrapKind, EXIT_CODE};
+    use std::time::{Duration, Instant};
+    use svm_text::parse_module;
+    use svm_verify::verify_module;
+
+    /// The teardown latency bound: generous for CI (compile included), but far below the
+    /// MAX-WAIT scale of the hang this guards against (the daemon parks with timeout −1).
+    const PROMPT: Duration = Duration::from_secs(15);
+
+    /// Func 1 in every fixture: a daemon vCPU that parks forever on `i32.atomic.wait` (timeout −1)
+    /// at address 0, whose word never changes and which nothing ever notifies.
+    const PARKED_DAEMON: &str = "func (i64, i64) -> (i64) {\n\
+        block 0 (vsp: i64, v0: i64) {\n\
+        \x20 v1 = i64.const 0\n\
+        \x20 v2 = i32.const 0\n\
+        \x20 v3 = i64.const -1\n\
+        \x20 v4 = i32.atomic.wait v1 v2 v3\n\
+        \x20 v5 = i64.const 7\n\
+        \x20 return v5\n\
+          }\n\
+        }\n";
+
+    fn run_promptly(src: &str) -> JitOutcome {
+        let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+        let start = Instant::now();
+        let out = compile_and_run(&m, 0, &[]).expect("jit compile/run");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < PROMPT,
+            "domain teardown must be prompt, took {elapsed:?}"
+        );
+        out
+    }
+
+    /// Rule 2: the **root's clean return** ends the run — the parked daemon (indefinite
+    /// `atomic.wait`) is torn down, its outcome unobservable, and the result is the root's own
+    /// return value. Before the fix this hung: nothing re-evaluated the parked daemon's wait when
+    /// the root finished.
+    #[test]
+    fn root_return_tears_down_parked_daemon() {
+        let src = format!(
+            "memory 16\n\
+             func () -> (i64) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.const 8\n\
+             \x20 v3 = i32.const 0\n\
+             \x20 v4 = i64.const 10000000\n\
+             \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+             \x20 v6 = i64.const 42\n\
+             \x20 return v6\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}"
+        );
+        match run_promptly(&src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// Rule 1 (`exit`): the root calls the exit capability while the daemon is parked forever —
+    /// the whole domain unwinds and the run reports `Exited` promptly. Before the fix this hung:
+    /// the exit code sat in the trap cell but the parked daemon was never woken to observe it.
+    #[test]
+    fn exit_tears_down_parked_daemon() {
+        /// A one-op powerbox: `cap.call 1 0` is `exit(code)` — store `EXIT_CODE | code << 32`
+        /// into the trap cell, exactly as svm-run's host thunk does for `Trap::Exit`.
+        unsafe extern "C" fn exit_thunk(
+            _ctx: *mut core::ffi::c_void,
+            _mem_base: *mut u8,
+            _mem_size: u64,
+            _mem_reserved: u64,
+            _type_id: u32,
+            _op: u32,
+            _handle: i32,
+            args: *const i64,
+            _n_args: u64,
+            _results: *mut i64,
+            _n_results: u64,
+            trap_out: *mut i64,
+        ) {
+            let code = *args as i32;
+            *trap_out = EXIT_CODE as i64 | ((code as i64) << 32);
+        }
+
+        let src = format!(
+            "memory 16\n\
+             func () -> () {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.const 8\n\
+             \x20 v3 = i32.const 0\n\
+             \x20 v4 = i64.const 10000000\n\
+             \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+             \x20 v6 = i32.const 0\n\
+             \x20 v7 = i32.const 0\n\
+             \x20 v8 = cap.call 1 0 (i32) -> (i64) v6 (v7)\n\
+             \x20 unreachable\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}"
+        );
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+        let start = Instant::now();
+        let out = compile_and_run_with_host(&m, 0, &[], exit_thunk, core::ptr::null_mut())
+            .expect("jit compile/run");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < PROMPT,
+            "domain teardown must be prompt, took {elapsed:?}"
+        );
+        match out {
+            JitOutcome::Exited(code) => assert_eq!(code, 0),
+            other => panic!("expected Exited(0), got {other:?}"),
+        }
+    }
+
+    /// Rule 1 (trap): a root trap (`unreachable`) tears down the parked daemon and surfaces the
+    /// root's trap promptly — same wake path as `exit`, with a `TrapKind` in the cell instead.
+    #[test]
+    fn root_trap_tears_down_parked_daemon() {
+        let src = format!(
+            "memory 16\n\
+             func () -> (i64) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.const 8\n\
+             \x20 v3 = i32.const 0\n\
+             \x20 v4 = i64.const 10000000\n\
+             \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+             \x20 unreachable\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}"
+        );
+        match run_promptly(&src) {
+            JitOutcome::Trapped(k) => assert_eq!(k, TrapKind::Unreachable),
+            other => panic!("expected Trapped(Unreachable), got {other:?}"),
+        }
+    }
+
+    /// Rule 2 for the **`thread.join` park**: a sibling blocked joining the forever-parked daemon
+    /// (handle 0, the first spawn) must also unwind when the root returns — the join park site has
+    /// its own teardown check and its own wake.
+    #[test]
+    fn root_return_tears_down_parked_joiner() {
+        let src = format!(
+            "memory 16\n\
+             func () -> (i64) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = thread.spawn 2 v0 v0\n\
+             \x20 v3 = i64.const 8\n\
+             \x20 v4 = i32.const 0\n\
+             \x20 v5 = i64.const 10000000\n\
+             \x20 v6 = i32.atomic.wait v3 v4 v5\n\
+             \x20 v7 = i64.const 42\n\
+             \x20 return v7\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}\
+             func (i64, i64) -> (i64) {{\n\
+             block 0 (vsp: i64, v0: i64) {{\n\
+             \x20 v1 = i32.const 0\n\
+             \x20 v2 = thread.join v1\n\
+             \x20 return v2\n\
+               }}\n\
+             }}\n"
+        );
+        match run_promptly(&src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
     }
 }
 
@@ -3518,6 +3725,18 @@ impl CompiledModule {
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
+            // Owner decision 2026-07-24 — domain teardown (DESIGN.md §12; ISSUES.md I37; D37
+            // death-is-revocation): the root vCPU has finished, which ends the domain — a trap or
+            // `exit` from any vCPU already sits in the shared cell, and a clean root return stores
+            // the internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
+            // Either way every parked sibling (futex wait / join) is woken to observe the non-zero
+            // cell and unwind through its trailing trap-propagation guard, so `join_all` below
+            // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
+            // teardown: the root unwound under `UNWINDING` and parked siblings return through the
+            // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
+            let freezing =
+                (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
+            d.begin_teardown(freezing);
             d.join_all();
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
@@ -3595,7 +3814,10 @@ impl CompiledModule {
         // synchronization point); Relaxed suffices.
         let cell = trap_cell.load(Ordering::Relaxed);
         let code = cell as u32;
-        let outcome = if code == 0 {
+        let outcome = if code == 0 || code == DOMAIN_DONE_CODE {
+            // `DOMAIN_DONE_CODE` is the internal root-completed teardown sentinel (owner decision
+            // 2026-07-24): the root returned cleanly and the sentinel only unwound leftover sibling
+            // vCPUs, whose outcomes are unobservable — the run outcome is the root's own results.
             JitOutcome::Returned(results)
         } else if code == EXIT_CODE {
             JitOutcome::Exited((cell >> 32) as i32)

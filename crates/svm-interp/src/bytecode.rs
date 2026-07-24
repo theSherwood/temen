@@ -6199,8 +6199,17 @@ fn drive(
         }
     }
     let mut clock: u64 = 0;
+    // §12 "Domain lifetime & teardown" (owner 2026-07-24): child envs already torn down by a
+    // member's trap/exit — a later live call through one completes with an errno instead of
+    // parking forever (D37 death-is-revocation; the tree-walker's dead-callee park probe).
+    let mut dead_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
     loop {
+        // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
+        // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
+        // before reading the root's state, so a sibling's trap that killed the root domain
+        // surfaces as the run's result (previously the root's timed wait simply outlived it).
+        teardown_domains(&mut tasks, &extra_envs, &mut dead_envs);
         // The root's result is the run's result (other vCPUs' effects are already reflected in it).
         if let TaskState::Done(res) = &tasks[0].state {
             let res = res.clone();
@@ -6344,6 +6353,16 @@ fn drive(
                 let k = extra_envs
                     .iter()
                     .position(|e| std::sync::Arc::ptr_eq(&e.host, &callee));
+                // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
+                // already-torn-down callee can never be replied — complete with the probeable
+                // errno instead of parking forever (the tree-walker's dead-callee park probe).
+                if k.is_some_and(|k| dead_envs.contains(&k)) {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i64(super::CAP_REVOKED));
+                    continue;
+                }
                 if let Some(k) = k {
                     for t in &mut tasks {
                         if t.env == Some(k) && matches!(t.state, TaskState::BlockedSvc) {
@@ -7740,6 +7759,77 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                 }
                 Err(trap) => work.push((j, Err(trap.clone()))),
             }
+        }
+    }
+}
+
+/// Domain lifetime & teardown, cooperative-bytecode form (DESIGN.md §12, owner 2026-07-24;
+/// ISSUES.md I37): a member's trap/exit is terminal for its whole **domain** — the shared-window
+/// world its `env` names (`None` = the root + its `thread.spawn` threads; `Some(k)` = a §14
+/// child + its threads). Fixpoint: find a domain with a `Done(Err)` member and a still-live
+/// member, kill every live member with the same trap (via [`complete`], so a cross-domain joiner
+/// re-raises and a `poll` reports status 2 — the I37 supervision mechanics), then errno-wake
+/// cross-domain callers parked through the dying child (D37 death-is-revocation: cancellation is
+/// a value, never a hang); repeat until no such domain remains (a kill that propagates into a
+/// joiner may fell *its* domain next). The root domain's death is read by the caller's loop-top
+/// root check — a sibling's trap becomes the run's result. Runs before anything is scheduled, so
+/// teardown is "next safepoint" prompt in the cooperative model.
+fn teardown_domains(
+    tasks: &mut [TaskSlot],
+    extra_envs: &[ChildEnv],
+    dead_envs: &mut std::collections::BTreeSet<usize>,
+) {
+    loop {
+        let hit = tasks.iter().find_map(|t| {
+            if let TaskState::Done(Err(trap)) = &t.state {
+                match t.env {
+                    // A child domain is processed exactly once (`dead_envs` is the marker), even
+                    // when the trapping member was its only vCPU — a later call through it must
+                    // still find it dead (errno, not a deadlock).
+                    Some(k) if !dead_envs.contains(&k) => {
+                        return Some((Some(k), trap.clone()));
+                    }
+                    // The root domain: a live member left means the sweep hasn't run yet (once
+                    // every member is Done the caller's root check ends the run).
+                    None if tasks
+                        .iter()
+                        .any(|u| u.env.is_none() && !matches!(u.state, TaskState::Done(_))) =>
+                    {
+                        return Some((None, trap.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        });
+        let Some((env, trap)) = hit else { return };
+        if let Some(k) = env {
+            dead_envs.insert(k);
+        }
+        for i in 0..tasks.len() {
+            if tasks[i].env == env && !matches!(tasks[i].state, TaskState::Done(_)) {
+                complete(tasks, i, Err(trap.clone()));
+            }
+        }
+        // The dying child's undelivered dispatches: wake every caller parked on a ticket
+        // against its host with the probeable errno (queued or admitted — no reply will ever
+        // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_envs`).
+        if let Some(k) = env {
+            let dying = &extra_envs[k].host;
+            for t in tasks.iter_mut() {
+                if let TaskState::BlockedTicket { callee, dst, .. } = &t.state {
+                    if std::sync::Arc::ptr_eq(callee, dying) {
+                        let dst = *dst;
+                        t.vt.active.set(dst, Reg::from_i64(super::CAP_REVOKED));
+                        t.state = TaskState::Runnable;
+                    }
+                }
+            }
+            dying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .svc_queue
+                .clear();
         }
     }
 }

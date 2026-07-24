@@ -1306,6 +1306,18 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
             *trap_out = TrapKind::OutOfFuel as i64;
             return 0;
         }
+        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
+        // trap/exit from any vCPU of the parent domain — or the root's completion (the internal
+        // DOMAIN_DONE sentinel) — ends the domain; a sibling vCPU parked here joining a nested
+        // child returns so its trailing trap-propagation guard (which checks this same cell)
+        // unwinds it. Observed on the same bounded re-check cadence as the kill-path above; the
+        // atomic load matches the cell's cross-thread contract (an `AtomicI64`'s storage).
+        if (*(trap_out as *const core::sync::atomic::AtomicI64))
+            .load(core::sync::atomic::Ordering::Relaxed)
+            != 0
+        {
+            return 0;
+        }
         st = done
             .cv
             .wait_timeout(st, std::time::Duration::from_millis(20))
