@@ -189,14 +189,16 @@ and resumes. Provided bytes join the run's deterministic input record (the `CapT
 
 ## W5 — In-browser frontend (C source → module, client-side)
 
-> **Status (2026-07-24): REMAINING.** The browser has in-wasm *text-IR* parse/verify/encode
-> (`svm_parse`) and the wasm-JIT tier, but **not** C-source→module. The blocker is not C-language
-> coverage — chibicc already compiles real libraries (Clay, jsmn, tinfl, tiny-regex, stb_perlin)
-> byte-identically to native `cc` (`FRONTEND.md`) — it is **hosting the compiler in wasm**:
-> build `frontend/chibicc` to wasm32 against a wasm libc (or run it as an SVM guest over the POSIX
-> personality), give it in-memory source-in / text-IR-out instead of `fopen`/`open_file`, embed the
-> bundled `include/*.h` in a virtual FS so `#include` resolves, always pass `-g`, then pipe its
-> text IR through the existing `svm_parse` encoder. See the requirement note below and `FRONTEND.md`.
+> **Status (2026-07-24): REMAINING — see `SELFHOST_C.md`.** The browser has in-wasm *text-IR*
+> parse/verify/encode (`svm_parse`) and the wasm-JIT tier, but **not** C-source→module. The blocker
+> is not C-language coverage — chibicc already compiles real libraries (Clay, jsmn, tinfl,
+> tiny-regex, stb_perlin) byte-identically to native `cc` (`FRONTEND.md`). The chosen approach is
+> **not** to port chibicc to wasm32 against a wasm libc; it is the broader **self-hosting** design:
+> compile chibicc *to an SVM IR module* via the LLVM on-ramp (kept for speed), run that `chibicc.svmb`
+> as an ordinary guest on the bytecode engine with source + `include/*.h` seeded into memfs, and close
+> the loop with an assemble step. In the browser that means shipping `chibicc.svmb` as a static asset
+> and reusing the cdylib's `svm_parse` for the encode. Full plan (libc coverage, the compile loop,
+> validation, build order) is in **`SELFHOST_C.md`**; the section below is the original W5 sketch.
 
 **Need.** Interactive embedders want the full edit-compile-run loop client-side: source text
 in, verified module out, no server round-trip, sub-second warm compiles.
