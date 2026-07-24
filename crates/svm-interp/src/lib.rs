@@ -1932,9 +1932,14 @@ fn drive_arc(
         s.next_task += 1;
         s.live += 1;
         s.workers = 1; // the calling thread acts as worker 0
-                       // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
-                       // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
-                       // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
+                       // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once.
+        s.freeze_on_quiesce = mem
+            .as_ref()
+            .map(|m| m.durable_freeze_on_quiesce())
+            .unwrap_or(false);
+        // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
+        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
+        // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -3778,6 +3783,15 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**: a durable run armed to freeze the
+    /// instant it would otherwise block on `svc.wait`-parked consumers only (a server idle in its
+    /// accept loop, which no safepoint countdown can reach — a parked vCPU runs no ops). When the
+    /// worker loop finds nothing runnable and no futex/svc timers, but consumers are parked in
+    /// `svc.wait`, it promotes each parked vCPU's window to `UNWINDING` and re-admits it: the
+    /// re-executed `svc.wait` observes the freeze and takes the 4b sentinel, so the domain unwinds
+    /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
+    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
+    freeze_on_quiesce: bool,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
     /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
     /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
@@ -4032,6 +4046,33 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 }
                 if s.shutdown {
                     break None;
+                }
+                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the only thing
+                // keeping the run alive is `svc.wait`-parked consumers (a server idle in its
+                // accept loop) and the run is armed to freeze on quiesce, trigger it now —
+                // promote each parked domain's window to `UNWINDING` and re-admit it. Its
+                // re-executed `svc.wait` takes the trailing-poll sentinel and unwinds, so the
+                // freeze completes with the serve trio captured instead of the run hanging. Gated
+                // on empty futex timers too: a futex-parked vCPU (or a *timed* svc.wait) will wake
+                // on its own, so it isn't a quiesced idle server. One-shot (cleared on fire).
+                if s.freeze_on_quiesce
+                    && !s.svc_waiters.is_empty()
+                    && s.timers.is_empty()
+                    && s.svc_timers.is_empty()
+                {
+                    s.freeze_on_quiesce = false;
+                    let keys: Vec<usize> = s.svc_waiters.keys().copied().collect();
+                    for k in keys {
+                        for mut v in s.svc_waiters.remove(&k).into_iter().flatten() {
+                            // Set the vCPU's own durable phase: the `dispatch` prologue swaps it
+                            // into the window before the vCPU runs (a direct window write would be
+                            // clobbered by that swap). At root context this routes to the global
+                            // freeze word, so the re-executed `svc.wait` observes `UNWINDING`.
+                            v.dstate = STATE_UNWINDING;
+                            s.runnable.push_back(v);
+                        }
+                    }
+                    continue;
                 }
                 let dl_futex = s.timers.peek().map(|Reverse((dl, _, _))| *dl);
                 let dl_svc = s.svc_timers.peek().map(|Reverse((dl, _, _))| *dl);
@@ -5050,6 +5091,11 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
 /// `svm_durable::ARM_BACKEDGE_OFF`.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
+/// non-zero arms the runtime to freeze the instant the run would otherwise block on
+/// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
+/// Must equal `svm_durable::ARM_QUIESCE_OFF`.
+pub const ARM_QUIESCE_OFF: u64 = 32;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -16516,6 +16562,14 @@ impl Mem {
             .and_then(|b| b.try_into().ok())
             .map(i32::from_le_bytes)
             .unwrap_or(STATE_NORMAL)
+    }
+
+    /// DURABILITY.md §13.4 slice 4c-bis — the `i8` **freeze-on-quiesce** arm flag at
+    /// [`ARM_QUIESCE_OFF`] (non-zero ⇒ armed). Read once at run setup.
+    fn durable_freeze_on_quiesce(&self) -> bool {
+        self.read_bytes_impl(ARM_QUIESCE_OFF, 1)
+            .map(|b| b[0] != 0)
+            .unwrap_or(false)
     }
 
     /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the

@@ -2146,6 +2146,22 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      `UNWINDING`, and capture/quiesce, *before* the worker loop can finish. That is a
      run/scheduler-lifecycle change (a "freeze unparks everything" step at trigger time),
      not an epilogue probe — the reason 4c-bis is its own slice rather than a rider here.
+     **BUILT 2026-07-24 (freeze-on-quiesce, single-domain):** a new arm — `arm_freeze_on_
+     quiesce` (window flag `ARM_QUIESCE_OFF`, read once at run setup into
+     `Sched::freeze_on_quiesce`) — leaves the run in `NORMAL` so the server runs and parks
+     normally; the worker loop, the instant it would block with **only** `svc.wait`-parked
+     consumers left (nothing runnable, no futex/svc timers), promotes each parked vCPU's
+     phase to `UNWINDING` (via `v.dstate`, which the `dispatch` prologue swaps into the
+     window — a direct write is clobbered by that swap) and re-admits it. The re-executed
+     `svc.wait` takes the 4b sentinel and unwinds, so the domain freezes with its (empty)
+     serve trio in the v13 section instead of the run hanging. One-shot. Pinned in
+     `svm-durable/tests/serve.rs` (`an_idle_server_freezes_on_quiesce_and_thaws_still_serving`):
+     freeze a root server idle in its accept loop → thaw with a dispatch seeded into the
+     restored queue → the re-issued `svc.wait` drains and serves it (handler reply + count),
+     the flagship end to end. **Remaining:** the *nested*-serving-child variant (a parked
+     child's carve, not the global word, needs the `UNWINDING`; its trio rides
+     `FrozenChildState` not the v13 section) and 4d `LiveImpl` capture — the multi-domain
+     accept-loop fixture.
    * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
      its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
      record (a `DomainId` is process-local, so the artifact never carries it; the id is

@@ -119,6 +119,13 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
 /// reserve's `[24, 64)` gap.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
+/// non-zero arms the runtime to freeze the instant the run would otherwise block on
+/// `svc.wait`-parked consumers only — a server idle in its accept loop, which no safepoint or
+/// back-edge countdown can reach (a parked vCPU runs no ops). Distinct from the two countdown
+/// slots (which trigger mid-execution); this triggers at quiescence. Lives in the reserve's
+/// `[32, 64)` gap, so an unarmed run stays byte-identical. Must equal `svm-interp`'s copy.
+pub const ARM_QUIESCE_OFF: u64 = 32;
 /// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
 /// (`REWINDING`/`NORMAL`) **within a context's region** — just past the 8-byte in-region shadow-SP word
 /// at the region base, addressed via the `durable.shadow_base` register (like the SP word). Each frozen
@@ -1233,6 +1240,18 @@ pub fn arm_freeze_after(window: &mut [u8], safepoints: i64) {
     window[ARM_COUNTDOWN_OFF as usize..ARM_COUNTDOWN_OFF as usize + 8]
         .copy_from_slice(&n.to_le_bytes());
     write_state(window, STATE_ARMED);
+}
+
+/// Arm a window to **freeze on quiesce** (DURABILITY.md §13.4 slice 4c-bis): the deterministic
+/// trigger for a server idle in its accept loop. The run proceeds normally; the instant it would
+/// otherwise block with only `svc.wait`-parked consumers left (no runnable work, no futex/svc
+/// timers pending), the runtime promotes each parked domain's window to `UNWINDING` and re-admits
+/// it — the re-executed `svc.wait` takes the trailing-poll sentinel, so the domain unwinds and the
+/// freeze completes instead of the run hanging. Sets the quiesce flag ([`ARM_QUIESCE_OFF`]); the
+/// two countdown slots stay 0 so the triggers never interfere. Unlike the countdown arms, the
+/// state word stays `NORMAL` — the trigger is quiescence, detected scheduler-side, not a poll.
+pub fn arm_freeze_on_quiesce(window: &mut [u8]) {
+    window[ARM_QUIESCE_OFF as usize] = 1;
 }
 
 /// Arm a window to **freeze after `backedges` further loop back-edges** (the deterministic Phase-4
