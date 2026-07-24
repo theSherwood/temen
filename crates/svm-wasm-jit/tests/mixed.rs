@@ -150,10 +150,7 @@ fn mixed(m: &svm_ir::Module, arg: i64) -> Result<i64, ()> {
 /// Whether the full-interpreter oracle traps running the whole module's func 0 with `arg`.
 fn oracle_traps(m: &svm_ir::Module, arg: i64) -> bool {
     let mut fuel = u64::MAX;
-    matches!(
-        svm_interp::run(m, 0, &[Value::I64(arg)], &mut fuel),
-        Err(_)
-    )
+    svm_interp::run(m, 0, &[Value::I64(arg)], &mut fuel).is_err()
 }
 
 /// `env` cell must be at least `ENV_CELL_BYTES`; we put it at ENV_PTR with 2 pages of memory, so
