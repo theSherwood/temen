@@ -107,7 +107,12 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// The thaw seeds the re-created child's fresh host from it verbatim (slots/generations
 /// preserved), so a serving or cap-holding child survives the subtree cut. One extra `uleb` (0)
 /// per plain nested record otherwise, so a v13 nested record mis-parses.
-const FORMAT_VERSION: u16 = 14;
+/// v15 (§13.4 slice 4d: durable live-impl caps): the handle-table binding codec gains a
+/// `LiveImpl { slot, export }` tag (`B_LIVE_IMPL`) — a `child_offer` cap over a §14 child, named
+/// structurally by the callee's join slot (a `DomainId`/`Arc` never rides the artifact). A v14
+/// artifact holding no live-impl cap is byte-identical (only the version differs); one that does
+/// couldn't have been produced by v14 (freeze refused it), so there's no v14 mis-parse to guard.
+const FORMAT_VERSION: u16 = 15;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -133,6 +138,7 @@ const B_MEMORY: u8 = 3;
 const B_YIELDER: u8 = 4;
 const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
+const B_LIVE_IMPL: u8 = 7;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -892,6 +898,11 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
+        DurableBinding::LiveImpl { slot, export } => {
+            b.push(B_LIVE_IMPL);
+            write_uleb(b, slot as u64);
+            write_uleb(b, export as u64);
+        }
     }
 }
 
@@ -914,6 +925,10 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_INSTANTIATOR => DurableBinding::Instantiator {
             base: r.uleb()?,
             size: r.uleb()?,
+        },
+        B_LIVE_IMPL => DurableBinding::LiveImpl {
+            slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         _ => return Err(RestoreError::Malformed),
     })

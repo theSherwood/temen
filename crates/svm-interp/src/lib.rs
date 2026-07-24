@@ -1888,9 +1888,16 @@ fn drive_arc(
             // root re-enters under `REWINDING` in its own per-context thaw word — no longer the global
             // word). The root's context is 0; `durable_load_dstate(0)` combines both words:
             // non-`NORMAL` ⇒ freeze/thaw in progress.
-            .map(|m| m.durable_load_dstate(0))
-            .unwrap_or(STATE_NORMAL)
-            != STATE_NORMAL
+            // §13.4 slice 4c-bis: a **freeze-on-quiesce** run starts `NORMAL` (it runs normally,
+            // then freezes the instant it would block on `svc.wait` parks) — so the state word
+            // doesn't catch it, but it must serialize too: the quiesce trigger is a whole-run
+            // stop-the-world that has to observe *every* domain parked atomically. Multi-worker,
+            // it can fire when only a subset is parked (the rest still executing on another
+            // worker), drain the subset, consume its one-shot arm, and strand the rest in
+            // `svc.wait` forever. So a subtree that spawns a child (2+ live vCPUs) hangs
+            // intermittently — the flaky CI hang this closes.
+            .map(|m| m.durable_load_dstate(0) != STATE_NORMAL || m.durable_freeze_on_quiesce())
+            .unwrap_or(false)
     {
         1
     } else {
@@ -1932,9 +1939,14 @@ fn drive_arc(
         s.next_task += 1;
         s.live += 1;
         s.workers = 1; // the calling thread acts as worker 0
-                       // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
-                       // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
-                       // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
+                       // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once.
+        s.freeze_on_quiesce = mem
+            .as_ref()
+            .map(|m| m.durable_freeze_on_quiesce())
+            .unwrap_or(false);
+        // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
+        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
+        // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -2097,6 +2109,10 @@ fn drive_arc(
             // absolute base + its own recorded offset — accumulated down the chain here.
             let mut abs_off: std::collections::BTreeMap<TaskId, u64> =
                 std::collections::BTreeMap::new();
+            // §13.4 slice 4d: the re-created **direct** children's host Arcs, by join slot, so a
+            // holder's restored `LiveImpl` can be re-linked to its callee after the rebuild.
+            let mut direct_child_hosts: std::collections::BTreeMap<usize, Arc<Mutex<Host>>> =
+                std::collections::BTreeMap::new();
             for fnr in nseed {
                 let parent = fnr.parent_task as TaskId;
                 // The parent-child's absolute carve base (0 for a direct child of the root).
@@ -2240,12 +2256,18 @@ fn drive_arc(
                     children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
                 };
                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
+                // can be re-linked to it once the whole subtree is rebuilt (below).
+                let child_host = Arc::new(Mutex::new(ch));
+                if parent == id {
+                    direct_child_hosts.insert(fnr.slot, Arc::clone(&child_host));
+                }
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&cfuncs),
                     fnr.entry,
                     &child_args,
                     child_mem,
-                    Arc::new(Mutex::new(ch)),
+                    child_host,
                     *fuel,
                     cdepth,
                     cid,
@@ -2286,6 +2308,22 @@ fn drive_arc(
                 }
                 abs_off.insert(cid, abs_carve);
                 children.insert(cid, child);
+            }
+            // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-created
+            // direct children now that the subtree exists — the holder's rewound call then
+            // dispatches to the live callee exactly as before the freeze. (A nested holder's
+            // pending re-links — a child holding a cap onto a grandchild — are a follow-up.)
+            let pending = host_shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_pending_live_impls();
+            for (idx, cslot, export) in pending {
+                if let Some(chost) = direct_child_hosts.get(&cslot) {
+                    host_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .relink_live_impl(idx, Arc::clone(chost), export);
+                }
             }
             // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
             for (_, child) in children {
@@ -3778,6 +3816,15 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**: a durable run armed to freeze the
+    /// instant it would otherwise block on `svc.wait`-parked consumers only (a server idle in its
+    /// accept loop, which no safepoint countdown can reach — a parked vCPU runs no ops). When the
+    /// worker loop finds nothing runnable and no futex/svc timers, but consumers are parked in
+    /// `svc.wait`, it promotes each parked vCPU's window to `UNWINDING` and re-admits it: the
+    /// re-executed `svc.wait` observes the freeze and takes the 4b sentinel, so the domain unwinds
+    /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
+    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
+    freeze_on_quiesce: bool,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
     /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
     /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
@@ -4032,6 +4079,33 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 }
                 if s.shutdown {
                     break None;
+                }
+                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the only thing
+                // keeping the run alive is `svc.wait`-parked consumers (a server idle in its
+                // accept loop) and the run is armed to freeze on quiesce, trigger it now —
+                // promote each parked domain's window to `UNWINDING` and re-admit it. Its
+                // re-executed `svc.wait` takes the trailing-poll sentinel and unwinds, so the
+                // freeze completes with the serve trio captured instead of the run hanging. Gated
+                // on empty futex timers too: a futex-parked vCPU (or a *timed* svc.wait) will wake
+                // on its own, so it isn't a quiesced idle server. One-shot (cleared on fire).
+                if s.freeze_on_quiesce
+                    && !s.svc_waiters.is_empty()
+                    && s.timers.is_empty()
+                    && s.svc_timers.is_empty()
+                {
+                    s.freeze_on_quiesce = false;
+                    let keys: Vec<usize> = s.svc_waiters.keys().copied().collect();
+                    for k in keys {
+                        for mut v in s.svc_waiters.remove(&k).into_iter().flatten() {
+                            // Set the vCPU's own durable phase: the `dispatch` prologue swaps it
+                            // into the window before the vCPU runs (a direct window write would be
+                            // clobbered by that swap). At root context this routes to the global
+                            // freeze word, so the re-executed `svc.wait` observes `UNWINDING`.
+                            v.dstate = STATE_UNWINDING;
+                            s.runnable.push_back(v);
+                        }
+                    }
+                    continue;
                 }
                 let dl_futex = s.timers.peek().map(|Reverse((dl, _, _))| *dl);
                 let dl_svc = s.svc_timers.peek().map(|Reverse((dl, _, _))| *dl);
@@ -5050,6 +5124,11 @@ pub const ARM_COUNTDOWN_OFF: u64 = 16;
 /// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
 /// `svm_durable::ARM_BACKEDGE_OFF`.
 pub const ARM_BACKEDGE_OFF: u64 = 24;
+/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
+/// non-zero arms the runtime to freeze the instant the run would otherwise block on
+/// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
+/// Must equal `svm_durable::ARM_QUIESCE_OFF`.
+pub const ARM_QUIESCE_OFF: u64 = 32;
 /// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
 /// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
 /// on each fiber switch. Must equal `svm_durable::SHADOW_SP_OFF`.
@@ -7746,17 +7825,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let export =
                                 get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
                                     as u32;
-                            let cap = resolve_thread(threads, ch)
-                                .ok()
-                                .and_then(|slot| child_hosts.get(&slot).cloned())
-                                .and_then(|callee| {
-                                    let sigs = callee
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .offer_shape(export)?;
-                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.wire_live_impl(&callee, export, &sigs).ok()
-                                });
+                            let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
+                                let callee = child_hosts.get(&slot).cloned()?;
+                                let sigs = callee
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .offer_shape(export)?;
+                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                // §13.4 4d: record the child's join `slot` — the live impl's
+                                // durable structural name, re-linked to the re-created child on thaw.
+                                Some(hg.wire_live_impl_child(&callee, export, &sigs, slot))
+                            });
                             frames[top]
                                 .vals
                                 .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
@@ -11256,8 +11335,22 @@ pub enum DurableBinding {
     Clock,
     Memory,
     Yielder,
-    AddressSpace { base: u64, size: u64 },
-    Instantiator { base: u64, size: u64 },
+    AddressSpace {
+        base: u64,
+        size: u64,
+    },
+    Instantiator {
+        base: u64,
+        size: u64,
+    },
+    /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
+    /// **structurally** by the callee's join `slot` in the holder's own table + the offer
+    /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
+    /// re-links it to the re-created child at `slot` (its host + re-fetched offer shape).
+    LiveImpl {
+        slot: u32,
+        export: u32,
+    },
 }
 
 /// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
@@ -11689,6 +11782,12 @@ struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
     sigs: Arc<[FuncType]>,
+    /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
+    /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
+    /// `child_offer` (op 14) mint over a §14 child — the only durably-capturable live impl,
+    /// since a thaw re-links it to the re-created child at this slot. `None` for a wire /
+    /// child-regrant mint (no §14 child behind it), which stays non-durable (freeze refuses).
+    callee_slot: Option<usize>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -11885,6 +11984,12 @@ pub struct Host {
     serve_native_ctx: usize,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
+    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
+    /// child: `(live_impls index, callee join slot, offer export)`. Populated by
+    /// [`Host::restore_durable_handles`] (the callee host doesn't exist yet at restore); drained
+    /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
+    /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
+    pending_live_impls: Vec<(u32, usize, u32)>,
     /// PROCESS.md §5 — the side table a [`Binding::WindowMinter`] indexes: each entry the
     /// minter's **remaining byte quota**, deducted at every detached mint (numeric,
     /// host-enforced; no refund on child completion — the quota bounds lifetime total, v1).
@@ -12177,6 +12282,7 @@ impl Host {
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
             live_impls: Vec::new(),
+            pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
             pool: None,
             rings: Vec::new(),
@@ -12803,8 +12909,21 @@ impl Host {
                 Binding::GuestImpl(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
                 }
-                Binding::LiveImpl(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::LiveImpl))
+                Binding::LiveImpl(idx) => {
+                    // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
+                    // slot) is durably capturable — named structurally so the thaw re-links it.
+                    // A wire / child-regrant mint (no §14 child behind it) stays non-durable.
+                    match self
+                        .live_impls
+                        .get(idx as usize)
+                        .and_then(|e| e.callee_slot)
+                    {
+                        Some(cslot) => DurableBinding::LiveImpl {
+                            slot: cslot as u32,
+                            export: self.live_impls[idx as usize].export,
+                        },
+                        None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
+                    }
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
@@ -12901,8 +13020,45 @@ impl Host {
                 DurableBinding::Yielder => Binding::Yielder,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+                DurableBinding::LiveImpl { slot, export } => {
+                    // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
+                    // patched once the §14 child at `slot` is re-created — see
+                    // [`Host::take_pending_live_impls`]) and record the pending re-link. The
+                    // placeholder is never dispatched to: the thaw patches it before the holder
+                    // re-enters guest code.
+                    let idx = self.live_impls.len() as u32;
+                    self.live_impls.push(LiveImplEntry {
+                        callee: Arc::new(Mutex::new(Host::new())),
+                        export,
+                        sigs: Vec::<FuncType>::new().into(),
+                        callee_slot: Some(slot as usize),
+                    });
+                    self.pending_live_impls.push((idx, slot as usize, export));
+                    Binding::LiveImpl(idx)
+                }
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
+        }
+    }
+
+    /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
+    /// export)`), for the thaw to patch once the §14 children exist. Cleared on take.
+    pub fn take_pending_live_impls(&mut self) -> Vec<(u32, usize, u32)> {
+        std::mem::take(&mut self.pending_live_impls)
+    }
+
+    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-created §14
+    /// child `callee`, re-fetching the offer's shape from the child's registered module (the
+    /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
+    /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
+    pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
+        let sigs = callee
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .offer_shape(export);
+        if let (Some(e), Some(sigs)) = (self.live_impls.get_mut(idx as usize), sigs) {
+            e.callee = callee;
+            e.sigs = sigs.into();
         }
     }
 
@@ -13285,7 +13441,21 @@ impl Host {
         export: u32,
         sigs: &[FuncType],
     ) -> Result<i32, Trap> {
-        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into()))
+        // No §14 child slot behind an embedder wire — non-durable (freeze refuses).
+        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
+    }
+
+    /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
+    /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
+    /// re-links it to the re-created child at this slot).
+    fn wire_live_impl_child(
+        &mut self,
+        callee: &Arc<Mutex<Host>>,
+        export: u32,
+        sigs: &[FuncType],
+        callee_slot: usize,
+    ) -> i32 {
+        self.install_live_impl(Arc::clone(callee), export, sigs.into(), Some(callee_slot))
     }
 
     /// Install a live-callee offer entry + grant its handle — shared by the wire
@@ -13296,6 +13466,7 @@ impl Host {
         callee: Arc<Mutex<Host>>,
         export: u32,
         sigs: Arc<[FuncType]>,
+        callee_slot: Option<usize>,
     ) -> i32 {
         let type_id = self.intern_interface(&sigs);
         let idx = self.live_impls.len() as u32;
@@ -13303,6 +13474,7 @@ impl Host {
             callee,
             export,
             sigs,
+            callee_slot,
         });
         self.grant(type_id, Binding::LiveImpl(idx))
     }
@@ -14207,7 +14379,10 @@ impl Host {
         // intern never touches the callee's lock.
         if let Some(e) = self.resolve_live_impl(handle) {
             let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
-            return Some(child.install_live_impl(callee, export, sigs));
+            // The callee's join slot is the *parent's* structural name, meaningless in the
+            // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
+            // a re-grant's durable name would be the sibling's provenance path).
+            return Some(child.install_live_impl(callee, export, sigs, None));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling
@@ -16516,6 +16691,14 @@ impl Mem {
             .and_then(|b| b.try_into().ok())
             .map(i32::from_le_bytes)
             .unwrap_or(STATE_NORMAL)
+    }
+
+    /// DURABILITY.md §13.4 slice 4c-bis — the `i8` **freeze-on-quiesce** arm flag at
+    /// [`ARM_QUIESCE_OFF`] (non-zero ⇒ armed). Read once at run setup.
+    fn durable_freeze_on_quiesce(&self) -> bool {
+        self.read_bytes_impl(ARM_QUIESCE_OFF, 1)
+            .map(|b| b[0] != 0)
+            .unwrap_or(false)
     }
 
     /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
