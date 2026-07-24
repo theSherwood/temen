@@ -409,7 +409,7 @@ threading for import-bearing cache sharing.
 
 **Phase 3 — frontends.** `svm-wasm` de-threading (~73 handle-threading
 sites — the largest single item); `svm-llvm`; chibicc; `svm-posix` off
-`CapBound`. `svm-wasmjit`: extend `outline_cap_calls` (lib.rs:1138-1181) to
+`CapBound`. `svm-wasm-jit`: extend `outline_cap_calls` (lib.rs:1138-1181) to
 also outline `CallImport` — its tierability classifier already lists it as a
 host-boundary op (lib.rs:947-949) — and relax the `emit_module` import-free
 assertion (lib.rs:1352-1353) to "no `CallImport` call-site survives in an
@@ -421,7 +421,7 @@ rule (§2.1).
 
 *Phase-3 status:*
 
-- *`svm-wasmjit` — **landed.** `outline_cap_calls` outlines `CallImport`
+- *`svm-wasm-jit` — **landed.** `outline_cap_calls` outlines `CallImport`
   into the same cross-tier wrapper as `cap.call` (import index baked as an
   immediate); `emit_module` permits the manifest and rejects only an import
   op surviving in an emitted function (`tests/outline_callimport.rs`).*
@@ -1670,9 +1670,9 @@ dynamic mode, reflection) cover discovery of *granted* capabilities only.
    slot; DURABILITY.md §12.5 pins "reinstate the same `(slot, generation)`"
    as a hard invariant; the snapshot roundtrip test proves guest-held packed
    handle values survive restore.
-2. ~~Does anything in `svm-wasmjit`/browser assume import-free modules
+2. ~~Does anything in `svm-wasm-jit`/browser assume import-free modules
    post-load?~~ — **RESOLVED (audit, §7): yes, one site** — `emit_module`
-   hard-rejects non-empty imports (svm-wasmjit lib.rs:1352-1353). Fix scoped
+   hard-rejects non-empty imports (svm-wasm-jit lib.rs:1352-1353). Fix scoped
    in phase 3; the browser adds no independent assumption (its `env.*` wasm
    imports are unrelated to SVM capability imports, and capability dispatch
    bounces to the interpreter tier).
