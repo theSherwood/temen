@@ -81,7 +81,18 @@ another real C program whose output happens to be SVM IR.
 Emit with `-g` so a compile running under the W1 debugger has source info. **Risk: low** (on-ramp
 handles Postgres/QuickJS).
 
-### B. libc coverage on the POSIX personality + memfs
+### B. libc coverage — **reuse the proven Postgres guest-libc shims** (see Appendix B)
+
+Step-2 investigation found this is *not* a write-from-scratch job: `crates/svm-run/demos/postgres/`
+already contains a byte-exact-vs-glibc guest libc — `printf_shim.c` (floats delegate to the
+on-ramp's correctly-rounded bignum dtoa `__vm_fmt_{fix,sci,gen}`, so `%.17g` "just works" — F2
+dissolves), `stdio_shim.c` (`FILE*`), `os_shim.c` (the file syscalls over `__vm_cap_resolve("fs")`
++ `__vm_host_call`, with stdout/stderr fd-dispatched to the powerbox Stream), `mem_shim.c`,
+`libc_shim.c`, `strerror_shim.c`, `time_shim.c`, `proc_shim.c`, `shim_errno.h`. These already run
+**Postgres byte-identical to native**, so the compiler's libc is *assembly of proven parts* plus a
+short chibicc-specific remainder. Full mapping + the missing list: **Appendix B**.
+
+The original per-op split still holds for the substrate reasoning below:
 chibicc's measured runtime footprint (from its own source): stdio **with files and buffered
 `FILE*` streams** (`fopen`/`fread`/`fwrite`/`fclose`/`fflush`/`fputc`, `stdin`/`stdout`/`stderr`,
 `fprintf`/`vfprintf`/`snprintf`/`vsnprintf`), `malloc`/`calloc`/`realloc`/`free`, `exit`, `strtoul`;
@@ -308,3 +319,55 @@ defining TU is missing — `align_to` (owned by the excluded `codegen.c`, called
 layout) translated and verified fine as a trap-stub time bomb. `cc1_main.c` now defines it, and
 the script's **step 2a stub audit fails on any undefined symbol outside the allowlist above**, so
 an excluded-TU gap can never reach the artifact again.
+
+---
+
+## Appendix B — step-3 plan: assemble the guest libc from the Postgres shims (2026-07-24)
+
+Step-2's stub list (A.5) maps onto the existing `demos/postgres/` guest-libc shims as follows —
+**26 of 41 symbols are already provided by proven, byte-identical-to-native code**:
+
+| Provided by (Postgres shim, reusable) | chibicc symbols it covers |
+|---|---|
+| `printf_shim.c` | `fprintf` `vfprintf` `snprintf` `vsnprintf` (+ the `%.17g` path via `__vm_fmt_gen` — **F2 solved**) |
+| `stdio_shim.c` | `fopen` `fclose` `fread` `fwrite` `fflush` `fputc` (+ `stdin`/`stdout`/`stderr`) |
+| `os_shim.c` | `stat` and the file syscall bottom-edge (`open`/`read`/`write`/`lseek`/`close`) over the `fs` cap |
+| `mem_shim.c` | `strcmp` `strncmp` `strlen` |
+| `libc_shim.c` | `strdup` `strncpy` `strstr` `strtoul` `__ctype_b_loc` |
+| `strerror_shim.c` | `strerror` |
+| `time_shim.c` / `proc_shim.c` | `localtime` `time` / `__assert_fail` |
+
+**The chibicc-specific remainder (~15) — a small `chibicc_extra.c`:**
+- *Trivial* (a few lines each): `bcmp`, `memchr`, `strchr`, `strndup`, `strncasecmp`, `puts`,
+  `calloc` (`malloc`+`memset`), `free`, `__errno_location` (or reuse `shim_errno.h`), `exit`.
+- *Small but real:*
+  - `realloc` — the one allocator decision (§8): personality `OP_REALLOC` **or** a guest
+    size-header shim over the on-ramp's bump `malloc`.
+  - `open_memstream` — **required**: `strings.c`'s ubiquitous `format()` builds strings through a
+    memory `FILE*`. A growable-buffer `FILE` mode over `stdio_shim`'s struct.
+  - `strtold` — with `-mlong-double-64` (F3) this is `strtod`; provide/alias it.
+  - `dirname` — pure string (relative `#include` base); a dozen lines.
+  - `ctime_r` — `__TIMESTAMP__` only; fixed-epoch stub (F4).
+
+**Build shape.** A single `-DSVM_GUEST` driver TU (the Postgres pattern) that `#include`s the
+reusable shims + `chibicc_extra.c`, linked with the cc1 bitcode; drop `--stub-externs` and let the
+step-2a audit assert **zero** undefined symbols remain (every name defined, or a recognized on-ramp
+import — `__vm_host_call`/`__vm_cap_resolve`/`malloc`). Bottom edge is the **`fs` cap** (not raw
+`svm-posix` name-binding): the on-ramp recognizes `__vm_host_call`, and the `fs` cap already backs a
+memfs (`crates/svm-run/src/fs.rs`), so source + `include/*.h` seed straight in (§5 C).
+
+**Open decision — where the shared guest libc lives.** These shims are now wanted by a *second*
+consumer (chibicc), which is exactly the project's stated trigger to dedup (§8). Three options:
+(a) **factor** the reusable shims into a shared `demos/_guestlibc/` (or `crates/svm-run/guestlibc/`)
+and point both Postgres and chibicc at it — cleanest, but edits Postgres's proven build and must be
+re-validated; (b) chibicc's driver **`#include`s** `../postgres/*_shim.c` in place — zero
+Postgres-build risk, fast, but couples the demos; (c) **copy** the shims — no coupling, ~1.5k
+duplicated lines that will drift. Recommendation: **(b) for the first chibicc bring-up** (reversible,
+proves the reuse), then **(a)** once both guests are green (factor with two proven consumers, not
+one). Owner call before implementing.
+
+**Validation (the real gate, next slice).** A run harness instantiates `chibicc.svmb` on the `fs`
+cap with memfs seeded (source `.c` + `/include`), runs `main`, captures the emitted IR, and asserts
+it **byte-matches native `chibicc --emit-ir`** — starting with an integer-only program (never
+touches `%.17g`), then floats, then the demo corpus (§7 step 5). This is where libc bugs surface;
+budget iteration.
