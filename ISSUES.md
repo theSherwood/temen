@@ -21,6 +21,27 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I44 — freeze-on-quiesce could fire multi-worker and strand a subset in `svc.wait` (S2, intermittent CI hang) — **FIX LANDED 2026-07-24** (§13.4 4c-bis branch)
+
+**Symptom.** PR #437's `build · test · fmt · clippy` + `build · test (macos)` jobs both hit their
+`timeout-minutes` ceilings (cancelled, not failed): `a_nested_two_server_subtree_freezes_on_quiesce
+_and_thaws_still_serving` hung indefinitely. Reproduced locally ~2/12 only when the whole `serve.rs`
+binary ran (all tests in parallel threads, under load) — never in isolation, which is why the
+per-crate gate missed it.
+
+**Root cause.** The durable "serialize onto one worker" clamp is gated on `durable_load_dstate(0)
+!= NORMAL`. A **freeze-on-quiesce** run starts `NORMAL` (it runs normally, then freezes the instant
+it would block on `svc.wait` parks), so the clamp didn't catch it. A subtree that spawns a child
+(2+ live vCPUs) then spawns a *second* worker thread (`maybe_spawn_worker`), and the freeze-on-
+quiesce trigger — a whole-run stop-the-world that must observe *every* domain parked atomically —
+could fire on one worker while a domain was still executing on the other: it drained the parked
+subset, consumed its one-shot arm, and left the rest parked in `svc.wait` forever.
+
+**Fix.** Extend the clamp: a freeze-on-quiesce-armed run (`durable_freeze_on_quiesce()`) also
+serializes onto one worker, so the quiesce check sees the true global parked state. Hammered 20/20
+clean on the full binary. (Lesson for the harness: per-crate `cargo test -p X` runs one binary's
+tests in parallel but doesn't reproduce cross-binary load; the flake needed the full-binary hammer.)
+
 ### I36 — a serving module runs its ENTIRE program on the tree-walk oracle: `module_serves` folds the fast backends away (S3, **promoted 2026-07-23 — owner: the cliff is not acceptable**)
 
 **Where:** the §3.6 parity decision (IMPORTS.md): the serve loop (`svc.wait`/`svc.poll` + handler

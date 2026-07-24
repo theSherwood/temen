@@ -1888,9 +1888,16 @@ fn drive_arc(
             // root re-enters under `REWINDING` in its own per-context thaw word — no longer the global
             // word). The root's context is 0; `durable_load_dstate(0)` combines both words:
             // non-`NORMAL` ⇒ freeze/thaw in progress.
-            .map(|m| m.durable_load_dstate(0))
-            .unwrap_or(STATE_NORMAL)
-            != STATE_NORMAL
+            // §13.4 slice 4c-bis: a **freeze-on-quiesce** run starts `NORMAL` (it runs normally,
+            // then freezes the instant it would block on `svc.wait` parks) — so the state word
+            // doesn't catch it, but it must serialize too: the quiesce trigger is a whole-run
+            // stop-the-world that has to observe *every* domain parked atomically. Multi-worker,
+            // it can fire when only a subset is parked (the rest still executing on another
+            // worker), drain the subset, consume its one-shot arm, and strand the rest in
+            // `svc.wait` forever. So a subtree that spawns a child (2+ live vCPUs) hangs
+            // intermittently — the flaky CI hang this closes.
+            .map(|m| m.durable_load_dstate(0) != STATE_NORMAL || m.durable_freeze_on_quiesce())
+            .unwrap_or(false)
     {
         1
     } else {
