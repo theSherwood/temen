@@ -22,6 +22,18 @@
 //! it on a bounded interval (`KILL_RECHECK`, real-build only) so it wakes and unwinds too — so a
 //! single host interrupt stops the entire multithreaded domain, not just its busy threads, and
 //! `join_all` never hangs on a vCPU that would otherwise wait forever.
+//!
+//! **Domain teardown** (owner decision 2026-07-24; DESIGN.md §12, ISSUES.md I37, D37
+//! death-is-revocation): a trap or `exit` from **any** vCPU — and the **root vCPU's completion**,
+//! clean return included — ends the whole domain: sibling vCPUs, RUNNING or PARKED, unwind and
+//! their outcomes are unobservable ("root completion ends the activation; the owner's departure
+//! ends the domain"). The mechanism is the shared trap cell + the emitted trap-propagation guard: a
+//! trap/exit is already in the cell, and a clean root return stores the internal
+//! [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site (futex `wait`,
+//! `thread.join`) returns on observing a non-zero cell — woken promptly by
+//! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
+//! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
+//! return through the freeze re-issue machinery instead (the sentinel is skipped).
 
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
@@ -409,11 +421,14 @@ impl Domain {
         lock(&self.threads).live += 1;
     }
 
-    /// The §14 child finished — drop it from the live count (see [`Self::child_started`]). A parked
-    /// infinite waiter re-evaluates `peers_live` within `KILL_RECHECK`, exactly as it does when a
-    /// spawned vCPU exits (`run_child`'s decrement).
+    /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
+    /// the futex waiters so a parked infinite waiter re-evaluates `peers_live` promptly (not only
+    /// on the `KILL_RECHECK` cadence, which an unarmed run doesn't have), exactly as when a spawned
+    /// vCPU exits (`run_child`'s decrement + wake).
     pub(crate) fn child_finished(&self) {
         lock(&self.threads).live -= 1;
+        let _g = lock(&self.futex);
+        self.futex_cv.notify_all();
     }
 
     fn env(&self) -> Env {
@@ -513,6 +528,62 @@ impl Domain {
     /// their own `freeze_drive`. `run_inner` merges this into the run's `frozen_out`.
     pub(crate) fn take_frozen_fibers(&self) -> Vec<crate::FrozenFiber> {
         std::mem::take(&mut lock(&self.frozen_fibers))
+    }
+
+    /// **Domain teardown** (owner decision 2026-07-24; DESIGN.md §12, D37 death-is-revocation).
+    /// Called by `run_inner` when the **root vCPU** has finished — clean return, trap, exit, or
+    /// fault — right before [`Self::join_all`]. If no trap/exit is already stored, store the
+    /// internal [`crate::DOMAIN_DONE_CODE`] sentinel ("root completion ends the activation"), so
+    /// every surviving sibling's trap-propagation guard treats the domain as over; then wake every
+    /// parked vCPU so it observes the non-zero cell and unwinds instead of waiting forever.
+    ///
+    /// `freezing` (a durable **freeze**: the root unwound under `UNWINDING`) is *not* teardown —
+    /// the sentinel is skipped so parked siblings park-and-unwind through the freeze re-issue
+    /// machinery and the deferred/concurrent children record their residue; the wake is still
+    /// issued (a parked waiter returns on observing `UNWINDING`, as before, just promptly).
+    pub(crate) fn begin_teardown(&self, freezing: bool) {
+        if !freezing {
+            let env = self.env();
+            // CAS 0 → sentinel: never clobber a real trap / exit a dying vCPU already stored.
+            // SAFETY: `trap_out` is the run's live trap cell (an `AtomicI64`'s storage; see
+            // [`store_trap`]), valid until run teardown.
+            unsafe {
+                let _ = (*(env.trap_out as *const AtomicI64)).compare_exchange(
+                    0,
+                    crate::DOMAIN_DONE_CODE as i64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        self.wake_all_parked();
+    }
+
+    /// Wake every parked vCPU in this domain so it re-evaluates its park predicate: the futex
+    /// waiters (`atomic.wait`) and every joiner (`thread.join` parks on a per-child [`Done`] cell).
+    /// Each notify is serialized with the corresponding waiter lock (the futex map / `Done.state`),
+    /// so a waiter's check-then-park can never miss it — the same no-lost-wake discipline as
+    /// [`futex_notify`]. Called at domain teardown ([`Self::begin_teardown`]) and whenever a vCPU
+    /// finishes ([`run_child`]): a completion changes `live` (the deadlock predicate) and a
+    /// trap/exit begins teardown (owner decision 2026-07-24), and either way the parked must
+    /// re-check, not sleep until `KILL_RECHECK` (or forever, when no kill-path is armed).
+    pub(crate) fn wake_all_parked(&self) {
+        {
+            let _g = lock(&self.futex);
+            self.futex_cv.notify_all();
+        }
+        // Snapshot the completion cells out of their table locks, then notify each under its own
+        // state lock (never hold a table lock while taking a cell lock).
+        let mut cells: Vec<std::sync::Arc<Done>> = lock(&self.threads).cells.to_vec();
+        cells.extend(
+            lock(&self.dchildren)
+                .values()
+                .flat_map(|t| t.cells.iter().cloned()),
+        );
+        for c in cells {
+            let _g = lock(&c.state);
+            c.cv.notify_all();
+        }
     }
 
     /// Join every spawned OS thread (run teardown). After this returns no vCPU is still touching the
@@ -850,9 +921,17 @@ fn run_child(a: SpawnArgs) {
         let mut t = lock(&(*a.dom).threads);
         t.live -= 1;
     }
-    let mut st = lock(&a.done.state);
-    *st = Some((result, trap));
-    a.done.cv.notify_all();
+    {
+        let mut st = lock(&a.done.state);
+        *st = Some((result, trap));
+        a.done.cv.notify_all();
+    }
+    // A finished vCPU re-wakes the whole domain (owner decision 2026-07-24; DESIGN.md §12): parked
+    // futex waiters re-evaluate the deadlock predicate against the dropped `live`, and — when this
+    // vCPU carried a trap (any trap is domain teardown) — every parked sibling observes the shared
+    // cell and unwinds. A few condvar broadcasts, only on vCPU exit.
+    // SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
+    unsafe { (*a.dom).wake_all_parked() };
 }
 
 /// The running vCPU's env, found via the baked `Domain` pointer the thunks receive.
@@ -1473,6 +1552,15 @@ pub(crate) unsafe extern "C" fn thread_join(
         if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
             return 0; // freeze in progress — return so the join's trailing safepoint unwinds
         }
+        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
+        // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
+        // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
+        // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
+        // Woken promptly by [`Domain::wake_all_parked`].
+        // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
+        if unsafe { load_trap(trap_out as *mut i64) } != 0 {
+            return 0;
+        }
         // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
         // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
         #[cfg(not(loom))]
@@ -1567,6 +1655,12 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // wait/join (incl. this waiter). `live > parked` ⇒ some live vCPU is still runnable and could
         // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
         || lock(&dom.threads).live > dom.parked.load(Ordering::Acquire),
+        // Owner decision 2026-07-24 (domain teardown): return on a non-zero trap cell — the
+        // **caller's own** cell (`trap_out`), i.e. the one this waiter's trailing guard checks, so
+        // the wake always unwinds the right thread (a §14 child parked on the shared futex has its
+        // own cell and is untouched by a parent-domain teardown, as before).
+        // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
+        || unsafe { load_trap(trap_out as *mut i64) } != 0,
     );
     // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
     // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
@@ -1626,6 +1720,11 @@ fn futex_wait(
     // a `notify`). An infinite wait whose `peers_live()` is false (every live vCPU is blocked) can never
     // be satisfied → [`WAIT_DEADLOCK`].
     peers_live: impl Fn() -> bool,
+    // Owner decision 2026-07-24 (domain teardown): `true` once **this waiter's own** trap cell is
+    // non-zero — a trap/exit from any vCPU of its domain, or the root-completed
+    // [`crate::DOMAIN_DONE_CODE`] sentinel. The waiter returns as if woken; its caller's trailing
+    // trap-propagation guard checks the same cell and unwinds it before the guest observes the status.
+    torn_down: impl Fn() -> bool,
 ) -> i32 {
     let mut g = lock(futex);
     if !still_eq() {
@@ -1656,6 +1755,14 @@ fn futex_wait(
         // committed window base, offset 0 RW for the run.
         #[cfg(not(loom))]
         if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+            break WAIT_WOKEN;
+        }
+        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): the
+        // domain is over — a trap/exit from any vCPU, or the root's completion (the internal
+        // DOMAIN_DONE sentinel), sits in this waiter's trap cell. Return as if woken; the caller's
+        // trailing trap-propagation guard unwinds it. Re-checked on every [`Domain::wake_all_parked`]
+        // broadcast, so a PARKED sibling observes teardown promptly even with no kill-path armed.
+        if torn_down() {
             break WAIT_WOKEN;
         }
         match deadline {
@@ -1789,6 +1896,7 @@ mod loom_tests {
                 0,
                 &parked,
                 || true, // loom models the producer↔consumer rendezvous; a peer is always live
+                || false, // no domain teardown in this model
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
@@ -1831,6 +1939,7 @@ mod loom_tests {
                 0,
                 &parked,
                 || peer_live.load(Ordering::SeqCst) > 0, // a live peer could still notify
+                || false,                                // no domain teardown in this model
             );
             peer.join().unwrap();
             assert_eq!(

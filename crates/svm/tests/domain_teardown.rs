@@ -74,7 +74,10 @@ fn exit_tears_down_parked_daemons() {
             .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
         let took = t0.elapsed();
         assert_eq!(run.outcome, Outcome::Exited(0), "{backend:?}");
-        assert_eq!(run.stdout, b"done\n", "{backend:?}: the pre-exit print lands");
+        assert_eq!(
+            run.stdout, b"done\n",
+            "{backend:?}: the pre-exit print lands"
+        );
         assert!(
             took < PROMPT,
             "{backend:?}: exit must not wait out the daemon (took {took:?})"
@@ -164,7 +167,10 @@ fn sibling_trap_tears_down_the_domain() {
         let t0 = Instant::now();
         let err = match instance.run(backend, &RunConfig::default()) {
             Err(e) => e,
-            Ok(run) => panic!("{backend:?}: sibling trap must end the run, got {:?}", run.outcome),
+            Ok(run) => panic!(
+                "{backend:?}: sibling trap must end the run, got {:?}",
+                run.outcome
+            ),
         };
         let took = t0.elapsed();
         assert!(
