@@ -2118,15 +2118,83 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      root's). A child holding a *non-durable* handle refuses the freeze like a root. The
      handle path is exercised by every existing nested round trip (all children record);
      two pieces remain before the serving-subtree fixture can pin the trio path end-to-end:
-     (1) **wake-for-freeze** — a child *parked in `svc.wait`* never observes the `UNWINDING`
-     broadcast (a parked vCPU isn't executing), so the flagship freeze-while-parked scenario
-     needs the freeze driver to wake parked consumers into their sentinel arm; (2) the
-     op-14 caller flow (a parent's `LiveImpl` still refuses capture — 4d).
-   * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
-     its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
-     record (a `DomainId` is process-local, so the artifact never carries it; the id is
-     re-minted and re-linked at thaw). Lifts the caller-side capture refusal for in-cut
-     callees; an out-of-cut callee stays non-durable (O10 is the cross-cut story).
+     (1) **the parked-in-`svc.wait` child** (below); (2) the op-14 caller flow (a parent's
+     `LiveImpl` still refuses capture — 4d).
+   * **4c-bis — the parked-in-`svc.wait` child (design corrected 2026-07-24, from a failed
+     wake-in-epilogue experiment):** a child blocked in `svc.wait` at freeze does **not**
+     self-unwind. The first cut waked its serve key from the parent's freeze-collection loop
+     so its rewound park would re-execute `svc.wait`, observe `UNWINDING`, and take the 4b
+     sentinel — but that loop runs in `drive`'s **post-execution epilogue**, after the worker
+     pool has already quiesced, so the wake pushes the child to `runnable` and *nothing runs
+     it* (verified: `svc_wake` returns `woke=true`, the child never executes, the freeze
+     records no child state). Wake-in-epilogue is structurally wrong. The right model uses
+     §13.2's own note — an `svc.wait` park is **trivially durable: re-execution is the
+     recovery**, no continuation to flatten: the child's "continuation" is literally *re-run
+     `svc.wait`*. So a parked-in-`svc.wait` child needs **capture-without-unwind** — record
+     its `FrozenNested` + `FrozenChildState` directly (detect it: the child vCPU is parked on
+     its own domain key in `svc_waiters` at freeze), and on thaw re-create it and **re-run its
+     entry** (O10 / re-execution-is-recovery: any pre-`svc.wait` side effects replay, then it
+     re-parks on the restored — now seeded — queue). This is the durable-serving flagship
+     (freeze a server idle in its accept loop, thaw it still serving) and its own slice; the
+     op-14/`LiveImpl` capture (4d) is the other half of the same fixture.
+     **Deeper blocker found (2026-07-24):** the slice is bigger than "capture-without-unwind"
+     — a server parked *forever* in `svc.wait` never lets the run **quiesce**, so `drive`'s
+     freeze-collection epilogue is never reached while any consumer is parked. The freeze
+     **trigger** (the `ARMED → UNWINDING` promotion, or an externally-set `UNWINDING`) must
+     therefore first **drain the scheduler's park sets** — `svc_waiters` (and the fiber/cap
+     waiter maps) back to `runnable` — so those vCPUs re-execute their park op, observe
+     `UNWINDING`, and capture/quiesce, *before* the worker loop can finish. That is a
+     run/scheduler-lifecycle change (a "freeze unparks everything" step at trigger time),
+     not an epilogue probe — the reason 4c-bis is its own slice rather than a rider here.
+     **BUILT 2026-07-24 (freeze-on-quiesce, single-domain):** a new arm — `arm_freeze_on_
+     quiesce` (window flag `ARM_QUIESCE_OFF`, read once at run setup into
+     `Sched::freeze_on_quiesce`) — leaves the run in `NORMAL` so the server runs and parks
+     normally; the worker loop, the instant it would block with **only** `svc.wait`-parked
+     consumers left (nothing runnable, no futex/svc timers), promotes each parked vCPU's
+     phase to `UNWINDING` (via `v.dstate`, which the `dispatch` prologue swaps into the
+     window — a direct write is clobbered by that swap) and re-admits it. The re-executed
+     `svc.wait` takes the 4b sentinel and unwinds, so the domain freezes with its (empty)
+     serve trio in the v13 section instead of the run hanging. One-shot. Pinned in
+     `svm-durable/tests/serve.rs` (`an_idle_server_freezes_on_quiesce_and_thaws_still_serving`):
+     freeze a root server idle in its accept loop → thaw with a dispatch seeded into the
+     restored queue → the re-issued `svc.wait` drains and serves it (handler reply + count),
+     the flagship end to end.
+     **Nested variant — proven, no new code (2026-07-24):** a two-server subtree (root server
+     + an instantiated child server, both idle in `svc.wait`) freezes on quiesce and thaws
+     back into the same serving state with **zero additional production code** — the
+     freeze-on-quiesce drain already generalizes. It sets each parked vCPU's `dstate` to
+     `UNWINDING`, and for a nested child that routes into its **own carve's** state word (the
+     child's mem is its carve view), so the child's `svc.wait` re-executes under its carve's
+     `UNWINDING` and takes the sentinel exactly as the root does under the global word. The
+     drain walks `svc_waiters` in `domain_id` order — root first — so the root freezes first
+     and records the still-running child as a re-attach `FrozenNested` (`completed=None`),
+     then the child's own 4c self-unwind records its `FrozenChildState`; the two stay
+     `(parent_task, slot)`-consistent. Pinned in `svm-durable/tests/serve.rs`
+     (`a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving`): freeze →
+     thaw (runtime re-creates the child, seeds its host from the residue, rewinds it to its
+     `svc.wait` arm) → re-arm freeze-on-quiesce → the thawed subtree re-parks both servers
+     and re-freezes, recording the child's residue a second time (a serving subtree came back
+     serving). **Remaining:** 4d `LiveImpl` capture — a parent holding a live cap onto a
+     serving child still refuses; the cross-domain *call* path (op-14 offer + parked caller)
+     is the last fixture.
+   * **4d — live-cap re-link: BUILT 2026-07-24.** `Binding::LiveImpl` is now durably
+     capturable when it names a §14 child: `child_offer` (op 14) records the callee's **join
+     slot** on the `LiveImplEntry` (`wire_live_impl_child`), and `capture_durable_handles`
+     emits a structural `DurableBinding::LiveImpl { slot, export }` (snapshot v15 — no
+     `DomainId`/`Arc` on the wire). A wire / child-regrant mint (no §14 child behind it) keeps
+     the `callee_slot: None` and stays non-durable (freeze still refuses). Restore is
+     **two-phase**: `restore_durable_handles` installs a placeholder entry + records a pending
+     re-link (the callee host doesn't exist yet); the thaw's nested re-creation collects each
+     direct child's host by join slot and `relink_live_impl`s the placeholder to it,
+     re-fetching the offer shape from the re-created child's module. Pinned in
+     `svm-snapshot/tests/roundtrip.rs`
+     (`a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked`): a supervisor
+     mints a cap over a child server's `echo`, parks in `svc.wait` holding it, freezes on
+     quiesce (was `ThreadFault` pre-4d), and after thaw calls `echo(7)` through the re-linked
+     cap — reaching the re-created child (serving from its own re-parked accept loop) and
+     returning 107. Follow-ups: a **nested holder's** pending re-links (a child holding a cap
+     onto a grandchild — the thaw patches only the root's pending today) and the
+     wire/child-regrant durable name (a sibling-provenance path).
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options

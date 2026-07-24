@@ -1044,3 +1044,111 @@ block 0 (vx: i64) {
         "the completion cell filled on thaw"
     );
 }
+
+/// §13.4 slice 4d — a **supervisor holding a live cap** onto a serving child freezes (its
+/// `LiveImpl` handle captured structurally by the callee's join slot, v15) and thaws with the
+/// cap **re-linked** to the re-created child. The supervisor instantiates a same-module child
+/// server, mints a `child_offer` cap over its `echo` export, then parks in `svc.wait` holding
+/// the cap; freeze-on-quiesce captures the subtree. On thaw the runtime re-creates the child
+/// and re-links the supervisor's restored `LiveImpl`; a dispatch seeded into the supervisor's
+/// own queue lets its `svc.wait` return, and it then calls `echo(7)` through the re-linked cap
+/// — reaching the re-created child (which serves it from its own re-parked accept loop) and
+/// returning 107. A broken re-link would fault or hang instead.
+const SRC_4D_SUPERVISOR: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { echo: 0 }
+export 0 interface "svc" 1 { echo: 1 }
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 2
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.const 0
+  v7 = cap.call 6 14 (i32, i64) -> (i32) v0 (v5, v6)
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  va = i64.const 7
+  vr = cap.call 268435456 0 (i64) -> (i64) v7 (va)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v1 = i64.const 100
+  vr = i64.add vx v1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+"#;
+
+#[test]
+fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
+    use svm_durable::arm_freeze_on_quiesce;
+
+    let mut m = svm_text::parse_module(SRC_4D_SUPERVISOR).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Freeze the supervisor (parked in svc.wait, holding the child_offer cap) + the idle child.
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(&inst);
+    let ih = h.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    arm_freeze_on_quiesce(&mut win);
+    let mut fuel = 5_000_000u64;
+    let (r, snap) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut h,
+    );
+    assert!(
+        r.is_ok(),
+        "the cap-holding supervisor freezes (was refused pre-4d): {r:?}"
+    );
+    let artifact = freeze(&inst, &snap, &h).expect("freeze artifact with a live cap");
+
+    // Restore + thaw: the child is re-created and the supervisor's LiveImpl re-linked. Seed a
+    // dispatch into the supervisor's own queue so its svc.wait returns and it calls the child.
+    let mut rhost = Host::new();
+    rhost.set_durable(true);
+    rhost.set_self_module(&inst);
+    let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
+    rhost
+        .svc_enqueue(0, 0, vec![0])
+        .expect("seed a dispatch for the supervisor's svc.wait");
+    let mut twin = rwin.clone();
+    begin_thaw(&mut twin, 0);
+    let mut fuel = 5_000_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut rhost,
+    );
+    assert_eq!(
+        thawed,
+        Ok(vec![Value::I64(107)]),
+        "the thawed supervisor called echo(7) through the re-linked cap and got 107"
+    );
+}
