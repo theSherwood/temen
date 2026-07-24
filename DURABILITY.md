@@ -2158,10 +2158,25 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      `svm-durable/tests/serve.rs` (`an_idle_server_freezes_on_quiesce_and_thaws_still_serving`):
      freeze a root server idle in its accept loop → thaw with a dispatch seeded into the
      restored queue → the re-issued `svc.wait` drains and serves it (handler reply + count),
-     the flagship end to end. **Remaining:** the *nested*-serving-child variant (a parked
-     child's carve, not the global word, needs the `UNWINDING`; its trio rides
-     `FrozenChildState` not the v13 section) and 4d `LiveImpl` capture — the multi-domain
-     accept-loop fixture.
+     the flagship end to end.
+     **Nested variant — proven, no new code (2026-07-24):** a two-server subtree (root server
+     + an instantiated child server, both idle in `svc.wait`) freezes on quiesce and thaws
+     back into the same serving state with **zero additional production code** — the
+     freeze-on-quiesce drain already generalizes. It sets each parked vCPU's `dstate` to
+     `UNWINDING`, and for a nested child that routes into its **own carve's** state word (the
+     child's mem is its carve view), so the child's `svc.wait` re-executes under its carve's
+     `UNWINDING` and takes the sentinel exactly as the root does under the global word. The
+     drain walks `svc_waiters` in `domain_id` order — root first — so the root freezes first
+     and records the still-running child as a re-attach `FrozenNested` (`completed=None`),
+     then the child's own 4c self-unwind records its `FrozenChildState`; the two stay
+     `(parent_task, slot)`-consistent. Pinned in `svm-durable/tests/serve.rs`
+     (`a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving`): freeze →
+     thaw (runtime re-creates the child, seeds its host from the residue, rewinds it to its
+     `svc.wait` arm) → re-arm freeze-on-quiesce → the thawed subtree re-parks both servers
+     and re-freezes, recording the child's residue a second time (a serving subtree came back
+     serving). **Remaining:** 4d `LiveImpl` capture — a parent holding a live cap onto a
+     serving child still refuses; the cross-domain *call* path (op-14 offer + parked caller)
+     is the last fixture.
    * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
      its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
      record (a `DomainId` is process-local, so the artifact never carries it; the id is
