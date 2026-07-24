@@ -105,5 +105,29 @@ int main(void) {
 }
 EOF
 
-echo "=== $pass passed, $fail failed ==="
+echo "=== IR differential: $pass passed, $fail failed ==="
+
+# --- The capstone loop (SELFHOST_C.md §5 D / §7 step 5): compile a C program with chibicc-the-guest
+# INSIDE the SVM, then parse + run the emitted module INSIDE the SVM, and assert its result matches
+# the same program built + run natively. This is the exact browser-playground pipeline (compile →
+# encode via svm_text::parse_module → run), gated locally on every engine. Corpus = return-value
+# programs (the result is main's exit code); no libc in the compiled output, so no external symbols.
+echo "=== capstone loop: in-SVM compile-and-run  vs  native clang (exit code) ==="
+CLANG_NATIVE="${CLANG:-clang}"
+for f in "$HERE"/corpus/*.c; do
+  b=$(basename "$f" .c)
+  # The program's result IS its exit code, so a non-zero exit is normal — capture it via `if` so it
+  # doesn't trip `set -e`.
+  "$CLANG_NATIVE" -O2 "$f" -o "$CACHE/$b.native" 2>/dev/null
+  if "$CACHE/$b.native"; then nat=0; else nat=$?; fi
+  res=""
+  for eng in $ENGINES; do
+    if SVM_CHIBICC_EXEC=1 SVM_CHIBICC_BACKEND="$eng" cargo run -q -p svm-run --example chibicc_run -- \
+         "$SVMB" "$f" /in.c >/dev/null 2>"$CACHE/$b.$eng.exec.err"; then g=0; else g=$?; fi
+    if [ "$g" = "$nat" ]; then res="$res $eng✓"; else res="$res $eng✗($g)"; fail=$((fail+1)); fi
+  done
+  echo "  $b: native=$nat |$res"
+done
+
+echo "=== total failures: $fail ==="
 [ "$fail" -eq 0 ]
