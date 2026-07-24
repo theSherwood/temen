@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use svm_interp::{bytecode, Region, Value};
-use svm_wasmjit::{compile_module_reactor, ENV_CELL_BYTES};
+use svm_wasm_jit::{compile_module_reactor, ENV_CELL_BYTES};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000; // the guest window starts at wasm offset 64 KiB (`memory 16`)
@@ -54,11 +54,13 @@ fn parse(src: &str) -> svm_ir::Module {
     m
 }
 
-/// Full-interpreter oracle over func 0.
+/// Full-interpreter oracle over func 0, on the tree-walk interpreter (the root oracle,
+/// INVARIANTS.md #9). The cross-tier leaf below still runs on the bytecode engine — production
+/// behavior under test, not the oracle.
 fn oracle(m: &svm_ir::Module, arg: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel) {
-        Some(Ok(v)) => match v.first() {
+    match svm_interp::run(m, 0, &[Value::I64(arg)], &mut fuel) {
+        Ok(v) => match v.first() {
             Some(Value::I64(x)) => *x,
             Some(Value::I32(x)) => *x as i64,
             _ => panic!("oracle result"),

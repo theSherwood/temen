@@ -1,4 +1,4 @@
-//! **Cap-call outlining** ([`svm_wasmjit::outline_cap_calls`]) — the transform that lets a reactor
+//! **Cap-call outlining** ([`svm_wasm_jit::outline_cap_calls`]) — the transform that lets a reactor
 //! whose hot `tick` interleaves compute with an inline `cap.call` (a `display.present` / `keyboard.poll`
 //! once per frame) emit to wasm without a source change. A `cap.call` is outside the emitter's compute
 //! subset, and emittability is per whole function, so one inline cap call keeps the whole function
@@ -13,7 +13,7 @@
 //! real `display` cap on the f64 Mandelbrot guest is proven by the browser JIT-reactor test.)
 
 use svm_interp::{bytecode, Host, Value};
-use svm_wasmjit::{compile_module_reactor, outline_cap_calls};
+use svm_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry (`f0`) is otherwise-emittable integer compute, but makes one inline `cap.call` to a
 // host-fn capability (`cap_id::HOST_FN` = type_id 13, op 0) whose handle arrives as the arg: it computes

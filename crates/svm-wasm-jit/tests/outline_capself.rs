@@ -1,4 +1,4 @@
-//! **`cap.self.resolve` outlining** ([`svm_wasmjit::outline_cap_calls`] also hoists
+//! **`cap.self.resolve` outlining** ([`svm_wasm_jit::outline_cap_calls`] also hoists
 //! [`svm_ir::Inst::CapSelfResolve`]) — the transform that lets the on-ramp `_start` synth emit. The
 //! powerbox entry is otherwise pure compute + stores, but resolves each granted capability **by name**
 //! (`cap.self.resolve`, a host-boundary reflection op outside the compute subset), so one such call
@@ -10,7 +10,7 @@
 //! `cap.self.resolve`-bearing entry, and (2) **preserves semantics** (same host, same resolved handle).
 
 use svm_interp::{bytecode, Host, Value};
-use svm_wasmjit::{compile_module_reactor, outline_cap_calls};
+use svm_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry resolves the capability name "exit" — four bytes in a data segment at window offset 0 — to
 // the handle it was granted under, and returns it. Pure compute apart from the one `cap.self.resolve`.

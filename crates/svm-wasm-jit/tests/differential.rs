@@ -1,11 +1,11 @@
-//! The slice-1 gate: every kernel runs on the **bytecode engine** (the oracle) and on the
+//! The slice-1 gate: every kernel runs on the **tree-walk interpreter** (the root oracle) and on the
 //! **emitted wasm** under `wasmi`, comparing results *and trap kinds* across an arg sweep. A
 //! mismatch is a `MISCOMPILE`-grade failure — the emitter is escape-TCB-adjacent (its output
 //! confines guest addresses), so this differential is the correctness contract, exactly like the
 //! `svm-bytecode-wasm` bench row's cross-check.
 
-use svm_interp::{bytecode, Trap, Value};
-use svm_wasmjit::{compile_module, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
+use svm_interp::{Trap, Value};
+use svm_wasm_jit::{compile_module, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 /// Where the guest window starts in the harness's linear memory (page 1 — page 0 holds the env
@@ -47,10 +47,13 @@ enum TrapKind {
 
 fn oracle(m: &svm_ir::Module, args: &[Value], fuel: u64) -> Outcome {
     let mut fuel = fuel;
-    match bytecode::compile_and_run(m, 0, args, &mut fuel) {
-        None => panic!("oracle: module unsupported by the bytecode engine"),
-        Some(Ok(vals)) => Outcome::Vals(vals),
-        Some(Err(t)) => Outcome::Trap(match t {
+    // The tree-walk interpreter is the root oracle (INVARIANTS.md #9): the wasm-JIT is held against
+    // it directly, like the Cranelift JIT. This is bit-identical to the bytecode engine this
+    // previously anchored on (gated by `bytecode_diff`), so re-anchoring is a provenance change, not
+    // a behavioral one — and the tree-walker never declines, so there is no "unsupported" arm.
+    match svm_interp::run(m, 0, args, &mut fuel) {
+        Ok(vals) => Outcome::Vals(vals),
+        Err(t) => Outcome::Trap(match t {
             Trap::DivByZero => TrapKind::DivByZero,
             Trap::IntOverflow | Trap::BadConversion => TrapKind::OverflowOrConv,
             Trap::MemoryFault => TrapKind::MemoryFault,

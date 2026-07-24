@@ -2,9 +2,9 @@
 //! **entry-rooting** (`compile_module_mixed_entry` — the JIT entry is an arbitrary function, not
 //! func 0) and **data tolerance** (the emitter no longer rejects `data` segments; the host lays them
 //! into the window before running). Both are exercised by emitting under `wasmi`, initializing the
-//! window from `m.data`, and comparing to the bytecode-engine oracle.
+//! window from `m.data`, and comparing to the tree-walk oracle.
 
-use svm_wasmjit::{analyze_from, compile_module_mixed_entry};
+use svm_wasm_jit::{analyze_from, compile_module_mixed_entry};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -83,20 +83,22 @@ fn jit_run(m: &svm_ir::Module, entry: u32, arg: i64) -> i64 {
 
 fn oracle(m: &svm_ir::Module, entry: u32, arg: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match bytecode_run(m, entry, arg, &mut fuel) {
+    match treewalk_run(m, entry, arg, &mut fuel) {
         Some(x) => x,
         None => panic!("oracle failed"),
     }
 }
 
-fn bytecode_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Option<i64> {
-    match svm_interp::bytecode::compile_and_run(m, entry, &[svm_interp::Value::I64(arg)], fuel) {
-        Some(Ok(v)) => Some(match v.first() {
+// The tree-walk interpreter is the root oracle (INVARIANTS.md #9); it never declines, so a `None`
+// here means the oracle itself trapped, not that the engine could not run the module.
+fn treewalk_run(m: &svm_ir::Module, entry: u32, arg: i64, fuel: &mut u64) -> Option<i64> {
+    match svm_interp::run(m, entry, &[svm_interp::Value::I64(arg)], fuel) {
+        Ok(v) => Some(match v.first() {
             Some(svm_interp::Value::I64(x)) => *x,
             Some(svm_interp::Value::I32(x)) => *x as i64,
             _ => panic!("result"),
         }),
-        _ => None,
+        Err(_) => None,
     }
 }
 

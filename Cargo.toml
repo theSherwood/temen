@@ -21,7 +21,7 @@ members = [
     "crates/svm-spec",
     "crates/svm-run",
     "crates/svm-wasm",
-    "crates/svm-wasmjit",
+    "crates/svm-wasm-jit",
     "crates/svm-wasi",
     "crates/svm-posix",
     "crates/svm-capi",
@@ -59,7 +59,7 @@ svm-snapshot = { path = "crates/svm-snapshot" }
 svm-fiber = { path = "crates/svm-fiber" }
 svm-jit = { path = "crates/svm-jit" }
 svm-spec = { path = "crates/svm-spec" }
-svm-wasmjit = { path = "crates/svm-wasmjit" }
+svm-wasm-jit = { path = "crates/svm-wasm-jit" }
 
 [profile.release]
 opt-level = 3
