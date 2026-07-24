@@ -2312,7 +2312,7 @@ pub struct Vcpu<'p> {
     /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
     /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
     /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
-    /// embedder computes it (e.g. from `svm_wasmjit::analyze`).
+    /// embedder computes it (e.g. from `svm_wasm_jit::analyze`).
     jit_eligible: Option<std::sync::Arc<[bool]>>,
     /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw

@@ -1,4 +1,4 @@
-//! §17 SIMD (v128) differential gate: every kernel runs on the **bytecode engine** (the oracle) and
+//! §17 SIMD (v128) differential gate: every kernel runs on the **tree-walk interpreter** (the root oracle) and
 //! on the **emitted wasm** under `wasmi`, comparing the i64 result across an arg sweep. The emitter
 //! is escape-TCB-adjacent (its output confines guest addresses, and v128 adds the one 16-byte
 //! widened access), so this differential is the correctness contract for every SIMD opcode — a
@@ -8,8 +8,8 @@
 //! op family, and reduces back to an i64 (lane extract, or reinterpret of a float lane's bits) so
 //! the comparison is exact — NaN payloads and rounding included.
 
-use svm_interp::{bytecode, Value};
-use svm_wasmjit::compile_module;
+use svm_interp::Value;
+use svm_wasm_jit::compile_module;
 use wasmi::{Caller, Config, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -17,10 +17,11 @@ const ENV_PTR: u32 = 1024;
 
 fn oracle(m: &svm_ir::Module, args: &[Value], fuel: u64) -> Vec<Value> {
     let mut fuel = fuel;
-    match bytecode::compile_and_run(m, 0, args, &mut fuel) {
-        Some(Ok(vals)) => vals,
-        Some(Err(t)) => panic!("oracle trapped: {t:?}"),
-        None => panic!("oracle: module unsupported by the bytecode engine"),
+    // Tree-walk interpreter = the root oracle (INVARIANTS.md #9); bit-identical to the bytecode
+    // engine this previously anchored on, and it never declines (no "unsupported" arm).
+    match svm_interp::run(m, 0, args, &mut fuel) {
+        Ok(vals) => vals,
+        Err(t) => panic!("oracle trapped: {t:?}"),
     }
 }
 
@@ -103,7 +104,7 @@ fn diff(name: &str, src: &str, sweep: &[i64]) {
 
 /// Like [`diff`] but the single i64 result is a **reinterpreted f64 lane's bits**: two NaN results
 /// compare equal regardless of sign/payload. wasm leaves the sign and payload of a *generated* NaN
-/// nondeterministic (§ "NaN propagation"), so the bytecode oracle (Rust `f64`) and wasmi legitimately
+/// nondeterministic (§ "NaN propagation"), so the tree-walk oracle (Rust `f64`) and wasmi legitimately
 /// disagree on those bits for inf/NaN inputs — a divergence that is unobservable to a conforming
 /// guest. Finite results still compare exactly (rounding included).
 fn diff_f64bits(name: &str, src: &str, sweep: &[i64]) {

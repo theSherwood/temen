@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use svm_interp::{bytecode, Value};
-use svm_wasmjit::{compile_module_mixed, ENV_CELL_BYTES};
+use svm_wasm_jit::{compile_module_mixed, ENV_CELL_BYTES};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -22,11 +22,13 @@ fn parse(src: &str) -> svm_ir::Module {
     m
 }
 
-/// Full-interpreter oracle: run the whole module's func 0 on the bytecode engine.
+/// Full-interpreter oracle: run the whole module's func 0 on the tree-walk interpreter (the root
+/// oracle, INVARIANTS.md #9). The cross-tier interp leaf still runs on the bytecode engine below —
+/// that is the production behavior under test, not the oracle.
 fn oracle(m: &svm_ir::Module, arg: i64) -> i64 {
     let mut fuel = u64::MAX;
-    match bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel) {
-        Some(Ok(vals)) => match vals.first() {
+    match svm_interp::run(m, 0, &[Value::I64(arg)], &mut fuel) {
+        Ok(vals) => match vals.first() {
             Some(Value::I64(x)) => *x,
             Some(Value::I32(x)) => *x as i64,
             _ => panic!("oracle: unexpected result"),
@@ -148,10 +150,7 @@ fn mixed(m: &svm_ir::Module, arg: i64) -> Result<i64, ()> {
 /// Whether the full-interpreter oracle traps running the whole module's func 0 with `arg`.
 fn oracle_traps(m: &svm_ir::Module, arg: i64) -> bool {
     let mut fuel = u64::MAX;
-    matches!(
-        bytecode::compile_and_run(m, 0, &[Value::I64(arg)], &mut fuel),
-        Some(Err(_))
-    )
+    svm_interp::run(m, 0, &[Value::I64(arg)], &mut fuel).is_err()
 }
 
 /// `env` cell must be at least `ENV_CELL_BYTES`; we put it at ENV_PTR with 2 pages of memory, so

@@ -851,7 +851,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "svm-wasmjit"
+name = "svm-wasm-jit"
 version = "0.0.0"
 dependencies = [
  "svm-interp",

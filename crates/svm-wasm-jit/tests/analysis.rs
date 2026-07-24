@@ -2,7 +2,7 @@
 //! function as in-subset (the JIT emits it), an interp leaf (a cross-tier call runs it on the
 //! bytecode engine), or neither — and decides whether a guest can run mixed-tier at all.
 
-use svm_wasmjit::analyze;
+use svm_wasm_jit::analyze;
 
 fn m(src: &str) -> svm_ir::Module {
     let m = svm_text::parse_module(src).expect("parse");

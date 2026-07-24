@@ -657,7 +657,7 @@ static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
 /// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
 /// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
-/// which is the whole point of the threads tier ([`svm_wasmjit::compile_module_tierup`]).
+/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_module_tierup`]).
 ///
 /// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
 /// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
@@ -688,7 +688,7 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
         // Emit the tier-up module against the shared linear memory (the browser threads build) and take
         // its per-function emit set. `Err` only if the assembler itself rejects the set — treat as "no
         // tier-up" (fail-closed: the guest keeps interpreting).
-        let Ok((wasm, emit)) = svm_wasmjit::compile_module_tierup(&m, true) else {
+        let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup(&m, true) else {
             return 0;
         };
         let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
@@ -879,7 +879,7 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
         let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
             return 0;
         };
-        let Ok(wasm) = svm_wasmjit::compile_module_mixed_entry(&service_m, 0, true) else {
+        let Ok(wasm) = svm_wasm_jit::compile_module_mixed_entry(&service_m, 0, true) else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
@@ -895,7 +895,7 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
 /// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
 /// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
-/// [`svm_wasmjit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
+/// [`svm_wasm_jit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
 /// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
 /// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
 /// (on the main thread) before the run.
@@ -1050,7 +1050,7 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         let Some(m) = &cfg.module else {
             return 0;
         };
-        let Ok((wasm, eligible)) = svm_wasmjit::compile_module_tierup(m, true) else {
+        let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_tierup(m, true) else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
@@ -2886,7 +2886,7 @@ impl JitOnrampReactor {
         // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
         // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
         // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
-        svm_wasmjit::outline_cap_calls(&mut module);
+        svm_wasm_jit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
         if let Some(mc) = module.memory.as_mut() {
             if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -2910,7 +2910,7 @@ impl JitOnrampReactor {
         // Emit the whole `tick` (cross-tier helpers routed to `env.call_interp`). Fall back if the
         // guest isn't reactor-emittable (e.g. its `tick` directly makes a cap.call → not in-subset).
         let (emitted_wasm, emitted) =
-            svm_wasmjit::compile_module_reactor(&module, tick, shared_memory)
+            svm_wasm_jit::compile_module_reactor(&module, tick, shared_memory)
                 .map_err(|_| STATUS_UNSUPPORTED)?;
         Ok(JitOnrampReactor {
             module,
@@ -3109,7 +3109,7 @@ impl JitOnrampRun {
     ) -> Result<JitOnrampRun, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let mut module = m.clone();
-        svm_wasmjit::outline_cap_calls(&mut module);
+        svm_wasm_jit::outline_cap_calls(&mut module);
         // Enlarge the mapped window to cover the guest's heap (fixed — emitted code can't grow it).
         if let Some(mc) = module.memory.as_mut() {
             if (mc.size_log2 as u32) < win_log2 as u32 {
@@ -3140,7 +3140,7 @@ impl JitOnrampRun {
         // Emit rooted at func 0 (`_start`); cross-tier helpers route to `env.call_interp`. Fall back if
         // `_start` itself is out of subset.
         let (emitted_wasm, emitted) =
-            svm_wasmjit::compile_module_reactor(&module, 0, shared_memory)
+            svm_wasm_jit::compile_module_reactor(&module, 0, shared_memory)
                 .map_err(|_| STATUS_UNSUPPORTED)?;
         Ok(JitOnrampRun {
             module,
@@ -3699,7 +3699,7 @@ pub extern "C" fn svm_onramp_jit_tick() -> u32 {
 /// module's `env` argument.
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_env_bytes() -> usize {
-    svm_wasmjit::ENV_CELL_BYTES
+    svm_wasm_jit::ENV_CELL_BYTES
 }
 
 /// **Cross-tier bounce** — the emitted `tick`'s `env.call_interp(func, args_ptr)` relays here. Runs
@@ -3880,7 +3880,7 @@ pub extern "C" fn svm_onramp_jit_run_win_ptr() -> usize {
 /// The `env` cell size the page must `svm_alloc` for the emitted module's `env` argument.
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_run_env_bytes() -> usize {
-    svm_wasmjit::ENV_CELL_BYTES
+    svm_wasm_jit::ENV_CELL_BYTES
 }
 /// The number of capability-handle params `_start` takes — the emitted `f0`'s trailing `...slots` args.
 #[no_mangle]
@@ -4214,8 +4214,8 @@ pub extern "C" fn svm_dap_response_len() -> usize {
 /// `unreachable`; because the JS host calls the emitted function **directly** (not via this
 /// cdylib), that `unreachable` surfaces as a catchable `RuntimeError` at the JS boundary — the host
 /// reads the code it recorded to classify the trap (exactly the slice-1 differential model).
-pub const WASMJIT_TRAP_OUT_OF_FUEL: i32 = svm_wasmjit::TRAP_OUT_OF_FUEL;
-pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = svm_wasmjit::TRAP_MEMORY_FAULT;
+pub const WASMJIT_TRAP_OUT_OF_FUEL: i32 = svm_wasm_jit::TRAP_OUT_OF_FUEL;
+pub const WASMJIT_TRAP_MEMORY_FAULT: i32 = svm_wasm_jit::TRAP_MEMORY_FAULT;
 
 /// Compile the encoded SVM module at `[mod_ptr, mod_len)` to a **WebAssembly module** (the wasm-JIT
 /// tier). Returns `1` and stashes the emitted wasm bytes when the whole module is JIT-eligible (its
@@ -4259,7 +4259,7 @@ pub extern "C" fn svm_wasmjit_compile_full(
     // `compile_module_mixed_entry` (slice 3) emits the reachable in-subset functions and routes a
     // call to an interp leaf through `env.call_interp` → [`svm_wasmjit_call_interp`]; a
     // fully-in-subset guest is the special case with no leaves.
-    match svm_wasmjit::compile_module_mixed_entry(&m, entry, shared != 0) {
+    match svm_wasm_jit::compile_module_mixed_entry(&m, entry, shared != 0) {
         Ok(wasm) => {
             // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
@@ -4290,7 +4290,7 @@ static mut WASMJIT_MOD: Option<svm_ir::Module> = None;
 /// allocation with this.
 #[no_mangle]
 pub extern "C" fn svm_wasmjit_env_bytes() -> usize {
-    svm_wasmjit::ENV_CELL_BYTES
+    svm_wasm_jit::ENV_CELL_BYTES
 }
 
 /// Materialize the most recent [`svm_wasmjit_compile`] module's **data segments** into the window at

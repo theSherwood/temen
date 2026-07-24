@@ -700,7 +700,7 @@ Chromium/V8:** the tab evaluates JS and prints correct output (incl. shortest fl
 `0.30000000000000004`) in ~0.6 s for a light program. Boot is milliseconds (no snapshot/restore).
 
 **wasm-JIT tier — ★ DONE, ~6× the interpreter, byte-identical.** QuickJS's `_start` now emits. Three
-emitter changes closed the gap (all in `svm-wasmjit`): (1) **§12 atomics** — lowered to a
+emitter changes closed the gap (all in `svm-wasm-jit`): (1) **§12 atomics** — lowered to a
 single-threaded load/(rmw)/store sequence + alignment trap (a JIT-tier guest is concurrency-free, so
 this is observably identical to a hardware atomic *and* stays differential-testable on `wasmi`, which
 has no threads); (2) **`cap.self.resolve` outlining** — the powerbox `_start` synth's only
@@ -737,7 +737,7 @@ shortest-float printing confirmed working — no dtoa slice needed); (f) ~~real-
 playground tab~~ **done** (interp tier, real Chromium/V8); (g) ~~regex / `try`/`catch` / … breadth~~
 **done** (`demo_quickjs_breadth_vs_native`); ~~the open breadth item is **BigInt**~~ **done** (ISSUES.md
 I25 — an i128-large-constant translator bug, now fixed; the full JS surface runs byte-identical); (h)
-~~the **`svm-wasmjit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
+~~the **`svm-wasm-jit` emitter gap** so the JIT tier lights up (speed)~~ **done** — QuickJS emits and
 runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlining + pooled locals; see
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.

@@ -1,4 +1,4 @@
-//! **`call.import` outlining** ([`svm_wasmjit::outline_cap_calls`], IMPORTS.md phase 3) — the same
+//! **`call.import` outlining** ([`svm_wasm_jit::outline_cap_calls`], IMPORTS.md phase 3) — the same
 //! transform as cap-call outlining, applied to an **executable manifest import**. A `call.import` is
 //! a host-boundary op outside the emitter's compute subset, so an inline one keeps its whole
 //! function on the interpreter; outlining hoists it into an integer-signature wrapper (a cross-tier
@@ -11,7 +11,7 @@
 //! bindings, same result) — and the rewritten module still **verifies**.
 
 use svm_interp::{bytecode, BoundImport, Host, Value};
-use svm_wasmjit::{compile_module_reactor, outline_cap_calls};
+use svm_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry (`f0`) is otherwise-emittable integer compute, but drives import 0 (a host-fn interface,
 // type_id 13 op 0) inline: it computes `hostfn(10, 20) + 5`. The host-fn adds its two args, so the

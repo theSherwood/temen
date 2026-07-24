@@ -546,7 +546,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
-   browser/JS exists. Landed as **`crates/svm-wasmjit`** (`compile_module(&svm_ir::Module) →
+   browser/JS exists. Landed as **`crates/svm-wasm-jit`** (`compile_module(&svm_ir::Module) →
    Vec<u8>`, `svm-ir`-only runtime dep, `#![forbid(unsafe_code)]`, module-granular
    `Error::Unsupported` fail-closed): the integer compute subset (i32/i64 const/arith/bitwise/
    shift/rotate/cmp/`clz`/`ctz`/`popcnt`/`extend`/`wrap`/`select`/`eqz`), all load/store widths with
@@ -562,7 +562,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    kernels green, plus a `fail_closed` test pinning the refused families (float/fiber/thread/tailcall).
    Remaining for this slice's PR: none — browser wiring is slice 2.
 2. **[landed] Browser linking.** Landed: the cdylib FFI `svm_wasmjit_compile(mod_ptr, mod_len)`
-   emits a wasm module for a JIT-eligible SVM module (via `svm_wasmjit::compile_module_shared`) and
+   emits a wasm module for a JIT-eligible SVM module (via `svm_wasm_jit::compile_module_shared`) and
    stashes the bytes (`svm_wasmjit_ptr`/`_len`), returning `0` — the fail-closed signal to stay on
    the interpreter — for anything the emitter refuses. The JS linker (`web/wasmjit.js`,
    `compileJit`) compiles those bytes, instantiates the emitted module against **the cdylib's own
@@ -628,7 +628,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (the emitted `WebAssembly.Module` doesn't expose per-param types to JS). Each Worker computes its
    own bitmap locally from the shared guest bytes (`svm_par_enable_jit` — an `Arc<[bool]>` can't
    cross Worker instances) and instantiates its own emitted module against the **one** shared memory
-   (wasm tables aren't shareable across Workers). Proofs: `crates/svm-wasmjit/tests/tierup.rs` (4
+   (wasm tables aren't shareable across Workers). Proofs: `crates/svm-wasm-jit/tests/tierup.rs` (4
    differential cases pinning the emit set — spawn-only leaf, transitive leaves, a dropped
    unroutable caller, all-in-subset — each emitted `f{i}` matched to the bytecode oracle over an arg
    sweep); the native `crates/svm-interp/tests/vcpu_tierup.rs` (the `TierUp` seam on the resumable
@@ -761,7 +761,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    guest→host boundary (it dispatches into the powerbox, host-side), outside the emitter's compute
    subset, and emittability is decided per **whole function** — so a reactor whose `tick` interleaves
    compute with a once-per-frame `display.present` / `keyboard.poll` kept the *entire* function (its
-   hot loop included) on the interpreter. **`svm_wasmjit::outline_cap_calls`** (a JIT pre-pass run after `resolve_imports`,
+   hot loop included) on the interpreter. **`svm_wasm_jit::outline_cap_calls`** (a JIT pre-pass run after `resolve_imports`,
    before analyze/emit) hoists each inline `cap.call` into a synthetic single-block wrapper function
    and rewrites the call site to a plain `Call`. The wrapper has an all-integer signature (a capability
    handle is `i32`, its op args/results `i64`), so it is a **cross-tier leaf** reached through the
@@ -777,7 +777,7 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    file can open a JIT reactor. Measured in Chromium on the **unmodified** playground assets, per frame
    interpreter → JIT, with **byte-identical** framebuffers over 40 frames on every demo: mandelzoom
    (f64 escape loop) **488 ms → 20 ms (~24×, ~2 → ~49 FPS, bit-exact)**, life 34×, bounce 7.8×. Proven
-   by `crates/svm-wasmjit/tests/outline_capcalls.rs` (the transform flips emittability and preserves
+   by `crates/svm-wasm-jit/tests/outline_capcalls.rs` (the transform flips emittability and preserves
    interpreter semantics, and the rewritten module verifies) and the committed
    `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
    real Chromium). *(This does **not** bring `cap.call` into the emitted subset — the note at slice 3's

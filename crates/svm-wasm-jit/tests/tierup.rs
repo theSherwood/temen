@@ -7,7 +7,7 @@
 //! interpreter, the same MISCOMPILE-grade contract the whole-module path holds.
 
 use svm_interp::{bytecode, Trap, Value};
-use svm_wasmjit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
+use svm_wasm_jit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
