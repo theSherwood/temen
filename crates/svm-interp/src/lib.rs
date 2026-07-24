@@ -1055,6 +1055,7 @@ impl Inspector {
             );
             root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
             root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
+            s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
             s.runnable.push(Box::new(root));
             id
         };
@@ -1932,9 +1933,16 @@ fn drive_arc(
         s.next_task += 1;
         s.live += 1;
         s.workers = 1; // the calling thread acts as worker 0
-                       // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
-                       // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
-                       // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
+                       // §12 domain lifetime (owner 2026-07-24): record the root domain's key — a
+                       // trap/exit anywhere in the shared-powerbox domain ends the whole run, not
+                       // just the trapping vCPU (the batch activation's owner is gone).
+        s.root_domain = host_shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .domain_id() as usize;
+        // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
+        // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
+        // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
         let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -2311,6 +2319,9 @@ fn drive_arc(
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
+        // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
+        // synthesizes the root's outcome — the domain's ending trap, with its `mem`/`fuel`
+        // residue — when a sibling's trap/exit killed it while parked or running.
         let out = s.results.remove(&root_id).expect("root vCPU finished");
         (out, s.trap_origin.take())
     };
@@ -2556,6 +2567,7 @@ pub fn run_scheduled(
             Quota::default(), // deterministic oracle path: the fixed anti-bomb ceilings
             dt,
         ));
+        s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
         s.runnable.push(root);
         id
     };
@@ -3198,6 +3210,7 @@ fn run_one_schedule(
             dt,
         );
         root.memop = true;
+        s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
         s.runnable.push(Box::new(root));
         id
     };
@@ -3495,10 +3508,12 @@ const WAIT_NOT_EQUAL: i32 = 1;
 const WAIT_TIMED_OUT: i32 = 2;
 
 /// Upper bound on how long a `<ty>.atomic.wait` will actually block, regardless of the guest's
-/// requested timeout (and what a negative — "infinite" — timeout is clamped to). A vCPU blocking
-/// forever would never let the run's thread `scope` join; capping keeps the host live (a guest can
-/// stall *itself* but not wedge the process). Legitimate waits return immediately on the notify, so
-/// the cap only bounds the missed-notify fallback.
+/// requested timeout (and what a negative — "infinite" — timeout is clamped to). Since the
+/// domain-lifetime decision (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24) this is a
+/// **pure anti-wedge backstop**, never semantics: teardown wakes or drops parked waiters directly
+/// (root completion / a domain's trap ends them; a run never "waits out" a daemon), so the cap only
+/// bounds a genuinely-missed wake — keeping the host live against a bug, not shaping guest-visible
+/// behavior.
 const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Maximum worker OS threads the executor will spawn for one run (the "N" of M:N). Capped at the
@@ -3508,6 +3523,13 @@ const MAX_WORKERS: usize = 32;
 /// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
 /// spawner's child table); the executor keys results/waiters by `TaskId`.
 type TaskId = u64;
+
+/// The run's **root vCPU** — always the first task a driver allocates ([`drive_arc`],
+/// [`run_scheduled`], the Inspector all create it before anything can spawn). Domain lifetime
+/// (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24): the root's completion — return,
+/// exit, or trap — ends the *activation*, and a batch run is one activation, so it ends the whole
+/// run; parked siblings are torn down, their outcomes unobservable.
+const ROOT_TASK: TaskId = 0;
 
 /// A finished vCPU's outcome, parked in the scheduler until a `thread.join` claims it (or, for the
 /// root, until [`drive`] reads it). Carries `mem`/`fuel` so the root's window can be snapshot and its
@@ -3778,6 +3800,20 @@ struct Sched {
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
+    /// Domain lifetime (DESIGN.md §12 "Domain lifetime & teardown" / ISSUES.md I37, owner
+    /// 2026-07-24): domains already torn down, keyed by powerbox identity ([`Host::domain_id`] —
+    /// the `svc_waiters` key), each carrying the trap that ended them (`Trap::Exit` or the
+    /// origin's own trap). Parked members were killed at the teardown sweep; a member that was
+    /// *running* (teardown is non-preemptive) finds its domain here at its next safepoint — the
+    /// park arms reap it and a late `Done` is normalized to the domain's trap — so it never
+    /// re-parks into a dead world. A caller about to park through a dead callee
+    /// ([`Blocked::CapReply`]) probes this too, completing with an errno instead of stranding
+    /// (D37 death-is-revocation).
+    dead: BTreeMap<usize, Trap>,
+    /// The root domain's key (the run's shared powerbox identity), set at run setup before any
+    /// dispatch. A trap/exit anywhere in *this* domain ends the whole run (the batch activation's
+    /// owner is gone), not just the domain — see [`teardown_run`].
+    root_domain: usize,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
     /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
     /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
@@ -3805,7 +3841,9 @@ impl Scheduler {
     /// demand warrants. `None` if the live cap is hit (a thread-bomb).
     fn spawn(self: &Arc<Self>, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         let mut s = self.lock();
-        if s.live >= self.cap {
+        // §12 teardown (owner 2026-07-24): a post-teardown sibling (running at the sweep, effects
+        // unspecified) must not repopulate a run that is already over.
+        if s.live >= self.cap || s.shutdown {
             return None;
         }
         let id = s.next_task;
@@ -4017,6 +4055,239 @@ fn process_timers(s: &mut Sched) {
             }
         }
     }
+}
+
+/// A vCPU's **domain key**: its powerbox identity ([`Host::domain_id`] — the same key
+/// `svc_waiters`, fiber waiters' `svc` field, and [`Sched::dead`] use). All vCPUs of a domain
+/// share the powerbox `Arc`, so this partitions a run's vCPUs into its domains (the root + its
+/// `thread.spawn` threads vs. each §14 live child + *its* threads). Lock order sched → host is
+/// the established one (the park arms take it the same way).
+fn domain_key_of(v: &VCpu) -> usize {
+    v.host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize
+}
+
+/// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
+/// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` re-raises
+/// (I37 supervision mechanics) — keeping `mem`/`fuel` residue (the root's is read back by
+/// [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
+/// durable shadow context, and set its own §14 children's kill flags (ownership anchors *their*
+/// lifetime too — the owner's death propagates as the existing S3 kill, observed at the child's
+/// per-op poll). Returns the dispatch tickets the vCPU had admitted but not replied
+/// (`handler_parks` / `serve_run`) so the caller can errno-wake their cross-domain callers (D37).
+fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
+    let tickets: Vec<u64> = v
+        .handler_parks
+        .values()
+        .map(|&(_, t)| t)
+        .chain(v.serve_run.as_ref().map(|r| r.ticket))
+        .collect();
+    for flag in v.child_kill.values() {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if v.vcpu_ctx > 0 {
+        v.registry.free_vcpu_context(v.vcpu_ctx);
+    }
+    let outcome = Outcome {
+        result: Err(reason),
+        mem: v.mem.take(),
+        fuel: v.fuel,
+        trap_bt: Vec::new(), // the *origin's* backtrace is already in `trap_origin` (first-wins)
+        trap_fiber: None,
+    };
+    let id = v.id;
+    drop(v);
+    if let Some(parent) = s.join_waiters.remove(&id) {
+        s.runnable.push_back(parent);
+    }
+    s.results.insert(id, outcome);
+    s.live -= 1;
+    if s.live == 0 {
+        s.shutdown = true;
+    }
+    tickets
+}
+
+/// D37 death-is-revocation, teardown flavor: complete cross-domain callers parked on the given
+/// dispatch tickets with the probeable [`CAP_REVOKED`] errno (the [`Scheduler::cap_reply_or_stash`]
+/// wake shape) — a dying callee never strands its callers. A caller not yet parked is handled at
+/// its park instead (the `CapReply` arms probe [`Sched::dead`]).
+fn wake_dead_tickets(s: &mut Sched, tickets: impl IntoIterator<Item = u64>) {
+    for t in tickets {
+        match s.ticket_waiters.remove(&t) {
+            Some(Waiter::VCpu(mut w)) => {
+                w.pending = Some(Pending::CapResult(CAP_REVOKED));
+                s.runnable.push_back(w);
+            }
+            Some(Waiter::Fiber { reg, slot, svc }) => {
+                reg.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
+                svc_wake_locked(s, svc);
+            }
+            None => {}
+        }
+    }
+}
+
+/// DESIGN.md §12 "Domain lifetime & teardown" (owner 2026-07-24; ISSUES.md I37): tear down
+/// domain `key` because one of its vCPUs ended it — `exit(n)` or any trap, both domain-wide
+/// (trap-is-terminal for the one world; I37). Sweeps every waiter store for **member** vCPUs
+/// (runnable / join / futex / cap / ticket / svc parks) and reaps each; a member's parked
+/// *fibers* are dropped with it (nothing of the domain remains to resume them). Members
+/// currently RUNNING are untouched (non-preemptive): their next safepoint finds the domain in
+/// [`Sched::dead`]. Cross-domain callers parked *through* the dying domain — its queued
+/// dispatches and its in-flight handler tickets — complete with a probeable errno, never a hang
+/// (D37). Only vCPUs OF the dying domain are killed; for a §14 live child the run continues and
+/// the owner observes the outcomes (`poll` → 2, `join` re-raises).
+fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<Host>>) {
+    if s.dead.contains_key(&key) {
+        return; // already down (a second member's trap raced the sweep)
+    }
+    s.dead.insert(key, reason.clone());
+    let mut victims: Vec<Box<VCpu>> = Vec::new();
+    let runnable = std::mem::take(&mut s.runnable);
+    for v in runnable {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.runnable.push_back(v);
+        }
+    }
+    let jw = std::mem::take(&mut s.join_waiters);
+    for (k, v) in jw {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.join_waiters.insert(k, v);
+        }
+    }
+    for q in s.wait_waiters.values_mut() {
+        let mut i = 0;
+        while i < q.len() {
+            let member = match &q[i].1 {
+                Waiter::VCpu(v) => domain_key_of(v) == key,
+                Waiter::Fiber { svc, .. } => *svc == key,
+            };
+            if member {
+                if let (_, Waiter::VCpu(v)) = q.remove(i) {
+                    victims.push(v);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    s.wait_waiters.retain(|_, q| !q.is_empty());
+    for q in s.cap_waiters.values_mut() {
+        let mut i = 0;
+        while i < q.len() {
+            let member = match &q[i] {
+                Waiter::VCpu(v) => domain_key_of(v) == key,
+                Waiter::Fiber { svc, .. } => *svc == key,
+            };
+            if member {
+                if let Waiter::VCpu(v) = q.remove(i) {
+                    victims.push(v);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    s.cap_waiters.retain(|_, q| !q.is_empty());
+    // Members parked as *callers* through some other domain die too (their tickets there go
+    // unclaimed — the callee's eventual reply finds no waiter and stashes, harmlessly).
+    let tw = std::mem::take(&mut s.ticket_waiters);
+    for (t, w) in tw {
+        let member = match &w {
+            Waiter::VCpu(v) => domain_key_of(v) == key,
+            Waiter::Fiber { svc, .. } => *svc == key,
+        };
+        if member {
+            if let Waiter::VCpu(v) = w {
+                victims.push(v);
+            }
+        } else {
+            s.ticket_waiters.insert(t, w);
+        }
+    }
+    if let Some(vs) = s.svc_waiters.remove(&key) {
+        victims.extend(vs);
+    }
+    let mut tickets: Vec<u64> = Vec::new();
+    for v in victims {
+        tickets.extend(reap(s, v, reason.clone()));
+    }
+    // The dying domain's *queued* (never-admitted) dispatches: their callers wake too.
+    tickets.extend(
+        dying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .svc_queue
+            .drain(..)
+            .map(|d| d.ticket),
+    );
+    wake_dead_tickets(s, tickets);
+}
+
+/// Rule 3 of the domain-lifetime decision (DESIGN.md §12, owner 2026-07-24): the **root's**
+/// completion — or the root domain's death — ends the whole run (a batch run is instantiate +
+/// one activation + drop; the owner's departure ends the domain). Every remaining parked vCPU of
+/// every domain is reaped — their outcomes unobservable (nothing will read them) — waiter stores
+/// cleared, and `shutdown` flips so idle workers exit and running siblings stop at their next
+/// safepoint (the park gate). Parked daemons are abandoned, never waited out (`MAX_WAIT` stays a
+/// pure anti-wedge backstop).
+fn teardown_run(s: &mut Sched) {
+    s.shutdown = true;
+    let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
+    victims.extend(std::mem::take(&mut s.join_waiters).into_values());
+    for (_, q) in std::mem::take(&mut s.wait_waiters) {
+        for (_, w) in q {
+            if let Waiter::VCpu(v) = w {
+                victims.push(v);
+            }
+        }
+    }
+    for (_, q) in std::mem::take(&mut s.cap_waiters) {
+        for w in q {
+            if let Waiter::VCpu(v) = w {
+                victims.push(v);
+            }
+        }
+    }
+    for (_, w) in std::mem::take(&mut s.ticket_waiters) {
+        if let Waiter::VCpu(v) = w {
+            victims.push(v);
+        }
+    }
+    for (_, vs) in std::mem::take(&mut s.svc_waiters) {
+        victims.extend(vs);
+    }
+    for v in victims {
+        let reason = s
+            .dead
+            .get(&domain_key_of(&v))
+            .cloned()
+            .unwrap_or(Trap::ThreadFault);
+        reap(s, v, reason);
+    }
+}
+
+/// The **park gate** (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24): a vCPU
+/// reaching a park safepoint after its domain — or the whole run — was torn down is reaped here
+/// instead of parking into the dead world (teardown is non-preemptive, so the sweep could not
+/// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
+/// lock as the park insert, so a teardown can never slip between the check and the park. Returns
+/// the vCPU back when its world is still alive.
+fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
+    let key = domain_key_of(&v);
+    if !s.shutdown && !s.dead.contains_key(&key) {
+        return Some(v);
+    }
+    // Run-level teardown with no recorded domain trap (the root returned Ok): the outcome is
+    // unobservable — the batch activation is over — so any terminal trap will do.
+    let reason = s.dead.get(&key).cloned().unwrap_or(Trap::ThreadFault);
+    let tickets = reap(s, v, reason);
+    wake_dead_tickets(s, tickets);
+    None
 }
 
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
@@ -4316,7 +4587,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 Vec::new()
             };
             let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
-            let outcome = Outcome {
+            // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
+            // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
+            // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
+            let key = domain_key_of(&v);
+            let dying_host = Arc::clone(&v.host);
+            let own_tickets: Vec<u64> = v
+                .handler_parks
+                .values()
+                .map(|&(_, t)| t)
+                .chain(v.serve_run.as_ref().map(|r| r.ticket))
+                .collect();
+            let mut outcome = Outcome {
                 result,
                 mem: v.mem.take(),
                 fuel: v.fuel,
@@ -4332,19 +4614,51 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 s.trap_origin
                     .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
             }
+            // §12 domain lifetime: a member of an already-dead domain finishing *after* the
+            // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
+            // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
+            // observable outcome is the domain's trap. (Never during a freeze unwind, which
+            // completes vCPUs early on purpose.)
+            if !froze && outcome.result.is_ok() {
+                if let Some(t) = s.dead.get(&key) {
+                    outcome.result = Err(t.clone());
+                }
+            }
+            let died: Option<Trap> = outcome.result.as_ref().err().cloned();
             if let Some(parent) = s.join_waiters.remove(&id) {
                 s.runnable.push_back(parent);
                 sched.work.notify_one();
             }
             s.results.insert(id, outcome);
             s.live -= 1;
+            // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
+            // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
+            // from ANY member is domain-wide teardown; the ROOT's completion (return, exit, or
+            // trap — or its domain's death via a sibling) ends the whole run, parked daemons
+            // abandoned. Gated off during a freeze unwind (`froze`): a freeze intentionally
+            // completes vCPUs early — including fail-closed `ThreadFault` refusals — and must
+            // drain every sibling, not kill it.
+            if !froze {
+                if let Some(t) = &died {
+                    teardown_domain(&mut s, key, t, &dying_host);
+                    wake_dead_tickets(&mut s, own_tickets);
+                }
+                if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
+                    teardown_run(&mut s);
+                }
+            }
             if s.live == 0 {
                 s.shutdown = true;
-                sched.work.notify_all();
             }
+            sched.work.notify_all();
         }
         Step::Park(Blocked::Join { child }) => {
             let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
             if s.results.contains_key(&child) {
                 // Already finished between the join check and here — resume immediately.
                 s.runnable.push_back(v);
@@ -4362,6 +4676,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         }) => {
             let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
             let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(mut v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
             // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
             // The value lives at the absolute `addr`; the queue/timer key is the canonical `key` (S1b).
             if v.atomic_value(addr, width) != expected {
@@ -4387,6 +4706,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // handle is now dead we wake ourselves with the same errno instead of parking
             // forever. (Lock order sched → host; the revoke path holds neither.)
             let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(mut v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
             let live = v
                 .host
                 .lock()
@@ -4408,6 +4732,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // the scheduler lock: a reply that landed before this park sits in the callee's
             // completion cell — take it and wake ourselves instead of stranding the caller.
             let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(mut v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
+            // D37 death-is-revocation: a callee torn down between the enqueue and this park will
+            // never reply (its queue was drained by the teardown before we got here) — complete
+            // with the probeable errno instead of stranding the caller.
+            let callee_dead = {
+                let cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                s.dead.contains_key(&(cg.domain_id() as usize))
+            };
             let early = callee
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4416,6 +4752,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             match early {
                 Some(r) => {
                     v.pending = Some(Pending::CapResult(r));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+                None if callee_dead => {
+                    v.pending = Some(Pending::CapResult(CAP_REVOKED));
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
@@ -4431,6 +4772,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // `svc.wait` finds the work). Multi-consumer: push alongside any sibling
             // consumers already parked on this domain (never displace them).
             let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
             let empty = v
                 .host
                 .lock()
@@ -4601,6 +4947,10 @@ struct DetState {
     clock: u64, // logical nanoseconds, advanced only to fire a timeout
     rng: u64,
     cap: usize,
+    /// §12 domain lifetime (owner 2026-07-24): the root domain's key ([`domain_key_of`] of the
+    /// root vCPU, set at creation). A trap/exit anywhere in this domain ends the whole run —
+    /// see [`det_teardown_run`]; a §14 child domain's death reaps only its members.
+    root_domain: usize,
 }
 
 impl DetState {
@@ -4670,6 +5020,95 @@ impl DetState {
     }
 }
 
+/// Reap one explorer vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner
+/// 2026-07-24): record `Err(reason)` — the owner's `poll` sees 2, `join` re-raises (I37) — and
+/// wake any cross-domain joiner. The explorer's single-threaded, so unlike the executor's
+/// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
+fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
+    let outcome = Outcome {
+        result: Err(reason.clone()),
+        mem: v.mem.take(),
+        fuel: v.fuel,
+        trap_bt: Vec::new(), // the origin's own Done recorded the true backtrace
+        trap_fiber: None,
+    };
+    let id = v.id;
+    drop(v);
+    if let Some(parent) = s.join_waiters.remove(&id) {
+        s.runnable.push(parent);
+    }
+    s.results.insert(id, outcome);
+    s.live -= 1;
+}
+
+/// DESIGN.md §12 "Domain lifetime & teardown" (owner 2026-07-24), explorer form of
+/// [`teardown_domain`]: a member's trap/exit kills every vCPU of ITS domain (the powerbox-`Arc`
+/// partition — a §14 `instantiate` child and its threads run on this same explorer with their own
+/// powerbox, so domain ≠ run here too), wherever parked. The explorer is single-threaded, so the
+/// sweep is complete — no non-preemptive residue, no dead-domain map needed. Cross-domain parks
+/// (svc/cap/ticket) fail closed on this driver, so there are no dying-callee waiters to errno.
+fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
+    let mut victims: Vec<Box<VCpu>> = Vec::new();
+    let runnable = std::mem::take(&mut s.runnable);
+    for v in runnable {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.runnable.push(v);
+        }
+    }
+    let jw = std::mem::take(&mut s.join_waiters);
+    for (k, v) in jw {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.join_waiters.insert(k, v);
+        }
+    }
+    let ww = std::mem::take(&mut s.wait_waiters);
+    for w in ww {
+        if domain_key_of(&w.vcpu) == key {
+            victims.push(w.vcpu);
+        } else {
+            s.wait_waiters.push(w);
+        }
+    }
+    let sw = std::mem::take(&mut s.spin_waiters);
+    for w in sw {
+        if domain_key_of(&w.vcpu) == key {
+            victims.push(w.vcpu);
+        } else {
+            s.spin_waiters.push(w);
+        }
+    }
+    for v in victims {
+        det_reap(s, v, reason);
+    }
+}
+
+/// Explorer form of [`teardown_run`] (rule 3, owner 2026-07-24): the root's completion — or the
+/// root domain's death — ends the whole run. Every remaining parked vCPU of every domain is
+/// reaped (outcomes unobservable; `ThreadFault` is the terminal marker) instead of scheduled on —
+/// previously the driver kept firing wait deadlines until the last sibling finished, so a
+/// sibling's trap was silently outlived by the root's timed wait.
+fn det_teardown_run(s: &mut DetState) {
+    let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
+    victims.extend(std::mem::take(&mut s.join_waiters).into_values());
+    victims.extend(
+        std::mem::take(&mut s.wait_waiters)
+            .into_iter()
+            .map(|w| w.vcpu),
+    );
+    victims.extend(
+        std::mem::take(&mut s.spin_waiters)
+            .into_iter()
+            .map(|w| w.vcpu),
+    );
+    for v in victims {
+        det_reap(s, v, &Trap::ThreadFault);
+    }
+}
+
 impl DetSched {
     fn new(seed: u64, cap: usize) -> DetSched {
         DetSched {
@@ -4684,6 +5123,7 @@ impl DetSched {
                 clock: 0,
                 rng: seed | 1,
                 cap,
+                root_domain: 0, // stamped when the driver creates the root vCPU
             }),
         }
     }
@@ -4907,6 +5347,7 @@ impl SchedDriver {
                         Vec::new()
                     };
                     let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                    let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
@@ -4916,11 +5357,22 @@ impl SchedDriver {
                     };
                     drop(v);
                     let mut s = det.lock();
+                    let died: Option<Trap> = outcome.result.as_ref().err().cloned();
                     if let Some(parent) = s.join_waiters.remove(&id) {
                         s.runnable.push(parent);
                     }
                     s.results.insert(id, outcome);
                     s.live -= 1;
+                    // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner
+                    // 2026-07-24): a trap/exit is terminal for the trapping vCPU's DOMAIN; the
+                    // root's completion — or the root domain's death — ends the whole run. Same
+                    // rules as the executor's `dispatch`, differentially pinned.
+                    if let Some(t) = &died {
+                        det_teardown_domain(&mut s, key, t);
+                    }
+                    if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
+                        det_teardown_run(&mut s);
+                    }
                 }
                 Step::Park(Blocked::Join { child }) => {
                     let mut s = det.lock();
@@ -4957,6 +5409,7 @@ impl SchedDriver {
                     Blocked::CapRead { .. } | Blocked::CapReply { .. } | Blocked::SvcWait { .. },
                 ) => {
                     let id = v.id;
+                    let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
                     drop(v);
                     let mut s = det.lock();
                     if let Some(parent) = s.join_waiters.remove(&id) {
@@ -4973,6 +5426,12 @@ impl SchedDriver {
                         },
                     );
                     s.live -= 1;
+                    // §12 teardown (owner 2026-07-24): the fail-closed park is this vCPU's
+                    // terminal trap — domain-wide, run-wide if it was the root('s domain).
+                    det_teardown_domain(&mut s, key, &Trap::CapFault);
+                    if id == ROOT_TASK || key == s.root_domain {
+                        det_teardown_run(&mut s);
+                    }
                 }
                 Step::Yield => {
                     // Spin-park: the turn ran one visible op, changed no memory, and returned the vCPU
@@ -8248,22 +8707,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
-                                            sg.ticket_waiters.insert(
-                                                t,
-                                                Waiter::Fiber {
-                                                    reg: Arc::clone(&regc),
-                                                    slot,
-                                                    svc: svck,
-                                                },
-                                            );
-                                            drop(sg);
-                                            let early = calleec
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .svc_results
-                                                .remove(&t);
-                                            if let Some(r) = early {
-                                                regc.wake_blocked(slot, Reg::from_i64(r));
+                                            // D37 death-is-revocation (§12 teardown, owner
+                                            // 2026-07-24): a callee already torn down never
+                                            // replies — complete now with the probeable errno
+                                            // instead of parking through a dead domain.
+                                            if sg.dead.contains_key(&(callee_id as usize)) {
+                                                drop(sg);
+                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
+                                            } else {
+                                                sg.ticket_waiters.insert(
+                                                    t,
+                                                    Waiter::Fiber {
+                                                        reg: Arc::clone(&regc),
+                                                        slot,
+                                                        svc: svck,
+                                                    },
+                                                );
+                                                drop(sg);
+                                                let early = calleec
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .svc_results
+                                                    .remove(&t);
+                                                if let Some(r) = early {
+                                                    regc.wake_blocked(slot, Reg::from_i64(r));
+                                                }
                                             }
                                         });
                                     }
@@ -8398,22 +8866,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             as usize;
                                         fiber_park!(|slot: usize| {
                                             let mut sg = sr.lock();
-                                            sg.ticket_waiters.insert(
-                                                t,
-                                                Waiter::Fiber {
-                                                    reg: Arc::clone(&regc),
-                                                    slot,
-                                                    svc: svck,
-                                                },
-                                            );
-                                            drop(sg);
-                                            let early = calleec
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .svc_results
-                                                .remove(&t);
-                                            if let Some(r) = early {
-                                                regc.wake_blocked(slot, Reg::from_i64(r));
+                                            // D37 death-is-revocation (§12 teardown, owner
+                                            // 2026-07-24): a callee already torn down never
+                                            // replies — complete now with the probeable errno
+                                            // instead of parking through a dead domain.
+                                            if sg.dead.contains_key(&(callee_id as usize)) {
+                                                drop(sg);
+                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
+                                            } else {
+                                                sg.ticket_waiters.insert(
+                                                    t,
+                                                    Waiter::Fiber {
+                                                        reg: Arc::clone(&regc),
+                                                        slot,
+                                                        svc: svck,
+                                                    },
+                                                );
+                                                drop(sg);
+                                                let early = calleec
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .svc_results
+                                                    .remove(&t);
+                                                if let Some(r) = early {
+                                                    regc.wake_blocked(slot, Reg::from_i64(r));
+                                                }
                                             }
                                         });
                                     }
@@ -18019,5 +18496,232 @@ mod domain_table_tests {
         );
         // An out-of-range module (a forged/stale slot) yields None → the caller traps.
         assert!(resolve_module(&parent, &mut local, &None, &dt, 9).is_none());
+    }
+}
+
+#[cfg(test)]
+mod domain_teardown_tests {
+    //! **Domain lifetime & teardown** (DESIGN.md §12 "Domain lifetime & teardown", INVARIANTS #6
+    //! "one lifetime, too", ISSUES.md I37 — owner decision 2026-07-24): executors never anchor a
+    //! domain's lifetime; ownership does. Root completion (return / `exit` / trap) ends the whole
+    //! run with parked daemons abandoned, and ANY vCPU's trap/exit is domain-wide teardown.
+    //! These pin the interpreter's two multi-vCPU drivers: the threaded M:N executor (wall-clock
+    //! bounds well under the 10 s `MAX_WAIT` anti-wedge clamp — a reintroduced
+    //! wait-out-the-daemons regression fails loudly without being timing-flaky) and the
+    //! deterministic explorer (`run_scheduled`, no clock needed — the teardown is exact).
+    use super::*;
+    use svm_text::parse_module;
+
+    /// Well under the 10 s `MAX_WAIT` clamp, well over CI jitter.
+    const PROMPT: Duration = Duration::from_secs(5);
+
+    /// Root spawns a daemon that parks on an **indefinite** `i32.atomic.wait`, does a 10 ms timed
+    /// wait of its own (nobody notifies — it times out, having let the daemon park), then calls
+    /// `Exit(3)`. The parked daemon must be abandoned at the exit, never waited out.
+    const EXIT_WITH_PARKED_DAEMON: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v1 v1
+  v3 = i64.const 8
+  v4 = i32.const 0
+  v5 = i64.const 10000000
+  v6 = i32.atomic.wait v3 v4 v5
+  v7 = i32.const 3
+  cap.call 1 0 (i32) -> () v0 (v7)
+  unreachable
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  v2 = i32.const 0
+  v3 = i64.const -1
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.const 7
+  return v5
+  }
+}
+"#;
+
+    /// Same shape, no powerbox: the root **returns** `42` with the daemon still parked — the C
+    /// rule (`main` returning is `exit`), so root completion ends the run identically.
+    const RETURN_WITH_PARKED_DAEMON: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = i64.const 8
+  v3 = i32.const 0
+  v4 = i64.const 10000000
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 42
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  v2 = i32.const 0
+  v3 = i64.const -1
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.const 7
+  return v5
+  }
+}
+"#;
+
+    /// The sibling traps (`unreachable`, func 1) while the root sits in a LONG (8 s) timed wait:
+    /// the trap is domain-wide (I37), so the run must end with it promptly — never by waiting
+    /// out the root's timeout — and the trap origin must name the sibling, not the root.
+    const SIBLING_TRAP_WHILE_ROOT_PARKED: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = i64.const 8
+  v3 = i32.const 0
+  v4 = i64.const 8000000000
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 42
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  unreachable
+  }
+}
+"#;
+
+    /// (a) threaded: `exit(n)` from the root = immediate whole-run teardown, `Exited` promptly.
+    #[test]
+    fn threaded_root_exit_abandons_parked_daemon() {
+        let m = parse_module(EXIT_WITH_PARKED_DAEMON).unwrap();
+        let mut host = Host::new();
+        let exit = host.grant_exit();
+        let mut fuel = 10_000_000u64;
+        let t0 = Instant::now();
+        let r = run_with_host(&m, 0, &[Value::I32(exit)], &mut fuel, &mut host);
+        let took = t0.elapsed();
+        assert_eq!(r, Err(Trap::Exit(3)));
+        assert!(
+            took < PROMPT,
+            "exit must not wait out the parked daemon (took {took:?})"
+        );
+    }
+
+    /// (b) threaded: the root's clean `return` ends the run the same way (a batch run is one
+    /// activation; the owner's departure ends the domain).
+    #[test]
+    fn threaded_root_return_abandons_parked_daemon() {
+        let m = parse_module(RETURN_WITH_PARKED_DAEMON).unwrap();
+        let mut fuel = 10_000_000u64;
+        let t0 = Instant::now();
+        let r = run(&m, 0, &[], &mut fuel);
+        let took = t0.elapsed();
+        assert_eq!(r, Ok(vec![Value::I64(42)]));
+        assert!(
+            took < PROMPT,
+            "root return must not wait out the parked daemon (took {took:?})"
+        );
+    }
+
+    /// (c) threaded: a sibling's trap tears the (root) domain down — the run returns THAT trap
+    /// promptly, and the first-wins `trap_origin` capture names the sibling's frames (func 1),
+    /// not the root's join/wait site.
+    #[test]
+    fn threaded_sibling_trap_ends_run_with_the_trap() {
+        let m = parse_module(SIBLING_TRAP_WHILE_ROOT_PARKED).unwrap();
+        let mut fuel = 10_000_000u64;
+        let t0 = Instant::now();
+        let (r, bt, _fiber) = run_traced(&m, 0, &[], &mut fuel);
+        let took = t0.elapsed();
+        assert_eq!(r, Err(Trap::Unreachable));
+        assert!(
+            took < PROMPT,
+            "the sibling's trap must not wait for the root's 8 s timeout (took {took:?})"
+        );
+        assert_eq!(
+            bt.first().map(|pc| pc.func),
+            Some(1),
+            "trap origin names the trapping sibling, not the torn-down root: {bt:?}"
+        );
+    }
+
+    /// (d) explorer: root return with a parked daemon — every seed yields the root's `Ok`,
+    /// with the daemon reaped, not scheduled to its (logical) timeout.
+    #[test]
+    fn scheduled_root_return_abandons_parked_daemon() {
+        let m = parse_module(RETURN_WITH_PARKED_DAEMON).unwrap();
+        for seed in 0..16 {
+            let r = run_scheduled(&m, 0, &[], 1_000_000, seed);
+            assert_eq!(r, Ok(vec![Value::I64(42)]), "seed {seed}");
+        }
+    }
+
+    /// (d) explorer: a sibling's trap is the run's result on every interleaving — previously the
+    /// explorer fired the root's wait deadline and returned its `Ok(42)`, silently outliving the
+    /// trap (and an indefinitely-parked daemon degraded to `ThreadFault`).
+    #[test]
+    fn scheduled_sibling_trap_surfaces_the_trap() {
+        let m = parse_module(SIBLING_TRAP_WHILE_ROOT_PARKED).unwrap();
+        for seed in 0..16 {
+            let r = run_scheduled(&m, 0, &[], 1_000_000, seed);
+            assert_eq!(r, Err(Trap::Unreachable), "seed {seed}");
+        }
+    }
+
+    /// Domain **scoping**: a §14 `instantiate` live child (own powerbox, same scheduler) traps —
+    /// only ITS domain dies; the run continues and the owner observes the death as a value:
+    /// `poll` (iface 6 op 9) reports status 2 (trapped, non-propagating — the I37 supervision
+    /// idiom), which the root returns. The owner's world must NOT be torn down.
+    const CHILD_TRAP_POLLED: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  br 1(v0, v5)
+}
+block 1 (v6: i32, v7: i32) {
+  v8 = cap.call 6 9 (i32) -> (i32) v6 (v7)
+  v9 = i32.const 0
+  v10 = i32.eq v8 v9
+  br_if v10 2(v6, v7) 3(v8)
+}
+block 2 (v11: i32, v12: i32) {
+  v13 = i64.const 8
+  v14 = i32.const 0
+  v15 = i64.const 5000000
+  v16 = i32.atomic.wait v13 v14 v15
+  br 1(v11, v12)
+}
+block 3 (v17: i32) {
+  v18 = i64.extend_i32_u v17
+  return v18
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  unreachable
+  }
+}
+"#;
+
+    #[test]
+    fn threaded_live_child_trap_kills_only_its_domain() {
+        let m = parse_module(CHILD_TRAP_POLLED).unwrap();
+        let mut host = Host::new();
+        let inst = host.grant_instantiator(0, 128 << 10);
+        let mut fuel = 10_000_000u64;
+        let r = run_with_host(&m, 0, &[Value::I32(inst)], &mut fuel, &mut host);
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(2)]),
+            "the owner survives its child's trap and polls status 2"
+        );
     }
 }
