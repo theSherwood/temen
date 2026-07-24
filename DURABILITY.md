@@ -2177,11 +2177,24 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      serving). **Remaining:** 4d `LiveImpl` capture — a parent holding a live cap onto a
      serving child still refuses; the cross-domain *call* path (op-14 offer + parked caller)
      is the last fixture.
-   * **4d — live-cap re-link:** capture `Binding::LiveImpl` as a durable descriptor naming
-     its callee **structurally** — the `(parent_task, slot)` of the callee's own nested
-     record (a `DomainId` is process-local, so the artifact never carries it; the id is
-     re-minted and re-linked at thaw). Lifts the caller-side capture refusal for in-cut
-     callees; an out-of-cut callee stays non-durable (O10 is the cross-cut story).
+   * **4d — live-cap re-link: BUILT 2026-07-24.** `Binding::LiveImpl` is now durably
+     capturable when it names a §14 child: `child_offer` (op 14) records the callee's **join
+     slot** on the `LiveImplEntry` (`wire_live_impl_child`), and `capture_durable_handles`
+     emits a structural `DurableBinding::LiveImpl { slot, export }` (snapshot v15 — no
+     `DomainId`/`Arc` on the wire). A wire / child-regrant mint (no §14 child behind it) keeps
+     the `callee_slot: None` and stays non-durable (freeze still refuses). Restore is
+     **two-phase**: `restore_durable_handles` installs a placeholder entry + records a pending
+     re-link (the callee host doesn't exist yet); the thaw's nested re-creation collects each
+     direct child's host by join slot and `relink_live_impl`s the placeholder to it,
+     re-fetching the offer shape from the re-created child's module. Pinned in
+     `svm-snapshot/tests/roundtrip.rs`
+     (`a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked`): a supervisor
+     mints a cap over a child server's `echo`, parks in `svc.wait` holding it, freezes on
+     quiesce (was `ThreadFault` pre-4d), and after thaw calls `echo(7)` through the re-linked
+     cap — reaching the re-created child (serving from its own re-parked accept loop) and
+     returning 107. Follow-ups: a **nested holder's** pending re-links (a child holding a cap
+     onto a grandchild — the thaw patches only the root's pending today) and the
+     wire/child-regrant durable name (a sibling-provenance path).
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options

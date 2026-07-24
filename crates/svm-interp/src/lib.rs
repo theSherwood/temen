@@ -2102,6 +2102,10 @@ fn drive_arc(
             // absolute base + its own recorded offset — accumulated down the chain here.
             let mut abs_off: std::collections::BTreeMap<TaskId, u64> =
                 std::collections::BTreeMap::new();
+            // §13.4 slice 4d: the re-created **direct** children's host Arcs, by join slot, so a
+            // holder's restored `LiveImpl` can be re-linked to its callee after the rebuild.
+            let mut direct_child_hosts: std::collections::BTreeMap<usize, Arc<Mutex<Host>>> =
+                std::collections::BTreeMap::new();
             for fnr in nseed {
                 let parent = fnr.parent_task as TaskId;
                 // The parent-child's absolute carve base (0 for a direct child of the root).
@@ -2245,12 +2249,18 @@ fn drive_arc(
                     children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
                 };
                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
+                // can be re-linked to it once the whole subtree is rebuilt (below).
+                let child_host = Arc::new(Mutex::new(ch));
+                if parent == id {
+                    direct_child_hosts.insert(fnr.slot, Arc::clone(&child_host));
+                }
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&cfuncs),
                     fnr.entry,
                     &child_args,
                     child_mem,
-                    Arc::new(Mutex::new(ch)),
+                    child_host,
                     *fuel,
                     cdepth,
                     cid,
@@ -2291,6 +2301,22 @@ fn drive_arc(
                 }
                 abs_off.insert(cid, abs_carve);
                 children.insert(cid, child);
+            }
+            // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-created
+            // direct children now that the subtree exists — the holder's rewound call then
+            // dispatches to the live callee exactly as before the freeze. (A nested holder's
+            // pending re-links — a child holding a cap onto a grandchild — are a follow-up.)
+            let pending = host_shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_pending_live_impls();
+            for (idx, cslot, export) in pending {
+                if let Some(chost) = direct_child_hosts.get(&cslot) {
+                    host_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .relink_live_impl(idx, Arc::clone(chost), export);
+                }
             }
             // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
             for (_, child) in children {
@@ -7792,17 +7818,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let export =
                                 get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
                                     as u32;
-                            let cap = resolve_thread(threads, ch)
-                                .ok()
-                                .and_then(|slot| child_hosts.get(&slot).cloned())
-                                .and_then(|callee| {
-                                    let sigs = callee
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .offer_shape(export)?;
-                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.wire_live_impl(&callee, export, &sigs).ok()
-                                });
+                            let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
+                                let callee = child_hosts.get(&slot).cloned()?;
+                                let sigs = callee
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .offer_shape(export)?;
+                                let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                // §13.4 4d: record the child's join `slot` — the live impl's
+                                // durable structural name, re-linked to the re-created child on thaw.
+                                Some(hg.wire_live_impl_child(&callee, export, &sigs, slot))
+                            });
                             frames[top]
                                 .vals
                                 .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
@@ -11302,8 +11328,22 @@ pub enum DurableBinding {
     Clock,
     Memory,
     Yielder,
-    AddressSpace { base: u64, size: u64 },
-    Instantiator { base: u64, size: u64 },
+    AddressSpace {
+        base: u64,
+        size: u64,
+    },
+    Instantiator {
+        base: u64,
+        size: u64,
+    },
+    /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
+    /// **structurally** by the callee's join `slot` in the holder's own table + the offer
+    /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
+    /// re-links it to the re-created child at `slot` (its host + re-fetched offer shape).
+    LiveImpl {
+        slot: u32,
+        export: u32,
+    },
 }
 
 /// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
@@ -11735,6 +11775,12 @@ struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
     sigs: Arc<[FuncType]>,
+    /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
+    /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
+    /// `child_offer` (op 14) mint over a §14 child — the only durably-capturable live impl,
+    /// since a thaw re-links it to the re-created child at this slot. `None` for a wire /
+    /// child-regrant mint (no §14 child behind it), which stays non-durable (freeze refuses).
+    callee_slot: Option<usize>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -11931,6 +11977,12 @@ pub struct Host {
     serve_native_ctx: usize,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
+    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
+    /// child: `(live_impls index, callee join slot, offer export)`. Populated by
+    /// [`Host::restore_durable_handles`] (the callee host doesn't exist yet at restore); drained
+    /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
+    /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
+    pending_live_impls: Vec<(u32, usize, u32)>,
     /// PROCESS.md §5 — the side table a [`Binding::WindowMinter`] indexes: each entry the
     /// minter's **remaining byte quota**, deducted at every detached mint (numeric,
     /// host-enforced; no refund on child completion — the quota bounds lifetime total, v1).
@@ -12223,6 +12275,7 @@ impl Host {
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
             live_impls: Vec::new(),
+            pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
             pool: None,
             rings: Vec::new(),
@@ -12849,8 +12902,21 @@ impl Host {
                 Binding::GuestImpl(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
                 }
-                Binding::LiveImpl(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::LiveImpl))
+                Binding::LiveImpl(idx) => {
+                    // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
+                    // slot) is durably capturable — named structurally so the thaw re-links it.
+                    // A wire / child-regrant mint (no §14 child behind it) stays non-durable.
+                    match self
+                        .live_impls
+                        .get(idx as usize)
+                        .and_then(|e| e.callee_slot)
+                    {
+                        Some(cslot) => DurableBinding::LiveImpl {
+                            slot: cslot as u32,
+                            export: self.live_impls[idx as usize].export,
+                        },
+                        None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
+                    }
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
@@ -12947,8 +13013,45 @@ impl Host {
                 DurableBinding::Yielder => Binding::Yielder,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+                DurableBinding::LiveImpl { slot, export } => {
+                    // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
+                    // patched once the §14 child at `slot` is re-created — see
+                    // [`Host::take_pending_live_impls`]) and record the pending re-link. The
+                    // placeholder is never dispatched to: the thaw patches it before the holder
+                    // re-enters guest code.
+                    let idx = self.live_impls.len() as u32;
+                    self.live_impls.push(LiveImplEntry {
+                        callee: Arc::new(Mutex::new(Host::new())),
+                        export,
+                        sigs: Vec::<FuncType>::new().into(),
+                        callee_slot: Some(slot as usize),
+                    });
+                    self.pending_live_impls.push((idx, slot as usize, export));
+                    Binding::LiveImpl(idx)
+                }
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
+        }
+    }
+
+    /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
+    /// export)`), for the thaw to patch once the §14 children exist. Cleared on take.
+    pub fn take_pending_live_impls(&mut self) -> Vec<(u32, usize, u32)> {
+        std::mem::take(&mut self.pending_live_impls)
+    }
+
+    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-created §14
+    /// child `callee`, re-fetching the offer's shape from the child's registered module (the
+    /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
+    /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
+    pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
+        let sigs = callee
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .offer_shape(export);
+        if let (Some(e), Some(sigs)) = (self.live_impls.get_mut(idx as usize), sigs) {
+            e.callee = callee;
+            e.sigs = sigs.into();
         }
     }
 
@@ -13331,7 +13434,21 @@ impl Host {
         export: u32,
         sigs: &[FuncType],
     ) -> Result<i32, Trap> {
-        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into()))
+        // No §14 child slot behind an embedder wire — non-durable (freeze refuses).
+        Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
+    }
+
+    /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
+    /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
+    /// re-links it to the re-created child at this slot).
+    fn wire_live_impl_child(
+        &mut self,
+        callee: &Arc<Mutex<Host>>,
+        export: u32,
+        sigs: &[FuncType],
+        callee_slot: usize,
+    ) -> i32 {
+        self.install_live_impl(Arc::clone(callee), export, sigs.into(), Some(callee_slot))
     }
 
     /// Install a live-callee offer entry + grant its handle — shared by the wire
@@ -13342,6 +13459,7 @@ impl Host {
         callee: Arc<Mutex<Host>>,
         export: u32,
         sigs: Arc<[FuncType]>,
+        callee_slot: Option<usize>,
     ) -> i32 {
         let type_id = self.intern_interface(&sigs);
         let idx = self.live_impls.len() as u32;
@@ -13349,6 +13467,7 @@ impl Host {
             callee,
             export,
             sigs,
+            callee_slot,
         });
         self.grant(type_id, Binding::LiveImpl(idx))
     }
@@ -14253,7 +14372,10 @@ impl Host {
         // intern never touches the callee's lock.
         if let Some(e) = self.resolve_live_impl(handle) {
             let (callee, export, sigs) = (Arc::clone(&e.callee), e.export, Arc::clone(&e.sigs));
-            return Some(child.install_live_impl(callee, export, sigs));
+            // The callee's join slot is the *parent's* structural name, meaningless in the
+            // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
+            // a re-grant's durable name would be the sibling's provenance path).
+            return Some(child.install_live_impl(callee, export, sigs, None));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling
