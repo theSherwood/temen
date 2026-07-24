@@ -162,7 +162,7 @@ all three backends, for memory-safety validation and cache/page-fault scoring; a
 | `svm-interp` | Two of the four IR backends: the **tree-walk interpreter** (the differential oracle, §18) and the **bytecode interpreter** (`bytecode.rs` — the portable / JIT-not-viable path, incl. the wasm64 browser platform). All four backends must agree (§3 parity invariant) | — |
 | `svm-fiber` | Native stack-switch primitive for fibers / green threads (§3d/§6/§12); the lone home for that `unsafe`, tiny and auditable (x86-64 + aarch64 unix, x86-64 Windows) | escape-TCB |
 | `svm-jit` | **Cranelift JIT** (backend 3, the native speed path) — CLIF lowering + the §4 masking lowering + guard page/signal (§9). By convention bare "JIT" means *this* one | escape-TCB† |
-| `svm-wasmjit` | **wasm-JIT** (backend 4; canonical crate name `svm-wasm-jit`, rename pending) — emits WebAssembly from the IR so hot compute runs on a wasm engine (§21, `BROWSER.md`); a leaf accelerator under the bytecode interpreter, fail-closed to it | escape-TCB† |
+| `svm-wasm-jit` | **wasm-JIT** (backend 4) — emits WebAssembly from the IR so hot compute runs on a wasm engine (§21, `BROWSER.md`); a leaf accelerator under the bytecode interpreter, fail-closed to it. Held against the tree-walk oracle (`tests/differential.rs`) | escape-TCB† |
 | `svm-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `svm-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction (`WASM.md`) | — |
 | `svm-llvm` | **LLVM-bitcode → IR translator** — the AOT LLVM on-ramp (untrusted, re-verified); dominance-SSA → block-args (§20a, D54; `LLVM.md`) | — |

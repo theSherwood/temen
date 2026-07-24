@@ -301,7 +301,7 @@ naming; use these names (see "Naming standard" below).
    faster than the tree-walker and is the **portable** execution path for targets
    where a JIT is unavailable, and the JIT-not-viable fallback generally.
 3. **Cranelift JIT** (crate `svm-jit`) — the production native **speed** path (§9).
-4. **wasm-JIT** (crate `svm-wasm-jit`, currently `svm-wasmjit`) — emits WebAssembly
+4. **wasm-JIT** (crate `svm-wasm-jit`) — emits WebAssembly
    from the IR so hot guest compute runs on a wasm engine's optimizing tiers (§21,
    `BROWSER.md`). Fail-closed like the Cranelift JIT: anything outside its subset
    (`Error::Unsupported`) stays on the bytecode interpreter, which drives. It is a
@@ -338,10 +338,10 @@ continuously differential-tested:
   `crates/svm/tests/jit_diff.rs`);
 - the **wasm-JIT is held against the tree-walk oracle** the same way — NaN-insensitive,
   since the wasm engine's NaN propagation is likewise host-defined — on its supported
-  subset (`crates/svm-wasmjit/tests/differential.rs`). *(Today that differential
-  anchors on the bytecode interpreter, which is itself bit-exact to the tree-walker;
-  re-anchoring it directly on the tree-walk oracle is a pending test slice — the
-  invariant is the tree-walk oracle either way, via a bit-exact hop.)*
+  subset (`crates/svm-wasm-jit/tests/differential.rs` and the sibling `mixed`/`cross_tier`/
+  `entry_data`/`simd` gates, whose `oracle()` helpers run `svm_interp::run`; the cross-tier
+  interp-leaf drivers still run on the bytecode engine, since that is the production
+  behavior under test, not the oracle).
 
 Where a fast backend does not implement an op, that module is excluded from its
 differential corpus; every op it *does* support must match exactly. This four-way
@@ -2922,7 +2922,7 @@ as open-ended, not a byproduct of the build.
   the Cranelift JIT (`jit_diff`) and the bytecode interpreter (`bytecode_diff`, bit-exact)
   against it on a large random corpus — catches codegen/compile bugs without expert eyes.
   The wasm-JIT is held against the same oracle by its own harness
-  (`svm-wasmjit/tests/differential.rs`). This is the §3 parity invariant (four backends, one
+  (`svm-wasm-jit/tests/differential.rs`). This is the §3 parity invariant (four backends, one
   observable behavior).
 - **Fuzz the verifier from day one** (invariant: verified ⇒ cannot escape) — the
   one security validation that doesn't need a continuous expert in the loop.
