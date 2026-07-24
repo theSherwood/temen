@@ -378,9 +378,23 @@ duplicated lines that will drift. Recommendation: **(b) for the first chibicc br
 proves the reuse), then **(a)** once both guests are green (factor with two proven consumers, not
 one). Owner call before implementing.
 
-**Validation (slice 2, the real gate — NOT yet done).** A run harness instantiates `chibicc.svmb`
-on the `fs` cap with memfs seeded (source `.c` + `/include`), runs `main`, captures the emitted IR,
-and asserts it **byte-matches native `chibicc --emit-ir`** — starting with an integer-only program
-(never touches `%.17g`), then floats, then the demo corpus (§7 step 5). This is where any libc bug
-(the arena allocator, the memstream `FILE*`, the fd-dispatch) surfaces; budget iteration. Slice 1
-proves the module is *well-formed and complete*; slice 2 proves it is *correct*.
+**Validation (slice 2 — done 2026-07-24, the real gate).** `crates/svm-run/examples/chibicc_run.rs`
+instantiates `chibicc.svmb` on the `fs` cap with a memfs seeded (source `.c` + optional `/include`),
+passes argv, runs `main` on the **tree-walker** (the oracle engine), and forwards the guest's
+stdout. `run_selfhost_diff.sh` asserts that stdout **byte-matches** a native reference built from the
+*same* cc1 TUs + `cc1_main.c` (`chibicc_ref`) — so the only variables are the substrate (guest libc +
+SVM interpreter vs system libc + native CPU). Three cases pass byte-for-byte:
+- **int** — recursion, arrays, loops: the full tokenize→parse→codegen_ir pipeline + arena allocator.
+- **float** — `double`/`float` literals + arithmetic: the codegen emits f64/f32 constants through the
+  byte-exact `%.17g` path (`printf_shim` → `__vm_fmt_gen`). *This case caught a real bug — in the
+  oracle, not the guest:* the native ref, built `-mlong-double-64`, was calling the system 80-bit
+  `strtold` and reading back garbage; the guest (whose `strtold`→`strtod`) was already correct.
+  `native_ref_shims.c` gives the reference the same forwarding, making it apples-to-apples.
+- **hdr** — `#include <stdbool.h>`/`<stdint.h>`: preprocess reaches the memfs `/include` mount and
+  reads real headers. `cc1_main.c` gained an optional leading `-Idir` so the native side can point at
+  the real header tree (the guest keeps its `/include` default); it never appears in the emitted IR.
+
+The one normalization: `-g` writes `debug.file 0 "<argv[1]>"`, which echoes the input path (host path
+vs `/in.c`); the script rewrites that single quoted path before diffing. Everything else is an exact
+match. Slice 1 proved the module *well-formed and complete*; slice 2 proves it *correct* on this
+corpus. Next: widen the corpus toward chibicc's own `test/*.c` and wire the differential into CI.

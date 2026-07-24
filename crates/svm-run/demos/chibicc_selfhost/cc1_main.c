@@ -31,15 +31,21 @@ int align_to(int n, int align) {
   return (n + align - 1) / align * align;
 }
 
-// usage: chibicc <in.c> [out]   ("-"/absent → stdout). Include path fixed to /include — the
-// memfs seed mounts frontend/chibicc/include there (§5 C).
+// usage: chibicc [-Idir] <in.c> [out]   ("-"/absent out → stdout). The include dir defaults to
+// /include — where the memfs seed mounts frontend/chibicc/include for the guest (§5 C). The
+// optional leading -Idir lets the native reference (self-host differential, run_selfhost_diff.sh)
+// point at the real header tree instead, since /include doesn't exist on a host fs; it never
+// affects the emitted IR (headers aren't named in the output), so both sides stay comparable.
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: chibicc <in.c> [out]\n");
+  char *inc = "/include";
+  int ai = 1;
+  if (argc > ai && argv[ai][0] == '-' && argv[ai][1] == 'I') { inc = argv[ai] + 2; ai++; }
+  if (argc <= ai) {
+    fprintf(stderr, "usage: chibicc [-Idir] <in.c> [out]\n");
     return 2;
   }
-  base_file = argv[1];
-  strarray_push(&include_paths, "/include");
+  base_file = argv[ai];
+  strarray_push(&include_paths, inc);
 
   Token *tok = tokenize_file(base_file);
   if (!tok) {
@@ -50,10 +56,10 @@ int main(int argc, char **argv) {
   Obj *prog = parse(tok);
 
   FILE *out = stdout;
-  if (argc >= 3 && strcmp(argv[2], "-") != 0) {
-    out = fopen(argv[2], "w");
+  if (argc > ai + 1 && strcmp(argv[ai + 1], "-") != 0) {
+    out = fopen(argv[ai + 1], "w");
     if (!out) {
-      fprintf(stderr, "%s: cannot open for writing\n", argv[2]);
+      fprintf(stderr, "%s: cannot open for writing\n", argv[ai + 1]);
       return 1;
     }
   }
