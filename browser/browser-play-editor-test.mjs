@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 // when the Lua asset is actually built — otherwise it's SKIPped, not failed.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_eval.svmb'));
+const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.svmb'));
 
 const chromium = (await import('playwright')).chromium;
 const { server, port } = await startServer(process.cwd());
@@ -88,6 +89,31 @@ try {
     luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the card editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
   } else {
     console.log('  SKIP: editable-module stdin (lua_eval.svmb not built — run build-onramp-assets.mjs)');
+  }
+
+  // The C-compiler card mounted a C-mode editor.
+  const cc = await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`)?.CodeMirror?.getOption('mode'),
+    card('C compiler (chibicc → SVM — compile & run)'));
+  cc === 'text/x-csrc' ? ok('chibicc card → C mode') : fail(`chibicc mode: ${cc}`);
+
+  // …and running it compiles the editor's C with chibicc.svmb IN THE BROWSER, svm_parse-es the emitted
+  // IR, runs the result, and shows main()'s return value. A trivial program pins an exact expected
+  // value; the stdout pane must carry the emitted SVM IR. (Skipped when the asset isn't built.)
+  if (chibiccBuilt) {
+    const ccName = 'C compiler (chibicc → SVM — compile & run)';
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      'int main(void){ int x = 7 * 6; return x; }'), card(ccName));
+    await runCard(page, ccName, 30_000);
+    const cco = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      result: document.querySelector(`${sel} .result`).textContent,
+      ir: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    cco.state === 'done' && cco.result === '42' && cco.ir.includes('func') && cco.ir.includes('_start')
+      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser)')
+      : fail(`chibicc run: ${JSON.stringify({ state: cco.state, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+  } else {
+    console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }
 
   // The SQL card mounted a SQL-mode editor.

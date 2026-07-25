@@ -407,6 +407,12 @@ jobs:
         env:
           SVM_PG_CACHE: /tmp/svm_pg_cache
         run: node build-pg-assets.mjs
+      # Stage chibicc.svmb for the playground C-compiler card so browser-play-editor-test.mjs runs its
+      # compile-and-run assertion (rather than SKIPping). Uses the same LLVM-18/clang installed above;
+      # fail-soft so a build hiccup degrades to a SKIP, never a red build (the test guards on the asset).
+      - name: build + stage chibicc asset
+        working-directory: browser
+        run: node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
       # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
       # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
       - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)

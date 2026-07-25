@@ -49,6 +49,16 @@ fn main() {
     let module = svm_encode::decode_module(&bytes).expect("decode .svmb");
     let inst = svm_run::instantiate(module).expect("instantiate (verifies)");
 
+    // SVM_CHIBICC_BACKEND selects the engine: treewalk (the oracle, default), bytecode (what the
+    // browser runs), or jit (Cranelift — the compiling-backend proxy for the browser's wasm-jit).
+    // The self-host differential runs all three to prove the guest compiles identically on each.
+    let backend = match std::env::var("SVM_CHIBICC_BACKEND").as_deref() {
+        Ok("bytecode") => Backend::Bytecode,
+        Ok("jit") => Backend::Jit,
+        Ok("treewalk") | Err(_) => Backend::TreeWalk,
+        Ok(other) => panic!("SVM_CHIBICC_BACKEND: unknown engine {other:?}"),
+    };
+
     let cfg = RunConfig {
         limits: Limits {
             fuel: None,
@@ -62,26 +72,58 @@ fn main() {
         env: vec![],
     };
     let run = inst
-        .run_with_caps(
-            Backend::TreeWalk,
-            &cfg,
-            &[("fs", fs::mem_fs_seeded(files, dirs))],
-        )
+        .run_with_caps(backend, &cfg, &[("fs", fs::mem_fs_seeded(files, dirs))])
         .expect("run chibicc guest");
 
-    // Forward exactly what the guest produced; the script diffs our stdout against native.
     use std::io::Write;
-    std::io::stdout().write_all(&run.stdout).unwrap();
     std::io::stderr().write_all(&run.stderr).unwrap();
-    match run.outcome {
-        Outcome::Returned(vals) => {
-            // main returned N → the on-ramp _start passes it to exit; treat non-empty i32 as code.
-            let code = match vals.first() {
-                Some(svm_run::Value::I32(n)) => *n,
+    if !matches!(&run.outcome, Outcome::Returned(_) | Outcome::Exited(0)) {
+        eprintln!("chibicc guest did not exit cleanly: {:?}", run.outcome);
+        exit(1);
+    }
+    let ir = run.stdout;
+
+    // SVM_CHIBICC_EXEC=1 runs the *full playground pipeline*: instead of printing the IR, parse it
+    // (svm_text::parse_module — the same entry the browser cdylib's encode step uses), instantiate
+    // the compiled program, run it on the same engine, and exit with its result. This is the local
+    // mirror of the browser demo (compile in-SVM → encode → run in-SVM → surface the result).
+    if std::env::var("SVM_CHIBICC_EXEC").as_deref() == Ok("1") {
+        let text = String::from_utf8(ir).expect("guest IR is not UTF-8");
+        let out_mod = svm_text::parse_module(&text).expect("parse compiled IR");
+        let out_inst = svm_run::instantiate(out_mod).expect("instantiate compiled program");
+        let out_cfg = RunConfig {
+            limits: Limits {
+                fuel: None,
+                deadline: None,
+                max_fibers: 0,
+                max_vcpus: 0,
+            },
+            stdin: vec![],
+            memory_size_log2: None,
+            args: vec![],
+            env: vec![],
+        };
+        let out_run = out_inst
+            .run(backend, &out_cfg)
+            .expect("run compiled program");
+        std::io::stdout().write_all(&out_run.stdout).unwrap();
+        std::io::stderr().write_all(&out_run.stderr).unwrap();
+        match out_run.outcome {
+            Outcome::Returned(vals) => exit(match vals.first() {
+                Some(svm_run::Value::I32(n)) => *n & 0xff,
                 _ => 0,
-            };
-            exit(code);
+            }),
+            Outcome::Exited(code) => exit(code & 0xff),
         }
+    }
+
+    // Default: forward the emitted IR (the differential diffs our stdout against native).
+    std::io::stdout().write_all(&ir).unwrap();
+    match run.outcome {
+        Outcome::Returned(vals) => exit(match vals.first() {
+            Some(svm_run::Value::I32(n)) => *n,
+            _ => 0,
+        }),
         Outcome::Exited(code) => exit(code),
     }
 }

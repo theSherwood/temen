@@ -193,6 +193,33 @@ compiler bug is a clean error, never an escape.
    output in the pane. The encode step reuses the cdylib's existing `svm_parse`. Gated by a
    Playwright test in the `real-browser` CI job (the `browser-play-editor-test.mjs` pattern):
    compile ≥2 corpus programs in Chromium, run them, assert output matches the native build's.
+
+   **→ Step-5 slice A done 2026-07-24 — engine parity settled (the prerequisite).** `chibicc_run.rs`
+   takes `SVM_CHIBICC_BACKEND`; `run_selfhost_diff.sh` runs every case on **treewalk / bytecode / jit**
+   and all three emit **byte-identical IR** vs native. Engine decision for the playground card:
+   **bytecode engine (`jit: false`)**. The browser's whole-module wasm-JIT tier is *integer-subset
+   only* — `svm_wasmjit::compile_module(chibicc.svmb)` fails "a function is outside the integer
+   subset" (chibicc uses floats: the `%.17g`/`__vm_fmt` path). That is expected and not a blocker: the
+   playground already runs float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
+   per-demo `jit` flag (`browser/web/play.js`); the wasm-JIT is an opt-in accelerator for integer
+   modules, not the only path. chibicc's compiled *outputs* run on bytecode too (integer-only ones may
+   opt into wasm-JIT later). No substrate change; making the wasm tier accept floats is out of scope.
+
+   **→ Step 5 DONE 2026-07-24 — the capstone runs in the browser.** The playground has a "C compiler
+   (chibicc → SVM)" card (`browser/web/play.js`, `kind: 'chibicc'`): edit C → the page runs
+   `chibicc.svmb` on the bytecode engine, seeding the source on an `fs` cap at `/in.c`
+   (new cdylib export `svm_run_onramp_fs`, which generalizes the Postgres `pg_setup` memfs+argv path)
+   → SVM-IR text → `svm_parse` → run → `main()`'s return value, all client-side. Built + verified:
+   - **Local capstone loop** (`run_selfhost_diff.sh`): in-SVM compile-and-run of the return-value corpus
+     (`corpus/{sum,sort,hash}.c`) matches native clang on every engine.
+   - **Full browser path proven in Rust** (compile via `onramp_fs_exec` → `parse_module` → run via
+     `onramp_exec`) and **in Chromium** — the Playwright gate (`browser-play-editor-test.mjs`) asserts a
+     C program compiles-and-runs in-browser to an exact value with SVM IR in the output pane.
+   - `build-onramp-assets.mjs` stages `chibicc.svmb`; the `real-browser` CI job builds it so the test
+     runs there (fail-soft → SKIP if the toolchain is absent, the Lua pattern).
+   Scope: header-free return-value programs (the compiled output has no libc; a `printf` compiles to an
+   unresolved `call.sym "printf"`). Follow-ups: `#include` support (seed a header image — the export
+   already accepts one), and a `printf`→Stream output convention for text-emitting programs.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

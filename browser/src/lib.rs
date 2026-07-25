@@ -2131,7 +2131,11 @@ fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
 /// data `image`, and build the `--single` argv image. Returns `(host, init_mem, fs handle)` or a
 /// `STATUS_*` on failure. `host`'s stdin is left empty and non-blocking; the caller sets those per
 /// run mode.
-fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::MemFsHandle), i32> {
+fn pg_setup(
+    m: &svm_ir::Module,
+    image: &[u8],
+    argv: &[&[u8]],
+) -> Result<(Host, Vec<u8>, svm_fs::MemFsHandle), i32> {
     // IMPORTS.md phase 4: an import-bearing module must be a manifest module (paramless exported
     // `_start`) — the runtime binds slots, it never rewrites. Fail closed otherwise.
     onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
@@ -2180,9 +2184,9 @@ fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::
     let (fs_hostfn, fs_handle) = svm_fs::mem_fs_seeded_shared(files, dirs);
     let fsh = host.grant_host_fn(fs_hostfn);
     host.register_cap_name("fs", fsh);
-    // Seed `argv` at the powerbox args base: a slashed argv[0] so `find_my_exec` resolves.
-    let argv: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
-    let blob = pg_args_blob(&argv);
+    // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
+    // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`).
+    let blob = pg_args_blob(argv);
     let base = svm_ir::POWERBOX_ARGS_BASE as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
@@ -2198,6 +2202,19 @@ fn pg_setup(m: &svm_ir::Module, image: &[u8]) -> Result<(Host, Vec<u8>, svm_fs::
 /// exit, memory, fs` caps are reached by name (`cap.self.resolve`) or through the module's manifest
 /// slot bindings — the paramless `_start` takes no handle args (IMPORTS.md phase 4).
 pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
+    onramp_fs_exec(m, image, &PG_SINGLE_ARGV, stdin)
+}
+
+/// The Postgres `--single` argv (a slashed `argv[0]` so `find_my_exec` resolves).
+const PG_SINGLE_ARGV: [&[u8]; 5] = [b"./postgres", b"--single", b"-D", b".", b"postgres"];
+
+/// Generic on-ramp run with a seeded multi-file `fs` cap + caller-supplied `argv` — the shape
+/// [`pg_exec`] (Postgres) and [`svm_run_onramp_fs`] (chibicc-the-guest) share. Mounts the memfs
+/// `image` on the `fs` cap, seeds `argv` at `POWERBOX_ARGS_BASE`, feeds `stdin`, and runs `_start`
+/// on the reserved-window engine (the guest may grow a heap through the `memory` cap). Unlike
+/// [`onramp_exec`], the guest reads its input from served files, not stdin — chibicc `fopen`s
+/// `/in.c` + `/include/*.h`.
+pub fn onramp_fs_exec(m: &svm_ir::Module, image: &[u8], argv: &[&[u8]], stdin: &[u8]) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         status,
         value: 0,
@@ -2206,7 +2223,7 @@ pub fn pg_exec(m: &svm_ir::Module, image: &[u8], stdin: &[u8]) -> PbOutcome {
         stderr: Vec::new(),
         framebuffer: None,
     };
-    let (mut host, init_mem, _fs) = match pg_setup(m, image) {
+    let (mut host, init_mem, _fs) = match pg_setup(m, image, argv) {
         Ok(setup) => setup,
         Err(status) => return unsupported(status),
     };
@@ -2274,6 +2291,66 @@ pub extern "C" fn svm_run_pg(
         return 0;
     }
     let out = pg_exec(&m, image, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// **Run chibicc-the-guest to compile a C source** — the playground C-compiler demo (SELFHOST_C.md
+/// §7 step 5). Decode + verify the compiler module at `[mod_ptr, mod_len)`, build an in-memory `fs`
+/// mounting the user's source at `in.c` (the guest opens `/in.c`) plus, if `img_len > 0`, the chibicc
+/// headers from the `encode_image` blob at `[img_ptr, img_len)` (its `include/*.h`), seed
+/// `argv = ["chibicc", "/in.c"]`, and run. The emitted SVM-IR **text** comes back on
+/// `svm_stdout_ptr`/`_len`, ready to hand to [`svm_parse`] → a runnable module. Passing an empty
+/// header image compiles header-free sources (the return-value demo corpus). Sets
+/// [`svm_status`]/[`svm_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
+#[no_mangle]
+pub extern "C" fn svm_run_onramp_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    // Assemble the memfs from the source + the optional header image (headers under `include/`,
+    // which chibicc's fixed `/include` search path resolves against). The guest maps the absolute
+    // `/in.c`/`/include/*` back to these cap-relative keys (`in.c`, `include/…`).
+    let (mut files, dirs) = if img_len == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+        match svm_fs::decode_image(image) {
+            Ok(seed) => seed,
+            Err(_) => {
+                set(STATUS_DECODE_ERR);
+                return 0;
+            }
+        }
+    };
+    files.push(("in.c".to_string(), src.to_vec()));
+    let image = svm_fs::encode_image(&files, &dirs);
+    let out = onramp_fs_exec(&m, &image, &[b"chibicc", b"/in.c"], &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -2387,7 +2464,7 @@ pub extern "C" fn svm_pg_open(
         set(STATUS_VERIFY_ERR);
         return -STATUS_VERIFY_ERR;
     }
-    let (mut host, init_mem, fs_snap) = match pg_setup(&m, image) {
+    let (mut host, init_mem, fs_snap) = match pg_setup(&m, image, &PG_SINGLE_ARGV) {
         Ok(setup) => setup,
         Err(status) => {
             set(status);

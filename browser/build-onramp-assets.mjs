@@ -324,4 +324,22 @@ if (doomSvmb && doomWad) {
   console.log(`  – doom skipped (${missing} failed — offline, or no toolchain?)`);
 }
 
+// chibicc — the in-browser C compiler (SELFHOST_C.md §7 step 5). Multi-TU like QuickJS/Doom, so it's
+// built by its demo script (per-TU bitcode → llvm-link → translate → verify) and the resulting
+// `chibicc.svmb` copied in. The playground compiles a C source with it, `svm_parse`s the emitted IR,
+// and runs the result. Fail-soft: no clang/llvm ⇒ the demo is simply absent (the card shows a build
+// hint), like Lua/Doom.
+try {
+  const chibiccScript = join(REPO, 'crates', 'svm-run', 'demos', 'chibicc_selfhost', 'build_chibicc_svmb.sh');
+  const chibiccCache = process.env.SVM_CHIBICC_CACHE ?? '/tmp/svm_chibicc_cache';
+  execFileSync('bash', [chibiccScript], { stdio: 'inherit' });
+  const built = join(chibiccCache, 'chibicc.svmb');
+  if (!existsSync(built)) throw new Error('build script produced no chibicc.svmb');
+  copyFileSync(built, join(ASSETS, 'chibicc.svmb'));
+  const kb = (readFileSync(built).length / 1024).toFixed(0);
+  console.log(`  ✓ chibicc.svmb (${kb} KB)`);
+} catch (e) {
+  console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
+}
+
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

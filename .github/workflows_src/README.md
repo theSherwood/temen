@@ -28,5 +28,10 @@ identical until the next agent edit.
   built-but-unwired fuzzer. Job renamed `cargo-fuzz (all targets)`.
 - **ci.yml** (2026-07-24): `cross-os` job — removed the stale commented-out `continue-on-error`
   TODO; the job is already gating.
+- **ci.yml** (2026-07-24): `real-browser` job gains a `build + stage chibicc asset` step (after
+  `build + stage Postgres artifacts`) so `browser-play-editor-test.mjs` runs the playground
+  C-compiler card's compile-and-run assertion instead of SKIPping it. Fail-soft: a build hiccup
+  degrades to a SKIP, never a red build (the test guards on `web/assets/chibicc.svmb` existing).
+  See PR #441 / SELFHOST_C.md §7 step 5.
 
 Remove entries from this list when they land in `.github/workflows/`.
