@@ -3911,6 +3911,15 @@ impl Scheduler {
         }
     }
 
+    /// §3.6 slice 5a (timed fiber waits): fire any due timers now. Called at a `cont.resume`
+    /// poll of a still-blocked fiber, so a fiber wait whose deadline has passed completes **at
+    /// the poll** — a busy resume-poll loop never idles a worker, so [`worker_loop`]'s own
+    /// `process_timers` would otherwise never run and the poll would spin to fuel exhaustion
+    /// (the jacl timed-wait shape; `svm/tests/fiber_timed_wait.rs`).
+    fn fire_due_timers(&self) {
+        process_timers(&mut self.lock());
+    }
+
     /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
@@ -9210,6 +9219,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
                     // parked one (delivering `arg` as the result of its `suspend`).
                     let (target, claimed) = registry.claim(kh)?;
+                    // §3.6 slice 5a (timed fiber waits): a poll of a still-blocked fiber is a
+                    // scheduler touchpoint — fire due timers, then re-claim, so a fiber wait
+                    // whose deadline has passed completes at the poll instead of starving in a
+                    // busy resume-poll loop (which never idles a worker, the only other place
+                    // `process_timers` runs). A racing claimant winning between the two claims
+                    // just means this poll reports `FIBER_PARKED`, as it would have anyway.
+                    let (target, claimed) = match claimed {
+                        Claimed::StillParked => {
+                            if let SchedRef::Real(sr) = sched {
+                                sr.fire_due_timers();
+                                registry.claim(kh).unwrap_or((target, Claimed::StillParked))
+                            } else {
+                                (target, Claimed::StillParked)
+                            }
+                        }
+                        c => (target, c),
+                    };
                     let new_frames = match claimed {
                         Claimed::Start { func: funcref, sp } => {
                             // A forged / wrong-type fiber funcref is a **fiber** fault, not a

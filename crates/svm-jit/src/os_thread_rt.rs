@@ -38,7 +38,7 @@
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // loom swaps the synchronization primitives for its model-checked versions; `Arc` and `JoinHandle`
@@ -255,6 +255,32 @@ struct FutexEntry {
     /// Bumped by `notify` so parked waiters re-check and observe a wake (vs a spurious one).
     generation: u64,
     waiters: u32,
+    /// §3.6 slice 5a — **event-parked FIBER waiters** on this key (FIFO). A fiber's
+    /// `memory.wait` parks the fiber, not its OS thread, so it can't sit on the condvar like a
+    /// vCPU waiter; instead it queues a status cell here. `notify` drains up to its remaining
+    /// budget (counting them as woken); the timeout consumes the cell at a `cont.resume` poll
+    /// ([`fiber_futex_wait`]). Invariant: a cell is queued here iff its status is still
+    /// [`PENDING_WAIT`] — every transition happens under the futex lock. Always empty in the
+    /// loom model (fiber parks are not modeled; the futex core paths are untouched when so).
+    fibers: Vec<std::sync::Arc<FiberWaitCell>>,
+}
+
+/// §3.6 slice 5a — one event-parked fiber waiter's completion cell (see [`FutexEntry::fibers`]).
+/// Written once, under the futex lock; read by the parked fiber at each `cont.resume` poll.
+struct FiberWaitCell {
+    /// [`PENDING_WAIT`] while queued; a `WAIT_*` status once the event fired.
+    status: AtomicI32,
+}
+
+/// [`FiberWaitCell::status`] sentinel: no event yet. Distinct from every `WAIT_*` status; 0 is
+/// `WAIT_WOKEN`, so the cell is constructed at this explicit sentinel (via [`fiber_cell_new`]).
+const PENDING_WAIT: i32 = i32::MIN;
+
+/// A fresh [`FiberWaitCell`] at the [`PENDING_WAIT`] sentinel.
+fn fiber_cell_new() -> std::sync::Arc<FiberWaitCell> {
+    std::sync::Arc::new(FiberWaitCell {
+        status: AtomicI32::new(PENDING_WAIT),
+    })
 }
 
 /// PROCESS.md S1b/S1c — **canonical futex key**. A §13 `SharedRegion` mapped at several window offsets
@@ -1637,6 +1663,22 @@ pub(crate) unsafe extern "C" fn thread_wait(
     } else {
         0
     };
+    // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this OS thread — the
+    // resumer keeps running and sees `cont.resume` status `FIBER_PARKED`, exactly the tree-walk
+    // oracle's fiber-park routing (`svm-interp/tests/fiber_parks.rs`; the timed-wait slice is
+    // pinned by `svm/tests/fiber_timed_wait.rs`, the jacl consumer report).
+    if let Some(slot) = fiber_rt::current_fiber_slot() {
+        return fiber_futex_wait(
+            dom,
+            &slot,
+            phys,
+            expected & mask,
+            width,
+            deadline,
+            unwind_base,
+            trap_out,
+        );
+    }
     // Canonical key (S1b/S1c): a region-mapped page keys on `(backing, region offset)` so aliases at
     // different window offsets rendezvous; a plain page keys on the absolute address as before. The
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
@@ -1670,6 +1712,100 @@ pub(crate) unsafe extern "C" fn thread_wait(
         return 0;
     }
     status
+}
+
+/// §3.6 slice 5a (timed fiber waits) — the fiber-context arm of [`thread_wait`]: park the
+/// FIBER, not this OS thread. Registers a status cell under the futex key, re-checks the value
+/// under the same lock (the oracle's compare-under-lock — a store that already landed marks the
+/// cell `WAIT_NOT_EQUAL` instead of queueing it), then yields to the resumer with
+/// `(FIBER_PARKED, 0)`. Each re-entry is a `cont.resume` poll (possibly from another vCPU —
+/// migration is the slot claim's business, not ours): a fired event returns its status into the
+/// guest; a **passed deadline fires the timeout at the poll** (the aligned firing point — see
+/// `svm/tests/fiber_timed_wait.rs` — so a cooperative resume-poll loop terminates without
+/// depending on scheduler idle time); otherwise the fiber parks again.
+///
+/// # Safety
+/// Called from inside a running fiber (`slot` is its own slot, via
+/// [`fiber_rt::current_fiber_slot`]); `phys`/`trap_out`/`unwind_base` as [`thread_wait`].
+#[allow(clippy::too_many_arguments)] // the same threaded park context as `futex_wait`
+unsafe fn fiber_futex_wait(
+    dom: &Domain,
+    slot: &std::sync::Arc<fiber_rt::FiberSlot>,
+    phys: u64,
+    expected: u64,
+    width: u32,
+    deadline: Option<Instant>,
+    unwind_base: u64,
+    trap_out: u64,
+) -> i32 {
+    let mask = width_mask(width);
+    let key = futex_key_of(phys);
+    let cell = fiber_cell_new();
+    {
+        let mut g = lock(&dom.futex);
+        if read_phys(phys, width) & mask != expected & mask {
+            // Insta-wake (the park-vs-store race, closed): deliver `WAIT_NOT_EQUAL` without
+            // queueing — but still park once below, so the resumer sees the one transient
+            // `FIBER_PARKED` the oracle's register-then-recheck shows (fiber_parks.rs).
+            cell.status.store(WAIT_NOT_EQUAL, Ordering::Release);
+        } else {
+            g.entry(key).or_default().fibers.push(cell.clone());
+        }
+    }
+    loop {
+        fiber_rt::fiber_event_park(slot);
+        // Re-entered: a `cont.resume` polled this fiber. Completed?
+        let st = cell.status.load(Ordering::Acquire);
+        if st != PENDING_WAIT {
+            return st;
+        }
+        // Mirror the OS park's exits (kill / teardown / freeze): consume the waiter entry and
+        // return as if woken — the caller's trailing guards (the epoch poll, the trap
+        // propagation, the durable re-issue safepoint) unwind before the guest observes it.
+        if epoch_fired(dom.env().epoch_addr)
+            || load_trap(trap_out as *mut i64) != 0
+            || (unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base))
+        {
+            fiber_wait_deregister(dom, key, &cell);
+            return WAIT_WOKEN;
+        }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                // The deadline passed: fire the timeout at this poll. A notify that raced us
+                // and already consumed the cell wins with its own status.
+                if fiber_wait_deregister(dom, key, &cell) {
+                    return WAIT_TIMED_OUT;
+                }
+                return cell.status.load(Ordering::Acquire);
+            }
+        }
+    }
+}
+
+/// Consume `cell`'s waiter entry under the futex lock: `true` if it was still queued (the
+/// caller owns the wake and delivers its own status), `false` if a `notify` already drained it
+/// (its stored status stands). See the [`FutexEntry::fibers`] invariant.
+fn fiber_wait_deregister(
+    dom: &Domain,
+    key: FutexKey,
+    cell: &std::sync::Arc<FiberWaitCell>,
+) -> bool {
+    let mut g = lock(&dom.futex);
+    let Some(e) = g.get_mut(&key) else {
+        return false;
+    };
+    let Some(pos) = e
+        .fibers
+        .iter()
+        .position(|c| std::sync::Arc::ptr_eq(c, cell))
+    else {
+        return false;
+    };
+    e.fibers.remove(pos);
+    if e.waiters == 0 && e.fibers.is_empty() {
+        g.remove(&key);
+    }
+    true
 }
 
 /// `atomic.notify` thunk: wake up to `count` vCPUs parked on confined `phys`; return the `i32` count
@@ -1826,7 +1962,8 @@ fn futex_wait(
         // Audit #8: drop a fully-drained entry so the futex map can't accumulate stale keys. Safe
         // under the held lock — `waiters == 0` means no one is parked, so the per-key generation
         // has no live observer to preserve; a later waiter on this key starts a fresh entry.
-        if e.waiters == 0 {
+        // (§3.6 slice 5a: unless event-parked fiber waiters still queue here — keep their cells.)
+        if e.waiters == 0 && e.fibers.is_empty() {
             g.remove(&key);
         }
     }
@@ -1844,9 +1981,27 @@ fn futex_notify(
     let woken = {
         let mut g = lock(futex);
         match g.get_mut(&key) {
-            Some(e) if e.waiters > 0 && count > 0 => {
-                e.generation = e.generation.wrapping_add(1);
-                e.waiters.min(count)
+            Some(e) if count > 0 => {
+                let os = if e.waiters > 0 {
+                    e.generation = e.generation.wrapping_add(1);
+                    e.waiters.min(count)
+                } else {
+                    0
+                };
+                // §3.6 slice 5a: spend the remaining budget on event-parked FIBER waiters
+                // (FIFO). Statuses are delivered under this same lock, so a racing poll either
+                // finds the cell queued or finds its status — never neither. OS waiters count
+                // first; the oracle wakes in strict arrival order across both kinds, a
+                // difference only racy multi-waiter kernels could see (not differentially
+                // pinnable).
+                let take = ((count - os) as usize).min(e.fibers.len());
+                for c in e.fibers.drain(..take) {
+                    c.status.store(WAIT_WOKEN, Ordering::Release);
+                }
+                if e.waiters == 0 && e.fibers.is_empty() {
+                    g.remove(&key);
+                }
+                os + take as u32
             }
             _ => 0,
         }

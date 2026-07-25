@@ -180,3 +180,113 @@ fn a_prechanged_cell_wakes_the_parking_fiber_immediately() {
         "one transient FIBER_PARKED, then WAIT_NOT_EQUAL delivered"
     );
 }
+
+/// The TIMEOUT wake (the jacl timed-wait regression, 2026-07-24): the fiber parks on a 10ms
+/// **timed** wait on a never-notified cell; the root sees `FIBER_PARKED`, does its own 100ms
+/// timed wait (the scheduler fires the fiber's deadline meanwhile), and the re-resume completes
+/// the fiber with `WAIT_TIMED_OUT` (2) delivered as the wait's result. Composite: s1*10_000 +
+/// s2*100 + v2 = 3*10_000 + 1*100 + 2 = 30_102. The cross-backend pinning (and the poll-fires-
+/// the-deadline rule) lives in `svm/tests/fiber_timed_wait.rs`.
+const TIMED_WAIT_TIMES_OUT: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  vs1, vv1 = cont.resume v2 v3
+  va = i64.const 8
+  ve = i32.const 0
+  vt = i64.const 100000000
+  vw = i32.atomic.wait va ve vt
+  vs2, vv2 = cont.resume v2 v3
+  vk1 = i64.const 10000
+  vs1e = i64.extend_i32_s vs1
+  vp1 = i64.mul vs1e vk1
+  vk2 = i64.const 100
+  vs2e = i64.extend_i32_s vs2
+  vp2 = i64.mul vs2e vk2
+  vp = i64.add vp1 vp2
+  vr = i64.add vp vv2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const 10000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+
+#[test]
+fn a_timed_fiber_wait_fires_its_deadline_and_completes() {
+    let m = svm_text::parse_module(TIMED_WAIT_TIMES_OUT).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let mut fuel = u64::MAX;
+    let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("no trap, no hang");
+    assert_eq!(
+        r,
+        vec![Value::I64(30_102)],
+        "park (3), root sleeps across the deadline, resume delivers WAIT_TIMED_OUT (2)"
+    );
+}
+
+/// The **poll fires a passed deadline**: no root sleep at all — a busy `cont.resume` poll loop
+/// over the parked fiber (jacl's harness shape). The loop's polls are the only scheduler
+/// touchpoints, so this pins that a poll of a still-blocked fiber whose deadline has passed
+/// completes the wait right there (rather than starving until a worker idles — the regression's
+/// tree-walker leg). Result: the fiber's `WAIT_TIMED_OUT` status (2).
+const POLL_LOOP_TIMES_OUT: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  br 1(v2)
+}
+block 1 (vk: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  vone = i32.const 1
+  vdone = i32.eq vs vone
+  br_if vdone 2(vv) 1(vk)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const 10000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+
+#[test]
+fn a_resume_poll_loop_observes_the_passed_deadline() {
+    let m = svm_text::parse_module(POLL_LOOP_TIMES_OUT).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    // Bounded fuel: the pre-fix failure mode is the loop spinning forever (the deadline never
+    // fired without an idle worker), which this converts into a loud OutOfFuel.
+    let mut fuel = 2_000_000_000;
+    let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("no trap, no spin-forever");
+    assert_eq!(
+        r,
+        vec![Value::I64(2)],
+        "the poll itself fires the due timeout: WAIT_TIMED_OUT delivered"
+    );
+}
