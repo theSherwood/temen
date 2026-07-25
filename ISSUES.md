@@ -1221,6 +1221,34 @@ scheduled.
 
 ---
 
+### I45 — fiber futex waits on the **secondary bytecode drivers** still park the whole vCPU (S3) — split out of the jacl timed-wait fix (2026-07-25)
+
+**What.** The jacl timed-wait fix aligned the three svm-run backends on the §3.6 slice-5a
+fiber-park contract for `memory.wait` inside a fiber (tree-walk scheduler, bytecode *cooperative*
+driver `drive`, Cranelift JIT futex thunk — pinned by `svm/tests/fiber_timed_wait.rs`). Two
+bytecode entry paths outside that routing still run the **pre-5a whole-vCPU-park** semantics: the
+opt-in **parallel** driver (`compile_and_run_capture_over_parallel*` — the wait blocks the OS
+thread with the fiber active) and the browser **`Vcpu`** session driver (the wait surfaces as a
+whole-vCPU `VcpuEvent::Wait`). The resumer never sees `FIBER_PARKED` there; the wait resolves
+inside the resume. The debug drivers (`ScheduledDebugRun`) share the vCPU-park shape, which for a
+*tool* is sanctioned tiering (invariant 9 observability corollary); the deterministic explorer's
+whole-vCPU park is likewise deliberate (the `fiber_park!` gate on `SchedRef::Real`, documented in
+`fiber_timed_wait.rs`'s module doc).
+
+**Why tracked, not fixed here.** Neither path is reachable from `svm_run::Instance::run` (the
+consumer surface the regression was reported against), no existing test puts a wait inside a
+fiber on them, and extending the fiber-park routing into the parallel driver means fiber-waiter
+delivery through its real cross-thread futex — its own slice, not a bolt-on. Invariant 9 wants
+the divergence enumerated rather than silently normalized: this is the entry.
+
+**Plan.** Fold fiber-level wait parks into the parallel driver's futex (mirroring the JIT's
+`FutexEntry::fibers` cells) when a consumer reaches for fibers + waits on that path; the `Vcpu`
+driver should follow the cooperative driver's `WaitParked` shape. Until then, fail-closed is not
+required (the semantics are the historical ones), but any differential harness pointed at those
+entries must avoid wait-inside-fiber kernels.
+
+---
+
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
 
 Every place the suite deliberately runs *less* on some platform to dodge the failure families

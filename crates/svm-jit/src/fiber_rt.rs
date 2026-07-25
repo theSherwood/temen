@@ -48,7 +48,7 @@ use crate::{FnEntry, TrapKind};
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use svm_fiber::{Fiber, State, Yielder};
 
@@ -269,6 +269,12 @@ pub(crate) type FiberCallTramp = extern "C" fn(
 /// Sentinel for [`FiberSlot::running_on`]: no vCPU is running this fiber.
 const NOT_RUNNING: u64 = u64::MAX;
 
+/// §3.6 slice 5a — the third `cont.resume` status (beside suspended = 0 / returned = 1),
+/// matching the interpreter's `FIBER_PARKED`: the fiber hit an event park (`memory.wait`) and
+/// was set aside — the fiber parked, not the vCPU. The resumer proceeds; re-resuming while
+/// still blocked reports this again (the cooperative poll).
+const FIBER_PARKED: i64 = 3;
+
 /// One slot of the domain-shared fiber table (D57 3b-ii/3c). The `Arc` keeps a resolved slot stable
 /// while the table grows (a re-entrant `cont.new` from inside a running fiber pushes new slots).
 pub(crate) struct FiberSlot {
@@ -298,6 +304,13 @@ pub(crate) struct FiberSlot {
     /// (a thaw re-creates the fiber from them). Immutable after creation.
     func: i32,
     sp: i64,
+    /// §3.6 slice 5a — **event-park marker**: set by the futex thunk around its park-yield
+    /// ([`fiber_event_park`]) so the resume seam reports that yield as `FIBER_PARKED` — the
+    /// suspend the guest didn't write — instead of a guest `suspend`'s `(0, value)`. Written by
+    /// the running fiber inside the thunk and read by its resumer after the switch returns on
+    /// that same OS thread; cross-vCPU polls order it through the `own` claim/publish pairing,
+    /// so `Relaxed` suffices.
+    event_park: AtomicBool,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -416,6 +429,7 @@ impl SharedFiberTable {
             shadow_sp: AtomicU64::new(fiber_region_base(slot) + REGION_HEADER_LEN), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
             func,
             sp,
+            event_park: AtomicBool::new(false),
         });
         if reuse.is_some() {
             t.free.pop();
@@ -455,6 +469,7 @@ impl SharedFiberTable {
             shadow_sp: AtomicU64::new(shadow_sp),
             func,
             sp,
+            event_park: AtomicBool::new(false),
         }));
         slot
     }
@@ -531,6 +546,11 @@ pub(crate) struct FiberRuntime {
     /// The running fibers' `Yielder`s, one per live resume on this vCPU; `suspend` switches via
     /// the top one.
     yielders: Vec<*const Yielder>,
+    /// §3.6 slice 5a — the fiber slots this vCPU is currently resuming, innermost last (the
+    /// resumer-side parallel of `yielders`: pushed before the switch in, popped when the resume
+    /// returns, on this one OS thread). The futex thunk reads the top to fiber-park the
+    /// RUNNING fiber ([`current_fiber_slot`]); empty means the root computation is running.
+    active_slots: Vec<Arc<FiberSlot>>,
     /// The generated call-trampoline address (filled in after the module is finalized).
     call_tramp: Option<FiberCallTramp>,
     /// The structural type id every fiber entry must have (`(i64 sp, i64 arg) -> i64`), checked at
@@ -574,6 +594,7 @@ impl FiberRuntime {
             table,
             me,
             yielders: Vec::new(),
+            active_slots: Vec::new(),
             call_tramp: None,
             fiber_type_id,
             fn_table_mask,
@@ -874,7 +895,12 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
     // `*fib` exclusive to this vCPU. The same `svm-fiber` instruction sequence regardless of which
     // thread the fiber last ran on (see the module header's 3c soundness argument).
+    // §3.6 slice 5a: record the slot this vCPU is switching into (the resumer-side parallel of
+    // the body's yielder push), so the futex thunk can park the RUNNING fiber; popped when the
+    // resume returns, on this same OS thread.
+    (*current()).active_slots.push(Arc::clone(&slot));
     let st = (*fib).resume(arg as u64);
+    (*current()).active_slots.pop();
     svm_set_current_fiber(prev_fiber);
     // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
     // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
@@ -898,12 +924,22 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // Phase 3: publish the fiber's new state (clearing the seam assert *before* republishing).
     match st {
         State::Yielded(v) => {
+            // §3.6 slice 5a: an event-park yield (the futex thunk set the marker around its
+            // park) surfaces as `(FIBER_PARKED, 0)` — the suspend the guest didn't write; a
+            // guest `suspend` keeps its `(0, value)`. Read before republishing, so a cross-vCPU
+            // poll's claim-acquire orders it behind this seam.
+            let parked = slot.event_park.load(Ordering::Relaxed);
             // Voluntarily suspended: **publish to the pool** — claimable by any vCPU now, on any
             // thread (the migration point; release-pairs with the next claimant's acquire).
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.suspend_to_pool();
-            *status_out = 0;
-            v as i64
+            if parked {
+                *status_out = FIBER_PARKED;
+                0
+            } else {
+                *status_out = 0;
+                v as i64
+            }
         }
         State::Complete(v) => {
             // Durable freeze residue (DURABILITY.md §12.8 slice 3.2): this `Complete` is a freeze
@@ -981,6 +1017,45 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         rt.yielders.push(y);
     }
     r as i64
+}
+
+/// §3.6 slice 5a: the fiber currently running on this OS thread (the innermost live resume),
+/// if any — the futex thunk's fiber-context probe. `None` for the root computation.
+pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
+    let rt = current();
+    if rt.is_null() {
+        return None;
+    }
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    unsafe { (*rt).active_slots.last().cloned() }
+}
+
+/// §3.6 slice 5a — the **event-park yield**: hand control back to the resumer, which observes
+/// `cont.resume` status `FIBER_PARKED` (the suspend the guest didn't write), and return when a
+/// `cont.resume` polls this fiber again. Mirrors [`fiber_suspend`] minus the guest-visible
+/// `(status, value)` and minus the armed-freeze tick — the interpreter's fiber-level park is
+/// not a `suspend` op, and only real `cont.resume`/`suspend` safepoints count, so the armed
+/// countdown stays backend-identical.
+///
+/// # Safety
+/// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
+/// thunk resolves it via [`current_fiber_slot`]).
+pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>) {
+    let y = {
+        let rt = &mut *current();
+        rt.yielders
+            .pop()
+            .expect("event park only inside a running fiber")
+    };
+    slot.event_park.store(true, Ordering::Relaxed);
+    let _ = (*y).suspend(0); // the poll's resume arg is deliberately not delivered
+    slot.event_park.store(false, Ordering::Relaxed);
+    // Back from the poll — possibly on a different OS thread (a sibling vCPU's `cont.resume`):
+    // push the yielder onto the *resuming* thread's runtime, exactly as `fiber_suspend` does.
+    {
+        let rt = &mut *current();
+        rt.yielders.push(y);
+    }
 }
 
 /// **Durable freeze driver** (DURABILITY.md §12.8 slice 3.3.2) — the JIT analogue of the

@@ -5137,6 +5137,30 @@ enum FiberState {
     Pending { funcref: i32, sp: i64 },
     /// Suspended mid-run; resuming delivers the new `arg` into `suspend_dst` and continues `vm`.
     Parked { vm: Vm, suspend_dst: u32 },
+    /// §3.6 slice 5a — **event-parked on a futex wait**: the fiber's `memory.wait` parked the
+    /// FIBER, not its vCPU (the tree-walk oracle's fiber-park routing, `fiber_parks.rs`). Not
+    /// resumable until an event sets `woken`; a `cont.resume` meanwhile reports `FIBER_PARKED`
+    /// to the resumer without switching (the cooperative poll). Woken by `notify`
+    /// (`WAIT_WOKEN`), by the park-time value recheck (`WAIT_NOT_EQUAL` — after one transient
+    /// `FIBER_PARKED`, matching the oracle's register-then-recheck), or by its timeout — which
+    /// fires at driver idle via the **logical** `deadline` (with the whole-vCPU wait timers) or
+    /// at a `cont.resume` poll via the **real** `real_deadline`, so a busy resume-poll loop
+    /// terminates without depending on driver idle time (the jacl timed-wait shape; see
+    /// `svm/tests/fiber_timed_wait.rs`).
+    WaitParked {
+        vm: Vm,
+        /// The wait's status register in `vm`; the waking resume writes the `WAIT_*` result here.
+        wait_dst: u32,
+        /// The confined wait address (the same key `TaskState::BlockedWait` parks on).
+        key: u64,
+        /// Logical-clock deadline (`clock + timeout`), fired when no task is runnable.
+        deadline: u64,
+        /// Real-clock deadline, checked at each `cont.resume` poll of this fiber.
+        real_deadline: std::time::Instant,
+        /// `Some(status)` once the event fired — the fiber is claimable and the next resume
+        /// delivers the status; `None` while still blocked.
+        woken: Option<i32>,
+    },
     /// Currently on the resume chain (active or an ancestor) — not independently resumable.
     Running,
     /// Returned; resuming again is a `FiberFault`.
@@ -5736,6 +5760,40 @@ fn step_vcpu(
                             _ => unreachable!(),
                         }
                     }
+                    // §3.6 slice 5a: an event-parked fiber (blocked in `memory.wait`). Woken —
+                    // or with its real deadline passed (the timeout fires at the poll, so a
+                    // cooperative resume-poll loop terminates) — the resume delivers the wait's
+                    // status into the fiber and continues it (the resume `arg` is deliberately
+                    // NOT delivered, matching the oracle's `LiveWoken`); still blocked, the
+                    // resumer gets `(FIBER_PARKED, 0)` without a switch (the cooperative poll).
+                    Some(slot @ FiberState::WaitParked { .. }) => {
+                        let FiberState::WaitParked {
+                            woken,
+                            real_deadline,
+                            ..
+                        } = slot
+                        else {
+                            unreachable!()
+                        };
+                        let fired = woken.take().or_else(|| {
+                            (std::time::Instant::now() >= *real_deadline)
+                                .then_some(super::WAIT_TIMED_OUT)
+                        });
+                        let Some(st) = fired else {
+                            vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                            vt.active.set(dst + 1, Reg::from_i64(0));
+                            continue;
+                        };
+                        match std::mem::replace(slot, FiberState::Running) {
+                            FiberState::WaitParked {
+                                mut vm, wait_dst, ..
+                            } => {
+                                vm.set(wait_dst, Reg::from_i32(st));
+                                vm
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     _ => return Err(Trap::FiberFault), // forged / Running / Done
                 };
                 // Fiber switch (resumer → fiber `k`): re-point the durable shadow-SP before the swap.
@@ -6001,7 +6059,12 @@ fn step_vcpu(
                         scan_vm_roots(vm, &dom.source, &mut consider);
                     }
                     for fib in fibers.iter() {
-                        if let FiberState::Parked { vm, .. } = fib {
+                        // §3.6 slice 5a: an event-parked (`WaitParked`) fiber holds live frames
+                        // exactly like a suspended one — scan both, or a root held across a
+                        // fiber's `memory.wait` would be missed (unsound for GC.md §3.2).
+                        if let FiberState::Parked { vm, .. } | FiberState::WaitParked { vm, .. } =
+                            fib
+                        {
                             scan_vm_roots(vm, &dom.source, &mut consider);
                         }
                     }
@@ -6266,13 +6329,22 @@ fn drive(
             .iter()
             .position(|t| matches!(t.state, TaskState::Runnable))
         else {
-            // No runnable task: fire the earliest `wait` timeout, else it is a deadlock.
+            // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
+            // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
             let next = tasks
                 .iter()
                 .filter_map(|t| match t.state {
                     TaskState::BlockedWait { deadline, .. } => Some(deadline),
                     _ => None,
                 })
+                .chain(fibers.iter().filter_map(|f| match f {
+                    FiberState::WaitParked {
+                        deadline,
+                        woken: None,
+                        ..
+                    } => Some(*deadline),
+                    _ => None,
+                }))
                 .min();
             match next {
                 Some(d) => {
@@ -6282,6 +6354,21 @@ fn drive(
                             if deadline <= clock {
                                 t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                                 t.state = TaskState::Runnable;
+                            }
+                        }
+                    }
+                    // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
+                    // fiber becomes claimable (leaving the pending set, so this loop makes
+                    // progress); its resumer's next `cont.resume` delivers the status.
+                    for f in fibers.iter_mut() {
+                        if let FiberState::WaitParked {
+                            deadline,
+                            woken: w @ None,
+                            ..
+                        } = f
+                        {
+                            if *deadline <= clock {
+                                *w = Some(super::WAIT_TIMED_OUT);
                             }
                         }
                     }
@@ -6852,6 +6939,38 @@ fn drive(
                 timeout,
                 dst,
             }) => {
+                // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this vCPU
+                // (the tree-walk oracle's fiber-park routing — DESIGN.md "blocks the fiber,
+                // never the domain"; `fiber_parks.rs`). Unwind one chain link to the resumer
+                // with `(FIBER_PARKED, 0)` and set the fiber aside; the park-time value recheck
+                // closes the park-vs-store race (a store that already landed wakes it with
+                // `WAIT_NOT_EQUAL` — after the one transient `FIBER_PARKED`, like the oracle).
+                if tasks[ti].vt.active_id != ROOT_FIBER {
+                    let durable = host.is_durable();
+                    let vt = &mut tasks[ti].vt;
+                    let (rid, resumer, rdst) =
+                        vt.chain.pop().expect("a running fiber has a resumer");
+                    let k = vt.active_id;
+                    shadow_switch(mem, &mut fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
+                    let fvm = std::mem::replace(&mut vt.active, resumer);
+                    let cur = mem
+                        .as_ref()
+                        .map(|m| m.atomic_value(base, width))
+                        .unwrap_or(0);
+                    fibers[k] = FiberState::WaitParked {
+                        vm: fvm,
+                        wait_dst: dst,
+                        key: base,
+                        deadline: clock.saturating_add(timeout),
+                        real_deadline: std::time::Instant::now()
+                            + std::time::Duration::from_nanos(timeout),
+                        woken: (cur != expected).then_some(super::WAIT_NOT_EQUAL),
+                    };
+                    vt.active_id = rid;
+                    vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
+                    vt.active.set(rdst + 1, Reg::from_i64(0));
+                    continue;
+                }
                 // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
                 // already changed, return not-equal; else park until notified or timed out.
                 let cur = mem
@@ -6883,6 +7002,25 @@ fn drive(
                         if key == base {
                             t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                             t.state = TaskState::Runnable;
+                            woken += 1;
+                        }
+                    }
+                }
+                // §3.6 slice 5a: also wake event-parked FIBER waiters on this key (lowest slot
+                // next, deterministic like the task scan). The status is delivered when a
+                // `cont.resume` claims the fiber — its resumer re-admits it cooperatively.
+                for f in fibers.iter_mut() {
+                    if woken >= want {
+                        break;
+                    }
+                    if let FiberState::WaitParked {
+                        key,
+                        woken: w @ None,
+                        ..
+                    } = f
+                    {
+                        if *key == base {
+                            *w = Some(super::WAIT_WOKEN);
                             woken += 1;
                         }
                     }
