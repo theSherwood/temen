@@ -433,10 +433,24 @@ fn provenance_reports_platform_vs_ancestor_terminated() {
 /// A stateful provider module: op func 0 bumps a counter in the provider's OWN window and
 /// returns the new count — the §3.2 v2 exporter-domain-state probe.
 fn counter_provider() -> svm_ir::Module {
+    // A bounded work loop (each back-edge an IR **safepoint**, the unit the impl-fuel reserve is
+    // metered in since the fuel unification) runs *before* the persistent counter increment, so a
+    // reserve clamped below the loop's cost traps mid-loop — before the store — leaving the counter
+    // untouched (the "counter survives the dry spell" property the reserve test relies on). The loop
+    // drains ~7 safepoints, comfortably above the clamp the test sets (3).
     svm_text::parse_module(
         "memory 16\n\
          func () -> (i64) {\n\
          block 0 () {\n\
+           vk0 = i32.const 8\n\
+           br 1(vk0)\n\
+         }\n\
+         block 1 (vk: i32) {\n\
+           vone = i32.const 1\n\
+           vk2 = i32.sub vk vone\n\
+           br_if vk2 1(vk2) 2()\n\
+         }\n\
+         block 2 () {\n\
            va = i64.const 0\n\
            vc = i64.load va\n\
            v1 = i64.const 1\n\
