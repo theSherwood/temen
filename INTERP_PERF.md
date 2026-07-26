@@ -428,14 +428,28 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
    (`Call`/`CallIndirect`/`ReturnCall`/`ReturnCallIndirect`); `kill` is polled at those same points.
    The per-op charge is gone; `budget` (explorer/single-step) is untouched, so debug step traces are
    bit-identical. `FUEL_BURN` (was a straight-line block — now free) rewritten to a counted loop so
-   `out_of_fuel_backtrace_matches` traps at the loop back-edge. Validated: 19-harness differential
-   batch green — `bytecode_diff`, `bytecode_traced` (incl. the OutOfFuel backtrace), all
+   `out_of_fuel_backtrace_matches` traps at the loop back-edge. Validated across **39 harnesses (two
+   batches)** — `bytecode_diff`, `bytecode_traced` (incl. the OutOfFuel backtrace), all
    `bytecode_debug*`, `jit_diff`, `escape_oracle`, `simd`, coroutines/threads/fibers/dynlink/
-   instantiate. (JIT still on the async kill-cell; `jit_diff` skips `OutOfFuel`, so the pair is
-   coherent standalone.)
-3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. — next.
+   instantiate, plus `quota`/`jit_quota`, `durable_backedge_jit` + the durability suite, `dpor`,
+   `concurrent*`, `jit_killpath`, and the heavy fuzzers (`fiber_fuzz`, `jit_fuzz`, `fuzz_smoke`).
+   (JIT still on the async kill-cell; `jit_diff` skips `OutOfFuel`, so the pair is coherent
+   standalone.)
+3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. — **next; scoped.** The JIT
+   already emits `emit_epoch_check` (the §5 kill-cell poll) at exactly the safepoints we need —
+   function entry (`lib.rs:5344`) + every back-edge (`6981/6996/7005`). Add a `fuel_addr: i64` on
+   `Lower` paralleling `epoch_addr`, threaded through the ~15 pipeline sites `epoch_addr` already
+   flows through (nested JIT children, spawn, coroutine children — all escape-TCB paths, so mirror it
+   exactly). At those 4 emit sites, when `fuel_addr != 0`, emit `f = load(fuel_addr); brif f==0 →
+   trap OutOfFuel; store(fuel_addr, f-1)` — the store⇒load dependency stops Cranelift hoisting it out
+   of the loop (no atomic needed; the cell is the guest's own budget, not host-written mid-run).
+   Gate on `fuel_addr` so the plain (non-fuel-armed) fast path is byte-identical — fuel metering is
+   opt-in, as it is today. Add a fuel-armed run entry that allocates the host fuel cell, passes its
+   address, and reads the remainder back. **Validate on the escape-TCB codegen paths** (jit_diff
+   fuel-armed, jit_killpath, nested-child) — this is security-critical codegen, do it as a focused
+   pass, not rushed.
 4. Flip the harnesses from "skip `OutOfFuel`" to "assert `OutOfFuel` parity" across all three — the
-   acceptance test that unification holds.
+   acceptance test that unification holds. (Depends on step 3.)
 5. Follow-on: the `instantiate` child honors its `fuel` uniformly (thread the counter in), closing
    the `_fuel`-ignored divergence.
 
