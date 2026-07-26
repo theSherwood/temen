@@ -18,7 +18,7 @@ fn main() {
     // access can't be forwarded/hoisted/vectorized (unlike `mem`, which every compiler deletes).
     let chase = chase_src(16, 4096, false); // memory 2^16 = 64 KiB window holds the 16 KiB array
     let chase_rand = chase_src(22, 1 << 20, true); // memory 2^22 = 4 MiB window holds the 4 MiB array
-    let kernels: [(&str, &str, i32, i32); 9] = [
+    let kernels: [(&str, &str, i32, i32); 10] = [
         ("alu", ALU, 1_000, 201_000),
         ("call", CALL, 1_000, 201_000),
         ("call_indirect", CALL_INDIRECT, 1_000, 201_000),
@@ -28,6 +28,7 @@ fn main() {
         ("fnv", FNV, 1_000, 201_000),
         ("fma", FMA, 1_000, 201_000),
         ("vsum", VSUM, 1_000, 201_000),
+        ("loopc", LOOPC, 1_000, 201_000),
     ];
     for (name, src, small, large) in kernels {
         let m = text::parse_module(src).expect("kernel parses");
@@ -335,6 +336,29 @@ block 2 (vk: i32, vsum: i32, vc: i32) {
 }
 block 3 (vsf: i32) {
   return vsf
+}
+}
+"#;
+
+/// C-style **counted loop** `sum += i` for `i in 0..n`, whose exit test is a real `i32.lt_s`
+/// comparison feeding the loop back-edge — the `IntCmp` + `br_if` shape that Slice 5a fuses into a
+/// single `BrIfCmp` (the other kernels use the `sub`-result-as-truthiness idiom, which has no compare
+/// to fuse). This is the canonical `for (i = 0; i < n; i++)` a C frontend emits.
+const LOOPC: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  lzero = i32.const 0
+  br 1(lzero, lzero, v0)
+}
+block 1 (li: i32, lacc: i32, ln: i32) {
+  lacc2 = i32.add lacc li
+  lone = i32.const 1
+  li2 = i32.add li lone
+  llt = i32.lt_s li2 ln
+  br_if llt 1(li2, lacc2, ln) 2(lacc2)
+}
+block 2 (lr: i32) {
+  return lr
 }
 }
 "#;

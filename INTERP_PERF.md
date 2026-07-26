@@ -282,21 +282,34 @@ stays the JIT's job).
   dominates (dispatch is hidden behind cache-miss stalls); `vsum` is the one kernel where bytecode
   *loses* to the tree-walker — the store-in-init + reduction shape is a concrete 5a target.
 
-- **Slice 5a — superinstructions / operand-folding (the centerpiece).** A peephole over the linear
-  op stream in `compile_module`, run after per-block lowering and before the branch-target patch,
-  fusing single-use adjacent pairs with no block boundary between them:
-  - `IntCmp` + `BrIf` → **`BrIfCmp`** — fires on every loop back-edge; deletes a whole dispatch
-    cycle plus the boolean's write-then-reread.
-  - `Const` + binop → **immediate operand** (`SubImm`/`AddImm`) — deletes the `Const` op *and* frees
-    its register slot (which also shrinks the 16-byte-`Reg` cost).
+- **Slice 5a — `IntCmp`+`BrIf` → `BrIfCmp` fusion. ✅ LANDED, but the win is small (measured).** A
+  peephole in `compile_func` fuses a block-final `IntCmp` whose result is its `BrIf`'s sole consumer
+  (last inst, cond slot not carried to a successor) into one `BrIfCmp`. Built behind a `fuse` flag:
+  the fast `compile_module` fuses; the five debug/trace entries use `compile_module_unfused` so their
+  step trace keeps one location per source inst (the `src` map is now built incrementally, in
+  lockstep with `ops`, so dropping the fused op can't desync it). All gates green — `bytecode_diff`
+  (4000 modules + suspend-slicing), every `bytecode_debug*`, `jit_diff`, `simd`, `escape_oracle`.
+  Added the `loopc` kernel (canonical `for (i<n)` — the only shape with a compare to fuse; the other
+  kernels use the `sub`-as-truthiness idiom and are correctly **unchanged**, a clean no-regression
+  check).
 
-  Estimated ~15–20% on compute kernels (alu 4→3 ops/iter; the LCG kernel ~8→6), less on call-bound
-  code (the call op dominates). No `unsafe`, no new seams — but a fused op straddles **two** source
-  `(block, inst)` locations, so the real work is re-satisfying: the `Program::src` debug map, per-op
-  **fuel accounting** (a fused op charges for 2), and the suspend-slicing invariant. Gated by
-  `bytecode_diff` + `bytecode_debug` + `bytecode_suspend_resume`. Cost is paid once at compile,
-  benefit accrues every iteration — but the peephole must stay O(ops), single linear pass, no
-  allocation blowup, or it regresses tiny run-once functions (see Risks: compile-time cost).
+  **Measured A/B on `loopc` (fused vs unfused bytecode): 27.4 vs 28.2 ns — ~2–3%, at/below this
+  box's ~4% noise floor.** This **corrects the earlier ~15–20% estimate** and **confirms the Phase-3
+  finding**: the dropped dispatch is a *predicted* branch (≈free), so removing it saves little, and
+  what remains in the loop terminator — the edge-copy scatter/gather + the per-op fuel/budget — is
+  untouched by fusion. `BrIfCmp` also still charges 2 fuel (to keep counts bit-identical pre-fuel-
+  unification), which caps its own saving. **Takeaway:** op-*count* reduction is real but,
+  op-for-op, as predicted-branch-bound as Phase 3's control-overhead result. Its value is mostly
+  *unlocked by 5b* — once per-op fuel moves to safepoints, the fused op stops paying the doubled
+  charge and the dispatch saving is fully realized. Landed as foundation (correct, green, and the
+  `fuse`-flag + incremental-`src` machinery is what const-fold and future superinstructions build
+  on), not as a headline win.
+
+- **Slice 5a-2 — `Const`+binop → immediate operand (`SubImm`/`AddImm`) — NEXT.** Deletes the `Const`
+  op *and* frees its register slot (also shrinking the 16-byte-`Reg` cost). Fires on every loop
+  (the `const 1` increment/stride). Same peephole + `fuse`-flag machinery. Measure stacked on 5a and
+  on 5b — expectation, revised down by the 5a evidence: another low-single-digit %, meaningful only
+  in combination.
 
 - **Slice 5b — two-mode resume.** A fast `resume` loop that drops the per-op budget check and the
   per-op `step(fuel)` call — metering fuel at safepoints instead (see "Fuel unification") — whenever
@@ -322,8 +335,15 @@ stays the JIT's job).
   former; ~3–5%). These are the last ~2× toward the frontier and a `forbid-unsafe` renegotiation for
   a small gain — revisit only if 5a–5c land and the profile still justifies it.
 
-**Target.** 5a (± 5b/5c), all safe: bytecode ~26× → ~18–20× the JIT on the call kernel, i.e. into the
-register-interpreter frontier tier, **zero new TCB**.
+**Target — revised by the 5a measurement.** The optimistic "~1.3–1.5× combined" rested on op-count
+reduction paying ~15–20%; 5a's A/B shows each fusion is ~2–3% (predicted-branch-bound), so the safe
+levers stack to *low single digits each*, not a 1.3–1.5×. The real interpreter-vs-frontier residual
+is **edge-copy scatter/gather + per-op fuel/budget + software memory confinement**, not dispatch —
+so the highest-leverage *safe* work is probably **5b (fuel→safepoints, which also unlocks 5a's capped
+saving)** and reducing edge-copy cost, ahead of more superinstructions. This is the benchmark
+correcting the plan (AGENTS.md: the harness is the arbiter); the levers remain worth landing for
+being correct, safe, and cumulative, but the frontier is closed by *removing real work* (5b, memory),
+not by shaving predicted branches. The JIT stays the answer for near-native.
 
 ---
 
@@ -741,10 +761,17 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
       fuel — not `budget` — to safepoints is now justified by cross-backend **parity**, not the ~1%
       speed. The debug-seam constraint is honored because `budget` stays per-op.)
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.
-- [ ] **Phase 5** — op-count reduction, all safe (`forbid-unsafe` intact): fix the bit-rotted
-      `megabench` kernels first (log in ISSUES.md), then **5a** superinstructions (`BrIfCmp` +
-      `Const`+binop→immediate), **5b** two-mode resume, **5c** split register banks (profile-gated).
-      Target ~26× → ~18–20× the JIT on the call kernel, zero new TCB. Not started.
+- [~] **Phase 5** — op-count reduction, all safe (`forbid-unsafe` intact).
+  - [x] Prereq — fix the bit-rotted `megabench` kernels (I45); fresh 9-kernel baseline + `loopc`.
+  - [x] **5a** — `IntCmp`+`BrIf` → `BrIfCmp` fusion (fuse-flag; unfused debug/trace; incremental
+        `src`). All oracle gates green. **Measured ~2–3% on `loopc` (within noise)** — corrects the
+        ~15–20% estimate, confirms Phase 3 (dispatch is predicted-branch-bound). Landed as
+        correct/foundational, not a headline win.
+  - [ ] **5a-2** — `Const`+binop→immediate (`SubImm`/`AddImm`). Next.
+  - [ ] **5b** — two-mode resume / fuel→safepoints (also unlocks 5a's fuel-capped saving).
+  - [ ] **5c** — split register banks (profile-gated).
+  - **Revised thesis:** safe levers are low-single-digit% each; the frontier is closed by removing
+        real work (5b, memory, edge-copies), not by shaving predicted branches.
 - [ ] **Fuel unification** — safepoint-anchored fuel (IR back-edges + function entries) charged
       identically across tree-walker / bytecode / Cranelift JIT; `OutOfFuel` flips from
       excluded-from-contract to differentially-asserted; single-step (`budget`) untouched.
