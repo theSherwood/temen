@@ -118,14 +118,11 @@ differential (refusal-vs-hang: diverging *toward refusal* is fail-closed winning
 short enumerated list) or **tracked debt with a convergence plan** (the `poll` eager/lazy
 child divergence) — never quietly normalized.
 
-**Fuel is one unit across backends (owner, 2026-07-25):** metering is charged in **IR-anchored
-safepoints** — taken back-edges + function entries, counted off the shared IR so every backend
-agrees by construction — identically on tree-walker, bytecode, and Cranelift JIT. `OutOfFuel`
-is therefore a differentially-checked fact, not the excluded one it was under the old split
-(per-op on the interpreters, an async kill-cell on the JIT). Single-step is a *separate* per-op
-counter (`budget`), so fuel accounting never moves where stepping stops. *Violated by:* an
-op-granular fuel contract, a backend metering at non-safepoint sites, or fuel accounting that
-perturbs the debug seam. (INTERP_PERF.md "Fuel unification".)
+**Fuel is uniform across backends; debugging is not (owner, 2026-07-25):** unlike the debug seam
+above — a per-backend *view*, deliberately tiered — the fuel bound is metered in one unit by every
+backend, so `OutOfFuel` is a differentially-checked fact, not an engine-specific quirk. *Violated
+by:* a backend that meters fuel on a different unit than the others. (INTERP_PERF.md "Fuel
+unification".)
 
 ## 10. Identity is structural
 
