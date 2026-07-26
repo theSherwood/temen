@@ -3646,8 +3646,8 @@ fn debug_advance_fiber(
         // same-module `spawn_coroutine`/`resume`/`yield` round-trip therefore runs correctly under the
         // debugger; on the single-vCPU `DebugRun` the body is then stepped **op-by-op** (step-into) via
         // `active_coro`/`step_active_coro` (slice 14b), while the scheduled engine keeps it opaque. A
-        // *separate-module* coroutine (`SpawnCoroutineModule`) needs the mutable `Domain` to push the
-        // granted module, so it stays a caller seam (`Other` → declined) for now.
+        // *separate-module* coroutine (`SpawnCoroutineModule`) is handled just below (slice 14c) — it
+        // pushes the granted module to the shared source, then resumes/steps like any coroutine.
         Ok(Outcome::SpawnCoroutine {
             ibase,
             isize: isz,
@@ -3726,9 +3726,40 @@ fn debug_advance_fiber(
         // A `Yielder.yield` only resolves inside an inline coroutine child (consumed by `resume_coro`);
         // at the top level the yielder handle is ungranted, so any leak here is a fault.
         Ok(Outcome::CoYield { .. }) => FiberStep::Trapped(Trap::FiberFault),
-        // Threads / wait / notify / instantiate / separate-module coroutine / tier-up — a scheduler
-        // seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine dispatches
-        // its subset).
+        // §14 **separate-module** coroutine (`spawn_coroutine_module`, op 6 / demand op 7) — on the
+        // single-vCPU `DebugRun` (`coro_step_into`) only. Resolve + compile + push the granted module and
+        // register the child inline; thereafter it is `resume`d and stepped exactly like a same-module
+        // coroutine (slice 14b). The scheduled engine keeps declining it (falls through to `Other`).
+        Ok(Outcome::SpawnCoroutineModule {
+            ibase,
+            isize: isz,
+            mh,
+            entry,
+            off,
+            size_log2,
+            dst,
+            demand,
+        }) if vt.coro_step_into => {
+            match spawn_coroutine_module(
+                &mut vt.coroutines,
+                source,
+                mem,
+                host,
+                mh,
+                entry,
+                (ibase, isz, off, size_log2),
+                demand,
+            ) {
+                Ok(h) => {
+                    vt.active.set(dst, Reg::from_i32(h));
+                    FiberStep::Stepped
+                }
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
+        // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
+        // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
+        // dispatches its subset).
         Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
     }
@@ -6344,6 +6375,101 @@ fn spawn_coroutine(
         faulted_page: None,
     }));
     (coroutines.len() - 1) as i32
+}
+
+/// Build a §14 **separate-module** coroutine child (`spawn_coroutine_module`, op 6 / demand op 7) inline
+/// in `coroutines` — the debug-engine counterpart of [`Vcpu::service_coroutine_module`]. Resolve the
+/// host-granted `Module` (handle `mh`) from the powerbox, compile it, **push it to the shared `source`**
+/// (so it dispatches by index — the mutable-`Domain` step that previously kept this op declined under the
+/// debugger), materialize its data segments into the carve, and register the `Coro` over its own natural
+/// table + a Yielder-only powerbox. Returns the child handle, `EINVAL` for a bad entry / carve / memory
+/// mismatch, or a `Trap` for a forged/closed module handle or a module the engine can't lower.
+#[allow(clippy::too_many_arguments)]
+fn spawn_coroutine_module(
+    coroutines: &mut Vec<Option<Coro>>,
+    source: &ModuleSource,
+    mem: &Option<Mem>,
+    host: &Host,
+    mh: i32,
+    entry: i64,
+    // `(holder base, holder size, offset, size_log2)` — the Instantiator-relative carve geometry.
+    carve: (u64, u64, i64, i64),
+    demand: bool,
+) -> Result<i32, Trap> {
+    let (ibase, isz, off, size_log2) = carve;
+    // Resolve + clone the granted module from the powerbox (a forged/closed/wrong-type handle traps).
+    let (cfuncs, cmem_log2, cdata) = {
+        let g = host.resolve_module(mh)?;
+        (g.funcs.clone(), g.memory_log2, g.data.clone())
+    };
+    // Compile to bytecode — a module using an op the engine can't lower is `Malformed` (as for install).
+    let child_compiled = match compile_module(&cfuncs) {
+        Some(c) => c,
+        None => return Err(Trap::Malformed),
+    };
+    let ok_entry = child_compiled
+        .sigs
+        .get(entry as u64 as usize)
+        .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off_u = off as u64;
+    let fits = child_size != 0
+        && child_size <= isz
+        && off_u & (child_size - 1) == 0
+        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+    // A separate-module child's carve must equal its declared memory (§14 transparency).
+    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    if !ok_entry || !fits || !mod_ok {
+        return Ok(super::EINVAL as i32);
+    }
+    let pbase = mem.as_ref().map_or(0, |m| m.window.base());
+    let abs_base = pbase + ibase + off_u;
+    // Materialize the module's data segments into the carve before the child runs, then the view.
+    let child_mem = {
+        if let Some(m) = mem.as_ref() {
+            for d in cdata.iter() {
+                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                    for (k, &b) in d.bytes.iter().enumerate() {
+                        m.set_byte(abs_base + d.offset + k as u64, b);
+                    }
+                }
+            }
+        }
+        mem.as_ref().map(|m| {
+            let cm = m.nested_view(abs_base, size_log2 as u8);
+            if demand {
+                cm.demand_page();
+            }
+            cm
+        })
+    };
+    let mut child_host = Host::new();
+    let cy = child_host.grant_yielder();
+    let progs_len = child_compiled.progs.len();
+    let cm = source.push(child_compiled); // the mutable-Domain step: the child dispatches by index
+    let child_table = build_table_for(progs_len, 0, cm as u32);
+    let mut child_vm = match source
+        .get(cm)
+        .and_then(|u| Vm::new(&u, entry as u64 as usize, &[Value::I64(cy as i64)]).ok())
+    {
+        Some(v) => v,
+        None => return Ok(super::EINVAL as i32),
+    };
+    child_vm.module = cm; // the child runs its own pushed module, not module 0
+    coroutines.push(Some(Coro {
+        vm: child_vm,
+        mem: child_mem,
+        host: child_host,
+        table: child_table,
+        awaiting: None,
+        fault_yields: demand,
+        faulted_page: None,
+    }));
+    Ok((coroutines.len() - 1) as i32)
 }
 
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.

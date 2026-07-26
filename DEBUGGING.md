@@ -335,15 +335,31 @@ different things depending on which pair you compare:
   (breakpoint-inside-the-body, step-descends, step-over-runs-the-coroutine, confined-window inspection,
   and body-position tick-replay), with the slice-14a oracle-parity suites unchanged (result-identical).
 
+  **§14 separate-module coroutines on the single-vCPU engine (slice 14c).** `spawn_coroutine_module`
+  (op 6 / demand op 7) is no longer declined: a new `spawn_coroutine_module` helper (the debug-engine
+  counterpart of `Vcpu::service_coroutine_module`) resolves the host-granted `Module` from the powerbox,
+  compiles it, **pushes it to the shared source** (the mutable-`Domain` step that was the blocker),
+  materializes its data segments into the confined carve, and registers the child `Coro` over its own
+  natural table + a Yielder-only powerbox. Thereafter it is `resume`d and stepped by the same 14b path —
+  so a breakpoint fires in the parent *and* inside the **granted module's** body (a distinct pushed
+  module index), and `read_window` reads the child's confined window. Gated to the single-vCPU
+  `DebugRun` (`coro_step_into`); the scheduled engine still declines it. Oracle here is the production
+  bytecode engine (`compile_and_run_with_host`) — `run_with_host` drives only the same-module form.
+  Covered by `bytecode_debug_coroutine_module.rs` (oracle parity, a parent breakpoint, step-into the
+  granted module's body with confined-window read, deterministic body-position tick-replay). Full
+  *source-variable* inspection inside a separate-module child (the `FrameReader`'s module-0 gate + per-
+  module debug metadata) is a follow-up; position-level step-into and window reads work today.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
   `thread.spawn`/`join`/`wait`/`notify` and **fibers** (single-vCPU *and* composed with threads), and
-  **same-module §14 coroutines** driven inline on the single-vCPU engine — including **step-into** the
-  coroutine body (slice 14b). Remaining `Declined` ops: **separate-module** coroutines
-  (`spawn_coroutine_module`), and scheduler-driven **instantiate** children (the confined-executor
-  `Coro`/env + attenuated powerbox) — each a further slice. Plus a checkpoint ladder to bound
-  reverse-replay cost (a perf optimization — today's small debugged programs replay from turn 0 cheaply).
+  **§14 coroutines** — same-module *and* separate-module — driven inline on the single-vCPU engine,
+  including **step-into** the coroutine body (slices 14b/14c). Remaining `Declined` ops: scheduler-driven
+  **instantiate** children (the confined-executor `Coro`/env + attenuated powerbox + quota), and
+  *source-variable* inspection inside a separate-module coroutine body — each a further slice. Plus a
+  checkpoint ladder to bound reverse-replay cost (a perf optimization — today's small debugged programs
+  replay from turn 0 cheaply).
 
 ---
 
