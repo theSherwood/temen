@@ -261,10 +261,26 @@ svm-bytecode into the wasm3 / Wasmi-0.32 register-interpreter frontier (~10–12
 **not** close to the JIT (that gap is structural — compilation + MMU + cross-op optimization — and
 stays the JIT's job).
 
-- **Prereq — fix the bench.** `crates/svm/examples/megabench.rs`'s `chase`/`chase_rand`/`fnv`/`fma`/
-  `vsum` kernels no longer parse (`ParseError` on a `binit` token — the text frontend drifted), so
-  only alu/call/call_indirect/mem currently measure. Repair them first (memory-latency + SIMD +
-  pointer-chase coverage), and log the rot in `ISSUES.md`. Without it we can't measure 5a/5c.
+- **Prereq — fix the bench. ✅ DONE (I45).** `megabench.rs`'s `chase`/`chase_rand`/`fnv`/`fma`/`vsum`
+  kernels used the retired named-block text syntax; rewritten to numeric `block N (params) { }` with
+  numeric branch targets. All 9 kernels now run on all three engines. Fresh baseline (ns/iter,
+  tw → bc → jit; bc/jit ratio):
+
+  | kernel      | tree-walk | bytecode | JIT    | bc/jit | note |
+  |-------------|----------:|---------:|-------:|-------:|------|
+  | alu         | 33.3      | 22.2     | 0.45   | ~49×   | JIT strength-reduces |
+  | call        | 77.0      | 38.4     | 1.56   | ~25×   | honest structural gap |
+  | call_indirect | 86.9    | 61.4     | 2.51   | ~24×   | |
+  | mem         | 107.4     | 83.2     | 0.33   | ~249×  | JIT elides store/load |
+  | chase       | 92.6      | 70.9     | 2.52   | ~28×   | L1 pointer chase |
+  | chase_rand  | 93.8      | 90.0     | 24.1   | **~3.7×** | memory-latency-bound — all engines stall on DRAM, so the interpreter tax is hidden |
+  | fnv         | 94.5      | 69.6     | 1.49   | ~47×   | serial hash loop |
+  | fma         | 54.6      | 33.3     | 2.61   | ~13×   | f64 latency-bound recurrence |
+  | vsum        | 96.0      | **107.2**| 0.58   | ~185×  | **bytecode ~0.9× the tree-walker — a regression to investigate in 5a** |
+
+  Two findings: `chase_rand` confirms the ~26× compute gap collapses to ~3.7× when memory latency
+  dominates (dispatch is hidden behind cache-miss stalls); `vsum` is the one kernel where bytecode
+  *loses* to the tree-walker — the store-in-init + reduction shape is a concrete 5a target.
 
 - **Slice 5a — superinstructions / operand-folding (the centerpiece).** A peephole over the linear
   op stream in `compile_module`, run after per-block lowering and before the branch-target patch,

@@ -197,8 +197,9 @@ func (i32) -> (i64) {{
 block 0 (v0: i32) {{
   vi0 = i32.const 0
   vrem0 = i32.const {size}
-  br binit(vi0, vrem0, v0)
-binit(vi: i32, vrem: i32, vn: i32):
+  br 1(vi0, vrem0, v0)
+}}
+block 1 (vi: i32, vrem: i32, vn: i32) {{
   vfour = i64.const 4
   vidx64 = i64.extend_i32_u vi
   vaddr = i64.mul vidx64 vfour
@@ -209,8 +210,9 @@ binit(vi: i32, vrem: i32, vn: i32):
   vrem2 = i32.sub vrem vone
   vzero = i32.const 0
   vhops0 = i64.const 0
-  br_if vrem2 binit(vi2, vrem2, vn) bchase(vzero, vhops0, vn)
-bchase(vidx: i32, vhops: i64, vk: i32):
+  br_if vrem2 1(vi2, vrem2, vn) 2(vzero, vhops0, vn)
+}}
+block 2 (vidx: i32, vhops: i64, vk: i32) {{
   vfour2 = i64.const 4
   vc64 = i64.extend_i32_u vidx
   vcaddr = i64.mul vc64 vfour2
@@ -219,10 +221,11 @@ bchase(vidx: i32, vhops: i64, vk: i32):
   vhops2 = i64.add vhops vle
   vkone = i32.const 1
   vk2 = i32.sub vk vkone
-  br_if vk2 bchase(vloaded, vhops2, vk2) bret(vhops2)
-bret(vh: i64):
+  br_if vk2 2(vloaded, vhops2, vk2) 3(vhops2)
+}}
+block 3 (vh: i64) {{
   return vh
-  }}
+}}
 }}
 "
     )
@@ -237,8 +240,9 @@ func (i32) -> (i32) {
 block 0 (v0: i32) {
   fi0 = i32.const 0
   frem0 = i32.const 4096
-  br finit(fi0, frem0, v0)
-finit(fi: i32, frem: i32, fcount: i32):
+  br 1(fi0, frem0, v0)
+}
+block 1 (fi: i32, frem: i32, fcount: i32) {
   faddr = i64.extend_i32_u fi
   fseven = i32.const 7
   fm = i32.mul fi fseven
@@ -250,8 +254,9 @@ finit(fi: i32, frem: i32, fcount: i32):
   fi2 = i32.add fi fone
   frem2 = i32.sub frem fone
   fbasis = i32.const 2166136261
-  br_if frem2 finit(fi2, frem2, fcount) fhash(fcount, fbasis)
-fhash(hrem: i32, hh: i32):
+  br_if frem2 1(fi2, frem2, fcount) 2(fcount, fbasis)
+}
+block 2 (hrem: i32, hh: i32) {
   hmask = i32.const 4095
   hidx = i32.and hrem hmask
   haddr = i64.extend_i32_u hidx
@@ -261,10 +266,11 @@ fhash(hrem: i32, hh: i32):
   hh2 = i32.mul hxor hprime
   hone = i32.const 1
   hrem3 = i32.sub hrem hone
-  br_if hrem3 fhash(hrem3, hh2) fret(hh2)
-fret(hf: i32):
+  br_if hrem3 2(hrem3, hh2) 3(hh2)
+}
+block 3 (hf: i32) {
   return hf
-  }
+}
 }
 "#;
 
@@ -275,19 +281,21 @@ const FMA: &str = r#"
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   pacc0 = f64.const 1.0
-  br ploop(v0, pacc0)
-ploop(pk: i32, pacc: f64):
+  br 1(v0, pacc0)
+}
+block 1 (pk: i32, pacc: f64) {
   pc = f64.const 0.9999999
   pd = f64.const 1.0
   pmul = f64.mul pacc pc
   pacc2 = f64.add pmul pd
   pone = i32.const 1
   pk2 = i32.sub pk pone
-  br_if pk2 ploop(pk2, pacc2) pdone(pacc2)
-pdone(paccf: f64):
+  br_if pk2 1(pk2, pacc2) 2(pacc2)
+}
+block 2 (paccf: f64) {
   pr = i32.trunc_f64_s paccf
   return pr
-  }
+}
 }
 "#;
 
@@ -300,8 +308,9 @@ func (i32) -> (i32) {
 block 0 (v0: i32) {
   si0 = i32.const 0
   srem0 = i32.const 262144
-  br vinit(si0, srem0, v0)
-vinit(vi: i32, vrem: i32, vn: i32):
+  br 1(si0, srem0, v0)
+}
+block 1 (vi: i32, vrem: i32, vn: i32) {
   vfour = i64.const 4
   vi64 = i64.extend_i32_u vi
   vaddr = i64.mul vi64 vfour
@@ -311,8 +320,9 @@ vinit(vi: i32, vrem: i32, vn: i32):
   vi2 = i32.add vi vone
   vrem2 = i32.sub vrem vone
   szero = i32.const 0
-  br_if vrem2 vinit(vi2, vrem2, vn) vsumloop(szero, szero, vn)
-vsumloop(vk: i32, vsum: i32, vc: i32):
+  br_if vrem2 1(vi2, vrem2, vn) 2(szero, szero, vn)
+}
+block 2 (vk: i32, vsum: i32, vc: i32) {
   vfour2 = i64.const 4
   vk64 = i64.extend_i32_u vk
   vaddr2 = i64.mul vk64 vfour2
@@ -321,10 +331,11 @@ vsumloop(vk: i32, vsum: i32, vc: i32):
   vsone = i32.const 1
   vk2 = i32.add vk vsone
   vsrem = i32.sub vc vk2
-  br_if vsrem vsumloop(vk2, vsum2, vc) vsret(vsum2)
-vsret(vsf: i32):
+  br_if vsrem 2(vk2, vsum2, vc) 3(vsum2)
+}
+block 3 (vsf: i32) {
   return vsf
-  }
+}
 }
 "#;
 
