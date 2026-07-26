@@ -21,6 +21,16 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT
+
+`cargo run --release --example megabench -p svm` panics after the first four kernels
+(alu/call/call_indirect/mem) with `ParseError("expected RBrace, found Ident(\"binit\")")` at
+`megabench.rs:33` — the `chase_src` generator emits a token the text frontend no longer accepts, so
+the memory-latency (`chase`/`chase_rand`), FNV, FMA, and vector-sum rows are silently lost. Not
+CI-gating (it's a dev example, not a gate), but it blinds the cross-engine A/B exactly where the
+INTERP_PERF Phase-5 work needs memory + SIMD + pointer-chase coverage. **Fix is the Phase-5 prereq**
+(INTERP_PERF.md "Phase 5"): repair the kernel sources to current text syntax before measuring 5a/5c.
+
 ### I44 — freeze-on-quiesce could fire multi-worker and strand a subset in `svc.wait` (S2, intermittent CI hang) — **FIX LANDED 2026-07-24** (§13.4 4c-bis branch)
 
 **Symptom.** PR #437's `build · test · fmt · clippy` + `build · test (macos)` jobs both hit their
