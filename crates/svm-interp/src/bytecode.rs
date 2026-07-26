@@ -965,10 +965,17 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
         let edge = |bidx: usize, args: &[u32]| -> Edge {
+            // Slice 5b: drop **identity** self-copies (`src == dst`) at compile time. A loop-invariant
+            // block param threaded unchanged across a back-edge lands in the same global slot it came
+            // from, so the copy is a no-op — eliding it removes a real `scratch` push+write per such
+            // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
+            // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
+            // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
             let copies = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
+                .filter(|(src, dst)| src != dst)
                 .collect();
             (copies, bidx as u32) // block index; patched to entry pc below
         };

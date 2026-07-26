@@ -305,11 +305,21 @@ stays the JIT's job).
   `fuse`-flag + incremental-`src` machinery is what const-fold and future superinstructions build
   on), not as a headline win.
 
-- **Slice 5a-2 — `Const`+binop → immediate operand (`SubImm`/`AddImm`) — NEXT.** Deletes the `Const`
-  op *and* frees its register slot (also shrinking the 16-byte-`Reg` cost). Fires on every loop
-  (the `const 1` increment/stride). Same peephole + `fuse`-flag machinery. Measure stacked on 5a and
-  on 5b — expectation, revised down by the 5a evidence: another low-single-digit %, meaningful only
-  in combination.
+- **Slice 5a-2 — `Const`+binop → immediate operand (`SubImm`/`AddImm`).** Deletes the `Const`
+  op; the *slot-freeing* benefit needs slot-reclaim (renumbering), without which it's just another
+  predicted-branch dispatch drop (≈free by the 5a evidence). Deferred as low-ROID until slot-reclaim
+  is in scope.
+
+- **Slice 5b-edge — edge-copy identity elision. ✅ LANDED.** A loop-invariant block param threaded
+  unchanged across a back-edge lands in the *same* global slot, so its edge copy is an `x → x` no-op.
+  The `edge` builder now drops these at compile time (one `.filter(src != dst)`), removing a real
+  `scratch` push+write per invariant param, every iteration — unlike dispatch-shaving this removes
+  actual `Vec` work, not a predicted branch. Semantics-transparent (a self-copy changes nothing; its
+  removal can't perturb the gather/scatter of the aliasing copies), so it needs no `fuse` flag and
+  touches no step trace. All gates green (`bytecode_diff`, `bytecode_debug*`, `jit_diff`, `simd`,
+  `escape_oracle`). *Not* pursued: the non-aliasing direct-copy path (skip `scratch` when no dst is a
+  src) — a struct/macro change for a sub-noise gain, which fights invariant 1; left until a profile
+  names edge-copies as a measured cost.
 
 - **Slice 5b — two-mode resume.** A fast `resume` loop that drops the per-op budget check and the
   per-op `step(fuel)` call — metering fuel at safepoints instead (see "Fuel unification") — whenever
