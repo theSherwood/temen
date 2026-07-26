@@ -142,10 +142,38 @@ fn builtin_stdout_and_each_backend_via_c_abi() {
     }
 }
 
+/// Like [`HELLO`], but spins a bounded counter loop (each back-edge an IR **safepoint**) before the
+/// `write`, so a tight fuel budget runs the interpreter out of fuel *at a back-edge* — the unit fuel
+/// is metered in since the fuel unification (straight-line code like `HELLO` is now free).
+const LOOP_HELLO: &str = "\
+memory 15
+data ro 16384 \"hi from C\\n\"
+export 0 func \"_start\" 0
+func () -> (i32) {
+block 0 () {
+  n0 = i32.const 100
+  br 1(n0)
+}
+block 1 (n: i32) {
+  one = i32.const 1
+  n2 = i32.sub n one
+  br_if n2 1(n2) 2()
+}
+block 2 () {
+  v0 = i32.const 0
+  v1 = i64.const 16384
+  v2 = i64.const 10
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i32.const 0
+  return v4
+  }
+}
+";
+
 #[test]
 fn run_config_threads_fuel_and_memory() {
     unsafe {
-        // fuel=1 out-of-fuels the tree-walker; the JIT ignores it.
+        // fuel=1 out-of-fuels the tree-walker at a loop back-edge (LOOP_HELLO); the JIT ignores it.
         let cfg = SvmRunConfig {
             fuel: 1,
             fuel_set: 1,
@@ -159,7 +187,7 @@ fn run_config_threads_fuel_and_memory() {
             memory_set: 0,
         };
         let mk = || {
-            let ir = CString::new(HELLO).unwrap();
+            let ir = CString::new(LOOP_HELLO).unwrap();
             let m = svm_module_parse_text(ir.as_ptr());
             assert!(!m.is_null(), "parse");
             let imports = svm_imports_new();
