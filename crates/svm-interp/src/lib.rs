@@ -7305,8 +7305,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             let inst = &block.insts[frames[top].inst];
             // Fuel unification: insts do NOT charge fuel — fuel is metered at IR safepoints (back-edge
             // branches + function entries), charged in the Call/CallIndirect arms and the branch
-            // terminators below. `budget` (explorer/single-step) stays per-op above; `kill` is likewise
-            // polled at safepoints now, matching the JIT.
+            // terminators below. `budget` (explorer/single-step) stays per-op above. `kill` also stays
+            // **per-op** (`poll_kill`, free when unarmed) — it is an async interrupt orthogonal to
+            // fuel, and a §14 child must self-terminate even in a loop that exits on its first
+            // iteration (no back-edge), so it can't wait for a safepoint.
+            poll_kill(kill.as_deref())?;
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
@@ -9781,10 +9784,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
         }
 
-        // Fuel unification: the terminator no longer charges unconditionally. A *back-edge* branch
+        // Fuel unification: the terminator no longer charges fuel unconditionally. A *back-edge* branch
         // (target block <= current) charges in its arm below; tail calls charge as function entries;
-        // forward branches and `return` are free (bounded straight-line control flow). `kill` is polled
-        // at those same safepoints.
+        // forward branches and `return` are free (bounded straight-line control flow). `kill` stays
+        // per-op — polled here for the terminator too (it is orthogonal to fuel).
+        poll_kill(kill.as_deref())?;
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
         // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
@@ -17954,12 +17958,23 @@ fn step(fuel: &mut u64, kill: Option<&AtomicBool>) -> Result<(), Trap> {
     // PROCESS.md S3 `kill`: a §14 child (and its inherited-flag descendants) polls its parent-set
     // kill flag once per op. Set ⇒ the vCPU self-terminates (`ThreadFault`, `poll` → 2). `None` for
     // the root / top-level threads (a predictable branch, no atomic load) — the undebugged hot path.
+    poll_kill(kill)?;
+    *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+    Ok(())
+}
+
+/// The `kill`-flag half of [`step`], split out so it can be polled **per op** while fuel is charged
+/// only at IR safepoints (fuel unification). `kill` is an async host interrupt (§5 / PROCESS.md S3
+/// `Instantiator.kill`), orthogonal to the fuel budget: a §14 child must self-terminate promptly even
+/// inside a loop that exits on its *first* iteration (no back-edge to poll at), so kill cannot wait
+/// for a safepoint. Free when unarmed (`None` — the common case, a predicted branch, no atomic load).
+#[inline]
+fn poll_kill(kill: Option<&AtomicBool>) -> Result<(), Trap> {
     if let Some(k) = kill {
         if k.load(Ordering::Relaxed) {
             return Err(Trap::ThreadFault);
         }
     }
-    *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
     Ok(())
 }
 

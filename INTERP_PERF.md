@@ -425,9 +425,11 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. ✅ **DONE.**
    Both engines now charge fuel only at a taken back-edge (`target block <= current`, i.e. a backward
    jump — in the bytecode engine, literally `target_pc <= pc`) and at each function entry
-   (`Call`/`CallIndirect`/`ReturnCall`/`ReturnCallIndirect`); `kill` is polled at those same points.
-   The per-op charge is gone; `budget` (explorer/single-step) is untouched, so debug step traces are
-   bit-identical. `FUEL_BURN` (was a straight-line block — now free) rewritten to a counted loop so
+   (`Call`/`CallIndirect`/`ReturnCall`/`ReturnCallIndirect`). Only *fuel* moved: the §5 `kill`
+   interrupt stays **per-op** (`poll_kill`, free when unarmed) — it is orthogonal to the fuel budget,
+   and a §14 child must self-terminate even in a loop that exits on its first iteration (no back-edge
+   to poll at). The per-op *fuel* charge is gone; `budget` (explorer/single-step) is untouched, so
+   debug step traces are bit-identical. `FUEL_BURN` (was a straight-line block — now free) rewritten to a counted loop so
    `out_of_fuel_backtrace_matches` traps at the loop back-edge. Validated across **39 harnesses (two
    batches)** — `bytecode_diff`, `bytecode_traced` (incl. the OutOfFuel backtrace), all
    `bytecode_debug*`, `jit_diff`, `escape_oracle`, `simd`, coroutines/threads/fibers/dynlink/
