@@ -4554,12 +4554,33 @@ struct DbgTask {
     /// The reified continuation of this vCPU: its active `Vm` plus its §12 fiber resume `chain` (a
     /// `cont.resume` switches `vt.active` into a fiber; `suspend` / a fiber return switches back).
     vt: VTask,
-    /// This vCPU's `thread.spawn` children (handle = index → global task index; `None` = joined).
+    /// This vCPU's `thread.spawn` / `instantiate` children (handle = index → global task index; `None`
+    /// = joined). Both seams share one handle namespace, so `Instantiator.join` (→ `ThreadJoin`) joins
+    /// an `instantiate` child through the same machinery.
     threads: Vec<Option<usize>>,
+    /// The runtime environment this vCPU steps against: `None` = the shared domain (root + its
+    /// `thread.spawn` siblings, over `self.mem`/`self.host`/`self.table`); `Some(k)` = the confined
+    /// [`extra_envs`](ScheduledDebugRun::extra_envs)`[k]` of a §14 `instantiate` child. The debug-engine
+    /// counterpart of the production [`TaskSlot::env`].
+    env: Option<usize>,
     state: DbgTaskState,
     /// Paused on a just-reported breakpoint — step one op past it before the next scan makes progress
     /// (the per-task analogue of [`DebugRun::at_bp`], so a loop-body breakpoint re-fires each iteration).
     at_bp: bool,
+}
+
+/// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
+/// debug-engine counterpart of the production [`ChildEnv`]. Its `mem` is a `nested_view` sub-window
+/// sharing the parent's backing (the confinement masking is the production primitive, unchanged — the
+/// debugger only drives an already-confined child op-by-op), `host` an attenuated powerbox (an
+/// `Instantiator` + `AddressSpace`, each over `[0, child_size)`), `table` a fresh natural dispatch table
+/// over module 0 (no installed §22 units), and `fuel` a sub-allocated quota. Plain `Host` (the debug
+/// scheduler is single-threaded and the §3.6 live-call/serve machinery is not yet driven here).
+struct DbgEnv {
+    mem: Option<Mem>,
+    host: Host,
+    table: SharedSlots,
+    fuel: u64,
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -4574,14 +4595,20 @@ struct DbgTask {
 /// (in/over/out), **`memory.wait`/`notify`** park/wake threads (a stuck set advances a logical `clock`
 /// to the earliest wait deadline, exactly as the production `drive`), and **§12 fibers** switch each
 /// vCPU's active continuation (breakpoints fire inside a resumed fiber; the fiber registry is run-shared
-/// so a fiber migrates across vCPUs — D57). Anything still outside the subset (`instantiate`,
-/// coroutines) surfaces as [`SchedStop::Declined`].
+/// so a fiber migrates across vCPUs — D57), and **§14 `instantiate`** spawns a confined executor child
+/// as its own scheduled vCPU (its own [`DbgEnv`] — window / powerbox / quota — joinable through the
+/// shared thread machinery). Still outside the subset (→ [`SchedStop::Declined`]): `instantiate_module`
+/// (separate-module child), coroutines, and tier-up.
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
     table: SharedSlots,
     mem: Option<Mem>,
     host: Host,
     tasks: Vec<DbgTask>,
+    /// §14 `instantiate` confined children's environments (handle = index; a task's [`DbgTask::env`] is
+    /// `Some(k)` into this). Grown as children spawn; rebuilt deterministically on a reverse-`seek`
+    /// replay. Not torn down mid-run (a finished child's env is inert — revocation semantics deferred).
+    extra_envs: Vec<DbgEnv>,
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs; a fiber created on
     /// one can be resumed on another — D57). Rebuilt deterministically on a reverse `seek` replay.
     fibers: Vec<FiberState>,
@@ -4659,10 +4686,159 @@ fn dbg_spawn(
         return Err(Trap::ThreadFault); // thread bomb
     }
     let vt = VTask::new(&primary, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+    let env = tasks[ti].env; // a thread inherits its spawner's environment (shares its window)
     let cidx = tasks.len();
     tasks.push(DbgTask {
         vt,
         threads: Vec::new(),
+        env,
+        state: DbgTaskState::Runnable,
+        at_bp: false,
+    });
+    let handle = tasks[ti].threads.len() as i32;
+    tasks[ti].threads.push(Some(cidx));
+    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    Ok(())
+}
+
+/// The per-op driver for a scheduled debug task, selecting its runtime context: the shared domain
+/// (`env = None`) or its confined [`DbgEnv`] (`env = Some(k)`). Centralizes the split borrow so the
+/// unified `drive`/`tick` pumps stay a single call. Mirrors the production `drive`'s `RunCtx` selection.
+#[allow(clippy::too_many_arguments)]
+fn dbg_advance_task(
+    tasks: &mut [DbgTask],
+    ti: usize,
+    extra_envs: &mut [DbgEnv],
+    fibers: &mut Vec<FiberState>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> FiberStep {
+    match tasks[ti].env {
+        None => debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host),
+        Some(k) => {
+            let e = &mut extra_envs[k];
+            debug_advance_fiber(
+                &mut tasks[ti].vt,
+                fibers,
+                source,
+                &e.table,
+                &mut e.fuel,
+                &mut e.mem,
+                &mut e.host,
+            )
+        }
+    }
+}
+
+/// §14 `instantiate` (op 0) under the debug scheduler: build a **confined executor child** as a new
+/// scheduled vCPU with its own [`DbgEnv`] (window / attenuated powerbox / quota), registered as a
+/// child handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it). The debug-engine counterpart
+/// of the production `drive`'s `Instantiate` arm — same carve + attenuation + natural table. Writes the
+/// handle (or `EINVAL`) to `dst`; `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`).
+#[allow(clippy::too_many_arguments)]
+fn dbg_instantiate(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    extra_envs: &mut Vec<DbgEnv>,
+    source: &ModuleSource,
+    shared_mem: &Option<Mem>,
+    shared_fuel: u64,
+    ibase: u64,
+    isz: u64,
+    entry: i64,
+    off: i64,
+    size_log2: i64,
+    quota: i64,
+    dst: u32,
+) -> Result<(), Trap> {
+    let c0 = source.primary();
+    // A confined child's entry is `(i64 instantiator) -> (i64)` or `(i64 instantiator, i64 address_space)
+    // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
+    let sig = c0.sigs.get(entry as u64 as usize);
+    let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let ok_entry = sig.is_some_and(|(p, r)| {
+        r[..] == [ValType::I64]
+            && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
+    });
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off_u = off as u64;
+    let fits = child_size != 0
+        && child_size <= isz
+        && off_u & (child_size - 1) == 0
+        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+    if !ok_entry || !fits {
+        tasks[ti]
+            .vt
+            .active
+            .set(dst, Reg::from_i32(super::EINVAL as i32));
+        return Ok(());
+    }
+    let live = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
+        .count();
+    if live >= super::MAX_VCPUS {
+        return Err(Trap::ThreadFault); // instantiate bomb
+    }
+    // Holder-relative `ibase`/`off` → backing-absolute base (so nesting composes); parent window base
+    // and fuel come from the parent's environment (shared or its own confined env).
+    let (pbase, pfuel) = match tasks[ti].env {
+        None => (
+            shared_mem.as_ref().map_or(0, |m| m.window.base()),
+            shared_fuel,
+        ),
+        Some(k) => (
+            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
+            extra_envs[k].fuel,
+        ),
+    };
+    let abs_base = pbase + ibase + off_u;
+    let child_mem = match tasks[ti].env {
+        None => shared_mem
+            .as_ref()
+            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+        Some(k) => extra_envs[k]
+            .mem
+            .as_ref()
+            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+    };
+    // Attenuated powerbox over the child's *own* `[0, child_size)`: an `Instantiator` (so it can nest —
+    // confinement composes) and an `AddressSpace`; these are its entry arguments.
+    let mut child_host = Host::new();
+    let cinst = child_host.grant_instantiator(0, child_size);
+    let cas = child_host.grant_address_space(0, child_size);
+    let child_args = if want_as {
+        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+    } else {
+        vec![Value::I64(cinst as i64)]
+    };
+    let child_fuel = if quota <= 0 {
+        pfuel
+    } else {
+        (quota as u64).min(pfuel)
+    };
+    // The child is its own domain: a fresh natural table over module 0 (no installed §22 units).
+    let child_table = build_table(c0.progs.len(), 0);
+    let child_vt = VTask::new(&c0, entry as u64 as usize, &child_args)?;
+    let eidx = extra_envs.len();
+    extra_envs.push(DbgEnv {
+        mem: child_mem,
+        host: child_host,
+        table: child_table,
+        fuel: child_fuel,
+    });
+    let cidx = tasks.len();
+    tasks.push(DbgTask {
+        vt: child_vt,
+        threads: Vec::new(),
+        env: Some(eidx),
         state: DbgTaskState::Runnable,
         at_bp: false,
     });
@@ -4782,8 +4958,22 @@ fn dbg_pick_runnable(tasks: &mut [DbgTask], clock: &mut u64) -> Option<usize> {
 
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
-    /// bytecode engine's subset (`compile_module` declines it).
+    /// bytecode engine's subset (`compile_module` declines it). The powerbox is empty; use
+    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted capability
+    /// (e.g. a §14 `Instantiator` for `instantiate`).
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<ScheduledDebugRun> {
+        ScheduledDebugRun::new_with_host(m, func, args, Host::new())
+    }
+
+    /// [`new`](ScheduledDebugRun::new) carrying a live powerbox `host`, so a granted `Instantiator`
+    /// (`host.grant_instantiator(..)`) reaches the guest as an argument and makes an `instantiate`-using
+    /// multithreaded guest debuggable (the debug-scheduler analogue of [`DebugRun::new_with_host`]).
+    pub fn new_with_host(
+        m: &Module,
+        func: FuncIdx,
+        args: &[Value],
+        host: Host,
+    ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
         let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
         let mut fn_block_base = Vec::with_capacity(m.funcs.len());
@@ -4806,9 +4996,8 @@ impl ScheduledDebugRun {
             ));
         }
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
-        let dom = Domain::new(c, 0);
+        let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let host = Host::new();
         let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
         let Domain { source, table } = dom;
         Some(ScheduledDebugRun {
@@ -4819,9 +5008,11 @@ impl ScheduledDebugRun {
             tasks: vec![DbgTask {
                 vt,
                 threads: Vec::new(),
+                env: None,
                 state: DbgTaskState::Runnable,
                 at_bp: false,
             }],
+            extra_envs: Vec::new(),
             fibers: Vec::new(),
             fn_block_base,
             fn_block_types,
@@ -4876,6 +5067,7 @@ impl ScheduledDebugRun {
             mem,
             host,
             tasks,
+            extra_envs,
             fibers,
             funcs,
             breakpoints,
@@ -4917,9 +5109,15 @@ impl ScheduledDebugRun {
                         };
                     }
                     if !watchpoints.is_empty() && pc.module == 0 {
+                        // Watch against the running task's own window (a confined `instantiate` child
+                        // sees its own `nested_view`, else the shared mem).
+                        let task_mem = match tasks[ti].env {
+                            None => &*mem,
+                            Some(k) => &extra_envs[k].mem,
+                        };
                         if let Some((addr, write)) = watch_hit_before(
                             &tasks[ti].vt.active,
-                            mem,
+                            task_mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
@@ -4939,8 +5137,9 @@ impl ScheduledDebugRun {
                     }
                 }
             }
-            let step_res =
-                debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host);
+            let step_res = dbg_advance_task(
+                tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
+            );
             tasks[ti].at_bp = false;
             match step_res {
                 // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
@@ -4979,7 +5178,25 @@ impl ScheduledDebugRun {
                         *turn += 1;
                         dbg_notify(tasks, ti, base, count, dst);
                     }
-                    // Instantiate / coroutine / tier-up — outside this slice.
+                    // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
+                    Outcome::Instantiate {
+                        ibase,
+                        isize: isz,
+                        entry,
+                        off,
+                        size_log2,
+                        quota,
+                        dst,
+                    } => {
+                        *turn += 1;
+                        if let Err(t) = dbg_instantiate(
+                            tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
+                            size_log2, quota, dst,
+                        ) {
+                            dbg_complete(tasks, ti, Err(t));
+                        }
+                    }
+                    // instantiate_module / coroutine / tier-up — outside this slice.
                     _ => return SchedStop::Declined,
                 },
             }
@@ -5052,6 +5269,7 @@ impl ScheduledDebugRun {
             mem,
             host,
             tasks,
+            extra_envs,
             fibers,
             turn,
             clock,
@@ -5060,8 +5278,9 @@ impl ScheduledDebugRun {
         let Some(ti) = dbg_pick_runnable(tasks, clock) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
-        let step_res =
-            debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host);
+        let step_res = dbg_advance_task(
+            tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
+        );
         tasks[ti].at_bp = false;
         *turn += 1;
         match step_res {
@@ -5084,6 +5303,24 @@ impl ScheduledDebugRun {
                 } => dbg_wait(tasks, ti, mem, *clock, base, expected, width, timeout, dst),
                 Outcome::MemoryNotify { base, count, dst } => {
                     dbg_notify(tasks, ti, base, count, dst)
+                }
+                // §14 `instantiate` (op 0): build the confined child — mirrors the `drive` arm so a
+                // reverse-`seek` replay reconstructs the env/task set identically.
+                Outcome::Instantiate {
+                    ibase,
+                    isize: isz,
+                    entry,
+                    off,
+                    size_log2,
+                    quota,
+                    dst,
+                } => {
+                    if let Err(t) = dbg_instantiate(
+                        tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
+                        size_log2, quota, dst,
+                    ) {
+                        dbg_complete(tasks, ti, Err(t));
+                    }
                 }
                 _ => return false, // an unsupported op — stop the replay here
             },
@@ -5153,12 +5390,22 @@ impl ScheduledDebugRun {
         self.turn
     }
 
-    /// A [`FrameReader`] over the **focused** thread's `Vm` (what `select_task` chose).
+    /// The memory window a task steps against: its confined `instantiate` env (`Some(k)`) or the shared
+    /// mem — so inspection of a focused child reads its own confined window.
+    fn task_mem(&self, ti: usize) -> &Option<Mem> {
+        match self.tasks[ti].env {
+            None => &self.mem,
+            Some(k) => &self.extra_envs[k].mem,
+        }
+    }
+
+    /// A [`FrameReader`] over the **focused** thread's `Vm` (what `select_task` chose), over that
+    /// thread's own window (a confined `instantiate` child reads its `nested_view`, else the shared mem).
     fn reader(&self) -> FrameReader<'_> {
         FrameReader {
             vm: &self.tasks[self.focus].vt.active,
             source: &self.source,
-            mem: &self.mem,
+            mem: self.task_mem(self.focus),
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
@@ -5185,9 +5432,10 @@ impl ScheduledDebugRun {
         self.reader().var_addr(depth, name)
     }
 
-    /// Read `len` bytes from the shared guest window at `addr`.
+    /// Read `len` bytes from the focused thread's guest window at `addr` (its confined `instantiate`
+    /// window, else the shared mem).
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.mem.as_ref() {
+        match self.task_mem(self.focus).as_ref() {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
