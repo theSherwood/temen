@@ -359,8 +359,16 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 
 ## Fuel unification (safepoint-anchored)
 
-*Cross-backend execution contract; owner-approved 2026-07-25, implementation pending. The concise
-rule lives in INVARIANTS.md (invariant 9); this is the model and the migration.*
+> **Split to its own branch/PR (`claude/svm-fuel-unification-fkhrs0`), 2026-07-26.** The interpreter
+> implementation was built and validated but is **not part of this PR** — its blast radius (every
+> fuel-*denominated* mechanism: exhaustion tests, the `impl_fuel` reserve, and fuzzer runtime, since
+> safepoint fuel loosens the wall-clock bound by the ops/safepoint factor) needs deliberate handling
+> alongside the JIT half + the harness flip. This PR carries only the safe op-count perf slices
+> (5a, edge-copy elision). The design record below stays here as the plan; the code lives on the
+> fuel branch.
+
+*Cross-backend execution contract; owner-approved 2026-07-25, implementation pending on the fuel
+branch. The model and the migration:*
 
 **The non-parity today.** Fuel means three different things:
 - **tree-walker + bytecode** — a per-op decrementing counter (`step(fuel)` / `checked_sub(1)` before

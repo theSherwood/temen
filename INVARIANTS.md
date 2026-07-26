@@ -118,12 +118,6 @@ differential (refusal-vs-hang: diverging *toward refusal* is fail-closed winning
 short enumerated list) or **tracked debt with a convergence plan** (the `poll` eager/lazy
 child divergence) — never quietly normalized.
 
-**Fuel is uniform across backends; debugging is not (owner, 2026-07-25):** unlike the debug seam
-above — a per-backend *view*, deliberately tiered — the fuel bound is metered in one unit by every
-backend, so `OutOfFuel` is a differentially-checked fact, not an engine-specific quirk. *Violated
-by:* a backend that meters fuel on a different unit than the others. (INTERP_PERF.md "Fuel
-unification".)
-
 ## 10. Identity is structural
 
 Interface and type identity is the interned shape (D59) — never a nominal name or registry.
