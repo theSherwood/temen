@@ -57,9 +57,44 @@ fn run_diff_under_config() {
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
 }
 
-/// `fuel` bounds the **interpreters** (per-op budget) but is ignored by the JIT (which bounds runaway
-/// guests with a `deadline` instead) — the one documented backend-specific knob, shown uniform-API but
-/// honest about who honors it.
+/// A looping variant: spins a bounded counter loop (each back-edge an IR **safepoint**) before the
+/// same `write`, so a tight fuel budget runs the interpreters out of fuel *at a back-edge* — the unit
+/// fuel is metered in since the fuel unification (straight-line code like `HELLO` is now free, so it
+/// can't be out-of-fueled). The JIT still ignores the interpreter fuel counter.
+const LOOP_HELLO: &str = "\
+memory 15
+data ro 16384 \"hello, powerbox\\n\"
+export 0 func \"_start\" 0
+func () -> (i32) {
+block 0 () {
+  n0 = i32.const 100
+  br 1(n0)
+}
+block 1 (n: i32) {
+  one = i32.const 1
+  n2 = i32.sub n one
+  br_if n2 1(n2) 2()
+}
+block 2 () {
+  v0 = i32.const 0
+  v1 = i64.const 16384
+  v2 = i64.const 16
+  v3 = call.sym \"write\" (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = i32.const 0
+  return v4
+  }
+}
+";
+
+fn loop_hello_instance() -> Instance {
+    let module = svm_text::parse_module(LOOP_HELLO).expect("parse");
+    instantiate(module).expect("instantiate")
+}
+
+/// `fuel` bounds the **interpreters** (metered at IR safepoints — loop back-edges + function entries)
+/// but is ignored by the JIT (which bounds runaway guests with a `deadline` instead) — the one
+/// documented backend-specific knob, shown uniform-API but honest about who honors it. Fuel is now
+/// unified to safepoints across both interpreters, so the two agree on where they run out.
 #[test]
 fn fuel_bounds_interpreters_not_the_jit() {
     let tight = RunConfig {
@@ -69,19 +104,24 @@ fn fuel_bounds_interpreters_not_the_jit() {
         },
         ..RunConfig::default()
     };
-    // A 1-op budget out-of-fuels the tree-walker and the bytecode engine before the program finishes.
+    // A 1-safepoint budget out-of-fuels both interpreters at a loop back-edge, before the program
+    // finishes its 100-iteration counter loop.
     assert!(
-        hello_instance().run(Backend::TreeWalk, &tight).is_err(),
+        loop_hello_instance()
+            .run(Backend::TreeWalk, &tight)
+            .is_err(),
         "fuel=1 must out-of-fuel the tree-walker"
     );
     assert!(
-        hello_instance().run(Backend::Bytecode, &tight).is_err(),
+        loop_hello_instance()
+            .run(Backend::Bytecode, &tight)
+            .is_err(),
         "fuel=1 must out-of-fuel the bytecode engine"
     );
-    // The JIT has no per-op counter, so it ignores `fuel` and runs to completion.
-    let run = hello_instance()
+    // The JIT has no interpreter fuel counter, so it ignores `fuel` and runs to completion.
+    let run = loop_hello_instance()
         .run(Backend::Jit, &tight)
-        .expect("the JIT ignores per-op fuel");
+        .expect("the JIT ignores interpreter fuel");
     assert_eq!(run.stdout, b"hello, powerbox\n");
 }
 
