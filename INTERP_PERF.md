@@ -85,8 +85,11 @@ instruction. We can approach that floor; we cannot reach the JIT.
   fibers/coroutines, threads, durability (freeze/thaw), and capability calls must all keep working.
   This is the hard part of any dispatch rewrite — the new execution model must still expose every
   seam.
-- **Determinism.** Fuel/scheduling changes must not make the interp diverge from the JIT on a
-  verified module (e.g. a fuel change that turns a completing run into `OutOfFuel` is a divergence).
+- **Determinism.** Scheduling changes must not make the interp diverge from the JIT on a verified
+  module, and a completing run must never become `OutOfFuel`. Fuel *metering itself* is being
+  unified to a single cross-backend unit — IR-anchored safepoints — so `OutOfFuel` becomes a
+  checked parity rather than an excluded difference (see "Fuel unification"; owner-approved
+  2026-07-25). Single-step granularity is the separate per-op `budget`, untouched by that change.
 
 ---
 
@@ -246,6 +249,186 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   the Phase-3 investigation above, the headroom is small (~3–5%, predicted-branch-bound) and capped
   by `forbid-unsafe`; threaded dispatch is also impractical in safe Rust (no computed goto). Deferred
   unless the interpreter's absolute speed becomes a priority over its oracle role.**
+
+### Phase 5 — op-count reduction (safe levers)
+
+Phase 3 measured the cost of *each trip* through the per-op machinery (dispatch + fuel + budget +
+bounds) and closed it as near-ceiling (~3–5%, predicted-branch-bound). Phase 5 attacks the
+**orthogonal** axis Phase 3 never touched — the **number of trips** — entirely in the compile pass,
+`#![forbid(unsafe_code)]` intact. Fewer ops executed multiplies against *every* per-op cost at once,
+so this is where the remaining safe headroom is. Prior-art placement: these are the moves that put
+svm-bytecode into the wasm3 / Wasmi-0.32 register-interpreter frontier (~10–12× native); they do
+**not** close to the JIT (that gap is structural — compilation + MMU + cross-op optimization — and
+stays the JIT's job).
+
+- **Prereq — fix the bench. ✅ DONE (I45).** `megabench.rs`'s `chase`/`chase_rand`/`fnv`/`fma`/`vsum`
+  kernels used the retired named-block text syntax; rewritten to numeric `block N (params) { }` with
+  numeric branch targets. All 9 kernels now run on all three engines. Fresh baseline (ns/iter,
+  tw → bc → jit; bc/jit ratio):
+
+  | kernel      | tree-walk | bytecode | JIT    | bc/jit | note |
+  |-------------|----------:|---------:|-------:|-------:|------|
+  | alu         | 33.3      | 22.2     | 0.45   | ~49×   | JIT strength-reduces |
+  | call        | 77.0      | 38.4     | 1.56   | ~25×   | honest structural gap |
+  | call_indirect | 86.9    | 61.4     | 2.51   | ~24×   | |
+  | mem         | 107.4     | 83.2     | 0.33   | ~249×  | JIT elides store/load |
+  | chase       | 92.6      | 70.9     | 2.52   | ~28×   | L1 pointer chase |
+  | chase_rand  | 93.8      | 90.0     | 24.1   | **~3.7×** | memory-latency-bound — all engines stall on DRAM, so the interpreter tax is hidden |
+  | fnv         | 94.5      | 69.6     | 1.49   | ~47×   | serial hash loop |
+  | fma         | 54.6      | 33.3     | 2.61   | ~13×   | f64 latency-bound recurrence |
+  | vsum        | 96.0      | **107.2**| 0.58   | ~185×  | **bytecode ~0.9× the tree-walker — a regression to investigate in 5a** |
+
+  Two findings: `chase_rand` confirms the ~26× compute gap collapses to ~3.7× when memory latency
+  dominates (dispatch is hidden behind cache-miss stalls); `vsum` is the one kernel where bytecode
+  *loses* to the tree-walker — the store-in-init + reduction shape is a concrete 5a target.
+
+- **Slice 5a — `IntCmp`+`BrIf` → `BrIfCmp` fusion. ✅ LANDED, but the win is small (measured).** A
+  peephole in `compile_func` fuses a block-final `IntCmp` whose result is its `BrIf`'s sole consumer
+  (last inst, cond slot not carried to a successor) into one `BrIfCmp`. Built behind a `fuse` flag:
+  the fast `compile_module` fuses; the five debug/trace entries use `compile_module_unfused` so their
+  step trace keeps one location per source inst (the `src` map is now built incrementally, in
+  lockstep with `ops`, so dropping the fused op can't desync it). All gates green — `bytecode_diff`
+  (4000 modules + suspend-slicing), every `bytecode_debug*`, `jit_diff`, `simd`, `escape_oracle`.
+  Added the `loopc` kernel (canonical `for (i<n)` — the only shape with a compare to fuse; the other
+  kernels use the `sub`-as-truthiness idiom and are correctly **unchanged**, a clean no-regression
+  check).
+
+  **Measured A/B on `loopc` (fused vs unfused bytecode): 27.4 vs 28.2 ns — ~2–3%, at/below this
+  box's ~4% noise floor.** This **corrects the earlier ~15–20% estimate** and **confirms the Phase-3
+  finding**: the dropped dispatch is a *predicted* branch (≈free), so removing it saves little, and
+  what remains in the loop terminator — the edge-copy scatter/gather + the per-op fuel/budget — is
+  untouched by fusion. `BrIfCmp` also still charges 2 fuel (to keep counts bit-identical pre-fuel-
+  unification), which caps its own saving. **Takeaway:** op-*count* reduction is real but,
+  op-for-op, as predicted-branch-bound as Phase 3's control-overhead result. Its value is mostly
+  *unlocked by 5b* — once per-op fuel moves to safepoints, the fused op stops paying the doubled
+  charge and the dispatch saving is fully realized. Landed as foundation (correct, green, and the
+  `fuse`-flag + incremental-`src` machinery is what const-fold and future superinstructions build
+  on), not as a headline win.
+
+- **Slice 5a-2 — `Const`+binop → immediate operand (`SubImm`/`AddImm`).** Deletes the `Const`
+  op; the *slot-freeing* benefit needs slot-reclaim (renumbering), without which it's just another
+  predicted-branch dispatch drop (≈free by the 5a evidence). Deferred as low-ROID until slot-reclaim
+  is in scope.
+
+- **Slice 5b-edge — edge-copy identity elision. ✅ LANDED.** A loop-invariant block param threaded
+  unchanged across a back-edge lands in the *same* global slot, so its edge copy is an `x → x` no-op.
+  The `edge` builder now drops these at compile time (one `.filter(src != dst)`), removing a real
+  `scratch` push+write per invariant param, every iteration — unlike dispatch-shaving this removes
+  actual `Vec` work, not a predicted branch. Semantics-transparent (a self-copy changes nothing; its
+  removal can't perturb the gather/scatter of the aliasing copies), so it needs no `fuse` flag and
+  touches no step trace. All gates green (`bytecode_diff`, `bytecode_debug*`, `jit_diff`, `simd`,
+  `escape_oracle`). *Not* pursued: the non-aliasing direct-copy path (skip `scratch` when no dst is a
+  src) — a struct/macro change for a sub-noise gain, which fights invariant 1; left until a profile
+  names edge-copies as a measured cost.
+
+- **Slice 5b — two-mode resume.** A fast `resume` loop that drops the per-op budget check and the
+  per-op `step(fuel)` call — metering fuel at safepoints instead (see "Fuel unification") — whenever
+  no debug / coroutine / preemption seam is armed; today's per-op loop stays as the fallback the
+  moment a seam attaches. On its own the ceiling is small (Phase 3 measured removing the whole
+  machinery at ~2–3%), but it composes with the fuel unification (same safepoint charge points) and
+  removes the interpreter's per-op fuel tax that wasm3 / Wasmi-default simply don't pay. No `unsafe`;
+  no contract change for the metered (seam-armed) mode.
+
+- **Slice 5c — split register banks (profile-gated).** Replace the uniform 16-byte `Reg` file with an
+  **8-byte scalar bank + 16-byte vector bank**, allocated per SSA value by its static (verifier)
+  type. Scalar *reads* already only touch `.lo`, so the reclaim is scalar store-width, register-file
+  cache footprint (halved), and edge-copy cost — a real but modest win, larger on realistically-sized
+  functions than on the L1-resident microkernels. No `unsafe`, but it complicates slot allocation,
+  the debug slot→type map (`func_value_types`), durability freeze/thaw serialization, and the
+  fiber/thread window save/restore — against invariant 1's "keep the core small." **Gate on a
+  profile** (instrument the bench for regfile store/copy traffic vs. total) that shows the register
+  file, not dispatch, as the bottleneck. Do not do it blind.
+
+- **Deferred (spends TCB — not Phase 5).** Audited-`unsafe` unchecked register access
+  (`get_unchecked` where the compile pass proved the slot in-window — the `svm-mem` precedent; ~3–5%,
+  predicted branches) and function-pointer tail-threaded dispatch (needs the `unsafe` from the
+  former; ~3–5%). These are the last ~2× toward the frontier and a `forbid-unsafe` renegotiation for
+  a small gain — revisit only if 5a–5c land and the profile still justifies it.
+
+**Target — revised by the 5a measurement.** The optimistic "~1.3–1.5× combined" rested on op-count
+reduction paying ~15–20%; 5a's A/B shows each fusion is ~2–3% (predicted-branch-bound), so the safe
+levers stack to *low single digits each*, not a 1.3–1.5×. The real interpreter-vs-frontier residual
+is **edge-copy scatter/gather + per-op fuel/budget + software memory confinement**, not dispatch —
+so the highest-leverage *safe* work is probably **5b (fuel→safepoints, which also unlocks 5a's capped
+saving)** and reducing edge-copy cost, ahead of more superinstructions. This is the benchmark
+correcting the plan (AGENTS.md: the harness is the arbiter); the levers remain worth landing for
+being correct, safe, and cumulative, but the frontier is closed by *removing real work* (5b, memory),
+not by shaving predicted branches. The JIT stays the answer for near-native.
+
+---
+
+## Fuel unification (safepoint-anchored)
+
+> **Split to its own branch/PR (`claude/svm-fuel-unification-fkhrs0`), 2026-07-26.** The interpreter
+> implementation was built and validated but is **not part of this PR** — its blast radius (every
+> fuel-*denominated* mechanism: exhaustion tests, the `impl_fuel` reserve, and fuzzer runtime, since
+> safepoint fuel loosens the wall-clock bound by the ops/safepoint factor) needs deliberate handling
+> alongside the JIT half + the harness flip. This PR carries only the safe op-count perf slices
+> (5a, edge-copy elision). The design record below stays here as the plan; the code lives on the
+> fuel branch.
+
+*Cross-backend execution contract; owner-approved 2026-07-25, implementation pending on the fuel
+branch. The model and the migration:*
+
+**The non-parity today.** Fuel means three different things:
+- **tree-walker + bytecode** — a per-op decrementing counter (`step(fuel)` / `checked_sub(1)` before
+  every op); unit = **ops executed**; deterministic, but each engine counts its *own* ops (an IR
+  inst can lower to a different number of bytecode ops, e.g. edge copies, the delegated `Eval`).
+- **Cranelift JIT** — **no counter.** A host-owned `AtomicU64` interrupt cell (the §5 fuel/epoch
+  kill-path) polled only at loop back-edges + function entries; the plain `compile_and_run` takes no
+  fuel at all, and the `instantiate(…, fuel)` child budget is `_fuel` — *ignored*.
+
+The harnesses cope by **excluding `OutOfFuel` from the equality contract** (`bytecode_diff` skips
+when either side runs out; `jit_diff`'s scalar diff lists fuel among what "the scalar JIT does not
+model"). So fuel is not a portable, deterministic bound — only the interpreter honors it precisely,
+and the `_fuel`-ignored child is a *guest-observable* divergence.
+
+**The unified model.** Fuel is charged in **IR-anchored safepoints**:
+
+> **fuel = number of taken back-edges + function entries executed.**
+
+This bounds every non-terminating program (an infinite loop / unbounded recursion crosses safepoints
+without limit) while being nearly free to charge; straight-line, call-free code costs ≈0 (a single
+block's work is already verifier-bounded). It is the **only unit all three backends can provide
+cheaply *and* deterministically** — the JIT cannot count individual ops without destroying the very
+speed that justifies it.
+
+**Determinism by construction — anchor safepoints to the shared IR, not each backend's CFG:**
+- a `br` / `br_if` / `br_table` whose target block index ≤ the current block (the IR back-edge), and
+- `call` / `call_indirect` / `return_call` entry.
+
+Charge 1 per site. Because both engines count off the *same* IR structure, the counts are identical
+by construction, and the harnesses can **stop skipping `OutOfFuel` and start asserting it** — a
+strengthening of the oracle, not just a perf tweak.
+
+**Per-engine change.**
+- *tree-walker + bytecode:* move the `step(fuel)` charge from every op to the safepoints above; leave
+  the per-op `budget` (suspension / single-step) exactly as-is.
+- *Cranelift JIT:* it already *polls* at those sites for the kill-path — upgrade the poll from
+  "load interrupt cell, test" to "decrement fuel counter, trap `OutOfFuel` at zero," keeping the
+  async host kill-cell alongside it.
+
+**Single-step is untouched (the hard constraint, verified).** Fuel and the single-step `budget` are
+already separate counters — the bytecode `resume` loop runs `if budget == 0 { …suspend… }; budget -=
+1; step(fuel, None)?`, and the debugger single-steps via `budget = 1` (`Vm::step` → `step_to` →
+`debug_advance_fiber`, stopping at each `IrPc`/`src` location), never via fuel. Moving fuel to
+safepoints changes only *where `step(fuel)` is invoked*; stepping granularity, breakpoints, and the
+location trace stay bit-identical. `bytecode_debug` / `bytecode_suspend_resume` are the gate.
+
+**Contract change.** The caller-visible `fuel` unit goes from "ops" to "safepoints" — existing
+callers/tests passing op-scaled budgets need rescaling, and the `run_*` / `EXEC.md` "deterministic
+under fuel" wording should reference this definition. Coarser granularity is the right trade for
+fuel's purpose (bounding runaways), and it matches what the JIT already effectively does.
+
+**Sequence.**
+1. Proposal + owner sign-off (this section + the INVARIANTS clause). ✅ owner-approved 2026-07-25.
+2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. Validate
+   `bytecode_debug` / `bytecode_suspend_resume` stay green and step traces are unchanged.
+3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints.
+4. Flip the harnesses from "skip `OutOfFuel`" to "assert `OutOfFuel` parity" across all three — the
+   acceptance test that unification holds.
+5. Follow-on: the `instantiate` child honors its `fuel` uniformly (thread the counter in), closing
+   the `_fuel`-ignored divergence.
 
 ---
 
@@ -590,6 +773,24 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   - [x] Bulk memory (`memory.copy`/`fill`) through the D62 fast path
         (`mem_copy_fast`/`mem_fill_fast`).
 - [x] **Phase 3** — investigated, closed as **not worth it** (see the Phase 3 section): per-op
-      control overhead measured at only ~2–3%; fuel-at-back-edges is a dead end (the `budget = 1`
-      op-stepping is load-bearing for the debug seam); decision — keep per-op fuel/budget.
+      control overhead measured at only ~2–3%; fuel-at-back-edges is a dead end *as a perf lever*
+      (the `budget = 1` op-stepping is load-bearing for the debug seam); decision — keep per-op
+      fuel/budget **for perf reasons**. (Superseded on a *different* axis by "Fuel unification": moving
+      fuel — not `budget` — to safepoints is now justified by cross-backend **parity**, not the ~1%
+      speed. The debug-seam constraint is honored because `budget` stays per-op.)
 - [ ] **Phase 4** — (stretch) fully flat bytecode + threaded dispatch.
+- [~] **Phase 5** — op-count reduction, all safe (`forbid-unsafe` intact).
+  - [x] Prereq — fix the bit-rotted `megabench` kernels (I45); fresh 9-kernel baseline + `loopc`.
+  - [x] **5a** — `IntCmp`+`BrIf` → `BrIfCmp` fusion (fuse-flag; unfused debug/trace; incremental
+        `src`). All oracle gates green. **Measured ~2–3% on `loopc` (within noise)** — corrects the
+        ~15–20% estimate, confirms Phase 3 (dispatch is predicted-branch-bound). Landed as
+        correct/foundational, not a headline win.
+  - [ ] **5a-2** — `Const`+binop→immediate (`SubImm`/`AddImm`). Next.
+  - [ ] **5b** — two-mode resume / fuel→safepoints (also unlocks 5a's fuel-capped saving).
+  - [ ] **5c** — split register banks (profile-gated).
+  - **Revised thesis:** safe levers are low-single-digit% each; the frontier is closed by removing
+        real work (5b, memory, edge-copies), not by shaving predicted branches.
+- [ ] **Fuel unification** — safepoint-anchored fuel (IR back-edges + function entries) charged
+      identically across tree-walker / bytecode / Cranelift JIT; `OutOfFuel` flips from
+      excluded-from-contract to differentially-asserted; single-step (`budget`) untouched.
+      Owner-approved 2026-07-25 (see "Fuel unification" + INVARIANTS invariant 9). Not started.
