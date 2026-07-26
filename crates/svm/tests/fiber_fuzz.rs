@@ -277,8 +277,15 @@ fn generated_fiber_programs_never_panic_and_are_deterministic() {
         // Interpret every function: never panics, and is deterministic across two runs.
         for fi in 0..m.funcs.len() as u32 {
             let args = [svm_interp::Value::I64(4096), svm_interp::Value::I64(1)];
-            let mut fuel_a = 8_000u64;
-            let mut fuel_b = 8_000u64;
+            // Fuel is metered at IR safepoints now (function entries + taken back-edges), not per op.
+            // This corpus is single-block (no back-edges) but the generator is *cyclic* — a `call` /
+            // `cont.new` may target any function, so a program can recurse — and under safepoint metering
+            // each entry costs 1 fuel while executing a whole ≤12-inst body. Per-op fuel=8000 bounded a
+            // program to ≤8000 *ops*; to keep the same total-work bound the safepoint budget must be
+            // ~8000/max_body ≈ 666, so 300 (≤~3600 ops/program) stays comfortably under the old ceiling
+            // while still driving hundreds of resume/return entries deep.
+            let mut fuel_a = 300u64;
+            let mut fuel_b = 300u64;
             let a = run(&m, fi, &args, &mut fuel_a);
             let b = run(&m, fi, &args, &mut fuel_b);
             assert_eq!(a, b, "interpretation was non-deterministic");

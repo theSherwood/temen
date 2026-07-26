@@ -367,14 +367,19 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > exhausts; each was rewritten to loop so a back-edge exists to charge at. **Pending in this PR:** the
 > Cranelift JIT counted-fuel half + flipping the differential harnesses to assert `OutOfFuel` parity.
 >
-> **The fuzzers were *not* rescaled** (a measured correction to an earlier assumption). Every generated
-> fiber program is a single block terminated by `Return` — no branches, no back-edges — so safepoint
-> fuel charges only at call entries and is behaviorally equivalent to per-op fuel for this corpus;
-> `fiber_fuzz`'s diff vs main is empty. Measured: the 2000-program deterministic sweep is fuel-insensitive
-> (200 progs at fuel 10/100/1000 ≈ 28/32/31s; full 2000 at fuel 50 vs 1000 ≈ 584s vs 673s, the gap a
-> contention artifact) — its cost is the per-program serialization round-trips (~90%), not interp ops.
-> Safepoint fuel only loosens the wall-clock bound for programs that actually *loop*, which this corpus
-> does not.
+> **One fuzzer needed rescaling** (`fiber_fuzz`'s `generated_fiber_programs_never_panic_and_are_deterministic`).
+> Each generated function is a single `Return`-terminated block — no back-edges — but the deterministic
+> test's generator is *cyclic*: a `call` / `cont.new` may target any function, so a program can recurse.
+> Function/fiber entries are safepoints, so under safepoint metering `fuel=8000` permits 8000 *entries*,
+> each executing a whole ≤12-inst body — where per-op `fuel=8000` had bounded a program to 8000 *ops*
+> total. That ~×(ops-per-body) loosening blew the test's runtime up on CI: `cargo test --workspace` went
+> 10.75→44 min on windows-latest (cancelled at the 45-min ceiling) and 6→26 min on Linux, all in this one
+> test. Fix: drop its fuel to **300** (≤~3600 ops/program, comfortably under the old 8000-op ceiling),
+> restoring main-era wall-clock while still driving hundreds of entries deep. (The acyclic interp↔JIT
+> differential in the same file was unaffected — bounded depth, no recursive explosion — and keeps its
+> budget.) *An earlier revision of this note wrongly claimed the corpus was fuel-insensitive; that was
+> measured branch-vs-branch on a contended box, never branch-vs-main — the CI regression above is the
+> real signal.*
 
 *Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
