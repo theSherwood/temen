@@ -179,3 +179,57 @@ fn sibling_trap_tears_down_the_domain() {
         );
     }
 }
+
+/// The #440 × #442 intersection (jacl fiber-timed-wait follow-up, 2026-07-25): teardown must reach
+/// a **fiber** parked on an event wait, not just a spawned vCPU. `_start` creates a fiber that
+/// parks on an indefinite `memory.wait` (§3.6 5a — the resumer sees `FIBER_PARKED`), then `exit`s
+/// with the fiber still parked. The abandoned fiber must not hold the run open: `exit` completes
+/// promptly on every engine (the JIT's `FiberWaitCell` cell is dropped with the domain; the
+/// bytecode `WaitParked` fiber and the tree-walker's `Waiter::Fiber` drop with their vCPU).
+const EXIT_WHILE_FIBER_PARKED: &str = r#"
+memory 16
+import 0 "exit" (i32) -> ()
+export 0 func "_start" 0
+func () -> () {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  vs, vv = cont.resume v2 v3
+  v4 = i32.const 0
+  call.import 0 (v4)
+  unreachable
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 0
+  v6 = i32.const 0
+  v7 = i64.const -1
+  v8 = i32.atomic.wait v5 v6 v7
+  v9 = i64.extend_i32_s v8
+  return v9
+  }
+}
+"#;
+
+#[test]
+fn exit_tears_down_a_parked_fiber() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let module = svm_text::parse_module(EXIT_WHILE_FIBER_PARKED).expect("parse");
+        svm_verify::verify_module(&module).expect("verify");
+        let imports = Imports::new().provide("exit", HostCap::exit());
+        let instance = instantiate_with_imports(module, imports).expect("instantiate");
+        let t0 = Instant::now();
+        let run = instance
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("run on {backend:?}: {e}"));
+        let took = t0.elapsed();
+        assert_eq!(run.outcome, Outcome::Exited(0), "{backend:?}");
+        assert!(
+            took < PROMPT,
+            "{backend:?}: exit must not wait out the parked fiber (took {took:?})"
+        );
+    }
+}

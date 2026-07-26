@@ -1287,6 +1287,30 @@ round-trips now agree; existing `debug_info_round_trips_through_binary` /
 `no_debug_info_is_back_compatible` unit tests still pass, and the exact crash input was verified to
 normalize and round-trip through both the binary and text paths.
 
+### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25 by the jacl fiber-timed-wait follow-up
+
+**What.** After the §3.6 slice-5a fiber-park contract (svm PR #442), a `memory.wait` inside a
+fiber parks the *fiber* and the resumer polls it with `cont.resume`, seeing `FIBER_PARKED (3)`
+until the event fires. A guest runtime with a runnable sibling just resumes it and comes back;
+but a guest whose **only** pending work is one parked fiber has nothing to do between polls, so
+it busy-spins `cont.resume` (jacl's shape) or approximates an idle by waiting on an unrelated
+cell. There is no primitive to say "idle this vCPU until the parked fiber is due or woken."
+
+**Why tracked, not built.** One named consumer (jacl) with a working — if spinny — workaround, and
+a blocking-resume primitive lands squarely on the scheduler's park/idle core (the most sensitive
+concurrency surface). INVARIANTS #1 (no machinery without a demonstrated need) says wait for a
+second consumer or a measured cost before adding surface; the poll contract is correct and
+complete as-is, this is only efficiency. jacl itself framed the ask as "only when a second
+consumer demonstrates genuine need."
+
+**Shape if/when built.** A `cont.resume`-family variant (or a flag) that, on `FIBER_PARKED`, idles
+the vCPU on the same deadline/wake machinery the fiber's `Waiter::Fiber` / `FiberWaitCell` already
+registers — waking on the futex notify or the timeout instead of returning `FIBER_PARKED` to the
+guest. Must stay backend-uniform (tree-walk oracle first, §18) and preserve the #440 teardown
+exits (a blocking resume must still unblock on exit/trap/freeze), and must not reintroduce a
+"blocks the domain" path (DESIGN.md §12: blocks the fiber, never the domain) — the vCPU idles only
+when nothing else in the domain is runnable.
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)

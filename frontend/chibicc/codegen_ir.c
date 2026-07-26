@@ -1387,7 +1387,10 @@ static int gen_builtin_fiber_resume(Node *node) {
   int status = nv++;
   int value = nv++;
   cg("  v%d, v%d = cont.resume v%d v%d\n", status, value, k, arg);
-  cg("  i32.store v%d v%d\n", done, status); // *done = 0 suspended / 1 returned
+  cg("  i32.store v%d v%d\n", done, status); // *done = cont.resume status: 0 suspended (guest
+  // yield; value = yielded i64), 1 returned, 3 FIBER_PARKED (event-parked on a `memory.wait`
+  // inside the fiber — value 0, not done; re-poll with another resume). Treating `!= 1` as
+  // "suspended, take value" drops the continuation on a park (§3.6 slice 5a; svm PR #442).
   return value;                                       // the yielded/returned i64
 }
 
