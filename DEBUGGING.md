@@ -317,21 +317,33 @@ different things depending on which pair you compare:
   powerbox, so a granted `Instantiator` reaches the guest and makes a coroutine-using program debuggable
   (previously the whole module was declined). Breakpoints fire in the coroutine **parent** across the
   cooperative handoffs, and the run stays bit-identical to the production engine + tree-walker oracle.
-  The coroutine *body* is still stepped opaquely by `resume_coro` (step-*into* the body is a follow-up),
-  and a **separate-module** coroutine (`SpawnCoroutineModule`, needs the mutable `Domain`) plus
+  A **separate-module** coroutine (`SpawnCoroutineModule`, needs the mutable `Domain`) plus
   scheduler-driven **instantiate** children remain caller seams. Covered by `bytecode_debug_coroutines.rs`
   (oracle parity on the resume/suspend round-trip and the demand-fault path, a parent breakpoint,
   deterministic tick-replay).
+
+  **§14 coroutine-body step-into on the single-vCPU engine (slice 14b).** On the `DebugRun` a `resume`
+  no longer runs the child opaquely: it hands the child to `active_coro`/`step_active_coro`, which drives
+  it **op-by-op** (the debug counterpart of `resume_coro`'s inner loop, same confined `mem`/`host`/`table`
+  and op set) so a breakpoint fires **inside** the coroutine body, `step` descends into it, and the
+  backtrace / `read_var` / `read_window` inspect the child's own confined window. Stepping depth is
+  *cumulative* across the resume — the child's frames count above the parent's resume frame — so
+  step-over of a `resume` runs the child to its next yield/return and step-out of the body lands back in
+  the parent. Reverse `seek`/tick replay reconstructs the active-coroutine state deterministically. The
+  scheduled engine keeps the opaque `resume_coro` path (a coroutine there stays atomic w.r.t. other
+  vCPUs, gated by `VTask::coro_step_into`). Covered by `bytecode_debug_coroutines.rs`
+  (breakpoint-inside-the-body, step-descends, step-over-runs-the-coroutine, confined-window inspection,
+  and body-position tick-replay), with the slice-14a oracle-parity suites unchanged (result-identical).
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
   `thread.spawn`/`join`/`wait`/`notify` and **fibers** (single-vCPU *and* composed with threads), and
-  **same-module §14 coroutines** driven inline on the single-vCPU engine. Remaining `Declined` ops:
-  **step-into** a coroutine/child body, **separate-module** coroutines (`spawn_coroutine_module`), and
-  scheduler-driven **instantiate** children (the confined-executor `Coro`/env + attenuated powerbox) —
-  each a further slice. Plus a checkpoint ladder to bound reverse-replay cost (a perf optimization —
-  today's small debugged programs replay from turn 0 cheaply).
+  **same-module §14 coroutines** driven inline on the single-vCPU engine — including **step-into** the
+  coroutine body (slice 14b). Remaining `Declined` ops: **separate-module** coroutines
+  (`spawn_coroutine_module`), and scheduler-driven **instantiate** children (the confined-executor
+  `Coro`/env + attenuated powerbox) — each a further slice. Plus a checkpoint ladder to bound
+  reverse-replay cost (a perf optimization — today's small debugged programs replay from turn 0 cheaply).
 
 ---
 
