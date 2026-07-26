@@ -363,20 +363,32 @@ different things depending on which pair you compare:
   A new `ScheduledDebugRun::new_with_host` carries the `Instantiator` grant (the scheduled analogue of
   `DebugRun::new_with_host`). Covered by `bytecode_debug_instantiate.rs` (oracle parity vs production +
   tree-walker, a child breakpoint on a distinct thread, confined-window inspection, deterministic
-  tick-replay). Still deferred (each a further slice): `instantiate_module` (separate-module child), the
-  §3.6 serve / live-call / `child_offer` machinery inside a child, and env teardown / D37 revocation.
+  tick-replay).
+
+  **§14 `instantiate_module` + depth-2 nesting on the multi-vCPU engine (slices 15b/15c).**
+  `instantiate_module` (op 5) is no longer declined: `dbg_instantiate_module` (mirroring the production
+  `drive`'s `InstantiateModule` arm) resolves the host-granted `Module` from the powerbox, compiles it,
+  **pushes it to the shared source** (the mutable-`Domain` step, like a separate-module coroutine — 14c),
+  materializes its data segments into the carve, and runs the child over its own pushed module index. So
+  a breakpoint fires inside the **granted module's** body on a distinct vCPU, and `read_window` reads the
+  child's confined window (15b, `bytecode_debug_instantiate_module.rs`). And because `dbg_instantiate`
+  already carves a confined child's grandchild from the *child's* env, **confinement composes to depth 2**
+  under the debugger — a grandchild is its own vCPU with its own window, three distinct confined windows
+  nested two deep (15c, `bytecode_debug_instantiate.rs::breakpoint_in_a_grandchild_fires`). Source-variable
+  inspection inside a separate-module child (the `FrameReader`'s module-0 gate) is a follow-up; position-
+  level breakpoints/step-into and window reads work today.
 
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
   `thread.spawn`/`join`/`wait`/`notify` and **fibers** (single-vCPU *and* composed with threads),
   **§14 coroutines** — same-module *and* separate-module — driven inline on the single-vCPU engine
-  (step-into the body, slices 14b/14c), and **§14 `instantiate`** confined children as scheduled vCPUs
-  on the multi-vCPU engine (slice 15a). Remaining `Declined` ops: `instantiate_module` under the
-  scheduler, the §3.6 serve/live-call machinery inside a confined child, and *source-variable* inspection
-  inside a separate-module coroutine body — each a further slice. Plus env teardown / D37 revocation and
-  a checkpoint ladder to bound reverse-replay cost (perf — today's small debugged programs replay from
-  turn 0 cheaply).
+  (step-into the body, slices 14b/14c), and **§14 `instantiate` / `instantiate_module`** confined
+  children as scheduled vCPUs on the multi-vCPU engine, nesting to any depth (slices 15a/15b/15c).
+  Remaining `Declined` ops: coroutines / tier-up on the scheduled engine. Follow-ups: the §3.6
+  serve/live-call machinery inside a confined child, *source-variable* inspection inside a separate-module
+  child body, env teardown / D37 revocation, and a checkpoint ladder to bound reverse-replay cost (perf —
+  today's small debugged programs replay from turn 0 cheaply).
 
 ---
 
