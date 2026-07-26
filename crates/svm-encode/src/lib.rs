@@ -1775,7 +1775,16 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let debug_info = if c.at_end() {
         None
     } else {
-        Some(decode_debug_info(&mut c)?)
+        let di = decode_debug_info(&mut c)?;
+        // Canonicalize an all-empty debug section to `None`: `Some(DebugInfo::default())` carries no
+        // information, and keeping it distinct from `None` breaks text round-trip — the printer emits
+        // nothing for empty debug info, so `parse ∘ print` yields `None` while `decode ∘ encode`
+        // preserves `Some(empty)` (fuzz `roundtrip` crash 2026-07-26). One canonical form fixes both.
+        if di == DebugInfo::default() {
+            None
+        } else {
+            Some(di)
+        }
     };
     if !c.at_end() {
         return Err(DecodeError::TrailingBytes);

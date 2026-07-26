@@ -36,5 +36,20 @@ fuzz_target!(|data: &[u8]| {
     if matches!(r0, Err(Trap::OutOfFuel)) || matches!(r1, Err(Trap::OutOfFuel)) {
         return;
     }
-    assert_eq!(r0, r1, "optimize_module changed observable behavior");
+    // NaN-aware result comparison: the IR pins no NaN bit-pattern (a NaN-producing op may emit a
+    // different-but-still-NaN payload after optimization), and `f32`/`f64` `PartialEq` makes
+    // `NaN != NaN` — so a bare `assert_eq!` false-positives whenever a result is NaN, even when both
+    // runs produced the identical value. Reuse the same value equivalence the JIT differential uses
+    // (`irgen::values_equal`: bit-exact for non-NaN scalars, all-NaN-equal for NaN).
+    let equiv = match (&r0, &r1) {
+        (Ok(a), Ok(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| irgen::values_equal(x, y))
+        }
+        (Err(a), Err(b)) => a == b,
+        _ => false,
+    };
+    assert!(
+        equiv,
+        "optimize_module changed observable behavior\n  orig: {r0:?}\n   opt: {r1:?}"
+    );
 });

@@ -1247,6 +1247,46 @@ driver should follow the cooperative driver's `WaitParked` shape. Until then, fa
 required (the semantics are the historical ones), but any differential harness pointed at those
 entries must avoid wait-inside-fiber kernels.
 
+### I46 — `opt_sccp` fuzz oracle false-positived on any NaN result (S4, nightly fuzz red) — **FIX LANDED 2026-07-26** (`claude/nightly-ci-failures-1u64o2`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (opt_sccp)` failed both 2026-07-25 and 2026-07-26:
+`assertion left == right failed: optimize_module changed observable behavior`, with `left` and
+`right` printing **identically** (`Ok([F32(NaN), F64(-1.146…e-155)])`). The fuzzer had just
+generated its first NaN-producing module (input `[255, 96, 43, 0]`), so this is a latent oracle
+bug surfacing, not a code regression — the 2026-07-24 nightly was green.
+
+**Root cause.** The target compared the two interpreter results with `assert_eq!` on
+`Result<Vec<Value>, Trap>`. `Value` derives `PartialEq`, so its `F32`/`F64` arms use IEEE equality
+where **`NaN != NaN`** — the equality fails whenever a result contains a NaN, even when the
+optimizer preserved behavior exactly (identical `Debug` output confirms it). The IR pins no NaN
+bit-pattern (SCCP may legally reshape a NaN payload), so bit-exact NaN comparison would be wrong
+anyway.
+
+**Fix.** Compare NaN-aware, reusing `irgen::values_equal` — the same equivalence the JIT
+differential (`jit_fuzz`) already uses: bit-exact for non-NaN scalars, all-NaN-equal for NaN.
+`values_equal` promoted to `pub` (the `#![allow(dead_code)]` module already tolerates
+per-includer unused subsets). Verified by replaying the crash input through the real
+optimize+interp pipeline: the input does produce a NaN, the bare `==` differs (control), and the
+new comparison holds.
+
+### I47 — text round-trip dropped a present-but-empty `debug_info`, breaking `parse ∘ print = id` (S3, nightly fuzz red) — **FIX LANDED 2026-07-26** (`claude/nightly-ci-failures-1u64o2`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (roundtrip)` failed 2026-07-26 (input
+`SVM\0` + zeroed section, `[83, 86, 77, 0, 8, 0, …]`): `text round-trip changed the IR`, with
+`left` = `Some(DebugInfo { files: [], locs: [], … })` and `right` = `None`.
+
+**Root cause.** `decode_module` returned `Some(decode_debug_info(...))` whenever any bytes trailed
+the funcs, so a zeroed (all-count-0) debug section decoded to `Some(DebugInfo::default())`. The
+binary round-trip (`decode ∘ encode`) preserved that `Some(empty)`, but the text printer emits
+nothing for empty debug info, so `parse ∘ print` collapsed it to `None` — the two round-trips
+disagreed on a value that carries no information.
+
+**Fix.** Canonicalize an all-empty debug section to `None` at decode (`if di ==
+DebugInfo::default() { None }`), giving "no debug info" a single in-memory representation. Both
+round-trips now agree; existing `debug_info_round_trips_through_binary` /
+`no_debug_info_is_back_compatible` unit tests still pass, and the exact crash input was verified to
+normalize and round-trip through both the binary and text paths.
+
 ---
 
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
