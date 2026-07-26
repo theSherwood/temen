@@ -224,6 +224,20 @@ enum Op {
         else_copies: Copies,
         else_pc: u32,
     },
+    /// Slice 5a superinstruction: a block-final `IntCmp` fused with the `BrIf` that is its sole
+    /// consumer — compare `a`/`b` (`ty`, `op`) and branch on the result, dropping one dispatch plus
+    /// the boolean's write-then-reread. Emitted only by the **fused** compile (the fast path); the
+    /// debug/trace compile is unfused so its step trace keeps one location per source instruction.
+    BrIfCmp {
+        a: u32,
+        b: u32,
+        ty: IntTy,
+        op: CmpOp,
+        then_copies: Copies,
+        then_pc: u32,
+        else_copies: Copies,
+        else_pc: u32,
+    },
     BrTable {
         idx: u32,
         arms: Box<[Edge]>,
@@ -855,8 +869,22 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
     s.has_svc && !s.svc_park_veto()
 }
 
-/// Lower every function, or `None` if any uses an op outside this slice's subset.
+/// Lower every function (fast path — superinstruction-**fused**, Slice 5a), or `None` if any uses an
+/// op outside this slice's subset. This is what every production/runtime path calls.
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
+    compile_module_with(funcs, true)
+}
+
+/// Unfused lowering — one op per source instruction, so the step/location trace stays
+/// tree-walker-identical. The debug/trace entries (`ir_trace`, `ir_window_trace`, `ir_value_trace`,
+/// `debug_advance_fiber`, `dbg_pick_runnable`) use this; results and traps are identical to the fused
+/// form (fusion only merges a pure compare into its sole-consumer branch).
+pub fn compile_module_unfused(funcs: &[Func]) -> Option<Compiled> {
+    compile_module_with(funcs, false)
+}
+
+/// Lower every function, or `None` if any uses an op outside this slice's subset.
+fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
     // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
     // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
@@ -890,7 +918,7 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let mut progs = Vec::with_capacity(funcs.len());
     for f in funcs {
-        progs.push(compile_func(f, &arities)?);
+        progs.push(compile_func(f, &arities, fuse)?);
     }
     let table_mask = funcs.len().next_power_of_two().max(1) - 1;
     Some(Compiled {
@@ -904,7 +932,7 @@ pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     })
 }
 
-fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
+fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
     // Global slot per value: each block's params then its value-producing insts, in order.
     let mut base = Vec::with_capacity(f.blocks.len());
     let mut nslots = 0u32;
@@ -917,21 +945,37 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
     }
     let mut block_pc = vec![0u32; f.blocks.len()];
     let mut ops: Vec<Op> = Vec::new();
+    // Debug reverse map (Slice 1c-3), built **incrementally** alongside `ops` (was a positional
+    // post-pass) so fusion — which drops an op — keeps `src` and `ops` in lockstep: each op push is
+    // paired with exactly one `src` push. Instruction ops map to their `(block, inst)`; the
+    // terminator op maps to `(block, insts.len() | SRC_TERM)` (flagged so `cur_ir_pc` skips it while
+    // `vm_trap_bt` can name a terminator-trap site). A fused `BrIfCmp` takes the terminator location
+    // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
+    // never single-stepped (debug/trace compile unfused), so no source location is lost there.
+    let mut src: Vec<Option<(u32, u32)>> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         let g = |local: u32| base[bi] + local; // operand: block-local index -> frame slot
         let mut local = b.params.len() as u32;
-        for inst in &b.insts {
+        for (i, inst) in b.insts.iter().enumerate() {
             let dst = base[bi] + local;
             local += inst.result_count(arities) as u32;
             ops.push(compile_inst(inst, dst, base[bi], &g)?);
+            src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
         let edge = |bidx: usize, args: &[u32]| -> Edge {
+            // Slice 5b: drop **identity** self-copies (`src == dst`) at compile time. A loop-invariant
+            // block param threaded unchanged across a back-edge lands in the same global slot it came
+            // from, so the copy is a no-op — eliding it removes a real `scratch` push+write per such
+            // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
+            // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
+            // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
             let copies = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
+                .filter(|(src, dst)| src != dst)
                 .collect();
             (copies, bidx as u32) // block index; patched to entry pc below
         };
@@ -949,13 +993,53 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
             } => {
                 let (then_copies, tt) = edge(*then_blk as usize, then_args);
                 let (else_copies, et) = edge(*else_blk as usize, else_args);
-                ops.push(Op::BrIf {
-                    cond: g(*cond),
-                    then_copies,
-                    then_pc: tt,
-                    else_copies,
-                    else_pc: et,
-                });
+                let cond_slot = g(*cond);
+                // Slice 5a: fuse a block-final `IntCmp` whose result is this branch's condition and
+                // is used nowhere else into a single `BrIfCmp`. Valid because the compare is pure and
+                // single-use *here*: it is the last instruction (so no later in-block reader) and the
+                // cond slot is not carried to any successor (not an edge-copy source). Fused compile
+                // only — `fuse == false` (debug/trace) keeps the compare as its own steppable op.
+                let fused = if fuse && !b.insts.is_empty() {
+                    match ops.last() {
+                        Some(Op::IntCmp {
+                            dst,
+                            a,
+                            b: cb,
+                            ty,
+                            op,
+                        }) if *dst == cond_slot
+                            && !then_copies.iter().any(|(s, _)| *s == cond_slot)
+                            && !else_copies.iter().any(|(s, _)| *s == cond_slot) =>
+                        {
+                            Some((*a, *cb, *ty, *op))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((a, cb, ty, op)) = fused {
+                    ops.pop(); // drop the now-fused IntCmp op ...
+                    src.pop(); // ... and its source-map entry (kept in lockstep)
+                    ops.push(Op::BrIfCmp {
+                        a,
+                        b: cb,
+                        ty,
+                        op,
+                        then_copies,
+                        then_pc: tt,
+                        else_copies,
+                        else_pc: et,
+                    });
+                } else {
+                    ops.push(Op::BrIf {
+                        cond: cond_slot,
+                        then_copies,
+                        then_pc: tt,
+                        else_copies,
+                        else_pc: et,
+                    });
+                }
             }
             Terminator::BrTable {
                 idx,
@@ -987,21 +1071,15 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
                 want_results: ty.results.clone().into(),
             }),
         }
+        // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
+        // with the terminator source entry so `src` stays the same length as `ops`.
+        src.push(Some((bi as u32, b.insts.len() as u32 | SRC_TERM)));
     }
-    // Debug reverse map (Slice 1c-3): each block lays out `insts.len()` instruction ops at
-    // `[block_pc[bi], +insts.len())` then exactly one terminator op. Instruction ops map to their
-    // `(block, inst)`; the terminator op maps to `(block, insts.len() | SRC_TERM)` — flagged so
-    // `cur_ir_pc` skips it (non-steppable) while `vm_trap_bt` can still name a terminator-trap site
-    // (`unreachable`). The later target-patch only rewrites jump fields, not the op order, so this
-    // index stays valid.
-    let mut src: Vec<Option<(u32, u32)>> = vec![None; ops.len()];
-    for (bi, b) in f.blocks.iter().enumerate() {
-        let base_pc = block_pc[bi] as usize;
-        for i in 0..b.insts.len() {
-            src[base_pc + i] = Some((bi as u32, i as u32));
-        }
-        src[base_pc + b.insts.len()] = Some((bi as u32, b.insts.len() as u32 | SRC_TERM));
-    }
+    debug_assert_eq!(
+        ops.len(),
+        src.len(),
+        "src map must stay in lockstep with ops"
+    );
 
     // Patch branch targets from block index to entry pc.
     let patch = |t: &mut u32| *t = block_pc[*t as usize];
@@ -1009,6 +1087,12 @@ fn compile_func(f: &Func, arities: &[usize]) -> Option<Program> {
         match op {
             Op::Br { target, .. } => patch(target),
             Op::BrIf {
+                then_pc, else_pc, ..
+            } => {
+                patch(then_pc);
+                patch(else_pc);
+            }
+            Op::BrIfCmp {
                 then_pc, else_pc, ..
             } => {
                 patch(then_pc);
@@ -3288,7 +3372,7 @@ pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>)
 /// reports tree-walker-identical locations, so breakpoints/stepping at [`crate::IrPc`] granularity
 /// land at the same program points on both backends.
 pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Option<IrTrace> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -3337,7 +3421,7 @@ pub fn ir_window_trace(
     addr: u64,
     len: usize,
 ) -> Option<WindowTrace> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -3400,7 +3484,7 @@ pub fn ir_value_trace(
             .into_iter()
             .next()
             .unwrap_or_default();
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_unfused(&m.funcs)?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -4067,7 +4151,7 @@ impl DebugRun {
                 m.memory.is_some(),
             ));
         }
-        let c = compile_module(&m.funcs)?;
+        let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
         let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
@@ -4721,7 +4805,7 @@ impl ScheduledDebugRun {
                 m.memory.is_some(),
             ));
         }
-        let c = compile_module(&m.funcs)?;
+        let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, 0);
         let mem = build_mem(m);
         let host = Host::new();
@@ -8714,6 +8798,33 @@ impl Vm {
                     else_pc,
                 } => {
                     if r!(*cond).i32() != 0 {
+                        edge!(then_copies);
+                        pc = *then_pc as usize;
+                    } else {
+                        edge!(else_copies);
+                        pc = *else_pc as usize;
+                    }
+                }
+                // Slice 5a fused compare+branch. Charge the second fuel unit (the fused-away
+                // `IntCmp`) so fuel counts stay bit-identical to the unfused form — a completing run
+                // never becomes `OutOfFuel` from fusion. (The loop already charged one before this
+                // match.)
+                Op::BrIfCmp {
+                    a,
+                    b,
+                    ty,
+                    op,
+                    then_copies,
+                    then_pc,
+                    else_copies,
+                    else_pc,
+                } => {
+                    step(fuel, None)?;
+                    let taken = match ty {
+                        IntTy::I32 => cmp32(*op, r!(*a).i32(), r!(*b).i32()),
+                        IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
+                    };
+                    if taken {
                         edge!(then_copies);
                         pc = *then_pc as usize;
                     } else {
