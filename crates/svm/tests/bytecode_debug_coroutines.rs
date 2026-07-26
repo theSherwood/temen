@@ -3,8 +3,8 @@
 //! debug engine (never via the thread scheduler), exactly as the production engine drives it — so a
 //! `spawn_coroutine`/`resume`/`yield` round-trip runs correctly under the debugger, breakpoints fire in
 //! the coroutine-using **parent**, and the whole run stays bit-identical to the production bytecode
-//! engine + tree-walker oracle. (The coroutine body itself is stepped opaquely by `resume_coro` here;
-//! step-*into* the body is a follow-up.)
+//! engine + tree-walker oracle. Slice 14b drives the child **op-by-op** too, so breakpoints fire and
+//! `step` descends *inside* the coroutine body, with inspection following the child's confined window.
 
 use svm_interp::bytecode::{self, DebugRun};
 use svm_interp::{run_with_host, Host, IrPc, Value};
@@ -225,4 +225,121 @@ fn coroutine_tick_replays_deterministically() {
     while b.op_clock() < clock && b.tick(&mut f2) {}
     assert_eq!(b.op_clock(), clock, "replayed to the same op clock");
     assert_eq!(b.frame_pc(0), Some(first_resume()), "same parent position");
+}
+
+// --- Step-into the coroutine body (slice 14b) ----------------------------------------------------
+// The child (func 1) runs `i32.wrap_i64`, `i64.const 0`, `i32.const 7`, `i32.store8`, then its first
+// `yield` — so `func 1, block 0, inst 0` is the body's first op and `inst 4` is the op right after the
+// store (byte 7 now in the child's confined window).
+
+/// The coroutine body's first op (`i32.wrap_i64 v0`) — reached only by *descending into* the child.
+fn child_first_op() -> IrPc {
+    IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 0,
+    }
+}
+
+/// A breakpoint set on the coroutine **child's** function fires **inside** the body across the inline
+/// `resume` handoff — the debugger descends into the coroutine, not just the parent — and continuing
+/// still reaches the correct result. (Before slice 14b the body was stepped opaquely by `resume_coro`.)
+#[test]
+fn breakpoint_inside_a_coroutine_body_fires() {
+    let mut r = coro_session();
+    let mut fuel = 5_000_000u64;
+    assert_eq!(
+        r.run_to(&[child_first_op()], &mut fuel),
+        Some(child_first_op())
+    );
+    assert_eq!(
+        r.frame_pc(0),
+        Some(child_first_op()),
+        "stopped inside the coroutine child, not the parent"
+    );
+    assert_eq!(r.depth(), 1, "at the child's root activation");
+    let (_, res) = drive(&mut r, &[], &mut fuel);
+    assert_eq!(
+        res,
+        Ok(vec![Value::I64(WANT)]),
+        "continues to the coroutine result"
+    );
+}
+
+/// A single **step** off the parent's `resume` descends into the coroutine body (its first op), the
+/// counterpart of `Inspector::step` crossing the cooperative handoff.
+#[test]
+fn step_descends_into_a_coroutine() {
+    let mut r = coro_session();
+    let mut fuel = 5_000_000u64;
+    assert_eq!(r.run_to(&[first_resume()], &mut fuel), Some(first_resume()));
+    assert_eq!(
+        r.step(&mut fuel),
+        Some(child_first_op()),
+        "step off the resume landed in the coroutine body"
+    );
+    assert_eq!(r.depth(), 1, "child's root frame");
+}
+
+/// **Step-over** a `resume` runs the coroutine child to its next yield and lands back in the parent —
+/// the cumulative-depth boundary means the child's frames count as *deeper* than the resume, so
+/// step-over doesn't descend. (`inst 7` is the parent's op right after the first resume at `inst 6`.)
+#[test]
+fn step_over_a_resume_runs_the_coroutine() {
+    let mut r = coro_session();
+    let mut fuel = 5_000_000u64;
+    assert_eq!(r.run_to(&[first_resume()], &mut fuel), Some(first_resume()));
+    let pc = r.step_over(&mut fuel).expect("landed back in the parent");
+    assert_eq!(
+        pc.func, 0,
+        "stepped over the coroutine — back in the parent"
+    );
+    assert_eq!(pc.inst, 7, "the op right after the resume");
+    assert_eq!(r.depth(), 1, "parent frame");
+}
+
+/// While stepped **inside** a coroutine, memory reads see the child's **confined** window: after the
+/// child's `i32.store8` of `7` at its window offset 0, `read_window(0, 1)` reads that byte — not the
+/// parent's window (the parent never wrote offset 0), proving inspection follows the active child.
+#[test]
+fn inspect_a_coroutine_childs_confined_window() {
+    let mut r = coro_session();
+    let mut fuel = 5_000_000u64;
+    let after_store = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 4,
+    };
+    assert_eq!(r.run_to(&[after_store], &mut fuel), Some(after_store));
+    assert_eq!(
+        r.read_window(0, 1).unwrap(),
+        vec![7u8],
+        "reads the coroutine child's confined window, not the parent's"
+    );
+}
+
+/// Reverse debugging composes with step-into: a fresh session ticked to a clock reached **inside** the
+/// coroutine body reproduces the exact child position — `seek` reconstructs the active-coroutine state
+/// deterministically across the handoff.
+#[test]
+fn coroutine_body_tick_replays_deterministically() {
+    let mut a = coro_session();
+    let mut fuel = 5_000_000u64;
+    assert_eq!(
+        a.run_to(&[child_first_op()], &mut fuel),
+        Some(child_first_op())
+    );
+    let clock = a.op_clock();
+
+    let mut b = coro_session();
+    let mut f2 = 5_000_000u64;
+    while b.op_clock() < clock && b.tick(&mut f2) {}
+    assert_eq!(b.op_clock(), clock, "replayed to the same op clock");
+    assert_eq!(
+        b.frame_pc(0),
+        Some(child_first_op()),
+        "replay reproduced the coroutine-body position"
+    );
 }

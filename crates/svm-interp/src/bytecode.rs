@@ -3550,6 +3550,13 @@ fn debug_advance_fiber(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
+    // Step-into a §14 coroutine body (single-vCPU `DebugRun` only): while a coroutine child is the
+    // active continuation — set by a `resume` under `coro_step_into` — drive *that child* one op over
+    // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
+    // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
+    if vt.active_coro.is_some() {
+        return step_active_coro(vt, source, fuel);
+    }
     match vt
         .active
         .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
@@ -3637,9 +3644,10 @@ fn debug_advance_fiber(
         // §14 **coroutines** are cooperative and driven **inline** here (never via the thread
         // scheduler), exactly as production `run_inner` drives them — the debug counterpart. A
         // same-module `spawn_coroutine`/`resume`/`yield` round-trip therefore runs correctly under the
-        // debugger; the coroutine body itself is stepped opaquely by `resume_coro` (step-into is a
-        // follow-up). A *separate-module* coroutine (`SpawnCoroutineModule`) needs the mutable `Domain`
-        // to push the granted module, so it stays a caller seam (`Other` → declined) for now.
+        // debugger; on the single-vCPU `DebugRun` the body is then stepped **op-by-op** (step-into) via
+        // `active_coro`/`step_active_coro` (slice 14b), while the scheduled engine keeps it opaque. A
+        // *separate-module* coroutine (`SpawnCoroutineModule`) is handled just below (slice 14c) — it
+        // pushes the granted module to the shared source, then resumes/steps like any coroutine.
         Ok(Outcome::SpawnCoroutine {
             ibase,
             isize: isz,
@@ -3661,19 +3669,35 @@ fn debug_advance_fiber(
             FiberStep::Stepped
         }
         Ok(Outcome::CoResume { ch, value, dst }) => {
-            // Take the coroutine; a forged/finished slot is an inert `CapFault` (propagates).
-            let mut coro = match vt.coroutines.get_mut(ch as usize).and_then(|c| c.take()) {
-                Some(c) => c,
-                None => return FiberStep::Trapped(Trap::CapFault),
-            };
-            if let Some(addr) = coro.faulted_page.take() {
-                // Resuming after a recoverable page fault: supply the page, re-run the rewound access.
-                if let Some(m) = coro.mem.as_ref() {
-                    m.supply_page(addr);
+            // Deliver this resume's effect (supply a demand-fault page and re-run the rewound access,
+            // or hand the value to the parked `yield`) to the child before it runs again — identical
+            // whether the child is then stepped op-by-op (step-into) or run opaquely.
+            if let Some(coro) = vt.coroutines.get_mut(ch as usize).and_then(|c| c.as_mut()) {
+                if let Some(addr) = coro.faulted_page.take() {
+                    if let Some(m) = coro.mem.as_ref() {
+                        m.supply_page(addr);
+                    }
+                } else if let Some(yd) = coro.awaiting.take() {
+                    coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
                 }
-            } else if let Some(yd) = coro.awaiting.take() {
-                coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
+            } else {
+                // Forged / finished slot: an inert `CapFault` (propagates), same as production.
+                return FiberStep::Trapped(Trap::CapFault);
             }
+            // Step-into path: hand the child to op-by-op stepping. The parent stays parked at `dst`;
+            // `step_active_coro` fills it when the child next yields / faults / returns. `parent_depth`
+            // lets the stepping predicate treat the child's frames as *deeper* than the parent's, so a
+            // step-over of this `resume` runs the child to completion.
+            if vt.coro_step_into {
+                let parent_depth = vt.active.stack.len() + 1;
+                vt.active_coro = Some((ch as usize, dst, parent_depth));
+                return FiberStep::Stepped;
+            }
+            // Opaque path (scheduled engine): drive the child to its next yield/return in one step, so
+            // a coroutine stays atomic w.r.t. other vCPUs.
+            let mut coro = vt.coroutines[ch as usize]
+                .take()
+                .expect("resumable coroutine");
             match resume_coro(&mut coro, source, fuel) {
                 Ok(CoStop::Yield(yv)) => {
                     vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
@@ -3702,11 +3726,160 @@ fn debug_advance_fiber(
         // A `Yielder.yield` only resolves inside an inline coroutine child (consumed by `resume_coro`);
         // at the top level the yielder handle is ungranted, so any leak here is a fault.
         Ok(Outcome::CoYield { .. }) => FiberStep::Trapped(Trap::FiberFault),
-        // Threads / wait / notify / instantiate / separate-module coroutine / tier-up — a scheduler
-        // seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine dispatches
-        // its subset).
+        // §14 **separate-module** coroutine (`spawn_coroutine_module`, op 6 / demand op 7) — on the
+        // single-vCPU `DebugRun` (`coro_step_into`) only. Resolve + compile + push the granted module and
+        // register the child inline; thereafter it is `resume`d and stepped exactly like a same-module
+        // coroutine (slice 14b). The scheduled engine keeps declining it (falls through to `Other`).
+        Ok(Outcome::SpawnCoroutineModule {
+            ibase,
+            isize: isz,
+            mh,
+            entry,
+            off,
+            size_log2,
+            dst,
+            demand,
+        }) if vt.coro_step_into => {
+            match spawn_coroutine_module(
+                &mut vt.coroutines,
+                source,
+                mem,
+                host,
+                mh,
+                entry,
+                (ibase, isz, off, size_log2),
+                demand,
+            ) {
+                Ok(h) => {
+                    vt.active.set(dst, Reg::from_i32(h));
+                    FiberStep::Stepped
+                }
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
+        // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
+        // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
+        // dispatches its subset).
         Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
+    }
+}
+
+/// Advance the **active §14 coroutine child** (`vt.active_coro`) by exactly one op — the op-by-op,
+/// debugger-facing counterpart of [`resume_coro`]'s inner loop. Same confined child (`vm`/`mem`/`host`/
+/// `table`) and the same op set (`Done`/`Suspended`/`CoYield`/`GcRoots`; anything else, e.g. a fiber or
+/// nested coroutine op, is unsupported inside a child and traps — matching `resume_coro`), only surfaced
+/// one op at a time so a breakpoint can fire inside the body and the frame stays inspectable.
+///
+/// When the child yields, faults (a demand child), or returns, the child stops being active: the
+/// parent's `resume` result slot (`dst`) is filled with `(status, value)` and control returns to the
+/// parent, exactly as the opaque path does. Stepping the child with `budget = 1` matches the demand
+/// path's per-op cursor persistence (so a recoverable fault re-runs the rewound access) and is
+/// computationally identical to the plain path's unmetered run — just finer-grained for the debugger.
+fn step_active_coro(vt: &mut VTask, source: &ModuleSource, fuel: &mut u64) -> FiberStep {
+    /// What one child op produced, decoupled from the `coro` borrow so the parent slot can be filled
+    /// after it ends.
+    enum CoStep {
+        /// A plain op ran (budget boundary) — the child stays active, the clock ticks.
+        Ran,
+        /// `Yielder.yield`: the child suspends to the parent with `(FIBER_SUSPENDED, value)`.
+        Yield(i64),
+        /// A demand child hit a recoverable page fault: `(CORO_FAULTED, addr)`; the parent supplies it.
+        Fault(u64),
+        /// The child function returned: `(FIBER_RETURNED, value)`; the slot is retired.
+        Done(Value),
+        /// The child trapped — it propagates to the resumer (the run's trap).
+        Trap(Trap),
+    }
+    let (ch, dst, _) = vt.active_coro.expect("active coroutine");
+    let step = {
+        let coro = vt.coroutines[ch]
+            .as_mut()
+            .expect("active coroutine present");
+        match coro.vm.resume(
+            source,
+            &coro.table,
+            fuel,
+            &mut coro.mem,
+            &mut HostCell::Excl(&mut coro.host),
+            1,
+        ) {
+            Ok(Outcome::Suspended) => CoStep::Ran, // budget boundary — one op done, keep stepping
+            Ok(Outcome::Done(vals)) => CoStep::Done(vals.first().copied().unwrap_or(Value::I64(0))),
+            Ok(Outcome::CoYield { value, dst: yd }) => {
+                coro.awaiting = Some(yd); // the next resume delivers its value here
+                CoStep::Yield(value)
+            }
+            // A coroutine child is its own confined domain (holds no `Instantiator`, no fibers/threads);
+            // its `gc.roots` scans just its own continuation. Resolve it inline and stay in the child —
+            // identical to `resume_coro`, one debug op.
+            Ok(Outcome::GcRoots {
+                lo,
+                hi,
+                mask,
+                buf,
+                cap,
+                dst: gdst,
+            }) => {
+                let mut roots = std::collections::BTreeSet::new();
+                {
+                    let mut consider = |w: u64| {
+                        let m = w & mask;
+                        if m >= lo && m < hi {
+                            roots.insert(m);
+                        }
+                    };
+                    scan_vm_roots(&coro.vm, source, &mut consider);
+                }
+                match gc_write(&mut coro.mem, buf, cap, roots) {
+                    Ok(total) => {
+                        coro.vm.set(gdst, Reg::from_i64(total));
+                        CoStep::Ran
+                    }
+                    Err(t) => CoStep::Trap(t),
+                }
+            }
+            // A fiber / nested-coroutine / thread op inside a child is unsupported (as in `resume_coro`).
+            Ok(_) => CoStep::Trap(Trap::FiberFault),
+            // A demand child's *recoverable* in-window fault suspends to the parent; an out-of-window
+            // fault (`take_fault` → `None`) is a real trap that propagates.
+            Err(Trap::MemoryFault) if coro.fault_yields => {
+                match coro.mem.as_ref().and_then(|m| m.take_fault()) {
+                    Some(addr) => {
+                        coro.faulted_page = Some(addr);
+                        CoStep::Fault(addr)
+                    }
+                    None => CoStep::Trap(Trap::MemoryFault),
+                }
+            }
+            Err(t) => CoStep::Trap(t),
+        }
+    };
+    match step {
+        CoStep::Ran => FiberStep::Stepped,
+        CoStep::Yield(v) => {
+            vt.active_coro = None; // back to the parent; the child stays parked (slot still `Some`)
+            vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
+            vt.active.set(dst + 1, Reg::from_i64(v));
+            FiberStep::Stepped
+        }
+        CoStep::Fault(addr) => {
+            vt.active_coro = None;
+            vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
+            vt.active.set(dst + 1, Reg::from_i64(addr as i64));
+            FiberStep::Stepped
+        }
+        CoStep::Done(v) => {
+            vt.active_coro = None;
+            vt.coroutines[ch] = None; // finished — a later resume is inert / `CapFault`
+            vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
+            vt.active.set(dst + 1, Reg::from_value(v));
+            FiberStep::Stepped
+        }
+        CoStep::Trap(t) => {
+            vt.active_coro = None;
+            FiberStep::Trapped(t)
+        }
     }
 }
 
@@ -3841,12 +4014,14 @@ impl FrameReader<'_> {
 }
 
 impl DebugRun {
-    /// A [`FrameReader`] over this single-vCPU session's `Vm` + debug metadata.
+    /// A [`FrameReader`] over this single-vCPU session's currently-stepping `Vm` + debug metadata —
+    /// the active §14 coroutine child (over its own confined `mem`) during step-into, else the parent.
     fn reader(&self) -> FrameReader<'_> {
+        let (vm, coro) = self.vt.debug_active();
         FrameReader {
-            vm: &self.vt.active,
+            vm,
             source: &self.source,
-            mem: &self.mem,
+            mem: coro.map_or(&self.mem, |c| &c.mem),
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
@@ -3895,7 +4070,8 @@ impl DebugRun {
         let c = compile_module(&m.funcs)?;
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
+        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
+        vt.coro_step_into = true; // single-vCPU: step *into* §14 coroutine bodies op-by-op
         let Domain { source, table } = dom;
         Some(DebugRun {
             source,
@@ -4027,29 +4203,35 @@ impl DebugRun {
             }
         }
         loop {
-            if let Some(pc) = vt.active.cur_ir_pc(source) {
-                if bps.contains(&pc) {
-                    *at_bp = true;
-                    return Some(pc);
-                }
-                // Watchpoint: stop *before* an op that touches a watched window range (the access
-                // hasn't applied — step once to observe the new bytes). Skipped when none are armed.
-                if !watchpoints.is_empty() && pc.module == 0 {
-                    if let Some(hit) = watch_hit_before(
-                        &vt.active,
-                        &*mem,
+            // Scan the currently-stepping continuation — the active §14 coroutine child (over its own
+            // confined window) during step-into, else the parent. A same-module child is module 0, so
+            // its ops share the parent's pc space; a breakpoint on the child's function fires here.
+            let hit = {
+                let (cur_vm, coro) = vt.debug_active();
+                let cur_mem = coro.map_or(&*mem, |c| &c.mem);
+                match cur_vm.cur_ir_pc(source) {
+                    Some(pc) if bps.contains(&pc) => Some((pc, None)),
+                    Some(pc) if !watchpoints.is_empty() && pc.module == 0 => watch_hit_before(
+                        cur_vm,
+                        cur_mem,
                         funcs,
                         fn_block_base,
                         watchpoints,
                         pc.func,
                         pc.block,
                         pc.inst,
-                    ) {
-                        *last_watch = Some(hit);
-                        *at_bp = true;
-                        return Some(pc);
-                    }
+                    )
+                    .map(|w| (pc, Some(w))),
+                    _ => None,
                 }
+            };
+            if let Some((pc, watch)) = hit {
+                // A watchpoint stops *before* the access applies (step once to observe the new bytes).
+                if let Some(w) = watch {
+                    *last_watch = Some(w);
+                }
+                *at_bp = true;
+                return Some(pc);
             }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => {
@@ -4112,9 +4294,17 @@ impl DebugRun {
                     return None;
                 }
             }
-            let depth = vt.active.stack.len() + 1;
+            // Depth is *cumulative* across a coroutine boundary: a child's frames sit above the parent's
+            // resume frame (`parent_depth + child stack`), so step-over of a `resume` (target =
+            // parent depth) runs the child to completion, and step-out of the child body lands back in
+            // the parent — while stepping *within* the child compares child-local frames as usual.
+            let (cur_vm, _) = vt.debug_active();
+            let depth = match vt.active_coro {
+                Some((_, _, pd)) => pd + cur_vm.stack.len() + 1,
+                None => cur_vm.stack.len() + 1,
+            };
             if max_depth.is_none_or(|m| depth <= m) {
-                if let Some(pc) = vt.active.cur_ir_pc(source) {
+                if let Some(pc) = cur_vm.cur_ir_pc(source) {
                     return Some(pc);
                 }
             }
@@ -4130,7 +4320,7 @@ impl DebugRun {
     /// **Step over**: execute the current op and stop at the next op in *this* frame — running any call
     /// it makes to completion rather than descending. The counterpart of `Inspector::step_over`.
     pub fn step_over(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
-        let d = self.depth();
+        let d = self.step_depth();
         self.step_to(Some(d), fuel)
     }
 
@@ -4138,14 +4328,28 @@ impl DebugRun {
     /// returned to (from the outermost frame, runs to completion). The counterpart of
     /// `Inspector::step_out`.
     pub fn step_out(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
-        let d = self.depth();
+        let d = self.step_depth();
         self.step_to(Some(d.saturating_sub(1)), fuel)
     }
 
     /// Number of live call frames at the current stop (callers + the running activation) — the depth a
-    /// DAP `stackTrace` would report.
+    /// DAP `stackTrace` would report. Inside a §14 coroutine child (step-into) this is the *child's*
+    /// own frame count; see [`step_depth`](DebugRun::step_depth) for the cumulative form the stepping
+    /// verbs use across the resume boundary.
     pub fn depth(&self) -> usize {
         self.reader().depth()
+    }
+
+    /// The **cumulative** call depth used by the stepping verbs: while stepping inside a coroutine child
+    /// its frames count *above* the parent's resume frame (`parent_depth + child depth`), so step-over /
+    /// step-out treat the resume boundary like an ordinary call. Equal to [`depth`](DebugRun::depth)
+    /// when the parent itself is running.
+    fn step_depth(&self) -> usize {
+        let d = self.reader().depth();
+        match self.vt.active_coro {
+            Some((_, _, pd)) => pd + d,
+            None => d,
+        }
     }
 
     /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
@@ -4182,9 +4386,11 @@ impl DebugRun {
 
     /// Read `len` bytes from the guest window at `addr` — the bytecode counterpart of
     /// `Inspector::read_window`, for a DAP `variables` backend walking an aggregate / following a
-    /// pointer. Errs if the range is unmapped or the module has no memory.
+    /// pointer. Reads the active §14 coroutine child's confined window during step-into, else the
+    /// parent's. Errs if the range is unmapped or the module has no memory.
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.mem.as_ref() {
+        let (_, coro) = self.vt.debug_active();
+        match coro.map_or(self.mem.as_ref(), |c| c.mem.as_ref()) {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
@@ -5192,6 +5398,19 @@ struct VTask {
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
     /// durable run; `super::SHADOW_BASE` (context 0's region base) otherwise.
     root_shadow_sp: u64,
+    /// Debug **step-into** of a §14 coroutine body (single-vCPU only — set by [`DebugRun`], left `false`
+    /// on the scheduled engine so a coroutine there stays driven atomically by `resume_coro`). When set,
+    /// a `resume` defers the child to op-by-op stepping via [`active_coro`](VTask::active_coro) instead
+    /// of running it opaquely to its next yield/return.
+    coro_step_into: bool,
+    /// While the debugger is stepping *inside* a coroutine child (only when `coro_step_into`), the
+    /// active continuation is that child, not `active`. `(handle, resume-result slot, parent depth)`:
+    /// which coroutine, the parent's `resume` `(status, value)` slot to fill when the child next yields
+    /// or returns, and the parent's call depth at the resume (so the stepping predicate sees a
+    /// *cumulative* depth across the boundary — step-over a `resume` runs the child to completion).
+    /// Coroutine children hold no `Instantiator`, so they never nest — one level suffices. `None` when
+    /// the parent itself is running. Reconstructed deterministically on a reverse-`seek` replay.
+    active_coro: Option<(usize, u32, usize)>,
 }
 
 impl VTask {
@@ -5202,7 +5421,24 @@ impl VTask {
             chain: Vec::new(),
             coroutines: Vec::new(),
             root_shadow_sp: super::SHADOW_BASE,
+            coro_step_into: false,
+            active_coro: None,
         })
+    }
+
+    /// The continuation the single-vCPU debugger is currently stepping: the active §14 coroutine child
+    /// (during **step-into**, over its own confined `mem`) or, normally, `active`. The backtrace,
+    /// breakpoint scan, and value/variable reads all resolve against this.
+    fn debug_active(&self) -> (&Vm, Option<&Coro>) {
+        match self.active_coro {
+            Some((ch, _, _)) => {
+                let c = self.coroutines[ch]
+                    .as_ref()
+                    .expect("active coroutine present");
+                (&c.vm, Some(c))
+            }
+            None => (&self.active, None),
+        }
     }
 }
 
@@ -5307,6 +5543,8 @@ fn freeze_drive(
             chain: Vec::new(),
             coroutines: Vec::new(),
             root_shadow_sp: root_sp,
+            coro_step_into: false,
+            active_coro: None,
         };
         match step_vcpu(&mut sub, fibers, fiber_sp, fiber_meta, dom, ctx, budget)? {
             VcpuStop::Done(_) => {}
@@ -6137,6 +6375,101 @@ fn spawn_coroutine(
         faulted_page: None,
     }));
     (coroutines.len() - 1) as i32
+}
+
+/// Build a §14 **separate-module** coroutine child (`spawn_coroutine_module`, op 6 / demand op 7) inline
+/// in `coroutines` — the debug-engine counterpart of [`Vcpu::service_coroutine_module`]. Resolve the
+/// host-granted `Module` (handle `mh`) from the powerbox, compile it, **push it to the shared `source`**
+/// (so it dispatches by index — the mutable-`Domain` step that previously kept this op declined under the
+/// debugger), materialize its data segments into the carve, and register the `Coro` over its own natural
+/// table + a Yielder-only powerbox. Returns the child handle, `EINVAL` for a bad entry / carve / memory
+/// mismatch, or a `Trap` for a forged/closed module handle or a module the engine can't lower.
+#[allow(clippy::too_many_arguments)]
+fn spawn_coroutine_module(
+    coroutines: &mut Vec<Option<Coro>>,
+    source: &ModuleSource,
+    mem: &Option<Mem>,
+    host: &Host,
+    mh: i32,
+    entry: i64,
+    // `(holder base, holder size, offset, size_log2)` — the Instantiator-relative carve geometry.
+    carve: (u64, u64, i64, i64),
+    demand: bool,
+) -> Result<i32, Trap> {
+    let (ibase, isz, off, size_log2) = carve;
+    // Resolve + clone the granted module from the powerbox (a forged/closed/wrong-type handle traps).
+    let (cfuncs, cmem_log2, cdata) = {
+        let g = host.resolve_module(mh)?;
+        (g.funcs.clone(), g.memory_log2, g.data.clone())
+    };
+    // Compile to bytecode — a module using an op the engine can't lower is `Malformed` (as for install).
+    let child_compiled = match compile_module(&cfuncs) {
+        Some(c) => c,
+        None => return Err(Trap::Malformed),
+    };
+    let ok_entry = child_compiled
+        .sigs
+        .get(entry as u64 as usize)
+        .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let off_u = off as u64;
+    let fits = child_size != 0
+        && child_size <= isz
+        && off_u & (child_size - 1) == 0
+        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
+    // A separate-module child's carve must equal its declared memory (§14 transparency).
+    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    if !ok_entry || !fits || !mod_ok {
+        return Ok(super::EINVAL as i32);
+    }
+    let pbase = mem.as_ref().map_or(0, |m| m.window.base());
+    let abs_base = pbase + ibase + off_u;
+    // Materialize the module's data segments into the carve before the child runs, then the view.
+    let child_mem = {
+        if let Some(m) = mem.as_ref() {
+            for d in cdata.iter() {
+                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                    for (k, &b) in d.bytes.iter().enumerate() {
+                        m.set_byte(abs_base + d.offset + k as u64, b);
+                    }
+                }
+            }
+        }
+        mem.as_ref().map(|m| {
+            let cm = m.nested_view(abs_base, size_log2 as u8);
+            if demand {
+                cm.demand_page();
+            }
+            cm
+        })
+    };
+    let mut child_host = Host::new();
+    let cy = child_host.grant_yielder();
+    let progs_len = child_compiled.progs.len();
+    let cm = source.push(child_compiled); // the mutable-Domain step: the child dispatches by index
+    let child_table = build_table_for(progs_len, 0, cm as u32);
+    let mut child_vm = match source
+        .get(cm)
+        .and_then(|u| Vm::new(&u, entry as u64 as usize, &[Value::I64(cy as i64)]).ok())
+    {
+        Some(v) => v,
+        None => return Ok(super::EINVAL as i32),
+    };
+    child_vm.module = cm; // the child runs its own pushed module, not module 0
+    coroutines.push(Some(Coro {
+        vm: child_vm,
+        mem: child_mem,
+        host: child_host,
+        table: child_table,
+        awaiting: None,
+        fault_yields: demand,
+        faulted_page: None,
+    }));
+    Ok((coroutines.len() - 1) as i32)
 }
 
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.

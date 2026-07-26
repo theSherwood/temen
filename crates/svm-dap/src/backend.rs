@@ -151,8 +151,11 @@ impl Debuggee for Inspector {
 /// for a `thread.spawn` guest. Chosen at launch by [`bytecode::module_spawns_threads`]; both are fully
 /// forward + reverse + watch capable.
 enum Engine {
-    Single(DebugRun),
-    Threaded(ScheduledDebugRun),
+    // Both `DebugRun` and `ScheduledDebugRun` are large (their `VTask`s carry the reified continuation),
+    // so box each variant to keep `Engine` — and the `BytecodeBackend` holding it — pointer-sized
+    // (`clippy::large_enum_variant`).
+    Single(Box<DebugRun>),
+    Threaded(Box<ScheduledDebugRun>),
 }
 
 /// The **bytecode backend** — the resumable bytecode debug session ([`Engine`]) plus the persistent
@@ -183,9 +186,9 @@ impl BytecodeBackend {
         fuel: u64,
     ) -> Option<BytecodeBackend> {
         let engine = if bytecode::module_spawns_threads(&module) {
-            Engine::Threaded(ScheduledDebugRun::new(&module, func, args)?)
+            Engine::Threaded(Box::new(ScheduledDebugRun::new(&module, func, args)?))
         } else {
-            Engine::Single(DebugRun::new(&module, func, args)?)
+            Engine::Single(Box::new(DebugRun::new(&module, func, args)?))
         };
         Some(BytecodeBackend {
             engine,
@@ -410,14 +413,14 @@ impl Debuggee for BytecodeBackend {
                     run.arm_breakpoint_skip();
                 }
             }
-            self.engine = Engine::Threaded(run);
+            self.engine = Engine::Threaded(Box::new(run));
             return self.step_stop();
         }
         let Some(mut run) = DebugRun::new(&self.module, self.func, &self.args) else {
             return Stop::Blocked;
         };
         while run.op_clock() < t && run.tick(&mut fuel) {}
-        self.engine = Engine::Single(run);
+        self.engine = Engine::Single(Box::new(run));
         self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
                               // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
                               // here makes progress instead of immediately re-reporting this stop.
