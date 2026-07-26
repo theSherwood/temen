@@ -8572,6 +8572,20 @@ impl Vm {
                 }
             }};
         }
+        // Fuel unification: fuel is metered at **IR safepoints** — a taken back-edge and each function
+        // entry — not per op. A back-edge is a *backward* jump in the flat op array: blocks are laid
+        // out in index order, so a terminator (the last op of its block, at index `pc`) taking a target
+        // whose entry `$t <= pc` is exactly a branch to an earlier-or-same block. This bounds every
+        // loop/recursion (an infinite loop must cross its back-edge unboundedly) while leaving
+        // straight-line code free — the one unit the tree-walker and JIT can meter identically. The
+        // per-op `budget` (suspension / single-step) is unchanged.
+        macro_rules! backedge {
+            ($t:expr) => {
+                if ($t as usize) <= pc {
+                    step(fuel, None)?;
+                }
+            };
+        }
 
         loop {
             if budget == 0 {
@@ -8583,7 +8597,6 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
-            step(fuel, None)?;
             match &c.progs[cur].ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;
@@ -8787,6 +8800,7 @@ impl Vm {
                     pc += 1;
                 }
                 Op::Br { copies, target } => {
+                    backedge!(*target);
                     edge!(copies);
                     pc = *target as usize;
                 }
@@ -8798,17 +8812,18 @@ impl Vm {
                     else_pc,
                 } => {
                     if r!(*cond).i32() != 0 {
+                        backedge!(*then_pc);
                         edge!(then_copies);
                         pc = *then_pc as usize;
                     } else {
+                        backedge!(*else_pc);
                         edge!(else_copies);
                         pc = *else_pc as usize;
                     }
                 }
-                // Slice 5a fused compare+branch. Charge the second fuel unit (the fused-away
-                // `IntCmp`) so fuel counts stay bit-identical to the unfused form — a completing run
-                // never becomes `OutOfFuel` from fusion. (The loop already charged one before this
-                // match.)
+                // Slice 5a fused compare+branch. Fuel is charged only if the taken edge is a
+                // back-edge (fuel unification) — the fused-away `IntCmp` no longer needs its own
+                // per-op charge, so fusion now saves a full op's work on the loop back-edge.
                 Op::BrIfCmp {
                     a,
                     b,
@@ -8819,15 +8834,16 @@ impl Vm {
                     else_copies,
                     else_pc,
                 } => {
-                    step(fuel, None)?;
                     let taken = match ty {
                         IntTy::I32 => cmp32(*op, r!(*a).i32(), r!(*b).i32()),
                         IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
                     };
                     if taken {
+                        backedge!(*then_pc);
                         edge!(then_copies);
                         pc = *then_pc as usize;
                     } else {
+                        backedge!(*else_pc);
                         edge!(else_copies);
                         pc = *else_pc as usize;
                     }
@@ -8835,6 +8851,7 @@ impl Vm {
                 Op::BrTable { idx, arms, default } => {
                     let i = r!(*idx).i32() as u32 as usize;
                     let (copies, target) = arms.get(i).unwrap_or(default);
+                    backedge!(*target);
                     edge!(copies);
                     pc = *target as usize;
                 }
@@ -8878,6 +8895,7 @@ impl Vm {
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
+                    step(fuel, None)?; // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     // wasm-JIT tier-up: a module-0 direct call to an eligible function surfaces to the
                     // host, which runs the emitted region and delivers the results. `argv` is the raw
@@ -8927,9 +8945,10 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
-                    // padding slot or a signature mismatch is an inert IndirectCallType trap. The
-                    // target may be an installed §22 unit (a different module) — a cross-module call.
+                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                                       // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
+                                       // padding slot or a signature mismatch is an inert IndirectCallType trap. The
+                                       // target may be an installed §22 unit (a different module) — a cross-module call.
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {
@@ -8986,6 +9005,7 @@ impl Vm {
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
                 Op::TailCall { callee, args } => {
+                    step(fuel, None)?; // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     let need = base + c.progs[callee].nslots as usize;
                     if self.regs.len() < need {
@@ -9007,6 +9027,7 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
+                    step(fuel, None)?; // fuel unification: function-entry safepoint
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {

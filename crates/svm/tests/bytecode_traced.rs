@@ -244,24 +244,31 @@ debug.fname 0 \"ok\"
 debug.loc 0 0 0 0 1 3
 ";
 
-/// Straight-line arithmetic lowered one op per IR instruction, so per-op fuel charging matches across
-/// engines: a small budget runs out mid-block and both backends raise `OutOfFuel` at the same op —
-/// the case that pins the `bump = 0` (no innermost advance) branch of the backtrace.
+/// A counted loop whose exit test is a **back-edge safepoint** (fuel unification): straight-line code
+/// no longer charges fuel, so a small budget is exhausted at the loop back-edge, and both backends
+/// raise `OutOfFuel` at the *same safepoint* — the case that pins the `bump = 0` (no innermost
+/// advance) branch of the backtrace. (Pre-unification this was a straight-line block that ran out
+/// mid-block; safepoint metering makes straight-line code free, so the burn must loop.)
 const FUEL_BURN: &str = "\
 func (i32) -> (i32) {
 block 0 (v0: i32) {
-  v1 = i32.const 1
-  v2 = i32.add v0 v1
-  v3 = i32.add v2 v1
-  v4 = i32.add v3 v1
-  v5 = i32.add v4 v1
-  return v5
+  v1 = i32.const 10
+  br 1(v1, v0)
+}
+block 1 (n: i32, acc: i32) {
+  acc2 = i32.add acc n
+  one = i32.const 1
+  n2 = i32.sub n one
+  br_if n2 1(n2, acc2) 2(acc2)
+}
+block 2 (r: i32) {
+  return r
   }
 }
 debug.file 0 \"burn.c\"
 debug.fname 0 \"burn\"
-debug.loc 0 0 0 0 5 3
-debug.loc 0 0 2 0 7 3
+debug.loc 0 1 0 0 5 3
+debug.loc 0 1 2 0 7 3
 ";
 
 #[test]

@@ -422,9 +422,18 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 
 **Sequence.**
 1. Proposal + owner sign-off (this section + the INVARIANTS clause). ✅ owner-approved 2026-07-25.
-2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. Validate
-   `bytecode_debug` / `bytecode_suspend_resume` stay green and step traces are unchanged.
-3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints.
+2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. ✅ **DONE.**
+   Both engines now charge fuel only at a taken back-edge (`target block <= current`, i.e. a backward
+   jump — in the bytecode engine, literally `target_pc <= pc`) and at each function entry
+   (`Call`/`CallIndirect`/`ReturnCall`/`ReturnCallIndirect`); `kill` is polled at those same points.
+   The per-op charge is gone; `budget` (explorer/single-step) is untouched, so debug step traces are
+   bit-identical. `FUEL_BURN` (was a straight-line block — now free) rewritten to a counted loop so
+   `out_of_fuel_backtrace_matches` traps at the loop back-edge. Validated: 19-harness differential
+   batch green — `bytecode_diff`, `bytecode_traced` (incl. the OutOfFuel backtrace), all
+   `bytecode_debug*`, `jit_diff`, `escape_oracle`, `simd`, coroutines/threads/fibers/dynlink/
+   instantiate. (JIT still on the async kill-cell; `jit_diff` skips `OutOfFuel`, so the pair is
+   coherent standalone.)
+3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. — next.
 4. Flip the harnesses from "skip `OutOfFuel`" to "assert `OutOfFuel` parity" across all three — the
    acceptance test that unification holds.
 5. Follow-on: the `instantiate` child honors its `fuel` uniformly (thread the counter in), closing

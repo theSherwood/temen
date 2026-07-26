@@ -7303,7 +7303,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 budget -= 1;
             }
             let inst = &block.insts[frames[top].inst];
-            step(fuel, kill.as_deref())?;
+            // Fuel unification: insts do NOT charge fuel — fuel is metered at IR safepoints (back-edge
+            // branches + function entries), charged in the Call/CallIndirect arms and the branch
+            // terminators below. `budget` (explorer/single-step) stays per-op above; `kill` is likewise
+            // polled at safepoints now, matching the JIT.
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
@@ -7487,6 +7490,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // Non-tail calls push a new frame and switch to it; the callee's results
                 // are appended to this frame's `vals` when it returns (see `Return`).
                 Inst::Call { func, args } => {
+                    step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
                     let argv = collect(&frames[top].vals, args)?;
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
@@ -7504,8 +7508,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     continue 'frames;
                 }
                 Inst::CallIndirect { ty, idx, args } => {
-                    // Dispatch through the module-0 table (new→old; matches the JIT, where every
-                    // function — parent or unit — is lowered against the parent `fn_table`).
+                    step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
+                                                  // Dispatch through the module-0 table (new→old; matches the JIT, where every
+                                                  // function — parent or unit — is lowered against the parent `fn_table`).
                     let (cmod, cfunc) = dispatch_indirect(
                         dt,
                         &funcs,
@@ -9776,7 +9781,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
         }
 
-        step(fuel, kill.as_deref())?;
+        // Fuel unification: the terminator no longer charges unconditionally. A *back-edge* branch
+        // (target block <= current) charges in its arm below; tail calls charge as function entries;
+        // forward branches and `return` are free (bounded straight-line control flow). `kill` is polled
+        // at those same safepoints.
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
         // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
@@ -9794,6 +9802,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         }
         match &block.term {
             Terminator::Br { target, args } => {
+                if (*target as usize) <= frames[top].block {
+                    step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
+                }
                 collect_into(&mut edge_buf, &frames[top].vals, args)?;
                 std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
@@ -9811,6 +9822,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     (*else_blk, else_args)
                 };
+                if (target as usize) <= frames[top].block {
+                    step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
+                }
                 collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
                 std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = target as usize;
@@ -9823,6 +9837,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             } => {
                 let i = get_i32(&frames[top].vals, *idx)? as u32 as usize;
                 let (target, edge_args) = targets.get(i).unwrap_or(default);
+                if (*target as usize) <= frames[top].block {
+                    step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
+                }
                 collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
                 std::mem::swap(&mut frames[top].vals, &mut edge_buf);
                 frames[top].block = *target as usize;
@@ -9926,6 +9943,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             Terminator::Unreachable => return Err(Trap::Unreachable),
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
+                step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
                 let argv = collect(&frames[top].vals, args)?;
                 if fs.get(*func as usize).is_none() {
                     return Err(Trap::Malformed);
@@ -9939,6 +9957,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 };
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
+                step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
                 let (cmod, cfunc) = dispatch_indirect(
                     dt,
                     &funcs,
