@@ -1075,7 +1075,7 @@ fn from_slot(t: ValType, s: i64) -> Value {
         ValType::Ref => Value::Ref(s as u64),
     }
 }
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // NaNs compare equal — the IR does not pin a NaN bit-pattern across backends.
         (Value::F32(x), Value::F32(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
