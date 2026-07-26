@@ -359,16 +359,24 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 
 ## Fuel unification (safepoint-anchored)
 
-> **Split to its own branch/PR (`claude/svm-fuel-unification-fkhrs0`), 2026-07-26.** The interpreter
-> implementation was built and validated but is **not part of this PR** — its blast radius (every
-> fuel-*denominated* mechanism: exhaustion tests, the `impl_fuel` reserve, and fuzzer runtime, since
-> safepoint fuel loosens the wall-clock bound by the ops/safepoint factor) needs deliberate handling
-> alongside the JIT half + the harness flip. This PR carries only the safe op-count perf slices
-> (5a, edge-copy elision). The design record below stays here as the plan; the code lives on the
-> fuel branch.
+> **This is the fuel-unification PR** (branch `claude/svm-fuel-unification-fkhrs0`), split from the
+> op-count perf work (merged in #444) so its blast radius is handled deliberately. **Landed here:**
+> both interpreters meter fuel at IR safepoints (§ below), the §5 `kill` poll is decoupled to stay
+> per-op, and the fuel-denominated exhaustion tests + the `impl_fuel` reserve are recalibrated — the
+> ones that assert `OutOfFuel` on *straight-line* code, which crosses zero safepoints and so never
+> exhausts; each was rewritten to loop so a back-edge exists to charge at. **Pending in this PR:** the
+> Cranelift JIT counted-fuel half + flipping the differential harnesses to assert `OutOfFuel` parity.
+>
+> **The fuzzers were *not* rescaled** (a measured correction to an earlier assumption). Every generated
+> fiber program is a single block terminated by `Return` — no branches, no back-edges — so safepoint
+> fuel charges only at call entries and is behaviorally equivalent to per-op fuel for this corpus;
+> `fiber_fuzz`'s diff vs main is empty. Measured: the 2000-program deterministic sweep is fuel-insensitive
+> (200 progs at fuel 10/100/1000 ≈ 28/32/31s; full 2000 at fuel 50 vs 1000 ≈ 584s vs 673s, the gap a
+> contention artifact) — its cost is the per-program serialization round-trips (~90%), not interp ops.
+> Safepoint fuel only loosens the wall-clock bound for programs that actually *loop*, which this corpus
+> does not.
 
-*Cross-backend execution contract; owner-approved 2026-07-25, implementation pending on the fuel
-branch. The model and the migration:*
+*Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
 **The non-parity today.** Fuel means three different things:
 - **tree-walker + bytecode** — a per-op decrementing counter (`step(fuel)` / `checked_sub(1)` before
