@@ -768,8 +768,11 @@ pub(crate) unsafe extern "C" fn fiber_new(
 }
 
 /// `cont.resume` thunk: switch into fiber `handle`, delivering `arg`; writes `*status_out` (0 =
-/// suspended, 1 = returned) and returns the fiber's yielded/returned value. A forged / out-of-range /
-/// already-running / finished handle traps (`FiberFault`), matching the interpreter.
+/// suspended on a guest `suspend`, 1 = returned, 3 = [`FIBER_PARKED`] — the fiber hit an event
+/// park (a `memory.wait` inside it), so it is set aside with `value` 0 and is **not** done; the
+/// resumer keeps running and re-polls with another `cont.resume`, §3.6 slice 5a) and returns the
+/// fiber's yielded/returned value. A forged / out-of-range / already-running / finished handle
+/// traps (`FiberFault`), matching the interpreter.
 ///
 /// # Safety
 /// `status_out`/`trap_out` are live `*mut i64` cells. The running vCPU's runtime is [`CURRENT_RT`].

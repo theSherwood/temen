@@ -11593,7 +11593,12 @@ fn lower_vm_builtin(
                 value: rs[0],
                 offset: 0,
                 align: 0,
-            }); // *done = status (0 suspended / 1 returned)
+            }); // *done = cont.resume status: 0 = suspended (guest `suspend`; `value` is the
+                //     yielded i64), 1 = returned (fiber ran to completion), 3 = FIBER_PARKED
+                //     (the fiber hit an event park — a timed/futex `memory.wait` inside it — and
+                //     was set aside; `value` is 0, the fiber is not done: re-poll it with another
+                //     `cont.resume`). A consumer that treats `!= 1` as "suspended, take value"
+                //     drops the continuation on a park (§3.6 slice 5a; svm PR #442).
             ctx.bind_dest(&c.dest, rs[1]); // the yielded/returned i64
             Ok(true)
         }
