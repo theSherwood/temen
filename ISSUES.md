@@ -397,37 +397,39 @@ by live state.
 death-is-revocation path already visits the waiter structures), or bound the map with an LRU/TTL.
 Small; suitable as a rider on any §3.6 residue slice.
 
-### I35 — chibicc miscompile (unreduced): an indexed array store through a post-incremented counter inside a capability-enumeration loop read back zeros (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner
+### I35 — NOT a miscompile: a `--child-entry` `main`'s argv-relocated frame was rounded up to the next 16 KiB page and collided with a SharedRegion the program mapped there; a local array on that frame read back garbage (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner — **FIX LANDED 2026-07-27** (`claude/chibicc-playground-status-7n6eh0`)
 
-**Where:** guest C compiled by the chibicc frontend (`--child-entry`). The `__stage` filter
-runner's grant-discovery loop originally read
+**The original diagnosis was wrong.** It was filed as "the indexed post-increment store
+`regs[nregs++] = h` miscompiles." It does not — chibicc emits correct IR for that store. Proof
+(reproductions, 2026-07-27): the identical loop in a **powerbox** `main(int, char**)` (a *local*
+array + post-increment) runs correctly on both engines; the same program spawned as a `--child-entry`
+child in a carve **that matches its declared window** also runs correctly; and in the failing runner
+both the post-increment form **and** an explicit-slot-pick form fail — so the store shape was never
+the variable. Storage class was: `static` worked, `local` failed.
 
-```c
-int regs[2]; int nregs = 0;
-int n = __vm_cap_count();
-for (int i = 0; i < n; i++) {
-  int t = 0;
-  int h = __vm_cap_at(i, &t);
-  if (t == 4 && nregs < 2) regs[nregs++] = h;
-}
-```
+**Real root cause (frontend, `codegen_ir.c` `emit_start`).** For a `main(int, char**)`, `_start`
+builds `argv[]` at `data_end` and relocates `main`'s frame above it. It rounded `main_sp` **up to the
+next full `POWERBOX_ARGS_END` (16 KiB) page**. The `__stage` runner's writable globals (a
+`window_pin_[50000]` pad that forces its declared window to 256 KiB) push `data_end` to 114688, so
+`main_sp` rounded to **exactly 131072** — the offset the runner then `__vm_region_map`s its ring into
+(`upper half of the 256 KiB window`). So a **local** `regs[]` lived on the frame at 131072+, aliasing
+the ring, and read back garbage once the ring was mapped/used; a **static** `regs[]` sat in the low
+globals region, clear of the frame, and survived — which is exactly why the static workaround worked.
+chibicc's IR was correct throughout; the frame was merely parked on top of a region the program owns.
 
-and `regs[0]`/`regs[1]` later read back **0** (both) even though `nregs` correctly reached 2 and
-an *inline* re-enumeration in the same function saw the right handles/types — so the powerbox and
-`cap.self.get` are fine; the `regs[nregs++] = h` stores are what went missing. A **minimal**
-probe (straight-line `a[n++] = 7; a[n++] = 9;` in a `--child-entry` `main`) compiles *correctly*
-(the emitted IR increments and indexes right), so the bug needs more of the surrounding shape —
-suspects: the loop back-edge interaction with the promote-scalars pass on `nregs`, the
-address-taken `&t` neighbor, or the local (frame-relocated) array in a `main(argc, argv)` child.
-Not reduced further.
+**Fix:** relocate `main`'s frame **just past the argv array (16-byte aligned)** instead of rounding up
+a full page — the array is only `(argc+1)*8` bytes and the frame grows upward away from it, so 16-byte
+alignment is all the ABI needs (`data_end` is already page-isolated from read-only globals, so D40
+still holds). This keeps the frame adjacent to `data_end`, below whatever offset a program maps
+regions at. The runner's grant-discovery loop is restored to its natural shape (local array +
+`regs[nregs++] = h`) in `crates/svm/tests/c_shell.rs` and now regression-guards the fix (it fails if
+the full-page rounding returns). Validated: full `c_frontend` + `c_shell` + `stage1_*` suites green.
 
-**Workaround (in-tree):** the runner uses explicit slot picks (`if (nregs == 0) regs[0] = h; else
-if (nregs == 1) regs[1] = h; nregs = nregs + 1;`) on `static` storage — see
-`crates/svm/tests/c_shell.rs` (`STAGE_RUNNER_MAIN`), which carries a pointer to this entry.
-
-**Fix sketch:** reduce by re-adding the original shape piecewise (loop, `&t`, local vs static
-array, `--child-entry` argv frame) against the emitted IR diff; the defect is frontend-only
-(codegen_ir.c), no VM/TCB involvement.
+**Latent parallel (not changed):** `svm-llvm`'s `synth_start_argv` (the on-ramp frontend) does the
+same page-alignment, deliberately tied to D40. It is not currently triggered — on-ramp `main`s don't
+map SharedRegions at colliding offsets — and its page-alignment is redundant-but-safe (its data stack
+is already page-isolated). Left untouched to keep this fix off the on-ramp artifact path; align it too
+if a child-entry on-ramp program ever hits the same collision.
 
 ### I34 — CI flake: `apt-get install gcc-mingw-w64-x86-64` stalled ~29 min on the `fiber-scaling (stack-check + arena-stacks)` job until the run was cancelled (S4) — seen 2026-07-23, PR #422 run 30027500683
 

@@ -2724,7 +2724,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   // `{ argc:u32, envc:u32 }` at `POWERBOX_ARGS_BASE` followed by the packed NUL-terminated strings; we
   // build `argv[]` (a `char*` per arg, plus the `argv[argc] == NULL` terminator) at `data_end` (the
   // entry SP, reused after the transient name scratch above), then call `main(main_sp, argc, argv)`
-  // with `main`'s frame relocated a full page above the array so it never overwrites `argv[]`. The
+  // with `main`'s frame relocated just above the array (16-byte aligned) so it never overwrites `argv[]`. The
   // loop mirrors `svm-llvm`'s `synth_start_argv`. Block value numbers are block-local (chibicc IR).
   if (needs_argv) {
     int mi = func_index(main_fn);
@@ -2780,9 +2780,17 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v7 = i64.add v0 v6\n");
     cg("  v8 = i64.mul v7 v2\n");
     cg("  v9 = i64.add v1 v8\n");
-    cg("  v10 = i64.const %d\n", POWERBOX_ARGS_END - 1);
+    // `main_sp` = the byte past `argv[]`, rounded up to the 16-byte frame alignment (`data_end` is
+    // already 16-aligned; this only clears the `(argc+1)*8` array). It must sit **just above** the
+    // array — enough that `main`'s upward-growing frame never overwrites `argv[]` — but no higher:
+    // rounding up to a full page (the old `POWERBOX_ARGS_END`) needlessly pushed the frame onto the
+    // next 16 KiB boundary, which collided with a window offset a program mapped a SharedRegion at
+    // (ISSUES.md I35 — a `--child-entry` runner maps rings at a fixed high offset and assumes the
+    // frame stays below it). 16-byte alignment is all the ABI needs (every frame offset is aligned
+    // within the frame; only the base must be 16-aligned).
+    cg("  v10 = i64.const 15\n");
     cg("  v11 = i64.add v9 v10\n");
-    cg("  v12 = i64.const %d\n", -POWERBOX_ARGS_END);
+    cg("  v12 = i64.const -16\n");
     cg("  v13 = i64.and v11 v12\n");
     cg("  v14 = i32.wrap_i64 v0\n");
     if (is_void) {
