@@ -21,6 +21,26 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I46 — CI flake: `concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify` fails on macOS (S4) — seen 2026-07-27, PR #455 run 30266760876
+
+**Symptom.** `build · test (macos-latest)` failed one test in `crates/svm/tests/durable_concurrent_jit.rs:1048`:
+`assertion left == right failed: the root's re-issued atomic.wait parked and was woken by the
+sibling's re-issued notify on thaw` (`left: 1, right: 0`). The other 14 tests in the binary passed;
+Linux/other runners were green on the same commit.
+
+**Why it's a flake, not the PR.** PR #455 (the Tcl on-ramp target) touches only `svm-llvm`
+(workspace-excluded), `crates/svm-run/demos/tcl/` (C/sh/md, not compiled by this suite), `browser/`,
+and docs — nothing in `crates/svm` or the durability/concurrency path. The test is a
+nondeterministic freeze/thaw over a futex (`atomic.wait` parked, then a sibling's `notify` must wake
+it *after* thaw re-issues both) — a wake-ordering race, the same family as **I44** (freeze × parked
+`svc.wait`), and it predates the PR (present in the branch's base, the #450 merge). `right: 0` means
+the sibling's re-issued `notify` didn't land the wake before the assertion read the counter.
+
+**Action.** Re-run the failed macOS job (expected to pass). Watch for recurrence — if it repeats,
+it graduates from S4-flake to a real thaw-time wake-ordering bug in the durable futex re-issue path
+(the I44 clamp covers freeze-on-quiesce, not this sibling-notify-on-thaw wake), tracked against
+`durable_concurrent_jit`.
+
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
 `cargo run --release --example megabench -p svm` panics after the first four kernels
