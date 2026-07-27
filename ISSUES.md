@@ -21,6 +21,27 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I49 — the playground's `chibicc.svmb` was never committed, so the C-compiler card 404'd (S3) — the I26/I42 asset-shipping class again — surfaced 2026-07-27 (`fetch ./assets/chibicc.svmb: 404`) — **FIX LANDED** (`claude/chibicc-playground-status-7n6eh0`)
+
+**Symptom.** The playground's "C compiler (chibicc → SVM)" card fails with
+`fetch ./assets/chibicc.svmb: 404 — run \`node build-onramp-assets.mjs\` to generate it`.
+
+**Where.** `browser/.gitignore` ignores `/web/assets/*.svmb` with explicit `!` un-ignore exceptions
+for every committed playground asset (`hello_c`, `gradient`, `bounce`, `life`, `mandelzoom`,
+`qjs_repl`) — but **not `chibicc.svmb`**. Step-5 landed the card + the `build-onramp-assets.mjs`
+wiring but never committed the artifact, and that build is **fail-soft** (skipped when clang/llvm-18
+is absent or the build hiccups). So the card only worked if the deploy-time build happened to
+succeed; there was no committed fallback, and any failure silently shipped a 404 — locally the card
+never worked out of the box at all.
+
+**This is the I26/I28/I42 class** (a Pages deploy shipping a playground missing an asset, fail-soft
+build masking it). **Fix:** commit `chibicc.svmb` in-tree behind a `!/web/assets/chibicc.svmb`
+gitignore exception, exactly like `qjs_repl.svmb` — the build script still rebuilds it in place when
+the toolchain is present. Built asset: 392786 bytes, 333 funcs, verifies + bytecode-compiles;
+compiles a C source to SVM IR on the bytecode engine (the browser's engine). **Residual guard gap
+(unfixed):** nothing gates that the *deployed* site actually serves each expected asset — the same
+gap I26 named; committing the artifact closes the symptom, not the class.
+
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
 `cargo run --release --example megabench -p svm` panics after the first four kernels
