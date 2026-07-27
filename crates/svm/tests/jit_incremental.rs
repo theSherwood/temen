@@ -38,6 +38,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,
@@ -380,6 +381,7 @@ fn install_makes_unit_call_indirectable() {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         4,

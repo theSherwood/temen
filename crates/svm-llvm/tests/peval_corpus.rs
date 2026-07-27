@@ -193,9 +193,10 @@ fn jit_compile(m: &Module, entry: u32) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
-        0,
+        0
     )
     .expect("jit compile")
 }

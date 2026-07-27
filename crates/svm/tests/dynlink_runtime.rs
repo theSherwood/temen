@@ -26,6 +26,7 @@ fn compile_host(src: &str) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,
@@ -102,6 +103,7 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         4,

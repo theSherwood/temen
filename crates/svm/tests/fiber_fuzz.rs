@@ -366,6 +366,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             None,
             None,
             None,
+            None, // fuel
             None,
             jit_quota,
             0,

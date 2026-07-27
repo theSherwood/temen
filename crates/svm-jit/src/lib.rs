@@ -829,10 +829,11 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
         empty_cap_thunk,
         core::ptr::null_mut(),
         DEFAULT_RESERVED_LOG2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0, // natural (non-B2-reserved) function-table size
     )
@@ -867,6 +868,7 @@ pub fn compile_and_run_with_host(
         None,
         None,             // no re-granted child powerbox (op 8 → CapFault)
         None,             // no kill-path armed (use `_interruptible` to arm one)
+        None,             // no fuel budget armed (use `_fuel` to arm one)
         None,             // no async ring
         None,             // no fast cap resolver (use `_fast` to supply one)
         Quota::default(), // no spawn quota (use a powerbox quota via svm-run)
@@ -905,6 +907,7 @@ pub fn compile_and_run_with_host_fast(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         None, // no kill-path armed
+        None, // no fuel budget armed
         None, // no async ring
         Some(fast_resolver),
         quota,
@@ -944,6 +947,7 @@ pub fn compile_and_run_with_host_interruptible(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         Some(interrupt),
+        None, // no fuel budget armed
         None, // no async ring
         None, // no fast cap resolver
         Quota::default(),
@@ -982,9 +986,51 @@ pub fn compile_and_run_with_host_interruptible_fast(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         Some(interrupt),
+        None, // no fuel budget armed
         None, // no async ring
         Some(fast_resolver),
         quota,
+    )?
+    .0)
+}
+
+/// Like [`compile_and_run_with_host`], but **arm safepoint-anchored counted fuel** (INTERP_PERF.md
+/// "Fuel unification"): the lowering decrements `*fuel` by one at every function entry and taken
+/// back-edge, and traps [`TrapKind::OutOfFuel`] when the budget would go below zero. Unlike the §5
+/// kill-path ([`compile_and_run_with_host_interruptible`], a host-written cell polled asynchronously),
+/// this is a deterministic **guest budget**: `fuel` counts exactly (function entries + taken
+/// back-edges), the same unit the tree-walker and bytecode engines now charge, so a run either
+/// completes or traps `OutOfFuel` at the same safepoint on all three backends. The caller owns the
+/// `u64` cell, seeds it with the budget, and reads the remainder back after the call.
+///
+/// # Safety
+/// `fuel` must point at a live, writable `u64` that outlives the call (its address is baked into the compiled
+/// code); `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
+pub fn compile_and_run_with_host_fuel(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    fuel: *mut u64,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        None,
+        DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        None, // no re-granted child powerbox (op 8 → CapFault)
+        None, // no async kill-path (the fuel budget bounds the run)
+        Some(fuel),
+        None, // no async ring
+        None, // no fast cap resolver
+        Quota::default(),
     )?
     .0)
 }
@@ -1031,6 +1077,7 @@ pub fn compile_and_run_capture_reserved(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         None, // no kill-path armed
+        None, // no fuel budget armed
         None, // no async ring
         None, // no fast cap resolver
         Quota::default(),
@@ -1067,6 +1114,7 @@ pub fn compile_and_run_capture_sub(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         None, // no kill-path armed
+        None, // no fuel budget armed
         None, // no async ring
         None, // no fast cap resolver
         Quota::default(),
@@ -1140,6 +1188,7 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
         resolve_module,
         grant_child,
         None, // no kill-path armed (the differential oracle runs to completion)
+        None, // no fuel budget armed
         None, // no async ring
         None, // no fast cap resolver
         Quota::default(),
@@ -1174,6 +1223,7 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         None, // no sub-window
         None, // no module resolver
         None, // no interrupt
+        None, // no fuel budget
         None, // no fast cap resolver
         Quota::default(),
         0, // one-shot path: natural table size
@@ -1273,10 +1323,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0,
     )?;
@@ -1317,10 +1368,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable_nested(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0,
     )?;
@@ -1367,10 +1419,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable_interruptible(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0,
     )?;
@@ -1421,10 +1474,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0,
     )?;
@@ -1476,10 +1530,11 @@ pub fn compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         Quota::default(),
         0,
     )?;
@@ -1533,6 +1588,7 @@ pub fn compile_and_run_capture_reserved_with_host_async(
         None,
         None, // no re-granted child powerbox (op 8 → CapFault)
         None, // no kill-path armed
+        None, // no fuel budget armed
         Some(hooks),
         None, // no fast cap resolver
         Quota::default(),
@@ -1564,6 +1620,7 @@ fn run_inner(
     resolve_module: Option<ModuleResolver>,
     grant_child: Option<GrantChildHooks>,
     interrupt: Option<*const AtomicU64>,
+    fuel: Option<*mut u64>,
     async_hooks: Option<&dyn AsyncHostHooks>,
     fast_resolver: Option<FastCapResolver>,
     quota: Quota,
@@ -1582,6 +1639,7 @@ fn run_inner(
         sub,
         resolve_module,
         interrupt,
+        fuel,
         fast_resolver,
         quota,
         0, // one-shot path: natural table size (no B2 reservation)
@@ -2430,6 +2488,7 @@ impl CompiledModule {
         sub: Option<SubWindow>,
         resolve_module: Option<ModuleResolver>,
         interrupt: Option<*const AtomicU64>,
+        fuel: Option<*mut u64>,
         fast_resolver: Option<FastCapResolver>,
         quota: Quota,
         table_reserve_log2: u8,
@@ -2449,10 +2508,11 @@ impl CompiledModule {
         // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
         let epoch_addr = interrupt.map_or(0, |p| p as i64);
         // Fuel unification: the address of the host-owned counted-fuel cell the lowering decrements at
-        // safepoints. `0` ⇒ no fuel armed (no fuel checks emitted — guest code byte-identical). The
-        // arming path (a `fuel` parameter + public run entry) is threaded in the follow-up slice; for
-        // now every compile is fuel-un-armed, so this whole feature is inert until then.
-        let fuel_addr = 0i64;
+        // safepoints (function entries + taken back-edges). `0` ⇒ no fuel armed (no fuel checks
+        // emitted — guest code byte-identical). The caller owns the `u64` cell (it must outlive the
+        // module, since its address is baked into the code) and reads the remaining budget back after
+        // the run.
+        let fuel_addr = fuel.map_or(0, |p| p as i64);
         // Calls can reach any function, so every function must be lowerable.
         for f in &m.funcs {
             ensure_supported(f)?;
@@ -7025,11 +7085,11 @@ fn lower_block(
             let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
             let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
-            // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
-            // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
-            // static per edge, but which edge is taken is a runtime value — so an edge that is a
-            // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
-            // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
+                                        // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
+                                        // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
+                                        // static per edge, but which edge is taken is a runtime value — so an edge that is a
+                                        // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
+                                        // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
             let then_be = lower.fuel_addr != 0 && *then_blk as usize <= block_idx;
             let else_be = lower.fuel_addr != 0 && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
@@ -7069,12 +7129,12 @@ fn lower_block(
         } => {
             let index = get(&vals, *idx)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
-            // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
-            // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
-            // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
-            // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
-            // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
-            // `fuel_addr != 0` so an un-armed compile builds the identical table.
+                                        // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
+                                        // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
+                                        // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
+                                        // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
+                                        // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
+                                        // `fuel_addr != 0` so an un-armed compile builds the identical table.
             let is_be = |t: u32| lower.fuel_addr != 0 && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
@@ -7082,11 +7142,14 @@ fn lower_block(
                 emit_fuel_check(b, lower);
             }
             let mixed = any_be && !all_be; // some arms back-edges, some not
-            // Build a BlockCall (target block + its edge args) for each table entry and the default;
-            // Cranelift masks the index and selects, default on OOB. A `(tramp, dest, args)` is deferred
-            // and filled after the `br_table` (a block can only be built once its predecessors exist).
-            let mut tramps: Vec<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Block, Vec<BlockArg>)> =
-                Vec::new();
+                                           // Build a BlockCall (target block + its edge args) for each table entry and the default;
+                                           // Cranelift masks the index and selects, default on OOB. A `(tramp, dest, args)` is deferred
+                                           // and filled after the `br_table` (a block can only be built once its predecessors exist).
+            let mut tramps: Vec<(
+                cranelift_codegen::ir::Block,
+                cranelift_codegen::ir::Block,
+                Vec<BlockArg>,
+            )> = Vec::new();
             let mut entries = Vec::with_capacity(targets.len());
             for (t, args) in targets {
                 let ba = map_args(&vals, args)?;
@@ -7100,7 +7163,11 @@ fn lower_block(
                     ));
                     tramps.push((tramp, blk, ba));
                 } else {
-                    entries.push(BlockCall::new(blk, ba.iter().copied(), &mut b.func.dfg.value_lists));
+                    entries.push(BlockCall::new(
+                        blk,
+                        ba.iter().copied(),
+                        &mut b.func.dfg.value_lists,
+                    ));
                 }
             }
             let (dt, dargs) = default;

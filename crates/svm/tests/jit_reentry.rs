@@ -88,6 +88,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,

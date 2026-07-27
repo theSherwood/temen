@@ -29,6 +29,7 @@ fn compile_host(src: &str) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,
