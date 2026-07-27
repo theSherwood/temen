@@ -11625,3 +11625,114 @@ fn ll_parity_call_void() {
          void v(int x){ sink(x); }",
     );
 }
+
+// ── Tcl — the reference Tcl 8.6 interpreter on the on-ramp (in-progress target) ────────────────────
+//
+// The minimal-embedding REPL (`crates/svm-run/demos/tcl/tcl_repl.c`, no `Tcl_Init`) over the whole
+// Tcl language core. Unlike the QuickJS/Lua ports (a handful of .c files), Tcl is configure-based, so
+// the faithful build lives in `demos/tcl/build_bitcode.sh`: it configures Tcl, builds the native
+// oracle (`libtcl8.6.a`), compiles all 162 core TUs to `.ll` with the Makefile's own flags, and
+// `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one module. The
+// test shells out to that script (idempotent + cached), builds the native *driver* oracle, then
+// translate → verify → run under the powerbox and diffs stdout.
+//
+// `#[ignore]`d: the on-ramp translate currently fail-closes at a constexpr `icmp`/`select` (README
+// "gap-walk record"), so this does not pass yet — it is the guard that *drives* the gap-walk, run
+// explicitly with `--ignored`. Skips loudly (never fails) when clang/curl/make are unavailable —
+// grep for `skipping tcl` before trusting a green `--ignored` run.
+
+/// Path to `demos/tcl`.
+fn tcl_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/tcl")
+}
+
+/// Run the faithful `build_bitcode.sh` (fetch + configure + native oracle + per-TU bitcode + link).
+/// Returns `(linked_ll, tcl_src_dir)` or `None` (skip) when the toolchain/network is unavailable.
+fn build_tcl() -> Option<(PathBuf, PathBuf)> {
+    let cache = std::env::temp_dir().join("svm_tcl_cache");
+    let linked = cache.join("tcl_linked.ll");
+    let src = cache.join("tcl8.6.14");
+    let script = tcl_demo_dir().join("build_bitcode.sh");
+    let status = Command::new("bash").arg(&script).status();
+    match status {
+        Ok(s) if s.success() && linked.exists() && src.join("unix/libtcl8.6.a").exists() => {
+            Some((linked, src))
+        }
+        _ => {
+            eprintln!("note: skipping tcl (build_bitcode.sh failed — offline or no clang/make?)");
+            None
+        }
+    }
+}
+
+/// Build the native **driver** oracle: `tcl_repl.c` + native `libtcl8.6.a` (`-lz -lm`). The stock
+/// `tclsh` the script also builds is *not* the oracle — the driver defines the REPL output shape, so
+/// the oracle must be the same driver compiled with `cc` (as the QuickJS test does).
+fn build_tcl_native_oracle(src: &Path) -> Option<PathBuf> {
+    let exe = std::env::temp_dir().join(format!("tcl_repl_native_{}", std::process::id()));
+    let ok = Command::new("cc")
+        .args(["-O2", "-I"])
+        .arg(src.join("generic"))
+        .arg("-I")
+        .arg(src.join("unix"))
+        .arg(tcl_demo_dir().join("tcl_repl.c"))
+        .arg(src.join("unix/libtcl8.6.a"))
+        .args(["-lz", "-lm", "-o"])
+        .arg(&exe)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok.then_some(exe)
+}
+
+/// **▶ Tcl REPL — evaluate a Tcl script piped in on stdin** (the playground driver). Translate the
+/// linked Tcl module → verify → run under the powerbox with `stdin`, and assert stdout byte-matches
+/// the native `cc` driver oracle. `#[ignore]`d (drives the on-ramp gap-walk; see README).
+#[test]
+#[ignore = "in-progress on-ramp target: translate fail-closes at a constexpr icmp/select (see demos/tcl/README.md)"]
+fn demo_tcl_repl_stdin() {
+    let Some((linked, src)) = build_tcl() else {
+        return;
+    };
+    let Some(oracle) = build_tcl_native_oracle(&src) else {
+        eprintln!("note: skipping tcl (native oracle cc build failed)");
+        return;
+    };
+    // A language-breadth script: recursion, lsort, format, dict, regexp, string, expr `**`.
+    let stdin: &[u8] =
+        b"proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\n\
+        set out {}\n\
+        for {set i 0} {$i < 10} {incr i} { lappend out [fib $i] }\n\
+        puts \"fib: $out\"\n\
+        puts \"sorted: [lsort -integer {5 3 8 1 9 2 7}]\"\n\
+        puts [format \"pi ~ %.4f, 255 = 0x%X\" 3.14159265 255]\n\
+        dict set d a 1; dict set d b 2; puts \"dict: $d\"\n\
+        expr {2**10 + [string length hello]}\n";
+
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&oracle)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native tcl driver");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child.wait_with_output().expect("run native tcl driver")
+    };
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native tcl oracle produced no output"
+    );
+
+    let t = svm_llvm::translate_ll_path(&linked).expect("translate tcl");
+    let module = t.module;
+    svm_verify::verify_module(&module).expect("verify tcl module");
+    let run = svm_run::run_powerbox(&module, stdin).expect("powerbox run tcl");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "tcl: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}

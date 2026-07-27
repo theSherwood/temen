@@ -742,6 +742,37 @@ runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlinin
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.
 
+### ▶ In-progress target — Tcl (a second scripting-language interpreter)
+
+**Status: scaffold + faithful whole-program pipeline landed; on-ramp gap-walk started.** The
+reference **Tcl 8.6.14** interpreter (Tcl/BSD license) via the minimal-embedding REPL
+(`demos/tcl/tcl_repl.c`, `Tcl_CreateInterp` + `Tcl_Eval`, **no `Tcl_Init`** — the whole language core
+runs with no filesystem, the direct analog of QuickJS's `qjs_eval.c`). Another self-contained C
+interpreter reached with **no new VM capabilities** — a frontend + libc-waist + driver +
+playground-registration job (see `demos/tcl/README.md`).
+
+- **DONE — native oracle + minimal embedding proven.** `tcl_repl.c` linked against native
+  `libtcl8.6.a` runs the whole language core (`set`/`expr`/`proc`+recursion/`lsort`/`for`/`format`/
+  `dict`/`regexp`/`string`/`**`, and `puts` via the stdout channel) with no `Tcl_Init`, no filesystem.
+- **DONE — faithful whole-program bitcode.** `demos/tcl/build_bitcode.sh` configures Tcl
+  (`--disable-shared --disable-threads --disable-load`), builds the oracle, compiles all **162 core
+  TUs** (generic + unix + Spencer regex + TclOO + libtommath) to `.ll` with the Makefile's own flags,
+  and `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one ~19.6 MB
+  module. The libc waist reuses the Postgres printf/scanf/ctype shims, the guest `strtod`, openlibm,
+  and the svm-posix caps; `tcl_shim.c` carries only Tcl's own OS surface (time/tty/locale/sockets).
+- **NEXT (translate gap #1) — constexpr `icmp`/`select`.** The first fail-closed stop is a
+  constant-expression compare the on-ramp's LLVM constant parser (`src/ll/parse.rs` `constant()`)
+  doesn't yet evaluate — `select i1 icmp eq (inttoptr(3), @DeleteScriptLimitCallback), …` from Tcl's
+  limit-callback wrapper. Add the `Constant::ICmp`/`Select` AST variants + parse arms + a
+  constant-operand lowering in `lib.rs` (emit as real IR — a global address is a relocation, not a
+  compile-time literal). A general on-ramp improvement; expect a QuickJS-length chain after it. The
+  guard is `demo_tcl_repl_stdin` in `crates/svm-llvm/tests/translate.rs` (`#[ignore]`d until it clears;
+  drives the gap-walk with `--ignored`, skips loudly offline).
+- **Follow-ups:** full `Tcl_Init` (seed the script `library/` + encodings into the svm-posix memfs,
+  like SQLite/chibicc, enabling `file`/`glob`/`clock`/`auto_load`); the wasm-JIT tier once `_start` is
+  proven emittable. Playground wiring is staged: `build-onramp-assets.mjs` builds `tcl_repl.svmb` the
+  moment translate clears, and the `web/play.js` card is a ready-to-uncomment template.
+
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
 literal runs are written straight from the format global; each conversion lowers to the synthesized
