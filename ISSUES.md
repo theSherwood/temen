@@ -38,9 +38,16 @@ never worked out of the box at all.
 build masking it). **Fix:** commit `chibicc.svmb` in-tree behind a `!/web/assets/chibicc.svmb`
 gitignore exception, exactly like `qjs_repl.svmb` — the build script still rebuilds it in place when
 the toolchain is present. Built asset: 392786 bytes, 333 funcs, verifies + bytecode-compiles;
-compiles a C source to SVM IR on the bytecode engine (the browser's engine). **Residual guard gap
-(unfixed):** nothing gates that the *deployed* site actually serves each expected asset — the same
-gap I26 named; committing the artifact closes the symptom, not the class.
+compiles a C source to SVM IR on the bytecode engine (the browser's engine).
+
+**Class guard added (2026-07-27):** `browser/check-play-assets.mjs`, driven from `web/play.js` (the
+single source of truth for referenced assets), wired into two workflows (`workflows_src`, pending
+copy-over): a `playground-assets` PR job asserts every referenced asset is committed or declared
+deploy-built (catches a card referencing an unaccounted asset — the static half of this class), and
+a `pages.yml` `--site` step asserts every referenced asset is actually present in the assembled
+`_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
+with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
+automatically. This closes the residual guard gap I26 named.
 
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 

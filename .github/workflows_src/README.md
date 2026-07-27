@@ -33,5 +33,12 @@ identical until the next agent edit.
   C-compiler card's compile-and-run assertion instead of SKIPping it. Fail-soft: a build hiccup
   degrades to a SKIP, never a red build (the test guards on `web/assets/chibicc.svmb` existing).
   See PR #441 / SELFHOST_C.md §7 step 5.
+- **ci.yml + pages.yml** (2026-07-27): playground-asset reachability gate (ISSUES.md I26/I42/I49).
+  New `ci.yml` job **`playground-assets`** runs `node browser/check-play-assets.mjs` on every PR —
+  every asset `web/play.js` references must be committed or declared deploy-built, else red (cheap,
+  no toolchain). `pages.yml` gains a **`verify playground assets reachable`** step (after `assemble
+  site`, before `upload-pages-artifact`) running the script in `--site` mode against `_site`, so a
+  fail-soft asset build dropping a required asset goes red *before* the site publishes instead of
+  shipping a silent 404. Both are driven from `play.js`, so new demo cards are covered automatically.
 
 Remove entries from this list when they land in `.github/workflows/`.

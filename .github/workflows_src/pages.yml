@@ -118,6 +118,15 @@ jobs:
           HTML
           echo "assembled:"; find "$SITE" -type f | sed "s|$SITE|_site|"
 
+      # Reachability gate (ISSUES.md I26/I42/I49): every asset play.js references must actually be
+      # present in the assembled site before it publishes, or the card 404s in production. The asset
+      # builds above are fail-soft (dead mirror / missing toolchain ⇒ skipped), so without this a
+      # dropped asset ships silently. MAY_BE_ABSENT (DOOM's externally-mirrored WAD) is allowed to
+      # degrade to a build-hint card; every other referenced asset missing = red, before deploy.
+      - name: verify playground assets reachable
+        working-directory: browser
+        run: node check-play-assets.mjs --site "$GITHUB_WORKSPACE/_site"
+
       - uses: actions/configure-pages@v5
         with: { enablement: true }
       - uses: actions/upload-pages-artifact@v3
