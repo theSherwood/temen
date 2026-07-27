@@ -359,16 +359,39 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 
 ## Fuel unification (safepoint-anchored)
 
-> **Split to its own branch/PR (`claude/svm-fuel-unification-fkhrs0`), 2026-07-26.** The interpreter
-> implementation was built and validated but is **not part of this PR** — its blast radius (every
-> fuel-*denominated* mechanism: exhaustion tests, the `impl_fuel` reserve, and fuzzer runtime, since
-> safepoint fuel loosens the wall-clock bound by the ops/safepoint factor) needs deliberate handling
-> alongside the JIT half + the harness flip. This PR carries only the safe op-count perf slices
-> (5a, edge-copy elision). The design record below stays here as the plan; the code lives on the
-> fuel branch.
+> **This is the fuel-unification PR** (branch `claude/svm-fuel-unification-fkhrs0`), split from the
+> op-count perf work (merged in #444) so its blast radius is handled deliberately. **Landed here:**
+> both interpreters meter fuel at IR safepoints (§ below), the §5 `kill` poll is decoupled to stay
+> per-op, and the fuel-denominated exhaustion tests + the `impl_fuel` reserve are recalibrated — the
+> ones that assert `OutOfFuel` on *straight-line* code, which crosses zero safepoints and so never
+> exhausts; each was rewritten to loop so a back-edge exists to charge at. **Pending in this PR:** the
+> Cranelift JIT counted-fuel half + flipping the differential harnesses to assert `OutOfFuel` parity.
+>
+> **One fuzzer needed rescaling — and it exposed a real metering gap.** `fiber_fuzz`'s
+> `generated_fiber_programs_never_panic_and_are_deterministic` uses a *cyclic* generator (a `call` /
+> `cont.new` may target any function, so a program can recurse and spawn/resume fibers). Under
+> safepoint metering that test blew `cargo test --workspace` past its CI ceilings: 10.75→44 min on
+> windows-latest (**cancelled at the 45-min ceiling**), 6→26 min on Linux — all in this one test.
+>
+> **Root cause (the gap):** fuel charges at `call` / `call_indirect` / `return_call*` (function entries)
+> and taken back-edges, but **not at `cont.resume` / `cont.new`**. Resuming a fiber is a control transfer
+> that per-op fuel used to meter (every op in the fiber decremented the counter); under safepoint fuel a
+> long fiber-resume chain runs almost entirely **unmetered** (only the occasional `call` inside it
+> charges). So fuel bounds these programs only loosely — runtime is ~linear in fuel with a huge constant
+> (`fuel=8000` hung; `fuel=300` completed in ~20 min). Lowering fuel alone can't fix it, and neither can
+> a tidy op-count argument — the executed work between safepoints is unbounded through fibers.
+>
+> **Stopgap (this PR):** drop the corpus **2_000 → 200** (measured to complete in ~4 min debug on a slow
+> box, well under budget) and fuel `8_000 → 300`, keeping thousands of resume/return chains exercised.
+> The acyclic interp↔JIT differential in the same file is unaffected (bounded spawn/call depth) and keeps
+> its budget. **Proper fix (scoped follow-up):** charge fuel at the `cont.resume` / `suspend` fiber
+> safepoints in *both* interpreters (the tree-walker's inline resume arm and the bytecode `drive`
+> driver) — the durable-freeze trigger already treats these as the cross-backend fiber safepoints — so
+> fuel bounds fiber work too; then the corpus can return to 2_000. *(An even earlier revision of this
+> note wrongly called the corpus fuel-insensitive; that was measured branch-vs-branch on a contended box,
+> never branch-vs-main. The CI regression is the real signal.)*
 
-*Cross-backend execution contract; owner-approved 2026-07-25, implementation pending on the fuel
-branch. The model and the migration:*
+*Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
 **The non-parity today.** Fuel means three different things:
 - **tree-walker + bytecode** — a per-op decrementing counter (`step(fuel)` / `checked_sub(1)` before
@@ -422,11 +445,36 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 
 **Sequence.**
 1. Proposal + owner sign-off (this section + the INVARIANTS clause). ✅ owner-approved 2026-07-25.
-2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. Validate
-   `bytecode_debug` / `bytecode_suspend_resume` stay green and step traces are unchanged.
-3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints.
+2. Interpreters (tree-walker + bytecode): fuel → IR safepoints; keep `budget` per-op. ✅ **DONE.**
+   Both engines now charge fuel only at a taken back-edge (`target block <= current`, i.e. a backward
+   jump — in the bytecode engine, literally `target_pc <= pc`) and at each function entry
+   (`Call`/`CallIndirect`/`ReturnCall`/`ReturnCallIndirect`). Only *fuel* moved: the §5 `kill`
+   interrupt stays **per-op** (`poll_kill`, free when unarmed) — it is orthogonal to the fuel budget,
+   and a §14 child must self-terminate even in a loop that exits on its first iteration (no back-edge
+   to poll at). The per-op *fuel* charge is gone; `budget` (explorer/single-step) is untouched, so
+   debug step traces are bit-identical. `FUEL_BURN` (was a straight-line block — now free) rewritten to a counted loop so
+   `out_of_fuel_backtrace_matches` traps at the loop back-edge. Validated across **39 harnesses (two
+   batches)** — `bytecode_diff`, `bytecode_traced` (incl. the OutOfFuel backtrace), all
+   `bytecode_debug*`, `jit_diff`, `escape_oracle`, `simd`, coroutines/threads/fibers/dynlink/
+   instantiate, plus `quota`/`jit_quota`, `durable_backedge_jit` + the durability suite, `dpor`,
+   `concurrent*`, `jit_killpath`, and the heavy fuzzers (`fiber_fuzz`, `jit_fuzz`, `fuzz_smoke`).
+   (JIT still on the async kill-cell; `jit_diff` skips `OutOfFuel`, so the pair is coherent
+   standalone.)
+3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. — **next; scoped.** The JIT
+   already emits `emit_epoch_check` (the §5 kill-cell poll) at exactly the safepoints we need —
+   function entry (`lib.rs:5344`) + every back-edge (`6981/6996/7005`). Add a `fuel_addr: i64` on
+   `Lower` paralleling `epoch_addr`, threaded through the ~15 pipeline sites `epoch_addr` already
+   flows through (nested JIT children, spawn, coroutine children — all escape-TCB paths, so mirror it
+   exactly). At those 4 emit sites, when `fuel_addr != 0`, emit `f = load(fuel_addr); brif f==0 →
+   trap OutOfFuel; store(fuel_addr, f-1)` — the store⇒load dependency stops Cranelift hoisting it out
+   of the loop (no atomic needed; the cell is the guest's own budget, not host-written mid-run).
+   Gate on `fuel_addr` so the plain (non-fuel-armed) fast path is byte-identical — fuel metering is
+   opt-in, as it is today. Add a fuel-armed run entry that allocates the host fuel cell, passes its
+   address, and reads the remainder back. **Validate on the escape-TCB codegen paths** (jit_diff
+   fuel-armed, jit_killpath, nested-child) — this is security-critical codegen, do it as a focused
+   pass, not rushed.
 4. Flip the harnesses from "skip `OutOfFuel`" to "assert `OutOfFuel` parity" across all three — the
-   acceptance test that unification holds.
+   acceptance test that unification holds. (Depends on step 3.)
 5. Follow-on: the `instantiate` child honors its `fuel` uniformly (thread the counter in), closing
    the `_fuel`-ignored divergence.
 
