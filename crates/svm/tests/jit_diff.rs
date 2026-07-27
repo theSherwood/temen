@@ -824,9 +824,12 @@ block 0 (v0: i32, v1: f64) {
 
 // ---- calls ----
 
-/// The JIT trap kind an interpreter `Trap` should correspond to, or `None` for traps
-/// the scalar JIT does not model (memory-guard fault, fuel, stack, capabilities) — those
-/// are skipped rather than asserted.
+/// The JIT trap kind an interpreter `Trap` should correspond to, or `None` for traps this harness
+/// does not assert (memory-guard fault, stack). `OutOfFuel` *is* now modeled by the JIT (counted fuel,
+/// INTERP_PERF.md "Fuel unification"), but this differential runs unarmed (no fuel budget) as a
+/// correctness/miscompile oracle, so its runs never exhaust — cross-engine `OutOfFuel` parity is
+/// asserted where it is actually exercised, in `jit_fuzz` (`jit_matches_interp_under_tight_fuel`) and
+/// `jit_fuel`. Leaving it unmapped here is therefore correct: an unarmed run cannot produce it.
 fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
     match t {
         Trap::DivByZero => Some(TrapKind::DivByZero),

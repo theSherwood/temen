@@ -1038,8 +1038,8 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<svm_interp::Value> {
 
 use svm_interp::{run_capture_reserved_with_host, run_capture_sub, Host, Trap, Value};
 use svm_jit::{
-    compile_and_run_capture_reserved_with_host, compile_and_run_capture_sub, JitError, JitOutcome,
-    TrapKind,
+    compile_and_run_capture_reserved_with_host_fuel, compile_and_run_capture_sub, JitError,
+    JitOutcome, TrapKind,
 };
 use svm_verify::verify_module;
 
@@ -1092,6 +1092,44 @@ fn droppable_trap(t: &Trap) -> bool {
 }
 
 /// Trap kinds the scalar JIT models (others — fuel/stack/guard — it need not).
+/// Tight-fuel JIT-vs-interp `OutOfFuel` parity for one module (INTERP_PERF.md "Fuel unification").
+/// Runs both engines at the same small `budget` and asserts they agree on whether/where they exhaust:
+/// all three engines charge one fuel per function entry + taken back-edge off the *same* IR, so a run
+/// either completes on both or traps `OutOfFuel` on both (the armed JIT can never *return* where the
+/// interpreter ran out — enforced by `assert_outcomes_agree`'s `(Err, Returned)` arm, now that
+/// `OutOfFuel` is a modeled, non-droppable trap). Returns `true` if the interpreter exhausted, so a
+/// sweep can prove it is non-vacuous. Modules the JIT can't compile are skipped (→ `false`).
+pub fn jit_interp_fuel_agree(m: &Module, args: &[Value], budget: u64) -> bool {
+    let results = m.funcs[0].results.clone();
+    let init: Vec<u8> = Vec::new(); // fuel parity needs no escape-oracle seed (mem_oracle = false)
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    assert_eq!(hi.grant_memory(), MEMORY_HANDLE);
+    assert_eq!(hj.grant_memory(), MEMORY_HANDLE);
+    let mut ifuel = budget;
+    let (interp, _) = run_capture_reserved_with_host(m, 0, args, &mut ifuel, &init, 0, &mut hi);
+    let interp_oof = matches!(interp, Err(Trap::OutOfFuel));
+    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
+    let mut jfuel = budget;
+    let (jit, _) = match compile_and_run_capture_reserved_with_host_fuel(
+        m,
+        0,
+        &slots,
+        &init,
+        0,
+        svm_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+        &mut jfuel,
+    ) {
+        Ok(o) => o,
+        Err(JitError::Unsupported(_)) => return false,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return false,
+        Err(e) => panic!("JIT failed to compile a verified module: {e:?}\n{m:#?}"),
+    };
+    assert_outcomes_agree(m, &results, interp, &[], jit, &[], false);
+    interp_oof
+}
+
 fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
     match t {
         Trap::DivByZero => Some(TrapKind::DivByZero),
@@ -1100,6 +1138,10 @@ fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
         Trap::Unreachable => Some(TrapKind::Unreachable),
         Trap::IndirectCallType => Some(TrapKind::IndirectCallType),
         Trap::CapFault => Some(TrapKind::CapFault),
+        // Fuel unification: the JIT now counts fuel at the same safepoints, so `OutOfFuel` is a
+        // modeled, non-droppable trap — when the interp exhausts, the armed JIT must too (it cannot
+        // silently *return* where the interp ran out; enforced by the `(Err, Returned)` arm).
+        Trap::OutOfFuel => Some(TrapKind::OutOfFuel),
         _ => None,
     }
 }
@@ -1217,7 +1259,11 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     let (interp, imem) =
         run_capture_reserved_with_host(m, 0, args, &mut fuel, init, reserved_log2, &mut hi);
     let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let (jit, jmem) = match compile_and_run_capture_reserved_with_host(
+    // Fuel unification: arm the JIT with the *same* budget so `OutOfFuel` is asserted for parity, not
+    // excluded — all three engines charge one fuel per function entry + taken back-edge off the same
+    // IR, so they exhaust identically. A fresh cell (the interp's `fuel` was decremented in place).
+    let mut jfuel = 5_000_000u64;
+    let (jit, jmem) = match compile_and_run_capture_reserved_with_host_fuel(
         m,
         0,
         &slots,
@@ -1225,6 +1271,7 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
         reserved_log2,
         svm_run::cap_thunk,
         &mut hj as *mut Host as *mut core::ffi::c_void,
+        &mut jfuel,
     ) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return, // generator only emits lowered ops; be safe
