@@ -2007,6 +2007,7 @@ fn jit_compile(m: &Module) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,

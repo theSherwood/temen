@@ -335,6 +335,7 @@ debug.loc 2 0 0 0 9 3
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,

@@ -53,6 +53,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,

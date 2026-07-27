@@ -48,6 +48,7 @@ impl Repl {
             None,
             None,
             None,
+            None, // fuel
             None,
             Quota::default(),
             4,

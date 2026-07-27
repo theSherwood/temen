@@ -1006,10 +1006,11 @@ pub fn jit_cap_run(
             cap_thunk_locked,
             ctx,
             reserved_log2,
-            None,
-            None,
-            None,
-            None,
+            None, // sub
+            None, // resolve_module
+            None, // interrupt
+            None, // fuel
+            None, // fast_resolver
             svm_jit::Quota::default(),
             table_reserve_log2,
         )?;
@@ -1034,10 +1035,11 @@ pub fn jit_cap_run(
         cap_thunk,
         host as *mut Host as *mut c_void,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         svm_jit::Quota::default(),
         table_reserve_log2,
     )?;
@@ -1102,10 +1104,11 @@ pub fn recompact_jit(
         cap_thunk,
         host as *mut Host as *mut c_void,
         reserved_log2,
-        None,
-        None,
-        None,
-        None,
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         svm_jit::Quota::default(),
         table_reserve_log2,
     )?;
@@ -1245,10 +1248,11 @@ impl JitSession {
             cap_thunk_locked,
             ctx,
             reserved_log2,
-            None,
-            None,
-            None,
-            None,
+            None, // sub
+            None, // resolve_module
+            None, // interrupt
+            None, // fuel
+            None, // fast_resolver
             svm_jit::Quota::default(),
             table_reserve_log2,
         )?;
@@ -1312,10 +1316,11 @@ impl JitSession {
             cap_thunk_locked,
             ctx,
             self.reserved_log2,
-            None,
-            None,
-            None,
-            None,
+            None, // sub
+            None, // resolve_module
+            None, // interrupt
+            None, // fuel
+            None, // fast_resolver
             svm_jit::Quota::default(),
             self.table_reserve_log2,
         )?;
@@ -2806,6 +2811,7 @@ unsafe fn powerbox_compile_run(
             None,
             None,
             interrupt_ptr,
+            None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
             None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
             quota,
             CLI_JIT_TABLE_LOG2,
@@ -2836,6 +2842,7 @@ unsafe fn powerbox_compile_run(
         None,
         None,
         interrupt_ptr,
+        None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
         Some(fast_cap_resolver),
         quota,
         CLI_JIT_TABLE_LOG2,
