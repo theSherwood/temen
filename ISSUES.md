@@ -21,25 +21,31 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I46 — CI flake: `concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify` fails on macOS (S4) — seen 2026-07-27, PR #455 run 30266760876
+### I46 — CI flake: the `durable_concurrent_jit` binary fails on macOS in two modes (S4) — seen 2026-07-27, PR #455 runs 30263159591 + 30266760876
 
-**Symptom.** `build · test (macos-latest)` failed one test in `crates/svm/tests/durable_concurrent_jit.rs:1048`:
-`assertion left == right failed: the root's re-issued atomic.wait parked and was woken by the
-sibling's re-issued notify on thaw` (`left: 1, right: 0`). The other 14 tests in the binary passed;
-Linux/other runners were green on the same commit.
+**Symptom — two distinct nondeterministic modes on `build · test (macos-latest)`, same binary:**
+- **Mode A — SIGSEGV on exit** (run 30263159591, commit `9de4926`): all 15 tests in
+  `durable_concurrent_jit` print `... ok`, then the process crashes on teardown —
+  `process didn't exit successfully: durable_concurrent_jit-… (signal: 11, SIGSEGV: invalid memory
+  reference)`. A test-harness/teardown fault, not an assertion.
+- **Mode B — wake-race assertion** (run 30266760876, commit `5b8faa4`):
+  `durable_concurrent_jit.rs:1048` `assertion left == right failed: the root's re-issued atomic.wait
+  parked and was woken by the sibling's re-issued notify on thaw` (`left: 1, right: 0`) — the
+  sibling's re-issued `notify` didn't land the wake before the assertion read the counter.
 
-**Why it's a flake, not the PR.** PR #455 (the Tcl on-ramp target) touches only `svm-llvm`
-(workspace-excluded), `crates/svm-run/demos/tcl/` (C/sh/md, not compiled by this suite), `browser/`,
-and docs — nothing in `crates/svm` or the durability/concurrency path. The test is a
-nondeterministic freeze/thaw over a futex (`atomic.wait` parked, then a sibling's `notify` must wake
-it *after* thaw re-issues both) — a wake-ordering race, the same family as **I44** (freeze × parked
-`svc.wait`), and it predates the PR (present in the branch's base, the #450 merge). `right: 0` means
-the sibling's re-issued `notify` didn't land the wake before the assertion read the counter.
+**Why it's a base-branch flake, not the PR (definitive).** PR #455 (the Tcl on-ramp target) touches
+only `svm-llvm` (workspace-excluded), `crates/svm-run/demos/tcl/` (C/sh/md, not compiled by this
+suite), `browser/`, and docs — **zero lines in `crates/svm`**. Mode A failed on the PR's *first*
+commit, which adds only `demos/tcl/` + an `#[ignore]`d test + docs and therefore *cannot* affect
+`crates/svm`; **20 of the 21 jobs were green** on that commit. Two different failure modes on
+commits that don't touch the code ⇒ a pre-existing macOS-flaky binary in the branch base (the #450
+merge), same family as **I44** (freeze × parked `svc.wait`).
 
-**Action.** Re-run the failed macOS job (expected to pass). Watch for recurrence — if it repeats,
-it graduates from S4-flake to a real thaw-time wake-ordering bug in the durable futex re-issue path
-(the I44 clamp covers freeze-on-quiesce, not this sibling-notify-on-thaw wake), tracked against
-`durable_concurrent_jit`.
+**Action.** Re-run the macOS job (a flake — expect green). Don't churn CI chasing it from an
+unrelated PR. Owner-side follow-up (the durability subsystem, not a Tcl-PR concern): Mode B is a
+thaw-time wake-ordering hole the I44 clamp doesn't cover (sibling-notify-on-thaw); Mode A is a macOS
+teardown SIGSEGV in the `durable_concurrent_jit` harness — both want a macOS-hammer repro
+(`stress-ng`-style loop over the full binary) to localize, as I44 needed the full-binary hammer.
 
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
