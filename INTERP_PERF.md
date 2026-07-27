@@ -364,8 +364,10 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > both interpreters meter fuel at IR safepoints (§ below), the §5 `kill` poll is decoupled to stay
 > per-op, and the fuel-denominated exhaustion tests + the `impl_fuel` reserve are recalibrated — the
 > ones that assert `OutOfFuel` on *straight-line* code, which crosses zero safepoints and so never
-> exhausts; each was rewritten to loop so a back-edge exists to charge at. **Pending in this PR:** the
-> Cranelift JIT counted-fuel half + flipping the differential harnesses to assert `OutOfFuel` parity.
+> exhausts; each was rewritten to loop so a back-edge exists to charge at. The Cranelift JIT
+> counted-fuel half landed in #452; the top-level-entry reconciliation and the harness flip to
+> **assert** `OutOfFuel` parity across all three engines landed after (see the Sequence, steps 3–4).
+> **Still separable:** the `instantiate`-child fuel threading (step 5).
 >
 > **One fuzzer needed rescaling — and it exposed a real metering gap.** `fiber_fuzz`'s
 > `generated_fiber_programs_never_panic_and_are_deterministic` uses a *cyclic* generator (a `call` /
@@ -463,23 +465,26 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
    `concurrent*`, `jit_killpath`, and the heavy fuzzers (`fiber_fuzz`, `jit_fuzz`, `fuzz_smoke`).
    (JIT still on the async kill-cell; `jit_diff` skips `OutOfFuel`, so the pair is coherent
    standalone.)
-3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. — **next; scoped.** The JIT
-   already emits `emit_epoch_check` (the §5 kill-cell poll) at exactly the safepoints we need —
-   function entry (`lib.rs:5344`) + every back-edge (`6981/6996/7005`). Add a `fuel_addr: i64` on
-   `Lower` paralleling `epoch_addr`, threaded through the ~15 pipeline sites `epoch_addr` already
-   flows through (nested JIT children, spawn, coroutine children — all escape-TCB paths, so mirror it
-   exactly). At those 4 emit sites, when `fuel_addr != 0`, emit `f = load(fuel_addr); brif f==0 →
-   trap OutOfFuel; store(fuel_addr, f-1)` — the store⇒load dependency stops Cranelift hoisting it out
-   of the loop (no atomic needed; the cell is the guest's own budget, not host-written mid-run).
-   Gate on `fuel_addr` so the plain (non-fuel-armed) fast path is byte-identical — fuel metering is
-   opt-in, as it is today. Add a fuel-armed run entry that allocates the host fuel cell, passes its
-   address, and reads the remainder back. **Validate on the escape-TCB codegen paths** (jit_diff
-   fuel-armed, jit_killpath, nested-child) — this is security-critical codegen, do it as a focused
-   pass, not rushed.
-4. Flip the harnesses from "skip `OutOfFuel`" to "assert `OutOfFuel` parity" across all three — the
-   acceptance test that unification holds. (Depends on step 3.)
-5. Follow-on: the `instantiate` child honors its `fuel` uniformly (thread the counter in), closing
-   the `_fuel`-ignored divergence.
+3. Cranelift JIT: counted decrement-and-trap at the same IR safepoints. ✅ **DONE** (PR #452). A
+   `fuel_addr: i64` on `Lower` parallels `epoch_addr`; `emit_fuel_check` at function entry + every
+   back-edge emits `f = load(fuel_addr); brif f==0 → trap OutOfFuel; store(fuel_addr, f-1)` (the
+   store⇒load dep stops Cranelift hoisting it), gated on `fuel_addr != 0` so the un-armed fast path is
+   byte-identical. Fuel-armed run entries allocate the host cell, pass its address, and read the
+   remainder back (`compile_and_run_with_host_fuel`, `compile_and_run_capture_reserved_with_host_fuel`).
+4. Reconcile the top-level-entry off-by-one, then flip the harnesses to **assert** `OutOfFuel` parity.
+   ✅ **DONE.** The JIT charged its top-level entry prologue while the interpreters charged only at
+   call ops + back-edges, so the JIT burned exactly interp+1; the interpreters now charge the
+   top-level entry too (`drive_arc` / bytecode `drive`, gated off durable thaw), so all three engines
+   consume the identical amount and exhaust at the identical safepoint. Harnesses flipped: `bytecode_diff`
+   asserts interp↔interp `OutOfFuel` **and** bit-exact remaining-fuel parity (`…_under_tight_fuel`,
+   850 exhaustion cases); `jit_fuzz` arms the JIT at the interp's budget and asserts interp↔JIT parity
+   (`…_under_tight_fuel`, 604 cases); `jit_fuel` tightened from `== interp+1` to strict `== interp`.
+   INVARIANTS §9 gained the fuel-parity clause.
+5. Follow-on (**pending, separable**): the `instantiate` child honors its `fuel` uniformly on the JIT
+   (`lib.rs` nested-child compile bakes `fuel_addr=0`; `instantiator_rt.rs` drops `_fuel` at the five
+   instantiation entry points), closing the last `_fuel`-ignored divergence for nested runs. The
+   generative corpus emits no `instantiate` ops, so top-level three-engine parity (steps 1–4) does not
+   depend on it.
 
 ---
 

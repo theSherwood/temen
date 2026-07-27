@@ -102,6 +102,17 @@ predicate, silent divergence documented as a quirk, or naming that hides which e
 "JIT" is ambiguous — say "Cranelift JIT" or "wasm-JIT"). (DESIGN.md §3/§18; the
 serve-qualification veto.)
 
+**Fuel is a checked cross-engine quantity, not an excluded difference.** Fuel is charged at
+**IR-anchored safepoints** — one per taken back-edge, per function entry (`call`/`call_indirect`/
+`return_call*` and the *top-level* entry), and per `cont.resume` — so the tree-walk oracle, the
+bytecode interpreter, and the Cranelift JIT all charge off the *same* IR structure and a run either
+completes on all three or traps `OutOfFuel` at the *identical* safepoint. The differential harnesses
+therefore **assert** `OutOfFuel` parity rather than skipping it (`bytecode_diff` bit-exact on the
+remaining fuel; `jit_fuzz`/`jit_fuel` on the trap). *Violated by:* a backend that meters fuel on a
+different unit (per-op, or a safepoint another backend doesn't charge), a harness that re-excludes
+`OutOfFuel` from the equality contract, or a fuel charge added to one engine but not the others.
+(INTERP_PERF.md "Fuel unification"; owner-approved 2026-07-25.)
+
 **Observability corollary.** Debugging/tracing is a *view onto* execution, not part of the
 semantic contract, and is deliberately tiered by backend (stepping and time travel want an
 interpreter; DWARF/gdb want native code) — but three clauses keep the tiering disciplined:

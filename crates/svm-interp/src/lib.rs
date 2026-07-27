@@ -1869,11 +1869,29 @@ fn drive_arc(
     // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
     // re-unwind mid-thaw and `durable_load_dstate` reads the thaw — the real snapshot-restore path
     // leaks the same `UNWINDING`. A freeze leaves the thaw word `NORMAL`, so this never fires on it.
+    // A durable **thaw** re-enters `drive` to *continue* an already-charged run (the root re-enters
+    // under REWINDING), so the top-level-entry fuel charge below must not fire again on it.
+    let is_thaw = durable
+        && mem
+            .as_ref()
+            .is_some_and(|m| m.durable_thaw_state(0) == STATE_REWINDING);
     if durable {
         if let Some(m) = mem.as_mut() {
             if m.durable_thaw_state(0) == STATE_REWINDING {
                 m.durable_set_state(STATE_NORMAL);
             }
+        }
+    }
+    // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
+    // function*, mirroring the per-callee-entry charge at `Call`/`CallIndirect`/`ReturnCall*` and the
+    // JIT's entry-prologue charge. The entry function is not reached via a `Call` op, so without this
+    // the interpreters burned exactly one fuel less than the JIT on the same run; charging it makes
+    // all three engines burn identically (a run either completes or traps `OutOfFuel` at the same
+    // safepoint). Fresh run only — a durable thaw continues an already-charged run.
+    if !is_thaw {
+        match fuel.checked_sub(1) {
+            Some(f) => *fuel = f,
+            None => return (Err(Trap::OutOfFuel), Vec::new(), None),
         }
     }
     // Durable **freeze/thaw** runs (a freeze's global word is `UNWINDING`/`ARMED`, or a thaw's

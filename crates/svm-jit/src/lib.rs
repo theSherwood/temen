@@ -1195,6 +1195,46 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
     )
 }
 
+/// [`compile_and_run_capture_reserved_with_host`] with a **counted-fuel budget armed** (INTERP_PERF.md
+/// "Fuel unification"): the caller owns the `u64` cell, seeds it with the budget, and reads the
+/// remainder back after the call; the run traps [`TrapKind::OutOfFuel`] when the budget would
+/// underflow, at the same IR safepoints (function entries + taken back-edges) the interpreters charge.
+/// This lets the differential fuzzer **assert** cross-engine `OutOfFuel` parity rather than exclude it.
+///
+/// # Safety
+/// As [`compile_and_run_capture_reserved_with_host`]; `fuel` must be a valid, writable `u64` that
+/// outlives the call.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_and_run_capture_reserved_with_host_fuel(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    init_mem: &[u8],
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    fuel: *mut u64,
+) -> Result<(JitOutcome, Vec<u8>), JitError> {
+    run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        Some(init_mem),
+        reserved_log2,
+        Some(SNAP_CAP),
+        None,
+        None,       // no re-granted child powerbox (op 8 → CapFault)
+        None,       // no module resolver (§14 module ops → CapFault)
+        None,       // no kill-path armed
+        Some(fuel), // counted-fuel budget armed — traps OutOfFuel at the shared safepoints
+        None,       // no async ring
+        None,       // no fast cap resolver
+        Quota::default(),
+    )
+}
+
 /// [`compile_and_run_capture_reserved_with_host`] that first **re-establishes** a captured
 /// per-page protection map on the window — the durable-restore step (DURABILITY.md §12.3): a
 /// thawed guest faults on a restored `Ro`/`Unmapped` page exactly as the frozen one would,

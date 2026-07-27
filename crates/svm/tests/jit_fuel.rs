@@ -6,13 +6,13 @@
 //! a finite run charges a countable amount — the same unit the tree-walker and bytecode engines now
 //! charge, so fuel becomes a checked cross-engine quantity rather than an excluded difference.
 //!
-//! NB: exact interp/JIT fuel *count* parity (and flipping the differential harnesses to assert it) is a
-//! later slice; today the JIT charges its top-level function entry (its prologue) while the interpreter
-//! charges only at call ops and back-edges, so the JIT consumes exactly **one more** fuel than the
-//! interpreter on the same run. These tests pin that relationship (`== interp` or `== interp + 1`) so
-//! the follow-up that reconciles it will tighten these asserts to exact equality.
+//! Exact interp/JIT fuel *count* parity now holds: the interpreters were reconciled to charge the
+//! top-level entry function too (`super::drive_arc` / bytecode `drive`), matching the JIT's entry-
+//! prologue charge, so all three engines consume the identical amount on the same run and exhaust at
+//! the identical safepoint. These tests assert strict equality (`== interp`), and the differential
+//! harnesses assert `OutOfFuel` parity rather than excluding it (`bytecode_diff`, `jit_fuzz`).
 
-use svm_interp::{run, Value};
+use svm_interp::{run, Trap, Value};
 use svm_jit::{compile_and_run, compile_and_run_with_host_fuel, JitOutcome, TrapKind};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -46,7 +46,7 @@ block 0 (v0: i64) {
 
 /// A **finite** countdown N → 0: block 1 loops back to itself while the counter is non-zero (a taken
 /// back-edge each iteration), then exits forward to block 2 (no charge). The back-edge is taken `N-1`
-/// times, so the interpreter charges `N-1` and the JIT `N` (its extra top-level-entry charge).
+/// times; both engines also charge the single top-level entry, so each charges `N` on the same run.
 const FINITE_COUNTDOWN: &str = "\
 func (i32) -> (i32) {
 block 0 (v0: i32) {
@@ -122,8 +122,8 @@ fn jit_fuel_finite_run_completes_and_charges() {
     let interp_consumed = BUDGET - interp_fuel;
     assert!(interp_consumed > 0, "the loop charges some fuel");
 
-    // JIT: same program, same budget — must return the same result and charge the same amount, modulo
-    // the one extra top-level-entry charge (reconciled to exact equality in the follow-up slice).
+    // JIT: same program, same budget — must return the same result and charge the *exact* same amount.
+    // Both engines now charge the top-level entry (fuel unification), so this is strict equality.
     let (outcome, remaining) = jit_fuel(FINITE_COUNTDOWN, &[N as i64], BUDGET);
     assert_eq!(
         outcome,
@@ -131,30 +131,39 @@ fn jit_fuel_finite_run_completes_and_charges() {
         "an armed-but-sufficient finite run completes normally"
     );
     let jit_consumed = BUDGET - remaining;
-    assert!(
-        jit_consumed == interp_consumed || jit_consumed == interp_consumed + 1,
-        "JIT fuel ({jit_consumed}) must match interp ({interp_consumed}) within the known \
-         top-level-entry off-by-one"
+    assert_eq!(
+        jit_consumed, interp_consumed,
+        "JIT fuel must exactly match interp after top-level-entry reconciliation"
     );
 }
 
 #[test]
 fn jit_fuel_exhausts_one_short() {
-    // If the budget is one below what the finite run needs, it must trap `OutOfFuel` rather than
-    // complete — proving the charge is exact at the boundary, not approximate.
+    // A budget one below the exact need must trap `OutOfFuel` rather than complete — proving the charge
+    // is exact at the boundary, not approximate. After fuel unification both engines charge the
+    // top-level entry, so they consume the *same* amount and exhaust at the *same* point: budget
+    // `interp_consumed` completes on both; `interp_consumed - 1` traps on both.
     const N: i32 = 1000;
     let m = parse_module(FINITE_COUNTDOWN).expect("parse");
     verify_module(&m).expect("verify");
     let mut interp_fuel = 10_000_000u64;
     run(&m, 0, &[Value::I32(N)], &mut interp_fuel).expect("interp ok");
     let interp_consumed = 10_000_000u64 - interp_fuel;
+    let short = interp_consumed - 1;
 
-    // Budget = interp_consumed exactly: the JIT needs one more (its top-level entry), so it must trap.
-    let (outcome, remaining) = jit_fuel(FINITE_COUNTDOWN, &[N as i64], interp_consumed);
+    // Interp one short: traps.
+    let mut interp_short = short;
+    assert_eq!(
+        run(&m, 0, &[Value::I32(N)], &mut interp_short),
+        Err(Trap::OutOfFuel),
+        "interp one short of its exact need must trap OutOfFuel"
+    );
+    // JIT one short: traps at the same boundary (exact interp/JIT fuel parity).
+    let (outcome, remaining) = jit_fuel(FINITE_COUNTDOWN, &[N as i64], short);
     assert_eq!(
         outcome,
         JitOutcome::Trapped(TrapKind::OutOfFuel),
-        "a budget one short of the JIT's need must trap OutOfFuel, not complete"
+        "JIT one short of the exact need must trap OutOfFuel, not complete"
     );
     assert_eq!(remaining, 0);
 }

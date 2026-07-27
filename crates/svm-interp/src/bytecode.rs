@@ -7058,6 +7058,18 @@ fn drive(
     host: &mut Host,
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
+    // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
+    // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
+    // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
+    // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
+    // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
+    let is_thaw = host.is_durable()
+        && mem
+            .as_ref()
+            .is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING);
+    if !is_thaw {
+        *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+    }
     let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
         vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
         threads: Vec::new(),
