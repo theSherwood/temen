@@ -76,12 +76,16 @@ for obj in $(ar t "$LIB"); do
 done
 echo "compiled $(ls "$OUT"/*.ll 2>/dev/null | wc -l) TUs (fail=$fail)"
 
-echo "=== [5/6] driver + reused shims + guest openlibm → bitcode ==="
+echo "=== [5/6] drivers + reused shims + guest openlibm → bitcode ==="
 CF=(-O2 -emit-llvm -S -fno-vectorize -fno-slp-vectorize -DNDEBUG -D_GNU_SOURCE
     "-I$SRC/generic" "-I$SRC/unix")
 DEMOS="$HERE/.."
-# The driver + the Tcl-specific OS/libc shim.
-clang "${CF[@]}" "$HERE/tcl_repl.c" -o "$OUT/_driver.ll" || { echo "driver FAIL"; exit 14; }
+# The two drivers are built to a SEPARATE dir (not $OUT) — each defines `main`, so only one is linked
+# into a given module. The full-init driver also needs the embedded script library header.
+DRV="$CACHE/drivers"; mkdir -p "$DRV"
+python3 "$HERE/gen_tcl_library.py" "$SRC/library" "$DRV/tcl_library.h" 2>&1 | tail -1
+clang "${CF[@]}" "$HERE/tcl_repl.c" -o "$DRV/repl.ll" || { echo "tcl_repl FAIL"; exit 14; }
+clang "${CF[@]}" "-I$DRV" "$HERE/tcl_init.c" -o "$DRV/init.ll" || { echo "tcl_init FAIL"; exit 14; }
 clang "${CF[@]}" "$HERE/tcl_shim.c" -o "$OUT/_tclshim.ll" || { echo "tcl_shim FAIL"; exit 14; }
 # Reused waist (see README): the Postgres printf/scanf engines, the guest strtod. (ctype tables are
 # pulled from the Postgres shim set too if your resolve stage reports them undefined.)
@@ -121,17 +125,26 @@ else
   echo "note: openlibm unavailable — libm transcendentals will surface as undefined at resolve"
 fi
 
-echo "=== [6/6] llvm-link → translate through the on-ramp ==="
+echo "=== [6/6] llvm-link both variants → translate through the on-ramp ==="
+# Shared core = everything in $OUT (Tcl core + shims + openlibm); each variant adds one driver.
+#   tcl_linked.ll       — the minimal REPL (tcl_repl.c, no Tcl_Init, no filesystem)
+#   tcl_init_linked.ll  — the full Tcl (tcl_init.c: Tcl_Init over the embedded-library VFS)
 LINKED="$CACHE/tcl_linked.ll"
-llvm-link -S "$OUT"/*.ll -o "$LINKED" 2>"$CACHE/llvm-link.err" \
-  || { echo "LINK FAILED:"; tail -5 "$CACHE/llvm-link.err"; exit 15; }
-echo "linked: $(stat -c%s "$LINKED") bytes → $LINKED"
+INIT_LINKED="$CACHE/tcl_init_linked.ll"
+llvm-link -S "$OUT"/*.ll "$DRV/repl.ll" -o "$LINKED" 2>"$CACHE/llvm-link.err" \
+  || { echo "LINK FAILED (repl):"; tail -5 "$CACHE/llvm-link.err"; exit 15; }
+llvm-link -S "$OUT"/*.ll "$DRV/init.ll" -o "$INIT_LINKED" 2>"$CACHE/llvm-link-init.err" \
+  || { echo "LINK FAILED (init):"; tail -5 "$CACHE/llvm-link-init.err"; exit 15; }
+echo "linked: repl $(stat -c%s "$LINKED") B → $LINKED"
+echo "linked: init $(stat -c%s "$INIT_LINKED") B → $INIT_LINKED"
 TR="$HERE/../../../svm-llvm/target/release/examples/try_translate"
 if [ -x "$TR" ]; then
-  # `SVM_STUB_EXTERNS=1`: trap-stub the OS surface unreached by the minimal REPL (zlib/scanf/fts) so
-  # the big program translates; the translator fixes (constexpr icmp, vector ptrtoint) are folded in.
-  echo "translate + verify (a runtime stub trap during channel init is the current frontier):"
-  SVM_STUB_EXTERNS=1 "$TR" "$LINKED" 2>&1 | grep -v '\[stub\]' | head -5
+  # `SVM_STUB_EXTERNS=1`: trap-stub the OS surface unreached by the guest (zlib/scanf/fts). The
+  # full-init variant serves its script library through an in-guest VFS (no filesystem capability).
+  echo "translate + verify (minimal REPL):"
+  SVM_STUB_EXTERNS=1 "$TR" "$LINKED" 2>&1 | grep -v '\[stub\]' | head -3
+  echo "translate + verify (full Tcl_Init):"
+  SVM_STUB_EXTERNS=1 "$TR" "$INIT_LINKED" 2>&1 | grep -v '\[stub\]' | head -3
 else
   echo "note: build the translator first:  (cd crates/svm-llvm && cargo build --release --example try_translate)"
 fi

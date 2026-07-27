@@ -41,6 +41,8 @@ const BUILT_AT_DEPLOY = new Set([
   'doom1.wad',            // build-onramp-assets.mjs — staged from the vendored demos/doom/doom1.wad
   'lua_eval.svmb',        // build-onramp-assets.mjs (fetches Lua source)
   'sqlite_repl.svmb',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
+  'shell.svmb',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.svmb)
+  'tcl_init.svmb',        // build-onramp-assets.mjs (fetches Tcl + openlibm; full Tcl_Init)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
 ]);
@@ -52,6 +54,7 @@ const BUILT_AT_DEPLOY = new Set([
 // (retiring the dead-mirror class, ISSUES.md I42/I43). Every other referenced asset MUST be present.
 const MAY_BE_ABSENT = new Set([
   'doom.svmb',
+  'tcl_init.svmb', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link
 ]);
 
 function referencedAssets() {
