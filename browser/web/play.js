@@ -857,6 +857,34 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
 "0.1 + 0.2 = " + (0.1 + 0.2);
 `,
   },
+  // Tcl — the reference Tcl 8.6 interpreter, minimal embedding (no Tcl_Init), reads a script from
+  // stdin and prints the completion result. The `tcl_repl.svmb` asset is built by
+  // `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_repl_stdin`). `jit: false` —
+  // the bytecode engine drives; proving `_start` wasm-JIT-emittable (near-native) is a follow-up.
+  'Tcl (8.6 — write & run)': {
+    kind: 'module',
+    jit: false,
+    editable: true,
+    lang: 'tcl',
+    url: './assets/tcl_repl.svmb',
+    mode: 'io',
+    desc: 'The reference Tcl 8.6.14 interpreter — its bytecode compiler + execution engine, expr, ' +
+      'string/list/dict, Henry Spencer regex, and libtommath bignums — compiled through the LLVM ' +
+      'on-ramp. Edit the Tcl on the left and click Run: your script is piped to the guest as stdin, ' +
+      'evaluated, and its output appears below. Real Tcl, running client-side in the sandbox.',
+    src: `# Write Tcl here, then click Run.
+proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }
+set out {}
+for {set i 0} {$i < 10} {incr i} { lappend out [fib $i] }
+puts "fib(0..9): $out"
+puts "sorted:   [lsort -integer {5 3 8 1 9 2 7}]"
+puts [format "pi ~ %.4f, 255 = 0x%X, sqrt2 = %.6f" 3.14159265 255 [expr {sqrt(2)}]]
+dict set d a 1; dict set d b 2
+puts "dict: $d"
+puts [string toupper "tcl on svm"]
+expr {2**10 + [string length "hello"]}
+`,
+  },
   'PostgreSQL (17.5 — write & run SQL)': {
     kind: 'pg',
     editable: true,

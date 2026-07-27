@@ -468,6 +468,17 @@ pub enum Constant {
     Add(ConstBinaryOp),
     Sub(ConstBinaryOp),
     Mul(ConstBinaryOp),
+    /// Constant-expression integer compare `icmp <pred> (<ty> <c0>, <ty> <c1>)` → `i1`. clang leaves
+    /// one when a comparison of two constants can't be folded to a literal — e.g. a function address
+    /// vs. a sentinel (`icmp eq (ptr inttoptr (i64 3 to ptr), ptr @f)`), which appears as an
+    /// instruction operand (a `select` condition). Lowered to a runtime `IntCmp` at the use site,
+    /// identical to the instruction-level `icmp`, since a global address is a relocation resolved at
+    /// instantiation, not a compile-time value.
+    ICmp {
+        predicate: IntPredicate,
+        operand0: ConstantRef,
+        operand1: ConstantRef,
+    },
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
@@ -527,6 +538,8 @@ impl Typed for Constant {
             | Constant::BitCast(u)
             | Constant::AddrSpaceCast(u) => u.to_type.clone(),
             Constant::Add(b) | Constant::Sub(b) | Constant::Mul(b) => types.type_of(&b.operand0),
+            // An integer compare yields `i1`, exactly like the instruction-level `icmp`.
+            Constant::ICmp { .. } => types.int(1),
         }
     }
 }

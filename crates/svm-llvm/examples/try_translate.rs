@@ -11,10 +11,18 @@ fn main() {
     let is_ll = std::path::Path::new(&p)
         .extension()
         .is_some_and(|e| e == "ll");
+    // `SVM_STUB_EXTERNS=1` mints trap stubs for genuinely-undefined externals instead of failing
+    // closed at translate — the large-program bring-up mode (unreached OS calls compiled into a big
+    // guest, e.g. Tcl's file/socket surface in the minimal no-Tcl_Init REPL).
+    let stub = std::env::var("SVM_STUB_EXTERNS").is_ok_and(|v| v != "0" && !v.is_empty());
+    let opts = svm_llvm::TranslateOptions {
+        stub_unresolved_externs: stub,
+        ..Default::default()
+    };
     let translated = if is_ll {
-        svm_llvm::translate_ll_path(&p)
+        svm_llvm::translate_ll_path_with_options(&p, opts)
     } else {
-        svm_llvm::translate_bc_path(&p)
+        svm_llvm::translate_bc_path_with_options(&p, opts)
     };
     let t = match translated {
         Ok(t) => t,
@@ -29,14 +37,42 @@ fn main() {
         t.module.funcs.len()
     );
     // Phase 3: the manifest binds at instantiation — no rewrite.
+    let exports = t.exports.clone();
     let module = t.module;
     if let Err(e) = svm_verify::verify_module(&module) {
         println!("VERIFY ERR: {e:?}");
+        // Localize a `TypeMismatch { func: N, .. }` to the guest function name (via the export map),
+        // for gap-walking a big program.
+        let msg = format!("{e:?}");
+        if let Some(rest) = msg.split("func:").nth(1) {
+            if let Ok(idx) = rest
+                .trim()
+                .split([',', ' '])
+                .next()
+                .unwrap_or("")
+                .parse::<u32>()
+            {
+                if let Some((name, _)) = exports.iter().find(|(_, i)| *i == idx) {
+                    println!("  ↳ func {idx} = `{name}`");
+                } else {
+                    println!("  ↳ func {idx} = <synthesized/unexported>");
+                }
+            }
+        }
         std::process::exit(1);
     }
     println!("VERIFIED");
     let t1 = std::time::Instant::now();
-    let run = match svm_run::run_powerbox(&module, b"") {
+    // `SVM_STDIN=1` pipes the process's stdin to the guest (so a REPL guest can be driven).
+    let stdin_bytes: Vec<u8> = if std::env::var_os("SVM_STDIN").is_some() {
+        use std::io::Read;
+        let mut b = Vec::new();
+        std::io::stdin().read_to_end(&mut b).ok();
+        b
+    } else {
+        Vec::new()
+    };
+    let run = match svm_run::run_powerbox(&module, &stdin_bytes) {
         Ok(r) => r,
         Err(e) => {
             println!("RUN ERR: {e}");

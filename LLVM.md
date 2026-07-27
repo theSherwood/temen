@@ -742,6 +742,45 @@ runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlinin
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.
 
+### ▶ Tcl — a second scripting-language interpreter (RUNS byte-identical to native)
+
+**Status: ★ RUNS — the whole Tcl 8.6 core executes byte-identical to native** (`demo_tcl_repl_stdin`).
+The reference **Tcl 8.6.14** interpreter (Tcl/BSD license) via the minimal-embedding REPL
+(`demos/tcl/tcl_repl.c`, `Tcl_CreateInterp` + `Tcl_Eval`, **no `Tcl_Init`** — the whole language core
+runs with no filesystem, the direct analog of QuickJS's `qjs_eval.c`). Another self-contained C
+interpreter reached with **no new VM capabilities** — a frontend + libc-waist + driver +
+playground-registration job (see `demos/tcl/README.md`).
+
+- **DONE — native oracle + minimal embedding proven.** `tcl_repl.c` linked against native
+  `libtcl8.6.a` runs the whole language core (`set`/`expr`/`proc`+recursion/`lsort`/`for`/`format`/
+  `dict`/`regexp`/`string`/`**`, and `puts` via the stdout channel) with no `Tcl_Init`, no filesystem.
+- **DONE — faithful whole-program bitcode.** `demos/tcl/build_bitcode.sh` configures Tcl
+  (`--disable-shared --disable-threads --disable-load`), builds the oracle, compiles all **162 core
+  TUs** (generic + unix + Spencer regex + TclOO + libtommath) to `.ll` with the Makefile's own flags,
+  and `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one ~19.6 MB
+  module. The libc waist reuses the Postgres printf/scanf/ctype shims, the guest `strtod`, openlibm,
+  and the svm-posix caps; `tcl_shim.c` carries only Tcl's own OS surface (time/tty/locale/sockets).
+- **DONE — Tcl translates (2669 funcs) + verifies**, after closing **three general on-ramp translator
+  gaps** it surfaced (each with a direct interp≡JIT unit test): (1) **constexpr `icmp`** — a
+  function-address-vs-sentinel compare LLVM leaves unfolded as a `select` operand (`Constant::ICmp`
+  AST variant + parse arm + a constant-operand lowering to a runtime `IntCmp`, since a global address
+  is a relocation); (2) **vector `ptrtoint`** — `<2 x ptr> → <2 x i64>`, a representational identity
+  on the packed v128 (clang packs a pointer pair in `FinalizeOONextFilter`); (3) **vector `inttoptr`**,
+  the symmetric inverse. Tests `constexpr_icmp_operand` / `vector_ptrtoint_identity`. The libc/OS waist
+  (`tcl_shim.c`) is built out — qsort/bsearch, address-taken string ops, the glibc ctype tables, the
+  time/tty/locale/socket/file surface as benign defined functions — with the unreached remainder
+  (zlib/scanf/fts) trap-stubbed via `SVM_STUB_EXTERNS`.
+- **DONE — RUNS byte-identical to native.** The last runtime blocker was `zlibVersion()`, which
+  `TclZlibInit` (from `Tcl_CreateInterp`) reads for its package config; with the zlib/file/tty/locale
+  surface given benign bodies, the Tcl core (2669 funcs) translates, verifies, and runs a stdin script
+  with stdout byte-identical to native — recursion, `lsort`, `format`, `dict`, `string`, `expr` (`**` +
+  `sqrt` through linked openlibm). Guard: `demo_tcl_repl_stdin` (`#[ignore]`d for wall-clock only, like
+  the QuickJS capstone; run with `--ignored`, skips loudly offline). The playground card is live.
+- **Follow-ups:** full `Tcl_Init` (seed the script `library/` + encodings into the svm-posix memfs,
+  like SQLite/chibicc, enabling `file`/`glob`/`clock`/`auto_load`); the wasm-JIT tier once `_start` is
+  proven emittable. Playground wiring is staged: `build-onramp-assets.mjs` builds `tcl_repl.svmb` the
+  moment translate+run clears, and the `web/play.js` card is a ready-to-uncomment template.
+
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):
 literal runs are written straight from the format global; each conversion lowers to the synthesized

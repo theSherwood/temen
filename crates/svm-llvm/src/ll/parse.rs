@@ -1611,6 +1611,28 @@ impl Parser {
                     _ => Constant::Mul(b),
                 }
             }
+            // A constant-expression integer compare `icmp <pred> ( <ty> <c0>, <ty> <c1> )` → i1. The
+            // predicate sits before the parens (`icmp eq (…)`); `samesign` (LLVM ≥ 20) is a drop-only
+            // hint, as in the instruction form.
+            Some(Token::Word(w)) if w == "icmp" => {
+                self.pos += 1; // `icmp`
+                if matches!(self.peek(), Some(Token::Word(w)) if w.as_str() == "samesign") {
+                    self.pos += 1;
+                }
+                let predicate = self.int_predicate()?;
+                self.expect(&Token::LParen)?;
+                let t0 = self.type_()?;
+                let operand0 = self.constant(&t0)?;
+                self.expect(&Token::Comma)?;
+                let t1 = self.type_()?;
+                let operand1 = self.constant(&t1)?;
+                self.expect(&Token::RParen)?;
+                Constant::ICmp {
+                    predicate,
+                    operand0,
+                    operand1,
+                }
+            }
             Some(Token::Global(_)) => return self.global_ref(),
             // `c"…"` — a byte string, i.e. an array of `i8` constants (escapes decoded to raw bytes).
             // The `c` prefix lexes as its own `Word` before the `Str` body.

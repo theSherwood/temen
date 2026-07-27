@@ -283,6 +283,9 @@ impl StubTable {
             return i;
         }
         let i = self.base + self.order.len() as u32;
+        if std::env::var_os("SVM_STUB_DEBUG").is_some() {
+            eprintln!("[stub] {name}");
+        }
         self.order.push((name.to_string(), sig));
         self.idx.insert(name.to_string(), i);
         i
@@ -15732,6 +15735,25 @@ impl<'a> BlockCtx<'a> {
                         Ok(self.push(Inst::ConstI64(v)))
                     }
                 }
+                // A constexpr integer compare — lower to a runtime `IntCmp` over its two operand
+                // values, exactly as the instruction-level `icmp` does (a global-address operand is a
+                // relocation, not a compile-time literal, so we do not const-fold). Operands are
+                // pointers / i32 / i64 constants (globals, `inttoptr`, literals), so the compare
+                // width is `bin_ty`'s `I64 for pointer/i64, else I32` — no sub-i32 canonicalization.
+                Constant::ICmp {
+                    predicate,
+                    operand0,
+                    operand1,
+                } => {
+                    let ty = match val_type(operand0.get_type(self.types).as_ref())? {
+                        ValType::I64 => IntTy::I64,
+                        _ => IntTy::I32,
+                    };
+                    let op = icmp_op(*predicate);
+                    let a = self.operand(&Operand::ConstantOperand(operand0.clone()))?;
+                    let b = self.operand(&Operand::ConstantOperand(operand1.clone()))?;
+                    Ok(self.push(Inst::IntCmp { ty, op, a, b }))
+                }
                 other => unsup(format!("constant operand {other:?}")),
             },
             Operand::MetadataOperand => unsup("metadata operand"),
@@ -17680,12 +17702,34 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // adjust, never a reinterpret: `ptrtoint` truncates the `i64` pointer to the target width
         // (identity at `i64`); `inttoptr` zero-extends a narrow integer up to the `i64` pointer.
         I::PtrToInt(x) => {
+            // A **vector** ptrtoint (`<K x ptr> → <K x i64>`) — clang packs a pointer pair, ptrtoints
+            // it, then truncates (`FinalizeOONextFilter`). Pointers are i64 lanes, so this is a
+            // representational identity on the packed v128; the width-preserving i64 target is the
+            // only shape ptrtoint emits (the real narrowing is a following vector `trunc`). A narrower
+            // vector target is fail-closed.
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                if vec_int_lane_bits(x.to_type.as_ref()) == Some(64) {
+                    let v = ctx.operand(&x.operand)?;
+                    return finish(ctx, &x.dest, v);
+                }
+                return unsup("vector ptrtoint to non-i64 lanes");
+            }
             let to = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("ptrtoint to non-int".into()))?;
             let v = ctx.operand(&x.operand)?;
             (&x.dest, emit_trunc(ctx, v, 64, to))
         }
         I::IntToPtr(x) => {
+            // The inverse vector identity (`<K x i64> → <K x ptr>`, both the same i64x2 v128). A
+            // narrower integer source would need a per-lane zero-extend; clang zexts first, so that
+            // shape is not emitted and stays fail-closed.
+            if vec_lane_shape(x.operand.get_type(types).as_ref()).is_some() {
+                if vec_int_lane_bits(x.operand.get_type(types).as_ref()) == Some(64) {
+                    let v = ctx.operand(&x.operand)?;
+                    return finish(ctx, &x.dest, v);
+                }
+                return unsup("vector inttoptr from non-i64 lanes");
+            }
             let from = src_bits(&x.operand, types)?;
             let v = ctx.operand(&x.operand)?;
             let r = if from >= 64 {
