@@ -112,6 +112,20 @@ try {
     cco.state === 'done' && cco.result === '42' && cco.ir.includes('func') && cco.ir.includes('_start')
       ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser)')
       : fail(`chibicc run: ${JSON.stringify({ state: cco.state, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+
+    // #include + printf: the seeded <stdio.h> makes a text-emitting program actually print (its
+    // output shows in the stdout pane, above the emitted IR) instead of trapping on an unresolved call.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\nint main(void){ for(int i=1;i<=3;i++) printf("i=%d\\n", i); return 0; }'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const pf = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\n') && pf.out.includes('SVM IR')
+      ? ok('chibicc #include <stdio.h> + printf → real output in-browser')
+      : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 80) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }

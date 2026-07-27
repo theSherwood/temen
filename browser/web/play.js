@@ -746,26 +746,23 @@ print("squares:", table.concat(sq, " "))
     mode: 'io',
     desc: 'A real C compiler — chibicc, itself compiled through the LLVM on-ramp — running client-side ' +
       'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.svmb over your source ' +
-      '(seeded on an fs capability at /in.c), which emits SVM IR (shown below as stdout); the page then ' +
-      'svm_parse-es that IR into a module and runs it. The result is your program’s main() return value. ' +
-      'Compile a program and run it, entirely in the browser, on top of the SVM. (Header-free sources; ' +
-      'the result is a value, so #include and printf aren’t needed — that’s a later step.)',
-    src: `// Write C here, then click Run. The result is main()'s return value.
-// The emitted SVM IR appears in the stdout pane.
+      '(seeded on an fs capability at /in.c), which emits SVM IR; the page then svm_parse-es that IR into ' +
+      'a module and runs it. Your program’s output (what printf writes) appears in the pane, with the ' +
+      'emitted SVM IR below it, and main()’s return value as the result. A small libc ships as headers ' +
+      '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h> and printf/puts/malloc/' +
+      'str* work as guest C over the powerbox’s ambient write. Compile a program and run it, entirely in ' +
+      'the browser, on the SVM. (Integer/string formatting; %f is not yet supported.)',
+    src: `// Write C here, then click Run. printf output shows in the pane on the
+// right; the emitted SVM IR appears below it, and main()'s return is the result.
+#include <stdio.h>
 
 int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 
 int main(void) {
-  // Bubble-sort a small array, then return a position-weighted checksum.
-  int a[8] = {42, 7, 13, 99, 1, 64, 28, 5};
-  int n = 8;
-  for (int i = 0; i < n; i++)
-    for (int j = 0; j < n - 1 - i; j++)
-      if (a[j] > a[j + 1]) { int t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }
-
-  int sum = 0;
-  for (int i = 0; i < n; i++) sum += a[i] * (i + 1);
-  return (sum + fib(10)) % 256;
+  printf("Hello from C — compiled to SVM IR in your browser!\\n\\n");
+  for (int i = 0; i < 10; i++)
+    printf("  fib(%d) = %d\\n", i, fib(i));
+  return 0;
 }
 `,
   },
@@ -1088,6 +1085,12 @@ async function runChibicc(c) {
   const r = moduleInterp(parsed, null);
   const ms = (performance.now() - t0).toFixed(0);
   c.el.result.textContent = `${r.rv}`;
+  // The stdout pane shows the compiled program's OUTPUT (what a `printf` writes through the
+  // powerbox's ambient `write`), with the emitted SVM IR below it as a divider-separated section —
+  // so both the payoff and "look, real IR" are visible. A pure return-value program shows just IR.
+  const progOut = r.stdout || '';
+  const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of SVM IR ${'─'.repeat(18)}\n${ir}`;
+  c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
   if (r.status === 0 || r.status === 5) {
     setState(c, 'done', `compiled & ran · returned ${r.rv} · ${ms}ms`);
     logTo(c, `ran compiled program → ${r.rv} (status ${r.status})`);
