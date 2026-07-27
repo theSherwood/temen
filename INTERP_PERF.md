@@ -367,19 +367,29 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > exhausts; each was rewritten to loop so a back-edge exists to charge at. **Pending in this PR:** the
 > Cranelift JIT counted-fuel half + flipping the differential harnesses to assert `OutOfFuel` parity.
 >
-> **One fuzzer needed rescaling** (`fiber_fuzz`'s `generated_fiber_programs_never_panic_and_are_deterministic`).
-> Each generated function is a single `Return`-terminated block — no back-edges — but the deterministic
-> test's generator is *cyclic*: a `call` / `cont.new` may target any function, so a program can recurse.
-> Function/fiber entries are safepoints, so under safepoint metering `fuel=8000` permits 8000 *entries*,
-> each executing a whole ≤12-inst body — where per-op `fuel=8000` had bounded a program to 8000 *ops*
-> total. That ~×(ops-per-body) loosening blew the test's runtime up on CI: `cargo test --workspace` went
-> 10.75→44 min on windows-latest (cancelled at the 45-min ceiling) and 6→26 min on Linux, all in this one
-> test. Fix: drop its fuel to **300** (≤~3600 ops/program, comfortably under the old 8000-op ceiling),
-> restoring main-era wall-clock while still driving hundreds of entries deep. (The acyclic interp↔JIT
-> differential in the same file was unaffected — bounded depth, no recursive explosion — and keeps its
-> budget.) *An earlier revision of this note wrongly claimed the corpus was fuel-insensitive; that was
-> measured branch-vs-branch on a contended box, never branch-vs-main — the CI regression above is the
-> real signal.*
+> **One fuzzer needed rescaling — and it exposed a real metering gap.** `fiber_fuzz`'s
+> `generated_fiber_programs_never_panic_and_are_deterministic` uses a *cyclic* generator (a `call` /
+> `cont.new` may target any function, so a program can recurse and spawn/resume fibers). Under
+> safepoint metering that test blew `cargo test --workspace` past its CI ceilings: 10.75→44 min on
+> windows-latest (**cancelled at the 45-min ceiling**), 6→26 min on Linux — all in this one test.
+>
+> **Root cause (the gap):** fuel charges at `call` / `call_indirect` / `return_call*` (function entries)
+> and taken back-edges, but **not at `cont.resume` / `cont.new`**. Resuming a fiber is a control transfer
+> that per-op fuel used to meter (every op in the fiber decremented the counter); under safepoint fuel a
+> long fiber-resume chain runs almost entirely **unmetered** (only the occasional `call` inside it
+> charges). So fuel bounds these programs only loosely — runtime is ~linear in fuel with a huge constant
+> (`fuel=8000` hung; `fuel=300` completed in ~20 min). Lowering fuel alone can't fix it, and neither can
+> a tidy op-count argument — the executed work between safepoints is unbounded through fibers.
+>
+> **Stopgap (this PR):** drop the corpus **2_000 → 200** (measured to complete in ~4 min debug on a slow
+> box, well under budget) and fuel `8_000 → 300`, keeping thousands of resume/return chains exercised.
+> The acyclic interp↔JIT differential in the same file is unaffected (bounded spawn/call depth) and keeps
+> its budget. **Proper fix (scoped follow-up):** charge fuel at the `cont.resume` / `suspend` fiber
+> safepoints in *both* interpreters (the tree-walker's inline resume arm and the bytecode `drive`
+> driver) — the durable-freeze trigger already treats these as the cross-backend fiber safepoints — so
+> fuel bounds fiber work too; then the corpus can return to 2_000. *(An even earlier revision of this
+> note wrongly called the corpus fuel-insensitive; that was measured branch-vs-branch on a contended box,
+> never branch-vs-main. The CI regression is the real signal.)*
 
 *Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
