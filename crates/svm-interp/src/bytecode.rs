@@ -4154,8 +4154,7 @@ impl DebugRun {
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
-        vt.coro_step_into = true; // single-vCPU: step *into* §14 coroutine bodies op-by-op
+        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?; // coro_step_into on by default
         let Domain { source, table } = dom;
         Some(DebugRun {
             source,
@@ -4513,8 +4512,9 @@ pub enum SchedStop {
     /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
     /// scheduler can't advance (it drives only `thread.spawn`/`join`).
     Blocked,
-    /// A thread reached an op outside the debug scheduler's subset — coroutines or tier-up. (Threads,
-    /// `wait`/`notify`, fibers, and `instantiate`/`instantiate_module` are all handled.)
+    /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
+    /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
+    /// coroutines (step-into, with the coroutine's vCPU pinned across the body) are all handled.
     Declined,
 }
 
@@ -4598,8 +4598,9 @@ struct DbgEnv {
 /// so a fiber migrates across vCPUs — D57), and **§14 `instantiate` / `instantiate_module`** spawn a
 /// confined executor child as its own scheduled vCPU (its own [`DbgEnv`] — window / powerbox / quota —
 /// joinable through the shared thread machinery; a separate-module child runs its own pushed module,
-/// and nesting composes to any depth). Still outside the subset (→ [`SchedStop::Declined`]): coroutines
-/// and tier-up.
+/// and nesting composes to any depth), and **§14 coroutines** are stepped op-by-op (step-into) with the
+/// coroutine's vCPU **pinned** across the body so a `resume` stays atomic w.r.t. other vCPUs. The only
+/// op outside the subset (→ [`SchedStop::Declined`]) is JIT tier-up (never enabled here).
 pub struct ScheduledDebugRun {
     source: std::sync::Arc<ModuleSource>,
     table: SharedSlots,
@@ -5065,6 +5066,16 @@ fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32)
     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
 }
 
+/// The task **pinned** to the scheduler because it is mid-`resume` inside a §14 coroutine body
+/// (`active_coro` set). A coroutine `resume` is atomic w.r.t. other vCPUs, so while its body is being
+/// stepped op-by-op the scheduler must keep running that same vCPU — never interleaving another thread —
+/// until the child yields / faults / returns and `active_coro` clears. At most one task is ever pinned
+/// (a task can only enter a coroutine while running, and a pinned task runs alone), so the first match
+/// is the pin.
+fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
+    tasks.iter().position(|t| t.vt.active_coro.is_some())
+}
+
 /// Pick the next thread to run: the lowest-index runnable one. If none is runnable, advance the futex
 /// `clock` to the earliest `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`),
 /// then retry. `None` only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`.
@@ -5224,56 +5235,64 @@ impl ScheduledDebugRun {
             if let DbgTaskState::Done(res) = &tasks[0].state {
                 return SchedStop::Finished(res.clone());
             }
-            // Prefer the stepping thread while it is runnable (so a step stays on it and a step-over
-            // runs its own call), else the lowest-index runnable thread (advancing the futex clock to
-            // wake a waiter when the set is stuck; unblocks a stepped `join`/`wait`).
-            let ti = match step {
-                Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
-                _ => match dbg_pick_runnable(tasks, clock) {
-                    Some(i) => i,
-                    None => return SchedStop::Blocked,
-                },
+            // A task mid-coroutine is pinned (atomic resume); otherwise prefer the stepping thread while
+            // it is runnable (so a step stays on it and a step-over runs its own call), else the
+            // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
+            // stuck; unblocks a stepped `join`/`wait`).
+            let ti = if let Some(p) = dbg_pinned_coro(tasks) {
+                p
+            } else {
+                match step {
+                    Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
+                    _ => match dbg_pick_runnable(tasks, clock) {
+                        Some(i) => i,
+                        None => return SchedStop::Blocked,
+                    },
+                }
             };
             // Pre-op stop checks (breakpoint / watchpoint), skipped for a thread that just reported (it
             // must make progress off its current op first, so a loop-body stop re-fires each iteration).
+            // Scan the task's *active continuation* — the §14 coroutine child (over its confined window)
+            // when this task is mid-`resume`, else its own vCPU — so a breakpoint fires inside a coroutine
+            // body on the right thread.
             if !tasks[ti].at_bp {
-                if let Some(pc) = tasks[ti].vt.active.cur_ir_pc(source) {
-                    if breakpoints.contains(&pc) {
-                        tasks[ti].at_bp = true;
-                        *stopped = Some(ti);
-                        *focus = ti;
-                        return SchedStop::Break {
-                            pc,
-                            reason: SchedBreak::Breakpoint,
-                        };
-                    }
-                    if !watchpoints.is_empty() && pc.module == 0 {
-                        // Watch against the running task's own window (a confined `instantiate` child
-                        // sees its own `nested_view`, else the shared mem).
-                        let task_mem = match tasks[ti].env {
+                let hit = {
+                    let (cur_vm, coro) = tasks[ti].vt.debug_active();
+                    let cur_mem: &Option<Mem> = match coro {
+                        Some(c) => &c.mem,
+                        None => match tasks[ti].env {
                             None => &*mem,
                             Some(k) => &extra_envs[k].mem,
-                        };
-                        if let Some((addr, write)) = watch_hit_before(
-                            &tasks[ti].vt.active,
-                            task_mem,
+                        },
+                    };
+                    match cur_vm.cur_ir_pc(source) {
+                        Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
+                        Some(pc) if !watchpoints.is_empty() && pc.module == 0 => watch_hit_before(
+                            cur_vm,
+                            cur_mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
                             pc.func,
                             pc.block,
                             pc.inst,
-                        ) {
-                            *last_watch = Some((addr, write));
-                            tasks[ti].at_bp = true;
-                            *stopped = Some(ti);
-                            *focus = ti;
-                            return SchedStop::Break {
-                                pc,
-                                reason: SchedBreak::Watchpoint { addr, write },
-                            };
-                        }
+                        )
+                        .map(|w| (pc, Some(w))),
+                        _ => None,
                     }
+                };
+                if let Some((pc, watch)) = hit {
+                    let reason = match watch {
+                        Some((addr, write)) => {
+                            *last_watch = Some((addr, write));
+                            SchedBreak::Watchpoint { addr, write }
+                        }
+                        None => SchedBreak::Breakpoint,
+                    };
+                    tasks[ti].at_bp = true;
+                    *stopped = Some(ti);
+                    *focus = ti;
+                    return SchedStop::Break { pc, reason };
                 }
             }
             let step_res = dbg_advance_task(
@@ -5359,11 +5378,18 @@ impl ScheduledDebugRun {
                 },
             }
             // Post-op step target: the stepping thread reached a qualifying call depth at an instruction.
+            // Depth is cumulative across a coroutine boundary (the child's frames sit above the parent's
+            // resume frame), so a step-over of a `resume` runs the child to completion and a step inside a
+            // coroutine body compares child-local frames — mirroring the single-vCPU `DebugRun::step_to`.
             if let Some((st, max_depth)) = step {
                 if ti == st && matches!(tasks[st].state, DbgTaskState::Runnable) {
-                    let depth = tasks[st].vt.active.stack.len() + 1;
+                    let (cur_vm, _) = tasks[st].vt.debug_active();
+                    let depth = match tasks[st].vt.active_coro {
+                        Some((_, _, pd)) => pd + cur_vm.stack.len() + 1,
+                        None => cur_vm.stack.len() + 1,
+                    };
                     if max_depth.is_none_or(|m| depth <= m) {
-                        if let Some(pc) = tasks[st].vt.active.cur_ir_pc(source) {
+                        if let Some(pc) = cur_vm.cur_ir_pc(source) {
                             *stopped = Some(st);
                             *focus = st;
                             return SchedStop::Break {
@@ -5394,20 +5420,28 @@ impl ScheduledDebugRun {
         self.step_to(None, fuel)
     }
 
+    /// The stopped thread's **cumulative** call depth (the child's frames count above the parent's resume
+    /// frame while it is mid-coroutine — see [`DebugRun::step_depth`]). Used by the depth-bounded verbs so
+    /// they treat a coroutine `resume` boundary like an ordinary call.
+    fn step_depth(&self, s: usize) -> usize {
+        let (cur_vm, _) = self.tasks[s].vt.debug_active();
+        let d = cur_vm.stack.len() + 1;
+        match self.tasks[s].vt.active_coro {
+            Some((_, _, pd)) => pd + d,
+            None => d,
+        }
+    }
+
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
     /// the stepped thread blocks), landing at the next op at the same call depth.
     pub fn step_over(&mut self, fuel: &mut u64) -> SchedStop {
-        let max = self
-            .stopped
-            .map(|s| self.tasks[s].vt.active.stack.len() + 1);
+        let max = self.stopped.map(|s| self.step_depth(s));
         self.step_to(max, fuel)
     }
 
     /// **Step out** — run until the stepped thread's current function returns (one call depth shallower).
     pub fn step_out(&mut self, fuel: &mut u64) -> SchedStop {
-        let max = self
-            .stopped
-            .map(|s| (self.tasks[s].vt.active.stack.len() + 1).saturating_sub(1));
+        let max = self.stopped.map(|s| self.step_depth(s).saturating_sub(1));
         self.step_to(max, fuel)
     }
 
@@ -5433,7 +5467,9 @@ impl ScheduledDebugRun {
             clock,
             ..
         } = self;
-        let Some(ti) = dbg_pick_runnable(tasks, clock) else {
+        // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
+        // pin on replay reconstructs the coroutine's op sequence deterministically.
+        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| dbg_pick_runnable(tasks, clock)) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
         let step_res = dbg_advance_task(
@@ -5576,13 +5612,18 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// A [`FrameReader`] over the **focused** thread's `Vm` (what `select_task` chose), over that
-    /// thread's own window (a confined `instantiate` child reads its `nested_view`, else the shared mem).
+    /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
+    /// the active §14 coroutine child (over its confined window) when that thread is mid-`resume`, else the
+    /// thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
     fn reader(&self) -> FrameReader<'_> {
+        let (vm, coro) = self.tasks[self.focus].vt.debug_active();
         FrameReader {
-            vm: &self.tasks[self.focus].vt.active,
+            vm,
             source: &self.source,
-            mem: self.task_mem(self.focus),
+            mem: match coro {
+                Some(c) => &c.mem,
+                None => self.task_mem(self.focus),
+            },
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
@@ -5609,10 +5650,16 @@ impl ScheduledDebugRun {
         self.reader().var_addr(depth, name)
     }
 
-    /// Read `len` bytes from the focused thread's guest window at `addr` (its confined `instantiate`
-    /// window, else the shared mem).
+    /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
+    /// confined window when mid-`resume`, else the thread's own window (its confined `instantiate`
+    /// window or the shared mem).
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.task_mem(self.focus).as_ref() {
+        let (_, coro) = self.tasks[self.focus].vt.debug_active();
+        let m = match coro {
+            Some(c) => c.mem.as_ref(),
+            None => self.task_mem(self.focus).as_ref(),
+        };
+        match m {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
@@ -5907,10 +5954,13 @@ struct VTask {
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
     /// durable run; `super::SHADOW_BASE` (context 0's region base) otherwise.
     root_shadow_sp: u64,
-    /// Debug **step-into** of a §14 coroutine body (single-vCPU only — set by [`DebugRun`], left `false`
-    /// on the scheduled engine so a coroutine there stays driven atomically by `resume_coro`). When set,
-    /// a `resume` defers the child to op-by-op stepping via [`active_coro`](VTask::active_coro) instead
-    /// of running it opaquely to its next yield/return.
+    /// Debug **step-into** of a §14 coroutine body — set for every *debug-engine* task (`true` by
+    /// default: the single-vCPU [`DebugRun`] *and* the multi-vCPU [`ScheduledDebugRun`], where the
+    /// coroutine's vCPU is pinned across the body so the op-by-op stepping stays atomic w.r.t. other
+    /// vCPUs). When set, a `resume` defers the child to op-by-op stepping via
+    /// [`active_coro`](VTask::active_coro) instead of running it opaquely to its next yield/return.
+    /// Only ever read by [`debug_advance_fiber`] (the debug driver); production's `step_vcpu` ignores it,
+    /// so a production `VTask` carrying `true` is inert.
     coro_step_into: bool,
     /// While the debugger is stepping *inside* a coroutine child (only when `coro_step_into`), the
     /// active continuation is that child, not `active`. `(handle, resume-result slot, parent depth)`:
@@ -5930,7 +5980,7 @@ impl VTask {
             chain: Vec::new(),
             coroutines: Vec::new(),
             root_shadow_sp: super::SHADOW_BASE,
-            coro_step_into: false,
+            coro_step_into: true,
             active_coro: None,
         })
     }

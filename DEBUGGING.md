@@ -378,17 +378,31 @@ different things depending on which pair you compare:
   inspection inside a separate-module child (the `FrameReader`'s module-0 gate) is a follow-up; position-
   level breakpoints/step-into and window reads work today.
 
+  **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
+  reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the
+  coroutine-active task is **pinned** in the scheduler (`dbg_pinned_coro` in `drive`/`tick`) — a `resume`
+  is atomic w.r.t. other vCPUs, so the scheduler never interleaves another thread between the coroutine's
+  ops. The breakpoint/watch scan, `reader`/`read_window`, and the step-depth predicate all resolve against
+  the task's active continuation (the coroutine child when mid-`resume`), so a breakpoint fires inside a
+  coroutine body on the right thread, a sibling vCPU stays frozen while the coroutine is single-stepped,
+  and reverse `tick`-replay stays deterministic. The sibling here is an `instantiate` executor child, not
+  a `thread.spawn` worker: the bytecode engine rejects `coroutine + thread` in one module (tree-walker-only,
+  `compile_module`), while `instantiate + coroutine` gives a real second scheduled vCPU. Covered by
+  `bytecode_debug_scheduled_coroutine.rs` (oracle parity, breakpoint-inside-body with the sibling frozen,
+  deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
+  the single-vCPU engine does.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
-  `thread.spawn`/`join`/`wait`/`notify` and **fibers** (single-vCPU *and* composed with threads),
-  **§14 coroutines** — same-module *and* separate-module — driven inline on the single-vCPU engine
-  (step-into the body, slices 14b/14c), and **§14 `instantiate` / `instantiate_module`** confined
-  children as scheduled vCPUs on the multi-vCPU engine, nesting to any depth (slices 15a/15b/15c).
-  Remaining `Declined` ops: coroutines / tier-up on the scheduled engine. Follow-ups: the §3.6
-  serve/live-call machinery inside a confined child, *source-variable* inspection inside a separate-module
-  child body, env teardown / D37 revocation, and a checkpoint ladder to bound reverse-replay cost (perf —
-  today's small debugged programs replay from turn 0 cheaply).
+  `thread.spawn`/`join`/`wait`/`notify`, **fibers**, **§14 coroutines** (step-into — same-module and
+  separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
+  **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
+  (slices 14b/14c, 15a/15b/15c, 16). The only remaining `Declined` op is JIT tier-up (never enabled on
+  the debug engine). Follow-ups: the §3.6 serve/live-call machinery inside a confined child,
+  *source-variable* inspection inside a separate-module child body, env teardown / D37 revocation, and a
+  checkpoint ladder to bound reverse-replay cost (perf — today's small debugged programs replay from turn
+  0 cheaply).
 
 ---
 
