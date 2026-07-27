@@ -21,6 +21,34 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I49 — the playground's `chibicc.svmb` was never committed, so the C-compiler card 404'd (S3) — the I26/I42 asset-shipping class again — surfaced 2026-07-27 (`fetch ./assets/chibicc.svmb: 404`) — **FIX LANDED** (`claude/chibicc-playground-status-7n6eh0`)
+
+**Symptom.** The playground's "C compiler (chibicc → SVM)" card fails with
+`fetch ./assets/chibicc.svmb: 404 — run \`node build-onramp-assets.mjs\` to generate it`.
+
+**Where.** `browser/.gitignore` ignores `/web/assets/*.svmb` with explicit `!` un-ignore exceptions
+for every committed playground asset (`hello_c`, `gradient`, `bounce`, `life`, `mandelzoom`,
+`qjs_repl`) — but **not `chibicc.svmb`**. Step-5 landed the card + the `build-onramp-assets.mjs`
+wiring but never committed the artifact, and that build is **fail-soft** (skipped when clang/llvm-18
+is absent or the build hiccups). So the card only worked if the deploy-time build happened to
+succeed; there was no committed fallback, and any failure silently shipped a 404 — locally the card
+never worked out of the box at all.
+
+**This is the I26/I28/I42 class** (a Pages deploy shipping a playground missing an asset, fail-soft
+build masking it). **Fix:** commit `chibicc.svmb` in-tree behind a `!/web/assets/chibicc.svmb`
+gitignore exception, exactly like `qjs_repl.svmb` — the build script still rebuilds it in place when
+the toolchain is present. Built asset: 392786 bytes, 333 funcs, verifies + bytecode-compiles;
+compiles a C source to SVM IR on the bytecode engine (the browser's engine).
+
+**Class guard added (2026-07-27):** `browser/check-play-assets.mjs`, driven from `web/play.js` (the
+single source of truth for referenced assets), wired into two workflows (`workflows_src`, pending
+copy-over): a `playground-assets` PR job asserts every referenced asset is committed or declared
+deploy-built (catches a card referencing an unaccounted asset — the static half of this class), and
+a `pages.yml` `--site` step asserts every referenced asset is actually present in the assembled
+`_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
+with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
+automatically. This closes the residual guard gap I26 named.
+
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
 `cargo run --release --example megabench -p svm` panics after the first four kernels
@@ -1129,6 +1157,13 @@ was stale too (4319380 B vs the pages run's 4318992 B) and is now regenerated as
 openlibm fetchable again.
 
 ### I42 — the Doom example vanished from the published playground: its single WAD mirror started 404ing, and every layer swallowed it (S3) — surfaced 2026-07-24 by `fetch ./assets/doom.svmb: 404` in production — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
+
+**Root cause retired (2026-07-27):** the shareware `doom1.wad` is now **vendored in-tree**
+(`crates/svm-run/demos/doom/doom1.wad`, v1.9, md5 `f0cefca49926d00903cf57551d901abe`) and staged
+directly — no WAD fetch, so no mirror can drop it. `build-onramp-assets.mjs`'s `ensureWad()`/`WAD_MIRRORS`
+are gone. The `--site` reachability gate (I49) now *requires* `doom1.wad` (removed from
+`MAY_BE_ABSENT`); only `doom.svmb` (id's engine source, still fetched-and-built) stays fail-soft. The
+mirror-list fix below is the prior, superseded mitigation.
 
 **Where:** `browser/build-onramp-assets.mjs` → `ensureWad()`. The shareware IWAD was fetched from a
 **single** URL, `https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad`, which now returns

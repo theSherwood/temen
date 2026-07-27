@@ -11,8 +11,7 @@
 // Outputs to `web/assets/*.svmb` (gitignored except the tiny committed `hello_c.svmb`).
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, existsSync, writeFileSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
-import { gunzipSync } from 'node:zlib';
+import { mkdirSync, existsSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -244,12 +243,16 @@ try {
 
 // 4) Doom (interactive reactor) — doomgeneric through the on-ramp, driven one `tick` per frame over
 //    the persistent window; `_start` reads the shareware IWAD through the `fs` capability. Two assets:
-//    the module (`demos/doom/{fetch,build}.sh` — id Software's Doom source is fetched-and-built, not
-//    vendored) and the freely-distributable shareware `doom1.wad`. The page opens the reactor over the
-//    WAD via `svm_onramp_open_fs`. Both are skipped (the playground just omits the example) if the
-//    toolchain or a fetch is unavailable — same fail-soft as SQLite offline.
+//    the module (`demos/doom/{fetch,build}.sh` — id Software's Doom *source* is fetched-and-built,
+//    needs the toolchain) and the shareware `doom1.wad`, which is now **vendored in-tree**
+//    (`crates/svm-run/demos/doom/doom1.wad`) rather than fetched. Vendoring the WAD retires the
+//    recurring dead-mirror outage (ISSUES.md I42/I43): a mirror going away can no longer drop the WAD.
+//    The WAD is staged unconditionally (it's a committed file — always reachable, no network); only
+//    the module stays fail-soft (skipped, so the playground omits the example, if the toolchain or the
+//    source fetch is unavailable).
 const DOOM = join(REPO, 'crates', 'svm-run', 'demos', 'doom');
 const DCACHE = '/tmp/doomgeneric_cache';
+const VENDORED_WAD = join(DOOM, 'doom1.wad');
 
 // Build doom.svmb via the demo scripts (fetch the sources, then compile+link+translate). Returns the
 // built module path, or null if the fetch/build failed (offline, or no clang/llvm-link).
@@ -266,62 +269,27 @@ function ensureDoomModule() {
   }
 }
 
-// Mirrors for the freely-redistributable shareware IWAD, tried in order. **Several on purpose**: this
-// used to be a single slitaz URL, which started 404ing — and because the failure was swallowed, the
-// Pages build kept going green while quietly shipping a playground with no Doom (the page 404'd on
-// ./assets/doom.svmb). One host disappearing must not cost us the example.
-//   - raw.githubusercontent.com serves the canonical shareware v1.9 IWAD (md5 f0cefca4…); it is the
-//     same transport `fetch.sh` already falls back to, so it works wherever the sources do.
-//   - the rest are the official idgames archive + two of its mirrors, which carry the shareware v1.8
-//     IWAD **gzipped**. v1.8 boots and renders the same; its title demo is from an older engine
-//     build, which doomgeneric tolerates (it prints instead of `I_Error`-ing on a demo mismatch).
-const WAD_MIRRORS = [
-  'https://raw.githubusercontent.com/Akbar30Bill/DOOM_wads/master/doom1.wad',
-  'https://www.gamers.org/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
-  'https://youfailit.net/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
-  'https://ftpmirror1.infania.net/pub/idgames/idstuff/doom/doom-1.8.wad.gz',
-];
-
-// Fetch the shareware doom1.wad (freely redistributable). Returns its path, or null if every mirror
-// is unavailable. Verifies the IWAD magic **after** decompressing, so neither a captive-portal HTML
-// page nor a mirror's 404 body can masquerade as the WAD.
-function ensureWad() {
-  const wad = join(DCACHE, 'doom1.wad');
-  const isIwad = (buf) => buf.subarray(0, 4).toString('latin1') === 'IWAD';
-  if (existsSync(wad) && isIwad(readFileSync(wad))) return wad;
-  mkdirSync(DCACHE, { recursive: true });
-  const tmp = join(DCACHE, 'doom1.wad.part');
-  for (const url of WAD_MIRRORS) {
-    try {
-      execFileSync('curl', ['-sfL', '--max-time', '180', '-o', tmp, url], { stdio: 'inherit' });
-      const raw = readFileSync(tmp);
-      const buf = url.endsWith('.gz') ? gunzipSync(raw) : raw;
-      if (!isIwad(buf)) throw new Error(`not an IWAD (magic ${JSON.stringify(buf.subarray(0, 4).toString('latin1'))})`);
-      writeFileSync(wad, buf);
-      return wad;
-    } catch (e) {
-      // Say which mirror failed and why — a silent `catch` here is what hid the outage.
-      console.log(`    – WAD mirror ${new URL(url).host} unavailable: ${e.message}`);
-    } finally {
-      rmSync(tmp, { force: true });
-    }
+// The shareware IWAD, vendored in-tree — freely-redistributable id Software DOOM shareware v1.9
+// (md5 f0cefca49926d00903cf57551d901abe, 4196020 bytes; provenance/license in demos/doom/README.md).
+// No network, no mirrors. Verify the IWAD magic as a cheap checkout-integrity guard.
+function vendoredWad() {
+  const buf = readFileSync(VENDORED_WAD);
+  if (buf.subarray(0, 4).toString('latin1') !== 'IWAD') {
+    throw new Error(`vendored ${VENDORED_WAD} is not an IWAD (magic ${JSON.stringify(buf.subarray(0, 4).toString('latin1'))}) — corrupt checkout?`);
   }
-  return null;
+  return VENDORED_WAD;
 }
 
+// Stage the WAD first, unconditionally — it's committed, so it's always reachable regardless of the
+// toolchain. The module build is the only fail-soft half now.
+copyFileSync(vendoredWad(), join(ASSETS, 'doom1.wad'));
 const doomSvmb = ensureDoomModule();
-const doomWad = ensureWad();
-if (doomSvmb && doomWad) {
+const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
+if (doomSvmb) {
   copyFileSync(doomSvmb, join(ASSETS, 'doom.svmb'));
-  copyFileSync(doomWad, join(ASSETS, 'doom1.wad'));
-  const mb = (n) => (readFileSync(n).length / (1024 * 1024)).toFixed(2);
-  console.log(`  ✓ doom.svmb (${mb(doomSvmb)} MB) + doom1.wad (${mb(doomWad)} MB)`);
+  console.log(`  ✓ doom.svmb (${mb(doomSvmb)} MB) + doom1.wad (vendored, ${mb(join(ASSETS, 'doom1.wad'))} MB)`);
 } else {
-  // Name the half that failed. The old catch-all ("no toolchain, or the source/WAD fetch failed")
-  // was printed even when the module had just built successfully one line above, which sent the
-  // WAD-mirror outage looking like a toolchain problem.
-  const missing = [!doomSvmb && 'module build', !doomWad && 'doom1.wad fetch'].filter(Boolean).join(' + ');
-  console.log(`  – doom skipped (${missing} failed — offline, or no toolchain?)`);
+  console.log(`  – doom.svmb skipped (module build failed — offline, or no toolchain?); doom1.wad (vendored) staged`);
 }
 
 // chibicc — the in-browser C compiler (SELFHOST_C.md §7 step 5). Multi-TU like QuickJS/Doom, so it's

@@ -7,9 +7,10 @@
 //! Rust the wasm export wraps — the slice-3c `doom_diff` differential already proved the *pixels* are
 //! byte-exact; this proves the *reactor wiring* (fs-served WAD in, per-frame `tick`, `display` out).
 //!
-//! `#[ignore]`d — it needs the built `doom.svmb` (`demos/doom/build.sh`) and the freely-distributable
-//! shareware `doom1.wad`, neither vendored. Paths are overridable via `DOOM_SVMB` / `DOOM_WAD`
-//! (defaults match the demo scripts' cache). Run:
+//! `#[ignore]`d — it needs the built `doom.svmb` (`demos/doom/build.sh`; not vendored). The shareware
+//! `doom1.wad` **is** vendored (`crates/svm-run/demos/doom/doom1.wad`). Paths are overridable via
+//! `DOOM_SVMB` / `DOOM_WAD` (defaults match the demo scripts' cache; point `DOOM_WAD` at the vendored
+//! file to skip the fetch). Run:
 //!   sh crates/svm-run/demos/doom/fetch.sh && sh crates/svm-run/demos/doom/build.sh
 //!   cargo test -p svm-browser --test doom_reactor -- --ignored --nocapture
 
