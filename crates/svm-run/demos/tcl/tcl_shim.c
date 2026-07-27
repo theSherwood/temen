@@ -967,6 +967,93 @@ int fts_close(void *f) {
     return 0;
 }
 
+/* --- zlib (benign) ---------------------------------------------------------------------------
+ * Tcl's `TclZlibInit` (called from `Tcl_CreateInterp`) reads `zlibVersion()` for its package
+ * config — so a real string is needed at startup even in the minimal REPL. The stream family is
+ * only reached by the `zlib`/`binary` compression commands (unused here); it returns Z_VERSION_ERROR
+ * so those raise a clean Tcl error. Signatures match zlib.h (a mismatch is a verify error, per the
+ * mknod dev_t lesson). Linking a real guest zlib is the follow-up for actual compression. */
+#define Z_STREAM_ERROR (-2)
+#define Z_VERSION_ERROR (-6)
+const char *zlibVersion(void) { return "1.2.13"; }
+const char *zError(int e) {
+    (void)e;
+    return "zlib unavailable";
+}
+unsigned long crc32(unsigned long crc, const unsigned char *buf, unsigned len) {
+    (void)buf;
+    (void)len;
+    return crc; /* unreached on the eval path; a real CRC is the compression follow-up */
+}
+unsigned long adler32(unsigned long adler, const unsigned char *buf, unsigned len) {
+    (void)buf;
+    (void)len;
+    return adler;
+}
+int deflate(void *s, int f) {
+    (void)s;
+    (void)f;
+    return Z_STREAM_ERROR;
+}
+int deflateEnd(void *s) {
+    (void)s;
+    return Z_STREAM_ERROR;
+}
+unsigned long deflateBound(void *s, unsigned long n) {
+    (void)s;
+    return n;
+}
+int deflateSetDictionary(void *s, const unsigned char *d, unsigned n) {
+    (void)s;
+    (void)d;
+    (void)n;
+    return Z_STREAM_ERROR;
+}
+int deflateSetHeader(void *s, void *h) {
+    (void)s;
+    (void)h;
+    return Z_STREAM_ERROR;
+}
+int deflateInit2_(void *s, int level, int method, int wbits, int memlvl, int strat,
+                  const char *ver, int sz) {
+    (void)s;
+    (void)level;
+    (void)method;
+    (void)wbits;
+    (void)memlvl;
+    (void)strat;
+    (void)ver;
+    (void)sz;
+    return Z_VERSION_ERROR;
+}
+int inflate(void *s, int f) {
+    (void)s;
+    (void)f;
+    return Z_STREAM_ERROR;
+}
+int inflateEnd(void *s) {
+    (void)s;
+    return Z_STREAM_ERROR;
+}
+int inflateGetHeader(void *s, void *h) {
+    (void)s;
+    (void)h;
+    return Z_STREAM_ERROR;
+}
+int inflateInit2_(void *s, int wbits, const char *ver, int sz) {
+    (void)s;
+    (void)wbits;
+    (void)ver;
+    (void)sz;
+    return Z_VERSION_ERROR;
+}
+int inflateSetDictionary(void *s, const unsigned char *d, unsigned n) {
+    (void)s;
+    (void)d;
+    (void)n;
+    return Z_STREAM_ERROR;
+}
+
 /* --- misc ------------------------------------------------------------------------------------- */
 void _exit(int code) {
     exit(code);

@@ -93,12 +93,17 @@ done
 # QuickJS slice CO mechanism). Fetch to a cache if OPENLIBM_DIR is unset; compile the **curated** set
 # (the QuickJS `OPENLIBM_SRCS` + Tcl's frexp/modf/hypot/log1p extras), not a glob (many openlibm TUs
 # need asm/aren't on this path).
-OL="${OPENLIBM_DIR:-$CACHE/openlibm-0.8.5}"
+# Prefer an explicit OPENLIBM_DIR; else the shared cache the `libm_bundled_vs_native` test populates
+# (/tmp/svm_openlibm_cache); else fetch into the shared cache so both reuse one copy.
+SHARED_OL=/tmp/svm_openlibm_cache/openlibm-0.8.5
+OL="${OPENLIBM_DIR:-$SHARED_OL}"
 if [ ! -f "$OL/src/e_log.c" ]; then
   echo "fetching openlibm 0.8.5 …"
-  curl -sfL --max-time 120 -o "$CACHE/openlibm.tgz" \
+  mkdir -p /tmp/svm_openlibm_cache
+  curl -sfL --max-time 120 -o /tmp/svm_openlibm_cache/openlibm.tgz \
     "https://github.com/JuliaMath/openlibm/archive/refs/tags/v0.8.5.tar.gz" \
-    && tar xf "$CACHE/openlibm.tgz" -C "$CACHE" 2>/dev/null || true
+    && tar xf /tmp/svm_openlibm_cache/openlibm.tgz -C /tmp/svm_openlibm_cache 2>/dev/null || true
+  OL="$SHARED_OL"
 fi
 if [ -f "$OL/src/e_log.c" ]; then
   OLSRCS="e_log e_log10 e_log2 e_exp s_exp2 e_pow s_sin s_cos s_tan k_sin k_cos k_tan

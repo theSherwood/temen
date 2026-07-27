@@ -231,26 +231,25 @@ if (ensureQuickJS() && ensureOpenlibm()) {
   console.log('  – qjs_repl rebuild skipped (quickjs/openlibm fetch failed) — using committed qjs_repl.svmb');
 }
 
-// 2c) Tcl (interactive, IN-PROGRESS) — the reference Tcl 8.6 interpreter with the minimal-embedding
-//     REPL driver (`demos/tcl/tcl_repl.c`, no `Tcl_Init`) that reads a Tcl script from **stdin**,
-//     evaluates it, and prints the completion result. Configure-based + multi-TU, so it's built by
-//     its demo script (`demos/tcl/build_bitcode.sh`: configure → native oracle → 162-TU bitcode →
-//     llvm-link), then the linked `.ll` is translated to a 64 KiB-page `.svmb`. **The on-ramp does
-//     not yet translate Tcl** (it fail-closes at a constexpr icmp/select — see demos/tcl/README.md),
-//     so the translate step currently throws and this is fail-soft: the example is simply absent
-//     until the gap-walk clears, at which point the asset builds with no further wiring. Same
-//     fail-soft as SQLite/Doom/chibicc offline.
+// 2c) Tcl (interactive) — the reference Tcl 8.6 interpreter with the minimal-embedding REPL driver
+//     (`demos/tcl/tcl_repl.c`, no `Tcl_Init`) that reads a Tcl script from **stdin**, evaluates it,
+//     and prints the completion result. Configure-based + multi-TU, so it's built by its demo script
+//     (`demos/tcl/build_bitcode.sh`: configure → native oracle → 162-TU bitcode + openlibm →
+//     llvm-link), then the linked `.ll` is translated to a 64 KiB-page `.svmb` with `--stub-externs`
+//     (the OS surface unreached by the minimal REPL — zlib/scanf/fts). Runs byte-identical to native
+//     (`demo_tcl_repl_stdin`). Fail-soft: skipped (the example simply absent) if the toolchain/fetch
+//     is unavailable, like SQLite/Doom/chibicc offline.
 try {
   const tclScript = join(REPO, 'crates', 'svm-run', 'demos', 'tcl', 'build_bitcode.sh');
   execFileSync('bash', [tclScript], { stdio: 'inherit' });
   const linked = join(process.env.SVM_TCL_CACHE ?? '/tmp/svm_tcl_cache', 'tcl_linked.ll');
   if (!existsSync(linked)) throw new Error('build script produced no tcl_linked.ll');
   const svmb = join(ASSETS, 'tcl_repl.svmb');
-  execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+  execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs'], { stdio: 'inherit' });
   const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
   console.log(`  ✓ tcl_repl.svmb (${size} B)`);
 } catch (e) {
-  console.log(`  – tcl_repl skipped (${e.message} — offline, or the on-ramp gap-walk is not yet complete)`);
+  console.log(`  – tcl_repl skipped (${e.message} — offline, or no clang/llvm-link)`);
 }
 
 // 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest

@@ -742,10 +742,10 @@ runs ~6× the interpreter, byte-identical (atomics + `cap.self.resolve` outlinin
 the "wasm-JIT tier — ★ DONE" note); (i) the `run-test262.c` harness over an embedded slice — the
 self-validating suite, QuickJS's analog of SQLite's sqllogictest.
 
-### ▶ In-progress target — Tcl (a second scripting-language interpreter)
+### ▶ Tcl — a second scripting-language interpreter (RUNS byte-identical to native)
 
-**Status: scaffold + faithful whole-program pipeline landed; on-ramp gap-walk started.** The
-reference **Tcl 8.6.14** interpreter (Tcl/BSD license) via the minimal-embedding REPL
+**Status: ★ RUNS — the whole Tcl 8.6 core executes byte-identical to native** (`demo_tcl_repl_stdin`).
+The reference **Tcl 8.6.14** interpreter (Tcl/BSD license) via the minimal-embedding REPL
 (`demos/tcl/tcl_repl.c`, `Tcl_CreateInterp` + `Tcl_Eval`, **no `Tcl_Init`** — the whole language core
 runs with no filesystem, the direct analog of QuickJS's `qjs_eval.c`). Another self-contained C
 interpreter reached with **no new VM capabilities** — a frontend + libc-waist + driver +
@@ -770,12 +770,12 @@ playground-registration job (see `demos/tcl/README.md`).
   (`tcl_shim.c`) is built out — qsort/bsearch, address-taken string ops, the glibc ctype tables, the
   time/tty/locale/socket/file surface as benign defined functions — with the unreached remainder
   (zlib/scanf/fts) trap-stubbed via `SVM_STUB_EXTERNS`.
-- **NEXT — a runtime stub trap during channel init.** The verified module traps (`Unreachable`) at run
-  time: a trap-stubbed function is still reached during `Tcl_CreateInterp` (prime suspect
-  `__isoc99_sscanf` — needs a real guest `sscanf`). Localize (the `SVM_STUB_DEBUG` dump + the
-  verify-error function-namer in `try_translate`), give it a body, then reach first execution and diff
-  vs the native oracle. The guard is `demo_tcl_repl_stdin` (`#[ignore]`d until it clears; drives the
-  walk with `--ignored`, skips loudly offline).
+- **DONE — RUNS byte-identical to native.** The last runtime blocker was `zlibVersion()`, which
+  `TclZlibInit` (from `Tcl_CreateInterp`) reads for its package config; with the zlib/file/tty/locale
+  surface given benign bodies, the Tcl core (2669 funcs) translates, verifies, and runs a stdin script
+  with stdout byte-identical to native — recursion, `lsort`, `format`, `dict`, `string`, `expr` (`**` +
+  `sqrt` through linked openlibm). Guard: `demo_tcl_repl_stdin` (`#[ignore]`d for wall-clock only, like
+  the QuickJS capstone; run with `--ignored`, skips loudly offline). The playground card is live.
 - **Follow-ups:** full `Tcl_Init` (seed the script `library/` + encodings into the svm-posix memfs,
   like SQLite/chibicc, enabling `file`/`glob`/`clock`/`auto_load`); the wasm-JIT tier once `_start` is
   proven emittable. Playground wiring is staged: `build-onramp-assets.mjs` builds `tcl_repl.svmb` the

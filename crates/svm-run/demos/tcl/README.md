@@ -8,8 +8,9 @@ sandbox, byte-identical to the same sources built natively with `cc`.
 
 Tcl joins the same genre as the `../quickjs`, `../lua` (see `LLVM.md`), and `../sqlite`
 ports: a self-contained C interpreter for a scripting language, reached with **no new VM
-capabilities** — a frontend + libc-waist + REPL-driver + playground-registration job. It is a
-**big lift**, tracked as an in-progress target (like QuickJS was), not a landed capstone.
+capabilities** — a frontend + libc-waist + REPL-driver + playground-registration job. **It runs,
+byte-identical to native** (see "It runs" below); getting there closed three general on-ramp
+translator gaps.
 
 ## Files
 
@@ -85,15 +86,29 @@ errors where out of MVP scope), so nothing faults on a signature or a missing bo
 libm resolves via linked openlibm. Genuinely-unreached leftovers (zlib, `__isoc99_sscanf`, `fts`)
 are trap-stubbed via `SVM_STUB_EXTERNS` — never called on the eval path.
 
-**NEXT — a runtime stub trap during channel init.** With stubbing on, the module translates +
-verifies, then traps (`Unreachable`) at run time: a trap-stubbed function is still reached during
-`Tcl_CreateInterp`'s channel/encoding setup (prime suspect `__isoc99_sscanf`, which needs a real
-guest `sscanf` — the Postgres `scanf_shim.c` doesn't compile standalone). Localize it (the
-`SVM_STUB_DEBUG` dump lists the stubbed set; `try_translate` names a mismatching function on a
-verify error), give it a real/benign body, then reach first execution.
+**DONE — first execution.** The last runtime blocker was `zlibVersion()`, which `TclZlibInit`
+(called from `Tcl_CreateInterp`) reads for its package config — a trap-stub that faulted at startup.
+With the zlib surface given benign bodies (and the file/tty/locale surface likewise), the module
+translates, verifies, and **runs**.
 
-**THEN — byte-identical output.** Diff guest stdout against the native `tcl_repl` oracle over a
-language-breadth script (`demo_tcl_repl_stdin`, currently `#[ignore]`d).
+## ★ It runs — byte-identical to native
+
+The Tcl 8.6 core (2669 functions) **translates, verifies, and executes** a script piped in on stdin,
+with stdout byte-identical to the native `cc` build (`demo_tcl_repl_stdin`, `#[ignore]`d only for
+wall-clock — a whole interpreter on the tree-walker takes tens of seconds):
+
+```
+fib: 0 1 1 2 3 5 8 13 21 34
+sorted: 1 2 3 5 7 8 9
+pi ~ 3.1416, 255 = 0xFF, sqrt2 = 1.414214       ← libtommath expr + openlibm sqrt
+dict: a 1 b 2
+TCL ON SVM
+```
+
+Recursion, `lsort`, `format` (`%.4f`/`%X`), `dict`, `string`, `expr` (`**` + the transcendental
+`sqrt` through linked openlibm) — all correct. Wired into the browser playground:
+`build-onramp-assets.mjs` builds `tcl_repl.svmb` (`--stub-externs`, 64 KiB pages) and `web/play.js`
+registers it as a "Tcl (8.6 — write & run)" example. Boot is milliseconds.
 
 ## Follow-ups (beyond the minimal REPL)
 

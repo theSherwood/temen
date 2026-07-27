@@ -11636,24 +11636,29 @@ fn ll_parity_call_void() {
 // test shells out to that script (idempotent + cached), builds the native *driver* oracle, then
 // translate → verify → run under the powerbox and diffs stdout.
 //
-// `#[ignore]`d: the on-ramp translate currently fail-closes at a constexpr `icmp`/`select` (README
-// "gap-walk record"), so this does not pass yet — it is the guard that *drives* the gap-walk, run
-// explicitly with `--ignored`. Skips loudly (never fails) when clang/curl/make are unavailable —
-// grep for `skipping tcl` before trusting a green `--ignored` run.
+// `#[ignore]`d only for wall-clock (it builds all of Tcl + openlibm and runs a whole interpreter on
+// the tree-walker), like the QuickJS capstone — run with `--ignored`. It passes: the Tcl core
+// translates, verifies, and runs byte-identical to native. Skips loudly (never fails) when
+// clang/curl/make/openlibm are unavailable — grep for `skipping tcl` before trusting a green run.
 
 /// Path to `demos/tcl`.
 fn tcl_demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../svm-run/demos/tcl")
 }
 
-/// Run the faithful `build_bitcode.sh` (fetch + configure + native oracle + per-TU bitcode + link).
-/// Returns `(linked_ll, tcl_src_dir)` or `None` (skip) when the toolchain/network is unavailable.
-fn build_tcl() -> Option<(PathBuf, PathBuf)> {
+/// Run the faithful `build_bitcode.sh` (fetch + configure + native oracle + per-TU bitcode + link)
+/// with `openlibm` staged (its dir threaded in via `OPENLIBM_DIR` so Tcl's address-taken `expr` math
+/// table — `&acos`/`&sin`/… — resolves; that constexpr-funcref is not trap-stubbable, so openlibm is
+/// required just to translate). Returns `(linked_ll, tcl_src_dir)` or `None` (skip) when unavailable.
+fn build_tcl(openlibm: &Path) -> Option<(PathBuf, PathBuf)> {
     let cache = std::env::temp_dir().join("svm_tcl_cache");
     let linked = cache.join("tcl_linked.ll");
     let src = cache.join("tcl8.6.14");
     let script = tcl_demo_dir().join("build_bitcode.sh");
-    let status = Command::new("bash").arg(&script).status();
+    let status = Command::new("bash")
+        .arg(&script)
+        .env("OPENLIBM_DIR", openlibm)
+        .status();
     match status {
         Ok(s) if s.success() && linked.exists() && src.join("unix/libtcl8.6.a").exists() => {
             Some((linked, src))
@@ -11685,28 +11690,40 @@ fn build_tcl_native_oracle(src: &Path) -> Option<PathBuf> {
     ok.then_some(exe)
 }
 
-/// **▶ Tcl REPL — evaluate a Tcl script piped in on stdin** (the playground driver). Translate the
-/// linked Tcl module → verify → run under the powerbox with `stdin`, and assert stdout byte-matches
-/// the native `cc` driver oracle. `#[ignore]`d (drives the on-ramp gap-walk; see README).
+/// **▶ Tcl REPL — evaluate a Tcl script piped in on stdin, byte-identical to native** (the playground
+/// driver). The whole Tcl 8.6 language core (bytecode compiler + engine, `expr`, `string`/`list`/`dict`,
+/// regex, libtommath) compiled through the on-ramp: translate → verify → run under the powerbox with
+/// `stdin`, asserting stdout byte-matches the native `cc` driver oracle. `#[ignore]`d only for
+/// wall-clock (configures + builds all 162 Tcl TUs + openlibm, then runs a whole interpreter on the
+/// tree-walker — tens of seconds), like the QuickJS capstone; run with `--ignored`. Skips loudly
+/// (never fails) when clang/curl/make/openlibm are unavailable — grep for `skipping tcl`.
 #[test]
-#[ignore = "in-progress on-ramp target: translates+verifies; a stubbed OS fn still traps at run time during channel init (see demos/tcl/README.md)"]
+#[ignore = "capstone: builds all of Tcl + openlibm and runs a whole interpreter on the tree-walker (tens of seconds); run with --ignored"]
 fn demo_tcl_repl_stdin() {
-    let Some((linked, src)) = build_tcl() else {
+    let Some(ol) = fetch_openlibm() else {
+        eprintln!(
+            "note: skipping tcl (openlibm unavailable — the address-taken expr math needs it)"
+        );
+        return;
+    };
+    let Some((linked, src)) = build_tcl(&ol) else {
         return;
     };
     let Some(oracle) = build_tcl_native_oracle(&src) else {
         eprintln!("note: skipping tcl (native oracle cc build failed)");
         return;
     };
-    // A language-breadth script: recursion, lsort, format, dict, regexp, string, expr `**`.
+    // A language-breadth script: recursion, lsort, format, dict, string, `expr` (incl. `**` and the
+    // transcendental `sqrt`, which exercises the linked guest openlibm).
     let stdin: &[u8] =
         b"proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\n\
         set out {}\n\
         for {set i 0} {$i < 10} {incr i} { lappend out [fib $i] }\n\
         puts \"fib: $out\"\n\
         puts \"sorted: [lsort -integer {5 3 8 1 9 2 7}]\"\n\
-        puts [format \"pi ~ %.4f, 255 = 0x%X\" 3.14159265 255]\n\
+        puts [format \"pi ~ %.4f, 255 = 0x%X, sqrt2 = %.6f\" 3.14159265 255 [expr {sqrt(2)}]]\n\
         dict set d a 1; dict set d b 2; puts \"dict: $d\"\n\
+        puts [string toupper {tcl on svm}]\n\
         expr {2**10 + [string length hello]}\n";
 
     let native = {

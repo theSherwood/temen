@@ -63,7 +63,16 @@ fn main() {
     }
     println!("VERIFIED");
     let t1 = std::time::Instant::now();
-    let run = match svm_run::run_powerbox(&module, b"") {
+    // `SVM_STDIN=1` pipes the process's stdin to the guest (so a REPL guest can be driven).
+    let stdin_bytes: Vec<u8> = if std::env::var_os("SVM_STDIN").is_some() {
+        use std::io::Read;
+        let mut b = Vec::new();
+        std::io::stdin().read_to_end(&mut b).ok();
+        b
+    } else {
+        Vec::new()
+    };
+    let run = match svm_run::run_powerbox(&module, &stdin_bytes) {
         Ok(r) => r,
         Err(e) => {
             println!("RUN ERR: {e}");
