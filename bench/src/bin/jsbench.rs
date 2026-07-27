@@ -8,12 +8,20 @@
 //!   3. **specialized** — an *attempt* at the first Futamura projection (`specialize_module`): fold
 //!      the engine against its startup.
 //!
-//! **Finding (2026-07-18).** `svm_peval` does not help real-JS-via-QuickJS perf — it is a
-//! small-clean-kernel tool, and QuickJS (1176 funcs / ~250k insts) is neither. `specialize(_start)`
-//! **refuses in ~11 ms with `Unsupported`**: `_start` uses constructs outside the specializer's
-//! symbolic-execution subset (the powerbox ABI, `cap.call`/`call_indirect`, a real allocator's memory
-//! patterns), so it never reaches the point where a const JS region would matter. And `optimize_module`
-//! churns for **>8 min without completing** on a module this large — not a usable lever. By contrast the
+//! **Finding (2026-07-18, refined 2026-07-27).** `svm_peval` does not help real-JS-via-QuickJS perf —
+//! it is a small-clean-kernel tool, and QuickJS (1176 funcs / ~250k insts) is neither.
+//! `specialize(_start)` **refuses in ~10 ms with `Unsupported`**. Instrumenting the exact first
+//! refusal (a cfg(test) probe in `svm-peval`) pins the wall precisely: `_start` runs its
+//! const/store/`cap.self.resolve` prologue fine, then hits a **bulk-memory `MemFill`** (a `memset`,
+//! a shallow subset gap — residualizable) and, one step past that, a **dynamic-index `call_indirect`**
+//! through a *runtime-resolved capability funcref* (sig `(i64,i64,i64)->i64`). That indirect call is
+//! the real, **fundamental** wall: its callee is a runtime value, and a single-function inline residual
+//! carries no dispatch table (the implicit funcref table is the identity map over `funcs`, and the
+//! residual renumbers to one function) — so it cannot be specialized, only re-emitted, which would be
+//! unsound. It sits at the very entry (the powerbox capability ABI), so a const JS region is never
+//! reached. Sharper than "it's just big": QuickJS's host boundary is **dynamic dispatch from the first
+//! call**. And `optimize_module` churns for **>8 min without completing** on a module this large — not
+//! a usable lever. By contrast the
 //! toy register-machine Futamura bench (`svm-peval/tests/bench.rs`) folds the dispatch away for a ~5×
 //! JIT speedup. Partial-evaluating a *production* interpreter (runtime `malloc`/GC ⇒ pointer-dependent
 //! values) has poor binding-time separation — the classic obstacle. Real QuickJS speed comes from the
