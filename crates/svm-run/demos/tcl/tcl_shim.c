@@ -143,6 +143,169 @@ unsigned long strtoul(const char *s, char **end, int base) {
 long __isoc23_strtol(const char *s, char **end, int base) { return strtol(s, end, base); }
 unsigned long __isoc23_strtoul(const char *s, char **end, int base) { return strtoul(s, end, base); }
 
+/* --- address-taken string compares -----------------------------------------------------------
+ * The on-ramp synthesizes strcmp/strncmp/memcmp at *call* sites, so they have no funcref address.
+ * Tcl passes them **as function pointers** (comparators to `qsort`, `Tcl_LsearchObjCmd`, sort
+ * routines), so `&strcmp` needs a real body. A guest definition supplies both the calls and the
+ * address (it shadows the on-ramp's inline builtin). Same pattern as QuickJS's address-taken libm. */
+int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+int strncmp(const char *a, const char *b, size_t n) {
+    for (; n; n--, a++, b++) {
+        if (*a != *b)
+            return (int)(unsigned char)*a - (int)(unsigned char)*b;
+        if (!*a)
+            break;
+    }
+    return 0;
+}
+int memcmp(const void *a, const void *b, size_t n) {
+    const unsigned char *p = a, *q = b;
+    for (; n; n--, p++, q++)
+        if (*p != *q)
+            return (int)*p - (int)*q;
+    return 0;
+}
+
+/* --- address-taken / remaining string + mem ops ----------------------------------------------
+ * The on-ramp synthesizes these inline at call sites (no funcref address). Tcl stores several as
+ * struct function pointers — the encoding `lengthProc` is `&strlen`, filesystem tables hold
+ * `&strcpy`/`&strlen`, etc. — so each needs a real guest body. Providing them real (shadowing the
+ * inline synthesis) supplies both the calls and the addresses; the mem ops coexist with the
+ * `llvm.memcpy`/`memset` intrinsics (a distinct mechanism). */
+size_t strlen(const char *s) {
+    const char *p = s;
+    while (*p)
+        p++;
+    return (size_t)(p - s);
+}
+char *strcpy(char *dst, const char *src) {
+    char *d = dst;
+    while ((*d++ = *src++)) {
+    }
+    return dst;
+}
+char *strchr(const char *s, int c) {
+    for (;; s++) {
+        if (*s == (char)c)
+            return (char *)s;
+        if (!*s)
+            return 0;
+    }
+}
+char *strrchr(const char *s, int c) {
+    const char *last = 0;
+    for (;; s++) {
+        if (*s == (char)c)
+            last = s;
+        if (!*s)
+            return (char *)last;
+    }
+}
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = s;
+    for (; n; n--, p++)
+        if (*p == (unsigned char)c)
+            return (void *)p;
+    return 0;
+}
+void *memcpy(void *dst, const void *src, size_t n) {
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    while (n--)
+        *d++ = *s++;
+    return dst;
+}
+void *memmove(void *dst, const void *src, size_t n) {
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    if (d < s)
+        while (n--)
+            *d++ = *s++;
+    else
+        while (n--)
+            d[n] = s[n];
+    return dst;
+}
+void *memset(void *dst, int c, size_t n) {
+    unsigned char *d = dst;
+    while (n--)
+        *d++ = (unsigned char)c;
+    return dst;
+}
+size_t strspn(const char *s, const char *set) {
+    const char *p = s;
+    for (; *p; p++) {
+        const char *t = set;
+        while (*t && *t != *p)
+            t++;
+        if (!*t)
+            break;
+    }
+    return (size_t)(p - s);
+}
+size_t strcspn(const char *s, const char *set) {
+    const char *p = s;
+    for (; *p; p++)
+        for (const char *t = set; *t; t++)
+            if (*t == *p)
+                return (size_t)(p - s);
+    return (size_t)(p - s);
+}
+
+/* --- other string ops ------------------------------------------------------------------------- */
+char *strncpy(char *dst, const char *src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++)
+        dst[i] = src[i];
+    for (; i < n; i++)
+        dst[i] = 0;
+    return dst;
+}
+char *strcat(char *dst, const char *src) {
+    char *d = dst;
+    while (*d)
+        d++;
+    while ((*d++ = *src++)) {
+    }
+    return dst;
+}
+char *strncat(char *dst, const char *src, size_t n) {
+    char *d = dst;
+    while (*d)
+        d++;
+    while (n-- && *src)
+        *d++ = *src++;
+    *d = 0;
+    return dst;
+}
+char *strstr(const char *hay, const char *needle) {
+    if (!*needle)
+        return (char *)hay;
+    for (; *hay; hay++) {
+        const char *h = hay, *n = needle;
+        while (*h && *n && *h == *n) {
+            h++;
+            n++;
+        }
+        if (!*n)
+            return (char *)hay;
+    }
+    return 0;
+}
+char *strpbrk(const char *s, const char *set) {
+    for (; *s; s++)
+        for (const char *t = set; *t; t++)
+            if (*s == *t)
+                return (char *)s;
+    return 0;
+}
+
 /* --- case-insensitive string compares --------------------------------------------------------- */
 static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 int strcasecmp(const char *a, const char *b) {
@@ -373,6 +536,26 @@ int getnameinfo(const void *a, unsigned l, char *h, unsigned hl, char *s, unsign
     (void)f;
     return -1;
 }
+void *gethostbyname(const char *n) {
+    (void)n;
+    return 0;
+}
+void *gethostbyaddr(const void *a, unsigned l, int t) {
+    (void)a;
+    (void)l;
+    (void)t;
+    return 0;
+}
+void *getservbyname(const char *n, const char *p) {
+    (void)n;
+    (void)p;
+    return 0;
+}
+char *inet_ntoa(unsigned int in) {
+    (void)in;
+    static char buf[1] = "";
+    return buf;
+}
 
 /* --- extra filesystem surface (beyond the svm-posix caps) --------------------------------------
  * The `file` command's metadata mutators and `glob`'s directory walk. Unreached by the minimal REPL
@@ -446,6 +629,341 @@ int symlink(const char *a, const char *b) {
 int fcntl(int fd, int cmd, ...) {
     (void)fd;
     (void)cmd;
+    return 0;
+}
+
+/* --- qsort / bsearch -------------------------------------------------------------------------
+ * Pure-computation libc the on-ramp does not synthesize. Tcl calls `qsort` in the regex NFA
+ * compaction (`regc_nfa.c`) and the ensemble/TclOO command tables. Implemented as an in-place
+ * **heapsort** — O(n log n) worst case, no recursion-depth or pivot-degeneracy concerns, and no
+ * scratch allocation — over arbitrary element sizes with a byte-wise swap. The comparator is called
+ * through a function pointer (→ `call_indirect`). Linked into the guest *and* the native oracle (like
+ * the other shims), so the sort order is identical on both sides of the differential regardless of
+ * how each libc's own `qsort` breaks ties. */
+static void __bswap(unsigned char *a, unsigned char *b, size_t n) {
+    while (n--) {
+        unsigned char t = *a;
+        *a++ = *b;
+        *b++ = t;
+    }
+}
+void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+    unsigned char *a = (unsigned char *)base;
+    if (n < 2 || size == 0)
+        return;
+    /* Build a max-heap, then repeatedly extract the max to the end (sift-down heapsort). */
+    for (size_t start = n / 2; start-- > 0;) {
+        size_t root = start;
+        for (;;) {
+            size_t child = 2 * root + 1;
+            if (child >= n)
+                break;
+            if (child + 1 < n && cmp(a + child * size, a + (child + 1) * size) < 0)
+                child++;
+            if (cmp(a + root * size, a + child * size) >= 0)
+                break;
+            __bswap(a + root * size, a + child * size, size);
+            root = child;
+        }
+    }
+    for (size_t end = n; end-- > 1;) {
+        __bswap(a, a + end * size, size);
+        size_t root = 0;
+        for (;;) {
+            size_t child = 2 * root + 1;
+            if (child >= end)
+                break;
+            if (child + 1 < end && cmp(a + child * size, a + (child + 1) * size) < 0)
+                child++;
+            if (cmp(a + root * size, a + child * size) >= 0)
+                break;
+            __bswap(a + root * size, a + child * size, size);
+            root = child;
+        }
+    }
+}
+void *bsearch(const void *key, const void *base, size_t n, size_t size,
+              int (*cmp)(const void *, const void *)) {
+    const unsigned char *a = (const unsigned char *)base;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = cmp(key, a + mid * size);
+        if (c < 0)
+            hi = mid;
+        else if (c > 0)
+            lo = mid + 1;
+        else
+            return (void *)(a + mid * size);
+    }
+    return 0;
+}
+
+/* --- strerror --------------------------------------------------------------------------------
+ * Tcl's `Tcl_ErrnoMsg` maps errno → message for its error results. A compact table of the common
+ * values (the ones the fs/exec/socket stubs and the posix caps produce); anything else gets a
+ * generic string. Linked into guest + oracle, so the messages agree on both sides of the
+ * differential. */
+char *strerror(int e) {
+    static char unknown[] = "Unknown error";
+    switch (e) {
+    case 0:
+        return (char *)"Success";
+    case 1:
+        return (char *)"Operation not permitted";
+    case 2:
+        return (char *)"No such file or directory";
+    case 9:
+        return (char *)"Bad file descriptor";
+    case 12:
+        return (char *)"Cannot allocate memory";
+    case 13:
+        return (char *)"Permission denied";
+    case 17:
+        return (char *)"File exists";
+    case 20:
+        return (char *)"Not a directory";
+    case 21:
+        return (char *)"Is a directory";
+    case 22:
+        return (char *)"Invalid argument";
+    case 28:
+        return (char *)"No space left on device";
+    case 38:
+        return (char *)"Function not implemented";
+    default:
+        return unknown;
+    }
+}
+
+/* --- ctype tables (glibc `__ctype_*_loc` ABI) ------------------------------------------------
+ * Tcl's tokenizer/`expr`/`string` use the `<ctype.h>` `isalpha`/`isdigit`/`isspace`/… macros,
+ * which glibc expands to `(*__ctype_b_loc())[c] & _ISbit`. The tables + accessors below are the
+ * glibc ABI (bits/ctype-info.h `_ISbit` values), reused verbatim from `../postgres/libc_shim.c`
+ * (differentially validated there over every byte 0..255). A guest def shadows the on-ramp's
+ * trap stub; both guest and oracle link it, so classification agrees on both sides. */
+static const unsigned short shim_ctype_b[384] = {
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0002, 0x0002, 0x0002, 0x0002,
+  0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x2003, 0x2002, 0x2002, 0x2002, 0x2002, 0x0002, 0x0002,
+  0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002,
+  0x0002, 0x0002, 0x0002, 0x0002, 0x6001, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004,
+  0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xd808, 0xd808, 0xd808, 0xd808,
+  0xd808, 0xd808, 0xd808, 0xd808, 0xd808, 0xd808, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004,
+  0xc004, 0xd508, 0xd508, 0xd508, 0xd508, 0xd508, 0xd508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508,
+  0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508, 0xc508,
+  0xc508, 0xc508, 0xc508, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xc004, 0xd608, 0xd608, 0xd608,
+  0xd608, 0xd608, 0xd608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608,
+  0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc608, 0xc004,
+  0xc004, 0xc004, 0xc004, 0x0002, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+  0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+};
+static const int shim_ctype_tolower[384] = {
+  -128, -127, -126, -125, -124, -123, -122, -121, -120, -119, -118, -117,
+  -116, -115, -114, -113, -112, -111, -110, -109, -108, -107, -106, -105,
+  -104, -103, -102, -101, -100, -99, -98, -97, -96, -95, -94, -93,
+  -92, -91, -90, -89, -88, -87, -86, -85, -84, -83, -82, -81,
+  -80, -79, -78, -77, -76, -75, -74, -73, -72, -71, -70, -69,
+  -68, -67, -66, -65, -64, -63, -62, -61, -60, -59, -58, -57,
+  -56, -55, -54, -53, -52, -51, -50, -49, -48, -47, -46, -45,
+  -44, -43, -42, -41, -40, -39, -38, -37, -36, -35, -34, -33,
+  -32, -31, -30, -29, -28, -27, -26, -25, -24, -23, -22, -21,
+  -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9,
+  -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3,
+  4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+  16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+  28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+  52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+  64, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
+  108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
+  120, 121, 122, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+  112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+  124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135,
+  136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147,
+  148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
+  160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+  172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183,
+  184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
+  196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207,
+  208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+  220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231,
+  232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243,
+  244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255
+};
+static const int shim_ctype_toupper[384] = {
+  -128, -127, -126, -125, -124, -123, -122, -121, -120, -119, -118, -117,
+  -116, -115, -114, -113, -112, -111, -110, -109, -108, -107, -106, -105,
+  -104, -103, -102, -101, -100, -99, -98, -97, -96, -95, -94, -93,
+  -92, -91, -90, -89, -88, -87, -86, -85, -84, -83, -82, -81,
+  -80, -79, -78, -77, -76, -75, -74, -73, -72, -71, -70, -69,
+  -68, -67, -66, -65, -64, -63, -62, -61, -60, -59, -58, -57,
+  -56, -55, -54, -53, -52, -51, -50, -49, -48, -47, -46, -45,
+  -44, -43, -42, -41, -40, -39, -38, -37, -36, -35, -34, -33,
+  -32, -31, -30, -29, -28, -27, -26, -25, -24, -23, -22, -21,
+  -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9,
+  -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3,
+  4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+  16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+  28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+  52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+  64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+  76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87,
+  88, 89, 90, 91, 92, 93, 94, 95, 96, 65, 66, 67,
+  68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+  80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 123,
+  124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135,
+  136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147,
+  148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
+  160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+  172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183,
+  184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
+  196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207,
+  208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+  220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231,
+  232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243,
+  244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255
+};
+
+/* Each pointer is initialized *at load time* to element 128 (code point 0) of its table — a
+ * compile-time-constant address, so no initializer function runs in the guest. */
+static const unsigned short *shim_ctype_b_ptr = shim_ctype_b + 128;
+static const int *shim_ctype_tolower_ptr = shim_ctype_tolower + 128;
+static const int *shim_ctype_toupper_ptr = shim_ctype_toupper + 128;
+
+const unsigned short **__ctype_b_loc(void) { return &shim_ctype_b_ptr; }
+const int **__ctype_tolower_loc(void) { return &shim_ctype_tolower_ptr; }
+const int **__ctype_toupper_loc(void) { return &shim_ctype_toupper_ptr; }
+
+/* --- POSIX file/dir surface (benign, not reached by the minimal REPL) ------------------------
+ * These are compiled into Tcl's channel/filesystem layer but unreached without `Tcl_Init` /
+ * `file`/`glob`/`open`. Real file I/O would bind the svm-posix caps at load; here they return clean
+ * errors so any use is a Tcl error, and — crucially — a **defined** function rather than a trap
+ * stub, so Tcl's startup channel probing never faults. `read`/`write` on the standard channels are
+ * the recognized `Stream` capability (not stubbed). */
+int open(const char *p, int flags, ...) {
+    (void)p;
+    (void)flags;
+    return -1;
+}
+int close(int fd) {
+    (void)fd;
+    return 0;
+}
+long lseek(int fd, long off, int whence) {
+    (void)fd;
+    (void)off;
+    (void)whence;
+    return -1;
+}
+int fstat(int fd, void *buf) {
+    (void)fd;
+    (void)buf;
+    return -1; /* not stat-able; Tcl's channel layer tolerates a failed fstat on a stream */
+}
+int stat(const char *p, void *buf) {
+    (void)p;
+    (void)buf;
+    return -1;
+}
+char *getcwd(char *buf, size_t n) {
+    if (buf && n) {
+        buf[0] = '/';
+        if (n > 1)
+            buf[1] = 0;
+    }
+    return buf;
+}
+int chdir(const char *p) {
+    (void)p;
+    return -1;
+}
+void *opendir(const char *p) {
+    (void)p;
+    return 0;
+}
+void *readdir(void *d) {
+    (void)d;
+    return 0;
+}
+int closedir(void *d) {
+    (void)d;
+    return 0;
+}
+int unlink(const char *p) {
+    (void)p;
+    return -1;
+}
+void *fdopen(int fd, const char *m) {
+    (void)fd;
+    (void)m;
+    return 0;
+}
+int mkstemp(char *t) {
+    (void)t;
+    return -1;
+}
+int mkstemps(char *t, int s) {
+    (void)t;
+    (void)s;
+    return -1;
+}
+int mkfifo(const char *p, unsigned m) {
+    (void)p;
+    (void)m;
+    return -1;
+}
+int mknod(const char *p, unsigned m, unsigned long d) { /* dev_t is 64-bit */
+    (void)p;
+    (void)m;
+    (void)d;
+    return -1;
+}
+int utime(const char *p, const void *t) {
+    (void)p;
+    (void)t;
+    return -1;
+}
+int select(int n, void *r, void *w, void *e, void *t) {
+    (void)n;
+    (void)r;
+    (void)w;
+    (void)e;
+    (void)t;
+    return 0;
+}
+void *fts_open(char *const *p, int o, void *c) {
+    (void)p;
+    (void)o;
+    (void)c;
+    return 0;
+}
+void *fts_read(void *f) {
+    (void)f;
+    return 0;
+}
+int fts_close(void *f) {
+    (void)f;
     return 0;
 }
 

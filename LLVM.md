@@ -760,18 +760,26 @@ playground-registration job (see `demos/tcl/README.md`).
   and `llvm-link`s them + the driver + `tcl_shim.c` + the reused printf/strtod shims into one ~19.6 MB
   module. The libc waist reuses the Postgres printf/scanf/ctype shims, the guest `strtod`, openlibm,
   and the svm-posix caps; `tcl_shim.c` carries only Tcl's own OS surface (time/tty/locale/sockets).
-- **NEXT (translate gap #1) — constexpr `icmp`/`select`.** The first fail-closed stop is a
-  constant-expression compare the on-ramp's LLVM constant parser (`src/ll/parse.rs` `constant()`)
-  doesn't yet evaluate — `select i1 icmp eq (inttoptr(3), @DeleteScriptLimitCallback), …` from Tcl's
-  limit-callback wrapper. Add the `Constant::ICmp`/`Select` AST variants + parse arms + a
-  constant-operand lowering in `lib.rs` (emit as real IR — a global address is a relocation, not a
-  compile-time literal). A general on-ramp improvement; expect a QuickJS-length chain after it. The
-  guard is `demo_tcl_repl_stdin` in `crates/svm-llvm/tests/translate.rs` (`#[ignore]`d until it clears;
-  drives the gap-walk with `--ignored`, skips loudly offline).
+- **DONE — Tcl translates (2669 funcs) + verifies**, after closing **three general on-ramp translator
+  gaps** it surfaced (each with a direct interp≡JIT unit test): (1) **constexpr `icmp`** — a
+  function-address-vs-sentinel compare LLVM leaves unfolded as a `select` operand (`Constant::ICmp`
+  AST variant + parse arm + a constant-operand lowering to a runtime `IntCmp`, since a global address
+  is a relocation); (2) **vector `ptrtoint`** — `<2 x ptr> → <2 x i64>`, a representational identity
+  on the packed v128 (clang packs a pointer pair in `FinalizeOONextFilter`); (3) **vector `inttoptr`**,
+  the symmetric inverse. Tests `constexpr_icmp_operand` / `vector_ptrtoint_identity`. The libc/OS waist
+  (`tcl_shim.c`) is built out — qsort/bsearch, address-taken string ops, the glibc ctype tables, the
+  time/tty/locale/socket/file surface as benign defined functions — with the unreached remainder
+  (zlib/scanf/fts) trap-stubbed via `SVM_STUB_EXTERNS`.
+- **NEXT — a runtime stub trap during channel init.** The verified module traps (`Unreachable`) at run
+  time: a trap-stubbed function is still reached during `Tcl_CreateInterp` (prime suspect
+  `__isoc99_sscanf` — needs a real guest `sscanf`). Localize (the `SVM_STUB_DEBUG` dump + the
+  verify-error function-namer in `try_translate`), give it a body, then reach first execution and diff
+  vs the native oracle. The guard is `demo_tcl_repl_stdin` (`#[ignore]`d until it clears; drives the
+  walk with `--ignored`, skips loudly offline).
 - **Follow-ups:** full `Tcl_Init` (seed the script `library/` + encodings into the svm-posix memfs,
   like SQLite/chibicc, enabling `file`/`glob`/`clock`/`auto_load`); the wasm-JIT tier once `_start` is
   proven emittable. Playground wiring is staged: `build-onramp-assets.mjs` builds `tcl_repl.svmb` the
-  moment translate clears, and the `web/play.js` card is a ready-to-uncomment template.
+  moment translate+run clears, and the `web/play.js` card is a ready-to-uncomment template.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

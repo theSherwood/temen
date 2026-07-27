@@ -89,27 +89,44 @@ for s in "postgres/printf_shim:_printf" "strtod/strtod:_strtod"; do
   src="$DEMOS/${s%%:*}.c"; tag="${s##*:}"
   clang "${CF[@]}" "$src" -o "$OUT/$tag.ll" 2>/dev/null || echo "  note: optional shim ${s%%:*} skipped"
 done
-# Guest openlibm, if staged (Tcl's expr math: sin/cos/pow/sqrt/... — the QuickJS slice CO mechanism).
-if [ -n "${OPENLIBM_DIR:-}" ] && [ -d "$OPENLIBM_DIR/src" ]; then
-  for f in "$OPENLIBM_DIR"/src/*.c; do
-    b=$(basename "$f" .c)
-    clang "${CF[@]}" "-I$OPENLIBM_DIR" "-I$OPENLIBM_DIR/include" "-I$OPENLIBM_DIR/src" \
-      "-I$OPENLIBM_DIR/amd64" "$f" -o "$OUT/libm_$b.ll" 2>/dev/null || true
+# Guest openlibm — Tcl's `expr` math (sin/cos/pow/sqrt/… address-taken in the math-function table, the
+# QuickJS slice CO mechanism). Fetch to a cache if OPENLIBM_DIR is unset; compile the **curated** set
+# (the QuickJS `OPENLIBM_SRCS` + Tcl's frexp/modf/hypot/log1p extras), not a glob (many openlibm TUs
+# need asm/aren't on this path).
+OL="${OPENLIBM_DIR:-$CACHE/openlibm-0.8.5}"
+if [ ! -f "$OL/src/e_log.c" ]; then
+  echo "fetching openlibm 0.8.5 …"
+  curl -sfL --max-time 120 -o "$CACHE/openlibm.tgz" \
+    "https://github.com/JuliaMath/openlibm/archive/refs/tags/v0.8.5.tar.gz" \
+    && tar xf "$CACHE/openlibm.tgz" -C "$CACHE" 2>/dev/null || true
+fi
+if [ -f "$OL/src/e_log.c" ]; then
+  OLSRCS="e_log e_log10 e_log2 e_exp s_exp2 e_pow s_sin s_cos s_tan k_sin k_cos k_tan
+          e_rem_pio2 k_rem_pio2 e_asin e_acos s_atan e_atan2 e_sinh e_cosh s_tanh s_cbrt
+          e_fmod s_scalbn s_copysign s_fabs k_exp s_expm1
+          e_hypot s_frexp s_modf s_asinh s_log1p s_round s_rint s_ceil s_floor s_trunc"
+  n=0
+  for b in $OLSRCS; do
+    [ -f "$OL/src/$b.c" ] || continue
+    clang "${CF[@]}" "-I$OL" "-I$OL/include" "-I$OL/src" "-I$OL/amd64" \
+      "$OL/src/$b.c" -o "$OUT/libm_$b.ll" 2>/dev/null && n=$((n+1)) || true
   done
-  echo "openlibm: $(ls "$OUT"/libm_*.ll 2>/dev/null | wc -l) TUs"
+  echo "openlibm: $n TUs"
 else
-  echo "note: OPENLIBM_DIR unset — libm transcendentals will surface as undefined at resolve"
+  echo "note: openlibm unavailable — libm transcendentals will surface as undefined at resolve"
 fi
 
-echo "=== [6/6] llvm-link → translate through the on-ramp (expect a fail-closed gap) ==="
+echo "=== [6/6] llvm-link → translate through the on-ramp ==="
 LINKED="$CACHE/tcl_linked.ll"
 llvm-link -S "$OUT"/*.ll -o "$LINKED" 2>"$CACHE/llvm-link.err" \
   || { echo "LINK FAILED:"; tail -5 "$CACHE/llvm-link.err"; exit 15; }
 echo "linked: $(stat -c%s "$LINKED") bytes → $LINKED"
 TR="$HERE/../../../svm-llvm/target/release/examples/try_translate"
 if [ -x "$TR" ]; then
-  echo "first gap (if any):"
-  "$TR" "$LINKED" 2>&1 | head -5
+  # `SVM_STUB_EXTERNS=1`: trap-stub the OS surface unreached by the minimal REPL (zlib/scanf/fts) so
+  # the big program translates; the translator fixes (constexpr icmp, vector ptrtoint) are folded in.
+  echo "translate + verify (a runtime stub trap during channel init is the current frontier):"
+  SVM_STUB_EXTERNS=1 "$TR" "$LINKED" 2>&1 | grep -v '\[stub\]' | head -5
 else
   echo "note: build the translator first:  (cd crates/svm-llvm && cargo build --release --example try_translate)"
 fi

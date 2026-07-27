@@ -51,8 +51,8 @@ of Tcl's 192 external symbols goes. **Nothing here is baked into the TCB.**
 
 ## Progress — the gap-walk record
 
-The build is **validated** through link; the on-ramp translate walks the fail-closed chokepoint
-one gap at a time (the Postgres/QuickJS workflow). Status:
+The build is **validated** through link, and Tcl now **translates (2669 funcs) and verifies**. The
+walk (Postgres/QuickJS workflow) so far:
 
 **DONE — native oracle + minimal embedding proven.** `tcl_repl.c` linked against the native
 `libtcl8.6.a` runs the whole language core with **no `Tcl_Init` and no filesystem** —
@@ -63,29 +63,37 @@ all correct (`puts` works too, via Tcl's stdout channel over the `write` cap). T
 **DONE — faithful whole-program bitcode.** `build_bitcode.sh` configures Tcl
 (`--disable-shared --disable-threads --disable-load`), builds the native oracle, and compiles all
 **162 core TUs** to LLVM IR with the Makefile's own flags, `llvm-link`-ing them + the driver +
-`tcl_shim.c` + the reused printf/strtod shims into one ~19.6 MB textual module that the on-ramp
-ingests.
+`tcl_shim.c` + openlibm + the reused printf/strtod shims into one ~19.9 MB textual module.
 
-**NEXT (translate gap #1) — constexpr `icmp` / `select`.** The first fail-closed stop is a
-constant-expression comparison the on-ramp's LLVM constant parser doesn't yet evaluate:
+**DONE — three on-ramp translator gaps closed (general fixes, not Tcl-specific):**
+1. **Constexpr `icmp`** — `tclInterp.c`'s limit-callback wrapper emits
+   `select i1 icmp eq (ptr inttoptr (i64 3 to ptr), ptr @DeleteScriptLimitCallback), …` (a
+   function-address-vs-sentinel compare LLVM left unfolded). Added the `Constant::ICmp` AST variant
+   + parser arm, lowered at the constant-operand site as a runtime `IntCmp` (a global address is a
+   relocation, not a compile-time literal). Test `constexpr_icmp_operand` (interp ≡ JIT).
+2. **Vector `ptrtoint`** — `FinalizeOONextFilter` (TclOO) packs a pointer pair:
+   `load <2 x ptr>` → `ptrtoint <2 x ptr> to <2 x i64>` → `trunc → <2 x i32>`. Pointers are i64
+   lanes, so the ptrtoint is a representational identity on the packed v128. Test
+   `vector_ptrtoint_identity` (interp ≡ JIT).
+3. **Vector `inttoptr`** — the inverse identity, added symmetrically.
 
-```llvm
-; tclInterp.c, DeleteScriptLimitCallback wrapper — a function-pointer-vs-sentinel compare
-; LLVM left unfolded as a constexpr operand of an instruction-level `select`:
-%39 = select i1 icmp eq (ptr inttoptr (i64 3 to ptr), ptr @DeleteScriptLimitCallback),
-             ptr @WrapFree, ptr @DeleteScriptLimitCallback
-```
+**DONE — the libc/OS waist.** `tcl_shim.c` now provides qsort/bsearch (heapsort), the string/mem
+ops the on-ramp doesn't synthesize *and* the address-taken ones (`&strcmp`/`&strlen` stored as
+comparators / encoding `lengthProc`), the glibc ctype tables (reused from `../postgres`), strerror,
+and the full time/tty/locale/socket/process/file surface — all as **defined** functions (benign
+errors where out of MVP scope), so nothing faults on a signature or a missing body. Address-taken
+libm resolves via linked openlibm. Genuinely-unreached leftovers (zlib, `__isoc99_sscanf`, `fts`)
+are trap-stubbed via `SVM_STUB_EXTERNS` — never called on the eval path.
 
-`src/ll/parse.rs`'s `constant()` handles constexpr conversions/binops/`getelementptr`/aggregates
-but not `icmp`/`fcmp`/`select`. Closing it means: add the `Constant::ICmp`/`Select` AST variants
-+ parse arms, and lower them at the constant-operand site in `lib.rs` (emit the compare as real IR,
-since a global-address operand is a relocation, not a compile-time literal). This is a general
-on-ramp improvement, not Tcl-specific. Expect further gaps after it (the QuickJS port closed ~a
-dozen); the `demo_tcl_repl_stdin` test is `#[ignore]`d until the chain clears.
+**NEXT — a runtime stub trap during channel init.** With stubbing on, the module translates +
+verifies, then traps (`Unreachable`) at run time: a trap-stubbed function is still reached during
+`Tcl_CreateInterp`'s channel/encoding setup (prime suspect `__isoc99_sscanf`, which needs a real
+guest `sscanf` — the Postgres `scanf_shim.c` doesn't compile standalone). Localize it (the
+`SVM_STUB_DEBUG` dump lists the stubbed set; `try_translate` names a mismatching function on a
+verify error), give it a real/benign body, then reach first execution.
 
-**THEN — resolve-stage waist + byte-identical output.** Once translate clears, the load stage
-reports the undefined-symbol set; grow `tcl_shim.c` / stage openlibm / trap-stub uncalled zlib
-until it resolves, then diff stdout against the native oracle over a language-breadth script.
+**THEN — byte-identical output.** Diff guest stdout against the native `tcl_repl` oracle over a
+language-breadth script (`demo_tcl_repl_stdin`, currently `#[ignore]`d).
 
 ## Follow-ups (beyond the minimal REPL)
 
