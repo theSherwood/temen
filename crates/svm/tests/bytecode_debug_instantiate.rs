@@ -189,3 +189,115 @@ fn instantiate_child_tick_replays_deterministically() {
         "replay reproduced the instantiate child's position"
     );
 }
+
+// --- Depth-2 nesting (slice 15c) -----------------------------------------------------------------
+// Confinement composes to depth 2 under the scheduled debugger: the root (func 0) instantiates a child
+// (func 1) in a 4 KiB window at 64 KiB; the child, handed an `Instantiator` over *its* window, itself
+// instantiates a grandchild (func 2) in a 1 KiB window at its own offset 2048. Each joins the next; the
+// grandchild returns 77, propagated up. Same fixture as `bytecode_instantiate.rs::DEPTH_TWO`.
+const DEPTH_TWO: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 12
+  v4 = i64.const 0
+  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 0
+  v3 = i32.const 171
+  i32.store8 v2 v3
+  v4 = i64.const 2
+  v5 = i64.const 2048
+  v6 = i64.const 10
+  v7 = i64.const 0
+  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
+  v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
+  return v9
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i32.const 200
+  i32.store8 v1 v2
+  v3 = i64.const 77
+  return v3
+  }
+}
+"#;
+
+fn depth_two_session() -> ScheduledDebugRun {
+    let m = parse_module(DEPTH_TWO).expect("parse");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 128 << 10);
+    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(inst)], host)
+        .expect("scheduled debug engine drives depth-2 instantiate")
+}
+
+/// Nested `instantiate` composes to depth 2 under the scheduled debugger and matches the oracle — a
+/// confined child (`env = Some(k)`) itself carves a grandchild env within its own window.
+#[test]
+fn depth_two_instantiate_matches_the_oracle() {
+    let mut r = depth_two_session();
+    let mut fuel = 5_000_000u64;
+    let res = drive_to_end(&mut r, &mut fuel);
+    assert_eq!(res, Ok(vec![Value::I64(77)]), "grandchild returns 77");
+
+    let m = parse_module(DEPTH_TWO).unwrap();
+    let mut h_bc = Host::new();
+    let inst_bc = h_bc.grant_instantiator(0, 128 << 10);
+    let mut f_bc = 5_000_000u64;
+    let bc =
+        bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(inst_bc)], &mut f_bc, &mut h_bc)
+            .expect("bytecode engine drives depth-2 instantiate");
+    assert_eq!(
+        bc.clone().map_err(|_| ()),
+        res,
+        "debug run ≡ production bytecode"
+    );
+
+    let mut h_tw = Host::new();
+    let inst_tw = h_tw.grant_instantiator(0, 128 << 10);
+    let mut f_tw = 5_000_000u64;
+    let tw = run_with_host(&m, 0, &[Value::I32(inst_tw)], &mut f_tw, &mut h_tw);
+    assert_eq!(tw, bc, "bytecode ≡ tree-walker");
+}
+
+/// A breakpoint in the **grandchild** fires on its own distinct vCPU (task 2), and `read_window` reads
+/// the grandchild's confined window (its marker 200), not the child's (171) or the shared window's (0)
+/// — three distinct confined windows nested two deep.
+#[test]
+fn breakpoint_in_a_grandchild_fires() {
+    let mut r = depth_two_session();
+    // The grandchild (func 2) is `const 0` (inst 0), `const 200` (inst 1), `store8` (inst 2), … — so
+    // stop at inst 3, just after the store, when its marker is in its window.
+    let after_store = IrPc {
+        module: 0,
+        func: 2,
+        block: 0,
+        inst: 3,
+    };
+    r.set_breakpoints(vec![after_store]);
+    let mut fuel = 5_000_000u64;
+    match r.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, .. } => assert_eq!(pc, after_store, "stopped in the grandchild"),
+        other => panic!("expected a grandchild breakpoint, got {other:?}"),
+    }
+    let gc = r.stopped_task().expect("stopped");
+    assert_ne!(gc, 0, "grandchild is a distinct vCPU");
+    assert!(r.select_task(gc));
+    assert_eq!(r.frame_pc(0), Some(after_store));
+    assert_eq!(
+        r.read_window(0, 1).unwrap(),
+        vec![200u8],
+        "reads the grandchild's own confined window (marker 200)"
+    );
+    assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(77)]));
+}
