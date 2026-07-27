@@ -717,8 +717,21 @@ static int run_if(char *line) {
 
 /* Top-level line dispatch: an `if …` line runs the conditional construct, everything else is a
    command list. */
+/* Strip an unquoted `#` comment (bash's word-start rule): a `#` at line start or after whitespace
+   begins a comment to end-of-line; a `#` mid-word (`a#b`) is kept. Truncates `line` in place. */
+static void strip_comment(char *line) {
+  for (int i = 0; line[i]; i++) {
+    if (line[i] == '#' && (i == 0 || line[i - 1] == ' ' || line[i - 1] == '\t')) {
+      line[i] = 0;
+      return;
+    }
+  }
+}
+
 static int run_top(char *line) {
+  strip_comment(line);
   char *t = ltrim(line);
+  if (*t == 0) return last_status; /* a blank or comment-only line is a no-op; `$?` is unchanged */
   if (kw_is(t, "if")) return run_if(t);
   return run_list(line);
 }

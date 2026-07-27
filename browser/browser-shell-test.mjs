@@ -37,9 +37,10 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 // The script exercises the read-eval loop, $VAR expansion, a redirect+cat over the memfs, a
 // `cat | grep` pipeline, and an if/test conditional — the Stage-0 shell surface the card advertises.
 const SCRIPT =
+  '# a comment line — ignored\n' +
   'echo hello from the sandbox\n' +
   'N=world\n' +
-  'echo hi $N\n' +
+  'echo hi $N   # an inline comment\n' +
   'echo apple > fruits\n' +
   'echo banana >> fruits\n' +
   'cat fruits | grep a\n' +
