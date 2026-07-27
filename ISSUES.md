@@ -1158,6 +1158,13 @@ openlibm fetchable again.
 
 ### I42 — the Doom example vanished from the published playground: its single WAD mirror started 404ing, and every layer swallowed it (S3) — surfaced 2026-07-24 by `fetch ./assets/doom.svmb: 404` in production — **FIX LANDED** (`claude/doom-asset-generation-6zi7k6`)
 
+**Root cause retired (2026-07-27):** the shareware `doom1.wad` is now **vendored in-tree**
+(`crates/svm-run/demos/doom/doom1.wad`, v1.9, md5 `f0cefca49926d00903cf57551d901abe`) and staged
+directly — no WAD fetch, so no mirror can drop it. `build-onramp-assets.mjs`'s `ensureWad()`/`WAD_MIRRORS`
+are gone. The `--site` reachability gate (I49) now *requires* `doom1.wad` (removed from
+`MAY_BE_ABSENT`); only `doom.svmb` (id's engine source, still fetched-and-built) stays fail-soft. The
+mirror-list fix below is the prior, superseded mitigation.
+
 **Where:** `browser/build-onramp-assets.mjs` → `ensureWad()`. The shareware IWAD was fetched from a
 **single** URL, `https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad`, which now returns
 **404** (verified 2026-07-24). `curl -sfL` is silent, the `catch` was empty, and the loop had exactly

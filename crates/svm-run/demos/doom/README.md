@@ -10,8 +10,29 @@ it draws into, and `w_file_stdc.c` reads the WAD through stock C file I/O. That 
 capabilities the playground already exposes (slices 1–3a): `display` out, `keyboard` in, the `fs`
 capability for the WAD, and a persistent multi-MB heap for Doom's zone allocator.
 
+## The vendored WAD (`doom1.wad`)
+
+The game data — **`doom1.wad`** — is **vendored in this directory** rather than fetched at build
+time. It is id Software's **DOOM shareware IWAD, v1.9** (`md5 f0cefca49926d00903cf57551d901abe`,
+4,196,020 bytes), the "Knee-Deep in the Dead" shareware episode id released for **free redistribution**.
+It is proprietary id Software content, not open-source — redistributed here under id's shareware terms
+(unmodified, non-commercial), the same basis on which Debian ships it as `doom-wad-shareware`. Only the
+shareware WAD is vendored; the retail/Ultimate/Doom II IWADs are **not** redistributable and must never
+be committed here.
+
+Why vendored: fetching it from third-party mirrors caused a recurring "the mirror died, the fail-soft
+build swallowed it, the playground silently shipped without Doom" outage (`ISSUES.md` I42/I43).
+Vendoring makes the WAD always reachable — `build-onramp-assets.mjs` stages this file directly, no
+network. Only the *engine* module (`doom.svmb`, built from doomgeneric's source by `fetch.sh` +
+`build.sh`) still needs the toolchain and stays fail-soft. To regenerate/verify the WAD, its canonical
+source is the shareware v1.9 IWAD (e.g. `raw.githubusercontent.com/Akbar30Bill/DOOM_wads`); check the
+md5 above.
+
 ## What's here
 
+- **`doom1.wad`** — the vendored shareware IWAD (above); the browser opens the reactor over it via the
+  `fs` capability, and the `svm-run` diff/reactor tests read it (default `/tmp/doomgeneric_cache`,
+  overridable via `DOOM_WAD` — point it at this file to run them without a fetch).
 - **`doomgeneric_svm.c`** — the platform layer (real, compiles against doomgeneric's headers). `DG_*`
   onto the caps: `DG_DrawFrame` swizzles the XRGB `DG_ScreenBuffer` to RGBA and presents it through
   `display`; `DG_GetKey` polls `keyboard` (browser keyCodes → Doom key codes); `DG_GetTicksMs` is a

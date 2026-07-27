@@ -37,21 +37,21 @@ const ASSETS_REL = 'browser/web/assets';
 // they pass the PR gate by being git-tracked.
 const BUILT_AT_DEPLOY = new Set([
   'gpu_shader.svmb',      // build-onramp-assets.mjs
-  'doom.svmb',            // build-onramp-assets.mjs (fetches shareware WAD)
-  'doom1.wad',            // build-onramp-assets.mjs
+  'doom.svmb',            // build-onramp-assets.mjs (id's DOOM source is fetched-and-built)
+  'doom1.wad',            // build-onramp-assets.mjs — staged from the vendored demos/doom/doom1.wad
   'lua_eval.svmb',        // build-onramp-assets.mjs (fetches Lua source)
   'sqlite_repl.svmb',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
 ]);
 
-// The subset of deploy-built assets allowed to be absent even in the assembled site, because they
-// depend on an external resource we don't control (the DOOM shareware IWAD mirrors — see ISSUES.md
-// I42/I43). A missing one degrades to a "build hint" card rather than blocking the whole deploy.
-// Everything else referenced by play.js MUST be present in the published site.
+// The subset of deploy-built assets allowed to be absent even in the assembled site. Only doom.svmb:
+// its module build fetches id Software's DOOM source and needs the toolchain, so it can legitimately
+// be skipped (the card degrades to a build hint). The WAD it pairs with is NOT here — doom1.wad is
+// vendored in-tree (demos/doom/doom1.wad) and staged unconditionally, so it is always reachable
+// (retiring the dead-mirror class, ISSUES.md I42/I43). Every other referenced asset MUST be present.
 const MAY_BE_ABSENT = new Set([
   'doom.svmb',
-  'doom1.wad',
 ]);
 
 function referencedAssets() {
