@@ -16,6 +16,11 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **ci.yml** (2026-07-27): the real-Chromium browser step stages the committed
+  `browser/tests/fixtures/shell.svmb` into `web/assets/` and runs
+  `node browser-shell-test.mjs` — the `svm-posix` shell playground card driven
+  through `svm_run_shell` (STAGE1.md). Skips cleanly if the asset is absent.
+
 - **ci.yml** (2026-07-24): `check` job gains `env: CARGO_PROFILE_TEST_DEBUG: "0"` — the I30
   linker-OOM runner deaths recurred twice on PR #427 *with* the `-j 2` cap (sightings 4-5);
   dropping test-profile debug info removes the dominant per-link memory term. See ISSUES.md I30.
@@ -33,5 +38,12 @@ identical until the next agent edit.
   C-compiler card's compile-and-run assertion instead of SKIPping it. Fail-soft: a build hiccup
   degrades to a SKIP, never a red build (the test guards on `web/assets/chibicc.svmb` existing).
   See PR #441 / SELFHOST_C.md §7 step 5.
+- **ci.yml + pages.yml** (2026-07-27): playground-asset reachability gate (ISSUES.md I26/I42/I49).
+  New `ci.yml` job **`playground-assets`** runs `node browser/check-play-assets.mjs` on every PR —
+  every asset `web/play.js` references must be committed or declared deploy-built, else red (cheap,
+  no toolchain). `pages.yml` gains a **`verify playground assets reachable`** step (after `assemble
+  site`, before `upload-pages-artifact`) running the script in `--site` mode against `_site`, so a
+  fail-soft asset build dropping a required asset goes red *before* the site publishes instead of
+  shipping a silent 404. Both are driven from `play.js`, so new demo cards are covered automatically.
 
 Remove entries from this list when they land in `.github/workflows/`.

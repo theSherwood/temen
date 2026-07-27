@@ -73,6 +73,18 @@ jobs:
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
+  # Guard against the I26/I42/I49 class: a play.js demo card referencing an asset that isn't shipped
+  # (neither committed under browser/web/assets/ nor declared deploy-built) → the card 404s. Cheap,
+  # no toolchain (Node is preinstalled) — the required set is derived from web/play.js, so new cards
+  # are covered automatically. The complementary "is every required asset actually assembled into the
+  # published site" check runs at deploy time in pages.yml (--site mode).
+  playground-assets:
+    name: playground assets accounted for
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: node browser/check-play-assets.mjs
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -432,6 +444,11 @@ jobs:
           node browser-jit-reactor-test.mjs
           node browser-play-editor-test.mjs
           node pg-reload-test.mjs
+          # The svm-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
+          # then drive `svm_run_shell` in real Chromium and assert the script's stdout. The test
+          # skips cleanly if the asset is absent, so the copy is what makes it actually run.
+          cp tests/fixtures/shell.svmb web/assets/shell.svmb
+          node browser-shell-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs

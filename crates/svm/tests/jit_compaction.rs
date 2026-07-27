@@ -43,6 +43,7 @@ fn compile_reserved(m: &Module, table_log2: u8) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         table_log2,
@@ -311,6 +312,7 @@ fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         table_log2,
@@ -409,6 +411,7 @@ fn recompaction_carries_live_invoke_only_unit() {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         table_log2,

@@ -67,6 +67,7 @@ fn jit_compile(m: &Module) -> svm_jit::CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         svm_jit::Quota::default(),
         0,

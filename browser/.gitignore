@@ -29,3 +29,9 @@ patched*.wasm
 # playground's JS demo works out of the box. `build-onramp-assets.mjs` rebuilds it in place when the
 # sources *are* fetchable, and otherwise leaves this committed artifact untouched.
 !/web/assets/qjs_repl.svmb
+# chibicc (the in-browser C compiler, SELFHOST_C.md §7 step 5) is committed prebuilt for the same
+# reason: `build-onramp-assets.mjs` builds it fail-soft (skipped when clang/llvm-18 is absent or the
+# build hiccups), so relying on the deploy-time build alone silently ships a 404 (the I26/I42 class).
+# Shipping the translated `.svmb` in-tree makes the C-compiler card work out of the box; the build
+# script rebuilds it in place when the toolchain is present.
+!/web/assets/chibicc.svmb

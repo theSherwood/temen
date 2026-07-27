@@ -52,6 +52,7 @@ fn compile_jit(m: &Module) -> CompiledModule {
         None,
         None,
         None,
+        None, // fuel
         None,
         Quota::default(),
         0,

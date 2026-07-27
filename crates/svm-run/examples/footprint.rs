@@ -54,11 +54,12 @@ fn jit_compile(m: &Module) -> (svm_jit::CompiledModule, usize) {
         0,
         svm_jit::INERT_CAP_THUNK,
         std::ptr::null_mut::<c_void>(),
-        28, // reserved_log2: a virtual range only; doesn't affect code size or resident pages
-        None,
-        None,
-        None,
-        None,
+        28,   // reserved_log2: a virtual range only; doesn't affect code size or resident pages
+        None, // sub
+        None, // resolve_module
+        None, // interrupt
+        None, // fuel
+        None, // fast_resolver
         svm_jit::Quota::default(),
         0,
     )
