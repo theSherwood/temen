@@ -53,6 +53,11 @@ fn chibicc() -> &'static Path {
 
 /// Compile a C source string to text IR via the frontend.
 fn c_to_ir(src: &str) -> String {
+    c_to_ir_with(src, &[])
+}
+
+/// [`c_to_ir`] with extra chibicc `-cc1` flags (e.g. `--data-page 65536` for the 64 KiB-page browser).
+fn c_to_ir_with(src: &str, extra: &[&str]) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -60,16 +65,17 @@ fn c_to_ir(src: &str) -> String {
     let cfile = base.with_extension("c");
     let irfile = base.with_extension("svm");
     std::fs::write(&cfile, src).unwrap();
+    let mut args: Vec<&str> = vec!["-cc1", "--emit-ir"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "-cc1-input",
+        cfile.to_str().unwrap(),
+        "-cc1-output",
+        irfile.to_str().unwrap(),
+        cfile.to_str().unwrap(),
+    ]);
     let status = Command::new(chibicc())
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "-cc1-input",
-            cfile.to_str().unwrap(),
-            "-cc1-output",
-            irfile.to_str().unwrap(),
-            cfile.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()
         .expect("run chibicc");
     assert!(status.success(), "chibicc failed on:\n{src}");
@@ -981,8 +987,15 @@ fn stage0_shell_ring_pipeline_falls_back_on_redirect() {
 #[test]
 #[ignore = "writes browser/tests/fixtures/shell.svmb; run explicitly to (re)generate the fixture"]
 fn gen_browser_shell_fixture() {
-    let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
-    let ir = c_to_ir(&src);
+    // The **sequential** subset (`SVM_SHELL_SEQUENTIAL`): no external-command spawn, no concurrent ring
+    // pipelines — so the module carries no `Instantiator`/`SharedRegion` cap.calls and compiles on the
+    // browser's bytecode engine (`compile_inst` rejects those; the tree-walk/JIT engines that run the
+    // full shell use OS threads + a wall clock, absent under wasm). `RING` is dropped with it.
+    let src = format!("#define SVM_SHELL_SEQUENTIAL 1\n{SHIM}\n{SHELL_MAIN}");
+    // `--data-page 65536`: the playground runs on a 64 KiB wasm page, so the read-only string data
+    // must share no host page with a writable global (else the shell's own write to a global faults
+    // under D40). Native chibicc defaults to 16 KiB, which is why the differential above never hit it.
+    let ir = c_to_ir_with(&src, &["--data-page", "65536"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");

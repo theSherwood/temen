@@ -342,4 +342,22 @@ try {
   console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
 }
 
+// Shell — the `svm-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
+// the shell is compiled by the in-tree **chibicc** onto the POSIX personality and run on the tree-walk
+// interpreter (it carries Instantiator cap.calls the wasm-JIT/bytecode paths don't take). Its module
+// bytes are the committed fixture `tests/fixtures/shell.svmb`, produced from the canonical source
+// (`crates/svm-run/demos/shell/*.c`) by the differential's generator:
+//   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
+// Copy it into web/assets/ (offline-safe, like the committed hello_c.svmb); rebuild the fixture with
+// the command above when the shell source changes.
+try {
+  const fixture = join(HERE, 'tests', 'fixtures', 'shell.svmb');
+  if (!existsSync(fixture)) throw new Error('tests/fixtures/shell.svmb missing (run the generator)');
+  copyFileSync(fixture, join(ASSETS, 'shell.svmb'));
+  const kb = (readFileSync(fixture).length / 1024).toFixed(0);
+  console.log(`  ✓ shell.svmb (${kb} KB)`);
+} catch (e) {
+  console.log(`  – shell skipped (${e.message})`);
+}
+
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

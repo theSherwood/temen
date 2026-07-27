@@ -20,12 +20,14 @@ static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++
 static long ring_out = 0;
 static int ring_out_closed = 0;
 static long wr_out(char *b, long n) {
+#ifndef SVM_SHELL_SEQUENTIAL
   if (out_fd == -2) {
     if (ring_out_closed) return n;
     long r = ring_write(ring_out, b, n);
     if (r <= 0) { ring_out_closed = 1; return n; }
     return r;
   }
+#endif
   return write(out_fd, b, n);
 }
 static void puts_(char *s) { wr_out(s, slen(s)); }
@@ -226,6 +228,10 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
    its `write(1, …)` reaches the shell's sink — a `>`/`|` redirect on an external command is not honored
    (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
+#ifndef SVM_SHELL_SEQUENTIAL
+/* Forces a window large enough for a 128 KiB-aligned command carve below the stack, and holds the
+   spawn grant record. Only the (guarded-out) external-command / ring paths use it, so the sequential
+   build omits it — its window then fits the shell's own globals + stack, not a megabyte of carve. */
 static char pool[1179648];
 static int spawn_cmd(long mod, int argc, char **argv) {
   long out = __px_exec_stdout(__px());
@@ -249,6 +255,7 @@ static int spawn_cmd(long mod, int argc, char **argv) {
   long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
   return (int)__join(__inst(), child);
 }
+#endif /* SVM_SHELL_SEQUENTIAL */
 
 static int exec_line(char *line) {
   char *argv[MAXARGS];
@@ -428,10 +435,16 @@ static int exec_line(char *line) {
     exit(argc > 1 ? (int)atoi_(argv[1]) : last_status);
   } else {
     /* Not a builtin: look the command up in the personality's PATH registry and, if found, spawn it as
-       an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. */
+       an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. In the sequential
+       build (the browser playground) there is no spawn path, so an unknown command is always
+       `not found`. */
+#ifndef SVM_SHELL_SEQUENTIAL
     long mod = __px_exec_lookup(__px(), (long)cmd, slen(cmd));
     if (mod < 0) { puts_(cmd); puts_(": not found\n"); st = 127; }
     else st = spawn_cmd(mod, argc, argv);
+#else
+    puts_(cmd); puts_(": not found\n"); st = 127;
+#endif
   }
   return st;
 }
@@ -481,6 +494,7 @@ done:
 /* A command with its own redirects but default stdin/stdout. */
 static int run_line(char *line) { return run_line_io(line, 0, 1); }
 
+#ifndef SVM_SHELL_SEQUENTIAL
 /* ---- Ring pipelines (STAGE1.md item 6): concurrent children over SharedRegion rings ---- */
 
 /* Is stage text `st` (a stage AFTER the first) a pure ring filter — runnable by the `__stage`
@@ -583,6 +597,7 @@ static int run_ring_pipeline(char **stages, int ns, long mod) {
   __rg_unmap(rh[0], mapoff, g);
   return st;
 }
+#endif /* SVM_SHELL_SEQUENTIAL */
 
 /* Run a pipeline `A | B | C`. When every stage after the first is a pure filter and the `__stage`
    runner is on PATH, the stages run **concurrently** — stage 0 in the shell, the rest as spawned
@@ -600,6 +615,7 @@ static int run_pipeline(char *seg) {
     else i++;
   }
   if (ns == 1) return run_line(stages[0]);
+#ifndef SVM_SHELL_SEQUENTIAL
   if (ns <= 4) {
     int ok = 1;
     for (int s = 1; s < ns; s++) if (!ring_filter_ok(stages[s])) { ok = 0; break; }
@@ -610,6 +626,7 @@ static int run_pipeline(char *seg) {
       if (mod >= 0) return run_ring_pipeline(stages, ns, mod);
     }
   }
+#endif
   static char tmp[8];                    /* "/.pipeN" — one name per producing stage */
   tmp[0] = '/'; tmp[1] = '.'; tmp[2] = 'p'; tmp[3] = 'i'; tmp[4] = 'p'; tmp[5] = 'e'; tmp[7] = 0;
   long prev_in = 0;                      /* stage 0 reads real stdin */
