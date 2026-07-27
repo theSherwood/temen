@@ -176,6 +176,7 @@ dependencies = [
  "svm-fs",
  "svm-interp",
  "svm-ir",
+ "svm-posix",
  "svm-text",
  "svm-verify",
  "svm-wasm-jit",
@@ -237,6 +238,14 @@ name = "svm-mem"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "svm-posix"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
 ]
 
 [[package]]
