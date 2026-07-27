@@ -37,7 +37,10 @@ block 0 () {
 fn posix_personality_echoes_stdin_through_the_playground_entry() {
     let m = svm_text::parse_module(ECHO_STDIN).expect("parse echo module");
     assert_eq!(
-        m.imports.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        m.imports
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>(),
         ["read", "write"],
         "the manifest carries the two POSIX imports, in declaration order",
     );

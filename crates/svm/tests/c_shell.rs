@@ -971,3 +971,24 @@ fn stage0_shell_ring_pipeline_falls_back_on_redirect() {
     );
     assert_eq!(jout, iout, "jit: fallback + ring outputs must match interp");
 }
+
+/// **Browser fixture generator** (run explicitly). Compiles the real shell (`shim + ring +
+/// shell_main`), resolves its libc/personality imports by name (the same `link_shim` the differential
+/// uses), verifies, and encodes it to `browser/tests/fixtures/shell.svmb` — the exact module bytes the
+/// browser playground's POSIX-personality entry runs (STAGE1.md, playground-shell epic). `#[ignore]`d
+/// because it writes into the tree and needs the chibicc build; regenerate with:
+///   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
+#[test]
+#[ignore = "writes browser/tests/fixtures/shell.svmb; run explicitly to (re)generate the fixture"]
+fn gen_browser_shell_fixture() {
+    let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
+    let ir = c_to_ir(&src);
+    let raw = parse_module_raw(&ir).expect("parse shell IR");
+    let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
+    verify_module(&m).expect("verify shell");
+    let bytes = svm_encode::encode_module(&m);
+    let out = repo_root().join("browser/tests/fixtures/shell.svmb");
+    std::fs::create_dir_all(out.parent().unwrap()).expect("create fixtures dir");
+    std::fs::write(&out, &bytes).expect("write shell.svmb");
+    eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
+}
