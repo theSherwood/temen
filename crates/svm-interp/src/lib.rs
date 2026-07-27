@@ -9222,6 +9222,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
                 Inst::ContResume { k, arg } => {
+                    // Fuel unification: resuming a fiber is a control transfer that per-op fuel used to
+                    // meter (every op the fiber ran decremented the counter). Under safepoint metering
+                    // it must charge here too — one fuel per `cont.resume` op, exactly as the bytecode
+                    // engine charges in its `Op::ContResume` arm — else a long fiber-resume chain runs
+                    // unmetered and fuel fails to bound it. Charged at op dispatch (before the claim), so
+                    // the count is one-per-op regardless of Start/Live/StillParked outcome, matching the
+                    // bytecode engine op-for-op.
+                    step(fuel, kill.as_deref())?;
                     let kh = get_i64(&frames[top].vals, *k)?;
                     let av = get_i64(&frames[top].vals, *arg)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a

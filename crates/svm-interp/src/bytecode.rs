@@ -9720,6 +9720,10 @@ impl Vm {
                     });
                 }
                 Op::ContResume { k, arg, dst } => {
+                    // Fuel unification: charge one fuel per `cont.resume` op — the tree-walker charges
+                    // the same at its `Inst::ContResume` arm. Resuming a fiber is a control transfer
+                    // per-op fuel used to meter; without this, a long fiber-resume chain runs unmetered.
+                    step(fuel, None)?;
                     let kh = r!(*k).i32();
                     let arg = r!(*arg).i64();
                     let dst = *dst;

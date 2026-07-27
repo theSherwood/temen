@@ -381,15 +381,18 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > (`fuel=8000` hung; `fuel=300` completed in ~20 min). Lowering fuel alone can't fix it, and neither can
 > a tidy op-count argument — the executed work between safepoints is unbounded through fibers.
 >
-> **Stopgap (this PR):** drop the corpus **2_000 → 200** (measured to complete in ~4 min debug on a slow
-> box, well under budget) and fuel `8_000 → 300`, keeping thousands of resume/return chains exercised.
-> The acyclic interp↔JIT differential in the same file is unaffected (bounded spawn/call depth) and keeps
-> its budget. **Proper fix (scoped follow-up):** charge fuel at the `cont.resume` / `suspend` fiber
-> safepoints in *both* interpreters (the tree-walker's inline resume arm and the bytecode `drive`
-> driver) — the durable-freeze trigger already treats these as the cross-backend fiber safepoints — so
-> fuel bounds fiber work too; then the corpus can return to 2_000. *(An even earlier revision of this
-> note wrongly called the corpus fuel-insensitive; that was measured branch-vs-branch on a contended box,
-> never branch-vs-main. The CI regression is the real signal.)*
+> **Fixed (the fiber-safepoint slice).** `cont.resume` now charges one fuel in *both* interpreters — the
+> tree-walker's `Inst::ContResume` arm and the bytecode `Op::ContResume` arm, one charge per resume op at
+> op dispatch so the two engines stay in lockstep. Resuming a fiber is the control transfer per-op fuel
+> used to meter, so charging it makes fuel bound fiber-recursion again. With that in place the full
+> **2_000-program corpus at the original `fuel=8_000` completes in ~5 s debug** (~1 s release) — the
+> pathological "hung" programs are now cut off by fuel — so the #448 stopgap (corpus 200, fuel 300) is
+> reverted to 2_000 / 8_000. `cont.new` is *not* charged: it only records a `Pending` fiber handle and
+> runs no fiber code; the work happens at the resume. `suspend` is *not* charged either, mirroring plain
+> `Return` (a fiber yielding back starts no new execution); the resumer's next `cont.resume` is what
+> charges. *(History: the #448 stopgap note above records how this gap was found — earlier revisions
+> wrongly called the corpus fuel-insensitive, measured branch-vs-branch; the CI regression was the real
+> signal that led here.)*
 
 *Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
