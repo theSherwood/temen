@@ -9,7 +9,13 @@
 //! holds a current SSA value; a branch passes the current values as block args, so a control-flow
 //! merge is just the successor's block parameter — no separate φ/dominance analysis. Value numbers
 //! reset per block (svm-text convention): a block's params are `v0..v(nslots-1)`, instructions
-//! continue from `nslots`. Address-taken locals / aggregates (a data-stack frame) are a later slice.
+//! continue from `nslots`.
+//!
+//! **Address-taken locals live in a window frame.** A local whose address is taken (`(addr x)`) is
+//! demoted from an SSA slot to a byte offset in a per-call data-stack frame; the proc gains a
+//! leading `$sp` stack-pointer param (slot 0) and reads/writes it via `load`/`store` at `sp+off`,
+//! and a call to a frame-needing proc passes `sp + frame_size` as the callee's frame. Aggregates
+//! (`at`/`dot` over arrays/objects) build on this and are a later slice.
 
 use std::collections::HashMap;
 
@@ -33,6 +39,9 @@ struct Sig {
     index: u32,
     params: Vec<ValType>,
     ret: Option<ValType>, // None = void
+    /// True if the proc takes the address of a local, so its emitted signature has a leading
+    /// stack-pointer param and callers must pass a fresh frame.
+    needs_frame: bool,
 }
 
 pub(crate) struct Translator {
@@ -60,7 +69,16 @@ impl Translator {
                 Some("proc") => {
                     let (name, params, ret) = self.proc_sig(item)?;
                     let index = proc_nodes.len() as u32;
-                    self.procs.insert(name, Sig { index, params, ret });
+                    let needs_frame = proc_needs_frame(item);
+                    self.procs.insert(
+                        name,
+                        Sig {
+                            index,
+                            params,
+                            ret,
+                            needs_frame,
+                        },
+                    );
                     proc_nodes.push(item);
                 }
                 Some(other) => {
@@ -103,12 +121,14 @@ impl Translator {
                 continue;
             }
             let (n, params, ret) = self.proc_sig(item)?;
+            let needs_frame = proc_needs_frame(item);
             self.procs.insert(
                 n,
                 Sig {
                     index: 0,
                     params,
                     ret,
+                    needs_frame,
                 },
             );
             let mut out = String::new();
@@ -174,12 +194,47 @@ impl Translator {
         let ret = self.ret_ty(&a[2])?;
         let body = a.get(4);
 
-        // Slots = params ++ every `var` in the body (the block-parameter set). Pre-scanned so every
-        // block can carry them; a var's slot exists before its declaration (default 0 until bound).
-        let mut slots: Vec<(String, ValType)> = params.clone();
+        // Address-taken locals become window frame slots; the proc gains a threaded stack pointer.
+        let mut addr_taken = std::collections::HashSet::new();
         if let Some(b) = body {
-            collect_vars(b, &mut slots)?;
+            collect_addr_taken(b, &mut addr_taken);
         }
+        for (pn, _) in &params {
+            if addr_taken.contains(pn) {
+                // Spilling an address-taken *param* to the frame is a later refinement.
+                return Err(LengError::Unsupported(format!(
+                    "address of parameter `{pn}`"
+                )));
+            }
+        }
+        let needs_frame = !addr_taken.is_empty();
+
+        // Every `var` in the body: address-taken ones go to the frame, the rest are SSA slots.
+        let mut all_vars: Vec<(String, ValType)> = Vec::new();
+        if let Some(b) = body {
+            collect_vars(b, &mut all_vars)?;
+        }
+        // SSA slots (block-parameter set): [$sp] ++ params ++ non-address-taken vars.
+        let mut slots: Vec<(String, ValType)> = Vec::new();
+        if needs_frame {
+            slots.push(("$sp".into(), ValType::I64));
+        }
+        slots.extend(params.clone());
+        let mut mem: HashMap<String, (u64, ValType)> = HashMap::new();
+        let mut frame_size = 0u64;
+        for (vn, vt) in all_vars {
+            if addr_taken.contains(&vn) {
+                mem.entry(vn).or_insert_with(|| {
+                    let off = frame_size;
+                    frame_size += 8; // one 8-byte slot per address-taken local
+                    (off, vt)
+                });
+            } else if !slots.iter().any(|(n, _)| n == &vn) {
+                slots.push((vn, vt));
+            }
+        }
+        let nparams = usize::from(needs_frame) + params.len();
+
         // Pointee types of pointer-typed locals (params + vars), for load/store width on `deref`.
         let mut pointee = HashMap::new();
         collect_pointees(&a[1], &mut pointee);
@@ -187,11 +242,25 @@ impl Translator {
             collect_pointees(b, &mut pointee);
         }
 
-        let ptys: Vec<&str> = params.iter().map(|(_, t)| prefix(*t)).collect();
+        // Signature: a leading `i64` stack pointer when frame-needing, then the Leng params.
+        let mut ptys: Vec<String> = Vec::new();
+        if needs_frame {
+            ptys.push("i64".into());
+        }
+        ptys.extend(params.iter().map(|(_, t)| prefix(*t).to_string()));
         let rty = ret.map(|t| prefix(t).to_string()).unwrap_or_default();
         out.push_str(&format!("func ({}) -> ({}) {{\n", ptys.join(", "), rty));
 
-        let mut f = FuncGen::new(self, ret, params.len(), slots, pointee);
+        let mut f = FuncGen::new(
+            self,
+            ret,
+            nparams,
+            slots,
+            pointee,
+            needs_frame,
+            mem,
+            frame_size,
+        );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
         // assigned reads 0 until its declaration binds it (matches Leng default-init semantics).
         f.open_entry();
@@ -224,6 +293,12 @@ struct FuncGen<'a> {
     nparams: usize,
     /// Pointer-typed locals → their pointee value type, for `deref`/store width.
     pointee: HashMap<String, ValType>,
+    /// This proc takes the address of a local, so slot 0 is a threaded stack pointer (`$sp`).
+    has_sp: bool,
+    /// Address-taken locals → (frame byte offset, value type). Accessed via load/store at `sp+off`.
+    mem: HashMap<String, (u64, ValType)>,
+    /// Total frame bytes; a call to a frame-needing proc passes `sp + frame_size` as its frame.
+    frame_size: u64,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -238,12 +313,16 @@ struct FuncGen<'a> {
 }
 
 impl<'a> FuncGen<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         t: &'a Translator,
         ret: Option<ValType>,
         nparams: usize,
         slots: Vec<(String, ValType)>,
         pointee: HashMap<String, ValType>,
+        has_sp: bool,
+        mem: HashMap<String, (u64, ValType)>,
+        frame_size: u64,
     ) -> Self {
         let slot_of = slots
             .iter()
@@ -257,6 +336,9 @@ impl<'a> FuncGen<'a> {
             slot_of,
             nparams,
             pointee,
+            has_sp,
+            mem,
+            frame_size,
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -385,6 +467,59 @@ impl<'a> FuncGen<'a> {
         })
     }
 
+    /// Read a local: an address-taken (frame) local emits a `load` at `sp+off`; an SSA slot returns
+    /// its current value.
+    fn read_local(&mut self, name: &str) -> Option<Val> {
+        if let Some(&(off, ty)) = self.mem.get(name) {
+            let sp = self.cur[0]; // slot 0 is $sp for a frame-needing proc
+            let id = self.fresh();
+            self.used_memory = true;
+            self.cur_buf.push_str(&format!(
+                "  v{id} = {}.load v{sp} offset={off}\n",
+                prefix(ty)
+            ));
+            return Some(Val { id, ty });
+        }
+        self.lookup(name)
+    }
+
+    /// Write a local: an address-taken (frame) local emits a `store` at `sp+off`; an SSA slot rebinds.
+    fn write_local(&mut self, name: &str, v: Val) -> Result<(), LengError> {
+        if let Some(&(off, ty)) = self.mem.get(name) {
+            let val = if v.ty != ty { self.convert(v, ty) } else { v };
+            let sp = self.cur[0];
+            self.used_memory = true;
+            self.cur_buf.push_str(&format!(
+                "  {}.store v{sp} v{} offset={off}\n",
+                prefix(ty),
+                val.id
+            ));
+            return Ok(());
+        }
+        self.set_slot(name, v)
+    }
+
+    /// `(addr x)` — the window address of a frame local: `sp + off`.
+    fn addr_of(&mut self, name: &str) -> Result<Val, LengError> {
+        let off = match self.mem.get(name) {
+            Some(&(off, _)) => off,
+            None => {
+                return Err(LengError::Unsupported(format!(
+                    "address of non-frame local `{name}` (only address-taken locals are framed)"
+                )))
+            }
+        };
+        let sp = self.cur[0];
+        let ko = self.emit_const(ValType::I64, off as i64);
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = i64.add v{sp} v{}\n", ko.id));
+        Ok(Val {
+            id,
+            ty: ValType::I64,
+        })
+    }
+
     /// The pointee value type of a pointer local `p`, plus its current value — errors if `p` isn't a
     /// known pointer local (unknown load/store width would be a silent-wrongness hazard).
     fn ptr_local(&self, name: &str) -> Result<(Val, ValType), LengError> {
@@ -416,7 +551,7 @@ impl<'a> FuncGen<'a> {
             LengError::Unsupported(format!("assignment to lvalue `{:?}`", lhs.tag()))
         })?;
         let v = self.expr(rhs)?;
-        self.set_slot(name, v)
+        self.write_local(name, v)
     }
 
     /// `StmtList ::= (stmts SCOPE? Stmt*)` — real hexer often omits the leading SCOPE atom.
@@ -468,12 +603,12 @@ impl<'a> FuncGen<'a> {
                     return Err(LengError::Malformed("var needs :name pragmas type".into()));
                 }
                 let name = sym_def(&a[0])?;
-                let ty = int_ty(&a[2])?;
+                let ty = val_ty(&a[2])?;
                 let v = match a.get(3) {
                     Some(init) if !init.is_empty_marker() => self.expr(init)?,
                     _ => self.emit_const(ty, 0),
                 };
-                self.set_slot(&name, v)
+                self.write_local(&name, v)
             }
             Some("asgn") => {
                 // `(asgn Lvalue Expr)`.
@@ -625,7 +760,7 @@ impl<'a> FuncGen<'a> {
     fn expr(&mut self, e: &Node) -> Result<Val, LengError> {
         match e {
             Node::Atom(a) => {
-                if let Some(v) = self.lookup(a) {
+                if let Some(v) = self.read_local(a) {
                     return Ok(v);
                 }
                 if let Ok(n) = parse_int(a) {
@@ -650,6 +785,13 @@ impl<'a> FuncGen<'a> {
                     Ok(self.convert(x, ty))
                 }
                 Some("par") => self.expr(&e.args()[0]),
+                Some("addr") => {
+                    let name =
+                        e.args().first().and_then(|n| n.as_atom()).ok_or_else(|| {
+                            LengError::Unsupported("address of a non-symbol".into())
+                        })?;
+                    self.addr_of(name)
+                }
                 Some("deref") => {
                     // `(deref P)` — load through a pointer local (width = its pointee type).
                     let a = e.args();
@@ -766,6 +908,7 @@ impl<'a> FuncGen<'a> {
         let index = sig.index;
         let ptys = sig.params.clone();
         let ret = sig.ret;
+        let callee_needs_frame = sig.needs_frame;
         if a.len() - 1 != ptys.len() {
             return Err(LengError::Malformed(format!(
                 "call to `{callee}`: {} args for {} params",
@@ -774,6 +917,20 @@ impl<'a> FuncGen<'a> {
             )));
         }
         let mut argvals = Vec::new();
+        // A frame-needing callee gets a fresh frame beyond ours: `sp_callee = sp + frame_size`.
+        if callee_needs_frame {
+            if !self.has_sp {
+                return Err(LengError::Unsupported(format!(
+                    "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
+                )));
+            }
+            let sp = self.cur[0];
+            let fs = self.emit_const(ValType::I64, self.frame_size as i64);
+            let spid = self.fresh();
+            self.cur_buf
+                .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
+            argvals.push(spid);
+        }
         for (arg, want) in a[1..].iter().zip(ptys) {
             argvals.push(self.expr_typed(arg, want)?.id);
         }
@@ -883,6 +1040,29 @@ fn pointee_ty(node: &Node) -> Option<ValType> {
     match node.tag() {
         Some("ptr") | Some("aptr") => node.args().first().and_then(|t| val_ty(t).ok()),
         _ => None,
+    }
+}
+
+/// A proc needs a frame iff it takes the address of a local somewhere in its body.
+fn proc_needs_frame(p: &Node) -> bool {
+    let mut s = std::collections::HashSet::new();
+    if let Some(b) = p.args().get(4) {
+        collect_addr_taken(b, &mut s);
+    }
+    !s.is_empty()
+}
+
+/// Collect the names of locals whose address is taken (`(addr name)`).
+fn collect_addr_taken(node: &Node, out: &mut std::collections::HashSet<String>) {
+    if let Node::List(_) = node {
+        if node.tag() == Some("addr") {
+            if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
+                out.insert(name.to_string());
+            }
+        }
+        for child in node.args() {
+            collect_addr_taken(child, out);
+        }
     }
 }
 

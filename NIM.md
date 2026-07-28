@@ -255,10 +255,18 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       pointee width tracked per pointer local. The module declares a `memory` window only when a
       load/store is actually emitted. Tested store→load round-trips on both engines. (No frame
       yet — the pointer is supplied by the caller as an offset.)
-    - **Next: address-of-local + the data-stack frame** — `(addr x)` demotes a local from an SSA
-      slot to a window frame slot; the proc gains a threaded stack pointer and calls pass a fresh
-      frame (the `codegen_ir.c` model). This unlocks real loops like `sumto` (`inc(addr i)`),
-      then `at`/`dot` for arrays/objects.
+    - **✅ address-of-local + the data-stack frame — DONE 2026-07-28.** `(addr x)` demotes a local
+      from an SSA slot to a byte offset in a per-call window frame; the proc gains a leading `$sp`
+      stack-pointer param (slot 0), reads/writes the local via `load`/`store` at `sp+off`, and a
+      call to a frame-needing proc passes `sp + frame_size` as the callee's frame. SSA and frame
+      locals coexist (only address-taken ones are framed). Tested with the real nimony loop shape
+      `inc(addr i)` (a frameless pointer helper called from a frame-needing counter) and a mixed
+      SSA-accumulator/framed-counter sum, interp == JIT. Address-taken *params* and recursion
+      depth beyond one frame are the remaining refinements.
+    - **Next: `at`/`dot`/`pat`** — array/field/pointer indexing over the frame + windows, the
+      gateway to `seq`/`string`/`object`. And whole-module: `gvar`/`type` top-levels +
+      cross-module `call` (`…sysvq0asl`) as imports, so real `sumto` (whose `inc` is a system
+      import) runs, not just its hand-modeled shape.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
