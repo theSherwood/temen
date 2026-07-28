@@ -382,6 +382,20 @@ try {
       ? ok('chibicc: debugged C at source level — stopped on a C line, C locals i/acc named')
       : fail(`chibicc debug paused: ${JSON.stringify(ccPaused)}`);
 
+    // Continue once: the loop body runs a `printf`, so the guest's output streams into the stdout pane
+    // under the on-ramp I/O powerbox (deny-all would trap the `write`). It stops at the next iteration.
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="continue"]`);
+    await page.waitForFunction((sel) => /i=3, acc=3/.test(document.querySelector(`${sel} .stdout`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: printf output captured under the powerbox while debugging');
+
+    // Reverse back to the earlier breakpoint: the run is rebuilt + replayed, so the captured output
+    // **rewinds** — the first printf hasn't run yet, so the pane no longer shows "i=3".
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="reverseContinue"]`);
+    await page.waitForFunction((sel) => !/i=3/.test(document.querySelector(`${sel} .stdout`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: reverse debugging rewound the captured output');
+
     await page.click(`${ccDbg} .dbg-controls button[data-cmd="stop"]`);
   }
 

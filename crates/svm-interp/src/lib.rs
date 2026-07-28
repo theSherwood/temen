@@ -13166,6 +13166,15 @@ impl Host {
         self.cap_replay = Some((tape, 0));
     }
 
+    /// Seed this host to **replay** capability inputs from `tape` (from the start) instead of driving the
+    /// live powerbox — the public entry a debug backend's reverse `seek` uses so a rebuilt run
+    /// re-executes with identical nondeterministic inputs (clock / stdin `read` / host-fn results). The
+    /// tape comes from [`cap_tape`](Host::cap_tape) on the furthest-forward run; pair with
+    /// [`record_caps`](Host::record_caps) so the rebuilt run keeps recording past the replayed prefix.
+    pub fn replay_cap_tape(&mut self, tape: CapTape) {
+        self.replay_caps(tape.records.into());
+    }
+
     /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
     /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
     /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
