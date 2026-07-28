@@ -978,6 +978,27 @@ fn stage0_shell_ring_pipeline_falls_back_on_redirect() {
     assert_eq!(jout, iout, "jit: fallback + ring outputs must match interp");
 }
 
+/// `#` comments (bash's word-start rule): a full-line comment, a comment-only line, an inline comment
+/// after a command, and a `#` mid-word kept literal — differential interp==JIT.
+#[test]
+fn stage0_shell_hash_comments() {
+    let (i, j) = run_shell(
+        b"# a full-line comment\n\
+          echo hi   # trailing comment\n\
+          #\n\
+          echo a#b\n",
+        &[],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        i,
+        b"hi\na#b\n".as_slice(),
+        "interp: comment lines vanish; inline `#` strips to EOL; `a#b` keeps its mid-word `#`"
+    );
+    assert_eq!(j, i, "jit: comment handling matches interp");
+}
+
 /// **Browser fixture generator** (run explicitly). Compiles the real shell (`shim + ring +
 /// shell_main`), resolves its libc/personality imports by name (the same `link_shim` the differential
 /// uses), verifies, and encodes it to `browser/tests/fixtures/shell.svmb` — the exact module bytes the
