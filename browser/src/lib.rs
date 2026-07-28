@@ -3862,6 +3862,118 @@ pub extern "C" fn svm_run_shell(
     out.value
 }
 
+/// **In-browser link + run of a frontend-emitted program** (docs/SVM_BROWSER_PLAN.md option (b)):
+/// the live-editing path, language-agnostic. Given a **program** module as SVM-IR **text**, a
+/// **library** module as SVM-IR text (its exports inline — e.g. a language runtime blob), and the
+/// name of the export to run, this parses both, links them (`link_with_manifest`), wraps the named
+/// entry in a powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same
+/// on-ramp powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native
+/// link/encode step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
+/// `svm_status`, `svm_exit_code`).
+///
+/// This is the generic browser counterpart to the native link path: **nothing here is specific to
+/// any source language.** The caller supplies the program's own-data relocations as a flat buffer of
+/// little-endian `u32` triples `(func, block, inst)` at `[reloc_ptr, reloc_ptr + reloc_len)` — each
+/// applied as a [`RelocKind::SelfData`] patch on the program unit (self-data addressing; a trailing
+/// partial triple is ignored). A frontend's own wire format (how it delivers those relocs alongside
+/// the module text, what it names its entry export, which blob is its runtime) stays entirely on the
+/// caller's side; it lands here already decomposed into these generic parameters.
+///
+/// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
+/// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
+/// resolve by name.
+#[no_mangle]
+pub extern "C" fn svm_link_run(
+    prog_ptr: *const u8,
+    prog_len: usize,
+    lib_ptr: *const u8,
+    lib_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    reloc_ptr: *const u8,
+    reloc_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let slice = |p: *const u8, n: usize| -> &'static [u8] {
+        if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
+    };
+    let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let stdin = slice(stdin_ptr, stdin_len);
+
+    // The program's own-data relocations: a flat buffer of LE u32 triples (func, block, inst), each a
+    // SelfData patch. Alignment-free (read the bytes little-endian) since the host buffer is align-1.
+    let reloc_bytes = slice(reloc_ptr, reloc_len);
+    let relocs: Vec<svm_ir::DataReloc> = reloc_bytes
+        .chunks_exact(12)
+        .map(|c| {
+            let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
+            svm_ir::DataReloc { func: u(0), block: u(4), inst: u(8), kind: svm_ir::RelocKind::SelfData }
+        })
+        .collect();
+
+    let program = match svm_text::parse_module(prog_text) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let lib = match svm_text::parse_module(lib_text) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let lib_exports: Vec<(String, svm_ir::FuncIdx)> =
+        lib.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+
+    let linked = match svm_ir::link_with_manifest(&[
+        svm_ir::LinkUnit { module: lib, exports: lib_exports, ..Default::default() },
+        svm_ir::LinkUnit {
+            module: program,
+            exports: vec![(entry_name.to_string(), 0)],
+            relocations: relocs,
+            ..Default::default()
+        },
+    ]) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    let entry = match linked.resolve_export(entry_name) {
+        Some(e) => e,
+        None => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    let module = match svm_ir::synth_manifest_start(linked, entry, false) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    // Verify before running: a program that references an undefined proc links to an unresolvable
+    // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
+    // it cleanly (STATUS_UNSUPPORTED) so a typo can't take down the playground's wasm instance.
+    if svm_verify::verify_module(&module).is_err() {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
+
+    let out = onramp_exec(&module, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
 /// Pointer / length of the RGBA framebuffer the most recent [`svm_run_onramp`] guest presented via
 /// the `display` capability (`(null, 0)` if none). `svm_framebuffer_width`/`_height` give its
 /// dimensions; `len` is `width*height*4`. Valid until the next `svm_run_onramp`; do not `svm_dealloc`.
