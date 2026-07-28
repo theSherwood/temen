@@ -909,10 +909,18 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
     // instantiate+thread and instantiate+coroutine.
     let s = scan_seams(funcs);
-    // `gc.roots` scans only the **calling vCPU's** continuation (its stack, fibers, coroutines), so a
-    // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
-    // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
-    // continuations *are* scanned).
+    // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
+    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
+    // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
+    // registry fiber's frames", `crates/svm/tests/gc_roots.rs`). Neither engine scans a *sibling
+    // thread's* own frames, and neither has to: a guest GC that threads coordinates a stop-the-world
+    // quiesce and has each vCPU enumerate its own roots (the reference barrier is
+    // `crates/svm/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
+    // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
+    // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
+    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
+    // scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
@@ -922,7 +930,6 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // serve arm has the fiber-park machinery (slice 5b).
     if (s.has_coro && (s.has_fiber || s.has_thread))
         || (s.has_instantiate && s.has_fiber)
-        || (s.has_gc && s.has_thread)
         || s.svc_park_veto()
     {
         return None;
