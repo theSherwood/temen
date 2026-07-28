@@ -274,9 +274,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::Swizzle { .. }
         | Inst::SimdWidthBytes => row(F, F),
 
-        // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift can't
-        // legalize it; wasm has no `i64x2` min/max op at all (so it never appears there — but as an
-        // `Inst` it's outside the wasm subset just the same).
+        // `i64x2` min/max: Cranelift synthesizes it (per-lane compare + `bitselect`, since x86/aarch64
+        // have no native `i64` vector min/max); wasm has no `i64x2` min/max opcode, so the wasm-JIT
+        // folds it to the interp — the same treatment as `i8x16.mul`.
         Inst::VIntBin { shape, op, .. }
             if matches!(
                 (*shape, *op),
@@ -286,13 +286,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
                 )
             ) =>
         {
-            row(
-                cell(
-                    Status::NotYet,
-                    "i64x2 min/max: no single-instr ISA lowering",
-                ),
-                cell(Status::Declines, "no i64x2 min/max op in wasm"),
-            )
+            row(F, cell(Status::Declines, "no i64x2 min/max op in wasm"))
         }
         // `i8x16.mul` has no wasm opcode (wasm omits byte-lane multiply); Cranelift synthesizes it
         // (widen → `i16x8` multiply → low-byte pack).

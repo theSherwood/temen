@@ -679,22 +679,11 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
             bb.push(Inst::ReplaceLane { shape, lane, a, b }, ValType::V128);
         }
         4 => {
-            // Lane-wise integer add/sub/mul/min/max. Every (shape, op) here is Cranelift-lowered
-            // (incl. `i8x16.mul` — widen → `i16x8` multiply → low-byte pack) **except** `i64x2`
-            // min/max, which has no single-instruction ISA lowering and bails to `Unsupported`
-            // (svm-parity marks it NotYet on the JIT); emitting it would silently skip the module.
+            // Lane-wise integer add/sub/mul/min/max — every (shape, op) is Cranelift-lowered now
+            // (`i8x16.mul` via widen→multiply→pack; `i64x2` min/max via compare+bitselect), so the
+            // full VIntBinOp set rides the differential.
             let shape = bb.g.vshape_int();
-            let op = loop {
-                let o = VIntBinOp::ALL[bb.g.below(7) as usize];
-                let i64x2_minmax = shape == VShape::I64x2
-                    && matches!(
-                        o,
-                        VIntBinOp::MinS | VIntBinOp::MinU | VIntBinOp::MaxS | VIntBinOp::MaxU
-                    );
-                if !i64x2_minmax {
-                    break o;
-                }
-            };
+            let op = VIntBinOp::ALL[bb.g.below(7) as usize];
             let a = bb.want(ValType::V128);
             let b = bb.want(ValType::V128);
             bb.push(Inst::VIntBin { shape, op, a, b }, ValType::V128);

@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**454 ops.** Across the two JIT columns: 851 ✅ Full · 43 ⛔ Declines · 4 🚧 Not-yet · 10 🔶 Conditional.
+**454 ops.** Across the two JIT columns: 855 ✅ Full · 43 ⛔ Declines · 0 🚧 Not-yet · 10 🔶 Conditional.
 
 ## scalar integer
 
@@ -329,10 +329,10 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i64x2.add` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64x2.sub` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64x2.mul` | ✅ | ✅ | ✅ | ✅ |  |
-| `i64x2.min_s` | ✅ | ✅ | 🚧 | ⛔ | i64x2 min/max: no single-instr ISA lowering; no i64x2 min/max op in wasm |
-| `i64x2.min_u` | ✅ | ✅ | 🚧 | ⛔ | i64x2 min/max: no single-instr ISA lowering; no i64x2 min/max op in wasm |
-| `i64x2.max_s` | ✅ | ✅ | 🚧 | ⛔ | i64x2 min/max: no single-instr ISA lowering; no i64x2 min/max op in wasm |
-| `i64x2.max_u` | ✅ | ✅ | 🚧 | ⛔ | i64x2 min/max: no single-instr ISA lowering; no i64x2 min/max op in wasm |
+| `i64x2.min_s` | ✅ | ✅ | ✅ | ⛔ | no i64x2 min/max op in wasm |
+| `i64x2.min_u` | ✅ | ✅ | ✅ | ⛔ | no i64x2 min/max op in wasm |
+| `i64x2.max_s` | ✅ | ✅ | ✅ | ⛔ | no i64x2 min/max op in wasm |
+| `i64x2.max_u` | ✅ | ✅ | ✅ | ⛔ | no i64x2 min/max op in wasm |
 | `i64x2.eq` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64x2.ne` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64x2.lt_s` | ✅ | ✅ | ✅ | ✅ |  |
