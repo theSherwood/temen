@@ -272,6 +272,17 @@ compiler bug is a clean error, never an escape.
    A fallback to `svm_run_onramp_fs` (bytecode) remains if the emit is ever unavailable, so the card can
    never regress to "won't run". Residual: chibicc's compiled *outputs* still run on whichever tier their
    own card selects; shortest-round-trip floats and larger libc surface stay open (above).
+
+   **→ Measured on V8 (2026-07-28, `browser/bench_chibicc_jit.mjs` — the threads cdylib on Node's
+   WebAssembly, both tiers over the shipped path):** compiling a real program (a `printf` loop, a
+   `string`+`stdlib` program, a nested-loop float program — each ~330 KB of IR) drops from **~1.9–2.2 s
+   on the bytecode interpreter to ~70–80 ms on the wasm-JIT — a ~27× steady-state speedup**; even a
+   trivial return-only program is ~9× (303 ms → 33 ms). The one-time cost is a **~430 ms cold warm-up**
+   (emitting chibicc's `_start` + `WebAssembly.compile` of the ~1.2 MB emitted module) paid **once per
+   page load** — the emitted module is the same for every program (the user's C is *data* in the seeded
+   memfs, not part of the emitted code), so V8 code-caches it and every compile after the first reuses it.
+   The bench also asserts the two tiers emit **byte-identical IR** (a second guard alongside
+   `chibicc_jit.rs`), so it doubles as a perf-and-correctness regression check.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
