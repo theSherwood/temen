@@ -5666,8 +5666,9 @@ impl ScheduledDebugRun {
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
-            // Populated once a scheduled separate-module coroutine records its own metadata; `None` today,
-            // so scheduled-child source-variable reads fall through the module-0 branch (a follow-up).
+            // A separate-module coroutine on the scheduled engine carries its own §6 metadata (built at
+            // spawn); a same-module one leaves it `None` (its frames are module 0, read against the fields
+            // above).
             coro_debug: coro.and_then(|c| c.mod_debug.as_ref()),
         }
     }
@@ -7765,15 +7766,23 @@ fn drive(
                 demand,
             }) => {
                 // Resolve + compile the granted module (forged handle → CapFault; uncoverable op →
-                // Malformed), exactly as for `instantiate_module`.
-                let (cfuncs, cmem_log2, cdata) = match host.resolve_module(mh) {
-                    Ok(g) => (g.funcs.clone(), g.memory_log2, g.data.clone()),
+                // Malformed), exactly as for `instantiate_module`. `gmod` is the whole granted `Module`,
+                // kept for its §6 `-g` info + funcs so a step-into resolves the child's source variables.
+                let (cfuncs, cmem_log2, cdata, gmod) = match host.resolve_module(mh) {
+                    Ok(g) => (
+                        g.funcs.clone(),
+                        g.memory_log2,
+                        g.data.clone(),
+                        std::sync::Arc::clone(&g.module),
+                    ),
                     Err(t) => {
                         complete(&mut tasks, ti, Err(t));
                         continue;
                     }
                 };
-                let child_compiled = match compile_module(&cfuncs) {
+                // Unfused (like module 0): the child is single-stepped under the debugger, so every IR inst
+                // stays a distinct op/src position a breakpoint or `read_var` can land on.
+                let child_compiled = match compile_module_unfused(&cfuncs) {
                     Some(c) => c,
                     None => {
                         complete(&mut tasks, ti, Err(Trap::Malformed));
@@ -7865,9 +7874,9 @@ fn drive(
                     awaiting: None,
                     fault_yields: demand,
                     faulted_page: None,
-                    // Separate-module source-variable inspection on the scheduled engine is a follow-up;
-                    // position-level step-into + window reads work today (DEBUGGING.md §14).
-                    mod_debug: None,
+                    // The child's own §6 metadata, keyed by its pushed index `cm`, so a step-into on the
+                    // scheduled engine resolves its source variables against its funcs (not module 0's).
+                    mod_debug: Some(ModuleDebug::build(&gmod, cm)),
                 }));
                 let h = (tasks[ti].vt.coroutines.len() - 1) as i32;
                 tasks[ti].vt.active.set(dst, Reg::from_i32(h));
