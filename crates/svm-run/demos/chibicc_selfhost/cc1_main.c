@@ -71,6 +71,12 @@ int main(int argc, char **argv) {
   base_file = argv[ai];
   strarray_push(&include_paths, inc);
 
+  // Define the predefined macros (`__FILE__`, `__LINE__`, `__STDC__`, `__SIZEOF_*`, `__linux__`, …)
+  // so real programs and glibc-shape headers (e.g. `<assert.h>`'s `__FILE__`/`__LINE__`) work. Safe
+  // in the sandbox: init_macros' only host dependencies — `time`/`localtime`/`ctime_r`/`stat` for
+  // `__DATE__`/`__TIME__`/`__TIMESTAMP__` — are stubbed in chibicc_extra.c (fixed 1970 epoch).
+  init_macros();
+
   Token *tok = tokenize_file(base_file);
   if (!tok) {
     fprintf(stderr, "%s: tokenize failed\n", base_file);

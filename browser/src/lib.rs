@@ -2444,6 +2444,26 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/stdint.h",
             include_str!("../playground-include/stdint.h"),
         ),
+        (
+            "include/stddef.h",
+            include_str!("../playground-include/stddef.h"),
+        ),
+        (
+            "include/limits.h",
+            include_str!("../playground-include/limits.h"),
+        ),
+        (
+            "include/errno.h",
+            include_str!("../playground-include/errno.h"),
+        ),
+        (
+            "include/assert.h",
+            include_str!("../playground-include/assert.h"),
+        ),
+        (
+            "include/math.h",
+            include_str!("../playground-include/math.h"),
+        ),
     ];
     HEADERS
         .iter()
@@ -3897,19 +3917,32 @@ pub extern "C" fn svm_link_run(
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
-        if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
     };
     let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
@@ -3920,23 +3953,41 @@ pub extern "C" fn svm_link_run(
         .chunks_exact(12)
         .map(|c| {
             let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
-            svm_ir::DataReloc { func: u(0), block: u(4), inst: u(8), kind: svm_ir::RelocKind::SelfData }
+            svm_ir::DataReloc {
+                func: u(0),
+                block: u(4),
+                inst: u(8),
+                kind: svm_ir::RelocKind::SelfData,
+            }
         })
         .collect();
 
     let program = match svm_text::parse_module(prog_text) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let lib = match svm_text::parse_module(lib_text) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
-    let lib_exports: Vec<(String, svm_ir::FuncIdx)> =
-        lib.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+    let lib_exports: Vec<(String, svm_ir::FuncIdx)> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
 
     let linked = match svm_ir::link_with_manifest(&[
-        svm_ir::LinkUnit { module: lib, exports: lib_exports, ..Default::default() },
+        svm_ir::LinkUnit {
+            module: lib,
+            exports: lib_exports,
+            ..Default::default()
+        },
         svm_ir::LinkUnit {
             module: program,
             exports: vec![(entry_name.to_string(), 0)],
@@ -3945,15 +3996,24 @@ pub extern "C" fn svm_link_run(
         },
     ]) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let entry = match linked.resolve_export(entry_name) {
         Some(e) => e,
-        None => { set(STATUS_UNSUPPORTED); return 0; }
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let module = match svm_ir::synth_manifest_start(linked, entry, false) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     // Verify before running: a program that references an undefined proc links to an unresolvable
     // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject

@@ -283,6 +283,30 @@ compiler bug is a clean error, never an escape.
    memfs, not part of the emitted code), so V8 code-caches it and every compile after the first reuses it.
    The bench also asserts the two tiers emit **byte-identical IR** (a second guard alongside
    `chibicc_jit.rs`), so it doubles as a perf-and-correctness regression check.
+
+   **→ Larger libc + predefined macros DONE 2026-07-28.** The seeded playground libc grew from "enough
+   for a `printf` demo" to "enough for real programs":
+   - **New headers** (`browser/playground-include/`): `<math.h>` (a demo-quality guest-C libm — exact
+     `fabs`/`floor`/`ceil`/`trunc`/`round`/`fmod`/`sqrt`, range-reduced-series `exp`/`log`/`pow`/`sin`/
+     `cos`/`atan`/…; **not** correctly-rounded, same posture as the float formatter), `<assert.h>`
+     (glibc-shape `file:line: Assertion …` → `abort`), `<limits.h>`, `<stddef.h>` (`offsetof`,
+     `ptrdiff_t`), `<errno.h>` (a guest global — nothing sets it, but programs that read/clear it build).
+   - **Additions**: `<string.h>` — `strncat`, `strspn`/`strcspn`, `strpbrk`, `strtok`, `strcasecmp`/
+     `strncasecmp`, `strdup`/`strndup`; `<stdlib.h>` — `strtoul`/`strtoll`/`strtoull`, `strtod`/`atof`,
+     `bsearch`, `div`/`ldiv`, `atoll`/`llabs`, `getenv` (→ NULL, no sandbox env); `<ctype.h>` —
+     `isgraph`/`isblank`.
+   - **Predefined macros wired** — the guest driver (`cc1_main.c`) now calls chibicc's `init_macros()`
+     before preprocessing, so `__FILE__`/`__LINE__`/`__STDC__`/`__STDC_VERSION__`/`__SIZEOF_*`/
+     `__linux__`/… are defined (real programs and `<assert.h>`'s `__FILE__`/`__LINE__` need them). Safe
+     in-sandbox: `init_macros`' only host deps — `time`/`localtime`/`ctime_r`/`stat` for `__DATE__`/
+     `__TIME__`/`__TIMESTAMP__` — are already stubbed in `chibicc_extra.c` (fixed 1970 epoch). This
+     required a **`chibicc.svmb` rebuild** (still 333 funcs, verifies, byte-identical IR across tiers).
+   Gated by `browser/tests/chibicc_libc.rs` (a real ~90-line stats pipeline over `strtok`/`strtod`/
+   `qsort`/`sqrt`/`assert`, an algebraic-math sweep, and the string/stdlib additions — compiled + run to
+   exact output) plus a `browser-play-editor-test.mjs` Chromium assertion (`<math.h>` + `<assert.h>` +
+   `strdup` → real output in-browser). Residual toward **full stage-2** (chibicc compiling its *own*
+   source): the playground path seeds a single `/in.c`, so a multi-file compile (chibicc is ~8 TUs +
+   its headers) still needs a driver that reads/links multiple guest files — the next stage-2 slice.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

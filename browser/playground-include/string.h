@@ -84,4 +84,80 @@ static inline void *memchr(const void *s, int c, size_t n) {
   return 0;
 }
 
+static inline char *strncat(char *d, const char *s, size_t n) {
+  char *r = d;
+  while (*d) d++;
+  size_t i = 0;
+  for (; i < n && s[i]; i++) d[i] = s[i];
+  d[i] = 0;
+  return r;
+}
+// Length of the initial span of `s` consisting entirely of bytes in / not in `set`.
+static inline size_t strspn(const char *s, const char *set) {
+  size_t i = 0;
+  for (; s[i]; i++) {
+    const char *p = set;
+    while (*p && *p != s[i]) p++;
+    if (!*p) break;
+  }
+  return i;
+}
+static inline size_t strcspn(const char *s, const char *set) {
+  size_t i = 0;
+  for (; s[i]; i++) {
+    const char *p = set;
+    while (*p && *p != s[i]) p++;
+    if (*p) break;
+  }
+  return i;
+}
+static inline char *strpbrk(const char *s, const char *set) {
+  for (; *s; s++) {
+    const char *p = set;
+    while (*p) if (*p++ == *s) return (char *)s;
+  }
+  return 0;
+}
+// `strtok` with the standard static-cursor state (single-threaded demo — fine here).
+static char *__pg_strtok_save;
+static inline char *strtok(char *s, const char *delim) {
+  if (!s) s = __pg_strtok_save;
+  if (!s) return 0;
+  s += strspn(s, delim); // skip leading delimiters
+  if (!*s) { __pg_strtok_save = 0; return 0; }
+  char *tok = s;
+  s += strcspn(s, delim);
+  if (*s) { *s = 0; __pg_strtok_save = s + 1; } else { __pg_strtok_save = 0; }
+  return tok;
+}
+static inline int __pg_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+static inline int strcasecmp(const char *a, const char *b) {
+  while (*a && __pg_lower((unsigned char)*a) == __pg_lower((unsigned char)*b)) { a++; b++; }
+  return __pg_lower((unsigned char)*a) - __pg_lower((unsigned char)*b);
+}
+static inline int strncasecmp(const char *a, const char *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    int ca = __pg_lower((unsigned char)a[i]), cb = __pg_lower((unsigned char)b[i]);
+    if (ca != cb) return ca - cb;
+    if (!a[i]) break;
+  }
+  return 0;
+}
+
+// `strdup`/`strndup` allocate through the playground `<stdlib.h>` bump allocator.
+#include <stdlib.h>
+static inline char *strdup(const char *s) {
+  size_t n = strlen(s) + 1;
+  char *p = (char *)malloc(n);
+  if (p) memcpy(p, s, n);
+  return p;
+}
+static inline char *strndup(const char *s, size_t n) {
+  size_t l = 0;
+  while (l < n && s[l]) l++;
+  char *p = (char *)malloc(l + 1);
+  if (p) { memcpy(p, s, l); p[l] = 0; }
+  return p;
+}
+
 #endif
