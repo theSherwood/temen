@@ -187,6 +187,16 @@ drops the build-time clang/LLVM dependency and shapes SVM-IR straight from Leng,
 supported extension pattern — C/C++/LLVM-IR/arkham already coexist behind Leng, plus the
 shoggoth optimizer.
 
+> **Capstone reached 2026-07-28: whole real modules verify.** `svm-leng` translates **entire**
+> real `hexer` modules — every proc plus globals, type decls, and cross-module imports — for three
+> real Nim programs (`addTwo`+`main`, `maxi`+`sumto`, `dot2`+`idx`), each **parsing and passing
+> `svm-verify`**, and the user `main` (an intra-module call) **runs end-to-end on both engines**
+> (`crates/svm-leng/tests/whole_real_module.rs`). Driving a whole module out turned the "what's
+> left" list into a measured one — the last gaps that blocked real modules were small: `(true)`/
+> `(false)`/`(nil)` literals, `cast`, and coercing a bare-literal `ret` to the proc's result type
+> (an i32 `main` returning `0`). The remaining breadth (below) is genuinely optional for coverage,
+> not structural.
+
 **Placement decision (2026-07-28): a Rust crate `crates/svm-leng` in *this* repo** — the
 **fourth SVM frontend**, beside `svm-wasm` and `svm-llvm` (both Rust, both untrusted, both
 verifier-rechecked). Rationale: it matches the established frontend pattern, reuses

@@ -1058,7 +1058,12 @@ impl<'a> FuncGen<'a> {
                 let term = if a.is_empty() || a[0].is_empty_marker() {
                     "return".to_string()
                 } else {
-                    let v = self.expr(&a[0])?;
+                    // Coerce the returned value to the function's result type (a bare literal
+                    // defaults to i64, but the proc may return i32).
+                    let v = match self.ret {
+                        Some(t) => self.expr_typed(&a[0], t)?,
+                        None => self.expr(&a[0])?,
+                    };
                     format!("return v{}", v.id)
                 };
                 self.finish_block(term, self.next_block);
@@ -1268,7 +1273,19 @@ impl<'a> FuncGen<'a> {
                     let x = self.expr(&a[1])?;
                     Ok(self.convert(x, ty))
                 }
+                Some("cast") => {
+                    // A C-style cast — for the scalar/pointer subset, a width reinterpretation
+                    // (pointer↔pointer and same-width are no-ops; i32↔i64 extend/wrap).
+                    let a = e.args();
+                    let ty = val_ty(&a[0])?;
+                    let x = self.expr(&a[1])?;
+                    Ok(self.convert(x, ty))
+                }
                 Some("par") => self.expr(&e.args()[0]),
+                // Literals: booleans are `i32` 0/1; `nil` is a null `i64` pointer.
+                Some("true") => Ok(self.emit_const(ValType::I32, 1)),
+                Some("false") => Ok(self.emit_const(ValType::I32, 0)),
+                Some("nil") => Ok(self.emit_const(ValType::I64, 0)),
                 Some("addr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
                     let (id, _desc) = self.lvalue_addr(&e.args()[0])?;
