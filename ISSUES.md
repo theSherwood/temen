@@ -21,6 +21,34 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I51 — bytecode `vcpu.tls` is per-`Vm`, not per-vCPU: a fiber that migrates across workers reads a stale TLS word (S3, multi-worker only) — recorded 2026-07-28 landing the JACL-in-browser `vcpu.tls` lowering
+
+**Symptom.** `vcpu.tls.get` must return the word of the vCPU *currently executing* the op
+(§12; `svm-ir` `Inst::VcpuTlsGet` — "after a fiber migrates between vCPUs `get` returns the
+new vCPU's word"). On the **bytecode engine** the TLS word lives on the running `Vm`
+(`bytecode.rs` `Vm::tls`), seeded to the vCPU's dense id and re-seeded for a `thread.spawn`ed
+task. A **fiber** (`cont.new`) is a separate `Vm` whose `tls` defaults to `0`, so a fiber
+running on worker N reads `0` instead of N's word; and a fiber that migrates from worker A to
+worker B (D57 / work-stealing) keeps A's word instead of reading B's. The tree-walker is
+correct here (its `tls` is on the vCPU it steps). A guest whose per-CPU allocator keys on
+`vcpu.tls` (e.g. JACL's `heap_gc.c` per-worker regions) would allocate into the wrong worker's
+arena under real multi-worker execution.
+
+**Not browser-affecting.** The browser tier is single-OS-thread cooperative with one worker
+(JACL `POOL_WORKERS=1`), so every read is a faithful `0` — this is latent only for native
+multi-worker (`drive_parallel`, or cooperative `drive` with spawned workers running fibers).
+That is why it was deferred rather than fixed on the JACL-in-browser path.
+
+**Where.** `crates/svm-interp/src/bytecode.rs`: `Op::VcpuTlsGet`/`VcpuTlsSet` read/write
+`self.tls` (the active `Vm`); the seed is on `Vm::new` + `drive`'s `Spawn` arm.
+
+**Fix sketch.** Make the TLS word per-vCPU rather than per-`Vm`: hold it on the vCPU/task
+(`VTask`) and have `Op::VcpuTlsGet`/`Set` operate on *that* word — thread a `&mut i64` for the
+executing vCPU's TLS through `Vm::resume` (~10 call sites) so it is correct regardless of which
+fiber is active and survives fiber switches within a `step_vcpu`. Cover with a cooperative
+multi-worker differential test (spawn workers, set distinct TLS per worker, migrate a fiber,
+assert `get` tracks the hosting worker) matched to the tree-walker.
+
 ### I49 — the playground's `chibicc.svmb` was never committed, so the C-compiler card 404'd (S3) — the I26/I42 asset-shipping class again — surfaced 2026-07-27 (`fetch ./assets/chibicc.svmb: 404`) — **FIX LANDED** (`claude/chibicc-playground-status-7n6eh0`)
 
 **Symptom.** The playground's "C compiler (chibicc → SVM)" card fails with
