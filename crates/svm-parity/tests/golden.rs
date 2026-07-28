@@ -10,8 +10,12 @@ fn ops_parity_md_is_up_to_date() {
     let on_disk =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let fresh = svm_parity::render_markdown();
+    // Compare line-ending-insensitively: this checks the doc is not *stale*, and a Windows checkout
+    // (autocrlf) rewrites the file to CRLF while the generator always emits LF. Normalizing both
+    // sides keeps the staleness check meaningful on every platform.
+    let norm = |s: &str| s.replace("\r\n", "\n");
     assert!(
-        on_disk == fresh,
+        norm(&on_disk) == norm(&fresh),
         "OPS_PARITY.md is stale — regenerate with `cargo run -p svm-parity`",
     );
 }
