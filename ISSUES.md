@@ -516,6 +516,15 @@ same job already caches) removes the fetch entirely from the steady state. **Tim
 applied** in `.github/workflows_src/ci.yml` (the editable mirror — owner copies over):
 apt mingw ×2 (15 min) + Playwright install (10 min); the cache half remains open.
 
+**Recurred 2026-07-28 (run 30395295933, PR #488):** the `real-browser` "Install Playwright +
+Chromium" step hit its **10-min cap** — this time the stall was the `--with-deps` **apt font
+download** (`Fetched 21.1 MB in 9min 55s (35.4 kB/s)`, a wedged Azure mirror), not the npm/CDN
+half. The timeout-minutes mitigation worked as intended (failed fast into a re-run instead of
+pinning the runner); every other job on the commit was green and the change was a pure
+`svm-interp` scheduler edit with no browser surface. Reinforces the still-open residual: **cache
+or pre-provision the apt font deps** (or split `--with-deps` off the timed step) so a slow distro
+mirror can't eat the budget. Cleared by a re-run.
+
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
 **Where:** the gating `build · test · fmt · clippy` job (ubuntu-latest), during `cargo test --workspace`'s
