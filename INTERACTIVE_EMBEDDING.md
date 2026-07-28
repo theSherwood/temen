@@ -1,20 +1,30 @@
 # INTERACTIVE_EMBEDDING.md — the interactive-embedder surface (browser-first)
 
-Status: **partially built — reconciled 2026-07-24.** Written 2026-07-17 as a pure scoping doc.
-Since then the critical path (W1) **shipped through a different mechanism than sketched below** —
-a **DAP-over-the-wasm-FFI** debugger, not the low-level `svm_dbg_*` ABI this doc proposed — and now
-lives in `DEBUGGING.md` (browser slices); the memory-instrumentation substrate (W3's dependency)
-lives in `HOOKS.md`. This doc is kept for the **remaining** workstreams and as the requirements
-record; built parts are marked and cross-referenced below, not restated.
+Status: **partially built — re-reconciled 2026-07-28** (prior reconcile 2026-07-24).
+Written 2026-07-17 as a pure scoping doc. Since then the critical path (W1) **shipped through a
+different mechanism than sketched below** — a **DAP-over-the-wasm-FFI** debugger, not the low-level
+`svm_dbg_*` ABI this doc proposed — and now lives in `DEBUGGING.md` (browser slices); the
+memory-instrumentation substrate (W3's dependency) lives in `HOOKS.md`. This doc is kept for the
+**remaining** workstreams and as the requirements record; built parts are marked and
+cross-referenced below, not restated.
+
+The 2026-07-28 pass corrected two rows the 07-24 reconcile left stale: **W4** (the `StdinPark`
+suspend/resume seam did in fact ship in the browser, via the `svm_pg_*` console path) and **W5**
+(chibicc now compiles C in the browser — `SELFHOST_C.md` marks all five self-host steps done
+2026-07-24, with printf/float follow-ons through 07-28). It also demoted **W6** to honest status
+(only the *native* seeded scheduler exists; the browser/tooling items are unbuilt) and added a
+**"Consumer-surfaced requirements not yet scoped"** section recording capability needs surfaced by a
+prospective interactive embedder (c_interpret) that the W1–W6 scope does not yet cover.
 
 | Workstream | Status | Home |
 |---|---|---|
 | **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`svm_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
 | **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `svm-dap`, `DEBUGGING.md` |
 | **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `svm-opt` instrumentation pass, C ABI `svm_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
-| **W4** blocking-input suspend/resume | **Remaining** | this doc |
-| **W5** in-browser C→module compile | **Remaining** — needs chibicc hosted in wasm (see the W5 section) | this doc, `BROWSER.md`, `FRONTEND.md` |
-| **W6** small host/tooling items | **Partial** — multithreaded time-travel / seed via `DEBUGGING.md`; the rest open | mixed |
+| **W4** blocking-input suspend/resume | **Partial** — the `VcpuEvent::StdinPark` suspend/resume seam **shipped in the browser** (`bytecode.rs`, `svm_pg_*` console path); the generic W1-session `provide_stdin` + `CapTape`/seek-replay form is the **remaining** piece | `bytecode.rs`, `browser/src/lib.rs`, this doc |
+| **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.svmb` asset + `svm_run_onramp_fs` + `svm_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
+| **W6** small host/tooling items | **Mostly remaining** — only the *native* seeded scheduler (`attach_scheduled_seeded`) exists; the four browser/tooling items (seed-via-ABI, `display` frame-query, memory-map JSON, compile metrics) are unbuilt | mixed |
+| **—** consumer-surfaced needs not yet scoped | **Not scoped** — telemetry stream, cache-coherence view, adversarial+replayable scheduling, paging counters, state writes, sem/barrier libc | new section below |
 
 The design invariants and the requirements for the remaining workstreams stand as written; where a
 section below has shipped, a **Status** line at its head points at where the built form lives and
@@ -170,6 +180,17 @@ ordering, and browser counters match the native run of the same hook stream.
 
 ## W4 — Blocking-input suspend/resume
 
+> **Status (2026-07-28): PARTIAL — the suspend/resume seam shipped, in the browser.** A `read` on
+> an exhausted stdin buffer suspends the vCPU instead of returning EOF, via `VcpuEvent::StdinPark`
+> (`crates/svm-interp/src/bytecode.rs`), with `Vcpu::set_stdin_blocking` / `push_stdin` to arm and
+> resume. It is wired into the browser cdylib as the console path: `svm_pg_open` boots a guest
+> suspended at the first stdin read, `pg_pump` returns on the park, and the query entry pushes bytes
+> and resumes (`browser/src/lib.rs`). What's **remaining** vs. the sketch below: it is packaged as
+> the `svm_pg_*` REPL/Postgres path, **not** as a generic `svm_dbg_provide_stdin` on the **W1 debug
+> session**, and it is **not** yet joined to the `CapTape`/`seek`-replay determinism the acceptance
+> criteria require (provided bytes must replay faithfully on a later `seek`). The text below is the
+> original sketch.
+
 **Need.** Interactive guests read input that does not exist yet (a REPL prompt, a stdin-driven
 program). The embedder needs the run to **suspend** when input is exhausted, surface that to
 JS, and **resume** when it supplies bytes — instead of EOF-and-done.
@@ -189,16 +210,19 @@ and resumes. Provided bytes join the run's deterministic input record (the `CapT
 
 ## W5 — In-browser frontend (C source → module, client-side)
 
-> **Status (2026-07-24): REMAINING — see `SELFHOST_C.md`.** The browser has in-wasm *text-IR*
-> parse/verify/encode (`svm_parse`) and the wasm-JIT tier, but **not** C-source→module. The blocker
-> is not C-language coverage — chibicc already compiles real libraries (Clay, jsmn, tinfl,
-> tiny-regex, stb_perlin) byte-identically to native `cc` (`FRONTEND.md`). The chosen approach is
-> **not** to port chibicc to wasm32 against a wasm libc; it is the broader **self-hosting** design:
-> compile chibicc *to an SVM IR module* via the LLVM on-ramp (kept for speed), run that `chibicc.svmb`
-> as an ordinary guest on the bytecode engine with source + `include/*.h` seeded into memfs, and close
-> the loop with an assemble step. In the browser that means shipping `chibicc.svmb` as a static asset
-> and reusing the cdylib's `svm_parse` for the encode. Full plan (libc coverage, the compile loop,
-> validation, build order) is in **`SELFHOST_C.md`**; the section below is the original W5 sketch.
+> **Status (2026-07-28): BUILT — see `SELFHOST_C.md`.** The browser compiles C source client-side
+> today. The chosen approach was **not** to port chibicc to wasm32 against a wasm libc; it is the
+> broader **self-hosting** design: compile chibicc *to an SVM IR module* via the LLVM on-ramp, run
+> that `chibicc.svmb` as an ordinary guest on the bytecode engine with source + `include/*.h` seeded
+> into memfs, and close the loop with the encode step. That shipped: `browser/web/assets/chibicc.svmb`
+> is a committed asset, `svm_run_onramp_fs` (`browser/src/lib.rs`) runs it over a seeded fs + argv,
+> and the cdylib's `svm_parse` does the text-IR → verify → encode. `SELFHOST_C.md` marks all five
+> self-host steps done 2026-07-24, with `#include`/`printf` and `%f/%e/%g` follow-ons through
+> 2026-07-28; `TODO.md` corroborates ("chibicc compiles C in the browser"). Gated by
+> `browser/tests/chibicc_printf.rs` + the Chromium editor gate. The section below is the original
+> (unbuilt-at-the-time) W5 sketch; it also lists the acceptance the shipped path meets (source →
+> verified module → runs on a W1 session, no server). One requirement from that sketch still holds
+> and is worth confirming per consumer: **always emit `-g`**, since the W1 debug surface depends on it.
 
 **Need.** Interactive embedders want the full edit-compile-run loop client-side: source text
 in, verified module out, no server round-trip, sub-second warm compiles.
@@ -237,6 +261,49 @@ warm compile of a few-hundred-line program well under a second.
   global turn counter (the `Inspector::turn` model). Rolling back one thread independently
   while others stand still is not meaningful under shared memory and is a **non-goal**.
 
+## Consumer-surfaced requirements not yet scoped
+
+Added 2026-07-28 from a mapping pass against a prospective interactive embedder (c_interpret, an
+educational C environment; its side lives in that repo's `SVM_MIGRATION.md`). These are real
+capability needs its UI depends on that **no W1–W6 slice currently covers**. They are stated
+embedder-neutrally and remain demand-driven — nothing here couples SVM to any one consumer, and none
+is a *blocker* (no architectural obstacle was found); they are unscoped scope, listed so the tracker
+is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
+
+- **X1 — Concurrency telemetry as a drained stream.** Beyond point-in-time race *witnesses* (which
+  SVM has natively), embedders that teach concurrency consume per-yield **streams**: intra-step
+  profiling samples (flame charts), context-switch / synchronization-event / **causality-edge**
+  records (timeline swimlanes, mutex-handoff/join/condvar arrows), and per-global "contested"
+  shared-state tracking. This is the largest gap — a whole visualization surface with no slice.
+  Natural home: an extension of the W1 threads follow-on + the W3 hook stream, drained as a batch
+  per scheduler turn rather than queried per step.
+- **X2 — Cache-coherence view, not just access scoring.** W3 scopes an access *stream* and host-side
+  cache *counters*. Embedders also render a live **coherence grid**: per-line tag/valid/dirty/MESI
+  state and LRU position across L1/L2, plus last-access set/way highlight. This is a host-side model
+  over the W3 stream (stays out of the engine/TCB), but it is materially more than "scoring" and
+  should be scoped as its own W3 consumer.
+- **X3 — Adversarial + replayable scheduling.** W6 scopes seed get/set. Embedders also need
+  **deterministic reproduction of a given interleaving** across a `seek`/replay, plus adversarial
+  controls: a chaos mode (quantum = 1) and a **forced context-switch** primitive. The native
+  `attach_scheduled_seeded` is the substrate; the browser ABI needs the seed **and** these controls,
+  and replay must reproduce the same interleaving.
+- **X4 — Demand-paging counters.** W6 scopes a memory-map *layout* JSON. A paging-model teaching
+  panel also wants **reserved vs. committed page counts, a page-fault counter, and a settable heap
+  limit** (to demonstrate OOM). Read-only tooling over Memory-capability state, plus one cap knob.
+- **X5 — State writes from the debugger.** W2 exposes machine state as a read-only *view*. Embedders
+  let students **write** a register/slot, an FP lane, and window bytes mid-session (with time-travel
+  staying consistent). This is DAP `setVariable` / `writeMemory` over the W1 session — small, but not
+  in the current W2 scope.
+- **X6 — Semaphore & barrier guest libc.** SVM's threading design covers mutex + condvar; embedders
+  also use **semaphores and barriers** (`sem_*`, `pthread_barrier_*`). These need guest-libc
+  equivalents over SVM's threading primitives (a frontend/libc item, not an engine one).
+
+Two adjacent risks the same pass surfaced, for the record (they are effort/measurement, not new
+scope): the **per-step ABI cost** — a real embedder polls ~20 state reads plus a JSON parse per
+step, so the W1 session should expose a **single batched per-step state bundle**, not N calls; and
+**frontend acceptance of SSE intrinsics** (`<xmmintrin.h>` / `__m128` / `_mm_*`) — the W2 XMM→`v128`
+remap presumes chibicc *accepts* those programs, which is a frontend-coverage check, not a view remap.
+
 ## Non-goals
 
 - Consumer-side integration (any embedder's UI, worker glue, content, or test suites).
@@ -253,9 +320,11 @@ warm compile of a few-hundred-line program well under a second.
 
 ## Suggested slice order
 
-> **2026-07-24:** steps 1–2 (W1 + its time-travel/watchpoints, and W2 v1) are **done** (via
-> DAP-over-wasm; `DEBUGGING.md`). The live remaining order is **W4 → W5 → W3 → W2 v2**, plus the
-> open **W6** items.
+> **2026-07-28:** W1 (+ time-travel/watchpoints), W2 v1, and **W5** are done; **W4**'s suspend/resume
+> seam shipped in the browser (its generic-debug-session + replay form remains). The live remaining
+> order is **W4 (generic form) → W3-in-browser → the W6 browser/tooling items → W2 v2**, plus the
+> **consumer-surfaced needs** section below as those are demanded. The 07-24 order (**W4 → W5 → W3 →
+> W2 v2**) is superseded.
 
 1. **W1 spike** — single-vCPU interactive step + source breakpoint exported from the cdylib,
    driven by a throwaway page, parity-checked against the native `Inspector`. De-risks
