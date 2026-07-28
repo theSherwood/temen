@@ -154,6 +154,45 @@ are git-ignored.
 
 ---
 
+## POSIX-personality on-ramp — the shell card
+
+Beyond the fixed on-ramp powerbox (`svm_run_onramp`: stdout/stdin/exit/memory), the browser exposes
+the **`svm-posix` personality** so the Stage-0 shell (`crates/svm/tests/c_shell.rs`, STAGE1.md) runs
+as an interactive playground card:
+
+- **Entries** (`browser/src/lib.rs`): `svm_run_onramp_posix` grants the personality and binds a
+  module's manifest imports to it by name; `svm_run_shell` (→ `posix_shell_exec`) runs the shell
+  module with the editor text as its stdin and returns the personality's captured stdout. `svm-posix`
+  deps only `svm-ir` + `svm-interp` (both already here and wasm-clean), so it compiles into the
+  cdylib.
+
+- **Bytecode engine only.** The shell runs on the **bytecode** engine, *not* the tree-walker: the
+  tree-walk `drive` uses OS worker threads + a wall clock (`Instant::now`), neither of which exists
+  under wasm — the same reason the whole browser path is bytecode-only (see "Why the bytecode engine"
+  above).
+
+- **Sequential subset.** `compile_inst` rejects `Instantiator`/`SharedRegion` cap.calls, which the
+  full shell carries (external commands + concurrent ring pipelines). So the browser fixture is built
+  with `-DSVM_SHELL_SEQUENTIAL`: `#ifndef` guards in `shell_main.c` drop those paths, leaving a
+  bytecode-compilable module. **The browser gets Stage-0** (builtins, redirects, in-window memfs
+  pipelines, command lists, `if`, variables, globbing, comments) — external commands and concurrent
+  pipelines are native-only.
+
+### Gotcha: chibicc guests need `--data-page 65536` for the 64 KiB wasm page
+
+chibicc lays read-only string data on its own page(s) so a `data ro` segment can be protected
+without over-covering adjacent **writable** globals (§3a / D40) — but it pinned that isolation
+boundary to **16 KiB** (`DATA_PAGE`), the largest common *native* host page. The browser runs on a
+**64 KiB** wasm linear-memory page (`host_page_size` hard-codes it), so at 16 KiB the RO region
+shares a 64 KiB host page with a writable global, and the guest's own write to that global faults
+under D40 — a startup `MemoryFault`, even for an empty script. chibicc's **`--data-page N`** flag
+(default 16384, native-unchanged) pins the boundary to 65536 for a playground guest, matching the
+LLVM on-ramp's long-standing `--host-page 65536` (build-onramp-assets.mjs). **Any** chibicc
+`main(void)` guest with read-only data destined for the browser must be built this way; a guest with
+no RO data is unaffected.
+
+---
+
 ## Decisions
 
 - **Fallback policy → fail-closed (v1).** When `compile_module` returns `None` (rare seams:

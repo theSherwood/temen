@@ -320,3 +320,110 @@ identical across backends — `1` returning, `2` trapping. That is now pinned by
 `crates/svm/tests/lifecycle_poll_convergence.rs` (interp vs JIT, both cases).
 See ISSUES.md I43. The `$?` = 128 + signal crash-status mapping is a shell/guest
 convention (not a substrate contract) and remains guest-personality work.
+
+## Shipped: the Stage-0 shell in the browser playground
+
+The Stage-0 shell now runs as an **interactive card** in the browser playground — type a script,
+click Run, see its output, client-side in the sandbox. This is the same shell `c_shell.rs`
+differential-tests; the browser plumbing lives in the detached `svm-browser` crate (see
+`BROWSER.md` → "POSIX-personality on-ramp"). The pieces:
+
+- **`svm-posix` reaches the browser runtime.** `svm-posix` is a dependency of the `svm-browser`
+  cdylib; `svm_run_shell` / `posix_shell_exec` grant the personality and run the shell module on the
+  **bytecode** engine (the tree-walker uses OS threads + a wall clock, absent under wasm), with the
+  editor text as stdin and the personality's captured stdout as output.
+
+- **Sequential subset only.** The browser's bytecode compiler rejects `Instantiator`/`SharedRegion`
+  cap.calls, so the browser fixture is built with `-DSVM_SHELL_SEQUENTIAL`: `#ifndef` guards in
+  `shell_main.c` drop the **external-command spawn** (slice 5, above) and the **concurrent ring
+  pipelines** (slice 6). What ships is the full Stage-0 surface — builtins, redirection, in-window
+  memfs pipelines, `;`/`&&`/`||` lists, `if`, variables, globbing, and `#` comments. External
+  commands and concurrent pipelines stay native-only (they need the caps bytecode can't compile);
+  the full shell keeps both.
+
+- **One source of truth.** The shell C source lives in `crates/svm-run/demos/shell/*.c`
+  (`shim.c`/`ring.c`/`shell_main.c`), `include_str!`d by `c_shell.rs` and compiled into the committed
+  `browser/tests/fixtures/shell.svmb` by the (ignored) `gen_browser_shell_fixture` test — reusing the
+  same chibicc compile + by-name import resolution the differential uses.
+
+- **The 64 KiB-page fix.** A chibicc `main(void)` guest with read-only data faulted in the browser
+  until chibicc gained a **`--data-page 65536`** flag (D40 / RO-vs-writable isolation at the wasm
+  64 KiB page). Detailed in `BROWSER.md`; it unblocks *any* chibicc guest for the playground, not just
+  the shell.
+
+Tested: native `c_shell` (differential interp==JIT) + `browser/tests/shell.rs` (bytecode) +
+`browser/browser-shell-test.mjs` (real Chromium over the wasm, in CI). External commands, concurrent
+pipelines, and `fork` (items 5–7 above) remain the native-only frontier.
+
+## Remaining work — from the Stage-0 shell to *actual bash* in the playground
+
+The card above is a **hand-written Stage-0 shell**, not GNU Bash. Getting real bash — the ~150k-line C
+program, not something bash-like — into the playground is two problems stacked: the **native** path
+to bash (mostly captured in `PROCESS.md`), *plus* a **browser-only** constraint that is not captured
+anywhere else and is the harder, partly-open half.
+
+### The native path to bash (see PROCESS.md)
+
+Bash is a different architecture from the current shell: where this shell mints **confined children
+and grants them capabilities** ("children born destitute", the `Instantiator` model), bash assumes
+ambient **`fork()` + `exec()` + `wait()`**, signals, and job control. The roadmap for that lives in
+`PROCESS.md` (the S8/S11/S12 stage table, the §7 fork plan, the POSIX-coverage census, the L0/L1/L2
+signals ladder). In dependency order:
+
+1. **Guest libc for bash** — assemble bash's link surface (`glob`/`fnmatch`, regex, `getpwnam`/
+   `getgrnam`, `setjmp` — proven — on top of the Postgres shim set). *Medium; incremental.*
+2. **Build `bash.svmb`** — autoconf cross-config for the svm "platform", `--noediting`, through the
+   `clang → svm-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
+   *Medium/mechanical.* Gets bash to *link and start*.
+3. **`fork` (the gate)** — the substrate has **no fork-returns-twice**. The plan (§7 / Stage 3 / S11)
+   implements it at the **personality** level over durable freeze → clone-window → thaw, with two hard
+   prereqs: **R8 closure** (durable `call_indirect` to may-suspend targets — bash dispatches builtins
+   through function-pointer tables, so R8 is squarely on fork's critical path) and a
+   durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
+   it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).
+4. **`exec`/`wait`/`waitpid`/`pipe`/`dup2`** wired to the child machinery. *Medium.*
+5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
+   cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
+6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for
+   interactive use. Deferrable behind `--noediting` (batch bash is still real bash); the terminal is
+   its own large frontend effort.
+
+Roughly ~80% of that is "solved-class" work (compile + libc + wiring, de-risked by Postgres/SQLite
+already running); the ~20% that gates everything is **`fork` + R8**.
+
+### The browser-only constraint — and how much of it is *already* there
+
+Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
+**bytecode-only** (the tree-walker uses OS threads + a wall clock, and the wasm-JIT tier is a
+hot-compute tier only). But the gap is **narrower than it first looks** — the bytecode engine's
+cooperative, single-thread driver (`compile_and_run_with_host`, the exact entry the browser shell runs
+on) **already lowers and drives the core §14 ops, wasm-safely:**
+
+- **`instantiate` (op 0), `instantiate_module` (op 5), `join` (op 1) already work on bytecode,
+  single-thread.** Op 0 was covered by `bytecode_parallel_instantiate.rs` (cooperative arm); op 5 —
+  the "exec a command" primitive, a *separate-module* child — is pinned matching the tree-walk oracle
+  by `bytecode_separate_module.rs`. No OS threads, no clock. So **sequential spawn/wait is already a
+  browser capability**, not a missing one.
+
+What the browser bytecode engine still **declines** (the real remaining gaps, in rough order):
+
+1. **`instantiate_module_named` (op 13)** — exec-with-inherited-stdout, what the shell's external-
+   command path uses. It has no bytecode lowering (only ops 0/1/5 do) and the cooperative driver
+   doesn't build the child's by-name powerbox. **This is the first parity slice**: lower op 13 (=
+   op 5 + op 11 grants) and drive it cooperatively, following the op-5 pattern that already works —
+   which unblocks *external commands* in the playground shell.
+2. **The ring / `AddressSpace` / `SharedRegion` ops** — `compile_inst` rejects these (concurrent
+   pipelines). Needed for the stripped ring-pipeline path.
+3. **True concurrency.** The cooperative driver runs a child *to completion synchronously*, which is
+   exactly right for sequential spawn/wait but not for *concurrently* live children (a `poll` that
+   must see a still-running child; a pipeline whose stages run interleaved). That needs a cooperative
+   **scheduler** that interleaves live children on one thread (logical clock, no OS threads) — the
+   wasm-safe analogue of the native M:N/JIT-OS-thread executors.
+4. **`fork`** — durable clone over the `Instantiator` child model (§7). Whether the durable
+   freeze/thaw path itself runs on the bytecode engine in wasm is the open question that gates *bash*
+   specifically; ops 1–3 are the parity groundwork it sits on.
+
+So this is a **sequence of scoped slices on the bytecode engine**, not an unbounded design problem:
+op 13 → ring ops → cooperative child scheduler → fork. The wasm-JIT tier can defer each §14 seam to
+the bytecode engine (as it already does for its cross-tier helpers), so bringing bytecode to parity
+brings *both* browser engines along. Slice 1 (op 13) is the immediate next step.
