@@ -348,7 +348,8 @@ different things depending on which pair you compare:
   Covered by `bytecode_debug_coroutine_module.rs` (oracle parity, a parent breakpoint, step-into the
   granted module's body with confined-window read, deterministic body-position tick-replay). Full
   *source-variable* inspection inside a separate-module child (the `FrameReader`'s module-0 gate + per-
-  module debug metadata) is a follow-up; position-level step-into and window reads work today.
+  module debug metadata) landed in **slice 17** (single-vCPU *and* scheduled); position-level step-into and
+  window reads work here.
 
   **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** `instantiate` (op 0) is
   no longer declined on the scheduled engine: `ScheduledDebugRun` grew a per-task `env` (the debug-engine
@@ -375,8 +376,9 @@ different things depending on which pair you compare:
   already carves a confined child's grandchild from the *child's* env, **confinement composes to depth 2**
   under the debugger — a grandchild is its own vCPU with its own window, three distinct confined windows
   nested two deep (15c, `bytecode_debug_instantiate.rs::breakpoint_in_a_grandchild_fires`). Source-variable
-  inspection inside a separate-module child (the `FrameReader`'s module-0 gate) is a follow-up; position-
-  level breakpoints/step-into and window reads work today.
+  inspection inside a separate-module child (the `FrameReader`'s module-0 gate) landed for the coroutine path
+  on both the single-vCPU and scheduled engines in **slice 17**; position-level breakpoints/step-into and
+  window reads work today.
 
   **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
   reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the
@@ -392,17 +394,37 @@ different things depending on which pair you compare:
   deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
   the single-vCPU engine does.
 
+  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled).** Stepping into
+  a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
+  variables — the `FrameReader`'s module-0 gate + per-module debug metadata that were the 14c/15b/15c
+  follow-up. The granted child module already retained its whole `Module` (`ModuleGrant.module`, for §3.6),
+  so `spawn_coroutine_module` builds a `ModuleDebug` from it (its `-g` info + per-`(func, block)` slot base
+  and value types, exactly as module 0's are built) keyed by the child's pushed source index, and stores it
+  on the child `Coro`. The `FrameReader` resolves each frame's metadata by its module — module 0's session
+  fields, or the active separate-module coroutine's own — dropping the flat `module != 0` gate (an
+  installed-unit frame still resolves to `None`, unchanged). The child is now compiled **unfused** under the
+  debugger (like module 0), so every child IR inst stays a distinct breakpoint/step position. Metadata is
+  per-run state rebuilt as the child re-spawns, so reverse `tick`-replay reproduces the child's live values.
+  Both debug engines carry it: the single-vCPU `DebugRun`'s `spawn_coroutine_module` helper and the
+  `ScheduledDebugRun` driver's `SpawnCoroutineModule` arm build + attach the child's `ModuleDebug`
+  identically, and both `reader()`s pass the active coroutine's metadata into the `FrameReader`. Covered by
+  `bytecode_debug_coroutine_module.rs` (single-vCPU) and `bytecode_debug_scheduled_coroutine.rs` (scheduled):
+  each reads a named SSA var inside the granted module's body, an unknown name `None`, and deterministically
+  tick-replays the value. (An `instantiate` sibling *plus* a separate-module coroutine in one module traps
+  `ThreadFault` on the production engine too — an invalid VM combination — so the scheduled coverage uses a
+  coroutine driven through the scheduler on its own vCPU.)
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
   `thread.spawn`/`join`/`wait`/`notify`, **fibers**, **§14 coroutines** (step-into — same-module and
   separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
-  (slices 14b/14c, 15a/15b/15c, 16). The only remaining `Declined` op is JIT tier-up (never enabled on
-  the debug engine). Follow-ups: the §3.6 serve/live-call machinery inside a confined child,
-  *source-variable* inspection inside a separate-module child body, env teardown / D37 revocation, and a
-  checkpoint ladder to bound reverse-replay cost (perf — today's small debugged programs replay from turn
-  0 cheaply).
+  (slices 14b/14c, 15a/15b/15c, 16), and **source-variable inspection inside a separate-module child body**
+  on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
+  (never enabled on the debug engine). Follow-ups: the §3.6 serve/live-call machinery inside a confined
+  child, env teardown / D37 revocation, and a checkpoint ladder to bound reverse-replay cost (perf — today's
+  small debugged programs replay from turn 0 cheaply).
 
 ---
 
