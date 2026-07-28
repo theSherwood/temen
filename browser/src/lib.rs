@@ -3870,23 +3870,69 @@ pub extern "C" fn svm_run_onramp_posix(
     out.value
 }
 
+/// Parse the shell's **PATH-registry blob** at `[ptr, len)` into `(name, module)` pairs. Layout, all
+/// integers little-endian: a `u32` entry count, then per entry a `u32` name length + that many UTF-8
+/// name bytes + a `u32` module length + that many encoded-module bytes. It bundles the `__stage`
+/// ring-filter runner and every external command (`primes`, …) into one buffer so `svm_run_shell` takes
+/// a single extra arg. Defensive: a truncated or malformed blob, or an entry whose module fails to
+/// decode, drops that entry (and everything after a length that overruns) rather than trapping — the
+/// shell still runs, just without the affected command. Returns owned `(String, Module)`s.
+fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, svm_ir::Module)> {
+    let mut out = Vec::new();
+    let rd_u32 = |b: &[u8], at: usize| -> Option<usize> {
+        b.get(at..at + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+    };
+    let count = match rd_u32(bytes, 0) {
+        Some(c) => c,
+        None => return out,
+    };
+    let mut off = 4usize;
+    for _ in 0..count {
+        let Some(nlen) = rd_u32(bytes, off) else {
+            break;
+        };
+        off += 4;
+        let Some(name_bytes) = bytes.get(off..off + nlen) else {
+            break;
+        };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            break;
+        };
+        off += nlen;
+        let Some(mlen) = rd_u32(bytes, off) else {
+            break;
+        };
+        off += 4;
+        let Some(mod_bytes) = bytes.get(off..off + mlen) else {
+            break;
+        };
+        off += mlen;
+        if let Ok(m) = svm_encode::decode_module(mod_bytes) {
+            out.push((name.to_string(), m));
+        }
+    }
+    out
+}
+
 /// Decode the module at `[mod_ptr, mod_len)` and run it as the **`svm-posix` shell** (see
 /// [`posix_shell_exec`]) with `[stdin_ptr, stdin_len)` as the script — the playground's shell card.
-/// `[stage_ptr, stage_len)`, when non-empty, is the `__stage` ring-filter runner module: registering it
-/// makes `cat f | sort | uniq`-style pipelines take the **concurrent ring path** (op 11 + `SharedRegion`
-/// + futex) instead of sequential memfs staging. Pass `stage_len = 0` to run without it (memfs
-/// pipelines only). Same capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via
-/// `svm_stdout_ptr`+`svm_stdout_len`, the exit code via [`svm_exit_code`], the status via
-/// [`svm_status`]. Returns the guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots
-/// with the other run exports — read them before the next call.
+/// `[cmds_ptr, cmds_len)`, when non-empty, is the **PATH-registry blob** ([`parse_shell_cmds`]): the
+/// `__stage` ring-filter runner (so `cat f | sort | uniq` takes the **concurrent ring path** — op 11 +
+/// `SharedRegion` + futex) and any **external commands** (`primes N`, …) the shell `exec`s as op-13
+/// §14 children. Pass `cmds_len = 0` to run bare (memfs pipelines, no external commands). Same
+/// capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via `svm_stdout_ptr`+
+/// `svm_stdout_len`, the exit code via [`svm_exit_code`], the status via [`svm_status`]. Returns the
+/// guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with the other run exports —
+/// read them before the next call.
 #[no_mangle]
 pub extern "C" fn svm_run_shell(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
-    stage_ptr: *const u8,
-    stage_len: usize,
+    cmds_ptr: *const u8,
+    cmds_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
@@ -3903,19 +3949,16 @@ pub extern "C" fn svm_run_shell(
             return 0;
         }
     };
-    // The optional `__stage` runner. A decode failure here is non-fatal: run the shell without the ring
-    // path (pipelines fall back to memfs staging) rather than failing the whole run.
-    let runner = if stage_ptr.is_null() || stage_len == 0 {
-        None
+    // The PATH registry (`__stage` + external commands). A truncated/undecodable blob is non-fatal:
+    // `parse_shell_cmds` drops the bad entries and the shell runs with whatever registered.
+    let owned = if cmds_ptr.is_null() || cmds_len == 0 {
+        Vec::new()
     } else {
-        let sbytes = unsafe { core::slice::from_raw_parts(stage_ptr, stage_len) };
-        svm_encode::decode_module(sbytes).ok()
+        let cb = unsafe { core::slice::from_raw_parts(cmds_ptr, cmds_len) };
+        parse_shell_cmds(cb)
     };
-    let cmds: &[(&str, &svm_ir::Module)] = match &runner {
-        Some(r) => &[("__stage", r)],
-        None => &[],
-    };
-    let out = posix_shell_exec_with(&m, stdin, cmds);
+    let cmds: Vec<(&str, &svm_ir::Module)> = owned.iter().map(|(n, m)| (n.as_str(), m)).collect();
+    let out = posix_shell_exec_with(&m, stdin, &cmds);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
