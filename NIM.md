@@ -1,0 +1,220 @@
+# NIM.md — running Nim (nimony) on SVM, and self-hosting it
+
+Status: **scoping / design doc + phase-1 in progress**, written 2026-07-28. This is the
+work-breakdown and the load-bearing decisions for targeting SVM from
+[nimony](https://github.com/nim-lang/nimony) — the in-development next-generation Nim
+compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOST_C.md`),
+libc-as-capabilities (`POSIX.md`), and the frontend trust model (`FRONTEND.md` §1,
+`DESIGN.md` §2a). This doc is the *what/how/when*; it does not restate those.
+
+Fold completed sections into `DESIGN.md` and drop this file once the actionable gaps
+close — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
+
+## 0. TL;DR
+
+- **Goal.** Compile Nim → SVM IR, and eventually **self-host nimony on SVM** — the same
+  shape as chibicc-on-SVM (`SELFHOST_C.md`) and the Postgres/QuickJS guest assets.
+- **Two phases, cheapest-first.**
+  - **Phase 1 (this doc's active work): the C on-ramp path — zero nimony code.**
+    nimony already emits C; SVM already ingests C→bitcode→SVM-IR via the proven LLVM
+    on-ramp (`LLVM.md`). So `nim → nimony → Leng → lengc(C) → clang -O2 → svm-llvm-translate
+    → prep_svmb`. This retires the real risk (does Nim-shaped codegen — ARC, error-flag
+    exceptions, raw-pointer objects, the `system` runtime — survive the on-ramp and run
+    correctly under confinement?) and delivers **nimony-on-SVM for free**, exactly as
+    `chibicc.svmb` came for free from the same pipeline.
+  - **Phase 2 (optional, if warranted): a native `Leng → SVM-IR` backend.** A
+    `lengc`-style backend written in Nim, consuming Leng NIF and emitting SVM text — the
+    supported multi-backend seam (C/C++/LLVM-IR/arkham already coexist behind Leng). The
+    **"arkham-for-SVM"** play: drops the clang/LLVM build-time dependency and shapes SVM-IR
+    directly from Leng.
+- **The one thing that could scare you — Leng assumes flat C-ABI memory with raw
+  pointers — is already solved.** It is the C frontend's situation exactly: the guest gets a
+  flat `[0, size)` **window**, pointers are window offsets, and the **masking lowering**
+  confines every access (INVARIANTS §2 — the security hinge, *not* the verifier). Nim/Leng
+  raw pointers are no more dangerous than C's. Leng's `ptr`/`aptr` split is *cleaner* than C.
+
+## 1. Background — nimony's pipeline and where a backend plugs in
+
+(Findings from reading nimony `master`, repo v0.4.0, 2026-07-28. **"NIFC" was renamed
+"Leng"**; the tool is `lengc`; the token/format library is "nifcore"; the interchange format
+is **NIF** — "Nim Intermediate Format", `nim-lang/nifspec`.)
+
+The compiler is a chain of tools passing **NIF token streams** (not trees) between phases:
+
+```
+Nim source
+  → nifler      parse → NIF dialect (.p.nif)
+  → nimony      sema: symbol/type resolution, template/macro expansion (.s.nif)
+                (+ effect inference — NOT yet implemented; + deref/mutation checks)
+  → hexer       lowering: iterator inlining, lambda lifting, ARC dup/copy + destructor
+                injection, control-flow-expr → stmt, exception translation, CPS
+  → hexer       emit  Leng                       ← the stable, documented codegen IR
+  → lengc       Leng → C | C++ | LLVM IR         ← the backend seam
+```
+
+- **Leng** (`doc/leng-spec.md`, ~450-line grammar) is a **typed, C-like tree/statement IR**
+  — *not* SSA, *not* a stack machine. Named locals; structured `if`/`while`/`case` plus
+  low-level `lab`/`jmp`. Types: sized `(i N)`/`(u N)`/`(f N)`/`(c N)`, `bool`, `void`,
+  `ptr`/`aptr`, value-semantic `array`, `object` (single inheritance = first child is the
+  base), `union`, `enum`, bitfields, SIMD `vector`. Ops carry their result type
+  (`add`/`sub`/…), `cast` (C cast) vs `conv` (value-preserving). Lvalues: `deref`/`addr`/`at`/
+  `pat`/`dot`. Overflow is explicit (`keepovf`/`ovf`, GCC-`__builtin_*_overflow`-shaped).
+  `emit` = verbatim C passthrough.
+- **The backend seam is real and already multi-consumer.** `src/lengc/` ships C, C++, **and
+  LLVM-IR** backends (`codegen.nim`, `llvmcodegen.nim`, dispatched by `lengc {c|cpp|llvm}`);
+  a separate **arkham** tool compiles Leng → typed asm-NIF → native (`nifasm`); **shoggoth**
+  is a NIF-level optimizer. A new backend consuming Leng is the *supported* extension. This
+  is what makes Phase 2 tractable.
+- **Runtime shape — favorable:**
+  - **ARC/ORC only, no tracing GC.** Destructors/dups are injected by hexer as **ordinary
+    Leng calls** → ordinary SVM-IR calls. No GC runtime to port.
+  - **libc optional.** Default stdlib is **libc-free** (native allocator + raw-syscall IO);
+    `-d:useLibc` opts into mimalloc. Raw syscalls → unresolved named imports the POSIX
+    personality resolves at load (`POSIX.md`) — the exact self-host libc model.
+  - **Exceptions:** error-flag + `goto` (`errv` bool + `onerr`), **no setjmp/longjmp**, or
+    C++ `try/throw` in cpp mode. Fully lowered before Leng.
+  - **Concurrency:** CPS / `.passive` procs → state machines over a minimal `system.nim`.
+  - **Self-hosting today:** nimony is written in Nim, built by Nim 2.x, and boots through C
+    to a **byte-identical stage2==stage3 fixpoint** (`doc/nifcore_migration.md`).
+
+### Compatibility ledger (the "why this works")
+
+| nimony/Leng concern | Lands on SVM as |
+|---|---|
+| Flat C-ABI memory, raw `ptr`/`aptr`, unions, casts | Window + masking lowering, as for C; §3d pins x86-64-SysV struct layout — matches Leng's ABI |
+| ARC/ORC, destructors as calls | Ordinary SVM-IR calls; **no GC runtime** |
+| libc-free / raw syscalls / mimalloc | Named imports → POSIX personality; allocator grows the window via the Memory cap |
+| Exceptions: error-flag + goto | SVM-IR general goto/branch (C frontend proves gnarly state machines) |
+| Bit-reinterpret casts | Already lowered to `copyMem` upstream — not arbitrary bit-punning at Leng |
+| CPS/passive → state machines | Ordinary code over minimal `system.nim`; SVM threads (`THREADS.md`) |
+| Leng is not SSA | SSA/block-params synthesized from named locals + goto — the on-ramp already does φ→block-args (`LLVM.md`); a native backend redoes this |
+
+### Trust (both phases)
+
+The Nim-derived module is an **untrusted frontend artifact** (`DESIGN.md` §2a): the verifier
+re-checks everything at load, so a nimony/backend bug is a **clean error, never an escape**.
+No self-hosting convenience may bypass verification (INVARIANTS §9).
+
+## 2. Phase 1 — the C on-ramp path (active)
+
+**Pipeline.** `nim → nimony/hexer → Leng → lengc c → clang-18 -O2 -emit-llvm →
+svm-llvm-translate → prep_svmb (decode → verify → bytecode-compile gate)`, then run on
+interpreter + JIT. This is the **`build-pg-assets.mjs` / `build_chibicc_svmb.sh` pattern**,
+retargeted at nimony's C output. Use the **LLVM on-ramp, not the chibicc C frontend**: Nim's
+C leans on compiler builtins (overflow — Leng's `keepovf`/`ovf`) that clang handles and
+chibicc does not.
+
+**Build order.**
+
+1. **Retire the codegen-shape risk *before* a nimony bootstrap** — validate that
+   **Nim-shaped C** survives the on-ramp and runs identically to native. A small probe
+   program exercises the exact patterns nimony/Leng emit: ARC refcount inc/dec + a destructor
+   call, an error-flag + goto raise/handler, a tagged `object` with an inheritance-style first
+   field, and a heap `seq`/`string`-like struct over `malloc`. Run interp == JIT == native.
+   **→ DONE 2026-07-28** — `crates/svm-run/demos/nimony/` (`arc_probe.c` + `build_probe.sh` +
+   the `nimony_probe` runner example). The probe translates through the on-ramp to a **21-func,
+   9.3 KB `.svmb`** that decodes / verifies / bytecode-compiles, and runs **byte-identical to
+   native `clang -O2` on all three engines** (treewalk / bytecode / JIT), exit 0. Every call
+   resolved to an on-ramp-recognized name with **no `--stub-externs`** — i.e. ARC destructor
+   calls, the error-flag+goto unwind, first-member-base object dispatch, and `realloc`-grown
+   seqs all lower and confine cleanly. The codegen-shape risk is retired; the remaining Phase-1
+   work is toolchain (step 2) + real libc surface (step 3), not "does Nim's shape fit SVM".
+2. **Obtain nimony + emit C.** Install Nim 2.x (choosenim; apt's 1.6 is too old), bootstrap
+   nimony (`nim c -r src/hastur build all`), and capture `lengc c` output for a corpus of
+   small Nim programs (int/float/recursion, `seq`/`string`, `object` + method, `ref` + ARC,
+   a `raises` proc). *Blocked in the current sandbox on toolchain install/bootstrap cost;
+   commands recorded below.*
+3. **On-ramp the real C**, `-mlong-double-64` if nimony emits `long double` (the chibicc F3
+   lesson), `--host-page 65536` for a browser-targetable asset. Fill the libc bottom edge by
+   **reusing the Postgres/chibicc guest-libc shims** (`SELFHOST_C.md` Appendix B) — the
+   surface is nearly identical (stdio, `malloc`/`realloc`, `str*`, `%.17g` via `__vm_fmt_gen`).
+4. **Differential-validate** each corpus program: guest stdout/exit byte-matches native
+   `nim c` build (the `chibicc_run.rs` / `run_selfhost_diff.sh` two-tier pattern).
+5. **nimony-on-SVM (the self-host payoff).** On-ramp nimony's *own* C output into a
+   `nimony.svmb` guest — the same way `chibicc.svmb` is built. `nim → nimony.svmb → SVM-IR`
+   is then a composition of proven pieces; no new substrate.
+
+**Exit criteria.** (a) the Nim-shaped-C probe runs interp==JIT==native; (b) ≥1 real nimony C
+program runs on SVM matching native; (c) the libc fill-list is measured (the `--stub-externs`
++ stub-audit method, `SELFHOST_C.md` A.5).
+
+### Current-sandbox status (2026-07-28)
+
+- ✅ `clang-18` present; ✅ `svm-llvm-translate` built; ✅ **step-1 probe green on all three
+  engines** (above).
+- ✅ Nim **2.2.10** installed via choosenim.
+- ⏳ **nimony bootstrap blocked on Nim version.** `nim c -r src/hastur build all` fails to
+  compile `hastur` itself under 2.2.10 (`typedthreads.nim` `Cannot prove that 'result' is
+  initialized`); `doc/install.md` calls for Nim **2.3.x** (devel). Getting real Leng/`lengc`
+  C output (step 2) needs a devel Nim (`choosenim devel` or a source build) — deferred rather
+  than sink the session into a compiler-of-a-compiler bootstrap. The step-1 result already
+  proves the pipeline; step 2 swaps the hand-modeled probe for genuine nimony output.
+
+## 3. Phase 2 — native `Leng → SVM-IR` backend (optional)
+
+Write a backend in Nim that consumes **Leng NIF** and emits **SVM text** (then `svm-encode`
+→ verify → run) — slotting in beside `lengc`'s C/C++/LLVM/arkham backends. Pursue **only if**
+Phase 1 proves the semantics *and* you want to (a) drop the clang/LLVM build-time dependency,
+or (b) shape SVM-IR directly from Leng instead of round-tripping through C.
+
+**The work (bounded — comparable to chibicc's `codegen_ir.c`, which exists and is proven):**
+
+- **SSA/block-param synthesis** from Leng's named locals + `lab`/`jmp` (the on-ramp's
+  φ→block-args, but from a tree IR — closer to `codegen_ir.c`'s data-SP-threading model).
+- **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
+  same ABI, so this is a match, not a negotiation).
+- **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
+  `ptr.add`; every access confined by the masking lowering (INVARIANTS §2).
+- **Control flow:** structured + `lab`/`jmp` → SVM branches/`br_table` (irreducible CFG is
+  native, `DESIGN.md` §3 — an advantage over wasm).
+- **Calls + ARC:** direct/indirect calls (threaded data-SP), destructor/dup calls pass
+  through as ordinary calls; `onerr`/`errv` → branch-on-flag.
+- **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
+- **Runtime bottom edge:** raw syscalls / allocator → POSIX personality named imports +
+  Memory cap, same as Phase 1.
+
+**Risks:** nimony is v0.4.0, "heavy development" — the Leng grammar and C output are moving
+targets (Phase 1 is insulated: it only needs "nimony emits compilable C"; Phase 2 couples to
+the grammar). Effect inference (pipeline phase 3) and parts of CPS are not yet implemented
+*in nimony itself* — a limit of the source compiler, not the backend.
+
+## 4. Invariants this must respect
+
+- **Untrusted frontend, zero escape-TCB.** Same class as chibicc/`svm-wasm`/`svm-llvm`: the
+  verifier re-checks the produced module; a bug is a clean error (INVARIANTS §9, §2a).
+- **No new substrate.** Both phases close over existing seams — the on-ramp, the POSIX
+  personality, the Memory cap, `prep_svmb`, the `fs` cap memfs. No new host ops. Host stays
+  mechanism (INVARIANTS §1/§4).
+- **Confinement is the masking lowering.** Nim raw pointers ride the same window+mask regime
+  as C; no new emitted-code/window-access surface (INVARIANTS §2).
+- **Code-coupled asset.** `nimony.svmb` (and any corpus `.svmb`) regenerate on IR/ABI/encoder
+  change, gated in CI — the Postgres/chibicc asset-lane template.
+
+## 5. Non-goals
+
+- Matching every Nim 2 feature — nimony's own coverage at v0.4.0 is the ceiling; effect
+  inference etc. are upstream gaps.
+- A general Nim package/build tool on SVM (nimble, etc.). The unit is a compiled SVM module.
+- Making the Phase-2 backend the *only* path — the on-ramp (Phase 1) stays the low-risk lane
+  and the self-host shipping path, exactly as the LLVM-built `chibicc.svmb` ships (§3 there).
+
+---
+
+## Appendix — recorded toolchain commands (Phase 1 step 2, for when a nim toolchain is present)
+
+```sh
+# Nim 2.x (apt's 1.6 is too old for nimony)
+curl -fsSL https://nim-lang.org/choosenim/init.sh | sh    # or: choosenim 2.2.0
+export PATH="$HOME/.nimble/bin:$PATH"
+
+# nimony
+git clone https://github.com/nim-lang/nimony && cd nimony
+nim c -r src/hastur build all          # bootstrap the toolchain
+# emit Leng-derived C for a program (via the C backend):
+#   the toolchain drives nifler → nimony → hexer → lengc c; capture the generated .c
+
+# on-ramp the C (mirrors build_chibicc_svmb.sh)
+clang-18 -O2 -emit-llvm -c -mlong-double-64 prog.c -o prog.bc
+svm-llvm-translate prog.bc -o prog_raw.svmb --binary --host-page 65536 [--stub-externs]
+cargo run --release -p svm-run --example prep_svmb -- prog_raw.svmb prog.svmb
+```
