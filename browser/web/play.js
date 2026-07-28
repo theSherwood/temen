@@ -750,11 +750,13 @@ print("squares:", table.concat(sq, " "))
       'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.svmb over your source ' +
       '(seeded on an fs capability at /in.c), which emits SVM IR; the page then svm_parse-es that IR into ' +
       'a module and runs it. Your program’s output (what printf writes) appears in the pane, with the ' +
-      'emitted SVM IR below it, and main()’s return value as the result. A small libc ships as headers ' +
-      '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h> and printf/puts/malloc/' +
-      'str* work as guest C over the powerbox’s ambient write, including %f/%e/%g float formatting ' +
-      '(correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
-      'exact-tie roundings can differ from glibc). Compile a program and run it, entirely in the browser, on the SVM.',
+      'emitted SVM IR below it, and main()’s return value as the result. A libc ships as headers ' +
+      '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h>/<math.h>/<assert.h>/' +
+      '<limits.h>/<stddef.h>/<errno.h> as guest C over the powerbox’s ambient write, including %f/%e/%g float ' +
+      'formatting (correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
+      'exact-tie roundings can differ from glibc). Split the editor into a multi-file project with `//// file: name` ' +
+      'marker lines — the code above the first marker is /in.c, and it can #include "name" the sibling files ' +
+      '(headers or extra .c, unity-build style). Compile a program and run it, entirely in the browser, on the SVM.',
     src: `// Write C here, then click Run. printf output shows in the pane on the
 // right; the emitted SVM IR appears below it, and main()'s return is the result.
 #include <stdio.h>

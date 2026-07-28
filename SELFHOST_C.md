@@ -304,9 +304,25 @@ compiler bug is a clean error, never an escape.
    Gated by `browser/tests/chibicc_libc.rs` (a real ~90-line stats pipeline over `strtok`/`strtod`/
    `qsort`/`sqrt`/`assert`, an algebraic-math sweep, and the string/stdlib additions — compiled + run to
    exact output) plus a `browser-play-editor-test.mjs` Chromium assertion (`<math.h>` + `<assert.h>` +
-   `strdup` → real output in-browser). Residual toward **full stage-2** (chibicc compiling its *own*
-   source): the playground path seeds a single `/in.c`, so a multi-file compile (chibicc is ~8 TUs +
-   its headers) still needs a driver that reads/links multiple guest files — the next stage-2 slice.
+   `strdup` → real output in-browser).
+
+   **→ Multi-file guest compile DONE 2026-07-28.** A card program can now span **multiple files**. The
+   compiler side already resolved it — chibicc-the-guest resolves quote-includes (`#include "x.h"`)
+   against the source's own directory (`/`), which the seeded memfs serves — so the only missing piece
+   was *providing* the files: the card has one editor. Added a `//// file: NAME` marker convention
+   (`split_multifile_source`, in the cdylib so both tiers + the native tests share it): the text before
+   the first marker is `/in.c`, and each marker seeds a sibling file the entry `#include`s (headers or
+   extra `.c`, unity-build style; a `NAME` with `/` nests, its parent dirs registered). No marker ⇒ a
+   single `/in.c`, unchanged — and because the card already routes the editor through
+   `chibicc_card_image`, this needed **zero JS/FFI change** and **no `chibicc.svmb` rebuild**. Gated by
+   `browser/tests/chibicc_multifile.rs` (the splitter + a real 3-file project — entry + `.h` + `.c` —
+   and a nested-dir include, compiled + run to exact output) and a `browser-play-editor-test.mjs`
+   Chromium assertion. **What remains for the full self-compile** (chibicc compiling its *own* ~8-TU
+   source in-sandbox): a real program only needs the memfs (done), but chibicc's own sources
+   `#include` a **much larger system-header surface** than the playground libc — `<sys/stat.h>`,
+   `<unistd.h>`, `<glob.h>`, `<libgen.h>`, `<time.h>`, buffered `FILE*` stdio, … — so the remaining
+   work is porting chibicc's build-time guest libc (`chibicc_libc.c`, Appendix B) into *seedable
+   headers*, not the multi-file plumbing. That libc-surface lift is the next stage-2 slice.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
