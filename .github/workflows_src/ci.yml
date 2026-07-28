@@ -443,6 +443,11 @@ jobs:
           # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
           node browser-jit-reactor-test.mjs
           node browser-play-editor-test.mjs
+          # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
+          # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
+          # staged chibicc.svmb; SKIPs if it's absent. Timing is informational — it only FAILs on IR
+          # divergence. See SELFHOST_C.md §7 (wasm-JIT tier) / PR #483.
+          node bench_chibicc_jit.mjs
           node pg-reload-test.mjs
           # The svm-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
           # then drive `svm_run_shell` in real Chromium and assert the script's stdout. The test
