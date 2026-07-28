@@ -277,10 +277,23 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       emitted together so **intra-module calls** resolve by index. Tested end-to-end: a global
       counter + `const` step + a `main → bumpN → bump` call chain, interp == JIT. Non-zero global
       initializers fail-close (a `data`-segment init is the refinement).
-    - **Next: cross-module `call`** (`…sysvq0asl` suffixes) as SVM **imports** — the remaining half
-      of whole-module, and what makes real `sumto` (whose `inc` is a system import) and real
-      multi-proc modules that call the stdlib run. Needs a callee-signature source (the sema `.idx`
-      export map, or a provided sig table) to declare each `import`/`call.import` correctly.
+    - **✅ cross-module `call` → SVM imports — DONE 2026-07-28.** A call to a callee not defined in
+      the module becomes a declared `import N "name" (params) -> (ret)` + `call.import N`; the
+      signature is fixed from the call site (param types from the args; return arity from position —
+      a stmt-call is void, an expr-call returns a value), cached per symbol (inconsistent arity
+      fail-closes). The runtime binds the import by name at instantiation, exactly like `write`.
+      Tested: a cross-module call translates + verifies, **runs correctly on the interpreter with a
+      bound host fn** (`use_ext(x)=ext_double(x)+1`), a stmt-call declares a void import, and — the
+      payoff — **real nimony `sumto` now translates and verifies**: `while i<=n: (inc(addr i);
+      result+=i)` composes the frame (address-taken counter), `while`, and the cross-module `inc`
+      import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
+      the real export sigs (and JIT-side import binding in tests) are refinements.
+
+  **State:** `svm-leng` translates whole real-ish modules — integers, control flow, pointers,
+  frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the rest, and is
+  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`). Remaining for full
+  real modules: `case`→`br_table`, `cast`/`conv` breadth, whole-aggregate copy/`oconstr`, floats,
+  and non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.

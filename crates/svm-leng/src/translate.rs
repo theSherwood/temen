@@ -22,11 +22,28 @@
 //! passed by address; aggregate `var`s are frame-resident. Whole-aggregate copy/constructors and
 //! C-ABI field offsets remain later refinements.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use svm_ir::ValType;
 
 use crate::{LengError, Node, Val};
+
+/// A cross-module callee lowered to an SVM `import` — its declared signature and slot. The runtime
+/// binds it by name at instantiation (like `write`), exactly as the embedder binds the powerbox.
+struct ImportDecl {
+    name: String,
+    params: Vec<ValType>,
+    ret: Option<ValType>,
+}
+
+/// Imports discovered while emitting a module. Interior-mutable because they're found during
+/// (immutable-`&self`) proc emission and materialized into the module header afterward.
+#[derive(Default)]
+struct ImportTable {
+    decls: Vec<ImportDecl>, // slot = index
+    slot_of: HashMap<String, u32>,
+}
 
 /// The svm-text prefix for a value type (`i32`/`i64`). This subset only produces integer types.
 fn prefix(ty: ValType) -> &'static str {
@@ -82,6 +99,8 @@ pub(crate) struct Translator {
     globals: HashMap<String, (u64, TyDesc)>,
     /// Scalar integer `const`s, inlined at use.
     consts: HashMap<String, i64>,
+    /// Cross-module callees lowered to SVM imports (discovered during emission).
+    imports: RefCell<ImportTable>,
 }
 
 impl Translator {
@@ -91,7 +110,60 @@ impl Translator {
             types: HashMap::new(),
             globals: HashMap::new(),
             consts: HashMap::new(),
+            imports: RefCell::new(ImportTable::default()),
         }
+    }
+
+    /// Register (or reuse) an import slot for a cross-module callee. First use fixes its signature;
+    /// a later call with a different arg count fail-closes (rather than emit a mismatched
+    /// `call.import` the verifier would reject).
+    fn register_import(
+        &self,
+        name: &str,
+        argtys: &[ValType],
+        ret: Option<ValType>,
+    ) -> Result<u32, LengError> {
+        let mut t = self.imports.borrow_mut();
+        if let Some(&slot) = t.slot_of.get(name) {
+            if t.decls[slot as usize].params.len() != argtys.len() {
+                return Err(LengError::Unsupported(format!(
+                    "import `{name}` called with inconsistent arity"
+                )));
+            }
+            return Ok(slot);
+        }
+        let slot = t.decls.len() as u32;
+        t.decls.push(ImportDecl {
+            name: name.to_string(),
+            params: argtys.to_vec(),
+            ret,
+        });
+        t.slot_of.insert(name.to_string(), slot);
+        Ok(slot)
+    }
+
+    /// Assemble the final module text: `memory` (if used) + `import` declarations + funcs.
+    fn assemble(&self, used_memory: bool, funcs: String) -> String {
+        let mut out = String::new();
+        if used_memory {
+            out.push_str("memory 16\n\n");
+        }
+        let t = self.imports.borrow();
+        for (slot, d) in t.decls.iter().enumerate() {
+            let ps = d
+                .params
+                .iter()
+                .map(|t| prefix(*t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rs = d.ret.map(prefix).unwrap_or("");
+            out.push_str(&format!("import {slot} \"{}\" ({ps}) -> ({rs})\n", d.name));
+        }
+        if !t.decls.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&funcs);
+        out
     }
 
     /// Collect `gvar`/`const` top-levels: globals get fixed window offsets (below the stack the
@@ -282,7 +354,7 @@ impl Translator {
         for p in &proc_nodes {
             used_memory |= self.proc_body(p, &mut out)?;
         }
-        Ok(with_memory(used_memory, out))
+        Ok(self.assemble(used_memory, out))
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -319,7 +391,7 @@ impl Translator {
             );
             let mut out = String::new();
             let used_memory = self.proc_body(item, &mut out)?;
-            return Ok(with_memory(used_memory, out));
+            return Ok(self.assemble(used_memory, out));
         }
         Err(LengError::Malformed(format!(
             "proc `{name}` not found in module"
@@ -1041,7 +1113,7 @@ impl<'a> FuncGen<'a> {
                 Ok(())
             }
             Some("call") => {
-                self.call(s)?;
+                self.call(s, false)?; // statement position: result (if any) discarded
                 Ok(())
             }
             Some("if") => self.if_stmt(s),
@@ -1207,7 +1279,7 @@ impl<'a> FuncGen<'a> {
                 }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
-                Some("call") => self.call(e),
+                Some("call") => self.call(e, true), // expression position: a value is wanted
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
                     other.unwrap_or("<headless>")
@@ -1295,8 +1367,10 @@ impl<'a> FuncGen<'a> {
         })
     }
 
-    /// `(call Callee Expr*)` — direct call to a named proc.
-    fn call(&mut self, e: &Node) -> Result<Val, LengError> {
+    /// `(call Callee Expr*)` — a direct call to a module proc, or an SVM `import` for a cross-module
+    /// callee. `want_value` distinguishes expr position (a result) from stmt position (discarded /
+    /// void) so an external callee's import signature gets the right return arity.
+    fn call(&mut self, e: &Node, want_value: bool) -> Result<Val, LengError> {
         let a = e.args();
         if a.is_empty() {
             return Err(LengError::Malformed("call needs a callee".into()));
@@ -1304,9 +1378,11 @@ impl<'a> FuncGen<'a> {
         let callee = a[0].as_atom().ok_or_else(|| {
             LengError::Unsupported("indirect call (callee is not a symbol)".into())
         })?;
-        let sig = self.t.procs.get(callee).ok_or_else(|| {
-            LengError::Unsupported(format!("call to unknown/external proc `{callee}`"))
-        })?;
+        // Cross-module callee (not defined in this module) → an SVM import.
+        if !self.t.procs.contains_key(callee) {
+            return self.call_import(callee, &a[1..], want_value);
+        }
+        let sig = self.t.procs.get(callee).expect("checked above");
         let index = sig.index;
         let ptys = sig.params.clone();
         let ret = sig.ret;
@@ -1359,6 +1435,47 @@ impl<'a> FuncGen<'a> {
         }
     }
 
+    /// Lower a cross-module call to a declared SVM `import` + `call.import`. Param types come from
+    /// the args; the return arity from the call position (a stmt-call is treated as void). The
+    /// runtime binds the import by name at instantiation — the frontend only makes it well-typed.
+    fn call_import(
+        &mut self,
+        name: &str,
+        args: &[Node],
+        want_value: bool,
+    ) -> Result<Val, LengError> {
+        let mut argvals = Vec::new();
+        let mut argtys = Vec::new();
+        for arg in args {
+            let v = self.expr(arg)?;
+            argvals.push(v.id);
+            argtys.push(v.ty);
+        }
+        let ret = if want_value { Some(ValType::I64) } else { None };
+        let slot = self.t.register_import(name, &argtys, ret)?;
+        let arglist = argvals
+            .iter()
+            .map(|id| format!("v{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match ret {
+            Some(ty) => {
+                let id = self.fresh();
+                self.cur_buf
+                    .push_str(&format!("  v{id} = call.import {slot} ({arglist})\n"));
+                Ok(Val { id, ty })
+            }
+            None => {
+                self.cur_buf
+                    .push_str(&format!("  call.import {slot} ({arglist})\n"));
+                Ok(Val {
+                    id: u32::MAX,
+                    ty: ValType::I32,
+                })
+            }
+        }
+    }
+
     fn emit_const(&mut self, ty: ValType, n: i64) -> Val {
         let id = self.fresh();
         self.cur_buf
@@ -1396,16 +1513,6 @@ impl<'a> FuncGen<'a> {
 // ---------------------------------------------------------------------------
 // Pre-scan + type/atom helpers.
 // ---------------------------------------------------------------------------
-
-/// Prepend the module `memory` declaration when any proc used the window. `memory 16` = 2^16 = 64
-/// KiB, the small-program default; offsets in the current subset stay well within it.
-fn with_memory(used: bool, funcs: String) -> String {
-    if used {
-        format!("memory 16\n\n{funcs}")
-    } else {
-        funcs
-    }
-}
 
 /// SVM value type of a Leng type: pointers (`ptr`/`aptr`) and named aggregates (held by address)
 /// are `i64`; else an integer scalar.
