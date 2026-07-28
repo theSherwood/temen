@@ -727,6 +727,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-leng"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-text",
+ "svm-verify",
+]
+
+[[package]]
 name = "svm-mask"
 version = "0.0.0"
 
