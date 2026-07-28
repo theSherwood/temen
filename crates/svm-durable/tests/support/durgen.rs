@@ -121,6 +121,11 @@ enum Suspend {
     Cap { npoints: u32 },
     /// Propagated: a single `call` to function `callee` (a deeper may-suspend function).
     Call(u32),
+    /// Propagated **indirect** (R8): a `call_indirect` to `callee` through the natural table
+    /// (slot i = func i). Every generated function is `(i32) -> (i64)`, so the signature-taint
+    /// rule marks the site may-suspend, and the reloaded index re-selects the same instrumented
+    /// callee on thaw. Exercises the indirect re-issue path (interp + cross-backend).
+    Indirect(u32),
 }
 
 /// Append a few i64 consts / total binops to `insts`, tracking value indices in
@@ -217,6 +222,33 @@ fn emit_suspend_body(
             gen_straightline(g, insts, i64_vals, next, acc);
             acc = *i64_vals.last().unwrap();
         }
+        Suspend::Indirect(callee) => {
+            insts.push(Inst::ConstI32(callee as i32)); // funcref: natural table slot = func index
+            let idx = *next;
+            *next += 1;
+            insts.push(Inst::CallIndirect {
+                ty: FuncType {
+                    params: vec![ValType::I32],
+                    results: vec![ValType::I64],
+                },
+                idx,
+                args: vec![0], // pass the handle down
+            });
+            let call_result = *next;
+            *next += 1;
+            i64_vals.push(call_result);
+            insts.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: total_binop(g),
+                a: acc,
+                b: call_result,
+            });
+            acc = *next;
+            *next += 1;
+            i64_vals.push(acc);
+            gen_straightline(g, insts, i64_vals, next, acc);
+            acc = *i64_vals.last().unwrap();
+        }
     }
     acc
 }
@@ -298,8 +330,12 @@ pub fn gen_module(g: &mut Gen) -> Module {
                 Suspend::Cap {
                     npoints: leaf_points,
                 }
-            } else {
+            } else if g.below(2) == 0 {
                 Suspend::Call(i + 1)
+            } else {
+                // R8: dispatch this link through the natural table instead of a direct call, so
+                // chains mix direct and indirect propagated frames.
+                Suspend::Indirect(i + 1)
             };
             // ~half the functions split their body across two blocks, so the suspend op
             // lands in a non-entry block (multi-block segmentation + branch remapping).
