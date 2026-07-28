@@ -3067,6 +3067,7 @@ impl<'p> Vcpu<'p> {
             awaiting: None,
             fault_yields: demand,
             faulted_page: None,
+            mod_debug: None, // production vCPU never inspects
         }));
         let h = (self.vt.coroutines.len() - 1) as i32;
         self.vt.active.set(dst, Reg::from_i32(h));
@@ -3520,6 +3521,54 @@ pub fn ir_value_trace(
             Ok(Outcome::Done(vals)) => return Some((trace, Ok(vals))),
             Ok(_) => return None, // a seam — out of single-vCPU debug scope
             Err(t) => return Some((trace, Err(t))),
+        }
+    }
+}
+
+/// Per-module §6 debug metadata a [`FrameReader`] resolves a source variable against: the `-g` info plus
+/// the per-`(func, block)` slot base and value types needed to read any live frame's values. Module 0's
+/// lives directly on the [`DebugRun`]/[`ScheduledDebugRun`]; a §14 **separate-module** child carries its
+/// own here (built from the granted `Module` at spawn, keyed by its pushed source index) so
+/// `read_var`/`var_addr`/`value_in_frame` resolve inside the child's body, not just module 0's.
+struct ModuleDebug {
+    /// The child's index in the shared [`ModuleSource`] (`>= 1`) — matched against a frame's module so a
+    /// frame outside this child (e.g. an installed §22 unit) isn't misread against these tables.
+    module: usize,
+    debug: Option<DebugInfo>,
+    fn_block_base: Vec<Vec<u32>>,
+    fn_block_types: Vec<Vec<Vec<ValType>>>,
+}
+
+impl ModuleDebug {
+    /// Build the per-`(func, block)` slot base + value types + §6 debug info for module `m`, pushed to the
+    /// shared source at index `module`. Mirrors the module-0 computation in [`DebugRun::new_with_host`], so
+    /// a separate-module child is inspected exactly as the primary program is.
+    fn build(m: &Module, module: usize) -> ModuleDebug {
+        let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
+        let mut fn_block_base = Vec::with_capacity(m.funcs.len());
+        let mut fn_block_types = Vec::with_capacity(m.funcs.len());
+        for g in &m.funcs {
+            let mut base = Vec::with_capacity(g.blocks.len());
+            let mut n = 0u32;
+            for b in &g.blocks {
+                base.push(n);
+                n += b.params.len() as u32;
+                for inst in &b.insts {
+                    n += inst.result_count(&arities) as u32;
+                }
+            }
+            fn_block_base.push(base);
+            fn_block_types.push(svm_verify::func_value_types(
+                g,
+                &m.funcs,
+                m.memory.is_some(),
+            ));
+        }
+        ModuleDebug {
+            module,
+            debug: m.debug_info.clone(),
+            fn_block_base,
+            fn_block_types,
         }
     }
 }
@@ -3979,12 +4028,33 @@ struct FrameReader<'a> {
     debug: Option<&'a DebugInfo>,
     fn_block_base: &'a [Vec<u32>],
     fn_block_types: &'a [Vec<Vec<ValType>>],
+    /// The active §14 **separate-module** coroutine's own §6 metadata (module index `>= 1`), set while
+    /// stepping inside its body — so a frame in the child resolves against the child's funcs. `None` when
+    /// the active continuation is module 0 (the parent or a same-module coroutine), where the module-0
+    /// fields above apply. See [`FrameReader::md_for`].
+    coro_debug: Option<&'a ModuleDebug>,
 }
 
-impl FrameReader<'_> {
+impl<'a> FrameReader<'a> {
     /// Call-stack depth (running activation + suspended callers).
     fn depth(&self) -> usize {
         self.vm.stack.len() + 1
+    }
+
+    /// The `(§6 debug, per-block slot base, per-block value types)` to read a frame in `module` against:
+    /// module 0's from the session fields, or an active separate-module coroutine's own. `None` for any
+    /// other module (e.g. an installed §22 unit whose frames carry no debug tables here) — such a frame is
+    /// not source-inspectable, matching the pre-slice module-0 gate.
+    #[allow(clippy::type_complexity)]
+    fn md_for(
+        &self,
+        module: usize,
+    ) -> Option<(Option<&'a DebugInfo>, &'a [Vec<u32>], &'a [Vec<Vec<ValType>>])> {
+        if module == 0 {
+            return Some((self.debug, self.fn_block_base, self.fn_block_types));
+        }
+        let md = self.coro_debug?;
+        (md.module == module).then_some((md.debug.as_ref(), &md.fn_block_base, &md.fn_block_types))
     }
 
     /// The `(module, func, block, inst, window base)` of the frame `depth` levels from the top (0 =
@@ -4019,25 +4089,22 @@ impl FrameReader<'_> {
         })
     }
 
-    /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed.
+    /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed against that frame's
+    /// module (module 0's, or an active separate-module coroutine's own).
     fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
         let (module, func, block, _inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None;
-        }
-        let off = *self.fn_block_base.get(func)?.get(block)? as usize;
-        let ty = *self.fn_block_types.get(func)?.get(block)?.get(idx)?;
+        let (_, fn_block_base, fn_block_types) = self.md_for(module)?;
+        let off = *fn_block_base.get(func)?.get(block)? as usize;
+        let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
         Some(self.vm.regs[base + off + idx].to_value(ty))
     }
 
     /// Read a source variable by name in the frame `depth` levels from the top, resolving its `VarLoc`
-    /// over the §6 debug info (SSA slot / window / fixed). `None` if unresolvable here.
+    /// over that frame's module's §6 debug info (SSA slot / window / fixed) — module 0's, or an active
+    /// separate-module coroutine's own. `None` if unresolvable here.
     fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
-        let di = self.debug?;
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None;
-        }
+        let di = self.md_for(module)?.0?;
         let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
         let window_read = |addr: u64| -> Option<VarValue> {
             Some(VarValue::Bytes(
@@ -4070,13 +4137,11 @@ impl FrameReader<'_> {
     }
 
     /// The window address of a memory-located source variable by name in the frame `depth` from the
-    /// top; `None` for a promoted SSA scalar (no address) or an unresolvable name.
+    /// top; `None` for a promoted SSA scalar (no address) or an unresolvable name. Resolves against that
+    /// frame's module's §6 info (module 0's, or an active separate-module coroutine's own).
     fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
-        let di = self.debug?;
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        if module != 0 {
-            return None;
-        }
+        let di = self.md_for(module)?.0?;
         let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
         match &var.loc {
             VarLoc::Ssa { .. } | VarLoc::SsaList(_) => None,
@@ -4109,6 +4174,9 @@ impl DebugRun {
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
+            // A separate-module coroutine carries its own §6 metadata; a same-module one leaves it `None`
+            // (its frames are module 0, read against the session fields above).
+            coro_debug: coro.and_then(|c| c.mod_debug.as_ref()),
         }
     }
 
@@ -4130,27 +4198,13 @@ impl DebugRun {
         host: Host,
     ) -> Option<DebugRun> {
         m.funcs.get(func as usize)?;
-        let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
-        // Slot base + value types per (function, block), so any frame on the call stack is readable.
-        let mut fn_block_base = Vec::with_capacity(m.funcs.len());
-        let mut fn_block_types = Vec::with_capacity(m.funcs.len());
-        for g in &m.funcs {
-            let mut base = Vec::with_capacity(g.blocks.len());
-            let mut n = 0u32;
-            for b in &g.blocks {
-                base.push(n);
-                n += b.params.len() as u32;
-                for inst in &b.insts {
-                    n += inst.result_count(&arities) as u32;
-                }
-            }
-            fn_block_base.push(base);
-            fn_block_types.push(svm_verify::func_value_types(
-                g,
-                &m.funcs,
-                m.memory.is_some(),
-            ));
-        }
+        // Slot base + value types per (function, block), so any frame on the call stack is readable — the
+        // module-0 counterpart of a §14 separate-module child's own [`ModuleDebug`].
+        let ModuleDebug {
+            fn_block_base,
+            fn_block_types,
+            ..
+        } = ModuleDebug::build(m, 0);
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
@@ -5125,26 +5179,11 @@ impl ScheduledDebugRun {
         host: Host,
     ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
-        let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
-        let mut fn_block_base = Vec::with_capacity(m.funcs.len());
-        let mut fn_block_types = Vec::with_capacity(m.funcs.len());
-        for g in &m.funcs {
-            let mut base = Vec::with_capacity(g.blocks.len());
-            let mut n = 0u32;
-            for b in &g.blocks {
-                base.push(n);
-                n += b.params.len() as u32;
-                for inst in &b.insts {
-                    n += inst.result_count(&arities) as u32;
-                }
-            }
-            fn_block_base.push(base);
-            fn_block_types.push(svm_verify::func_value_types(
-                g,
-                &m.funcs,
-                m.memory.is_some(),
-            ));
-        }
+        let ModuleDebug {
+            fn_block_base,
+            fn_block_types,
+            ..
+        } = ModuleDebug::build(m, 0);
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
@@ -5627,6 +5666,9 @@ impl ScheduledDebugRun {
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
+            // Populated once a scheduled separate-module coroutine records its own metadata; `None` today,
+            // so scheduled-child source-variable reads fall through the module-0 branch (a follow-up).
+            coro_debug: coro.and_then(|c| c.mod_debug.as_ref()),
         }
     }
 
@@ -6149,6 +6191,11 @@ struct Coro {
     /// Set while suspended on a recoverable page fault: the confined address to **supply** on the next
     /// `resume` (which then re-runs the rewound access). `None` otherwise.
     faulted_page: Option<u64>,
+    /// A §14 **separate-module** child's own §6 debug metadata (`Some`, keyed by its pushed source index),
+    /// so `read_var`/`var_addr` resolve source variables inside its body during step-into. `None` for a
+    /// **same-module** coroutine (its frames are module 0, read against the session's own metadata) and
+    /// for every production (non-debug) coroutine, which never inspects.
+    mod_debug: Option<ModuleDebug>,
 }
 
 /// Why [`resume_coro`] returned: the coroutine yielded a value, hit a recoverable page fault (a
@@ -6932,6 +6979,7 @@ fn spawn_coroutine(
         awaiting: None,
         fault_yields: demand,
         faulted_page: None,
+        mod_debug: None, // same-module: frames are module 0, read against the session's own metadata
     }));
     (coroutines.len() - 1) as i32
 }
@@ -6957,12 +7005,21 @@ fn spawn_coroutine_module(
 ) -> Result<i32, Trap> {
     let (ibase, isz, off, size_log2) = carve;
     // Resolve + clone the granted module from the powerbox (a forged/closed/wrong-type handle traps).
-    let (cfuncs, cmem_log2, cdata) = {
+    // `gmod` is the whole granted `Module` (retained for its §6 `-g` info + funcs), so a step-into can
+    // resolve the child's source variables by name — the module-0-gate follow-up (DEBUGGING.md §14).
+    let (cfuncs, cmem_log2, cdata, gmod) = {
         let g = host.resolve_module(mh)?;
-        (g.funcs.clone(), g.memory_log2, g.data.clone())
+        (
+            g.funcs.clone(),
+            g.memory_log2,
+            g.data.clone(),
+            std::sync::Arc::clone(&g.module),
+        )
     };
-    // Compile to bytecode — a module using an op the engine can't lower is `Malformed` (as for install).
-    let child_compiled = match compile_module(&cfuncs) {
+    // Compile to bytecode **unfused** (like module 0 in `DebugRun::new`): the child is single-stepped under
+    // the debugger, so every IR inst must stay a distinct op/src position — a breakpoint or `read_var` can
+    // land on any of them. A module using an op the engine can't lower is `Malformed` (as for install).
+    let child_compiled = match compile_module_unfused(&cfuncs) {
         Some(c) => c,
         None => return Err(Trap::Malformed),
     };
@@ -7027,6 +7084,9 @@ fn spawn_coroutine_module(
         awaiting: None,
         fault_yields: demand,
         faulted_page: None,
+        // The child's own §6 metadata, keyed by its pushed index `cm`, so a step-into resolves its
+        // source variables against its funcs (not module 0's) — position-level reads worked already.
+        mod_debug: Some(ModuleDebug::build(&gmod, cm)),
     }));
     Ok((coroutines.len() - 1) as i32)
 }
@@ -7805,6 +7865,9 @@ fn drive(
                     awaiting: None,
                     fault_yields: demand,
                     faulted_page: None,
+                    // Separate-module source-variable inspection on the scheduled engine is a follow-up;
+                    // position-level step-into + window reads work today (DEBUGGING.md §14).
+                    mod_debug: None,
                 }));
                 let h = (tasks[ti].vt.coroutines.len() - 1) as i32;
                 tasks[ti].vt.active.set(dst, Reg::from_i32(h));
@@ -8770,6 +8833,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     awaiting: None,
                     fault_yields: demand,
                     faulted_page: None,
+                    mod_debug: None, // production parallel scheduler never inspects
                 }));
                 let h = (vt.coroutines.len() - 1) as i32;
                 vt.active.set(dst, Reg::from_i32(h));
