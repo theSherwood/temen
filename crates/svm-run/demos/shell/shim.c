@@ -39,7 +39,9 @@ long __px_argv(int cap, long i, long buf, long cap2);
    itself is the shell's own `Instantiator` cap.call — `__spawn` (op 13) / `__join` (op 1) — dispatched
    on the reflection-discovered `Instantiator` handle (`__inst()`), like every import here. */
 long __px_exec_lookup(int cap, long name, long len);
+long __px_exec_win(int cap, long module);
 long __px_exec_stdout(int cap);
+long __px_exec_stdin(int cap, long buf, long len);
 long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
 long __join(int inst, long child);
 /* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into

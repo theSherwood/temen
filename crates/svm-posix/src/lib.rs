@@ -23,7 +23,7 @@
 //! is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use svm_interp::{cap_id, GuestMem, Host, HostFn, Trap};
@@ -54,11 +54,20 @@ pub const OP_ARGV: u32 = 18;
 /// against the [`Inner::commands`] PATH registry (a `name → Module` handle map the embedder seeds); the
 /// shell then drives `Instantiator.instantiate_module_named` (op 13) + `join` on the returned handle.
 /// `exec_stdout() -> stream_handle` returns the `Stream` the shell should re-grant to the child under
-/// the name `"stdout"` so the command's `write(1, …)` reaches the shell's sink. Neither op *is* the
-/// spawn — op 13 is a guest `cap.call` (the compiled shell holds the `Instantiator`); the personality
-/// only supplies the registry lookup and the forwardable stdout handle.
+/// the name `"stdout"` so the command's `write(1, …)` reaches the shell's sink. `exec_stdin(ptr, len)
+/// -> stream_handle` is the input counterpart (a **filter** command): the personality pushes the
+/// `[ptr, len)` bytes — the shell's current input, e.g. a `< file` redirect it drained — into a
+/// read-only pipe FIFO and returns the read end for the shell to re-grant as `"stdin"`, so the
+/// command's `read(0, …)` drains them (then `0` = EOF). Neither op *is* the spawn — op 13 is a guest
+/// `cap.call` (the compiled shell holds the `Instantiator`); the personality only supplies the registry
+/// lookup and the forwardable stdout/stdin handles.
 pub const OP_EXEC_LOOKUP: u32 = 19;
 pub const OP_EXEC_STDOUT: u32 = 20;
+pub const OP_EXEC_STDIN: u32 = 21;
+/// `exec_win(module_handle) -> size_log2`: the granted command `Module`'s declared window, so the shell
+/// carves each spawn to match it (a §14 child's carve must equal its declared memory, and commands vary
+/// in size). Returns `-1` for an unregistered handle. The embedder records it in [`Posix::register_command`].
+pub const OP_EXEC_WIN: u32 = 22;
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
@@ -172,14 +181,22 @@ struct Inner {
     /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
     /// invalidates the entry so the next `getenv` re-materializes the new value.
     env_ptrs: HashMap<String, u64>,
-    /// The **PATH registry** (STAGE1.md §5): command name → the granted `Module` handle in the shell's
-    /// cap table. `exec_lookup` scans it; the embedder seeds it with [`Posix::register_command`] after
+    /// The **PATH registry** (STAGE1.md §5): command name → `(granted Module handle, declared window
+    /// size_log2)`. `exec_lookup` returns the handle; `exec_win` the size_log2 (so the shell carves each
+    /// spawn to the command's own window). The embedder seeds it with [`Posix::register_command`] after
     /// granting each command `Module`. A plain `Vec` (a shell's PATH is short); first match wins.
-    commands: Vec<(String, i32)>,
+    commands: Vec<(String, i32, u8)>,
     /// The `Stream` handle `exec_stdout` returns — the stdout the shell re-grants to a spawned child
     /// under the name `"stdout"`. Set by [`Posix::set_exec_stdout`]; `0` until then (a shell that never
     /// spawns never reads it).
     exec_stdout_handle: i32,
+    /// The read-only-pipe handle `exec_stdin` returns (the child's `"stdin"`) and its shared FIFO. Set
+    /// by [`Posix::set_exec_stdin`] from [`Host::grant_input_pipe`]; `exec_stdin(ptr, len)` pushes the
+    /// guest bytes into `fifo` and returns `handle`. `None`/`0` until set (a shell with no filter
+    /// commands never calls it). The FIFO is fully drained by the child before the synchronous spawn
+    /// returns, so it is empty and ready for the next command.
+    exec_stdin_handle: i32,
+    exec_stdin_fifo: Option<Arc<Mutex<VecDeque<u8>>>>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -267,10 +284,11 @@ impl Posix {
     /// `module_handle` is the handle a granted command `Module` has in the shell's cap table. The
     /// shell's `exec_lookup(name)` returns it (or `-1` when absent). A later registration of the same
     /// name shadows the earlier (last wins), matching a `PATH` re-export.
-    pub fn register_command(&self, name: &str, module_handle: i32) {
+    pub fn register_command(&self, name: &str, module_handle: i32, win_log2: u8) {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        st.commands.retain(|(n, _)| n != name);
-        st.commands.push((name.to_string(), module_handle));
+        st.commands.retain(|(n, _, _)| n != name);
+        st.commands
+            .push((name.to_string(), module_handle, win_log2));
     }
 
     /// Set the `Stream` handle the shell re-grants to a spawned child as its `"stdout"` — what
@@ -281,6 +299,16 @@ impl Posix {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .exec_stdout_handle = handle;
+    }
+
+    /// Set the read-only-pipe `Stream` + FIFO the shell re-grants to a **filter** command as `"stdin"`
+    /// — the input twin of [`Self::set_exec_stdout`]. `handle` and `fifo` come from one
+    /// [`Host::grant_input_pipe`] call on the same `Host`; `exec_stdin(ptr, len)` pushes the guest bytes
+    /// into `fifo` and returns `handle`, so the child's `read(0, …)` drains them (then EOF).
+    pub fn set_exec_stdin(&self, handle: i32, fifo: Arc<Mutex<VecDeque<u8>>>) {
+        let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.exec_stdin_handle = handle;
+        st.exec_stdin_fifo = Some(fifo);
     }
 }
 
@@ -316,6 +344,8 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         // shell on this personality can spawn an external command via `Instantiator` op 13.
         "exec_lookup" => OP_EXEC_LOOKUP,
         "exec_stdout" => OP_EXEC_STDOUT,
+        "exec_stdin" => OP_EXEC_STDIN,
+        "exec_win" => OP_EXEC_WIN,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -374,6 +404,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         env_ptrs: HashMap::new(),
         commands: Vec::new(),
         exec_stdout_handle: 0,
+        exec_stdin_handle: 0,
+        exec_stdin_fifo: None,
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -408,6 +440,8 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_ARGV => st.argv(args, mem),
             OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
             OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
+            OP_EXEC_STDIN => st.exec_stdin(args, mem),
+            OP_EXEC_WIN => st.exec_win(args),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -724,10 +758,48 @@ impl Inner {
         let h = self
             .commands
             .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, h)| *h as i64)
+            .find(|(n, _, _)| n == name)
+            .map(|(_, h, _)| *h as i64)
             .unwrap_or(-1);
         Ok(vec![h])
+    }
+
+    /// `exec_win(module_handle) -> size_log2 | -1`: the declared window of the registered command with
+    /// this handle, so the shell carves its spawn to match (§14: carve == declared memory). `-1` when
+    /// the handle is not a registered command.
+    fn exec_win(&mut self, args: &[i64]) -> Result<Vec<i64>, Trap> {
+        let handle = *args.first().ok_or(Trap::Malformed)? as i32;
+        let wl = self
+            .commands
+            .iter()
+            .find(|(_, h, _)| *h == handle)
+            .map(|(_, _, w)| *w as i64)
+            .unwrap_or(-1);
+        Ok(vec![wl])
+    }
+
+    /// `exec_stdin(ptr, len) -> stream_handle`: push the guest bytes `[ptr, len)` — the input the shell
+    /// drained for a filter command — into the read-only pipe FIFO and return its read-end handle
+    /// ([`Posix::set_exec_stdin`]), which the shell re-grants to the child as `"stdin"`. Returns `-1`
+    /// when no input pipe was wired (a shell built without filter support). The FIFO is drained by the
+    /// child's `read`s (empty ⇒ EOF); it is empty on entry because the previous, synchronous spawn ran
+    /// its child to completion.
+    fn exec_stdin(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let Some(fifo) = self.exec_stdin_fifo.clone() else {
+            return Ok(vec![-1]);
+        };
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, len).ok_or(Trap::Malformed)?;
+        let mut q = fifo.lock().unwrap_or_else(|e| e.into_inner());
+        q.clear(); // defensively drop any residue from an aborted prior filter
+        q.extend(bytes);
+        Ok(vec![self.exec_stdin_handle as i64])
     }
 
     /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.

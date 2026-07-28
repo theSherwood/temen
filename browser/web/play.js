@@ -822,6 +822,7 @@ int main(void) {
     cmds: [
       { name: '__stage', url: './assets/stage_runner.svmb' },
       { name: 'primes', url: './assets/primes.svmb' },
+      { name: 'upper', url: './assets/upper.svmb' },
     ],
     mode: 'io',
     desc: 'A real POSIX-style shell — a command interpreter compiled by the in-tree chibicc C ' +
@@ -831,8 +832,9 @@ int main(void) {
       'output appears below. Builtins include echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/' +
       'uniq/ls, test/[ ], redirection (> >> <), command lists (; && ||), if/then/else, and globbing ' +
       '— all over an in-memory filesystem. Pipelines run as concurrent stages over shared-memory ' +
-      'rings (op 11 + SharedRegion + futex); an unknown name like `primes` is exec’d as a separate ' +
-      'compiled-C program (op 13 §14 child) — both spawned client-side in the sandbox.',
+      'rings (op 11 + SharedRegion + futex); an unknown name like `primes` (a generator) or `upper` ' +
+      '(a filter that reads stdin) is exec’d as a separate compiled-C program (op 13 §14 child) — all ' +
+      'spawned client-side in the sandbox.',
     src: `# A real shell, running in the sandbox. Type commands, then click Run.
 echo hello from the sandbox
 
@@ -840,10 +842,13 @@ echo hello from the sandbox
 NAME=world
 echo hi $NAME
 
-# primes is not a builtin — it is a separate compiled-C program the shell
-# exec's as a sandboxed child, streaming its stdout back.
+# primes and upper are not builtins — they are separate compiled-C programs
+# the shell exec's as sandboxed children. primes generates; upper is a filter
+# that reads its stdin.
 echo -- primes up to 30 --
 primes 30
+echo -- upper (a stdin filter) --
+echo shout this line | upper
 
 # a file, then a concurrent ring pipeline: sort and dedupe run as separate
 # stages, streaming over shared-memory rings with backpressure.

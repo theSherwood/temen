@@ -14,7 +14,7 @@ import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const ASSETS = ['shell.svmb', 'stage_runner.svmb', 'primes.svmb'];
+const ASSETS = ['shell.svmb', 'stage_runner.svmb', 'primes.svmb', 'upper.svmb'];
 if (ASSETS.some((a) => !existsSync(`${ROOT}/web/assets/${a}`))) {
   console.log(`– shell test skipped (web/assets/{${ASSETS.join(',')}} absent — run build-onramp-assets.mjs)`);
   process.exit(0);
@@ -39,7 +39,8 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The script exercises the read-eval loop, $VAR expansion, a redirect+cat over the memfs, a
 // `cat | grep` pipeline, a **`cat | sort | uniq` concurrent ring pipeline**, the **`primes` external
-// command** (op-13 §14 child), and an if/test conditional — the shell surface the card advertises.
+// command** (a generator), the **`upper` filter** (an external command that reads stdin), and an
+// if/test conditional — the shell surface the card advertises.
 const SCRIPT =
   '# a comment line — ignored\n' +
   'echo hello from the sandbox\n' +
@@ -47,6 +48,8 @@ const SCRIPT =
   'echo hi $N   # an inline comment\n' +
   'echo -- primes --\n' +
   'primes 10\n' +
+  'echo -- upper --\n' +
+  'echo shout it | upper\n' +
   'echo banana > fruits\n' +
   'echo apple >> fruits\n' +
   'echo banana >> fruits\n' +
@@ -54,10 +57,11 @@ const SCRIPT =
   'echo -- sorted --\n' +
   'cat fruits | sort | uniq\n' +
   'if test -f fruits; then echo exists; fi\n';
-// `primes 10` → the external command streams 2 3 5 7; `grep a` matches all three lines (banana, apple,
-// banana all contain 'a'); the ring `sort | uniq` then yields the deduped sorted pair.
+// `primes 10` → the generator streams 2 3 5 7; `echo shout it | upper` → the filter reads its stdin
+// and uppercases it; `grep a` matches all three lines (banana, apple, banana all contain 'a'); the
+// ring `sort | uniq` then yields the deduped sorted pair.
 const EXPECT =
-  'hello from the sandbox\nhi world\n-- primes --\n2\n3\n5\n7\n' +
+  'hello from the sandbox\nhi world\n-- primes --\n2\n3\n5\n7\n-- upper --\nSHOUT IT\n' +
   'banana\napple\nbanana\n-- sorted --\napple\nbanana\nexists\n';
 
 const res = await page.evaluate(async (script) => {
@@ -71,6 +75,7 @@ const res = await page.evaluate(async (script) => {
   const reg = [
     { name: '__stage', bytes: await fetchB('./assets/stage_runner.svmb') },
     { name: 'primes', bytes: await fetchB('./assets/primes.svmb') },
+    { name: 'upper', bytes: await fetchB('./assets/upper.svmb') },
   ].map((c) => ({ name: new TextEncoder().encode(c.name), bytes: c.bytes }));
   let total = 4;
   for (const c of reg) total += 4 + c.name.length + 4 + c.bytes.length;

@@ -202,7 +202,7 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
         svm_posix::grant(&mut host, (win - (64 << 10)) as u64, win as u64, Vec::new());
     posix.set_stdout_sink(sink); // …and the shell's own fd-1 writes land in the same sink.
     posix.set_exec_stdout(out_h);
-    posix.register_command("echo", echo_h);
+    posix.register_command("echo", echo_h, cmd.memory.map_or(0, |mm| mm.size_log2));
     posix.set_args(argv);
 
     let m = svm_ir::resolve_imports_with(shell, link_shim).expect("resolve");

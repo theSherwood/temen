@@ -237,28 +237,45 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
 #define SVM_STAGE_LOG2 18
 #endif
 #define SVM_STAGE_WIN (1L << SVM_STAGE_LOG2)
-/* The size an external command is spawned into — equal to the command module's declared window (a §14
-   child's carve must equal its declared memory). Default 17 (128 KiB), the size chibicc lands a small
-   command at under the native 16 KiB data page; the browser's 64 KiB page rounds it up to 19, so the
-   browser fixture builds the shell with `-D SVM_CMD_LOG2=19` to match its 64 KiB-page commands. */
-#ifndef SVM_CMD_LOG2
-#define SVM_CMD_LOG2 17
-#endif
-#define SVM_CMD_WIN (1L << SVM_CMD_LOG2)
 /* Forces a window large enough for the ring carves (3 stages × `SVM_STAGE_WIN`) + the parent's ring-0
    map slot + the spawn grant-record scratch (all kept in `pool`, below the stack), and the smaller
    128 KiB-aligned external-command carve. Only the (guarded-out) external-command / ring paths use it,
    so the sequential build omits it — its window then fits the shell's own globals + stack. */
 static char pool[4 * SVM_STAGE_WIN + 131072];
+/* A command's stdin buffer: when the command runs with input (a `< file` redirect or a pipe stage,
+   so `in_fd != 0`), the shell drains that fd here and hands the bytes to `exec_stdin`, which returns a
+   read-only pipe end the child reads as `"stdin"`. Bounded — a demo filter's input is small. */
+static char filter_in[65536];
 static int spawn_cmd(long mod, int argc, char **argv) {
   long out = __px_exec_stdout(__px());
   long base = (long)pool;
-  long carve = (base + (SVM_CMD_WIN - 1)) & ~(SVM_CMD_WIN - 1);
-  /* grant record at base: {name_off, name_len, out, flags}; "stdout" name follows at base+16 */
+  /* The carve must equal the command's declared window (§14), which varies per command — the
+     personality reports it from the granted `Module`. Carve it (window-aligned) out of `pool`. */
+  long wl = __px_exec_win(__px(), mod);
+  long cwin = 1L << wl;
+  long carve = (base + (cwin - 1)) & ~(cwin - 1);
+  /* grant records at base, 16 bytes each: {name_off, name_len, handle, flags}. Up to two records
+     (stdout, then stdin for a filter), so the names start at base+32 — clear of both records. */
   int *rec = (int *)base;
-  rec[0] = (int)(base + 16); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
-  char *nm = (char *)(base + 16);
+  rec[0] = (int)(base + 32); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
+  char *nm = (char *)(base + 32);
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
+  long gn = 1;
+  /* A `< file` redirect or pipe stage points `in_fd` at real input: drain it and grant the child a
+     `"stdin"` pipe over those bytes, so a filter's `read(0, …)` sees them (then EOF). `in_fd == 0` is
+     the shell's own script — never fed to a command — so a bare command gets no stdin (gn stays 1). */
+  if (in_fd != 0) {
+    long inlen = 0, r;
+    while (inlen < (long)sizeof(filter_in) &&
+           (r = read(in_fd, filter_in + inlen, sizeof(filter_in) - inlen)) > 0)
+      inlen += r;
+    long sin = __px_exec_stdin(__px(), (long)filter_in, inlen);
+    if (sin >= 0) {
+      rec[4] = (int)(base + 38); rec[5] = 5; rec[6] = (int)sin; rec[7] = 0;
+      nm[6]='s'; nm[7]='t'; nm[8]='d'; nm[9]='i'; nm[10]='n';
+      gn = 2;
+    }
+  }
   /* the command's args buffer at carve+128 (POWERBOX_ARGS_BASE): {argc, envc=0} then packed argv */
   char *ab = (char *)(carve + 128);
   int *hdr = (int *)ab;
@@ -269,7 +286,7 @@ static int spawn_cmd(long mod, int argc, char **argv) {
     for (long k = 0; k < L; k++) *p++ = s[k];
     *p++ = 0;
   }
-  long child = __spawn(__inst(), mod, base, 1, 0, carve, SVM_CMD_LOG2, 0);
+  long child = __spawn(__inst(), mod, base, gn, 0, carve, wl, 0);
   return (int)__join(__inst(), child);
 }
 #endif /* SVM_SHELL_SEQUENTIAL */

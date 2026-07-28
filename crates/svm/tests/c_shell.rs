@@ -246,11 +246,18 @@ fn run_shell_ex(
         host.set_region_factory(svm_run::new_shared_region);
         let sink = host.shared_stdout();
         let out_h = host.grant_stream(StreamRole::Out);
+        let (in_h, in_fifo) = host.grant_input_pipe();
         let inst_h = host.grant_instantiator(0, win as u64);
         let _as_h = host.grant_address_space(0, win as u64);
-        let cmd_handles: Vec<(&str, i32)> = cmd_mods
+        let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
             .iter()
-            .map(|(n, m)| (*n, host.grant_module(m)))
+            .map(|(n, m)| {
+                (
+                    *n,
+                    host.grant_module(m),
+                    m.memory.map_or(0, |mm| mm.size_log2),
+                )
+            })
             .collect();
         // The shell never `malloc`s, so the personality heap (top 64 KiB) is never touched — it just
         // stays clear of the command carve (inside `pool`, low) and the shell's stack.
@@ -258,8 +265,9 @@ fn run_shell_ex(
             svm_posix::grant(host, (win - (64 << 10)) as u64, win as u64, stdin.to_vec());
         posix.set_stdout_sink(sink);
         posix.set_exec_stdout(out_h);
-        for (n, h) in &cmd_handles {
-            posix.register_command(n, *h);
+        posix.set_exec_stdin(in_h, in_fifo);
+        for (n, h, wl) in &cmd_handles {
+            posix.register_command(n, *h, *wl);
         }
         for (k, v) in env {
             posix.set_env(k, v);
@@ -354,11 +362,18 @@ fn shell_bytecode_stdout(
     // aliasing, backing-agnostic), which is what the browser gets.
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst_h = host.grant_instantiator(0, win as u64);
     let _as_h = host.grant_address_space(0, win as u64);
-    let cmd_handles: Vec<(&str, i32)> = cmd_mods
+    let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
         .iter()
-        .map(|(n, cm)| (*n, host.grant_module(cm)))
+        .map(|(n, cm)| {
+            (
+                *n,
+                host.grant_module(cm),
+                cm.memory.map_or(0, |mm| mm.size_log2),
+            )
+        })
         .collect();
     let (_px_h, posix) = svm_posix::grant(
         &mut host,
@@ -368,8 +383,9 @@ fn shell_bytecode_stdout(
     );
     posix.set_stdout_sink(sink);
     posix.set_exec_stdout(out_h);
-    for (n, h) in &cmd_handles {
-        posix.register_command(n, *h);
+    posix.set_exec_stdin(in_h, in_fifo);
+    for (n, h, wl) in &cmd_handles {
+        posix.register_command(n, *h, *wl);
     }
     for (k, v) in env {
         posix.set_env(k, v);
@@ -431,6 +447,11 @@ fn stage_runner_src() -> String {
 /// `exec`s as an op-13 child, granted only its stdout. The playground registers it on PATH; the
 /// browser fixture is built from this same source.
 const PRIMES_MAIN: &str = include_str!("../../svm-run/demos/shell/primes_main.c");
+
+/// A demo **filter** external command (`upper`) — reads stdin, uppercases, writes stdout. Unlike a
+/// generator it is also granted a `"stdin"` pipe (`exec_stdin`), so `read(0, …)` sees the shell's
+/// input. Registered on PATH in both the differential and the browser.
+const UPPER_MAIN: &str = include_str!("../../svm-run/demos/shell/upper_main.c");
 
 /// An external command: echo every `argv[i]` on its own line, return `argc` (a non-zero status that
 /// tracks the argument count, so `$?` is observable).
@@ -502,6 +523,44 @@ fn stage0_shell_runs_external_primes() {
     );
     assert_eq!(iout, b"2\n3\n5\n7\n", "interp: primes \u{2264} 10");
     assert_eq!(jout, iout, "jit: primes output must match interp");
+}
+
+/// A **filter** external command that reads stdin (`upper < file`): the shell drains the `< file`
+/// redirect, hands the bytes to `exec_stdin` (a read-only pipe granted as the child's `"stdin"`), and
+/// `upper`'s `read(0, …)` uppercases them to its stdout. A separate compiled-C program consuming input
+/// — the op-13 spawn granting **two** streams (stdin + stdout). Differential interp==JIT==bytecode.
+#[test]
+fn stage0_shell_filter_reads_stdin() {
+    let (iout, jout) = run_shell_ex(
+        b"echo Hello, Shell > f\nupper < f\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("upper", UPPER_MAIN)],
+    );
+    assert_eq!(
+        iout, b"HELLO, SHELL\n",
+        "interp: `upper < f` uppercases the file"
+    );
+    assert_eq!(jout, iout, "jit: filter output must match interp");
+}
+
+/// A filter as a **pipe stage** (`echo … | upper`): the sequential pipeline points the filter's
+/// `in_fd` at the previous stage's output, which the shell drains into the granted stdin pipe.
+#[test]
+fn stage0_shell_filter_in_pipeline() {
+    let (iout, jout) = run_shell_ex(
+        b"echo racecar wow | upper\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("upper", UPPER_MAIN)],
+    );
+    assert_eq!(
+        iout, b"RACECAR WOW\n",
+        "interp: `echo … | upper` uppercases the pipe"
+    );
+    assert_eq!(jout, iout, "jit: filter pipeline output must match interp");
 }
 
 /// EOF (no trailing `exit`) cleanly ends the loop — the personality's `read(0, …)` returns `0` at the
@@ -1118,22 +1177,12 @@ fn gen_browser_shell_fixture() {
     // `--data-page 65536`: the playground runs on a 64 KiB wasm host page, so the read-only string
     // data must share no host page with a writable global (else the shell's own write to a global
     // faults — D40 host-page RO/RW protection is enforced under wasm). Native chibicc defaults to
-    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19` /
-    // `-D SVM_CMD_LOG2=19`: under the 64 KiB page a child module's data sections round up so its window
-    // is 19 (512 KiB) — the `__stage` runner and external commands alike — not the native 18/17; the
-    // shell must carve its ring stages and command spawns to match. Verified end to end against a real
-    // Chromium run by `browser-shell-test.mjs`.
-    let ir = c_to_ir_with(
-        &src,
-        &[
-            "--data-page",
-            "65536",
-            "-D",
-            "SVM_STAGE_LOG2=19",
-            "-D",
-            "SVM_CMD_LOG2=19",
-        ],
-    );
+    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19`: under the
+    // 64 KiB page the `__stage` runner's data sections round up so its window is 19 (512 KiB), not the
+    // native 18 — the shell must carve its ring stages to match. (External-command carves are sized
+    // per-command at run time via `exec_win`, so no `-D` is needed for them.) Verified end to end
+    // against a real Chromium run by `browser-shell-test.mjs`.
+    let ir = c_to_ir_with(&src, &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");
@@ -1169,19 +1218,18 @@ fn gen_browser_shell_fixture() {
     std::fs::write(&rout, &rbytes).expect("write stage_runner.svmb");
     eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
 
-    // A demo external command (`primes`), 64 KiB-page like the rest. A small command's data sections
-    // round up to a 19 (512 KiB) window, so it must equal the shell's `SVM_CMD_LOG2=19` command carve
-    // (a §14 child's carve equals its declared memory). The browser registers it on PATH under `primes`.
-    let primes_ir = c_to_ir_child_with(PRIMES_MAIN, &["--data-page", "65536"]);
-    let praw = parse_module_raw(&primes_ir).expect("parse primes IR");
-    verify_module(&praw).expect("verify primes");
-    assert_eq!(
-        praw.memory.map(|mm| mm.size_log2),
-        Some(19),
-        "the 64 KiB-page `primes` command must declare memory 19 (the shell's SVM_CMD_LOG2 carve)"
-    );
-    let pbytes = svm_encode::encode_module(&praw);
-    let pout = dir.join("primes.svmb");
-    std::fs::write(&pout, &pbytes).expect("write primes.svmb");
-    eprintln!("wrote {} ({} bytes)", pout.display(), pbytes.len());
+    // The demo external commands, 64 KiB-page. Each declares whatever window chibicc lands it at
+    // (`primes` 19, `upper` 18); the shell carves each spawn to that size via `exec_win`, so — unlike
+    // the ring runner — they need no fixed-size pin. `primes` is a generator (argv → stdout); `upper`
+    // is a **filter** — it reads stdin (a `< file` redirect the shell drains into its granted stdin
+    // pipe), uppercases, and writes stdout.
+    for (name, source) in [("primes", PRIMES_MAIN), ("upper", UPPER_MAIN)] {
+        let cir = c_to_ir_child_with(source, &["--data-page", "65536"]);
+        let craw = parse_module_raw(&cir).unwrap_or_else(|e| panic!("parse {name} IR: {e:?}"));
+        verify_module(&craw).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
+        let cbytes = svm_encode::encode_module(&craw);
+        let cout = dir.join(format!("{name}.svmb"));
+        std::fs::write(&cout, &cbytes).unwrap_or_else(|e| panic!("write {name}.svmb: {e:?}"));
+        eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());
+    }
 }

@@ -38,10 +38,12 @@ fn run_with_stage(script: &str) -> String {
     let runner = svm_encode::decode_module(rbytes).expect("decode stage_runner.svmb");
     let pbytes = include_bytes!("fixtures/primes.svmb");
     let primes = svm_encode::decode_module(pbytes).expect("decode primes.svmb");
+    let ubytes = include_bytes!("fixtures/upper.svmb");
+    let upper = svm_encode::decode_module(ubytes).expect("decode upper.svmb");
     let out = posix_shell_exec_with(
         &m,
         script.as_bytes(),
-        &[("__stage", &runner), ("primes", &primes)],
+        &[("__stage", &runner), ("primes", &primes), ("upper", &upper)],
     );
     assert_eq!(
         out.status, STATUS_OK,
@@ -106,6 +108,14 @@ fn shell_external_command_primes() {
     // a builtin. The shell spawns it, delivers `argv`, and its stdout streams into the shell's sink.
     let out = run_with_stage("primes 20\n");
     assert_eq!(out, "2\n3\n5\n7\n11\n13\n17\n19\n");
+}
+
+#[test]
+fn shell_external_filter_upper() {
+    // A **filter** external command (op-13 child granted both stdin + stdout): the shell drains the
+    // `< file` redirect into `upper`'s granted stdin pipe; `upper`'s `read(0, …)` uppercases to stdout.
+    let out = run_with_stage("echo Hello, Sandbox > f\nupper < f\n");
+    assert_eq!(out, "HELLO, SANDBOX\n");
 }
 
 #[test]
