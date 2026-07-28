@@ -221,6 +221,7 @@ impl Translator {
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
         match node.tag() {
             Some("ptr") | Some("aptr") => Ok(TyDesc::Scalar(ValType::I64)),
+            Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
                 Some(name) => Ok(TyDesc::Agg(name.to_string())),
@@ -500,12 +501,12 @@ impl Translator {
         Ok(())
     }
 
-    /// Return type: `(void)`/`.` → None, otherwise an integer ValType.
+    /// Return type: `(void)`/`.` → None, otherwise the scalar value type (int, float, or pointer).
     fn ret_ty(&self, node: &Node) -> Result<Option<ValType>, LengError> {
         if node.tag() == Some("void") || node.is_empty_marker() {
             return Ok(None);
         }
-        Ok(Some(int_ty(node)?))
+        Ok(Some(val_ty(node)?))
     }
 
     /// Emit one proc's `func {…}` into `out`; returns whether it touched the window (so the caller
@@ -1413,6 +1414,9 @@ impl<'a> FuncGen<'a> {
                 if let Ok(n) = parse_int(a) {
                     return Ok(self.emit_const(ValType::I64, n));
                 }
+                if let Ok(f) = a.parse::<f64>() {
+                    return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
+                }
                 Err(LengError::Unsupported(format!("atom expression `{a}`")))
             }
             Node::List(_) => match e.tag() {
@@ -1420,14 +1424,23 @@ impl<'a> FuncGen<'a> {
                 Some(op @ ("eq" | "neq" | "lt" | "le")) => self.compare(op, e),
                 Some("neg") => {
                     let a = e.args();
-                    let ty = int_ty(&a[0])?;
+                    let ty = val_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
-                    let zero = self.emit_const(ty, 0);
-                    Ok(self.emit_bin("sub", ty, zero, x))
+                    if is_float(ty) {
+                        // `fN.neg` (a proper negate — handles signed zero).
+                        let id = self.fresh();
+                        self.cur_buf
+                            .push_str(&format!("  v{id} = {}.neg v{}\n", prefix(ty), x.id));
+                        Ok(Val { id, ty })
+                    } else {
+                        let zero = self.emit_const(ty, 0);
+                        Ok(self.emit_bin("sub", ty, zero, x))
+                    }
                 }
                 Some("conv") => {
+                    // Value-preserving numeric conversion (int width, int↔float, f32↔f64).
                     let a = e.args();
-                    let ty = int_ty(&a[0])?;
+                    let ty = val_ty(&a[0])?;
                     let x = self.expr(&a[1])?;
                     Ok(self.convert(x, ty))
                 }
@@ -1444,6 +1457,10 @@ impl<'a> FuncGen<'a> {
                 Some("true") => Ok(self.emit_const(ValType::I32, 1)),
                 Some("false") => Ok(self.emit_const(ValType::I32, 0)),
                 Some("nil") => Ok(self.emit_const(ValType::I64, 0)),
+                // Float specials.
+                Some("inf") => Ok(self.emit_fconst(ValType::F64, f64::INFINITY)),
+                Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
+                Some("nan") => Ok(self.emit_fconst(ValType::F64, f64::NAN)),
                 Some("addr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
                     let (id, _desc) = self.lvalue_addr(&e.args()[0])?;
@@ -1479,13 +1496,31 @@ impl<'a> FuncGen<'a> {
         })
     }
 
-    /// `(add|sub|mul|div|mod Type Expr Expr)`.
+    /// `(add|sub|mul|div|mod Type Expr Expr)` — integer or floating-point per the carried `Type`.
     fn arith(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
         let a = e.args();
         if a.len() != 3 {
             return Err(LengError::Malformed(format!(
                 "`{op}` needs Type and two operands"
             )));
+        }
+        // Floating-point arithmetic: `fN.{add,sub,mul,div}` (no signedness, no `mod`).
+        if a[0].tag() == Some("f") {
+            let ty = float_ty(&a[0])?;
+            let l = self.expr_typed(&a[1], ty)?;
+            let r = self.expr_typed(&a[2], ty)?;
+            let name = match op {
+                "add" => "add",
+                "sub" => "sub",
+                "mul" => "mul",
+                "div" => "div",
+                _ => {
+                    return Err(LengError::Unsupported(format!(
+                        "float `{op}` (no `mod` on floats)"
+                    )))
+                }
+            };
+            return Ok(self.emit_bin(name, ty, l, r));
         }
         let (ty, signed) = int_ty_signed(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
@@ -1522,12 +1557,23 @@ impl<'a> FuncGen<'a> {
         }
         let l = self.expr(&a[0])?;
         let r = self.expr_typed(&a[1], l.ty)?;
-        let name = match op {
-            "eq" => "eq",
-            "neq" => "ne",
-            "lt" => "lt_s",
-            "le" => "le_s",
-            _ => unreachable!(),
+        // Float compares use unsigned-free names (`lt`/`le`); int compares are signed here.
+        let name = if is_float(l.ty) {
+            match op {
+                "eq" => "eq",
+                "neq" => "ne",
+                "lt" => "lt",
+                "le" => "le",
+                _ => unreachable!(),
+            }
+        } else {
+            match op {
+                "eq" => "eq",
+                "neq" => "ne",
+                "lt" => "lt_s",
+                "le" => "le_s",
+                _ => unreachable!(),
+            }
         };
         let id = self.fresh();
         self.cur_buf.push_str(&format!(
@@ -1658,6 +1704,14 @@ impl<'a> FuncGen<'a> {
         Val { id, ty }
     }
 
+    /// A float constant (`{:?}` round-trips through svm-text's `parse_float`).
+    fn emit_fconst(&mut self, ty: ValType, f: f64) -> Val {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.const {f:?}\n", prefix(ty)));
+        Val { id, ty }
+    }
+
     fn emit_bin(&mut self, op: &str, ty: ValType, l: Val, r: Val) -> Val {
         let id = self.fresh();
         self.cur_buf.push_str(&format!(
@@ -1669,16 +1723,30 @@ impl<'a> FuncGen<'a> {
         Val { id, ty }
     }
 
-    /// Integer width conversion between i32/i64 (value-preserving, signed).
+    /// Scalar numeric conversion: integer widths, int↔float (signed trunc/convert), and f32↔f64.
     fn convert(&mut self, v: Val, to: ValType) -> Val {
+        use ValType::{F32, F64, I32, I64};
         if v.ty == to {
             return v;
         }
         let id = self.fresh();
         let insn = match (v.ty, to) {
-            (ValType::I32, ValType::I64) => format!("i64.extend_i32_s v{}", v.id),
-            (ValType::I64, ValType::I32) => format!("i32.wrap_i64 v{}", v.id),
-            _ => format!("i64.extend_i32_s v{}", v.id),
+            (I32, I64) => format!("i64.extend_i32_s v{}", v.id),
+            (I64, I32) => format!("i32.wrap_i64 v{}", v.id),
+            // int → float (value-preserving, signed).
+            (I32, F32) => format!("f32.convert_i32_s v{}", v.id),
+            (I32, F64) => format!("f64.convert_i32_s v{}", v.id),
+            (I64, F32) => format!("f32.convert_i64_s v{}", v.id),
+            (I64, F64) => format!("f64.convert_i64_s v{}", v.id),
+            // float → int (truncate toward zero, signed — matches Nim `int(x)`).
+            (F32, I32) => format!("i32.trunc_f32_s v{}", v.id),
+            (F32, I64) => format!("i64.trunc_f32_s v{}", v.id),
+            (F64, I32) => format!("i32.trunc_f64_s v{}", v.id),
+            (F64, I64) => format!("i64.trunc_f64_s v{}", v.id),
+            // float ↔ float.
+            (F32, F64) => format!("f64.promote_f32 v{}", v.id),
+            (F64, F32) => format!("f32.demote_f64 v{}", v.id),
+            _ => format!("i64.extend_i32_s v{}", v.id), // unreachable in this subset
         };
         self.cur_buf.push_str(&format!("  v{id} = {insn}\n"));
         Val { id, ty: to }
@@ -1690,16 +1758,35 @@ impl<'a> FuncGen<'a> {
 // ---------------------------------------------------------------------------
 
 /// SVM value type of a Leng type: pointers (`ptr`/`aptr`) and named aggregates (held by address)
-/// are `i64`; else an integer scalar.
+/// are `i64`; floats are `f32`/`f64`; else an integer scalar.
 fn val_ty(node: &Node) -> Result<ValType, LengError> {
     match node.tag() {
         Some("ptr") | Some("aptr") => Ok(ValType::I64),
+        Some("f") => float_ty(node),
         Some(_) => int_ty(node),
         None => match node.as_atom() {
             Some(_) => Ok(ValType::I64),
             None => Err(LengError::Malformed("expected a type".into())),
         },
     }
+}
+
+/// `(f N)` → `f32` (N ≤ 32) or `f64`.
+fn float_ty(node: &Node) -> Result<ValType, LengError> {
+    let bits = node
+        .args()
+        .first()
+        .and_then(|n| n.as_atom())
+        .ok_or_else(|| LengError::Malformed("`f` type needs a bit width".into()))?;
+    Ok(if int_bits(bits)? <= 32 {
+        ValType::F32
+    } else {
+        ValType::F64
+    })
+}
+
+fn is_float(t: ValType) -> bool {
+    matches!(t, ValType::F32 | ValType::F64)
 }
 
 /// A proc needs a frame iff it takes the address of a local, or declares an aggregate-typed local

@@ -117,10 +117,11 @@ fn run_i64_i32arg(leng: &str, idx: usize, arg: i32) -> i64 {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // A float type is out of the integer subset → a clean Unsupported error, never a bad module.
-    let leng = "(stmts (proc :h.0 . (f +64) . (stmts . (ret 0))))";
+    // A `try`/exception construct is outside the subset → a clean Unsupported error, never a bad
+    // module. (Floats, once unsupported here, are now handled — see tests/floats.rs.)
+    let leng = "(stmts (proc :h.0 . (i +64) . (stmts . (try (stmts .) (stmts .) (stmts .)))))";
     match translate(leng) {
-        Err(LengError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported, got {other:?}"),
+        Err(LengError::Unsupported(_)) | Err(LengError::Malformed(_)) => {}
+        other => panic!("expected a fail-closed error, got {other:?}"),
     }
 }

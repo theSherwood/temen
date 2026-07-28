@@ -299,11 +299,17 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
-  **State:** `svm-leng` translates whole real-ish modules — integers, control flow, pointers,
-  frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the rest, and is
-  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`). Remaining for full
-  real modules: `cast`/`conv` breadth, whole-aggregate copy/`oconstr`, floats,
-  and non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
+  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow,
+  pointers, frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the
+  rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`,
+  `classify`, `favg`). Remaining for full real modules: whole-aggregate copy/`oconstr`, and
+  non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
+    - **✅ floats — DONE 2026-07-28.** `(f 32)`/`(f 64)` types; float arithmetic
+      (`fN.add/sub/mul/div`), `neg` (`fN.neg`), and comparisons (`fN.lt/le/eq/ne`); int↔float and
+      f32↔f64 `conv`/`cast` (`convert_iN_s`/`trunc_fN_s`/`promote`/`demote`); float literals
+      (`2.0`, `1e3`) and `(inf)`/`(neginf)`/`(nan)`; float loads/stores follow from the scalar
+      type. Tested on hand fixtures and **real nimony `favg`** (`(a+b)/2.0`) + `toF` (`float(n)*1.5`),
+      interp == JIT (bit-exact).
     - **✅ `case` → `br_table` — DONE 2026-07-28.** A dense-integer `case` (`(case Disc (of
       (ranges V+) Body)* (else Body)?)`) lowers to a normalized `br_table`: the discriminant is
       offset to the value span's minimum, a table entry per value maps to its covering branch, and
