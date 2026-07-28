@@ -61,6 +61,7 @@ svm-fiber = { path = "crates/svm-fiber" }
 svm-jit = { path = "crates/svm-jit" }
 svm-spec = { path = "crates/svm-spec" }
 svm-wasm-jit = { path = "crates/svm-wasm-jit" }
+svm-parity = { path = "crates/svm-parity" }
 
 [profile.release]
 opt-level = 3
