@@ -1515,6 +1515,25 @@ so it waits for benchmark evidence (jacl workloads) or settled
 semantics, whichever demands it first; the oracle fold is the baseline
 any native port will be differential-tested against.
 
+**[MEASURED 2026-07-28] The deferral is well-placed — the serve
+round-trip is scheduling-bound, not codegen-bound.**
+`crates/svm/tests/serving_bench.rs` (ignored perf probe) times a
+serial-serve round-trip — a caller with a live offer calls `add` through
+it N times, parking on each call until the child's `svc.wait` serves and
+wakes it — across TreeWalk, Bytecode, and Jit. All three land within
+~15% of each other (~2.3–2.6 µs/req on the dev box, and the ordering
+between them flips run to run — the spread is noise, not a backend
+signal); the native bytecode serve loop does **not** beat the tree-walk
+oracle here (TreeWalk ÷ Bytecode ≈ 0.9–1.0×). The cost is the cross-fiber
+park/wake/dispatch scheduling, which is the *same* machinery on every
+backend — so a native JIT caller side would recover at most that ~15%
+margin on this shape while duplicating the highest-divergence-risk code.
+The probe asserts all three backends agree on the checksum before timing
+(and doubles as the N-round serial-serve correctness pin the
+single-request `svc_parity.rs` does not cover). Revisit if a real jacl
+workload shows a *compute-heavy* handler (where per-op codegen, not the
+round-trip, dominates) — that is the shape that would move the decision.
+
 **[BUILT 2026-07-23] §3.6 slice 5b — handler-fiber parking at the serve
 loop.** Handlers now run as **fibers of the serving vCPU** (a registry
 slot per dispatch, recycled on finish, bounded by the §15 fiber quota —
