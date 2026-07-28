@@ -44,6 +44,7 @@ const BUILT_AT_DEPLOY = new Set([
   'shell.svmb',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.svmb)
   'stage_runner.svmb',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
   'primes.svmb',          // build-onramp-assets.mjs (the shell's `primes` external command)
+  'upper.svmb',           // build-onramp-assets.mjs (the shell's `upper` stdin-filter command)
   'tcl_init.svmb',        // build-onramp-assets.mjs (fetches Tcl + openlibm; full Tcl_Init)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs

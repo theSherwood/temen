@@ -12985,8 +12985,18 @@ impl Host {
                     }
                 }
             }
-            match policy(&im.name).and_then(|(tid, iop)| first_of(self, tid).map(|c| (tid, iop, c)))
-            {
+            // stdio convention (S15b): `write`→the `"stdout"` grant, `read`→the `"stdin"` grant, so a
+            // **filter** granted both streams binds each libc call to the right end. Fall back to the
+            // first cap of the interface type when the conventional name was not granted (e.g. a
+            // stdout-only generator command, or a legacy single-stream child).
+            match policy(&im.name).and_then(|(tid, iop)| {
+                let named = match im.name.as_str() {
+                    "write" => self.resolve_cap_name("stdout"),
+                    "read" => self.resolve_cap_name("stdin"),
+                    _ => None,
+                };
+                named.or_else(|| first_of(self, tid)).map(|c| (tid, iop, c))
+            }) {
                 Some((tid, iop, c)) => {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
@@ -13671,6 +13681,20 @@ impl Host {
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (w, r)
+    }
+
+    /// Grant a **read-only pipe end** and hand back both its handle and the shared FIFO backing — the
+    /// input counterpart of [`Self::shared_stdout`]. An embedder (e.g. the POSIX personality's
+    /// `exec_stdin`) pushes the bytes a child will read into the returned `backing`; the `read_handle`
+    /// is re-granted to the child as its `"stdin"`, and its `read`s drain the same FIFO (empty ⇒ `0`,
+    /// i.e. EOF — so a filter terminates cleanly). No write end is exposed: the source is the embedder's
+    /// buffer, not another guest.
+    pub fn grant_input_pipe(&mut self) -> (i32, Arc<Mutex<std::collections::VecDeque<u8>>>) {
+        let pipe = self.pipes.len() as u32;
+        let backing = Arc::new(Mutex::new(VecDeque::new()));
+        self.pipes.push(Arc::clone(&backing));
+        let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
+        (r, backing)
     }
 
     /// Resolve a handle to a **pipe end** — `(is_write, shared FIFO backing)` — or `None` if it is not

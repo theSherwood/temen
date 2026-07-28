@@ -2212,18 +2212,26 @@ pub fn posix_shell_exec_with(
     // as the tested one, and the shell's fd-1 writes + each child's re-granted `Stream` share one sink.
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst = host.grant_instantiator(0, win);
     let _as = host.grant_address_space(0, win);
-    let cmd_handles: Vec<(&str, i32)> = cmds
+    let cmd_handles: Vec<(&str, i32, u8)> = cmds
         .iter()
-        .map(|(n, cm)| (*n, host.grant_module(cm)))
+        .map(|(n, cm)| {
+            (
+                *n,
+                host.grant_module(cm),
+                cm.memory.map_or(0, |mm| mm.size_log2),
+            )
+        })
         .collect();
     let heap_base = win.saturating_sub(64 << 10);
     let (_px, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
     posix.set_stdout_sink(sink);
     posix.set_exec_stdout(out_h);
-    for (n, h) in &cmd_handles {
-        posix.register_command(n, *h);
+    posix.set_exec_stdin(in_h, in_fifo);
+    for (n, h, wl) in &cmd_handles {
+        posix.register_command(n, *h, *wl);
     }
     let mut fuel = 200_000_000u64;
     let (status, value, exit_code) =
