@@ -254,7 +254,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(26) {
+        match bb.g.below(27) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -606,6 +606,30 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
             // arithmetic is register-only (no escape surface); a v128.load/store is the 16-byte
             // bounds-checked access exercising `svm-mask`'s wider width under the oracle.
             25 => gen_simd(bb, has_mem),
+            26 if has_mem => {
+                // Bulk memory (`memcpy`/`memmove`/`memset`, D62): the whole span `[ptr, ptr+len)` is
+                // confined as a unit, then copied/filled. `dst`/`src` are arbitrary pool values (mostly
+                // out-of-window ⇒ both backends trap-agree, same masking lowering as `Store`); `len` is
+                // a small synthesized constant so an in-window span is a cheap bounded copy, never a
+                // multi-GB one. `val` (the `memset` byte) is an i32.
+                let dst = bb.want(ValType::I64);
+                let n = bb.g.below(1024) as i64;
+                let len = bb.push(Inst::ConstI64(n), ValType::I64);
+                match bb.g.below(3) {
+                    0 => {
+                        let src = bb.want(ValType::I64);
+                        bb.push0(Inst::MemCopy { dst, src, len });
+                    }
+                    1 => {
+                        let src = bb.want(ValType::I64);
+                        bb.push0(Inst::MemMove { dst, src, len });
+                    }
+                    _ => {
+                        let val = bb.want(ValType::I32);
+                        bb.push0(Inst::MemFill { dst, val, len });
+                    }
+                }
+            }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }
         break;
@@ -622,7 +646,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
 /// bits, so they stay. Float-lane arithmetic is differential-tested under NaN control in `simd.rs`,
 /// matching the §17/D58 "value differential is NaN-insensitive per lane" note.
 fn gen_simd(bb: &mut BB, has_mem: bool) {
-    match bb.g.below(13) {
+    match bb.g.below(14) {
         0 => {
             let bytes = bb.g.v128bytes();
             bb.push(Inst::ConstV128(bytes), ValType::V128);
@@ -655,12 +679,19 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
             bb.push(Inst::ReplaceLane { shape, lane, a, b }, ValType::V128);
         }
         4 => {
-            // Lane-wise integer add/sub/mul. `i8x16.mul` has no single-instruction JIT lowering
-            // (it bails to `Unsupported`, which would make the whole module skip), so avoid it.
+            // Lane-wise integer add/sub/mul/min/max. Every (shape, op) here is Cranelift-lowered
+            // (incl. `i8x16.mul` — widen → `i16x8` multiply → low-byte pack) **except** `i64x2`
+            // min/max, which has no single-instruction ISA lowering and bails to `Unsupported`
+            // (svm-parity marks it NotYet on the JIT); emitting it would silently skip the module.
             let shape = bb.g.vshape_int();
             let op = loop {
-                let o = VIntBinOp::ALL[bb.g.below(3) as usize];
-                if !(shape == VShape::I8x16 && o == VIntBinOp::Mul) {
+                let o = VIntBinOp::ALL[bb.g.below(7) as usize];
+                let i64x2_minmax = shape == VShape::I64x2
+                    && matches!(
+                        o,
+                        VIntBinOp::MinS | VIntBinOp::MinU | VIntBinOp::MaxS | VIntBinOp::MaxU
+                    );
+                if !i64x2_minmax {
                     break o;
                 }
             };
@@ -722,9 +753,118 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
                 align: 0,
             });
         }
+        12 => gen_simd_int(bb),
         // The feature-detect hook, and the fallback when memory isn't available for 10/11.
         _ => {
             bb.push(Inst::SimdWidthBytes, ValType::I32);
+        }
+    }
+}
+
+/// Append one random **deterministic integer** SIMD op — the widening / reduction / compare / shift /
+/// saturating families the base [`gen_simd`] didn't reach (svm-parity's `parity_corpus` coverage
+/// report flagged them as Cranelift-supported-but-unexercised). All are integer-lane, so unlike the
+/// computed-*float* ops they produce no host-defined NaN payload and stay exactly comparable through
+/// `extract_lane` — the reason [`gen_simd`] can differential-test them but float-lane arithmetic
+/// cannot. Every (shape, op) below is Cranelift-lowered (`i64x2` min/max is excluded at its source in
+/// [`gen_simd`] arm 4; it is the only integer-lane op the JIT folds).
+fn gen_simd_int(bb: &mut BB) {
+    // Shape subsets the verifier requires for the width-restricted ops.
+    let narrow2 = [VShape::I8x16, VShape::I16x8]; // saturating add/sub, avgr, narrow result
+    let wide3 = [VShape::I16x8, VShape::I32x4, VShape::I64x2]; // widen / extmul result
+    let wide2 = [VShape::I16x8, VShape::I32x4]; // extadd-pairwise result
+    match bb.g.below(16) {
+        0 => {
+            let shape = bb.g.vshape_int();
+            let op = VICmpOp::ALL[bb.g.below(10) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VIntCmp { shape, op, a, b }, ValType::V128);
+        }
+        1 => {
+            let shape = bb.g.vshape_int();
+            let op = VShiftOp::ALL[bb.g.below(3) as usize];
+            let a = bb.want(ValType::V128);
+            let amt = bb.want(ValType::I32);
+            bb.push(Inst::VShift { shape, op, a, amt }, ValType::V128);
+        }
+        2 => {
+            let shape = bb.g.vshape_int();
+            let op = VIntUnOp::ALL[bb.g.below(2) as usize];
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VIntUn { shape, op, a }, ValType::V128);
+        }
+        3 => {
+            let shape = narrow2[bb.g.below(2) as usize];
+            let op = VSatBinOp::ALL[bb.g.below(4) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VSatBin { shape, op, a, b }, ValType::V128);
+        }
+        4 => {
+            let shape = narrow2[bb.g.below(2) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VAvgr { shape, a, b }, ValType::V128);
+        }
+        5 => {
+            let shape = wide3[bb.g.below(3) as usize];
+            let op = VWidenOp::ALL[bb.g.below(4) as usize];
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VWiden { shape, op, a }, ValType::V128);
+        }
+        6 => {
+            let shape = narrow2[bb.g.below(2) as usize];
+            let op = VNarrowOp::ALL[bb.g.below(2) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VNarrow { shape, op, a, b }, ValType::V128);
+        }
+        7 => {
+            let shape = wide3[bb.g.below(3) as usize];
+            let op = VWidenOp::ALL[bb.g.below(4) as usize];
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VExtMul { shape, op, a, b }, ValType::V128);
+        }
+        8 => {
+            let shape = wide2[bb.g.below(2) as usize];
+            let signed = bb.g.boolean();
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VExtAddPairwise { shape, signed, a }, ValType::V128);
+        }
+        9 => {
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VDot { a, b }, ValType::V128);
+        }
+        10 => {
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VDotI8 { a, b }, ValType::V128);
+        }
+        11 => {
+            let a = bb.want(ValType::V128);
+            let b = bb.want(ValType::V128);
+            bb.push(Inst::VQ15MulrSat { a, b }, ValType::V128);
+        }
+        12 => {
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VPopcnt { a }, ValType::V128);
+        }
+        13 => {
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VAnyTrue { a }, ValType::I32);
+        }
+        14 => {
+            let shape = bb.g.vshape_int();
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VAllTrue { shape, a }, ValType::I32);
+        }
+        _ => {
+            let shape = bb.g.vshape_int();
+            let a = bb.want(ValType::V128);
+            bb.push(Inst::VBitmask { shape, a }, ValType::I32);
         }
     }
 }

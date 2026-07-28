@@ -340,8 +340,29 @@ pub fn parity_term(term: &Terminator) -> [Cell; 4] {
     }
 }
 
+/// Whether `backend` **runs `inst` itself** (`Full`, or target-conditional where its cfg holds) as
+/// opposed to folding it to the oracle (`Declines`/`NotYet`). The single programmatic source of a
+/// backend's supported-op set — the differential-test corpora consult it so their op selection can't
+/// drift from the matrix (INVARIANTS.md #9: one shared predicate, one definition). `Conditional`
+/// counts as supported because the harnesses that generate those ops run on the target where the
+/// substrate exists.
+pub fn supports(backend: Backend, inst: &Inst) -> bool {
+    matches!(
+        parity(inst)[backend as usize].status,
+        Status::Full | Status::Conditional
+    )
+}
+
+/// [`supports`] for a block terminator.
+pub fn supports_term(backend: Backend, term: &Terminator) -> bool {
+    matches!(
+        parity_term(term)[backend as usize].status,
+        Status::Full | Status::Conditional
+    )
+}
+
 mod catalog;
-pub use catalog::{catalog, Op};
+pub use catalog::{catalog, Focus, Op};
 
 mod render;
 pub use render::render_markdown;
