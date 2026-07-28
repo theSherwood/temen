@@ -1,8 +1,10 @@
 // Real-browser (V8) end-to-end check for the **playground shell card** (STAGE1.md): load the same
-// `svm_browser.wasm` the page runs, fetch `web/assets/shell.svmb` (the committed shell fixture the
-// build step copies in), and drive the `svm_run_shell` entry the card's Run calls — feeding a script
-// as stdin and asserting the captured stdout. This exercises the actual wasm path the "Shell" card
-// uses (interpreter tier; the shell carries Instantiator cap.calls, so there is no wasm-JIT tier).
+// `svm_browser.wasm` the page runs, fetch `web/assets/shell.svmb` + `stage_runner.svmb` (the committed
+// fixtures the build step copies in), and drive the `svm_run_shell` entry the card's Run calls —
+// feeding a script as stdin and asserting the captured stdout. This exercises the actual wasm path the
+// "Shell" card uses: the bytecode cooperative engine, with the `__stage` runner registered so a
+// `cat | sort | uniq` pipeline runs as concurrent stages over shared-memory rings (op 11 +
+// SharedRegion + futex) — the browser-parity capability this slice turned on.
 //
 // Skipped cleanly if the asset or a Chromium/Playwright install is unavailable (like the other
 // on-ramp browser checks). Run: node browser-shell-test.mjs
@@ -12,8 +14,8 @@ import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-if (!existsSync(`${ROOT}/web/assets/shell.svmb`)) {
-  console.log('– shell test skipped (web/assets/shell.svmb absent — run build-onramp-assets.mjs)');
+if (!existsSync(`${ROOT}/web/assets/shell.svmb`) || !existsSync(`${ROOT}/web/assets/stage_runner.svmb`)) {
+  console.log('– shell test skipped (web/assets/{shell,stage_runner}.svmb absent — run build-onramp-assets.mjs)');
   process.exit(0);
 }
 async function loadChromium() {
@@ -35,30 +37,40 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The script exercises the read-eval loop, $VAR expansion, a redirect+cat over the memfs, a
-// `cat | grep` pipeline, and an if/test conditional — the Stage-0 shell surface the card advertises.
+// `cat | grep` pipeline, a **`cat | sort | uniq` concurrent ring pipeline**, and an if/test
+// conditional — the shell surface the card advertises.
 const SCRIPT =
   '# a comment line — ignored\n' +
   'echo hello from the sandbox\n' +
   'N=world\n' +
   'echo hi $N   # an inline comment\n' +
-  'echo apple > fruits\n' +
+  'echo banana > fruits\n' +
+  'echo apple >> fruits\n' +
   'echo banana >> fruits\n' +
   'cat fruits | grep a\n' +
+  'echo -- sorted --\n' +
+  'cat fruits | sort | uniq\n' +
   'if test -f fruits; then echo exists; fi\n';
-const EXPECT = 'hello from the sandbox\nhi world\napple\nbanana\nexists\n';
+// `grep a` matches all three lines (banana, apple, banana all contain 'a'); the ring `sort | uniq`
+// then yields the deduped sorted pair.
+const EXPECT =
+  'hello from the sandbox\nhi world\nbanana\napple\nbanana\n-- sorted --\napple\nbanana\nexists\n';
 
 const res = await page.evaluate(async (script) => {
   const par = await import('./par.js');
   const eng = await par.loadEngine();
   const dec = (p, n) => new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + n));
   const bytes = new Uint8Array(await (await fetch('./assets/shell.svmb')).arrayBuffer());
+  const stage = new Uint8Array(await (await fetch('./assets/stage_runner.svmb')).arrayBuffer());
   const stdinBytes = new TextEncoder().encode(script);
   const mp = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, mp);
   const sp = eng.ex.svm_alloc(stdinBytes.length); new Uint8Array(eng.memory.buffer).set(stdinBytes, sp);
-  eng.ex.svm_run_shell(mp, bytes.length, sp, stdinBytes.length);
+  const gp = eng.ex.svm_alloc(stage.length); new Uint8Array(eng.memory.buffer).set(stage, gp);
+  eng.ex.svm_run_shell(mp, bytes.length, sp, stdinBytes.length, gp, stage.length);
   const status = eng.ex.svm_status();
   const stdout = dec(Number(eng.ex.svm_stdout_ptr()), eng.ex.svm_stdout_len());
   eng.ex.svm_dealloc(mp, bytes.length); eng.ex.svm_dealloc(sp, stdinBytes.length);
+  eng.ex.svm_dealloc(gp, stage.length);
   return { status, stdout };
 }, SCRIPT);
 

@@ -85,6 +85,11 @@ fn c_to_ir_with(src: &str, extra: &[&str]) -> String {
 /// Compile a C source string to text IR with the `--child-entry` spawnable §14 child ABI — how an
 /// external command the shell `exec`s (STAGE1.md §5) is built.
 fn c_to_ir_child(src: &str) -> String {
+    c_to_ir_child_with(src, &[])
+}
+
+/// [`c_to_ir_child`] with extra chibicc `-cc1` flags (e.g. `--data-page 65536` for the browser fixture).
+fn c_to_ir_child_with(src: &str, extra: &[&str]) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -92,17 +97,17 @@ fn c_to_ir_child(src: &str) -> String {
     let cfile = base.with_extension("c");
     let irfile = base.with_extension("svm");
     std::fs::write(&cfile, src).unwrap();
+    let mut args: Vec<&str> = vec!["-cc1", "--emit-ir", "--child-entry"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "-cc1-input",
+        cfile.to_str().unwrap(),
+        "-cc1-output",
+        irfile.to_str().unwrap(),
+        cfile.to_str().unwrap(),
+    ]);
     let status = Command::new(chibicc())
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "--child-entry",
-            "-cc1-input",
-            cfile.to_str().unwrap(),
-            "-cc1-output",
-            irfile.to_str().unwrap(),
-            cfile.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()
         .expect("run chibicc");
     assert!(status.success(), "chibicc --child-entry failed on:\n{src}");
@@ -1079,23 +1084,55 @@ fn stage0_shell_hash_comments() {
 /// because it writes into the tree and needs the chibicc build; regenerate with:
 ///   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
 #[test]
-#[ignore = "writes browser/tests/fixtures/shell.svmb; run explicitly to (re)generate the fixture"]
+#[ignore = "writes browser/tests/fixtures/{shell,stage_runner}.svmb; run explicitly to regenerate"]
 fn gen_browser_shell_fixture() {
-    // The **sequential** subset (`SVM_SHELL_SEQUENTIAL`): no external-command spawn, no concurrent ring
-    // pipelines — so the module carries no `Instantiator`/`SharedRegion` cap.calls and compiles on the
-    // browser's bytecode engine (`compile_inst` rejects those; the tree-walk/JIT engines that run the
-    // full shell use OS threads + a wall clock, absent under wasm). `RING` is dropped with it.
-    let src = format!("#define SVM_SHELL_SEQUENTIAL 1\n{SHIM}\n{SHELL_MAIN}");
-    // `--data-page 65536`: the playground runs on a 64 KiB wasm page, so the read-only string data
-    // must share no host page with a writable global (else the shell's own write to a global faults
-    // under D40). Native chibicc defaults to 16 KiB, which is why the differential above never hit it.
-    let ir = c_to_ir_with(&src, &["--data-page", "65536"]);
+    // The **full** shell — external-command spawn (op 13) and concurrent ring pipelines (op 11 +
+    // `SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` cap.calls now
+    // compile on the browser's bytecode cooperative engine (the slices that lowered ops 13/11 + region
+    // + futex, plus op-13 child-manifest binding); the differential above proves the module runs there
+    // byte-identically to the tree-walk/JIT oracle. `posix_shell_exec` grants the `__stage` runner
+    // below so `cat f | sort | uniq`-style pipelines take the ring path in the playground.
+    let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
+    // `--data-page 65536`: the playground runs on a 64 KiB wasm host page, so the read-only string
+    // data must share no host page with a writable global (else the shell's own write to a global
+    // faults — D40 host-page RO/RW protection is enforced under wasm). Native chibicc defaults to
+    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19`: under the
+    // 64 KiB page the `__stage` runner's data sections round up so its window is 19 (512 KiB), not the
+    // native 18 — the shell must carve its ring stages to match. Verified end to end against a real
+    // Chromium run by `browser-shell-test.mjs`.
+    let ir = c_to_ir_with(&src, &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");
     let bytes = svm_encode::encode_module(&m);
-    let out = repo_root().join("browser/tests/fixtures/shell.svmb");
-    std::fs::create_dir_all(out.parent().unwrap()).expect("create fixtures dir");
+    let dir = repo_root().join("browser/tests/fixtures");
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let out = dir.join("shell.svmb");
     std::fs::write(&out, &bytes).expect("write shell.svmb");
     eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
+
+    // The `__stage` ring-filter runner (STAGE1.md item 6) — the `--child-entry` command a ring pipeline
+    // spawns once per stage. Same 64 KiB-page data layout; its region ops are chibicc `__vm_region_*`
+    // builtins (no import manifest to link, so `c_to_ir_child`'s encode is self-contained). The browser
+    // grants it under the name `__stage`, exactly as the differential's `run_shell_ex` does.
+    // The `__stage` runner, also 64 KiB-page with `-D SVM_STAGE_LOG2=19` so its ring maps sit at the
+    // right half-window offset (256 KiB) for the 512 KiB window the 64 KiB page rounds it up to. Its
+    // declared memory (19) must equal the shell's ring carve (also 19 here) — a §14 child's carve
+    // equals its declared memory, the invariant the differential's `run_shell_ex` checks at 18.
+    let runner_ir = c_to_ir_child_with(
+        &stage_runner_src(),
+        &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"],
+    );
+    let rraw = parse_module_raw(&runner_ir).expect("parse stage runner IR");
+    verify_module(&rraw).expect("verify stage runner");
+    assert_eq!(
+        rraw.memory.map(|mm| mm.size_log2),
+        Some(19),
+        "the 64 KiB-page __stage runner must declare memory 19 (the shell's ring-carve size); \
+         drift breaks the spawn"
+    );
+    let rbytes = svm_encode::encode_module(&rraw);
+    let rout = dir.join("stage_runner.svmb");
+    std::fs::write(&rout, &rbytes).expect("write stage_runner.svmb");
+    eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
 }

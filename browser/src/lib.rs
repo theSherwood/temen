@@ -2189,15 +2189,42 @@ pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// window (inert this slice — see above), and the POSIX personality itself (its captured stdout is the
 /// shell's output). The personality heap is the top 64 KiB (the shell never `malloc`s).
 pub fn posix_shell_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    posix_shell_exec_with(m, stdin, &[])
+}
+
+/// As [`posix_shell_exec`], plus a **PATH registry** of external commands `(name, module)` — each
+/// granted as a `Module` and registered so an unknown command name in the script is `exec`'d as a
+/// separate compiled child (op 13, STAGE1.md §5) instead of `<cmd>: not found`. Registering the
+/// `__stage` ring-filter runner here is what makes `cat f | sort | uniq`-style pipelines take the
+/// **concurrent ring path** (op 11 + `SharedRegion` + futex) rather than sequential memfs staging.
+/// Grant order + the shared-stdout unification mirror `c_shell.rs`'s `setup` exactly, so a run here
+/// discovers the same handles as the byte-checked differential and its output (shell builtins + child
+/// stages) lands in one captured stdout.
+pub fn posix_shell_exec_with(
+    m: &svm_ir::Module,
+    stdin: &[u8],
+    cmds: &[(&str, &svm_ir::Module)],
+) -> PbOutcome {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut host = Host::new();
-    // Grant order mirrors `c_shell.rs`'s `setup` (Stream, Instantiator, AddressSpace, then personality)
-    // so a run here discovers the same handles as the tested one.
-    let _out = host.grant_stream(StreamRole::Out);
+    // Grant order mirrors `c_shell.rs`'s `setup` (shared stdout sink, Stream, Instantiator,
+    // AddressSpace, the command Modules, then the personality) so a run here discovers the same handles
+    // as the tested one, and the shell's fd-1 writes + each child's re-granted `Stream` share one sink.
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
     let _inst = host.grant_instantiator(0, win);
     let _as = host.grant_address_space(0, win);
+    let cmd_handles: Vec<(&str, i32)> = cmds
+        .iter()
+        .map(|(n, cm)| (*n, host.grant_module(cm)))
+        .collect();
     let heap_base = win.saturating_sub(64 << 10);
     let (_px, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    posix.set_stdout_sink(sink);
+    posix.set_exec_stdout(out_h);
+    for (n, h) in &cmd_handles {
+        posix.register_command(n, *h);
+    }
     let mut fuel = 200_000_000u64;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
@@ -3825,7 +3852,10 @@ pub extern "C" fn svm_run_onramp_posix(
 
 /// Decode the module at `[mod_ptr, mod_len)` and run it as the **`svm-posix` shell** (see
 /// [`posix_shell_exec`]) with `[stdin_ptr, stdin_len)` as the script — the playground's shell card.
-/// Same capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via
+/// `[stage_ptr, stage_len)`, when non-empty, is the `__stage` ring-filter runner module: registering it
+/// makes `cat f | sort | uniq`-style pipelines take the **concurrent ring path** (op 11 + `SharedRegion`
+/// + futex) instead of sequential memfs staging. Pass `stage_len = 0` to run without it (memfs
+/// pipelines only). Same capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via
 /// `svm_stdout_ptr`+`svm_stdout_len`, the exit code via [`svm_exit_code`], the status via
 /// [`svm_status`]. Returns the guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots
 /// with the other run exports — read them before the next call.
@@ -3835,6 +3865,8 @@ pub extern "C" fn svm_run_shell(
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
+    stage_ptr: *const u8,
+    stage_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
@@ -3851,7 +3883,19 @@ pub extern "C" fn svm_run_shell(
             return 0;
         }
     };
-    let out = posix_shell_exec(&m, stdin);
+    // The optional `__stage` runner. A decode failure here is non-fatal: run the shell without the ring
+    // path (pipelines fall back to memfs staging) rather than failing the whole run.
+    let runner = if stage_ptr.is_null() || stage_len == 0 {
+        None
+    } else {
+        let sbytes = unsafe { core::slice::from_raw_parts(stage_ptr, stage_len) };
+        svm_encode::decode_module(sbytes).ok()
+    };
+    let cmds: &[(&str, &svm_ir::Module)] = match &runner {
+        Some(r) => &[("__stage", r)],
+        None => &[],
+    };
+    let out = posix_shell_exec_with(&m, stdin, cmds);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -3897,19 +3941,32 @@ pub extern "C" fn svm_link_run(
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
-        if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
     };
     let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
@@ -3920,23 +3977,41 @@ pub extern "C" fn svm_link_run(
         .chunks_exact(12)
         .map(|c| {
             let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
-            svm_ir::DataReloc { func: u(0), block: u(4), inst: u(8), kind: svm_ir::RelocKind::SelfData }
+            svm_ir::DataReloc {
+                func: u(0),
+                block: u(4),
+                inst: u(8),
+                kind: svm_ir::RelocKind::SelfData,
+            }
         })
         .collect();
 
     let program = match svm_text::parse_module(prog_text) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let lib = match svm_text::parse_module(lib_text) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
-    let lib_exports: Vec<(String, svm_ir::FuncIdx)> =
-        lib.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+    let lib_exports: Vec<(String, svm_ir::FuncIdx)> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
 
     let linked = match svm_ir::link_with_manifest(&[
-        svm_ir::LinkUnit { module: lib, exports: lib_exports, ..Default::default() },
+        svm_ir::LinkUnit {
+            module: lib,
+            exports: lib_exports,
+            ..Default::default()
+        },
         svm_ir::LinkUnit {
             module: program,
             exports: vec![(entry_name.to_string(), 0)],
@@ -3945,15 +4020,24 @@ pub extern "C" fn svm_link_run(
         },
     ]) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let entry = match linked.resolve_export(entry_name) {
         Some(e) => e,
-        None => { set(STATUS_UNSUPPORTED); return 0; }
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let module = match svm_ir::synth_manifest_start(linked, entry, false) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     // Verify before running: a program that references an undefined proc links to an unresolvable
     // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
