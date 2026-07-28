@@ -762,7 +762,7 @@ int main(void) {
 
   // A little numerical integration: estimate pi via the Leibniz series.
   double pi = 0.0;
-  for (int k = 0; k < 100000; k++)
+  for (int k = 0; k < 20000; k++)
     pi += (k % 2 ? -4.0 : 4.0) / (2 * k + 1);
 
   printf("  pi  ~ %.6f   (%%e: %e)\\n", pi, pi);

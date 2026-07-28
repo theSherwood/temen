@@ -35,13 +35,13 @@ struct __pf_sink {
   char buf[128];
   int bn;
 };
-static void __pf_flush(struct __pf_sink *s) {
+static inline void __pf_flush(struct __pf_sink *s) {
   if (!s->out && s->bn) {
     write(s->fd, s->buf, s->bn);
     s->bn = 0;
   }
 }
-static void __pf_emit(struct __pf_sink *s, char c) {
+static inline void __pf_emit(struct __pf_sink *s, char c) {
   if (s->out) {
     if (s->n + 1 < s->cap)
       s->out[s->n] = c;
@@ -55,7 +55,7 @@ static void __pf_emit(struct __pf_sink *s, char c) {
 
 // Format `val` in `base` (10/16/8) into `tmp` (reversed), return its length. `upper` picks the
 // hex digit case.
-static int __pf_utoa(unsigned long val, unsigned base, int upper, char *tmp) {
+static inline int __pf_utoa(unsigned long val, unsigned base, int upper, char *tmp) {
   const char *lo = "0123456789abcdef";
   const char *hi = "0123456789ABCDEF";
   const char *dig = upper ? hi : lo;
@@ -76,7 +76,7 @@ static int __pf_utoa(unsigned long val, unsigned base, int upper, char *tmp) {
 // lose precision. For the values a playground uses it matches glibc. The helpers below take a
 // **non-negative** magnitude; sign/Inf/NaN/padding are handled at the call site.
 
-static double __pf_pow10(int e) {
+static inline double __pf_pow10(int e) {
   double r = 1.0, b = 10.0;
   int neg = e < 0;
   if (neg) e = -e;
@@ -89,7 +89,7 @@ static double __pf_pow10(int e) {
 }
 
 // `x` (>= 0) → "[ip].[frac]" with `prec` fractional digits (rounded). Returns the length.
-static int __pf_fix(char *out, double x, int prec) {
+static inline int __pf_fix(char *out, double x, int prec) {
   if (prec < 0) prec = 6;
   if (prec > 30) prec = 30;
   unsigned long long ip = (unsigned long long)x; // integer part (exact for |x| < 2^64)
@@ -130,7 +130,7 @@ static int __pf_fix(char *out, double x, int prec) {
 }
 
 // `x` (>= 0) → "d.ddde±dd" with `prec` mantissa-fraction digits. Returns the length.
-static int __pf_sci(char *out, double x, int prec, int upper) {
+static inline int __pf_sci(char *out, double x, int prec, int upper) {
   if (prec < 0) prec = 6;
   int exp = 0;
   if (x != 0.0) {
@@ -164,7 +164,7 @@ static int __pf_sci(char *out, double x, int prec, int upper) {
 }
 
 // `x` (>= 0) → `%g`: %e or %f by exponent, trailing zeros stripped unless `alt`. Returns the length.
-static int __pf_gen(char *out, double x, int prec, int upper, int alt) {
+static inline int __pf_gen(char *out, double x, int prec, int upper, int alt) {
   int P = prec < 0 ? 6 : (prec == 0 ? 1 : prec);
   int exp = 0;
   {
@@ -198,7 +198,7 @@ static int __pf_gen(char *out, double x, int prec, int upper, int alt) {
 }
 
 // Format the magnitude `x` (>= 0) per conv (f/e/g, any case). Returns the length.
-static int __pf_float(char *out, double x, int prec, char conv, int alt) {
+static inline int __pf_float(char *out, double x, int prec, char conv, int alt) {
   int up = (conv <= 'Z');
   char c = up ? (char)(conv + 32) : conv;
   if (c == 'f') return __pf_fix(out, x, prec);
@@ -206,7 +206,7 @@ static int __pf_float(char *out, double x, int prec, char conv, int alt) {
   return __pf_gen(out, x, prec, up, alt);
 }
 
-static int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
+static inline int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
   for (int i = 0; fmt[i]; i++) {
     if (fmt[i] != '%') {
       __pf_emit(s, fmt[i]);
@@ -342,73 +342,73 @@ static int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
   return (int)s->n;
 }
 
-static int vfprintf(FILE *stream, const char *fmt, va_list ap) {
+static inline int vfprintf(FILE *stream, const char *fmt, va_list ap) {
   struct __pf_sink s;
   s.out = 0; s.cap = 0; s.n = 0; s.fd = (int)(long)stream; s.bn = 0;
   int r = __pf_vprint(&s, fmt, ap);
   __pf_flush(&s);
   return r;
 }
-static int fprintf(FILE *stream, const char *fmt, ...) {
+static inline int fprintf(FILE *stream, const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   int r = vfprintf(stream, fmt, ap);
   va_end(ap);
   return r;
 }
-static int printf(const char *fmt, ...) {
+static inline int printf(const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   int r = vfprintf(stdout, fmt, ap);
   va_end(ap);
   return r;
 }
-static int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
+static inline int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   struct __pf_sink s;
   s.out = str; s.cap = size; s.n = 0; s.fd = 0; s.bn = 0;
   int r = __pf_vprint(&s, fmt, ap);
   if (size) s.out[s.n < size ? s.n : size - 1] = 0;
   return r;
 }
-static int snprintf(char *str, size_t size, const char *fmt, ...) {
+static inline int snprintf(char *str, size_t size, const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   int r = vsnprintf(str, size, fmt, ap);
   va_end(ap);
   return r;
 }
-static int sprintf(char *str, const char *fmt, ...) {
+static inline int sprintf(char *str, const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   int r = vsnprintf(str, (size_t)1 << 30, fmt, ap);
   va_end(ap);
   return r;
 }
 
-static int fputc(int c, FILE *stream) {
+static inline int fputc(int c, FILE *stream) {
   char b = (char)c;
   write((int)(long)stream, &b, 1);
   return c;
 }
-static int putc(int c, FILE *stream) { return fputc(c, stream); }
-static int putchar(int c) { return fputc(c, stdout); }
-static int fputs(const char *s, FILE *stream) {
+static inline int putc(int c, FILE *stream) { return fputc(c, stream); }
+static inline int putchar(int c) { return fputc(c, stdout); }
+static inline int fputs(const char *s, FILE *stream) {
   long n = 0;
   while (s[n]) n++;
   write((int)(long)stream, (char *)s, n);
   return 0;
 }
-static int puts(const char *s) {
+static inline int puts(const char *s) {
   fputs(s, stdout);
   return putchar('\n');
 }
-static size_t fwrite(const void *ptr, size_t sz, size_t nm, FILE *stream) {
+static inline size_t fwrite(const void *ptr, size_t sz, size_t nm, FILE *stream) {
   long n = (long)(sz * nm);
   if (n) write((int)(long)stream, (char *)ptr, n);
   return nm;
 }
 
-static int getchar(void) {
+static inline int getchar(void) {
   char c;
   return read(0, &c, 1) == 1 ? (unsigned char)c : EOF;
 }
-static char *fgets(char *s, int size, FILE *stream) {
+static inline char *fgets(char *s, int size, FILE *stream) {
   int fd = (int)(long)stream, i = 0;
   while (i < size - 1) {
     char c;

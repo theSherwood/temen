@@ -40,6 +40,8 @@ int align_to(int n, int align) {
 // affects the emitted IR (headers aren't named in the output), so both sides stay comparable.
 // --data-page N sets the D40 RO/writable isolation granularity (the browser passes 65536 for its
 // 64 KiB wasm host page, so a compiled program's RO globals never share a host page with writable data).
+// -g0 turns off debug info (`-g` is on by default for the W1 debugger); the playground passes it since
+// it never debugs the compiled program, and the `debug.*` sections are ~a third of the emitted IR.
 int main(int argc, char **argv) {
   char *inc = "/include";
   int ai = 1;
@@ -50,6 +52,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
       opt_data_page = atoi(argv[ai + 1]);
       ai += 2;
+    } else if (!strcmp(argv[ai], "-g0")) {
+      opt_g = false;
+      ai++;
     } else {
       break;
     }
