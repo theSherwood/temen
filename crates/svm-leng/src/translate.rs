@@ -1006,9 +1006,47 @@ impl<'a> FuncGen<'a> {
         Err(LengError::Unsupported("`at` on a non-array".into()))
     }
 
-    /// `(asgn Lvalue Expr)`: a symbol lvalue rebinds a slot; `deref`/`dot`/`at`/`pat` store through
-    /// the computed address.
+    /// The type descriptor of an lvalue, computed **without emitting** (for dispatching aggregate
+    /// vs scalar assignment). `None` for a plain SSA-scalar local (which has no address).
+    fn lvalue_type(&self, node: &Node) -> Option<TyDesc> {
+        match node {
+            Node::Atom(name) => {
+                if let Some((_, d)) = self.mem.get(name) {
+                    return Some(d.clone());
+                }
+                if let Some((_, d)) = self.t.globals.get(name) {
+                    return Some(d.clone());
+                }
+                self.local_desc.get(name).cloned()
+            }
+            Node::List(_) => match node.tag() {
+                Some("deref" | "pat") => node
+                    .args()
+                    .first()
+                    .and_then(|n| n.as_atom())
+                    .and_then(|p| self.pointee.get(p).cloned()),
+                Some("dot") => {
+                    let a = node.args();
+                    let bd = self.lvalue_type(a.first()?)?;
+                    let f = a.get(1)?.as_atom()?;
+                    self.field_of(&bd, f).ok().map(|(_, d)| d)
+                }
+                Some("at") => {
+                    let bd = self.lvalue_type(node.args().first()?)?;
+                    self.array_of(&bd).ok().map(|(_, d)| d)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// `(asgn Lvalue Expr)`. An **aggregate** destination copies/constructs whole; a scalar symbol
+    /// rebinds its slot; a scalar `deref`/`dot`/`at`/`pat`/global stores through its address.
     fn assign(&mut self, lhs: &Node, rhs: &Node) -> Result<(), LengError> {
+        if let Some(ddesc @ TyDesc::Agg(_)) = self.lvalue_type(lhs) {
+            let (daddr, _) = self.lvalue_addr(lhs)?;
+            return self.assign_aggregate(daddr, &ddesc, rhs);
+        }
         if matches!(lhs.tag(), Some("deref" | "dot" | "at" | "pat")) {
             return self.store_lvalue(lhs, rhs);
         }
@@ -1021,6 +1059,69 @@ impl<'a> FuncGen<'a> {
         }
         let v = self.expr(rhs)?;
         self.write_local(name, v)
+    }
+
+    /// Assign into an aggregate at address `daddr`: an `oconstr`/`aconstr` constructs field-by-field
+    /// in place; any other rhs is a whole-aggregate copy (`mem.copy` of the source's bytes).
+    fn assign_aggregate(
+        &mut self,
+        daddr: u32,
+        ddesc: &TyDesc,
+        rhs: &Node,
+    ) -> Result<(), LengError> {
+        match rhs.tag() {
+            Some("oconstr") => {
+                // `(oconstr T (kv Field Expr)*)`.
+                for kv in &rhs.args()[1..] {
+                    if kv.tag() != Some("kv") {
+                        continue;
+                    }
+                    let ka = kv.args();
+                    let fname = ka
+                        .first()
+                        .and_then(|n| n.as_atom())
+                        .ok_or_else(|| LengError::Malformed("kv needs a field name".into()))?;
+                    let (foff, fdesc) = self.field_of(ddesc, fname)?;
+                    let faddr = self.add_const_off(daddr, foff);
+                    self.store_member(faddr, &fdesc, &ka[1])?;
+                }
+                Ok(())
+            }
+            Some("aconstr") => {
+                // `(aconstr T Elem*)`.
+                let (esize, edesc) = self.array_of(ddesc)?;
+                for (i, ee) in rhs.args()[1..].iter().enumerate() {
+                    let eaddr = self.add_const_off(daddr, i as u64 * esize);
+                    self.store_member(eaddr, &edesc, ee)?;
+                }
+                Ok(())
+            }
+            _ => {
+                // Whole-aggregate copy: the rhs is an aggregate lvalue; copy its bytes.
+                let (saddr, _) = self.lvalue_addr(rhs)?;
+                let size = self.t.sizeof(ddesc);
+                let szc = self.emit_const(ValType::I64, size as i64);
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  mem.copy v{daddr} v{saddr} v{}\n", szc.id));
+                Ok(())
+            }
+        }
+    }
+
+    /// Store one member (field/element) at `addr`: a scalar stores directly; a nested aggregate
+    /// constructs/copies via [`assign_aggregate`].
+    fn store_member(&mut self, addr: u32, desc: &TyDesc, expr: &Node) -> Result<(), LengError> {
+        match desc {
+            TyDesc::Scalar(ty) => {
+                let v = self.expr_typed(expr, *ty)?;
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  {}.store v{addr} v{}\n", prefix(*ty), v.id));
+                Ok(())
+            }
+            TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
+        }
     }
 
     /// `StmtList ::= (stmts SCOPE? Stmt*)` — real hexer often omits the leading SCOPE atom.
@@ -1078,14 +1179,18 @@ impl<'a> FuncGen<'a> {
                 }
                 let name = sym_def(&a[0])?;
                 // An aggregate frame local's storage is the (zeroed) frame: a default-init is a
-                // no-op; an aggregate initializer (constructor) is a later slice.
-                if matches!(self.mem.get(&name), Some((_, TyDesc::Agg(_)))) {
-                    return match a.get(3) {
-                        Some(init) if !init.is_empty_marker() => Err(LengError::Unsupported(
-                            "aggregate initializer (oconstr/aconstr) not yet supported".into(),
-                        )),
-                        _ => Ok(()),
-                    };
+                // no-op; an initializer (`oconstr`/`aconstr`/another aggregate) constructs in place.
+                if let Some((off, ddesc)) = self.mem.get(&name).cloned() {
+                    if matches!(ddesc, TyDesc::Agg(_)) {
+                        return match a.get(3) {
+                            Some(init) if !init.is_empty_marker() => {
+                                let sp = self.cur[0];
+                                let daddr = self.add_const_off(sp, off);
+                                self.assign_aggregate(daddr, &ddesc, init)
+                            }
+                            _ => Ok(()),
+                        };
+                    }
                 }
                 let ty = val_ty(&a[2])?;
                 let v = match a.get(3) {

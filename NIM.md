@@ -300,10 +300,18 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
   **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow,
-  pointers, frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the
-  rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`,
-  `classify`, `favg`). Remaining for full real modules: whole-aggregate copy/`oconstr`, and
-  non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
+  pointers, frames, objects/arrays (incl. constructors + copy), globals, intra- and cross-module
+  calls — fail-closed on the rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`,
+  `dot2`, `sumto`, `classify`, `favg`, `mkSum`). Remaining for full real modules: aggregate
+  **return** (sret) and non-zero global/data initializers — plus wiring nimony's real export
+  signatures for imports.
+    - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
+      (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
+      `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
+      nested aggregates recursing), and any other rhs is a whole-aggregate `mem.copy` of the
+      source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
+      an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
+      y:b); p.x+p.y`), interp == JIT. Aggregate **return** by sret is the remaining half.
     - **✅ floats — DONE 2026-07-28.** `(f 32)`/`(f 64)` types; float arithmetic
       (`fN.add/sub/mul/div`), `neg` (`fN.neg`), and comparisons (`fN.lt/le/eq/ne`); int↔float and
       f32↔f64 `conv`/`cast` (`convert_iN_s`/`trunc_fN_s`/`promote`/`demote`); float literals
