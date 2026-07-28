@@ -4650,6 +4650,17 @@ impl DebugRun {
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         self.done.as_ref()
     }
+
+    /// The session's powerbox host (`Host::new_with_host`'s grant), for reading effects a debugged guest
+    /// produced — captured stdout/stderr, and the [`CapTape`](Host::cap_tape) a reverse `seek` replays so
+    /// a **powerbox** run (streams/clock/exit) re-executes with identical cap inputs.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+    /// Mutable powerbox host — e.g. to drain captured stdout between stops.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
+    }
 }
 
 /// Whether `m` can spawn a second vCPU — it contains a `thread.spawn` op somewhere. The DAP backend

@@ -66,6 +66,10 @@ struct Session {
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
+    /// Byte length of the guest stdout last surfaced as a DAP `output` event — so each stop emits one
+    /// only when the captured output *changed*. On a reverse `seek` the output shrinks, so the event
+    /// carries the **full** current stdout (not an append delta) and the client replaces its view.
+    stdout_shown: usize,
 }
 
 impl Session {
@@ -292,8 +296,18 @@ impl DapServer {
             .get("engine")
             .and_then(|v| v.as_str())
             .unwrap_or("treewalk");
+        // `powerbox: "onramp"` runs the guest under the on-ramp I/O powerbox (stdout/stdin/exit/memory),
+        // so a manifest program that calls a host capability — a chibicc `printf` → `write` — runs and its
+        // output is captured (surfaced as DAP `output` events), instead of `CapFault`ing. Absent ⇒
+        // deny-all (compute-only), unchanged. `stdin` preloads `read(0, …)`.
+        let powerbox = args.get("powerbox").and_then(|v| v.as_str()) == Some("onramp");
+        let stdin = args
+            .get("stdin")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
-            match BytecodeBackend::new(module, func, &call_args, fuel) {
+            match BytecodeBackend::new(module, func, &call_args, fuel, powerbox, stdin) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
                 Some(b) => {
@@ -328,6 +342,7 @@ impl DapServer {
             place_refs: Vec::new(),
             data_watch_ids: Vec::new(),
             scheduled,
+            stdout_shown: 0,
         });
         (true, Json::Null, vec![])
     }
@@ -966,7 +981,11 @@ impl DapServer {
             .stopped_task()
             .map(|t| t as i64 + 1)
             .unwrap_or(1);
-        (true, Json::Null, vec![stopped_event(reason, tid)])
+        // Flush the (rewound) powerbox output before the stop, so the client sees the captured stdout as
+        // it stood at this earlier point (the reverse search left the run rebuilt at `landed`).
+        let mut events = self.output_events();
+        events.push(stopped_event(reason, tid));
+        (true, Json::Null, events)
     }
 
     fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
@@ -1086,21 +1105,49 @@ impl DapServer {
     }
 
     /// Map a resume's outcome to the DAP event(s) that follow the response. The previous stop's
-    /// frame references are now stale, so clear them; the next `stackTrace` assigns fresh ones.
+    /// frame references are now stale, so clear them; the next `stackTrace` assigns fresh ones. Any new
+    /// powerbox stdout is flushed as an `output` event first, so the client sees the guest's output
+    /// before the stop/terminate.
     fn stop_events(&mut self, stop: Stop) -> Vec<Event> {
         if let Some(s) = self.session.as_mut() {
             s.frame_refs.clear();
             s.place_refs.clear();
         }
+        let mut events = self.output_events();
         let tid = self.stopped_thread_id();
-        match stop {
-            Stop::Break { reason, .. } => vec![stopped_event(dap_reason(reason), tid)],
+        events.push(match stop {
+            Stop::Break { reason, .. } => stopped_event(dap_reason(reason), tid),
             Stop::Finished(_) => {
                 self.terminated = true;
-                vec![("terminated", Json::obj(vec![]))]
+                ("terminated", Json::obj(vec![]))
             }
-            Stop::Blocked => vec![stopped_event("pause", tid)],
+            Stop::Blocked => stopped_event("pause", tid),
+        });
+        events
+    }
+
+    /// A DAP `output` event carrying the guest's captured stdout when a powerbox session's output has
+    /// **changed** since the last stop. The event carries the *full* current stdout — on a reverse `seek`
+    /// the output shrinks, so the client **replaces** its view rather than appending. Empty when there is
+    /// no powerbox output, or it is unchanged (a compute-only / deny-all session never emits one).
+    fn output_events(&mut self) -> Vec<Event> {
+        let Some(s) = self.session.as_mut() else {
+            return vec![];
+        };
+        let out = s.inspector.stdout();
+        if out.len() == s.stdout_shown {
+            return vec![];
         }
+        let len = out.len();
+        let text = String::from_utf8_lossy(out).into_owned();
+        s.stdout_shown = len;
+        vec![(
+            "output",
+            Json::obj(vec![
+                ("category", Json::s("stdout")),
+                ("output", Json::s(&text)),
+            ]),
+        )]
     }
 
     /// The DAP thread id of the stopped thread (vCPU id + 1); `1` in single-threaded mode.
