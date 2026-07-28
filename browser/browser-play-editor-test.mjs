@@ -106,12 +106,30 @@ try {
     await runCard(page, ccName, 30_000);
     const cco = await page.evaluate((sel) => ({
       state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
       result: document.querySelector(`${sel} .result`).textContent,
       ir: document.querySelector(`${sel} .stdout`).textContent,
     }), card(ccName));
+    // The card's wasm-JIT toggle defaults on, so this exercises chibicc's compile on the emitted-wasm
+    // tier (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback would fail here).
     cco.state === 'done' && cco.result === '42' && cco.ir.includes('func') && cco.ir.includes('_start')
-      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser)')
-      : fail(`chibicc run: ${JSON.stringify({ state: cco.state, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+    && cco.msg.includes('wasm-JIT')
+      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser, wasm-JIT)')
+      : fail(`chibicc run: ${JSON.stringify({ state: cco.state, msg: cco.msg, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+
+    // "Prove interp ≡ JIT": compile the same C on both tiers and assert the emitted IR is byte-identical.
+    await page.click(`${card(ccName)} button.prove`);
+    await page.waitForFunction(
+      (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+      `${card(ccName)} .state`, { timeout: 60_000 },
+    );
+    const ccp = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+    }), card(ccName));
+    ccp.state === 'done' && ccp.msg.includes('byte-identical')
+      ? ok('chibicc interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
+      : fail(`chibicc parity: ${JSON.stringify(ccp)}`);
 
     // #include + printf: the seeded <stdio.h> makes a text-emitting program actually print (its
     // output shows in the stdout pane, above the emitted IR) instead of trapping on an unresolved call.
@@ -167,8 +185,9 @@ try {
     && jitCards.includes('life (Conway — heap persistence)');
   const hasModuleJit = jitCards.includes('hello (C → SVM)')
     && jitCards.includes('SQLite (:memory: — write & run SQL)');
-  hasReactorJit && hasModuleJit
-    ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite modules)`)
+  const hasChibiccJit = jitCards.includes('C compiler (chibicc → SVM — compile & run)');
+  hasReactorJit && hasModuleJit && hasChibiccJit
+    ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite/chibicc modules)`)
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
   // The hello module card runs end-to-end via runModule (JIT toggle default-on): this exercises the

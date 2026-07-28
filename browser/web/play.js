@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule } from './wasmjit-module.js';
+import { runJitModule, runJitCompiler } from './wasmjit-module.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -740,7 +740,8 @@ print("squares:", table.concat(sq, " "))
   'C compiler (chibicc → SVM — compile & run)': {
     kind: 'chibicc',
     debug: true, // source-level C debugging: tick "debug info (-g)", then Debug (see the debugger below)
-    jit: false, // chibicc uses floats (the %.17g path) → bytecode engine, not the integer-only wasm-JIT
+    jit: true, // chibicc's _start emits to wasm (333 funcs; cap-call/float helpers bounce cross-tier) —
+    //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by chibicc_jit.rs)
     editable: true,
     lang: 'c',
     url: './assets/chibicc.svmb',
@@ -1193,15 +1194,19 @@ async function runModule(c) {
 //      (`svm_run_onramp_fs`), and capture the emitted SVM-IR *text* on stdout;
 //   2. encode + run: `svm_parse` that text into a module, then run it (`moduleInterp`) — the compiled
 //      program's result is its `main` return value.
-// chibicc uses floats (the %.17g path), so it runs on the bytecode interpreter, not the integer-only
-// wasm-JIT tier — hence `jit:false` (no toggle). Header-free sources compile with an empty header
-// image; the demo corpus is return-value programs whose result is the value shown.
+// Pass 1 (running chibicc) is the slow part, so it takes the "wasm-JIT" toggle: chibicc's whole
+// `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
+// several× faster than the bytecode interpreter — with a fallback to `svm_run_onramp_fs` if the emit is
+// ever unavailable. Both tiers share the fixed powerbox + the same seeded memfs, so the emitted IR is
+// byte-identical (gated by `chibicc_jit.rs`). Header-free sources compile with an empty header image;
+// the demo corpus is return-value programs whose result is the value shown.
 async function runChibicc(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching compiler…');
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let compiler;
   try {
     compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
@@ -1213,25 +1218,41 @@ async function runChibicc(c) {
   const srcBytes = new TextEncoder().encode(c.editor.getValue());
   if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); return; }
 
-  // Pass 1 — compile. Alloc both buffers before writing (svm_alloc may detach linear memory), pass an
-  // empty header image (0,0), and run chibicc; its emitted IR text is on the stdout stash.
-  setState(c, 'running', 'compiling…');
+  // Pass 1 — compile. On the wasm-JIT, hand the compiler + source to `runJitCompiler` (the cdylib seeds
+  // the memfs + argv and emits `_start`); otherwise run chibicc on the bytecode interpreter. Both leave
+  // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
+  setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
-  const p = eng.ex.svm_alloc(compiler.length);
-  const sp = eng.ex.svm_alloc(srcBytes.length);
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(compiler, p);
-  view.set(srcBytes, sp);
   // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `svm_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
-  eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
-  const cstatus = eng.ex.svm_status();
+  let cstatus, tier = 'interpreter';
+  if (useJit) {
+    try {
+      // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
+      cstatus = undefined;
+    }
+  }
+  if (cstatus === undefined) {
+    // Alloc both buffers before writing (svm_alloc may detach linear memory), pass an empty header
+    // image (0,0), and run chibicc on the interpreter.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    cstatus = eng.ex.svm_status();
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(sp, srcBytes.length);
+  }
   const ir = readModuleStdout();
   const cstderr = readModuleStderr();
-  eng.ex.svm_dealloc(p, compiler.length);
-  eng.ex.svm_dealloc(sp, srcBytes.length);
   c.el.stdout.textContent = ir; // show the emitted SVM IR
-  logTo(c, `compiled: ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
+  logTo(c, `compiled (${tier}): ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
     return;
@@ -1259,7 +1280,7 @@ async function runChibicc(c) {
   const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of SVM IR ${'─'.repeat(18)}\n${ir}`;
   c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
   if (r.status === 0 || r.status === 5) {
-    setState(c, 'done', `compiled & ran · returned ${r.rv} · ${ms}ms`);
+    setState(c, 'done', `compiled (${tier}) & ran · returned ${r.rv} · ${ms}ms`);
     logTo(c, `ran compiled program → ${r.rv} (status ${r.status})`);
   } else {
     setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
@@ -1816,6 +1837,73 @@ async function proveModuleParity(c) {
   }
 }
 
+// The chibicc-card twin of `proveModuleParity`: run **pass 1** (chibicc compiling the editor's C) on both
+// tiers and assert the emitted SVM-IR text is byte-identical — the compiler is the run-to-completion
+// guest, its stdout is the IR. This is exactly what `chibicc_jit.rs` asserts natively.
+async function proveChibiccParity(c) {
+  if (broken) return;
+  stopReactor();
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let compiler;
+  try {
+    compiler = await fetchModule(ex.url);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  if (srcBytes.length === 0) {
+    setState(c, 'error', 'empty source');
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  // Both tiers must compile with the same `-g` setting for the IR to match (it's a byte differential).
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    // Interpreter pass 1.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(sp, srcBytes.length);
+    const interpIr = readModuleStdout();
+    // wasm-JIT pass 1.
+    let jitIr;
+    try {
+      await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      jitIr = readModuleStdout();
+    } catch (e) {
+      setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
+      logTo(c, `parity: JIT compile failed: ${e.message}`);
+      return;
+    }
+    if (interpIr === jitIr) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical SVM IR (${jitIr.length}B)`);
+      logTo(c, `parity: ${jitIr.length}B emitted IR byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged (interp ${interpIr.length}B / jit ${jitIr.length}B IR)`);
+      logTo(c, `parity: emitted IR diverged (interp ${interpIr.length}B vs jit ${jitIr.length}B)`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
 // ---- the DAP debugger (DEBUGGING.md): breakpoints · stepping · variables, on the bytecode engine --
 // One debug session at a time. The panel drives the `svm-dap` server (bytecode backend) through the
 // `dap.js` client over the wasm FFI: launch the SVM text, run to a breakpoint, highlight the stopped
@@ -2313,9 +2401,10 @@ function buildCard(name, ex) {
   let jit = null;
   let proveBtn = null;
   if (ex.jit) {
-    // A reactor emits its per-frame tick(); a module emits the whole _start. The parity check compares
-    // the framebuffer (reactor, per frame) or the stdout (module, run-to-completion) accordingly.
-    const isModule = ex.kind === 'module';
+    // A reactor emits its per-frame tick(); a module (and the chibicc compiler) emits the whole _start.
+    // The parity check compares the framebuffer (reactor, per frame) or the stdout / emitted IR
+    // (module / chibicc, run-to-completion) accordingly.
+    const isModule = ex.kind === 'module' || ex.kind === 'chibicc';
     const l = el('label', 'jit-label');
     l.title = isModule
       ? 'Run the whole guest (_start) on emitted wasm (wasm-JIT tier) instead of the interpreter'
@@ -2422,7 +2511,10 @@ function buildCard(name, ex) {
     if (t) dapSelectThread(c, Number(t.dataset.thread));
   });
   stopBtn.addEventListener('click', () => stopDemo(c));
-  if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
+  if (proveBtn) {
+    const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
+    proveBtn.addEventListener('click', () => prove(c));
+  }
   if (resetBtn) resetBtn.addEventListener('click', () => {
     editor.setValue(dflt);
     clearSaved(id);

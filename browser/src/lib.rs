@@ -2451,6 +2451,50 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+/// The chibicc card's argv (shared by the bytecode [`svm_run_onramp_fs`] and the JIT
+/// [`svm_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
+/// (64 KiB wasm host page), so its read-only globals must not share a host page with writable data
+/// (D40). Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR, so a
+/// clean run compiles far less IR); pass `debug_info` (a `-g` flag) only when the user opts into
+/// source-level debugging (the DAP panel maps C `file:line`/locals through chibicc's debug section).
+fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
+    let mut argv: Vec<&'static [u8]> = vec![b"chibicc", b"--data-page", b"65536"];
+    if debug_info {
+        argv.push(b"-g");
+    }
+    argv.push(b"/in.c");
+    argv
+}
+
+/// Assemble the chibicc card's memfs image: the user's source `src` at `in.c`, the built-in playground
+/// libc headers under `include/` ([`playground_include_files`]), plus any caller headers from the
+/// optional `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash). Shared by the
+/// bytecode and JIT card entries so both seed an identical filesystem. `Err(STATUS_DECODE_ERR)` if the
+/// caller image doesn't decode.
+fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<Vec<u8>, i32> {
+    // The guest maps the absolute `/in.c`/`/include/*` back to these cap-relative keys (`in.c`,
+    // `include/…`); chibicc's fixed `/include` search path resolves the headers.
+    let (mut files, mut dirs) = if img_len == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        // SAFETY: the host guarantees `[img_ptr, img_len)` is a live allocation it just filled.
+        let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+        svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?
+    };
+    // Seed the built-in playground libc headers under `/include` so a compiled program can
+    // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
+    for (key, bytes) in playground_include_files() {
+        if !files.iter().any(|(k, _)| *k == key) {
+            files.push((key, bytes));
+        }
+    }
+    if !dirs.iter().any(|d| d == "include") {
+        dirs.push("include".to_string());
+    }
+    files.push(("in.c".to_string(), src.to_vec()));
+    Ok(svm_fs::encode_image(&files, &dirs))
+}
+
 /// **Run chibicc-the-guest to compile a C source** — the playground C-compiler demo (SELFHOST_C.md
 /// §7 step 5). Decode + verify the compiler module at `[mod_ptr, mod_len)`, build an in-memory `fs`
 /// mounting the user's source at `in.c` (the guest opens `/in.c`), the built-in playground libc
@@ -2486,46 +2530,15 @@ pub extern "C" fn svm_run_onramp_fs(
         set(STATUS_VERIFY_ERR);
         return 0;
     }
-    // Assemble the memfs from the source + the optional header image (headers under `include/`,
-    // which chibicc's fixed `/include` search path resolves against). The guest maps the absolute
-    // `/in.c`/`/include/*` back to these cap-relative keys (`in.c`, `include/…`).
-    let (mut files, mut dirs) = if img_len == 0 {
-        (Vec::new(), Vec::new())
-    } else {
-        let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
-        match svm_fs::decode_image(image) {
-            Ok(seed) => seed,
-            Err(_) => {
-                set(STATUS_DECODE_ERR);
-                return 0;
-            }
+    let image = match chibicc_card_image(img_ptr, img_len, src) {
+        Ok(image) => image,
+        Err(status) => {
+            set(status);
+            return 0;
         }
     };
-    // Seed the built-in playground libc headers under `/include` so a compiled program can
-    // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
-    for (key, bytes) in playground_include_files() {
-        if !files.iter().any(|(k, _)| *k == key) {
-            files.push((key, bytes));
-        }
-    }
-    if !dirs.iter().any(|d| d == "include") {
-        dirs.push("include".to_string());
-    }
-    files.push(("in.c".to_string(), src.to_vec()));
-    let image = svm_fs::encode_image(&files, &dirs);
-    // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
-    // read-only globals must not share a host page with writable data (D40) — chibicc pins the
-    // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
-    // Debug info is **off by default** (`debug_info == 0`) — the `debug.*` waist is ~a third of the
-    // emitted IR, so a clean run compiles far less IR (much faster on the bytecode interpreter). The
-    // playground passes `debug_info != 0` (a `-g` flag) only when the user opts into source-level
-    // debugging (the DAP panel maps C `file:line`/locals through chibicc's emitted debug section).
-    let argv: &[&[u8]] = if debug_info != 0 {
-        &[b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"]
-    } else {
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"]
-    };
-    let out = onramp_fs_exec(&m, &image, argv, &[]);
+    let argv = chibicc_card_argv(debug_info != 0);
+    let out = onramp_fs_exec(&m, &image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -3285,6 +3298,19 @@ pub struct JitOnrampRun {
     exited: bool,
 }
 
+/// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
+/// [`onramp_fs_exec`] (a seeded memfs + argv). `Stdin` grants the plain on-ramp powerbox
+/// ([`grant_onramp_caps`]); `Fs` grants the headless powerbox with a mounted `fs` image and seeds
+/// `argv` at `POWERBOX_ARGS_BASE` (the chibicc-in-the-browser card: `/in.c` + `/include/*.h`).
+enum RunInput {
+    Stdin(Vec<u8>),
+    Fs {
+        image: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        stdin: Vec<u8>,
+    },
+}
+
 impl JitOnrampRun {
     /// Open a single-shot JIT run over a **caller-owned** window (the FFI path: `win_ptr` addresses this
     /// module's own linear memory). `win_size == 1 << win_log2`.
@@ -3311,7 +3337,7 @@ impl JitOnrampRun {
             win_base,
             win_log2,
             shared_memory,
-            stdin,
+            RunInput::Stdin(stdin),
         )
     }
 
@@ -3324,6 +3350,75 @@ impl JitOnrampRun {
         win_log2: u8,
         shared_memory: bool,
         stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with(m, win_log2, shared_memory, RunInput::Stdin(stdin))
+    }
+
+    /// Like [`open_owned_run`](Self::open_owned_run), but the guest reads its input from a seeded
+    /// **memfs** `image` (mounted on the `fs` cap) with `argv` seeded at `POWERBOX_ARGS_BASE` — the
+    /// single-shot JIT twin of [`onramp_fs_exec`]. This is the chibicc-in-the-browser card's fast tier:
+    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits SVM-IR text on stdout.
+    pub fn open_owned_run_fs(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with(
+            m,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin,
+            },
+        )
+    }
+
+    /// Open a single-shot JIT run over a **caller-owned** window with a seeded memfs (the FFI twin of
+    /// [`open_owned_run_fs`](Self::open_owned_run_fs)).
+    ///
+    /// # Safety
+    /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
+    /// module's linear memory, used solely as this run's window, valid until the run is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn open_shared_run_fs(
+        m: &svm_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        let win_base = win_ptr as usize;
+        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            win_ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin,
+            },
+        )
+    }
+
+    fn open_owned_run_with(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
         let declared = m.memory.map_or(0, |mc| mc.size_log2);
         let win_log2 = win_log2.max(declared);
@@ -3343,7 +3438,7 @@ impl JitOnrampRun {
             win_base,
             win_log2,
             shared_memory,
-            stdin,
+            input,
         )
     }
 
@@ -3357,7 +3452,7 @@ impl JitOnrampRun {
         win_base: usize,
         win_log2: u8,
         shared_memory: bool,
-        stdin: Vec<u8>,
+        input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let mut module = m.clone();
@@ -3368,19 +3463,41 @@ impl JitOnrampRun {
                 mc.size_log2 = win_log2;
             }
         }
-        let mut host = Host::new();
-        host.stdin = stdin;
-        // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered by
-        // name; `display` too (unused by a pure compute guest, present for parity with
-        // `onramp_exec`). No `fs` (input comes from stdin).
-        let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
+        // from the input shape. `frame` is only ever populated by a `display.present` — kept for
+        // struct parity; a compiler/compute guest never presents.
+        let (host, init_mem, frame): (Host, Vec<u8>, _) = match input {
+            RunInput::Stdin(stdin) => {
+                let mut host = Host::new();
+                host.stdin = stdin;
+                // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
+                // by name; `display` too (unused by a pure compute guest, present for parity with
+                // `onramp_exec`). No `fs` (input comes from stdin).
+                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                (host, Vec::new(), frame)
+            }
+            RunInput::Fs { image, argv, stdin } => {
+                // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as the
+                // bytecode `onramp_fs_exec` builds it — the `MemFsHandle` is dropped (no snapshot here).
+                let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+                let (mut host, init_mem, _fsh) = pg_setup(&module, &image, &argv_refs)?;
+                host.stdin = stdin;
+                let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+                (host, init_mem, frame)
+            }
+        };
         // Compile once — reused for every cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
-        // Materialize `.data`/`.rodata` into the window before the emitted `_start` runs (the interpreter
-        // does this at instantiation; the emitted `_start` seeds only the heap + stashes handles).
+        // Materialize the window before the emitted `_start` runs (the interpreter does this at
+        // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
+        // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
+        // module's data page (65 KiB), so they never overlap the argv prefix at POWERBOX_ARGS_BASE.
         // SAFETY: `[win_ptr, win_size)` is a live window (owned backing or the caller's linear memory).
         unsafe {
             let win = core::slice::from_raw_parts_mut(win_ptr, win_size as usize);
+            if init_mem.len() <= win.len() {
+                win[..init_mem.len()].copy_from_slice(&init_mem);
+            }
             for seg in &module.data {
                 let off = seg.offset as usize;
                 let end = off.saturating_add(seg.bytes.len());
@@ -4180,6 +4297,64 @@ pub extern "C" fn svm_onramp_jit_run_open(
     };
     // The play threads build imports a **shared** memory, so the emitted module must too.
     match JitOnrampRun::open_owned_run(&m, JIT_RUN_WIN_LOG2, true, stdin) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// Open a **single-shot wasm-JIT run** of the chibicc compiler card: decode the compiler module at
+/// `[mod_ptr, mod_len)`, assemble the same memfs [`svm_run_onramp_fs`] does (the user's source at
+/// `/in.c`, the built-in libc headers + any caller headers under `/include`), and emit `_start` as
+/// wasm — so the browser runs chibicc's compile on the **wasm-JIT** instead of the bytecode
+/// interpreter (the compiler's `fopen`/`write`/`exit` bounce cross-tier). The fast twin of
+/// `svm_run_onramp_fs`; drive it with the same `svm_onramp_jit_run_*` exports (call
+/// [`svm_onramp_jit_run_finish`] for the emitted IR on `svm_stdout_ptr`). `debug_info != 0` compiles
+/// with `-g` (source-level debug section) — off by default, as in `svm_run_onramp_fs`. Returns `0`,
+/// else a negative `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start`
+/// isn't emittable (the page falls back to [`svm_run_onramp_fs`]).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_open_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+    debug_info: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return -STATUS_VERIFY_ERR;
+    }
+    let image = match chibicc_card_image(img_ptr, img_len, src) {
+        Ok(image) => image,
+        Err(status) => {
+            set(status);
+            return -status;
+        }
+    };
+    let argv = chibicc_card_argv(debug_info != 0);
+    // The play threads build imports a **shared** memory, so the emitted module must too.
+    match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
