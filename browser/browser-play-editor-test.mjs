@@ -321,6 +321,35 @@ try {
     ? ok('Stop ended the debug session (panel hidden, editor writable)')
     : fail(`debug stop: ${JSON.stringify(ended)}`);
 
+  // The chibicc source-level debug card: chibicc compiles the C **with -g** in the browser, and the DAP
+  // debugger runs the emitted IR — stopping on a **C source line** with the **C locals named** (i, acc).
+  // A whole C program debugged at source level, client-side. (Compute-only: no printf → no powerbox.)
+  if (chibiccBuilt) {
+    const ccDbg = card('C source-level debugging (chibicc → SVM — breakpoints on C lines)');
+    const ccDbg0 = await page.evaluate((sel) => ({
+      debugEnabled: !!document.querySelector(`${sel} .debug:not([disabled])`),
+      gChecked: document.querySelector(`${sel} input[type=checkbox]`)?.checked === true, // the -g toggle (gOn)
+      bpDots: document.querySelectorAll(`${sel} .cm-bp-marker`).length,
+    }), ccDbg);
+    ccDbg0.debugEnabled && ccDbg0.gChecked && ccDbg0.bpDots === 1
+      ? ok('chibicc debug card: -g on, Debug enabled, breakpoint pre-placed')
+      : fail(`chibicc debug card: ${JSON.stringify(ccDbg0)}`);
+
+    // Debug → compile with -g (a beat) → run to the C-line breakpoint and pause with the C locals shown.
+    await page.click(`${ccDbg} .debug`);
+    await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+      ccDbg, { timeout: 30_000 });
+    const ccPaused = await page.evaluate((sel) => ({
+      vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+      stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+    }), ccDbg);
+    /\bi\b/.test(ccPaused.vars) && /\bacc\b/.test(ccPaused.vars) && ccPaused.stopLine
+      ? ok('chibicc: debugged C at source level — stopped on a C line, C locals i/acc named')
+      : fail(`chibicc debug paused: ${JSON.stringify(ccPaused)}`);
+
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="stop"]`);
+  }
+
   // The watchpoint card: a counter at a fixed window address, named `count` by its `debug` section, so
   // the Variables pane can arm a data breakpoint on it. Debug pauses at the pre-placed loop-body
   // breakpoint; clicking `count`'s ● toggle arms the watch; Continue then stops for the data breakpoint.

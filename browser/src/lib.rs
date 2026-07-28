@@ -2469,6 +2469,7 @@ pub extern "C" fn svm_run_onramp_fs(
     img_len: usize,
     src_ptr: *const u8,
     src_len: usize,
+    debug_info: i32,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
@@ -2515,15 +2516,16 @@ pub extern "C" fn svm_run_onramp_fs(
     // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
     // read-only globals must not share a host page with writable data (D40) — chibicc pins the
     // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
-    // `-g0`: the playground never debugs the compiled program, so drop debug info (~a third of the
-    // emitted IR). With the seeded libc's `static inline` + chibicc's dead-code elimination, a small
-    // program then compiles far less IR — much faster on the bytecode interpreter.
-    let out = onramp_fs_exec(
-        &m,
-        &image,
-        &[b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"],
-        &[],
-    );
+    // Debug info is **off by default** (`debug_info == 0`) — the `debug.*` waist is ~a third of the
+    // emitted IR, so a clean run compiles far less IR (much faster on the bytecode interpreter). The
+    // playground passes `debug_info != 0` (a `-g` flag) only when the user opts into source-level
+    // debugging (the DAP panel maps C `file:line`/locals through chibicc's emitted debug section).
+    let argv: &[&[u8]] = if debug_info != 0 {
+        &[b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"]
+    } else {
+        &[b"chibicc", b"--data-page", b"65536", b"/in.c"]
+    };
+    let out = onramp_fs_exec(&m, &image, argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
