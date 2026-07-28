@@ -119,11 +119,24 @@ chibicc does not.
    calls, the error-flag+goto unwind, first-member-base object dispatch, and `realloc`-grown
    seqs all lower and confine cleanly. The codegen-shape risk is retired; the remaining Phase-1
    work is toolchain (step 2) + real libc surface (step 3), not "does Nim's shape fit SVM".
-2. **Obtain nimony + emit C.** Install Nim 2.x (choosenim; apt's 1.6 is too old), bootstrap
-   nimony (`nim c -r src/hastur build all`), and capture `lengc c` output for a corpus of
-   small Nim programs (int/float/recursion, `seq`/`string`, `object` + method, `ref` + ARC,
-   a `raises` proc). *Blocked in the current sandbox on toolchain install/bootstrap cost;
-   commands recorded below.*
+2. **Real Nim codegen on SVM.** **→ PARTIALLY DONE 2026-07-28 via stock Nim as a stand-in.**
+   `crates/svm-run/demos/nimony/list_seq.nim` (ARC `ref object` linked list + a `seq`) is
+   compiled by the **stock Nim 2.2.10 ARC backend** (`--mm:arc -d:useMalloc -d:noSignalHandler`)
+   and on-ramped by `build_nim.sh` — the same `nim → C → clang -O2 → svm-llvm-translate →
+   prep_svmb` chain, then run on all three engines. **Result: byte-identical to a native `nim c`
+   build (stdout `listSum=385 / seqSum=55`, exit 0) on treewalk / bytecode / JIT.** This is
+   genuine Nim-runtime codegen (ARC destructors, heap `ref`, `realloc`-grown `seq`), not the
+   hand-modeled `arc_probe.c` — and stock Nim and nimony share the ARC/ORC model + C-ABI shape.
+   - **Measured libc surface (the chibicc A.5 stub-audit method): 10 undefined symbols, all
+     on-ramp-recognized** — `malloc`/`free`/`realloc`, `fwrite`/`fflush`/`fputc`/`stdout`/`stderr`,
+     `exit`, `strlen`. *Far* smaller than chibicc's 41; no libc fill needed for this corpus.
+   - **One gotcha found:** Nim installs SIGSEGV/etc. handlers at startup (`signal()` →
+     stubbed → `Unreachable` trap); `-d:noSignalHandler` avoids it. Recorded in `build_nim.sh`.
+   - **Still to do for step 2 proper — nimony itself.** Getting `lengc c` output (post-monomorph,
+     hexer-lowered Leng→C) needs a nimony bootstrap, which is **blocked on Nim version**: `hastur`
+     won't compile under 2.2.10 and `choosenim devel` couldn't fetch a 2.3.x nightly here. The
+     stock-Nim result de-risks the *codegen model*; swapping in genuine nimony output is the
+     remaining delta. Commands recorded below.
 3. **On-ramp the real C**, `-mlong-double-64` if nimony emits `long double` (the chibicc F3
    lesson), `--host-page 65536` for a browser-targetable asset. Fill the libc bottom edge by
    **reusing the Postgres/chibicc guest-libc shims** (`SELFHOST_C.md` Appendix B) — the
@@ -142,13 +155,14 @@ program runs on SVM matching native; (c) the libc fill-list is measured (the `--
 
 - ✅ `clang-18` present; ✅ `svm-llvm-translate` built; ✅ **step-1 probe green on all three
   engines** (above).
-- ✅ Nim **2.2.10** installed via choosenim.
+- ✅ Nim **2.2.10** installed via choosenim; ✅ **stock-Nim ARC program green on all three
+  engines** (step 2 above) — genuine Nim-runtime codegen runs on SVM.
 - ⏳ **nimony bootstrap blocked on Nim version.** `nim c -r src/hastur build all` fails to
   compile `hastur` itself under 2.2.10 (`typedthreads.nim` `Cannot prove that 'result' is
-  initialized`); `doc/install.md` calls for Nim **2.3.x** (devel). Getting real Leng/`lengc`
-  C output (step 2) needs a devel Nim (`choosenim devel` or a source build) — deferred rather
-  than sink the session into a compiler-of-a-compiler bootstrap. The step-1 result already
-  proves the pipeline; step 2 swaps the hand-modeled probe for genuine nimony output.
+  initialized`); `doc/install.md` calls for Nim **2.3.x** (devel), and `choosenim devel`
+  couldn't fetch a nightly here. Getting real Leng/`lengc` C output needs a devel Nim (source
+  build) — deferred rather than sink the session into a compiler-of-a-compiler bootstrap. The
+  stock-Nim result de-risks the codegen model; step 2 proper swaps in genuine nimony output.
 
 ## 3. Phase 2 — native `Leng → SVM-IR` backend (optional)
 
