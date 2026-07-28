@@ -415,6 +415,16 @@ try {
       ? ok('chibicc: debugged C at source level — stopped on a C line, C locals i/acc named')
       : fail(`chibicc debug paused: ${JSON.stringify(ccPaused)}`);
 
+    // Step Over (next) advances forward a source line and stays in the program (the paused frame is still
+    // `main`) — exercising the forward-stepping button end-to-end. Non-disruptive: it lands on the printf
+    // line, so the Continue below still prints "i=3, acc=3".
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="next"]`);
+    await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+      ccDbg, { timeout: 15_000 });
+    /\bmain\b/.test(await page.evaluate((sel) => document.querySelector(`${sel} .dbg-vars`).textContent, ccDbg))
+      ? ok('chibicc: Step Over advanced a source line, staying in main')
+      : fail('chibicc Step Over: frame left main');
+
     // Continue once: the loop body runs a `printf`, so the guest's output streams into the stdout pane
     // under the on-ramp I/O powerbox (deny-all would trap the `write`). It stops at the next iteration.
     await page.click(`${ccDbg} .dbg-controls button[data-cmd="continue"]`);
