@@ -565,6 +565,19 @@ enum Op {
     DurableShadowBase {
         dst: u32,
     },
+    /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): push this `Vm`'s `tls` word to
+    /// `dst`. The reference `eval_inst` traps `Malformed` on it (no vCPU context), so — like
+    /// [`Op::DurableShadowBase`] — it gets a dedicated op rather than the `Eval` fallback. Seeded to
+    /// the dense vCPU id (root = 0) at `Vm` construction; a spawned thread's `Vm` is re-seeded to its
+    /// id (see `drive`'s `Spawn` arm). See the tree-walker's `Inst::VcpuTlsGet`.
+    VcpuTlsGet {
+        dst: u32,
+    },
+    /// §12 per-vCPU **thread-local register** write (`vcpu.tls.set`): set this `Vm`'s `tls` word to
+    /// `val`. No result (like `store`).
+    VcpuTlsSet {
+        val: u32,
+    },
 }
 
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
@@ -915,10 +928,18 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
     // instantiate+thread and instantiate+coroutine.
     let s = scan_seams(funcs);
-    // `gc.roots` scans only the **calling vCPU's** continuation (its stack, fibers, coroutines), so a
-    // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
-    // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
-    // continuations *are* scanned).
+    // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
+    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
+    // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
+    // registry fiber's frames", `crates/svm/tests/gc_roots.rs`). Neither engine scans a *sibling
+    // thread's* own frames, and neither has to: a guest GC that threads coordinates a stop-the-world
+    // quiesce and has each vCPU enumerate its own roots (the reference barrier is
+    // `crates/svm/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
+    // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
+    // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
+    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
+    // scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
@@ -928,7 +949,6 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // serve arm has the fiber-park machinery (slice 5b).
     if (s.has_coro && (s.has_fiber || s.has_thread))
         || (s.has_instantiate && s.has_fiber)
-        || (s.has_gc && s.has_thread)
         || s.svc_park_veto()
     {
         return None;
@@ -1649,6 +1669,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },
+        // §12 per-vCPU TLS register: serviced from the running `Vm`'s `tls` word (the reference
+        // `eval_inst` traps on it — no vCPU context), so it gets a dedicated op rather than `Eval`.
+        Inst::VcpuTlsGet => Op::VcpuTlsGet { dst },
+        Inst::VcpuTlsSet { val } => Op::VcpuTlsSet { val: g(*val) },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -7494,12 +7518,15 @@ fn drive(
                     complete(&mut tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                     continue;
                 }
-                let child = VTask::new(
+                let mut child = VTask::new(
                     &dom.source.primary(),
                     func as usize,
                     &[Value::I64(sp), Value::I64(arg)],
                 )?;
                 let cidx = tasks.len();
+                // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
+                // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
+                child.active.tls = cidx as i64;
                 // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
                 // (the shared domain for a root-spawned thread, or the same confined `instantiate`
                 // env for one spawned by a confined child).
@@ -9036,6 +9063,13 @@ struct Vm {
     /// by the current `svc.poll` activation.
     serve_ticket: Option<u64>,
     serve_count: i64,
+    /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
+    /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
+    /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
+    /// Mirrors the tree-walker's `Vm::tls`. (Multi-OS-thread fiber *migration* re-seeding — a fiber
+    /// resumed on a different worker reading that worker's word — is a follow-up; the browser tier is
+    /// single-OS-thread cooperative, where the sole worker is 0, so every read is a faithful `0`.)
+    tls: i64,
     /// The domain's **home module** — the unit whose functions are its service handlers (0 for the
     /// primary; a separate-module child's pushed unit index). `svc.poll`/`svc.wait` only dispatch
     /// handlers while executing in this module: `svc_handler_func` resolves indices against the
@@ -9067,6 +9101,7 @@ impl Vm {
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             serve_ticket: None,
             serve_count: 0,
+            tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
         })
     }
@@ -10275,6 +10310,15 @@ impl Vm {
                     // §12.8 4A.5: this context's shadow-SP word address (its own region base).
                     self.regs[base + *dst as usize] =
                         Reg::from_i64(self.durable_region_base as i64);
+                    pc += 1;
+                }
+                Op::VcpuTlsGet { dst } => {
+                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
+                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
+                    pc += 1;
+                }
+                Op::VcpuTlsSet { val } => {
+                    self.tls = r!(*val).i64();
                     pc += 1;
                 }
             }
