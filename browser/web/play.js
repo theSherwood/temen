@@ -778,7 +778,7 @@ int main(void) {
     kind: 'chibicc',
     debug: true,
     gOn: true, // debug info starts ON: this card is ready to Debug (the compiler emits chibicc's -g waist)
-    bp: 7, // pre-place a breakpoint on the `acc += i;` line (0-based editor line 7)
+    bp: 8, // pre-place a breakpoint on the `acc += i;` line (0-based editor line 8)
     jit: false,
     editable: true,
     lang: 'c',
@@ -787,22 +787,25 @@ int main(void) {
     desc: 'Debug a **C program at source level**, entirely in the browser. chibicc compiles this C with ' +
       '`-g` (the DEBUGGING.md §6 debug-info waist — source lines + variable names), and the DAP debugger ' +
       'runs the emitted IR on the bytecode engine: set a breakpoint in the gutter on a C line, press ' +
-      'Debug, and it stops on that C line with the C locals (i, acc) named in the Variables pane. Step / ' +
-      'Continue / reverse all work. A breakpoint is pre-placed on the `acc += i;` line. Note: the ' +
-      'debugger runs the compiled program deny-all (no powerbox), so this demo is compute-only — a ' +
-      '`printf` (which needs the ambient write capability) would trap; powerbox-backed C debugging is a ' +
-      'follow-up. Untick "debug info (-g)" to compile clean, faster IR (and disable the debugger).',
-    src: `// A compute-only C program (no printf → no powerbox needed): sum 3+2+1 = 6.
-// A breakpoint is pre-placed on "acc += i;" — press Debug and step the loop,
-// watching i and acc in the Variables pane. Click the gutter to move it.
+      'Debug, and it stops on that C line with the C locals (i, acc) named in the Variables pane. This ' +
+      'program **`printf`s** — the debugger runs it under the on-ramp **I/O powerbox**, so its output ' +
+      'streams into the stdout pane as you step, and **reverse debugging rewinds the output** (the ' +
+      'capability-input tape replays faithfully). Step / Continue / Step Back / Reverse all work; a ' +
+      'breakpoint is pre-placed on the `acc += i;` line. Untick "debug info (-g)" to compile clean, ' +
+      'faster IR (and disable the debugger).',
+    src: `// Debug a C program with printf — the debugger runs it under the I/O powerbox,
+// so its output streams into the pane and reverse rewinds it. A breakpoint is
+// pre-placed on "acc += i;": press Debug, step, watch i/acc, then Continue.
+#include <stdio.h>
+
 int main(void) {
   int acc = 0;
-  int i = 3;
-  while (i > 0) {
+  for (int i = 3; i > 0; i--) {
     acc += i;
-    i -= 1;
+    printf("i=%d, acc=%d\\n", i, acc);
   }
-  return acc;
+  printf("sum = %d\\n", acc);
+  return 0;
 }
 `,
   },
@@ -2011,6 +2014,11 @@ function dapToggleWatch(c, name) {
 
 // Handle a resume reply: a `terminated` event ends the session; a `stopped` event pauses (show it).
 function dapHandle(c, reply) {
+  // A powerbox session (chibicc under the on-ramp I/O powerbox) streams the guest's captured stdout as
+  // `output` events. The event carries the *full* current output (it rewinds on a reverse step), so
+  // replace the pane with the latest one — the program's own output shows as you step / reverse.
+  const output = reply.events.filter((e) => e.event === 'output').pop();
+  if (output) c.el.stdout.textContent = output.body.output;
   if (reply.events.some((e) => e.event === 'terminated')) {
     endDebug(c, 'program finished');
     return;
@@ -2085,8 +2093,15 @@ async function startDebug(c) {
   dapSource = dapSourceName(programText); // breakpoints target the launched program's `debug.file`
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
+  // Clear the output pane for a chibicc session — the guest's own stdout (its `printf`s under the I/O
+  // powerbox) streams in here as it steps, rather than the compile's emitted IR.
+  if (c.ex.kind === 'chibicc') c.el.stdout.textContent = '';
   dapClient.send('initialize', {});
-  const launch = dapClient.send('launch', { programText, function: 0, args: [], engine: 'bytecode' });
+  // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
+  // output streams back as `output` events instead of trapping; a hand-written SVM card stays deny-all.
+  const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
+  if (c.ex.kind === 'chibicc') launchArgs.powerbox = 'onramp';
+  const launch = dapClient.send('launch', launchArgs);
   if (!launch.response.success) {
     endDebug(c, null);
     setState(c, 'error', 'debug launch failed — does the program parse and verify?');
