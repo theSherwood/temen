@@ -3745,6 +3745,108 @@ pub extern "C" fn svm_run_shell(
     out.value
 }
 
+/// **In-browser JACL link + run** (docs/SVM_BROWSER_PLAN.md option (b)): the live-editing path.
+/// Given the SVM-IR **text** a browser frontend emitted for a program (`jacl_emit_ir`, optionally
+/// followed by a `%%RELOCS%%\n` sentinel + SelfData relocs) and the JACL **runtime** as SVM-IR text
+/// (`jaclrt.svm`, its exports inline), this parses both, links them (`link_with_manifest`), wraps the
+/// program entry in a powerbox `_start` (`synth_manifest_start`), and runs it through the same on-ramp
+/// powerbox as [`svm_run_onramp`] — so edited source runs without a native link/encode step. Results
+/// are read back through the same accessors (`svm_stdout_ptr`/`_len`, `svm_status`, `svm_exit_code`).
+///
+/// The extern **catalog** is a test-only artifact (only `buf_extern_c.jacl` uses `extern`), so it is
+/// not linked here; a program that uses no `extern` needs only the runtime.
+#[no_mangle]
+pub extern "C" fn svm_link_run_jacl(
+    prog_ptr: *const u8,
+    prog_len: usize,
+    rt_ptr: *const u8,
+    rt_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let slice = |p: *const u8, n: usize| -> &'static [u8] {
+        if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
+    };
+    let prog_raw = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let rt_text = match core::str::from_utf8(slice(rt_ptr, rt_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let stdin = slice(stdin_ptr, stdin_len);
+
+    // Split the frontend output into module text + SelfData relocs (the native `--file` wire format).
+    let (prog_text, relocs) = match prog_raw.find("%%RELOCS%%") {
+        None => (prog_raw, Vec::new()),
+        Some(i) => {
+            let r = prog_raw[i..]
+                .lines()
+                .skip(1)
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    let n: Vec<u32> = l.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    (n.len() == 3).then(|| svm_ir::DataReloc {
+                        func: n[0], block: n[1], inst: n[2], kind: svm_ir::RelocKind::SelfData,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (&prog_raw[..i], r)
+        }
+    };
+
+    let program = match svm_text::parse_module(prog_text) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let rt = match svm_text::parse_module(rt_text) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let rt_exports: Vec<(String, svm_ir::FuncIdx)> =
+        rt.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+
+    let linked = match svm_ir::link_with_manifest(&[
+        svm_ir::LinkUnit { module: rt, exports: rt_exports, ..Default::default() },
+        svm_ir::LinkUnit {
+            module: program,
+            exports: vec![("__jacl_entry".to_string(), 0)],
+            relocations: relocs,
+            ..Default::default()
+        },
+    ]) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    let entry = match linked.resolve_export("__jacl_entry") {
+        Some(e) => e,
+        None => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    let module = match svm_ir::synth_manifest_start(linked, entry, false) {
+        Ok(m) => m,
+        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+    };
+    // Verify before running: a program that references an undefined proc links to an unresolvable
+    // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
+    // it cleanly (STATUS_UNSUPPORTED) so a typo can't take down the playground's wasm instance.
+    if svm_verify::verify_module(&module).is_err() {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
+
+    let out = onramp_exec(&module, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
 /// Pointer / length of the RGBA framebuffer the most recent [`svm_run_onramp`] guest presented via
 /// the `display` capability (`(null, 0)` if none). `svm_framebuffer_width`/`_height` give its
 /// dimensions; `len` is `width*height*4`. Valid until the next `svm_run_onramp`; do not `svm_dealloc`.
