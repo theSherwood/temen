@@ -144,6 +144,10 @@ static inline int strncasecmp(const char *a, const char *b, size_t n) {
   return 0;
 }
 
+// `strerror` — the sandbox libc has no failing syscalls, so a single generic message suffices (a
+// program that prints strerror(errno) still compiles and runs; errno is never actually set).
+static inline char *strerror(int e) { (void)e; return (char *)"error"; }
+
 // `strdup`/`strndup` allocate through the playground `<stdlib.h>` bump allocator.
 #include <stdlib.h>
 static inline char *strdup(const char *s) {

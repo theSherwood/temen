@@ -178,6 +178,22 @@ try {
     mf.state === 'done' && mf.out.startsWith('gcd=12\n')
       ? ok('chibicc multi-file project (//// file: markers → #include sibling .h/.c) → ran in-browser')
       : fail(`chibicc multifile: ${JSON.stringify({ state: mf.state, out: mf.out.slice(0, 90) })}`);
+
+    // open_memstream + buffered FILE* (SELFHOST_C.md §7 stage-2): the <stdio.h> upgrade that lets
+    // chibicc's own format()-style code compile and run — a memory FILE built up with fprintf, read back.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\nint main(void){ char*b; size_t n; FILE*m=open_memstream(&b,&n);\n' +
+      'for(int i=0;i<3;i++) fprintf(m,"[%d]", i*i); fclose(m);\n' +
+      'printf("%s len=%lu\\n", b, (unsigned long)n); return 0; }'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const ms = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    ms.state === 'done' && ms.out.startsWith('[0][1][4] len=9\n')
+      ? ok('chibicc open_memstream + buffered FILE* (the self-host stdio) → ran in-browser')
+      : fail(`chibicc memstream: ${JSON.stringify({ state: ms.state, out: ms.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }

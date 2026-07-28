@@ -139,6 +139,8 @@ static inline double strtod(const char *s, char **end) {
   return sign * v;
 }
 static inline double atof(const char *s) { return strtod(s, (char **)0); }
+// `long double` is built as `double` (chibicc's -mlong-double-64), so strtold is strtod.
+static inline long double strtold(const char *s, char **end) { return strtod(s, end); }
 
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;

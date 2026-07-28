@@ -317,12 +317,26 @@ compiler bug is a clean error, never an escape.
    `chibicc_card_image`, this needed **zero JS/FFI change** and **no `chibicc.svmb` rebuild**. Gated by
    `browser/tests/chibicc_multifile.rs` (the splitter + a real 3-file project — entry + `.h` + `.c` —
    and a nested-dir include, compiled + run to exact output) and a `browser-play-editor-test.mjs`
-   Chromium assertion. **What remains for the full self-compile** (chibicc compiling its *own* ~8-TU
-   source in-sandbox): a real program only needs the memfs (done), but chibicc's own sources
-   `#include` a **much larger system-header surface** than the playground libc — `<sys/stat.h>`,
-   `<unistd.h>`, `<glob.h>`, `<libgen.h>`, `<time.h>`, buffered `FILE*` stdio, … — so the remaining
-   work is porting chibicc's build-time guest libc (`chibicc_libc.c`, Appendix B) into *seedable
-   headers*, not the multi-file plumbing. That libc-surface lift is the next stage-2 slice.
+   Chromium assertion.
+
+   **→ Self-host libc + per-TU self-compile DONE 2026-07-28 — chibicc compiles its own source in the
+   sandbox.** The remaining libc-surface lift landed: the playground `<stdio.h>` gained a **real
+   buffered `FILE*`** — fd-backed *or* memory-backed — with `open_memstream`/`fopen`/`fread`/`fclose`/
+   `fflush` (one `__pg_fwrite_raw` dispatcher behind every output path), modelled on the proven guest
+   libc `chibicc_extra.c`. This is the load-bearing piece: chibicc's `format()` builds **every** string
+   through `open_memstream` → `vfprintf` → `fclose`. Plus `strtold` (= `strtod` under `-mlong-double-64`),
+   `strerror`, and the system-header stubs `chibicc.h` `#include`s — `<stdnoreturn.h>`, `<strings.h>`,
+   `<glob.h>`, `<libgen.h>`, `<unistd.h>`, `<time.h>` (fixed 1970 epoch), `<sys/stat.h>`/`<sys/types.h>`/
+   `<sys/wait.h>` (mostly inert — the sandbox has no processes/globbing/wall-clock; present so `chibicc.h`
+   parses). With those seeded, **chibicc-the-guest compiles real chibicc `-cc1` translation units to
+   valid SVM IR** — gated by `browser/tests/chibicc_selfhost.rs` (tokenize/strings/hashmap/unicode each
+   compile → parse + verify; `strings.c` is the `open_memstream` proof) + an `open_memstream` runtime
+   round-trip and a Chromium assertion. **What remains for the whole-compiler self-compile**: a single
+   **unity** build (all TUs + the `cc1_main` entry amalgamated) into one runnable module. Cross-TU
+   references only resolve when every TU is compiled together (e.g. `parse.c`'s `struct_type` reads as a
+   capability-extern standalone), and that whole-compiler amalgamation — plus running the result and the
+   bootstrap-fixpoint differential (§5 E) — is the last self-host slice. The hard libc/header work is
+   done; per-TU compile is the pin that proves it.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
