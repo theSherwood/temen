@@ -279,8 +279,19 @@ stays the JIT's job).
   | vsum        | 96.0      | **107.2**| 0.58   | ~185×  | **bytecode ~0.9× the tree-walker — a regression to investigate in 5a** |
 
   Two findings: `chase_rand` confirms the ~26× compute gap collapses to ~3.7× when memory latency
-  dominates (dispatch is hidden behind cache-miss stalls); `vsum` is the one kernel where bytecode
-  *loses* to the tree-walker — the store-in-init + reduction shape is a concrete 5a target.
+  dominates (dispatch is hidden behind cache-miss stalls); `vsum` was the one kernel where bytecode
+  appeared to *lose* to the tree-walker on the box above.
+
+  **Re-measured (post-fuel-unification, different box):** `vsum` is **bytecode 69.8 vs tree-walk 89.4 ns
+  → ~1.28× faster** — the apparent regression was **box-specific and does not reproduce**. What remains
+  is that `vsum` sits in the *weak class* (~1.28×, next to `mem` ~1.25× — tw 108.4 / bc 86.8) rather
+  than the ~1.5× the compute kernels get. The mechanism is not an isolable bug: `vsum` is a store loop
+  (`i32.store` per iter) followed by a load-reduction loop (`i32.load` + accumulate), each carrying
+  three block params across its back-edge, so its cost is dominated by the two **already-named frontier
+  residuals** — software memory confinement (the `mem` weak spot) and edge-copy scatter/gather. The
+  5b-edge identity elision *does* fire for its one loop-invariant param (verified). So the real levers
+  for `vsum` are the general ones (edge-copy reduction; a compile-pass strength-reduction of the strided
+  address the JIT already does), not a `vsum`-specific fix — the "concrete 5a target" framing is retired.
 
 - **Slice 5a — `IntCmp`+`BrIf` → `BrIfCmp` fusion. ✅ LANDED, but the win is small (measured).** A
   peephole in `compile_func` fuses a block-final `IntCmp` whose result is its `BrIf`'s sole consumer
