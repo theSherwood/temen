@@ -442,3 +442,168 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
         "the re-frozen child is still a live server, not a completed result"
     );
 }
+
+/// §13.4 slice 4c — **depth-2 (grandchild) serve capture**. A live-spawned nested child never
+/// stamped its own `parent_task`, so a *grandchild* (C2, spawned by a child C1) defaulted to `0`
+/// (the root). Its `FrozenChildState` was then keyed `(0, slot)` while its `FrozenNested` — which
+/// the *recording parent* C1 keys with its own id — was `(C1, slot)`; on thaw the two failed to
+/// match, so C2 fell to the fresh-grant path **without its serve module** and could not dispatch.
+/// Fixed by stamping the spawning vCPU's id at the op-0 spawn (the intent the `parent_task`
+/// destructure comment already stated). This freezes a three-level nested-server subtree, thaws it,
+/// and re-freezes — the grandchild's serve state must be attributed to C1, not the root, at every
+/// step.
+///
+/// (Child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it to scratch and
+/// reloads the low word with `i32.load` to get the `i32` instantiator handle for spawning C2,
+/// avoiding `i32.wrap_i64` which the durable transform does not type. Scratch sits above the 64 KiB
+/// `DURABLE_RESERVE` and below C2's sub-carve.)
+const SRC_NESTED_SERVERS_3: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { call: 0 }
+export 0 interface "svc" 1 { call: 2 }
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ventry = i64.const 1
+  voff = i64.const 262144
+  vsl = i64.const 18
+  vq = i64.const 0
+  vc1 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 65600
+  i64.store vk v0
+  vh = i32.load vk
+  ventry = i64.const 2
+  voff = i64.const 131072
+  vsl = i64.const 17
+  vq = i64.const 0
+  vc2 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+"#;
+
+#[test]
+fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent() {
+    use svm_durable::{arm_freeze_on_quiesce, begin_thaw};
+
+    const P_LOG2: u8 = 19;
+    const P_WINDOW: usize = 1 << P_LOG2;
+
+    let mut m = svm_text::parse_module(SRC_NESTED_SERVERS_3).expect("parse");
+    m.memory = Some(Memory { size_log2: P_LOG2 });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Freeze the idle three-level subtree (root -> C1 -> C2, each parked in svc.wait).
+    let (nested, child_state, root_sp, snap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_self_module(&inst);
+        let ih = h.grant_instantiator(0, P_WINDOW as u64);
+        let mut win = init_durable_window(P_WINDOW);
+        arm_freeze_on_quiesce(&mut win);
+        let mut fuel = 20_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(ih)],
+            &mut fuel,
+            &win,
+            P_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "the idle three-level subtree freezes: {r:?}");
+        assert_eq!(h.frozen_nested().len(), 2, "C1 and C2 both recorded nested");
+        assert_eq!(
+            h.frozen_child_state().len(),
+            2,
+            "C1 and C2 serve state captured"
+        );
+        // The grandchild (C2) must be attributed to C1, not the root: the two captured child
+        // states carry **distinct** parent tasks, and each matches a nested record's parent.
+        // Before the fix both were `0` (the root) and C2's state was orphaned.
+        let cs_parents: std::collections::BTreeSet<usize> = h
+            .frozen_child_state()
+            .iter()
+            .map(|cs| cs.parent_task)
+            .collect();
+        assert_eq!(
+            cs_parents.len(),
+            2,
+            "the grandchild's serve state is keyed to C1, distinct from C1's (keyed to root)"
+        );
+        for cs in h.frozen_child_state() {
+            assert!(
+                h.frozen_nested()
+                    .iter()
+                    .any(|n| n.parent_task == cs.parent_task && n.slot == cs.slot),
+                "each child state matches a nested record's (parent_task, slot) key"
+            );
+        }
+        (
+            h.frozen_nested().to_vec(),
+            h.frozen_child_state().to_vec(),
+            h.frozen_root_sp().expect("root extent"),
+            snap,
+        )
+    };
+
+    // Thaw with freeze-on-quiesce re-armed: the subtree re-creates C1 + C2 (C2 matched to its
+    // captured serve state, so it restores *with* its serve module), re-parks all three servers,
+    // and re-freezes — recording the grandchild's serve state under C1 a second time.
+    let mut h2 = Host::new();
+    h2.set_durable(true);
+    h2.set_self_module(&inst);
+    h2.set_frozen_nested(nested);
+    h2.set_frozen_child_state(child_state);
+    h2.set_frozen_root_sp(root_sp);
+    let ih2 = h2.grant_instantiator(0, P_WINDOW as u64);
+    let mut win = snap.clone();
+    begin_thaw(&mut win, 0);
+    arm_freeze_on_quiesce(&mut win);
+    let mut fuel = 20_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(ih2)],
+        &mut fuel,
+        &win,
+        P_LOG2,
+        &mut h2,
+    );
+    assert!(
+        r.is_ok(),
+        "the thawed three-level subtree re-freezes on quiesce: {r:?}"
+    );
+    assert_eq!(
+        h2.frozen_child_state().len(),
+        2,
+        "the thawed subtree came back a live three-level server tree (re-captured both states)"
+    );
+    let cs_parents2: std::collections::BTreeSet<usize> = h2
+        .frozen_child_state()
+        .iter()
+        .map(|cs| cs.parent_task)
+        .collect();
+    assert_eq!(
+        cs_parents2.len(),
+        2,
+        "the re-frozen grandchild is still attributed to C1, not the root"
+    );
+}

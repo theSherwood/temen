@@ -2195,6 +2195,24 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      returning 107. Follow-ups: a **nested holder's** pending re-links (a child holding a cap
      onto a grandchild — the thaw patches only the root's pending today) and the
      wire/child-regrant durable name (a sibling-provenance path).
+   * **Depth-2 serve-capture prerequisite — FIXED 2026-07-28.** Building the nested-holder
+     fixture surfaced a real bug *underneath* the re-link: a live-spawned nested child never
+     stamped its own `parent_task` at the op-0 spawn (the `parent_task` destructure comment
+     already stated the intent — "a spawned child stamps its own id as the grandchild's parent
+     below" — but the line was missing), so a **grandchild** defaulted to `0` (the root). Its
+     `FrozenChildState`, keyed by `(parent_task, slot)`, came out `(0, slot)` while its
+     `FrozenNested` — which the *recording parent* keys with **its own** id — was `(C1, slot)`;
+     on thaw the two failed to match, so the grandchild fell to the fresh-grant path **without
+     its serve module** and could not dispatch (`-EINVAL`/`EAGAIN` at the first offer call).
+     One line at the spawn (`child.parent_task = <spawning vCPU id>`) fixes it; direct children
+     are unchanged (root id is `0`). Pinned by
+     `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`
+     (freeze → thaw → re-freeze; the grandchild's serve state is attributed to C1, not the root,
+     at every step — the assertion fails without the fix). **Still open** (deferred, ISSUES.md
+     I49): the nested-holder *re-link* itself (proven to fire, but its only end-to-end observable
+     — a serving child's handler forwarding to a grandchild through the re-linked cap — dead-locks
+     on the single worker, a pre-existing serve-chain gap independent of durability), plus the
+     wire/child-regrant sibling-provenance name.
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options
