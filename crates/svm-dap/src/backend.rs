@@ -497,9 +497,15 @@ impl Debuggee for BytecodeBackend {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
         // terminator slot, where there's nothing to inspect) strictly before now, then seek there. The
         // single-vCPU coordinate is the op `clock`; the multithreaded one is the global scheduler `turn`.
-        let now = match &self.engine {
-            Engine::Single(run) => run.op_clock(),
-            Engine::Threaded(run) => run.op_turn(),
+        //
+        // **Depth-aware** (the reverse of `next`, not `stepIn`): only ops at call depth ≤ the current
+        // frame count are candidates, so a step-back from a line that *called* something (a chibicc
+        // `printf` → the guest libc) rewinds to the previous op **in the caller's frame**, not down into
+        // the callee's last op. Without this, stepping back from a `printf` descends into the libc
+        // internals (`__pf_flush`, …) instead of the previous source line — the reverse of stepping over.
+        let (now, now_depth) = match &self.engine {
+            Engine::Single(run) => (run.op_clock(), run.depth()),
+            Engine::Threaded(run) => (run.op_turn(), run.depth()),
         };
         let mut fuel = self.fuel;
         let target = match &self.engine {
@@ -513,7 +519,7 @@ impl Debuggee for BytecodeBackend {
                     if c >= now {
                         break;
                     }
-                    if probe.frame_pc(0).is_some() {
+                    if probe.frame_pc(0).is_some() && probe.depth() <= now_depth {
                         target = c;
                     }
                     if !probe.tick(&mut fuel) {
@@ -534,7 +540,7 @@ impl Debuggee for BytecodeBackend {
                         break;
                     }
                     probe.locate();
-                    if probe.frame_pc(0).is_some() {
+                    if probe.frame_pc(0).is_some() && probe.depth() <= now_depth {
                         target = c;
                     }
                     if !probe.tick(&mut fuel) {
