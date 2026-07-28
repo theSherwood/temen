@@ -368,6 +368,43 @@ fn bytecode_matches_interp_on_kernels() {
 }
 
 #[test]
+fn bytecode_matches_interp_on_aliasing_edge_swap() {
+    // Exercises the edge-copy **aliasing/scratch** path: a back-edge that *permutes* params (a swap of
+    // `x`/`y`). A one-pass direct copy would clobber a source before it is read, so the gather-then-
+    // scatter path must run — and stay bit-exact with the tree-walker. The result alternates with `n`'s
+    // parity (odd/even swap count), so a broken scratch path returns the *wrong value*, not just slower.
+    let src = "\
+func (i32) -> (i32) {
+block 0 (n: i32) {
+  a = i32.const 10
+  b = i32.const 20
+  br 1(n, a, b)
+}
+block 1 (i: i32, x: i32, y: i32) {
+  one = i32.const 1
+  i2 = i32.sub i one
+  br_if i2 1(i2, y, x) 2(x)
+}
+block 2 (r: i32) {
+  return r
+}
+}";
+    let m = svm::text::parse_module(src).expect("parse");
+    svm::verify::verify_module(&m).expect("verify");
+    for n in [1i32, 2, 3, 4, 5, 8, 101] {
+        let mut fi = u64::MAX;
+        let interp = run(&m, 0, &[Value::I32(n)], &mut fi);
+        let mut fb = u64::MAX;
+        let bc = bytecode::compile_and_run(&m, 0, &[Value::I32(n)], &mut fb)
+            .expect("bytecode supports this pure-compute module");
+        assert!(
+            results_eq(&bc, &interp),
+            "aliasing-edge swap disagrees at n={n}: interp={interp:?} bc={bc:?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "benchmark; run explicitly with --nocapture --ignored"]
 fn bytecode_kernel_perf() {
     for (name, src) in [("alu", ALU), ("call", CALL), ("mem", MEM)] {

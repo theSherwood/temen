@@ -328,9 +328,36 @@ stays the JIT's job).
   actual `Vec` work, not a predicted branch. Semantics-transparent (a self-copy changes nothing; its
   removal can't perturb the gather/scatter of the aliasing copies), so it needs no `fuse` flag and
   touches no step trace. All gates green (`bytecode_diff`, `bytecode_debug*`, `jit_diff`, `simd`,
-  `escape_oracle`). *Not* pursued: the non-aliasing direct-copy path (skip `scratch` when no dst is a
-  src) — a struct/macro change for a sub-noise gain, which fights invariant 1; left until a profile
-  names edge-copies as a measured cost.
+  `escape_oracle`).
+
+- **Slice 5b-edge-2 — non-aliasing direct edge copy. ✅ LANDED — the profile named it, and it is *not*
+  sub-noise.** 5b-edge (above) predicted this path a "sub-noise gain … left until a profile names
+  edge-copies as a measured cost." A/B measurement retired that guess: edge copies fire at **every**
+  taken edge (every loop back-edge *and* every straight-line block transition), and the old `edge`
+  runtime always gathered every source into `self.scratch` then scattered — a `Vec` push + read per
+  copy — purely to be safe against a *dst re-read as a src* (a param swap/rotation). That aliasing is
+  rare. `Copies` now carries a compile-time `aliasing` flag (some dst also a src); a **non-aliasing**
+  edge (the common induction/accumulator case) copies directly in one pass with no `scratch` traffic,
+  and only a true parallel-move permutation takes the gather/scatter path. Removing real `Vec` work
+  from the hottest inner-loop operation, measured on `megabench` (ns/iter, bytecode, same box):
+
+  | kernel | before | after | Δ |
+  |--------|-------:|------:|----:|
+  | alu    | 21.7 | 16.8 | **−23%** |
+  | loopc  | 21.8 | 17.3 | **−21%** |
+  | fma    | 31.0 | 26.4 | −15% |
+  | call   | 38.0 | 33.1 | −13% |
+  | vsum   | 69.8 | 61.4 | −12% |
+  | mem    | 86.8 | 80.6 | −10% |
+
+  By far the largest safe-lever win in Phase 5 — an order of magnitude past the "low single digits"
+  the dispatch/superinstruction levers delivered, because it removes *real work* on the operation that
+  runs at every edge, not a predicted branch. `#![forbid(unsafe)]`, no `fuse` flag, transparent to the
+  step trace. The aliasing (`scratch`) path is kept and explicitly exercised by
+  `bytecode_matches_interp_on_aliasing_edge_swap` (a parity-sensitive param swap). All gates green
+  (`bytecode_diff` incl. tight-fuel remainder parity, `bytecode_debug*`, `bytecode_traced`, `coroutine`,
+  `threads`, `fiber_fuzz`, `quota`, `escape_oracle`, `simd`). **This is the profile correcting the plan
+  (AGENTS.md: the harness is the arbiter) — the "sub-noise" prediction was wrong.**
 
 - **Slice 5b — two-mode resume.** A fast `resume` loop that drops the per-op budget check and the
   per-op `step(fuel)` call — metering fuel at safepoints instead (see "Fuel unification") — whenever
