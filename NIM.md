@@ -302,8 +302,15 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
   **State:** `svm-leng` translates whole real-ish modules — integers, control flow, pointers,
   frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the rest, and is
   validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`). Remaining for full
-  real modules: `case`→`br_table`, `cast`/`conv` breadth, whole-aggregate copy/`oconstr`, floats,
+  real modules: `cast`/`conv` breadth, whole-aggregate copy/`oconstr`, floats,
   and non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
+    - **✅ `case` → `br_table` — DONE 2026-07-28.** A dense-integer `case` (`(case Disc (of
+      (ranges V+) Body)* (else Body)?)`) lowers to a normalized `br_table`: the discriminant is
+      offset to the value span's minimum, a table entry per value maps to its covering branch, and
+      an out-of-range index (negative or over-large) selects the `else`/continuation via the table
+      default. Single values, multi-value `of`s, and `(range lo hi)` are handled; sparse/huge spans
+      (>256) fail-close (a comparison-chain lowering is the refinement). Tested on hand fixtures and
+      **real nimony `classify`** (`0 / 1,2 / 3 / else`), interp == JIT.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.

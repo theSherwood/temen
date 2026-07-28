@@ -1123,6 +1123,7 @@ impl<'a> FuncGen<'a> {
             }
             Some("if") => self.if_stmt(s),
             Some("while") => self.while_stmt(s),
+            Some("case") => self.case_stmt(s),
             // A bare label with no live jmp target (e.g. hexer's trailing `whileStmtLabel`) is inert
             // for our structured lowering; `jmp` itself is not yet supported.
             Some("lab") => Ok(()),
@@ -1216,6 +1217,163 @@ impl<'a> FuncGen<'a> {
         } else {
             self.cur_id = exit;
             self.reset_cur_state();
+        }
+        Ok(())
+    }
+
+    /// `(case Disc (of (ranges V+) Body)* (else Body)?)` → a `br_table` over a dense integer span
+    /// (normalized index; out-of-range → default). Sparse/large-span or non-integer discriminants
+    /// fail-closed (a comparison-chain lowering for those is a later refinement).
+    fn case_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let a = s.args();
+        if a.is_empty() {
+            return Err(LengError::Malformed("case needs a discriminant".into()));
+        }
+        // Parse the `of`/`else` clauses into integer value sets.
+        struct Branch<'n> {
+            vals: Vec<i64>,
+            ranges: Vec<(i64, i64)>,
+            body: &'n Node,
+        }
+        let mut branches: Vec<Branch> = Vec::new();
+        let mut else_body: Option<&Node> = None;
+        for clause in &a[1..] {
+            match clause.tag() {
+                Some("of") => {
+                    let c = clause.args();
+                    if c.len() < 2 || c[0].tag() != Some("ranges") {
+                        return Err(LengError::Malformed(
+                            "of needs (ranges …) and a body".into(),
+                        ));
+                    }
+                    let mut vals = Vec::new();
+                    let mut ranges = Vec::new();
+                    for v in c[0].args() {
+                        if let Some(n) = int_literal(v) {
+                            vals.push(n);
+                        } else if v.tag() == Some("range") {
+                            let ra = v.args();
+                            let lo = ra.first().and_then(int_literal);
+                            let hi = ra.get(1).and_then(int_literal);
+                            match (lo, hi) {
+                                (Some(l), Some(h)) => ranges.push((l, h)),
+                                _ => {
+                                    return Err(LengError::Unsupported(
+                                        "non-integer case range".into(),
+                                    ))
+                                }
+                            }
+                        } else {
+                            return Err(LengError::Unsupported(
+                                "non-integer case branch value (symbol/char) — later slice".into(),
+                            ));
+                        }
+                    }
+                    branches.push(Branch {
+                        vals,
+                        ranges,
+                        body: &c[1],
+                    });
+                }
+                Some("else") => else_body = clause.args().first(),
+                _ => return Err(LengError::Malformed("case expects of/else clauses".into())),
+            }
+        }
+        if branches.is_empty() {
+            return Err(LengError::Malformed("case with no `of`".into()));
+        }
+
+        // Dense span across all branch values; bail (fail-closed) if sparse/huge.
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for b in &branches {
+            for &v in &b.vals {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            for &(l, h) in &b.ranges {
+                lo = lo.min(l);
+                hi = hi.max(h);
+            }
+        }
+        let span = (hi as i128) - (lo as i128) + 1;
+        if !(1..=256).contains(&span) {
+            return Err(LengError::Unsupported(
+                "case span too large/sparse for a br_table (comparison-chain lowering is a later slice)"
+                    .into(),
+            ));
+        }
+        let span = span as usize;
+
+        // Discriminant → i32 index normalized to `lo`. Out-of-range → br_table default (a negative
+        // or over-large index selects `default`).
+        let disc = self.expr(&a[0])?;
+        let disc32 = if disc.ty == ValType::I32 {
+            disc
+        } else {
+            self.convert(disc, ValType::I32)
+        };
+        let loc = self.emit_const(ValType::I32, lo);
+        let nidx = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{nidx} = i32.sub v{} v{}\n", disc32.id, loc.id));
+
+        // Blocks: one per branch body, an optional else, and the continuation.
+        let cont = self.new_block_id();
+        let bblocks: Vec<u32> = (0..branches.len()).map(|_| self.new_block_id()).collect();
+        let else_block = else_body.map(|_| self.new_block_id());
+        let default_target = else_block.unwrap_or(cont);
+
+        // One table entry per value in [lo, hi]; each maps to its covering branch, else default.
+        let args = self.branch_args();
+        let mut targets = Vec::with_capacity(span);
+        for i in 0..span {
+            let v = lo + i as i64;
+            let tgt = branches
+                .iter()
+                .position(|b| {
+                    b.vals.contains(&v) || b.ranges.iter().any(|&(l, h)| v >= l && v <= h)
+                })
+                .map(|bi| bblocks[bi])
+                .unwrap_or(default_target);
+            targets.push(format!("{tgt}{args}"));
+        }
+        self.finish_block(
+            format!(
+                "br_table v{nidx} [{}] {default_target}{args}",
+                targets.join(", ")
+            ),
+            bblocks[0],
+        );
+
+        // Branch bodies, each falling through to `cont`.
+        let nbr = branches.len();
+        for bi in 0..nbr {
+            let body = branches[bi].body;
+            let next = if bi + 1 < nbr {
+                bblocks[bi + 1]
+            } else {
+                else_block.unwrap_or(cont)
+            };
+            self.stmt_list_or_single(body)?;
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), next);
+            } else {
+                self.cur_id = next;
+                self.reset_cur_state();
+            }
+        }
+        // else body (cur is `else_block` if present).
+        if let Some(eb) = else_body {
+            self.stmt_list_or_single(eb)?;
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), cont);
+            } else {
+                self.cur_id = cont;
+                self.reset_cur_state();
+            }
         }
         Ok(())
     }
