@@ -213,6 +213,27 @@ just fixtures.
 This proves the seam. The remaining work is adding grammar arms below (each a new match case),
 not rearchitecting.
 
+### Real nimony output — DONE 2026-07-28 (go deep)
+
+The skeleton now consumes a **real Leng file emitted by nimony's own `hexer`**, not just
+hand-written fixtures. `hexer c --isMain <mod>.s.nif` produces Leng for a module; the verbatim
+output for `proc addTwo(a,b: int): int = result = a + b` is checked in at
+`tests/fixtures/real_module.leng.nif`, and `translate_proc(real, "addTwo.0.")` translates that
+proc out of the full module (which also carries `gvar`/`type`/`main`/`ini` constructs still
+outside the subset) and **runs it on both engines** (`addTwo(20,22)=42`, etc.). This drove two
+reader corrections against real bytes:
+- **Line-info is pervasive and multi-form.** NIF attaches position info to *every* token — tags,
+  symbols, *and* numbers — introduced by `@` (`add@4`, `20@7`) **or** `~` (`a.0~2`, `(i~6,~4 64)`).
+  The reader strips from the first `@`/`~`; neither can occur in a semantic token (mangled
+  symbols encode them away; integer literals use `-`, not `~`).
+- **`(stmts …)` may omit the SCOPE marker.** The grammar is `(stmts SCOPE Stmt*)`, but real hexer
+  output starts straight with a statement (always a list); the reader skips a *leading atom*
+  scope but keeps a leading list.
+
+To go from one proc to the whole module (`main`, `ini`, `` `main ``) needs the broadening arms:
+`gvar`/`type`/`const` top-levels, `if`/`while`, cross-module `call` (`…sysvq0asl` suffixes) as
+imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct is now additive.
+
 **The work (bounded — comparable to chibicc's `codegen_ir.c`, which exists and is proven):**
 
 - **✅ integer scalars, arithmetic (`add`/`sub`/`mul`/`div`/`mod`), `neg`, width `conv`,

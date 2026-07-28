@@ -1,0 +1,111 @@
+(.nif27)
+(.indexat 1785             )
+(stmts@,1,../../../tmp/real.nim
+ (proc :addTwo.0.@5
+  (params@B
+   (param@1 :a.0 .
+    (i@3 64))
+   (param@9 :b.0 .
+    (i@3 64)))
+  (i@I 64)
+  (pragmas
+   (smry
+    (param 0 0 reads)
+    (param 1 1 reads)))
+  (stmts@2,1
+   (var@7 :result.0 .
+    (i@6,~1 64).@6,~1)
+   (asgn@7 result.0~7
+    (add@4
+     (i@G,l,../../../tmp/nimony/lib/std/system/arithmetics.nim 64)a.0~2 b.0@2))
+   (ret@D result.0)))
+ (proc@,3 :main.0.@5
+  (params@9).
+  (pragmas
+   (smry readGlobal))
+  (stmts@2,1
+   (var@4 :x.0 .
+    (i@9,~4 64)
+    (call@4 addTwo.0. 20@7 22@B))
+   (var@J :`x.0 .
+    (i~6,~4 64)x.0~B,1)))
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry readGlobal callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl)
+   (call@,7 main.0.)))
+ (type :`cchar.0.
+  (pragmas
+   (importc "char")
+   (nodecl))
+  (i 8))
+ (gvar :`cmdCount.0.
+  (pragmas
+   (exportc "cmdCount"))
+  (i 32).)
+ (gvar :`cmdLine.0.
+  (pragmas
+   (exportc "cmdLine"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (gvar :`nimEnviron.0.
+  (pragmas
+   (exportc "nimEnviron"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (proc :`main.0.
+  (params
+   (param :`argc.0. .
+    (i 32))
+   (param :`argv.0. .
+    (ptr
+     (ptr `cchar.0.)))
+   (param :`envp.0. .
+    (ptr
+     (ptr `cchar.0.))))
+  (i 32)
+  (pragmas
+   (exportc "main")
+   (smry readGlobal callsUnknown
+    (param 0 0 reads)
+    (param 1 1 reads)
+    (param 2 2 reads)))
+  (stmts
+   (asgn `cmdCount.0. `argc.0.)
+   (asgn `cmdLine.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`argv.0.))
+   (asgn `nimEnviron.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`envp.0.))
+   (call `ini.0.)
+   (call nimFlushStdStreams.0.sysvq0asl)
+   (ret 0))))(.index@,1,../../../tmp/real.nim
+ (x addTwo.0. 69)
+ (x main.0. 369)
+ (h `iniGuard.0. 192)
+ (x `ini.0. 34)
+ (x `cchar.0. 226)
+ (x `cmdCount.0. 71)
+ (x `cmdLine.0. 68)
+ (x `nimEnviron.0. 84)
+ (x `main.0. 90)
+ (h `argc.0. 27)
+ (h `argv.0. 34)
+ (h `envp.0. 54))

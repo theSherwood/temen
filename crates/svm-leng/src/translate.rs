@@ -81,6 +81,46 @@ impl Translator {
         Ok(out)
     }
 
+    /// Translate a **single named proc** out of the module as func 0 (NIM.md Phase 2 "go deep"):
+    /// the real hexer output carries `gvar`/`type`/other procs the skeleton can't lower yet, so we
+    /// locate just the target and emit it. Only its own signature is registered, so a call to any
+    /// other proc fail-closes rather than emitting a dangling index.
+    pub fn one_proc(&mut self, root: &Node, name: &str) -> Result<String, LengError> {
+        if root.tag() != Some("stmts") {
+            return Err(LengError::Malformed("module root must be (stmts …)".into()));
+        }
+        for item in root.args() {
+            if item.tag() != Some("proc") {
+                continue;
+            }
+            // Peek the name cheaply (don't run full proc_sig on procs we're skipping — they may
+            // use types outside the subset).
+            let pname = item
+                .args()
+                .first()
+                .and_then(|n| n.as_atom())
+                .map(|a| a.strip_prefix(':').unwrap_or(a).to_string());
+            if pname.as_deref() != Some(name) {
+                continue;
+            }
+            let (n, params, ret) = self.proc_sig(item)?;
+            self.procs.insert(
+                n,
+                Sig {
+                    index: 0,
+                    params,
+                    ret,
+                },
+            );
+            let mut out = String::new();
+            self.proc_body(item, &mut out)?;
+            return Ok(out);
+        }
+        Err(LengError::Malformed(format!(
+            "proc `{name}` not found in module"
+        )))
+    }
+
     /// Extract `(proc :Sym Params RetType Pragmas [Body])` → (name, param types, ret).
     fn proc_sig(&self, p: &Node) -> Result<(String, Vec<ValType>, Option<ValType>), LengError> {
         let a = p.args();
@@ -240,8 +280,12 @@ impl<'a> FuncGen<'a> {
         if node.tag() != Some("stmts") {
             return Err(LengError::Malformed("expected (stmts …) body".into()));
         }
-        // args()[0] is the scope symbol/`.`; statements follow.
-        for stmt in node.args().iter().skip(1) {
+        // `StmtList ::= (stmts SCOPE Stmt*)`, but the SCOPE is only present as a leading **atom**
+        // (a scope symbol, or `.` in our fixtures); real hexer output often omits it and starts
+        // straight with a statement (always a list). Skip a leading atom, keep leading lists.
+        let children = node.args();
+        let start = usize::from(matches!(children.first(), Some(Node::Atom(_))));
+        for stmt in &children[start..] {
             if self.terminated {
                 // Dead code after a terminator — Leng shouldn't emit it; ignore defensively.
                 break;

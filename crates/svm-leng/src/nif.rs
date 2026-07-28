@@ -156,10 +156,14 @@ impl Parser<'_> {
             self.i += 1;
         }
         let raw = String::from_utf8_lossy(&self.b[start..self.i]).into_owned();
-        // Strip an `@lineinfo` suffix (nimony appends it to tags/symbols). A lone `.` (Empty) and
-        // string/number atoms never contain a bare '@', so this only removes line info.
-        let cleaned = match raw.split_once('@') {
-            Some((head, _lineinfo)) if !head.is_empty() => head.to_string(),
+        // Strip the NIF **line-info** suffix. Every token (tag, symbol, number, even the `.` Empty
+        // marker) may carry position info introduced by `@` (absolute: `@col,line,file`) or `~`
+        // (a relative/negative delta: `a.0~2`, `(i~6,~4 64)`). Neither char can occur in the
+        // semantic part: builtin tags are plain words, mangled symbols encode `~`/`@` away
+        // (`tildeQ`/`atQ`, spec name-mangling table), and integer literals use `-`, not `~`. So
+        // cutting at the first `@`/`~` yields exactly the token, discarding only position info.
+        let cleaned = match raw.find(['@', '~']) {
+            Some(i) if i > 0 => raw[..i].to_string(),
             _ => raw,
         };
         Ok(Node::Atom(cleaned))
