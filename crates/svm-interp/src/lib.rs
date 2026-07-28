@@ -8002,6 +8002,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // assign — threaded into the child so its self-unwind can
                                     // key its host-state residue.
                                     let jslot = threads.len();
+                                    // §13.4 slice 4c: this (the spawning) vCPU's own task id — the
+                                    // child stamps it as its `parent_task` so its self-unwind keys
+                                    // its `FrozenChildState` under the correct parent. Without it a
+                                    // grandchild defaults to `0` (the root) and its child-state fails
+                                    // to match its `FrozenNested` at thaw (which the *recording
+                                    // parent* keys with its own id), so a depth-2+ server thaws
+                                    // without its serve module and can't dispatch.
+                                    let self_task = *id;
                                     let made = sched.spawn(move |id| {
                                         // A nested child is its **own** domain (own host/window/program),
                                         // so it gets its own dispatch table, not the parent's.
@@ -8031,6 +8039,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // below assigns exactly `threads.len()` at this point —
                                         // so its self-unwind can key its host-state residue.
                                         child.nested_slot = jslot;
+                                        // §13.4 slice 4c: stamp the spawning vCPU's id as the child's
+                                        // parent, so a depth-2+ child keys its `FrozenChildState`
+                                        // under its real parent (not the default `0`/root).
+                                        child.parent_task = self_task;
                                         // §4 depth-2: the child pushes its own [`FrozenNested`] residue
                                         // (for any grandchild) into the subtree's shared sink, so it
                                         // coalesces in the root host rather than the child's private one.

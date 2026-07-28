@@ -1396,6 +1396,42 @@ when nothing else in the domain is runnable.
 
 ---
 
+### I49 — durable **nested-holder re-link** blocked on a serve-chain deadlock; the underlying grandchild serve-capture bug is FIXED (S3) — surfaced 2026-07-28 building the §13.4 4d follow-up
+
+**What.** Two threads split out of the "nested holder" 4d follow-up (a *child* C1 holding a live
+`child_offer` cap onto a *grandchild* C2, durably frozen and re-linked on thaw):
+
+1. **FIXED — depth-2 serve-state keying.** A live-spawned nested child never stamped its own
+   `parent_task` at the op-0 `instantiate_module` spawn (the field's own destructure comment stated
+   the intent — "a spawned child stamps its own id as the grandchild's parent below" — but the
+   assignment was missing). A **grandchild** therefore defaulted to `parent_task = 0` (the root), so
+   its `FrozenChildState` keyed `(0, slot)` mismatched its `FrozenNested` `(C1, slot)` on thaw, and
+   it restored via the fresh-grant path **without its serve module** (first offer call → `EAGAIN`).
+   One line at the spawn fixes it (direct children unchanged; root id is `0`). Pinned by
+   `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`.
+
+2. **DEFERRED — the nested re-link + its blocking observable.** Generalizing the thaw re-link from
+   root-only to every holder (a `(holder task, join slot)` edge map) was implemented and *proven to
+   fire* for the C1→C2 edge, but its only end-to-end observable — C1 serving a dispatch whose
+   **handler forwards** to C2 through the re-linked cap — **dead-locks** on the single worker (the
+   handler fiber parks on C2's reply and C2 is never scheduled to serve it). That is a **pre-existing
+   serve-chain gap** (a handler making a live-offer call to a grandchild), independent of durability
+   and never exercised before, not a fault of the re-link. Per INVARIANTS #1 (no production change
+   without a passing test that fails without it), the re-link generalization is **held back** until
+   the serve-chain deadlock is fixed and a non-hanging end-to-end pin exists.
+
+**Why tracked, not built now.** The keying fix is the load-bearing, testable win and ships. The
+re-link + the serve-chain deadlock are their own slice (the deadlock lands on the scheduler's
+handler-fiber park/dispatch core, the most sensitive concurrency surface — §18 tree-walk-oracle
+first). Also open from the same 4d note: the wire/child-regrant **sibling-provenance** durable name.
+
+**Shape if/when built.** Fix the handler-forwards-to-grandchild schedule (a parked handler fiber
+must hand the single worker to the grandchild it is waiting on), add a non-hanging differential pin
+(root drives C1 → C1's handler reaches C2 → 107), then land the `(holder task, join slot)` re-link
+generalization behind it.
+
+---
+
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
 
 Every place the suite deliberately runs *less* on some platform to dodge the failure families
