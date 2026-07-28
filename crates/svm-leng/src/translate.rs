@@ -691,6 +691,10 @@ impl Translator {
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
         // assigned reads 0 until its declaration binds it (matches Leng default-init semantics).
         f.open_entry();
+        // Pre-allocate a block id for every `(lab :L)` so forward `(jmp L)` can target it.
+        if let Some(b) = body {
+            f.declare_labels(b);
+        }
         match body {
             Some(b) if !matches!(b, Node::Atom(_)) => {
                 f.stmt_list(b)?;
@@ -732,6 +736,10 @@ struct FuncGen<'a> {
     /// `Some((slot, desc))` when this proc returns an aggregate by sret: `cur[slot]` is the caller's
     /// destination pointer, into which `ret` copies/constructs the aggregate before a void return.
     sret: Option<(usize, TyDesc)>,
+    /// Leng label name (`(lab :L)`) → its pre-allocated block id, so a `(jmp L)` can branch to a
+    /// label defined later (forward jumps: `break`, `block`-`break`). All labels are declared before
+    /// any body statement is emitted.
+    label_block: HashMap<String, u32>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -776,6 +784,7 @@ impl<'a> FuncGen<'a> {
             mem,
             frame_size,
             sret,
+            label_block: HashMap::new(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -822,6 +831,19 @@ impl<'a> FuncGen<'a> {
             let ty = self.slots[i].1;
             let v = self.emit_const(ty, 0);
             self.cur.push(v.id);
+        }
+    }
+
+    /// Assign a fresh block id to each `(lab :L)` in the body (document order), so a `(jmp L)` to a
+    /// forward label resolves. Structured control flow allocates its blocks after these.
+    fn declare_labels(&mut self, body: &Node) {
+        let mut names = Vec::new();
+        collect_labels(body, &mut names);
+        for name in names {
+            if !self.label_block.contains_key(&name) {
+                let id = self.new_block_id();
+                self.label_block.insert(name, id);
+            }
         }
     }
 
@@ -1236,8 +1258,10 @@ impl<'a> FuncGen<'a> {
         let children = node.args();
         let start = usize::from(matches!(children.first(), Some(Node::Atom(_))));
         for stmt in &children[start..] {
-            if self.terminated {
-                break; // dead code after a terminator
+            // After a terminator, statements are dead — except a `(lab L)`, which reopens a block
+            // reachable via `(jmp L)` from elsewhere.
+            if self.terminated && stmt.tag() != Some("lab") {
+                continue;
             }
             self.stmt(stmt)?;
         }
@@ -1342,9 +1366,8 @@ impl<'a> FuncGen<'a> {
             Some("if") => self.if_stmt(s),
             Some("while") => self.while_stmt(s),
             Some("case") => self.case_stmt(s),
-            // A bare label with no live jmp target (e.g. hexer's trailing `whileStmtLabel`) is inert
-            // for our structured lowering; `jmp` itself is not yet supported.
-            Some("lab") => Ok(()),
+            Some("jmp") => self.jmp_stmt(s),
+            Some("lab") => self.lab_stmt(s),
             other => Err(LengError::Unsupported(format!(
                 "statement `{}`",
                 other.unwrap_or("<headless>")
@@ -1435,6 +1458,50 @@ impl<'a> FuncGen<'a> {
         } else {
             self.cur_id = exit;
             self.reset_cur_state();
+        }
+        Ok(())
+    }
+
+    /// `(jmp L)` → an unconditional branch to label `L`'s block, threading the current slot values.
+    /// Forward (`break`, `block`-`break`) and backward jumps both work: every block carries all
+    /// slots, so any edge just passes the live slot set. The block is terminated; following code is
+    /// dead until the next `(lab …)` reopens a reachable block.
+    fn jmp_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let name = s
+            .args()
+            .first()
+            .and_then(|n| n.as_atom())
+            .ok_or_else(|| LengError::Malformed("jmp needs a label".into()))?;
+        let lb = *self
+            .label_block
+            .get(name)
+            .ok_or_else(|| LengError::Unsupported(format!("jmp to unknown label `{name}`")))?;
+        let args = self.branch_args();
+        self.finish_block(format!("br {lb}{args}"), self.next_block);
+        self.terminated = true;
+        Ok(())
+    }
+
+    /// `(lab :L)` → open label `L`'s pre-allocated block. If the current block is still live it falls
+    /// through into `L` (threading slots); otherwise `L` is reached only by `(jmp L)` edges and we
+    /// just switch to emitting there.
+    fn lab_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let name = s
+            .args()
+            .first()
+            .map(sym_def)
+            .transpose()?
+            .ok_or_else(|| LengError::Malformed("lab needs a name".into()))?;
+        let lb = *self
+            .label_block
+            .get(&name)
+            .ok_or_else(|| LengError::Unsupported(format!("undeclared label `{name}`")))?;
+        if self.terminated {
+            self.cur_id = lb;
+            self.reset_cur_state();
+        } else {
+            let args = self.branch_args();
+            self.finish_block(format!("br {lb}{args}"), lb);
         }
         Ok(())
     }
@@ -2110,6 +2177,20 @@ fn has_aggregate_var(node: &Node) -> bool {
         return node.args().iter().any(has_aggregate_var);
     }
     false
+}
+
+/// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
+fn collect_labels(node: &Node, out: &mut Vec<String>) {
+    if let Node::List(_) = node {
+        if node.tag() == Some("lab") {
+            if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
+                out.push(name.strip_prefix(':').unwrap_or(name).to_string());
+            }
+        }
+        for child in node.args() {
+            collect_labels(child, out);
+        }
+    }
 }
 
 /// Collect the names of locals whose address is taken (`(addr name)`).

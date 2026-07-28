@@ -8,12 +8,13 @@
 //!
 //! ## Scope — a walking skeleton
 //!
-//! This first slice handles the **integer / arithmetic / local / direct-call** subset with
-//! straight-line bodies and `ret`. Everything outside it — control flow (`if`/`while`/`case`/
-//! `jmp`), aggregates (`object`/`array`/`union`), pointers (`ptr`/`aptr`/`deref`/`addr`), floats,
-//! `onerr`/`try`, `emit` — is a fail-closed [`LengError::Unsupported`], never a silent
-//! mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline). Growing the frontend means
-//! adding grammar arms below, not rearchitecting.
+//! The frontend now lowers integers/floats, arithmetic, locals and direct/indirect calls, control
+//! flow (`if`/`while`/`case`, and the low-level `jmp`/`lab` jump family for `break`/`block`), memory
+//! (`ptr`/`aptr`/`deref`/`addr` + window frames), aggregates (`object`/`array` with constructors,
+//! copy, and sret return), and globals. What remains outside the subset — exceptions (`onerr`/`try`/
+//! `raise`), seq/string, `union`, `emit`, the `jtrue`/`mflag`/`vflag` jump forms — is a fail-closed
+//! [`LengError::Unsupported`], never a silent mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)`
+//! discipline). Growing the frontend means adding grammar arms below, not rearchitecting.
 //!
 //! Like chibicc's `codegen_ir.c`, it emits **SVM text** and hands it to [`svm_text::parse_module`];
 //! [`translate`] returns the parsed (but not-yet-verified) [`Module`].

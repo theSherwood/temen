@@ -299,13 +299,14 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
-  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow,
-  pointers, frames, objects/arrays (incl. constructors, copy, and **sret return**), globals, intra-
-  and cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
-  (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`, `mkSum`, `mk`). Remaining for full real
-  modules (W1 Leng totality, §3a): general `goto` (the `jmp`/`lab`/`jtrue` jump family), exceptions
-  (`try`/`onerr`/`raise`), seq/string, and non-zero global/data initializers — plus wiring nimony's
-  real export signatures for imports.
+  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
+  `break`/`block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl. constructors, copy, and
+  **sret return**), globals, intra- and cross-module calls — fail-closed on the rest, and is
+  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`,
+  `mkSum`, `mk`, `firstHit`, `labeled`). Remaining for full real modules (W1 Leng totality, §3a):
+  exceptions (`try`/`onerr`/`raise`), seq/string, the `jtrue`/`mflag`/`vflag` conditional-jump
+  forms, and non-zero global/data initializers — plus wiring nimony's real export signatures for
+  imports.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
       `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
@@ -313,6 +314,16 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
       y:b); p.x+p.y`), interp == JIT.
+    - **✅ general `goto` (`jmp`/`lab`) — DONE 2026-07-28.** hexer keeps `if`/`while` structured and
+      emits the low-level jump family only for `break`/`block`-`break`: `(jmp L)` an unconditional
+      branch, `(lab :L)` a label. Both fall straight out of the block-parameter (slot-threading)
+      model — labels are pre-scanned and each assigned a block id, a `(jmp L)` is a `br` to that
+      block passing the live slot set, and a `(lab :L)` opens it (fall-through if the prior block is
+      live, else reached only by jumps). Dead statements after a `jmp` are skipped until the next
+      `lab` reopens a reachable block; forward and backward edges both work. Tested on hand fixtures
+      and **real nimony `firstHit`** (`while`+`break`) and **`labeled`** (`block done:`/`break done`
+      out of a nested loop), interp == JIT. The `jtrue`/`mflag`/`vflag` conditional-jump forms (not
+      emitted by hexer's default lowering) stay fail-closed.
     - **✅ aggregate return (sret) — DONE 2026-07-28.** A proc whose return type is a named aggregate
       returns `void` and takes a hidden `$sret` pointer param (after `$sp`, before the Leng params);
       `(ret aggval)` constructs/copies the result into that pointer (composing with `oconstr`/copy).
