@@ -161,6 +161,23 @@ try {
     lc.state === 'done' && lc.out.startsWith('libc sqrt=13 pow=1024\n')
       ? ok('chibicc expanded libc (<math.h> + <assert.h> + strdup) → real output in-browser')
       : fail(`chibicc libc: ${JSON.stringify({ state: lc.state, out: lc.out.slice(0, 90) })}`);
+
+    // Multi-file project (SELFHOST_C.md §7 stage-2 lever): `//// file: NAME` markers split the editor
+    // into memfs files, and /in.c #includes a sibling header + .c (unity build) — all compiled in-browser.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\n#include "mathx.h"\n#include "mathx.c"\n' +
+      'int main(void){ printf("gcd=%d\\n", gcd(48, 36)); return 0; }\n' +
+      '//// file: mathx.h\nint gcd(int, int);\n' +
+      '//// file: mathx.c\nint gcd(int a, int b){ while(b){ int t=a%b; a=b; b=t; } return a; }\n'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const mf = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    mf.state === 'done' && mf.out.startsWith('gcd=12\n')
+      ? ok('chibicc multi-file project (//// file: markers → #include sibling .h/.c) → ran in-browser')
+      : fail(`chibicc multifile: ${JSON.stringify({ state: mf.state, out: mf.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }

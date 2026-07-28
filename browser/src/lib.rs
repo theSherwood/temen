@@ -2511,8 +2511,67 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
     if !dirs.iter().any(|d| d == "include") {
         dirs.push("include".to_string());
     }
-    files.push(("in.c".to_string(), src.to_vec()));
+    // Split the editor buffer into a **multi-file** project: the compile targets `/in.c` (the text
+    // before the first marker), and each `//// file: NAME` marker seeds a sibling file the entry can
+    // `#include "NAME"` (chibicc resolves quote-includes against the source's own directory, `/`). No
+    // marker ⇒ the whole buffer is `/in.c`, exactly as before. Any `NAME` with a `/` seeds under that
+    // directory (its parent dirs are registered so the memfs can hold it).
+    for (key, bytes) in split_multifile_source(src) {
+        if let Some((dir, _)) = key.rsplit_once('/') {
+            // Register every ancestor directory of a nested file (e.g. `a/b/c.h` → `a`, `a/b`).
+            let mut acc = String::new();
+            for seg in dir.split('/') {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(seg);
+                if !dirs.iter().any(|d| *d == acc) {
+                    dirs.push(acc.clone());
+                }
+            }
+        }
+        // A seeded file wins over any same-key caller-image entry (the editor is the source of truth).
+        files.retain(|(k, _)| *k != key);
+        files.push((key, bytes));
+    }
     Ok(svm_fs::encode_image(&files, &dirs))
+}
+
+/// Split a card editor buffer into memfs files on `//// file: NAME` marker lines. The text before the
+/// first marker is the entry (`in.c`); each marker begins a new file `NAME` (a leading `/` is trimmed;
+/// a `NAME` with slashes nests). No marker ⇒ a single `in.c` (the whole buffer). Used by both the
+/// bytecode and JIT card entries so multi-file behaves identically across tiers.
+pub fn split_multifile_source(src: &[u8]) -> Vec<(String, Vec<u8>)> {
+    // A line is a marker iff, ignoring leading whitespace, it is `////` followed by (optional space)
+    // `file:` (case-insensitive) then a non-empty filename.
+    fn marker_name(line: &str) -> Option<String> {
+        let rest = line.trim_start().strip_prefix("////")?.trim_start();
+        // Case-insensitive `file:` prefix.
+        let after = rest.get(..5).filter(|p| p.eq_ignore_ascii_case("file:"))?;
+        let _ = after;
+        let name = rest[5..].trim().trim_start_matches('/').trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    let text = String::from_utf8_lossy(src);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut cur_name = "in.c".to_string();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        if let Some(name) = marker_name(line.trim_end_matches('\n')) {
+            files.push((cur_name, cur.into_bytes()));
+            cur_name = name;
+            cur = String::new();
+        } else {
+            cur.push_str(line);
+        }
+    }
+    files.push((cur_name, cur.into_bytes()));
+    files
 }
 
 /// **Run chibicc-the-guest to compile a C source** — the playground C-compiler demo (SELFHOST_C.md
