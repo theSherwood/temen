@@ -253,7 +253,11 @@ fn read_a_source_variable_inside_a_separate_module_coroutine() {
         Some(child_module_load()),
         "stopped inside the granted module's body"
     );
-    assert_eq!(r.frame_pc(0), Some(child_module_load()), "frame is in module 1");
+    assert_eq!(
+        r.frame_pc(0),
+        Some(child_module_load()),
+        "frame is in module 1"
+    );
     assert_eq!(r.depth(), 1, "child's root activation");
 
     // The child's own named SSA variable resolves to its live value (the data byte 75), read against the
@@ -265,7 +269,11 @@ fn read_a_source_variable_inside_a_separate_module_coroutine() {
     );
     // A name that isn't a variable of the child's function is unresolved (the child's info is consulted,
     // and it has no such name), never a stray hit from module 0.
-    assert_eq!(r.read_var(0, "nope", 4), None, "unknown child variable is None");
+    assert_eq!(
+        r.read_var(0, "nope", 4),
+        None,
+        "unknown child variable is None"
+    );
 
     assert_eq!(drive(&mut r, &[], &mut fuel), Ok(vec![Value::I64(WANT)]));
 }
@@ -289,7 +297,11 @@ fn separate_module_source_variable_tick_replays_deterministically() {
     let mut f2 = 5_000_000u64;
     while b.op_clock() < clock && b.tick(&mut f2) {}
     assert_eq!(b.op_clock(), clock, "replayed to the same op clock");
-    assert_eq!(b.frame_pc(0), Some(child_module_load()), "replay landed at the child body");
+    assert_eq!(
+        b.frame_pc(0),
+        Some(child_module_load()),
+        "replay landed at the child body"
+    );
     assert_eq!(
         b.read_var(0, "b", 4),
         live,

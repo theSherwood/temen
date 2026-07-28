@@ -4049,7 +4049,11 @@ impl<'a> FrameReader<'a> {
     fn md_for(
         &self,
         module: usize,
-    ) -> Option<(Option<&'a DebugInfo>, &'a [Vec<u32>], &'a [Vec<Vec<ValType>>])> {
+    ) -> Option<(
+        Option<&'a DebugInfo>,
+        &'a [Vec<u32>],
+        &'a [Vec<Vec<ValType>>],
+    )> {
         if module == 0 {
             return Some((self.debug, self.fn_block_base, self.fn_block_types));
         }

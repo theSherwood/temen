@@ -259,7 +259,11 @@ fn scheduled_separate_module_coroutine_matches_the_oracle() {
     let mut r = module_sched_session();
     let mut fuel = 5_000_000u64;
     let res = drive_to_end(&mut r, &mut fuel);
-    assert_eq!(res, Ok(vec![Value::I64(MODWANT)]), "coroutine-module returns 75");
+    assert_eq!(
+        res,
+        Ok(vec![Value::I64(MODWANT)]),
+        "coroutine-module returns 75"
+    );
 
     let m = parse_module(COROUTINE_MODULE).unwrap();
     let child = parse_module(MODULE_CHILD_DBG).unwrap();
@@ -288,12 +292,20 @@ fn read_a_source_variable_inside_a_scheduled_separate_module_coroutine() {
     let mut fuel = 5_000_000u64;
     match r.run_until_stop(&mut fuel) {
         SchedStop::Break { pc, reason } => {
-            assert_eq!(pc, child_module_load(), "stopped inside the granted module's body");
+            assert_eq!(
+                pc,
+                child_module_load(),
+                "stopped inside the granted module's body"
+            );
             assert_eq!(reason, SchedBreak::Breakpoint);
         }
         other => panic!("expected a coroutine-body breakpoint, got {other:?}"),
     }
-    assert_eq!(r.frame_pc(0), Some(child_module_load()), "focused on module 1");
+    assert_eq!(
+        r.frame_pc(0),
+        Some(child_module_load()),
+        "focused on module 1"
+    );
 
     // The child's own named SSA variable resolves to its live value (the data byte 75), read against the
     // child module's debug info — before this slice a `module != 0` frame gave `None` on this engine too.
@@ -302,9 +314,16 @@ fn read_a_source_variable_inside_a_scheduled_separate_module_coroutine() {
         Some(VarValue::Value(Value::I32(MODWANT as i32))),
         "read the granted module's source variable `b` by name on the scheduled engine"
     );
-    assert_eq!(r.read_var(0, "nope", 4), None, "unknown child variable is None");
+    assert_eq!(
+        r.read_var(0, "nope", 4),
+        None,
+        "unknown child variable is None"
+    );
 
-    assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(MODWANT)]));
+    assert_eq!(
+        drive_to_end(&mut r, &mut fuel),
+        Ok(vec![Value::I64(MODWANT)])
+    );
 }
 
 /// Reverse debugging composes with scheduled separate-module source-variable inspection: a fresh session
@@ -330,7 +349,11 @@ fn scheduled_separate_module_source_variable_tick_replays_deterministically() {
     b.locate();
     assert_eq!(b.op_turn(), turn, "replayed to the same turn");
     assert!(b.select_task(coro_thread));
-    assert_eq!(b.frame_pc(0), Some(child_module_load()), "replay landed at the child body");
+    assert_eq!(
+        b.frame_pc(0),
+        Some(child_module_load()),
+        "replay landed at the child body"
+    );
     assert_eq!(
         b.read_var(0, "b", 4),
         live,
