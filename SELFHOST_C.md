@@ -331,12 +331,29 @@ compiler bug is a clean error, never an escape.
    parses). With those seeded, **chibicc-the-guest compiles real chibicc `-cc1` translation units to
    valid SVM IR** — gated by `browser/tests/chibicc_selfhost.rs` (tokenize/strings/hashmap/unicode each
    compile → parse + verify; `strings.c` is the `open_memstream` proof) + an `open_memstream` runtime
-   round-trip and a Chromium assertion. **What remains for the whole-compiler self-compile**: a single
-   **unity** build (all TUs + the `cc1_main` entry amalgamated) into one runnable module. Cross-TU
-   references only resolve when every TU is compiled together (e.g. `parse.c`'s `struct_type` reads as a
-   capability-extern standalone), and that whole-compiler amalgamation — plus running the result and the
-   bootstrap-fixpoint differential (§5 E) — is the last self-host slice. The hard libc/header work is
-   done; per-TU compile is the pin that proves it.
+   round-trip and a Chromium assertion.
+
+   **→ Growable guest heap DONE 2026-07-28 (§8's "grow via `__vm_map`" follow-up).** chibicc-the-guest's
+   allocator was a **fixed 24 MiB static arena** (`chibicc_extra.c`) — fine for one source file, but a
+   whole-compiler working set overran it, and because the bump allocator returns `NULL` on overflow (no
+   growth), chibicc kept building on failed allocations → **silently corrupted type nodes** (spurious
+   "not a struct", "invalid operands", traps at nondeterministic points). Fixed by **deleting** the
+   arena and chibicc's `malloc`/`realloc`: the LLVM on-ramp then synthesizes its **`vm_map`-growable**
+   heap for them (the same one Postgres uses to grow a multi-GB heap), which commits reserved-tail pages
+   on demand — an effectively unbounded heap. Side effect: with the 24 MiB arena gone, chibicc.svmb's
+   declared memory dropped from `size_log2` 25 → 21 (the arena *was* the bloat). Rebuilt trap-free (333
+   funcs, verifies); every existing test still passes, and `codegen_ir.c` (chibicc's largest TU, ~1.4 MB
+   IR) now compiles cleanly where the arena silently corrupted (gated, `#[ignore]`d as a ~70 s heavy run).
+
+   **What remains for the whole-compiler self-compile** (chibicc compiling its *own* source into one
+   runnable module): the heap is no longer the wall — a naive **unity** amalgamation (`#include` every
+   TU) now runs cleanly *past* the memory issue and stops on a genuine source-organization problem:
+   chibicc's TUs are written for *separate* compilation and reuse the same `static` helper names for
+   different functions (~60 collisions — `eval2`, `expr`, `assign`, `cast`, …), so one TU redefines
+   another's. Resolving that needs either mechanical per-TU renaming of the colliding statics or a
+   guest-side IR **linker** (compile each TU to its own module, then link) — plus running the result
+   under an fs-capable powerbox and the bootstrap-fixpoint differential (§5 E). That's the last, larger
+   self-host slice; the libc, headers, and heap it stands on are all done.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
@@ -346,11 +363,12 @@ compiler bug is a clean error, never an escape.
   caps the in-guest story at layer 1; the encoder is small (the format is a deliberate single-pass
   design) and unlocks `vm_dlopen`. Decide when layer 2 has a consumer.
 - ~~Where the pure-libc bulk lives~~ — **settled by the step-1 audit (Appendix A): guest C**, one
-  small self-host libc translation unit compiled alongside chibicc at the `clang` step. The one
-  remaining allocator sub-question: `realloc` needs the old block size — either a personality
-  `OP_REALLOC` (host allocator owns block metadata, matching the POSIX.md split; personality
-  growth, not substrate) or a guest size-header shim over the existing `malloc` op. Decide at
-  implementation; both are small.
+  small self-host libc translation unit compiled alongside chibicc at the `clang` step. ~~The one
+  remaining allocator sub-question: `realloc` needs the old block size~~ — **settled 2026-07-28: neither
+  a personality op nor a guest shim. chibicc leaves `malloc`/`realloc` undefined and the on-ramp
+  synthesizes its `vm_map`-growable heap for them** (block metadata lives in the synth allocator's
+  own header, so its synth `realloc` copies the right length). This also gave chibicc an unbounded,
+  reserved-tail-growing heap — see the "growable guest heap" as-built in §7.
 - ~~`-g` cost in the guest: always emit debug info, or a flag?~~ **Settled 2026-07-28: a flag, off by
   default.** The `debug.*` waist is ~a third of the emitted IR, so `cc1_main.c` defaults `opt_g` off and
   takes `-g` to turn it on; the playground passes `-g` only for a source-level debug session (the Debug
