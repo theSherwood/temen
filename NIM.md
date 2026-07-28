@@ -238,11 +238,13 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 
 - **✅ integer scalars, arithmetic (`add`/`sub`/`mul`/`div`/`mod`), `neg`, width `conv`,
   locals (`var`/`asgn`), direct `call`, `ret`** — the landed skeleton.
-- **Next: control flow** — `if`/`ite`/`while`/`case` + `lab`/`jmp` → SVM blocks/`br_table`
-  (irreducible CFG is native, `DESIGN.md` §3). This needs real block/SSA-param synthesis from
-  Leng's named locals across joins (the skeleton is single-block); the on-ramp's φ→block-args
-  is the reference, but from a tree IR it's closer to `codegen_ir.c`'s data-SP threading.
-
+- **✅ control flow — DONE 2026-07-28.** `if`/`elif`/`else`, `while`, `scope`, nested `stmts`,
+  and comparisons (`eq`/`neq`/`lt`/`le`), lowered to **multi-block SVM-IR with locals threaded as
+  block parameters** (the chibicc/on-ramp φ model — no separate dominance analysis; a merge is
+  just the successor's block param). Value numbers reset per block; the entry block carries only
+  the function params (the ABI), successors carry every slot. Tested on hand fixtures (max, a
+  `while` sum, an `elif` sign chain) **and the real nimony `maxi` if/else** — interp == JIT on all.
+  `case`→`br_table` and `lab`/`jmp` (Leng's low-level jump family) remain.
 - **Then, further out:**
   - **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
     same ABI, so this is a match, not a negotiation).
