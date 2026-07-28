@@ -271,9 +271,16 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       frame-resident (default-zeroed). Tested on hand fixtures (object field set/get, array `at`,
       pointer `pat`, a framed local array) **and real nimony object bytes** (`dot2`, `p.x*p.x+…`),
       interp == JIT. Whole-aggregate copy/`oconstr`/`aconstr` and C-ABI (SysV) field offsets remain.
-    - **Next: whole-module** — `gvar`/`type` top-levels (types done) + cross-module `call`
-      (`…sysvq0asl`) as imports, so real `sumto` (whose `inc` is a system import) and multi-proc
-      modules run end-to-end, not just single procs.
+    - **✅ whole-module: globals + multi-proc — DONE 2026-07-28.** `gvar`/`tvar` module globals live
+      at fixed window offsets (below the caller-passed stack) and are shared across calls; scalar
+      `const`s inline; `gvar`/`const`/`type` top-levels are accepted, and a module's procs are
+      emitted together so **intra-module calls** resolve by index. Tested end-to-end: a global
+      counter + `const` step + a `main → bumpN → bump` call chain, interp == JIT. Non-zero global
+      initializers fail-close (a `data`-segment init is the refinement).
+    - **Next: cross-module `call`** (`…sysvq0asl` suffixes) as SVM **imports** — the remaining half
+      of whole-module, and what makes real `sumto` (whose `inc` is a system import) and real
+      multi-proc modules that call the stdlib run. Needs a callee-signature source (the sema `.idx`
+      export map, or a provided sig table) to declare each `import`/`call.import` correctly.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.

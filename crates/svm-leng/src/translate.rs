@@ -77,6 +77,11 @@ enum Layout {
 pub(crate) struct Translator {
     procs: HashMap<String, Sig>,
     types: HashMap<String, Layout>,
+    /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
+    /// starts zeroed); non-zero initializers are a later slice.
+    globals: HashMap<String, (u64, TyDesc)>,
+    /// Scalar integer `const`s, inlined at use.
+    consts: HashMap<String, i64>,
 }
 
 impl Translator {
@@ -84,7 +89,47 @@ impl Translator {
         Translator {
             procs: HashMap::new(),
             types: HashMap::new(),
+            globals: HashMap::new(),
+            consts: HashMap::new(),
         }
+    }
+
+    /// Collect `gvar`/`const` top-levels: globals get fixed window offsets (below the stack the
+    /// caller passes in); scalar int consts are recorded for inlining.
+    fn collect_globals(&mut self, root: &Node) -> Result<(), LengError> {
+        let mut off = 16u64; // leave the low bytes as a null sentinel region
+        for item in root.args() {
+            match item.tag() {
+                Some("gvar" | "tvar") => {
+                    let a = item.args();
+                    if a.len() < 3 {
+                        return Err(LengError::Malformed("gvar needs :name pragmas type".into()));
+                    }
+                    let name = sym_def(&a[0])?;
+                    let desc = self.tydesc(&a[2])?;
+                    if let Some(init) = a.get(3) {
+                        if !init.is_empty_marker() && int_literal(init) != Some(0) {
+                            return Err(LengError::Unsupported(format!(
+                                "non-zero global initializer for `{name}`"
+                            )));
+                        }
+                    }
+                    let sz = self.sizeof(&desc);
+                    self.globals.insert(name, (off, desc));
+                    off += sz.max(8);
+                }
+                Some("const") => {
+                    let a = item.args();
+                    if a.len() >= 4 {
+                        if let (Ok(name), Some(v)) = (sym_def(&a[0]), int_literal(&a[3])) {
+                            self.consts.insert(name, v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Byte size of a type descriptor.
@@ -200,6 +245,7 @@ impl Translator {
             )));
         }
         self.collect_types(root)?;
+        self.collect_globals(root)?;
         let mut proc_nodes = Vec::new();
         for item in root.args() {
             match item.tag() {
@@ -218,10 +264,10 @@ impl Translator {
                     );
                     proc_nodes.push(item);
                 }
-                Some("type") => {} // handled by collect_types
+                Some("type" | "gvar" | "tvar" | "const") => {} // handled by collect_types/globals
                 Some(other) => {
                     return Err(LengError::Unsupported(format!(
-                        "top-level construct `{other}` (proc/type supported)"
+                        "top-level construct `{other}` (proc/type/gvar/const supported)"
                     )))
                 }
                 None => {
@@ -247,6 +293,7 @@ impl Translator {
             return Err(LengError::Malformed("module root must be (stmts …)".into()));
         }
         self.collect_types(root)?;
+        self.collect_globals(root)?;
         for item in root.args() {
             if item.tag() != Some("proc") {
                 continue;
@@ -729,6 +776,11 @@ impl<'a> FuncGen<'a> {
                     let sp = self.cur[0];
                     return Ok((self.add_const_off(sp, off), desc));
                 }
+                // A module global lives at a fixed window offset (its address is a constant).
+                if let Some((off, desc)) = self.t.globals.get(name).cloned() {
+                    let base = self.emit_const(ValType::I64, off as i64);
+                    return Ok((base.id, desc));
+                }
                 // An aggregate passed by address: its slot value *is* the address.
                 if let Some(desc @ TyDesc::Agg(_)) = self.local_desc.get(name).cloned() {
                     if let Some(v) = self.lookup(name) {
@@ -890,6 +942,10 @@ impl<'a> FuncGen<'a> {
         let name = lhs.as_atom().ok_or_else(|| {
             LengError::Unsupported(format!("assignment to lvalue `{:?}`", lhs.tag()))
         })?;
+        // A global is stored through its fixed window address; a local rebinds/stores its slot.
+        if self.t.globals.contains_key(name) {
+            return self.store_lvalue(lhs, rhs);
+        }
         let v = self.expr(rhs)?;
         self.write_local(name, v)
     }
@@ -1112,6 +1168,12 @@ impl<'a> FuncGen<'a> {
             Node::Atom(a) => {
                 if let Some(v) = self.read_local(a) {
                     return Ok(v);
+                }
+                if let Some(&c) = self.t.consts.get(a) {
+                    return Ok(self.emit_const(ValType::I64, c));
+                }
+                if self.t.globals.contains_key(a) {
+                    return self.load_lvalue(e); // load the scalar global
                 }
                 if let Ok(n) = parse_int(a) {
                     return Ok(self.emit_const(ValType::I64, n));
@@ -1454,4 +1516,9 @@ fn sym_def(node: &Node) -> Result<String, LengError> {
 /// Parse a Leng integer literal (decimal, optional sign).
 fn parse_int(s: &str) -> Result<i64, ()> {
     s.parse::<i64>().map_err(|_| ())
+}
+
+/// The integer value of an atom literal node, if it is one.
+fn int_literal(node: &Node) -> Option<i64> {
+    node.as_atom().and_then(|s| s.parse::<i64>().ok())
 }
