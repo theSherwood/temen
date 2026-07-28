@@ -396,6 +396,14 @@ try {
       ccDbg, { timeout: 15_000 });
     ok('chibicc: reverse debugging rewound the captured output');
 
+    // Step Back is **depth-aware** — it rewinds within `main`, not down into the guest libc `printf`
+    // internals. The Variables pane header shows the paused frame's function; before the fix a step-back
+    // from a line that called `printf` descended into `__pf_flush`/stdio.h.
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="stepBack"]`);
+    await page.waitForFunction((sel) => /main/.test(document.querySelector(`${sel} .dbg-vars`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: Step Back stayed in main (not the libc printf internals)');
+
     await page.click(`${ccDbg} .dbg-controls button[data-cmd="stop"]`);
   }
 

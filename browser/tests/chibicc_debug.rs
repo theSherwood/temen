@@ -318,3 +318,35 @@ fn debug_a_printf_program_with_captured_output_and_reverse() {
         "reverse debugging rewound the captured output to the earlier point"
     );
 }
+
+/// **Step Back is depth-aware** — the reverse of *step over*, not *step in*. After a `printf` line has
+/// run (the call descended into the guest libc and returned), `stepBack` rewinds **within `main`**, never
+/// down into the libc internals (`__pf_flush` / `stdio.h`). Regression test for the bug where step-back
+/// descended into the callee's last op instead of the caller's previous op.
+#[test]
+fn step_back_stays_in_the_users_frame_across_a_printf() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, PRINTF_SRC);
+
+    let mut s = DapServer::new();
+    launch_printf(&mut s, &ir); // breakpoint on the second printf (line 4)
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert!(event(&out, "stopped"), "stopped at the second printf (first printf's call already returned)");
+
+    // Step back several times: every landing must stay in `main` at `/in.c` — never a libc frame
+    // (`__pf_flush [/include/stdio.h]`, which is what the un-fixed op-granular step-back descended into).
+    for i in 0..4 {
+        let out = s.handle(&req(10 + i, "stepBack", Json::obj(vec![("threadId", Json::i(1))])));
+        assert!(event(&out, "stopped"), "stepBack {i} stopped inside the guest");
+        let st = s.handle(&req(100 + i, "stackTrace", Json::obj(vec![("threadId", Json::i(1))])));
+        let top = &response(&st).get("body").unwrap().get("stackFrames").unwrap().as_array().unwrap()[0];
+        let src = top.get("source").and_then(|s| s.get("path")).and_then(|p| p.as_str()).unwrap_or("");
+        let name = top.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        assert_eq!(src, "/in.c", "stepBack {i} stayed in the C source, not libc — frame {name:?} [{src}]");
+        assert!(name.contains("main"), "stepBack {i} stayed in main — got {name:?}");
+    }
+}
