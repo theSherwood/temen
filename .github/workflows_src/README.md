@@ -16,6 +16,12 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **ci.yml** (2026-07-28): the real-Chromium browser step runs `node bench_chibicc_jit.mjs` (after
+  `browser-play-editor-test.mjs`) — chibicc compile-time on V8, bytecode vs wasm-JIT: prints the
+  speedup and asserts the two tiers emit byte-identical IR (a second guard alongside `chibicc_jit.rs`).
+  Reuses the threads cdylib + the committed/staged `chibicc.svmb`; SKIPs if the asset is absent, and
+  timing is informational so it only reds on IR divergence. See SELFHOST_C.md §7 / PR #483.
+
 - **ci.yml** (2026-07-27): the real-Chromium browser step stages the committed
   `browser/tests/fixtures/shell.svmb` into `web/assets/` and runs
   `node browser-shell-test.mjs` — the `svm-posix` shell playground card driven

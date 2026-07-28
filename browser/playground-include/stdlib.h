@@ -81,6 +81,89 @@ static inline long strtol(const char *s, char **end, int base) {
   return sign * v;
 }
 
+static inline unsigned long strtoul(const char *s, char **end, int base) {
+  unsigned long v = 0;
+  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+  if (*s == '+') s++;
+  if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; base = 16; }
+  if (base == 0) base = 10;
+  for (;;) {
+    int c = *s, d;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+    else break;
+    if (d >= base) break;
+    v = v * base + d;
+    s++;
+  }
+  if (end) *end = (char *)s;
+  return v;
+}
+static inline long long strtoll(const char *s, char **end, int base) {
+  long long sign = 1;
+  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
+  return sign * (long long)strtoul(s, end, base);
+}
+static inline unsigned long long strtoull(const char *s, char **end, int base) {
+  return (unsigned long long)strtoul(s, end, base);
+}
+static inline long long atoll(const char *s) { return strtoll(s, (char **)0, 10); }
+static inline long long llabs(long long x) { return x < 0 ? -x : x; }
+
+// `strtod` — decimal float parse (integer part, fraction, optional `e` exponent). Demo-accurate: it
+// accumulates in `double` rather than doing bignum shortest-round-trip, so the last ULP of a long
+// mantissa can differ from glibc (the same trade the `<stdio.h>` float formatter documents).
+static inline double strtod(const char *s, char **end) {
+  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+  double sign = 1;
+  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
+  double v = 0;
+  while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+  if (*s == '.') {
+    s++;
+    double scale = 0.1;
+    while (*s >= '0' && *s <= '9') { v += (*s++ - '0') * scale; scale *= 0.1; }
+  }
+  if (*s == 'e' || *s == 'E') {
+    s++;
+    int esign = 1, e = 0;
+    if (*s == '-') { esign = -1; s++; } else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') e = e * 10 + (*s++ - '0');
+    double p = 1, base = 10;
+    for (int i = 0; i < e; i++) p *= base;
+    if (esign < 0) v /= p; else v *= p;
+  }
+  if (end) *end = (char *)s;
+  return sign * v;
+}
+static inline double atof(const char *s) { return strtod(s, (char **)0); }
+
+typedef struct { int quot, rem; } div_t;
+typedef struct { long quot, rem; } ldiv_t;
+static inline div_t div(int a, int b) { div_t r; r.quot = a / b; r.rem = a % b; return r; }
+static inline ldiv_t ldiv(long a, long b) { ldiv_t r; r.quot = a / b; r.rem = a % b; return r; }
+
+// `bsearch` over a sorted array (the qsort companion).
+static inline void *bsearch(const void *key, const void *base, size_t n, size_t sz,
+                            int (*cmp)(const void *, const void *)) {
+  size_t lo = 0, hi = n;
+  const char *a = (const char *)base;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = cmp(key, a + mid * sz);
+    if (c < 0) hi = mid;
+    else if (c > 0) lo = mid + 1;
+    else return (void *)(a + mid * sz);
+  }
+  return 0;
+}
+
+// No environment in the sandbox powerbox — a program that reads `getenv` gets NULL (unset), which is
+// the portable "not present" path every getenv caller must already handle.
+static inline char *getenv(const char *name) { (void)name; return 0; }
+
 // Deterministic LCG (no wall clock in the sandbox).
 static unsigned long __pg_rng = 1;
 static inline int rand(void) { __pg_rng = __pg_rng * 6364136223846793005UL + 1442695040888963407UL; return (int)((__pg_rng >> 33) & 0x7fffffff); }

@@ -145,6 +145,22 @@ try {
     pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\npi=3.14 e=2.5\n') && pf.out.includes('SVM IR')
       ? ok('chibicc #include <stdio.h> + printf (incl. %f/%g floats) → real output in-browser')
       : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 90) })}`);
+
+    // The expanded libc (SELFHOST_C.md §7 "larger libc"): <math.h> algebra + <assert.h> (which needs
+    // the now-wired predefined __FILE__/__LINE__ macros) + <string.h>/<stdlib.h> additions, in-browser.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\n#include <math.h>\n#include <string.h>\n#include <assert.h>\n' +
+      'int main(void){ assert(sizeof(int)==4); char*d=strdup("libc");\n' +
+      'printf("%s sqrt=%g pow=%g\\n", d, sqrt(169.0), pow(2.0,10.0)); return 0; }'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const lc = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    lc.state === 'done' && lc.out.startsWith('libc sqrt=13 pow=1024\n')
+      ? ok('chibicc expanded libc (<math.h> + <assert.h> + strdup) → real output in-browser')
+      : fail(`chibicc libc: ${JSON.stringify({ state: lc.state, out: lc.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }
