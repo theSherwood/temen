@@ -860,11 +860,10 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
   // Tcl — the reference Tcl 8.6 interpreter with FULL Tcl_Init: the standard script library (init.tcl,
   // clock, msgcat, …) is embedded and served through an in-guest Tcl_Filesystem VFS, so clock/file/
   // glob/auto_load/package all work with no filesystem capability. The `tcl_init.svmb` asset is built
-  // by `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_init_stdin`). `jit: false` —
-  // the bytecode engine drives; proving `_start` wasm-JIT-emittable (near-native) is a follow-up.
+  // by `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_init_stdin`).
   'Tcl (8.6 — write & run)': {
     kind: 'module',
-    jit: false,
+    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
     editable: true,
     lang: 'tcl',
     url: './assets/tcl_init.svmb',

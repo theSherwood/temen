@@ -139,10 +139,14 @@ Tcl applications ship their library. `build_bitcode.sh` links both variants (`tc
 (~270 KB). Timezone data (`tzdata/`, ~900 files) is excluded — UTC `clock` works without it;
 local-zone conversion + `encoding` files are the remaining nicety.
 
-## Follow-up
+## wasm-JIT tier — the whole interpreter on emitted wasm
 
-- **wasm-JIT tier** — prove `_start` is wasm-JIT-emittable (`browser-jit-module-test`) so the
-  whole interpreter runs on emitted wasm in the playground (near-native), like Lua/SQLite/QuickJS.
+**DONE.** `_start` is **wasm-JIT-emittable**: the full-init module (`tcl_init.svmb`) runs on the
+emitted-wasm tier in real V8, **byte-identical to the interpreter** — `browser-jit-module-test.mjs`
+now drives Tcl (alongside hello_c/Lua/SQLite/QuickJS) through both `svm_run_onramp` and `runJitModule`
+and asserts equal stdout. The playground card (`play.js`) is `jit: true`, so the whole Tcl core +
+script library runs on emitted wasm in the browser, like Lua/SQLite/QuickJS. On the small demo script
+the win is modest (~1.3×, startup-dominated); it grows with compute, as QuickJS's ~10× shows.
 
 ## Running by hand
 
