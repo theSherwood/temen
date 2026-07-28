@@ -413,6 +413,13 @@ enum Op {
         size_log2: u32,
         quota: u32,
         dst: u32,
+        /// §14 `instantiate_named` (op 11, PROCESS.md S2): the `(grants_ptr, grants_n)` register pair
+        /// for the child's by-name grant list (op 0 is `None`). Same-module counterpart of op 13 — the
+        /// child runs the holder's *own* program at `entry`, but its powerbox additionally carries the
+        /// re-granted `grants_n × {name_off, name_len, handle, flags}` caps read from the parent window
+        /// (via the shared `Host::spawn_named_child`), so a spawned stage resolves an inherited region
+        /// (a ring end) or `stdout` by name — the concurrent-pipeline spawn.
+        grants: Option<(u32, u32)>,
     },
     /// §14 `Instantiator.instantiate_module(module, entry, off, size_log2, quota)` (op 5): like
     /// [`Op::Instantiate`], but the child runs a host-granted **separate** `Module` (`module` is its
@@ -833,11 +840,17 @@ fn scan_seams(funcs: &[Func]) -> Seams {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
-                    // ops 0/1 = instantiate/join, op 5 = instantiate_module (executor children);
-                    // everything else on INSTANTIATOR/YIELDER is the inline coroutine round-trip.
+                    // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 11 =
+                    // instantiate_named, op 13 = instantiate_module_named (all executor children,
+                    // scheduler-driven — the named variants re-grant caps but spawn the same kind of
+                    // confined task); everything else on INSTANTIATOR/YIELDER is the inline coroutine
+                    // round-trip. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
+                    // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
+                    // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 14,
+                        op: 0 | 1 | 5 | 11 | 13 | 14,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -1388,6 +1401,20 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     size_log2: g(args[2]),
                     quota: g(args[3]),
                     dst,
+                    grants: None,
+                },
+                // op 11 = instantiate_named: op 0 + a by-name grant list. Args:
+                // (grants_ptr, grants_n, entry, off, size_log2, quota). The child runs the holder's own
+                // program (same module as op 0); the driver reads the grant records from the parent
+                // window and re-grants each cap into the child powerbox.
+                (cap_id::INSTANTIATOR, 11) if args.len() >= 6 => Op::Instantiate {
+                    handle: g(*handle),
+                    entry: g(args[2]),
+                    off: g(args[3]),
+                    size_log2: g(args[4]),
+                    quota: g(args[5]),
+                    dst,
+                    grants: Some((g(args[0]), g(args[1]))),
                 },
                 (cap_id::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
@@ -2855,7 +2882,14 @@ impl<'p> Vcpu<'p> {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 }) => {
+                    // op 11 (named grants) is driven by the scheduler `drive` arm (the browser's
+                    // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
+                    // no child powerbox, so it declines a grant list rather than silently drop it.
+                    if grants.is_some() {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    }
                     if let Some(ev) =
                         self.event_instantiate(ibase, isz, entry, off, size_log2, quota, dst)
                     {
@@ -5458,9 +5492,13 @@ impl ScheduledDebugRun {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     } => {
                         *turn += 1;
-                        if let Err(t) = dbg_instantiate(
+                        // op 11 (named-grant spawn) is not driven by the debugger path.
+                        if grants.is_some() {
+                            dbg_complete(tasks, ti, Err(Trap::Malformed));
+                        } else if let Err(t) = dbg_instantiate(
                             tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
                             size_log2, quota, dst,
                         ) {
@@ -5625,8 +5663,12 @@ impl ScheduledDebugRun {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
-                    if let Err(t) = dbg_instantiate(
+                    // op 11 (named-grant spawn) is not driven by the debugger replay path.
+                    if grants.is_some() {
+                        dbg_complete(tasks, ti, Err(Trap::Malformed));
+                    } else if let Err(t) = dbg_instantiate(
                         tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
                         size_log2, quota, dst,
                     ) {
@@ -5912,6 +5954,9 @@ enum Outcome {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 11 (`instantiate_named`): the grant-list `(ptr, count)` (op 0 is `None`), read from the
+        /// register operands so the driver can re-grant the named caps into the child's powerbox.
+        grants: Option<(u64, u64)>,
     },
     /// §14 `Instantiator.instantiate_module`: like [`Outcome::Instantiate`], plus the resolved
     /// `Module` handle `mh` whose granted program the child runs (the driver resolves + compiles it).
@@ -6479,6 +6524,9 @@ enum VcpuStop {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 11 `instantiate_named`: resolved `(grants_ptr, grants_n)` window coordinates of the
+        /// child's by-name grant list (op 0 is `None`).
+        grants: Option<(u64, u64)>,
     },
     /// §14 `Instantiator.instantiate_module` — the driver additionally resolves + compiles the
     /// host-granted `Module` (`mh`) and runs it as the confined child's program.
@@ -6806,6 +6854,7 @@ fn step_vcpu(
                 size_log2,
                 quota,
                 dst,
+                grants,
             } => {
                 return Ok(VcpuStop::Instantiate {
                     ibase,
@@ -6815,6 +6864,7 @@ fn step_vcpu(
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 })
             }
             Outcome::InstantiateModule {
@@ -7222,9 +7272,13 @@ enum TaskState {
         slot: usize,
         dst: u32,
     },
-    /// Parked on `memory.wait` at futex key `key` until notified or `deadline` (logical clock).
+    /// Parked on `memory.wait` at futex `key` until notified or `deadline` (logical clock). The key is
+    /// **backing-identity canonical** ([`super::FutexKey`]): two confined `instantiate` children that
+    /// mapped the same `SharedRegion` into their separate windows park/wake on the same key (S1c), so a
+    /// pipe ring between concurrent stages rendezvous. A plain `thread.spawn` sibling (shared root
+    /// window, anonymous page) keys on its confined address — `FutexKey::Anon`, as before.
     BlockedWait {
-        key: u64,
+        key: super::FutexKey,
         deadline: u64,
         dst: u32,
     },
@@ -7592,6 +7646,7 @@ fn drive(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
                 // Validate the child entry signature against module 0 (a same-module child): it
                 // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
@@ -7654,10 +7709,55 @@ fn drive(
                 };
                 // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
                 // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
-                // over its *own* `[0, child_size)` window. These are its entry arguments.
-                let mut child_host = Host::new();
-                let cinst = child_host.grant_instantiator(0, child_size);
-                let cas = child_host.grant_address_space(0, child_size);
+                // over its *own* `[0, child_size)` window — its entry arguments. op 0 grants only
+                // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
+                // list read from the parent window, so a spawned stage resolves an inherited region
+                // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
+                // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm; grants resolve
+                // against the root `host`, so a confined child's forged handle fails `can_regrant`).
+                let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants {
+                    // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
+                    // records from the parent window (identical to the op-13 `InstantiateModule` arm).
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let list: Result<Vec<(String, i32)>, Trap> = (|| {
+                        let m = pm.ok_or(Trap::Malformed)?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..grants_n {
+                            let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name_bytes = m.read_window(name_off, name_len)?;
+                            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                            list.push((name, handle));
+                        }
+                        Ok(list)
+                    })();
+                    let list = match list {
+                        Ok(l) => l,
+                        Err(t) => {
+                            complete(&mut tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    match host.spawn_named_child(&list, child_size) {
+                        Some(triple) => triple,
+                        None => {
+                            complete(&mut tasks, ti, Err(Trap::CapFault));
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut ch = Host::new();
+                    let cinst = ch.grant_instantiator(0, child_size);
+                    let cas = ch.grant_address_space(0, child_size);
+                    (ch, cinst, cas)
+                };
                 // §3.6: a same-module child serves over the shared program — its serve machinery
                 // (enqueue admission, handler resolution) and any `child_offer` shape read the
                 // domain's registered module, exactly the tree-walker's `self_module` handoff.
@@ -8086,11 +8186,24 @@ fn drive(
                     continue;
                 }
                 // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
-                // already changed, return not-equal; else park until notified or timed out.
-                let cur = mem
-                    .as_ref()
-                    .map(|m| m.atomic_value(base, width))
-                    .unwrap_or(0);
+                // already changed, return not-equal; else park until notified or timed out. Both the
+                // value re-read and the rendezvous key are taken against THIS task's own memory: a
+                // confined `instantiate` child steps against its `extra_envs` window, not the root
+                // `mem`, and the key is backing-identity canonical (`futex_key`) so two children that
+                // mapped the same `SharedRegion` into separate windows rendezvous (S1c). Reading the
+                // root `mem` here instead would make a child's `wait` on its mapped ring flag re-read
+                // an unrelated root byte and spin forever.
+                let (cur, key) = {
+                    let tmem: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    (
+                        tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
+                        tmem.map(|m| m.futex_key(base))
+                            .unwrap_or(super::FutexKey::Anon(base)),
+                    )
+                };
                 if cur != expected {
                     tasks[ti]
                         .vt
@@ -8098,42 +8211,59 @@ fn drive(
                         .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                 } else {
                     tasks[ti].state = TaskState::BlockedWait {
-                        key: base,
+                        key,
                         deadline: clock.saturating_add(timeout),
                         dst,
                     };
                 }
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
-                // Wake up to `count` waiters on `base`, lowest task index first (deterministic).
+                // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
+                // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
+                // from one child's window matches a waiter parked from another child's window on the
+                // same `SharedRegion` byte.
+                let key = {
+                    let tmem: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    tmem.map(|m| m.futex_key(base))
+                        .unwrap_or(super::FutexKey::Anon(base))
+                };
                 let want = count as u32;
                 let mut woken = 0u32;
                 for t in &mut tasks {
                     if woken >= want {
                         break;
                     }
-                    if let TaskState::BlockedWait { key, dst: wdst, .. } = t.state {
-                        if key == base {
+                    if let TaskState::BlockedWait {
+                        key: wkey,
+                        dst: wdst,
+                        ..
+                    } = t.state
+                    {
+                        if wkey == key {
                             t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                             t.state = TaskState::Runnable;
                             woken += 1;
                         }
                     }
                 }
-                // §3.6 slice 5a: also wake event-parked FIBER waiters on this key (lowest slot
-                // next, deterministic like the task scan). The status is delivered when a
-                // `cont.resume` claims the fiber — its resumer re-admits it cooperatively.
+                // §3.6 slice 5a: also wake event-parked FIBER waiters (lowest slot next, deterministic
+                // like the task scan). Fibers can't coexist with `instantiate` (the module-level veto),
+                // so a fibered wait is always single-window — it keys on the raw confined address,
+                // unchanged. The status is delivered when a `cont.resume` claims the fiber.
                 for f in fibers.iter_mut() {
                     if woken >= want {
                         break;
                     }
                     if let FiberState::WaitParked {
-                        key,
+                        key: fkey,
                         woken: w @ None,
                         ..
                     } = f
                     {
-                        if *key == base {
+                        if *fkey == base {
                             *w = Some(super::WAIT_WOKEN);
                             woken += 1;
                         }
@@ -8659,7 +8789,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
+                // op 11 (named-grant spawn) is driven only by the cooperative single-thread `drive`
+                // path (the browser's wasm-safe entry); the OS-thread parallel driver declines it.
+                if grants.is_some() {
+                    return (Err(Trap::Malformed), mem);
+                }
                 // Validate the child entry signature against module 0 and the power-of-two-aligned
                 // carve within `[0, isize)` — identical to the cooperative `drive` arm.
                 let c0 = dom.source.primary();
@@ -10092,6 +10228,7 @@ impl Vm {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
@@ -10099,6 +10236,8 @@ impl Vm {
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
                     let quota = r!(*quota).i64();
+                    // op 11: resolve the grant-list `(ptr, count)` from their registers (op 0 is None).
+                    let grants = grants.map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
@@ -10112,6 +10251,7 @@ impl Vm {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     });
                 }
                 // §14 separate-module executor child — like `Instantiate`, but the first arg is a
