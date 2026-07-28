@@ -783,8 +783,11 @@ playground-registration job (see `demos/tcl/README.md`).
   (`gen_tcl_library.py` → `tcl_library.h`): the VFS callbacks fill Tcl's own `Tcl_StatBuf` in C (no ABI
   gap), need **no filesystem capability**, and work identically native/svm/browser. `build_bitcode.sh`
   links both variants; the playground card uses the full-init `tcl_init.svmb`.
-- **Follow-up:** the wasm-JIT tier once `_start` is proven emittable (near-native browser speed), like
-  Lua/SQLite/QuickJS; timezone (`tzdata`) + `encoding` files for non-UTC `clock` / legacy charsets.
+- **DONE — wasm-JIT tier.** `_start` is **wasm-JIT-emittable**: `tcl_init.svmb` runs on the
+  emitted-wasm tier in real V8 **byte-identical to the interpreter** (`browser-jit-module-test.mjs`
+  now drives Tcl alongside Lua/SQLite/QuickJS), so the playground card is `jit: true` — the whole Tcl
+  core + script library runs on emitted wasm in the browser, like Lua/SQLite/QuickJS.
+- **Follow-up:** timezone (`tzdata`) + `encoding` files for non-UTC `clock` / legacy charsets.
 
 **Slice W (DONE) — varargs `printf`, the guest-side format engine (lands `hexdump`).** A
 `printf(fmt, …)` with a **constant** format string is parsed at translate time (`parse_format`):

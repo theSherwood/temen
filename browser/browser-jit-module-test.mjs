@@ -29,6 +29,9 @@ const CASES = [
   { name: 'lua_eval', stdin: 'local s=0; for i=1,2000000 do s=s+i end; print(s)\n' },
   { name: 'sqlite_repl', stdin: "CREATE TABLE t(x);\nWITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<50000) INSERT INTO t SELECT i FROM c;\nSELECT sum(x), count(*) FROM t;\n" },
   { name: 'qjs_repl', stdin: "function fib(n){return n<2?n:fib(n-1)+fib(n-2);}\nconsole.log('fib', Array.from({length:25},(_,i)=>fib(i)).join(' '));\nconst xs=[5,3,8,1,9,2,7]; console.log('sorted', xs.slice().sort((a,b)=>a-b).join(','));\nlet s=0; for(let i=0;i<500000;i++) s+=i; console.log('sum', s);\nconsole.log('re', 'a1b2c3'.replace(/[0-9]/g,'#'));\n" },
+  // Full Tcl_Init: the script library (clock/file/glob) loads from the embedded VFS, so this drives
+  // both the language core AND the auto_load/package path through the emitted-wasm tier.
+  { name: 'tcl_init', stdin: "proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }\nputs \"fib [lmap i {1 2 3 4 5 6 7 8} {fib $i}]\"\nputs \"sorted [lsort -integer {5 3 8 1 9 2 7}]\"\nputs \"clock [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\"\nputs \"file [file join /a b c] ext=[file extension archive.tar.gz]\"\nputs [format {pi=%.4f 255=0x%X sqrt2=%.6f} 3.14159265 255 [expr {sqrt(2)}]]\nputs [string toupper {tcl on svm}]\n" },
 ].filter((c) => existsSync(`${ROOT}/web/assets/${c.name}.svmb`));
 
 const res = await page.evaluate(async (cases) => {
