@@ -85,14 +85,15 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes) {
 // the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
 // argv (`svm_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver
 // just hands over the module + source. The emitted SVM-IR comes back on `svm_stdout_*` after finish.
-export async function runJitCompiler(ex, memory, moduleBytes, srcBytes) {
+export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInfo = 0) {
   const u8 = () => new Uint8Array(memory.buffer);
   const modP = Number(ex.svm_alloc(moduleBytes.length));
   const srcP = Number(ex.svm_alloc(srcBytes.length));
   u8().set(moduleBytes, modP);
   u8().set(srcBytes, srcP);
-  // Empty header image (0, 0) — the cdylib seeds the built-in playground headers itself.
-  const opened = ex.svm_onramp_jit_run_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length);
+  // Empty header image (0, 0) — the cdylib seeds the built-in playground headers itself. `debugInfo`
+  // selects chibicc's `-g` debug section (off by default, matching the bytecode `svm_run_onramp_fs`).
+  const opened = ex.svm_onramp_jit_run_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length, debugInfo);
   ex.svm_dealloc(modP, moduleBytes.length);
   ex.svm_dealloc(srcP, srcBytes.length);
   if (opened !== 0) {

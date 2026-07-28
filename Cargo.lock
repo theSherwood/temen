@@ -621,6 +621,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-parity",
  "svm-posix",
  "svm-run",
  "svm-snapshot",
@@ -724,6 +725,17 @@ dependencies = [
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "svm-leng"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-text",
+ "svm-verify",
 ]
 
 [[package]]

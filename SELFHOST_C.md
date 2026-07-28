@@ -242,9 +242,10 @@ compiler bug is a clean error, never an escape.
    (a) the seeded libc headers are now `static inline`, and `codegen_ir.c` honours chibicc's `is_live`
    dead-code pass (the native `codegen.c` already did) — so `#include <stdio.h>` no longer compiles the
    ~13 unused libc functions (`puts`/`snprintf`/`fgets`/…) into every program, only `printf`'s reachable
-   closure; (b) the playground passes `-g0` (new guest-driver flag), dropping the `-g` debug info that
-   the compiled program never uses (~a third of the IR). The remaining lever was getting chibicc off the
-   bytecode interpreter and onto the wasm-JIT — done next.
+   closure; (b) debug info is **off by default** in the guest driver (`cc1_main.c`) — the `debug.*` waist
+   is ~a third of the IR, so a plain compile drops it; the playground passes `-g` only when the user opts
+   into source-level C debugging (the Debug button — DEBUGGING.md). The remaining lever was getting chibicc
+   off the bytecode interpreter and onto the wasm-JIT — done next.
 
    **→ wasm-JIT tier DONE 2026-07-28 — chibicc compiles on emitted wasm.** The card's compile pass (the
    slow half) now takes the **"wasm-JIT" toggle** (default on): chibicc's whole `_start` emits to wasm
@@ -258,9 +259,9 @@ compiler bug is a clean error, never an escape.
    run-to-completion twin of the Doom `JitOnrampReactor`, added for Lua/SQLite): this slice added an
    **fs+argv opener** (`open_owned_run_fs`/`open_shared_run_fs` + the `svm_onramp_jit_run_open_fs` FFI
    export) that grants the same headless memfs powerbox the bytecode `onramp_fs_exec` does (shared
-   `chibicc_card_image` + `CHIBICC_CARD_ARGV`) and seeds argv at `POWERBOX_ARGS_BASE`, plus the
-   `runJitCompiler` JS driver (a sibling of `runJitModule`). **No substrate / TCB change** — the emitter,
-   the interpreter, and the powerbox are all untouched. Gated by:
+   `chibicc_card_image` + `chibicc_card_argv`, which honours the same `-g` debug-info flag) and seeds argv
+   at `POWERBOX_ARGS_BASE`, plus the `runJitCompiler` JS driver (a sibling of `runJitModule`). **No
+   substrate / TCB change** — the emitter, the interpreter, and the powerbox are all untouched. Gated by:
    - `browser/tests/chibicc_jit.rs` — a native `wasmi` differential (the `jit_module.rs` pattern): the
      JIT-emitted IR is **byte-identical** to the interpreter oracle (`onramp_fs_exec`), and the emitted
      program then parses + runs to its expected stdout.
@@ -285,8 +286,10 @@ compiler bug is a clean error, never an escape.
   `OP_REALLOC` (host allocator owns block metadata, matching the POSIX.md split; personality
   growth, not substrate) or a guest size-header shim over the existing `malloc` op. Decide at
   implementation; both are small.
-- `-g` cost in the guest: always emit debug info, or a flag? Always-on pairs with the W1 debugger;
-  measure the size hit on `chibicc.svmb`.
+- ~~`-g` cost in the guest: always emit debug info, or a flag?~~ **Settled 2026-07-28: a flag, off by
+  default.** The `debug.*` waist is ~a third of the emitted IR, so `cc1_main.c` defaults `opt_g` off and
+  takes `-g` to turn it on; the playground passes `-g` only for a source-level debug session (the Debug
+  button on the C card), and compiles clean/fast otherwise.
 
 ## 9. Non-goals
 

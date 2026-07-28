@@ -1045,6 +1045,125 @@ block 0 (vx: i64) {
     );
 }
 
+/// §13.4 step 5 — **cross-cut O10 re-issue, reload-not-reissue guard.** A cross-cut caller is a
+/// dispatch enqueued from *outside* the freeze cut (an embedder / a domain in another run) that is
+/// in-flight when the serving domain freezes. The flagship above pins that it is served *once* on
+/// thaw; this pins the other half of O10 — a *completed* boundary call is **not resurrected**. We
+/// freeze a domain with a queued dispatch, thaw and let the re-issued serve op drain it (served
+/// once), then **re-freeze the thawed-and-served domain and thaw again**: the drained dispatch is
+/// gone from the restored serve trio, so the second serve run finds an empty queue (`served = 0`)
+/// and no completion cell is refilled. Re-issue applies to the *in-flight* dispatch on the first
+/// thaw; it must not re-fire once the call has completed — the R8/R11 rule at the serve boundary.
+///
+/// (The complementary *in-cut* caller — a guest parked in `CapReply` on a live offer inside the
+/// same run — is not reachable under today's freeze triggers: enqueuing wakes the callee's
+/// `svc.wait`, so the server serves before the run can quiesce, and freeze-on-quiesce drains only
+/// `svc_waiters`, never `ticket_waiters`; a `CapReply` fiber park still fails the freeze closed.
+/// When a future trigger admits it, the decided policy is the same O10 re-issue — the caller's
+/// rewound frame re-issues the `cap.call` on thaw — so this guard is the semantics it will inherit.)
+#[test]
+fn a_completed_cross_cut_dispatch_is_not_resurrected_on_refreeze() {
+    const SRC_SERVE: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 1 }
+
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 9 () -> (i64) vz ()
+  vc = i64.const 65600
+  vafter = i64.load vc
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vr = i64.add vm vafter
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vc = i64.const 65600
+  i64.store vc vx
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+"#;
+    let mut m = svm_text::parse_module(SRC_SERVE).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Freeze #1: one cross-cut dispatch queued, stopped at the serve point.
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.set_self_module(&inst);
+    let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 1_000_000u64;
+    let (r1, snap1) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut host);
+    assert!(r1.is_ok(), "freeze #1 returns a placeholder: {r1:?}");
+    let artifact1 = freeze(&inst, &snap1, &host).expect("freeze #1");
+
+    // Thaw #1: the re-issued serve op drains the one dispatch — served exactly once.
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact1, &inst, &mut rhost).expect("restore #1");
+    assert_eq!(
+        rhost.svc_state().0.len(),
+        1,
+        "artifact #1 carried the dispatch"
+    );
+    rhost.set_durable(true);
+    rhost.set_self_module(&inst);
+    let mut twin = rwin.clone();
+    begin_thaw(&mut twin, 0);
+    let mut fuel = 1_000_000u64;
+    let (thawed1, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut rhost);
+    assert_eq!(
+        thawed1,
+        Ok(vec![Value::I64(1041)]),
+        "thaw #1 served the cross-cut dispatch once (served*1000 + cell)"
+    );
+    // Inspect the serve trio *without consuming* the cell (`svc_result` removes it on read): the
+    // dispatch is drained from the queue, and its completion cell holds the delivered result.
+    let (q1, cells1, _next1) = rhost.svc_state();
+    assert!(
+        q1.is_empty(),
+        "the served dispatch is drained from the queue, not retained"
+    );
+    assert_eq!(
+        cells1,
+        vec![(ticket, 42)],
+        "the delivered result sits in the completion cell (unconsumed)"
+    );
+
+    // Re-freeze the post-thaw serve state directly (like the empty-elision path — no re-run to a
+    // serve point is needed; the serve trio lives on the host). The wire must NOT carry the
+    // already-served dispatch back onto the queue: restoring artifact #2 yields an empty queue, and
+    // the ticket's completion cell **reloads** its saved result (42) rather than the call being
+    // re-issued (which would re-append the dispatch and re-run the handler on the next thaw).
+    let win_rf = init_durable_window(WINDOW);
+    let artifact2 = freeze(&inst, &win_rf, &rhost).expect("re-freeze post-serve");
+    let mut rhost2 = Host::new();
+    restore(&artifact2, &inst, &mut rhost2).expect("restore #2");
+    assert!(
+        rhost2.svc_state().0.is_empty(),
+        "artifact #2 carries no resurrected dispatch"
+    );
+    assert_eq!(
+        rhost2.svc_result(ticket),
+        Some(42),
+        "the completed result reloads across the re-freeze, it is not re-issued"
+    );
+}
+
 /// §13.4 slice 4d — a **supervisor holding a live cap** onto a serving child freezes (its
 /// `LiveImpl` handle captured structurally by the callee's join slot, v15) and thaws with the
 /// cap **re-linked** to the re-created child. The supervisor instantiates a same-module child

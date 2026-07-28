@@ -1,0 +1,25 @@
+[package]
+name = "svm-leng"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The **fourth frontend** (NIM.md Phase 2): a Leng-NIF → SVM-IR translator. Leng is nimony's
+# C-like midlevel IR (the seam its C/C++/LLVM/arkham backends already consume). Like the chibicc
+# fork, `svm-wasm`, and `svm-llvm`, this is NOT part of the escape-TCB: it consumes the core crates
+# to produce a Module and is never a dependency of svm-jit/svm-interp — everything it emits is
+# re-verified by svm-verify, so a translation bug is a clean error, never an escape (DESIGN.md §2a).
+#
+# Status: a walking skeleton — the integer/arithmetic/call/local subset, straight-line + `ret`,
+# with fail-closed `Unsupported` for everything else (control flow, aggregates, pointers, floats).
+# It emits SVM text (svm_text::parse_module) the way chibicc's codegen_ir.c does; growing it means
+# adding grammar arms, not rearchitecting.
+
+[dependencies]
+svm-ir = { path = "../svm-ir" }
+svm-text = { path = "../svm-text" }
+
+[dev-dependencies]
+svm-verify = { path = "../svm-verify" }
+svm-interp = { path = "../svm-interp" }
+svm-jit = { path = "../svm-jit" }

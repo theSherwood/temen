@@ -297,3 +297,94 @@ fn fold_down_mask_rejected_identically() {
         "bytecode must reject fold-down mask"
     );
 }
+
+// ---- gc.roots coexisting with threads (the veto this engine used to apply) ----------------------
+//
+// `compile_module` used to decline any module with both `gc.roots` and a `thread.*` op (fall back to
+// the tree-walker), on the worry that a sibling vCPU could hold an unscanned root. But `gc.roots` is
+// per-vCPU by contract — each vCPU enumerates its own continuation plus the run-shared fiber registry
+// (`gc_roots.rs`), and cross-thread GC soundness is the guest's job via a stop-the-world quiesce
+// (`gc_quiesce.rs`). So the combination is admitted natively now; these pin the soundness (`tw ⊆ bc`)
+// and, crucially, that `compile_and_run_capture` no longer declines (its `.expect` would panic).
+
+/// `gc.roots` after a `thread.spawn`/`join`: the module carries a `thread.*` op (the old veto trigger)
+/// yet the caller's own root must still be enumerated on the bytecode engine.
+const GC_WITH_THREAD: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vsp = i64.const 0
+  varg = i64.const 0
+  vh = thread.spawn 1 vsp varg
+  vjr = thread.join vh
+  vroot = i64.const 5000
+  vlo = i64.const 4096
+  vhi = i64.const 8192
+  vmask = i64.const -1
+  vbuf = i64.const 0
+  vcap = i64.const 64
+  vt = gc.roots vlo vhi vmask vbuf vcap
+  return vt
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
+#[test]
+fn gc_roots_with_thread_is_admitted_and_sound() {
+    // 4096 (vlo constant) + 5000 (planted caller root) are both in range; the spawned thread is
+    // trivial. The `check` helper's `compile_and_run_capture(...).expect(...)` verifies the bytecode
+    // engine runs this natively rather than declining (the removed veto).
+    check(GC_WITH_THREAD, 4096, 8192, &[5000]);
+}
+
+/// The JACL seam profile: `gc.roots` + `thread.*` + a parked **fiber** holding a live root. A guest
+/// GC that spawns worker threads and runs its jobs as migratable fibers (JACL) must still find the
+/// job's root — it lives in the run-shared fiber registry `gc.roots` scans.
+const GC_WITH_THREAD_AND_FIBER: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vsp0 = i64.const 0
+  varg0 = i64.const 0
+  vh = thread.spawn 2 vsp0 varg0
+  vjr = thread.join vh
+  vf = ref.func 1
+  vfsp = i64.const 0
+  vk = cont.new vf vfsp
+  varg = i64.const 0
+  vst, vval = cont.resume vk varg
+  vlo = i64.const 4096
+  vhi = i64.const 8192
+  vmask = i64.const -1
+  vbuf = i64.const 0
+  vcap = i64.const 64
+  vt = gc.roots vlo vhi vmask vbuf vcap
+  return vt
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vroot = i64.const 5000
+  vy = i64.const 1
+  vr = suspend vy
+  vsum = i64.add vroot vr
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
+#[test]
+fn gc_roots_with_thread_and_parked_fiber_is_sound() {
+    // The parked fiber's live root (5000) must be enumerated even though the module also threads.
+    check(GC_WITH_THREAD_AND_FIBER, 4096, 8192, &[5000]);
+}

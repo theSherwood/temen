@@ -739,6 +739,7 @@ print("squares:", table.concat(sq, " "))
   },
   'C compiler (chibicc → SVM — compile & run)': {
     kind: 'chibicc',
+    debug: true, // source-level C debugging: tick "debug info (-g)", then Debug (see the debugger below)
     jit: true, // chibicc's _start emits to wasm (333 funcs; cap-call/float helpers bounce cross-tier) —
     //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by chibicc_jit.rs)
     editable: true,
@@ -770,6 +771,38 @@ int main(void) {
   printf("  e   ~ %.10g\\n", 2.718281828459045);
   printf("  1/7 = %.4f,  2^0.5 rounds to %.3g\\n", 1.0 / 7.0, 1.41421356);
   return 0;
+}
+`,
+  },
+  'C source-level debugging (chibicc → SVM — breakpoints on C lines)': {
+    kind: 'chibicc',
+    debug: true,
+    gOn: true, // debug info starts ON: this card is ready to Debug (the compiler emits chibicc's -g waist)
+    bp: 7, // pre-place a breakpoint on the `acc += i;` line (0-based editor line 7)
+    jit: false,
+    editable: true,
+    lang: 'c',
+    url: './assets/chibicc.svmb',
+    mode: 'io',
+    desc: 'Debug a **C program at source level**, entirely in the browser. chibicc compiles this C with ' +
+      '`-g` (the DEBUGGING.md §6 debug-info waist — source lines + variable names), and the DAP debugger ' +
+      'runs the emitted IR on the bytecode engine: set a breakpoint in the gutter on a C line, press ' +
+      'Debug, and it stops on that C line with the C locals (i, acc) named in the Variables pane. Step / ' +
+      'Continue / reverse all work. A breakpoint is pre-placed on the `acc += i;` line. Note: the ' +
+      'debugger runs the compiled program deny-all (no powerbox), so this demo is compute-only — a ' +
+      '`printf` (which needs the ambient write capability) would trap; powerbox-backed C debugging is a ' +
+      'follow-up. Untick "debug info (-g)" to compile clean, faster IR (and disable the debugger).',
+    src: `// A compute-only C program (no printf → no powerbox needed): sum 3+2+1 = 6.
+// A breakpoint is pre-placed on "acc += i;" — press Debug and step the loop,
+// watching i and acc in the Variables pane. Click the gutter to move it.
+int main(void) {
+  int acc = 0;
+  int i = 3;
+  while (i > 0) {
+    acc += i;
+    i -= 1;
+  }
+  return acc;
 }
 `,
   },
@@ -936,6 +969,7 @@ function winSizeOf(src) {
 // a time (a fresh Run supersedes any running reactor). `eng`/`run` are the shared wasm engine; `broken`
 // latches when a threaded run is Stopped mid-flight (shared state may wedge → every card's Run disables).
 let eng, run, aborter = null, broken = false;
+let engineReady = false; // set once the wasm engine loads; gates the per-card Debug/Run enablement
 const cards = [];
 
 const setState = (c, state, text) => { c.el.state.dataset.state = state; c.el.state.textContent = text; };
@@ -1189,10 +1223,13 @@ async function runChibicc(c) {
   // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
   setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
+  // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `svm_run_onramp_fs`).
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
   let cstatus, tier = 'interpreter';
   if (useJit) {
     try {
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes);
+      // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
@@ -1207,7 +1244,7 @@ async function runChibicc(c) {
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
     cstatus = eng.ex.svm_status();
     eng.ex.svm_dealloc(p, compiler.length);
     eng.ex.svm_dealloc(sp, srcBytes.length);
@@ -1826,6 +1863,8 @@ async function proveChibiccParity(c) {
     c.el.prove.disabled = false;
     return;
   }
+  // Both tiers must compile with the same `-g` setting for the IR to match (it's a byte differential).
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
   try {
     // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
@@ -1835,14 +1874,14 @@ async function proveChibiccParity(c) {
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
     eng.ex.svm_dealloc(p, compiler.length);
     eng.ex.svm_dealloc(sp, srcBytes.length);
     const interpIr = readModuleStdout();
     // wasm-JIT pass 1.
     let jitIr;
     try {
-      await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes);
+      await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
       jitIr = readModuleStdout();
     } catch (e) {
       setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
@@ -1876,20 +1915,24 @@ let dapWatch = new Set(); // source-variable names armed as data breakpoints (wa
 let dapScopeRef = 0; // the paused frame's Locals `variablesReference` (what `dataBreakpointInfo` scopes to)
 let dapStopped = 1; // the DAP threadId that hit the current stop (stepping always drives this thread)
 let dapThread = 1; // the DAP threadId currently being inspected (select a thread to view its stack)
+let dapSource = 'source.svm'; // the DAP source path breakpoints target this session (the launched
+                              // program's `debug.file`; for chibicc the compiled IR's `/in.c`, not the C editor)
 
 // The DAP source a breakpoint request targets — the program's own `debug.file 0 "…"` if it declares
 // one, else the name the engine's auto debug info uses (svm-text's AUTO_DEBUG_FILE = "source.svm"), so
-// breakpoints bind for a hand-written program with no explicit `debug` section.
+// breakpoints bind for a hand-written program with no explicit `debug` section. For chibicc this reads
+// the *compiled IR*'s `debug.file` (`/in.c`) — the C editor lines still map through chibicc's debug.loc.
 function dapSourceName(src) {
   const m = /debug\.file\s+0\s+"([^"]+)"/.exec(src);
   return m ? m[1] : 'source.svm';
 }
 
-// Push the card's current breakpoint lines (editor 0-based → DAP 1-based) to the server.
+// Push the card's current breakpoint lines (editor 0-based → DAP 1-based) to the server, against the
+// session's source (`dapSource` — set at launch to the launched program's `debug.file`).
 function dapSyncBreakpoints(c) {
   const breakpoints = c.editor.breakpointLines().map((l) => ({ line: l + 1 }));
   dapClient.send('setBreakpoints', {
-    source: { path: dapSourceName(c.editor.getValue()) },
+    source: { path: dapSource },
     breakpoints,
   });
 }
@@ -1985,21 +2028,65 @@ function dapHandle(c, reply) {
   }
 }
 
-// Start a debug session on the card's current SVM text (on the bytecode engine).
-function startDebug(c) {
+// Fetch chibicc and compile the card's current C source to SVM-IR text with `-g` (the debug waist:
+// source lines + variable names), for a source-level debug session. Returns `{ ir, status, stderr }`;
+// the caller reports a failed compile. Mirrors `runChibicc`'s pass 1, always debug-on.
+async function chibiccCompileIR(c) {
+  const compiler = await fetchModule(c.ex.url, onFetchProgress(c, baseName(c.ex.url)));
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  if (srcBytes.length === 0) return { ir: '', status: -1, stderr: 'empty source' };
+  const p = eng.ex.svm_alloc(compiler.length);
+  const sp = eng.ex.svm_alloc(srcBytes.length);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(compiler, p);
+  view.set(srcBytes, sp);
+  eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 1); // 1 = -g
+  const status = eng.ex.svm_status();
+  const ir = readModuleStdout();
+  const stderr = readModuleStderr();
+  eng.ex.svm_dealloc(p, compiler.length);
+  eng.ex.svm_dealloc(sp, srcBytes.length);
+  return { ir, status, stderr };
+}
+
+// Start a debug session on the bytecode engine. For an SVM-text card the editor content *is* the
+// program. For the chibicc C card, compile the C with `-g` first and debug the emitted IR at **C source
+// level**: breakpoints on C lines + C locals by name bind through chibicc's `debug.loc`/`debug.var`,
+// while the editor keeps showing C. (The DAP backend runs deny-all, so a program that calls a host
+// capability — e.g. `printf` → `write` — CapFaults; compute-only programs debug cleanly.)
+async function startDebug(c) {
   if (broken) return;
   stopReactor();
   if (dapCard) endDebug(dapCard, null); // supersede any running session
-  const src = c.editor.getValue();
+  let programText;
+  if (c.ex.kind === 'chibicc') {
+    setState(c, 'running', 'compiling with -g…');
+    let compiled;
+    try {
+      compiled = await chibiccCompileIR(c);
+    } catch (e) {
+      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the compiler`);
+      return;
+    }
+    if ((compiled.status !== 0 && compiled.status !== 5) || compiled.ir.length === 0) {
+      setState(c, 'error', `compile failed: status ${compiled.status}${compiled.stderr ? ` — ${compiled.stderr.trim()}` : ''}`);
+      return;
+    }
+    programText = compiled.ir;
+    logTo(c, `compiled with -g: ${compiled.ir.length}B debuggable SVM IR`);
+  } else {
+    programText = c.editor.getValue();
+  }
   dapClient = createDapClient(eng.ex, eng.memory);
   dapCard = c;
   dapWatch = new Set();
   dapStopped = 1;
   dapThread = 1;
+  dapSource = dapSourceName(programText); // breakpoints target the launched program's `debug.file`
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
   dapClient.send('initialize', {});
-  const launch = dapClient.send('launch', { programText: src, function: 0, args: [], engine: 'bytecode' });
+  const launch = dapClient.send('launch', { programText, function: 0, args: [], engine: 'bytecode' });
   if (!launch.response.success) {
     endDebug(c, null);
     setState(c, 'error', 'debug launch failed — does the program parse and verify?');
@@ -2287,11 +2374,27 @@ function buildCard(name, ex) {
     shareBtn.title = 'Copy a link that reproduces the current editor contents';
     controls.append(resetBtn, shareBtn);
   }
+  // The chibicc C card gets a "debug info (-g)" checkbox: off by default (chibicc then compiles clean,
+  // fast IR — the `debug.*` waist is ~a third of the output). Ticking it makes chibicc emit the source
+  // waist (so Run shows the `debug.*` sections) and enables source-level C debugging via the Debug
+  // button below. Default-on for a card that carries `gOn` (the ready-to-debug demo).
+  let gflag = null;
+  if (ex.kind === 'chibicc') {
+    const l = el('label', 'jit-label');
+    l.title = 'Emit chibicc’s debug info (source lines + variable names). Off = clean, fast IR; on = debuggable.';
+    gflag = el('input');
+    gflag.type = 'checkbox';
+    gflag.checked = !!ex.gOn;
+    l.append(gflag, ' debug info (-g)');
+    controls.appendChild(l);
+  }
   // A debug-capable card gets a Debug button (starts a DAP session on the bytecode engine).
   let debugBtn = null;
   if (ex.debug) {
     debugBtn = el('button', 'debug', 'Debug');
-    debugBtn.title = 'Debug this SVM program on the bytecode engine — breakpoints, stepping, variables';
+    debugBtn.title = ex.kind === 'chibicc'
+      ? 'Compile with -g and debug the C at source level — breakpoints on C lines, C locals by name (tick "debug info (-g)" first)'
+      : 'Debug this SVM program on the bytecode engine — breakpoints, stepping, variables';
     debugBtn.disabled = true;
     controls.appendChild(debugBtn);
   }
@@ -2387,10 +2490,17 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
+  // chibicc: the Debug button needs debug info, so it tracks the "-g" checkbox (source-level C debugging
+  // is only possible with the emitted `debug.*` waist). Non-chibicc debug cards leave it engine-gated.
+  if (gflag && debugBtn) {
+    const syncDbg = () => { debugBtn.disabled = broken || !engineReady || !gflag.checked; };
+    gflag.addEventListener('change', syncDbg);
+    c._syncDbgBtn = syncDbg;
+  }
   // Clicking a variable's ● toggle arms/clears a data breakpoint; clicking a thread button focuses that
   // thread's stack (delegated: the Variables pane is re-rendered on every stop, so the listener lives
   // on the stable container).
@@ -2497,10 +2607,14 @@ async function main() {
     setEngineState('error', `engine load failed: ${e.message}`);
     return;
   }
+  engineReady = true;
   for (const c of cards) {
     c.el.run.disabled = false;
     if (c.el.prove) c.el.prove.disabled = false;
-    if (c.el.debug) c.el.debug.disabled = false;
+    // chibicc's Debug tracks its "-g" checkbox (source-level debugging needs the emitted debug info);
+    // every other debug card enables unconditionally now the engine is up.
+    if (c._syncDbgBtn) c._syncDbgBtn();
+    else if (c.el.debug) c.el.debug.disabled = false;
   }
   setEngineState('ready', 'engine ready');
 }

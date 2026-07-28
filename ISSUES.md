@@ -1275,22 +1275,32 @@ if git-over-https is ever gated too — that is the shape `demos/doom/fetch.sh` 
 
 ---
 
-### I43 — `poll` after a synchronous spawn is not backend-portable: the interpreter runs the child lazily, the JIT eagerly (S3) — split out of STAGE1.md "Known caveat" (2026-07-24)
+### I43 — child `poll` (op 9) is a **WNOHANG** probe; its *terminal* status is backend-portable — **RESOLVED 2026-07-28**: contract clarified + differentially pinned (`claude/svm-ir-wasm-comparison-y0lkbn`)
 
 **What.** A crashing command must not crash the shell, so the shell reaches for `poll` (op 9: is the
-spawned child done yet?) instead of an unconditional `join`. But `poll` after a *synchronous* spawn is
-not yet backend-portable: the tree-walk interpreter runs the child **lazily** (only at `join`), so
-`poll` reports `0` (still running); the JIT runs it **eagerly** on its own OS thread, so `poll` reports
-`1` (returned). A differential `poll`-based control flow therefore disagrees across backends today.
+spawned child done yet?) instead of an unconditional `join`. The original concern: `poll` immediately
+after a *synchronous* spawn reads differently across backends — the tree-walk interpreter runs the child
+**lazily** (M:N scheduler defers it), so an immediate `poll` reads `0` (still running); the JIT runs it
+**eagerly** on its own OS thread, so an immediate `poll` may already read `1`/`2`.
 
-**Why it is tracked, not a bug.** This is a §18 oracle/backend divergence (INVARIANTS.md §9), kept as
-*tracked debt with a convergence plan* rather than silently normalized — the JIT's eager child only
-narrows, never widens, the observable window, and the shell's own control flow avoids the racy shape.
-The `$?` = 128 + signal exit-code mapping for a signal-killed child lands with the same convergence work.
+**Resolution — this is the *defined* semantics of a non-blocking probe, not a divergence.** `poll` is
+**WNOHANG**: `0` ("not done yet") is a valid answer at any time on any backend — a caller does not
+control how many `0`s it sees before the child is scheduled to completion. Making the interpreter
+"eager" *cannot* converge the immediate poll for the deterministic single-worker configs anyway (the
+JIT is a 1:1 OS-thread executor; a single-worker interp run has no thread to run the child ahead of the
+parent). The **portable idiom** is to loop `poll` (yielding the worker between probes) until it is
+non-zero; the **terminal** value that loop reaches is identical across backends — `1` for a returning
+child, `2` for a trapping one. That terminal convergence is now pinned by
+`crates/svm/tests/lifecycle_poll_convergence.rs` (returning-child and trapping-child cases, interp vs
+JIT), where before it lived only in this note and the interp⇄JIT fuzzer never exercised the poll+spawn
+shape.
 
-**Owner / plan:** STAGE1.md "Known caveat — crash handling waits for async convergence"; TODO.md "Crash
-handling / `poll` portability". Revisit after concurrent stages (eager children shrink the gap). Not yet
-scheduled.
+**Still open (separate, guest-personality):** the `$?` = 128 + signal exit-code mapping for a
+signal-killed child is a shell/guest convention, not a substrate contract — tracked under STAGE1.md
+crash-handling, out of the substrate `poll` scope resolved here.
+
+**Owner / plan:** RESOLVED as a contract clarification + differential pin. STAGE1.md "Known caveat"
+updated to point here.
 
 ---
 

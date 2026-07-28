@@ -427,6 +427,12 @@ enum Op {
         size_log2: u32,
         quota: u32,
         dst: u32,
+        /// §14 `instantiate_module_named` (op 13): the `(grants_ptr, grants_n)` register pair for the
+        /// child's by-name grant list (op 5 is `None`). The driver reads the `grants_n × {name_off,
+        /// name_len, handle, flags}` records from the parent window and re-grants each into the child
+        /// powerbox (via the shared `Host::spawn_named_child`), so a spawned command resolves an
+        /// inherited `stdout` by name — the shell "exec" primitive.
+        grants: Option<(u32, u32)>,
     },
     /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
     /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
@@ -564,6 +570,19 @@ enum Op {
     /// context), so it gets a dedicated op like `vcpu.tls` would.
     DurableShadowBase {
         dst: u32,
+    },
+    /// §12 per-vCPU **thread-local register** read (`vcpu.tls.get`): push this `Vm`'s `tls` word to
+    /// `dst`. The reference `eval_inst` traps `Malformed` on it (no vCPU context), so — like
+    /// [`Op::DurableShadowBase`] — it gets a dedicated op rather than the `Eval` fallback. Seeded to
+    /// the dense vCPU id (root = 0) at `Vm` construction; a spawned thread's `Vm` is re-seeded to its
+    /// id (see `drive`'s `Spawn` arm). See the tree-walker's `Inst::VcpuTlsGet`.
+    VcpuTlsGet {
+        dst: u32,
+    },
+    /// §12 per-vCPU **thread-local register** write (`vcpu.tls.set`): set this `Vm`'s `tls` word to
+    /// `val`. No result (like `store`).
+    VcpuTlsSet {
+        val: u32,
     },
 }
 
@@ -915,10 +934,18 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
     // instantiate+thread and instantiate+coroutine.
     let s = scan_seams(funcs);
-    // `gc.roots` scans only the **calling vCPU's** continuation (its stack, fibers, coroutines), so a
-    // module that also spawns threads could hold roots in a sibling vCPU we wouldn't scan — reject
-    // that combination (fall back) to stay sound. `gc.roots` + fibers / coroutines is fine (those
-    // continuations *are* scanned).
+    // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
+    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
+    // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
+    // registry fiber's frames", `crates/svm/tests/gc_roots.rs`). Neither engine scans a *sibling
+    // thread's* own frames, and neither has to: a guest GC that threads coordinates a stop-the-world
+    // quiesce and has each vCPU enumerate its own roots (the reference barrier is
+    // `crates/svm/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
+    // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
+    // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
+    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
+    // scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
@@ -928,7 +955,6 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // serve arm has the fiber-park machinery (slice 5b).
     if (s.has_coro && (s.has_fiber || s.has_thread))
         || (s.has_instantiate && s.has_fiber)
-        || (s.has_gc && s.has_thread)
         || s.svc_park_veto()
     {
         return None;
@@ -1378,6 +1404,20 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     size_log2: g(args[3]),
                     quota: g(args[4]),
                     dst,
+                    grants: None,
+                },
+                // op 13 = instantiate_module_named: op 5 + a by-name grant list. Args:
+                // (module, grants_ptr, grants_n, entry, off, size_log2, quota). The driver reads the
+                // grant records from the parent window and re-grants each cap into the child powerbox.
+                (cap_id::INSTANTIATOR, 13) if args.len() >= 7 => Op::InstantiateModule {
+                    handle: g(*handle),
+                    module: g(args[0]),
+                    entry: g(args[3]),
+                    off: g(args[4]),
+                    size_log2: g(args[5]),
+                    quota: g(args[6]),
+                    dst,
+                    grants: Some((g(args[1]), g(args[2]))),
                 },
                 // op 6/7 = spawn_coroutine_module / spawn_demand_coroutine_module: a coroutine child
                 // running a granted `Module` (the first arg); the carve args (entry/off/size_log2/fuel)
@@ -1649,6 +1689,10 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
         // §12.8 4A.5: serviced from the running `Vm`'s region base (the reference `eval_inst` has no
         // context), so it gets a dedicated op rather than the `Eval` fallback.
         Inst::DurableShadowBase => Op::DurableShadowBase { dst },
+        // §12 per-vCPU TLS register: serviced from the running `Vm`'s `tls` word (the reference
+        // `eval_inst` traps on it — no vCPU context), so it gets a dedicated op rather than `Eval`.
+        Inst::VcpuTlsGet => Op::VcpuTlsGet { dst },
+        Inst::VcpuTlsSet { val } => Op::VcpuTlsSet { val: g(*val) },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
         // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
         // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
@@ -2827,7 +2871,14 @@ impl<'p> Vcpu<'p> {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 }) => {
+                    // op 13 (named grants) is driven by the scheduler `drive` arm (the browser's
+                    // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
+                    // no child powerbox, so it declines a grant list rather than silently drop it.
+                    if grants.is_some() {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    }
                     match self
                         .event_instantiate_module(ibase, isz, mh, entry, off, size_log2, quota, dst)
                     {
@@ -5426,9 +5477,13 @@ impl ScheduledDebugRun {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     } => {
                         *turn += 1;
-                        if let Err(t) = dbg_instantiate_module(
+                        // op 13 (named-grant spawn) is not driven by the debugger path.
+                        if grants.is_some() {
+                            dbg_complete(tasks, ti, Err(Trap::Malformed));
+                        } else if let Err(t) = dbg_instantiate_module(
                             tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
                             off, size_log2, quota, dst,
                         ) {
@@ -5589,8 +5644,12 @@ impl ScheduledDebugRun {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
-                    if let Err(t) = dbg_instantiate_module(
+                    // op 13 (named-grant spawn) is not driven by the debugger replay path.
+                    if grants.is_some() {
+                        dbg_complete(tasks, ti, Err(Trap::Malformed));
+                    } else if let Err(t) = dbg_instantiate_module(
                         tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
                         off, size_log2, quota, dst,
                     ) {
@@ -5865,6 +5924,9 @@ enum Outcome {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 13 `instantiate_module_named`: the resolved `(grants_ptr, grants_n)` window coordinates
+        /// of the child's by-name grant list (op 5 is `None`).
+        grants: Option<(u64, u64)>,
     },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
@@ -6429,6 +6491,9 @@ enum VcpuStop {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 13 `instantiate_module_named`: resolved `(grants_ptr, grants_n)` window coordinates of
+        /// the child's by-name grant list (op 5 is `None`).
+        grants: Option<(u64, u64)>,
     },
     /// §14 `Instantiator.spawn_coroutine_module` — the driver resolves + compiles the host-granted
     /// `Module` (`mh`), builds a coroutine `Coro` over it, and registers it in the spawner's coroutine
@@ -6761,6 +6826,7 @@ fn step_vcpu(
                 size_log2,
                 quota,
                 dst,
+                grants,
             } => {
                 return Ok(VcpuStop::InstantiateModule {
                     ibase,
@@ -6771,6 +6837,7 @@ fn step_vcpu(
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 })
             }
             Outcome::MemoryWait {
@@ -7494,12 +7561,15 @@ fn drive(
                     complete(&mut tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                     continue;
                 }
-                let child = VTask::new(
+                let mut child = VTask::new(
                     &dom.source.primary(),
                     func as usize,
                     &[Value::I64(sp), Value::I64(arg)],
                 )?;
                 let cidx = tasks.len();
+                // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
+                // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
+                child.active.tls = cidx as i64;
                 // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
                 // (the shared domain for a root-spawned thread, or the same confined `instantiate`
                 // env for one spawned by a confined child).
@@ -7642,6 +7712,7 @@ fn drive(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
                 // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
                 let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
@@ -7734,9 +7805,53 @@ fn drive(
                     }
                     pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
                 };
-                let mut child_host = Host::new();
-                let cinst = child_host.grant_instantiator(0, child_size);
-                let cas = child_host.grant_address_space(0, child_size);
+                // op 5 grants only Instantiator+AddressSpace; op 13 (`grants` is `Some((ptr, n))`)
+                // additionally re-grants a by-name cap list read from the parent window, so a spawned
+                // command resolves an inherited `stdout` by name (STAGE1.md — the shell "exec"
+                // primitive). The named build fails closed via the shared, fuzzed `spawn_named_child`.
+                let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants {
+                    // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
+                    // records from the parent window (mirrors the tree-walk op-13 arm in lib.rs).
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let list: Result<Vec<(String, i32)>, Trap> = (|| {
+                        let m = pm.ok_or(Trap::Malformed)?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..grants_n {
+                            let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name_bytes = m.read_window(name_off, name_len)?;
+                            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                            list.push((name, handle));
+                        }
+                        Ok(list)
+                    })();
+                    let list = match list {
+                        Ok(l) => l,
+                        Err(t) => {
+                            complete(&mut tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    match host.spawn_named_child(&list, child_size) {
+                        Some(triple) => triple,
+                        None => {
+                            complete(&mut tasks, ti, Err(Trap::CapFault));
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut ch = Host::new();
+                    let cinst = ch.grant_instantiator(0, child_size);
+                    let cas = ch.grant_address_space(0, child_size);
+                    (ch, cinst, cas)
+                };
                 // §3.6: a separate-module child serves its OWN offers — enqueue admission,
                 // handler resolution, and `child_offer` shape all read its module (tree-walk
                 // lockstep: the spawn sets `self_module` from the grant).
@@ -8648,7 +8763,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
+                // op 13 (named-grant spawn) is driven only by the cooperative single-thread `drive`
+                // path (the browser's wasm-safe entry); the OS-thread parallel driver declines it.
+                if grants.is_some() {
+                    return (Err(Trap::Malformed), mem);
+                }
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
                 // handle is an inert CapFault → trap).
                 let (cfuncs, cmem_log2, cdata) = {
@@ -9036,6 +9157,13 @@ struct Vm {
     /// by the current `svc.poll` activation.
     serve_ticket: Option<u64>,
     serve_count: i64,
+    /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
+    /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
+    /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
+    /// Mirrors the tree-walker's `Vm::tls`. (Multi-OS-thread fiber *migration* re-seeding — a fiber
+    /// resumed on a different worker reading that worker's word — is a follow-up; the browser tier is
+    /// single-OS-thread cooperative, where the sole worker is 0, so every read is a faithful `0`.)
+    tls: i64,
     /// The domain's **home module** — the unit whose functions are its service handlers (0 for the
     /// primary; a separate-module child's pushed unit index). `svc.poll`/`svc.wait` only dispatch
     /// handlers while executing in this module: `svc_handler_func` resolves indices against the
@@ -9067,6 +9195,7 @@ impl Vm {
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             serve_ticket: None,
             serve_count: 0,
+            tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
         })
     }
@@ -9996,6 +10125,7 @@ impl Vm {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
@@ -10004,6 +10134,8 @@ impl Vm {
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
                     let quota = r!(*quota).i64();
+                    // op 13: resolve the grant-list `(ptr, count)` from their registers (op 5 is None).
+                    let grants = grants.map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
@@ -10018,6 +10150,7 @@ impl Vm {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
@@ -10275,6 +10408,15 @@ impl Vm {
                     // §12.8 4A.5: this context's shadow-SP word address (its own region base).
                     self.regs[base + *dst as usize] =
                         Reg::from_i64(self.durable_region_base as i64);
+                    pc += 1;
+                }
+                Op::VcpuTlsGet { dst } => {
+                    // §12 per-vCPU TLS read: this vCPU's word (seeded to its dense id, guest-overwritable).
+                    self.regs[base + *dst as usize] = Reg::from_i64(self.tls);
+                    pc += 1;
+                }
+                Op::VcpuTlsSet { val } => {
+                    self.tls = r!(*val).i64();
                     pc += 1;
                 }
             }

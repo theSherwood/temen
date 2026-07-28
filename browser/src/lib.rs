@@ -2451,13 +2451,20 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The chibicc card's fixed argv (shared by the bytecode [`svm_run_onramp_fs`] and the JIT
+/// The chibicc card's argv (shared by the bytecode [`svm_run_onramp_fs`] and the JIT
 /// [`svm_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
 /// (64 KiB wasm host page), so its read-only globals must not share a host page with writable data
-/// (D40). `-g0`: the playground never debugs the compiled program, so drop debug info (~a third of the
-/// emitted IR); with the seeded libc's `static inline` + chibicc's DCE, a small program then compiles
-/// far less IR.
-const CHIBICC_CARD_ARGV: &[&[u8]] = &[b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"];
+/// (D40). Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR, so a
+/// clean run compiles far less IR); pass `debug_info` (a `-g` flag) only when the user opts into
+/// source-level debugging (the DAP panel maps C `file:line`/locals through chibicc's debug section).
+fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
+    let mut argv: Vec<&'static [u8]> = vec![b"chibicc", b"--data-page", b"65536"];
+    if debug_info {
+        argv.push(b"-g");
+    }
+    argv.push(b"/in.c");
+    argv
+}
 
 /// Assemble the chibicc card's memfs image: the user's source `src` at `in.c`, the built-in playground
 /// libc headers under `include/` ([`playground_include_files`]), plus any caller headers from the
@@ -2506,6 +2513,7 @@ pub extern "C" fn svm_run_onramp_fs(
     img_len: usize,
     src_ptr: *const u8,
     src_len: usize,
+    debug_info: i32,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
@@ -2529,7 +2537,8 @@ pub extern "C" fn svm_run_onramp_fs(
             return 0;
         }
     };
-    let out = onramp_fs_exec(&m, &image, CHIBICC_CARD_ARGV, &[]);
+    let argv = chibicc_card_argv(debug_info != 0);
+    let out = onramp_fs_exec(&m, &image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -4307,9 +4316,10 @@ pub extern "C" fn svm_onramp_jit_run_open(
 /// wasm — so the browser runs chibicc's compile on the **wasm-JIT** instead of the bytecode
 /// interpreter (the compiler's `fopen`/`write`/`exit` bounce cross-tier). The fast twin of
 /// `svm_run_onramp_fs`; drive it with the same `svm_onramp_jit_run_*` exports (call
-/// [`svm_onramp_jit_run_finish`] for the emitted IR on `svm_stdout_ptr`). Returns `0`, else a negative
-/// `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start` isn't emittable
-/// (the page falls back to [`svm_run_onramp_fs`]).
+/// [`svm_onramp_jit_run_finish`] for the emitted IR on `svm_stdout_ptr`). `debug_info != 0` compiles
+/// with `-g` (source-level debug section) — off by default, as in `svm_run_onramp_fs`. Returns `0`,
+/// else a negative `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start`
+/// isn't emittable (the page falls back to [`svm_run_onramp_fs`]).
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_run_open_fs(
     mod_ptr: *const u8,
@@ -4318,6 +4328,7 @@ pub extern "C" fn svm_onramp_jit_run_open_fs(
     img_len: usize,
     src_ptr: *const u8,
     src_len: usize,
+    debug_info: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
@@ -4341,15 +4352,9 @@ pub extern "C" fn svm_onramp_jit_run_open_fs(
             return -status;
         }
     };
+    let argv = chibicc_card_argv(debug_info != 0);
     // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampRun::open_owned_run_fs(
-        &m,
-        JIT_RUN_WIN_LOG2,
-        true,
-        &image,
-        CHIBICC_CARD_ARGV,
-        Vec::new(),
-    ) {
+    match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
