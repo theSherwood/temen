@@ -249,8 +249,16 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
   - **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
     same ABI, so this is a match, not a negotiation).
   - **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
-    `ptr.add`; every access confined by the masking lowering (INVARIANTS §2). Address-taken
-    locals move from SSA values onto a data-stack frame (the `codegen_ir.c` model).
+    `ptr.add`; every access confined by the masking lowering (INVARIANTS §2).
+    - **✅ pointer params + `deref`/`store` — DONE 2026-07-28.** Pointer-typed params/vars are
+      `i64` window offsets; `(deref p)` loads and `(asgn (deref p) v)`/`(store v p)` store, at the
+      pointee width tracked per pointer local. The module declares a `memory` window only when a
+      load/store is actually emitted. Tested store→load round-trips on both engines. (No frame
+      yet — the pointer is supplied by the caller as an offset.)
+    - **Next: address-of-local + the data-stack frame** — `(addr x)` demotes a local from an SSA
+      slot to a window frame slot; the proc gains a threaded stack pointer and calls pass a fresh
+      frame (the `codegen_ir.c` model). This unlocks real loops like `sumto` (`inc(addr i)`),
+      then `at`/`dot` for arrays/objects.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.

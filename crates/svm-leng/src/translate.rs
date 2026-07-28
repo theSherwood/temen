@@ -76,10 +76,11 @@ impl Translator {
             }
         }
         let mut out = String::new();
+        let mut used_memory = false;
         for p in &proc_nodes {
-            self.proc_body(p, &mut out)?;
+            used_memory |= self.proc_body(p, &mut out)?;
         }
-        Ok(out)
+        Ok(with_memory(used_memory, out))
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -111,8 +112,8 @@ impl Translator {
                 },
             );
             let mut out = String::new();
-            self.proc_body(item, &mut out)?;
-            return Ok(out);
+            let used_memory = self.proc_body(item, &mut out)?;
+            return Ok(with_memory(used_memory, out));
         }
         Err(LengError::Malformed(format!(
             "proc `{name}` not found in module"
@@ -152,7 +153,7 @@ impl Translator {
                     "param needs :name pragmas type".into(),
                 ));
             }
-            out.push((sym_def(&pa[0])?, int_ty(&pa[2])?));
+            out.push((sym_def(&pa[0])?, val_ty(&pa[2])?));
         }
         Ok(out)
     }
@@ -165,7 +166,9 @@ impl Translator {
         Ok(Some(int_ty(node)?))
     }
 
-    fn proc_body(&self, p: &Node, out: &mut String) -> Result<(), LengError> {
+    /// Emit one proc's `func {…}` into `out`; returns whether it touched the window (so the caller
+    /// can emit the module `memory` declaration).
+    fn proc_body(&self, p: &Node, out: &mut String) -> Result<bool, LengError> {
         let a = p.args();
         let params = self.params(&a[1])?;
         let ret = self.ret_ty(&a[2])?;
@@ -177,12 +180,18 @@ impl Translator {
         if let Some(b) = body {
             collect_vars(b, &mut slots)?;
         }
+        // Pointee types of pointer-typed locals (params + vars), for load/store width on `deref`.
+        let mut pointee = HashMap::new();
+        collect_pointees(&a[1], &mut pointee);
+        if let Some(b) = body {
+            collect_pointees(b, &mut pointee);
+        }
 
         let ptys: Vec<&str> = params.iter().map(|(_, t)| prefix(*t)).collect();
         let rty = ret.map(|t| prefix(t).to_string()).unwrap_or_default();
         out.push_str(&format!("func ({}) -> ({}) {{\n", ptys.join(", "), rty));
 
-        let mut f = FuncGen::new(self, ret, params.len(), slots);
+        let mut f = FuncGen::new(self, ret, params.len(), slots, pointee);
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
         // assigned reads 0 until its declaration binds it (matches Leng default-init semantics).
         f.open_entry();
@@ -193,11 +202,12 @@ impl Translator {
             _ => {}
         }
         f.close_fallthrough()?;
+        let used_memory = f.used_memory;
         for blk in f.blocks {
             out.push_str(&blk);
         }
         out.push_str("}\n");
-        Ok(())
+        Ok(used_memory)
     }
 }
 
@@ -212,6 +222,10 @@ struct FuncGen<'a> {
     /// **only** those (the ABI: entry params == function params). Var slots follow and are carried
     /// as parameters of every *successor* block only.
     nparams: usize,
+    /// Pointer-typed locals → their pointee value type, for `deref`/store width.
+    pointee: HashMap<String, ValType>,
+    /// Set once the function emits a load/store (so the module declares a window).
+    used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
     blocks: Vec<String>,
     next_block: u32,
@@ -229,6 +243,7 @@ impl<'a> FuncGen<'a> {
         ret: Option<ValType>,
         nparams: usize,
         slots: Vec<(String, ValType)>,
+        pointee: HashMap<String, ValType>,
     ) -> Self {
         let slot_of = slots
             .iter()
@@ -241,6 +256,8 @@ impl<'a> FuncGen<'a> {
             slots,
             slot_of,
             nparams,
+            pointee,
+            used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
             cur_id: 0,
@@ -368,6 +385,40 @@ impl<'a> FuncGen<'a> {
         })
     }
 
+    /// The pointee value type of a pointer local `p`, plus its current value — errors if `p` isn't a
+    /// known pointer local (unknown load/store width would be a silent-wrongness hazard).
+    fn ptr_local(&self, name: &str) -> Result<(Val, ValType), LengError> {
+        let p = self
+            .lookup(name)
+            .ok_or_else(|| LengError::Unsupported(format!("deref of unknown pointer `{name}`")))?;
+        let pty = *self.pointee.get(name).ok_or_else(|| {
+            LengError::Unsupported(format!("deref of `{name}` with unknown pointee type"))
+        })?;
+        Ok((p, pty))
+    }
+
+    /// `(asgn Lvalue Expr)`: a symbol lvalue rebinds a slot; a `(deref P)` lvalue stores through P.
+    fn assign(&mut self, lhs: &Node, rhs: &Node) -> Result<(), LengError> {
+        if lhs.tag() == Some("deref") {
+            let pname = lhs
+                .args()
+                .first()
+                .and_then(|n| n.as_atom())
+                .ok_or_else(|| LengError::Unsupported("store through non-symbol pointer".into()))?;
+            let (p, pty) = self.ptr_local(pname)?;
+            let v = self.expr_typed(rhs, pty)?;
+            self.used_memory = true;
+            self.cur_buf
+                .push_str(&format!("  {}.store v{} v{}\n", prefix(pty), p.id, v.id));
+            return Ok(());
+        }
+        let name = lhs.as_atom().ok_or_else(|| {
+            LengError::Unsupported(format!("assignment to lvalue `{:?}`", lhs.tag()))
+        })?;
+        let v = self.expr(rhs)?;
+        self.set_slot(name, v)
+    }
+
     /// `StmtList ::= (stmts SCOPE? Stmt*)` — real hexer often omits the leading SCOPE atom.
     fn stmt_list(&mut self, node: &Node) -> Result<(), LengError> {
         if node.is_empty_marker() {
@@ -425,15 +476,20 @@ impl<'a> FuncGen<'a> {
                 self.set_slot(&name, v)
             }
             Some("asgn") => {
+                // `(asgn Lvalue Expr)`.
                 let a = s.args();
                 if a.len() != 2 {
                     return Err(LengError::Malformed("asgn needs lvalue and expr".into()));
                 }
-                let name = a[0]
-                    .as_atom()
-                    .ok_or_else(|| LengError::Unsupported("asgn to non-symbol lvalue".into()))?;
-                let v = self.expr(&a[1])?;
-                self.set_slot(name, v)
+                self.assign(&a[0], &a[1])
+            }
+            Some("store") => {
+                // `(store Expr Lvalue)` — asgn with reversed operands (Leng StoreStmt).
+                let a = s.args();
+                if a.len() != 2 {
+                    return Err(LengError::Malformed("store needs value and lvalue".into()));
+                }
+                self.assign(&a[1], &a[0])
             }
             Some("discard") => {
                 if let Some(e) = s.args().first() {
@@ -594,6 +650,19 @@ impl<'a> FuncGen<'a> {
                     Ok(self.convert(x, ty))
                 }
                 Some("par") => self.expr(&e.args()[0]),
+                Some("deref") => {
+                    // `(deref P)` — load through a pointer local (width = its pointee type).
+                    let a = e.args();
+                    let pname = a.first().and_then(|n| n.as_atom()).ok_or_else(|| {
+                        LengError::Unsupported("deref of non-symbol pointer".into())
+                    })?;
+                    let (p, pty) = self.ptr_local(pname)?;
+                    let id = self.fresh();
+                    self.used_memory = true;
+                    self.cur_buf
+                        .push_str(&format!("  v{id} = {}.load v{}\n", prefix(pty), p.id));
+                    Ok(Val { id, ty: pty })
+                }
                 Some("call") => self.call(e),
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
@@ -777,7 +846,7 @@ fn collect_vars(node: &Node, slots: &mut Vec<(String, ValType)>) -> Result<(), L
         if node.tag() == Some("var") {
             let a = node.args();
             if a.len() >= 3 {
-                if let (Ok(name), Ok(ty)) = (sym_def(&a[0]), int_ty(&a[2])) {
+                if let (Ok(name), Ok(ty)) = (sym_def(&a[0]), val_ty(&a[2])) {
                     if !slots.iter().any(|(n, _)| n == &name) {
                         slots.push((name, ty));
                     }
@@ -789,6 +858,49 @@ fn collect_vars(node: &Node, slots: &mut Vec<(String, ValType)>) -> Result<(), L
         }
     }
     Ok(())
+}
+
+/// Prepend the module `memory` declaration when any proc used the window. `memory 16` = 2^16 = 64
+/// KiB, the small-program default; pointer offsets in the current subset stay well within it.
+fn with_memory(used: bool, funcs: String) -> String {
+    if used {
+        format!("memory 16\n\n{funcs}")
+    } else {
+        funcs
+    }
+}
+
+/// Value type of a Leng type: pointers (`ptr`/`aptr`) are `i64` window offsets; else an integer.
+fn val_ty(node: &Node) -> Result<ValType, LengError> {
+    match node.tag() {
+        Some("ptr") | Some("aptr") => Ok(ValType::I64),
+        _ => int_ty(node),
+    }
+}
+
+/// If `node` is `(ptr T)`/`(aptr T)`, the pointee value type (load/store width through `deref`).
+fn pointee_ty(node: &Node) -> Option<ValType> {
+    match node.tag() {
+        Some("ptr") | Some("aptr") => node.args().first().and_then(|t| val_ty(t).ok()),
+        _ => None,
+    }
+}
+
+/// Record every pointer-typed `(param …)`/`(var …)` in a tree → its pointee value type.
+fn collect_pointees(node: &Node, map: &mut HashMap<String, ValType>) {
+    if let Node::List(_) = node {
+        if matches!(node.tag(), Some("param") | Some("var")) {
+            let a = node.args();
+            if a.len() >= 3 {
+                if let (Ok(name), Some(pt)) = (sym_def(&a[0]), pointee_ty(&a[2])) {
+                    map.insert(name, pt);
+                }
+            }
+        }
+        for child in node.args() {
+            collect_pointees(child, map);
+        }
+    }
 }
 
 /// Parse an integer Leng type `(i N)`/`(u N)`/`(c N)`/`(bool)` to a ValType; error on non-int.
