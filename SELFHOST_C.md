@@ -217,9 +217,19 @@ compiler bug is a clean error, never an escape.
      C program compiles-and-runs in-browser to an exact value with SVM IR in the output pane.
    - `build-onramp-assets.mjs` stages `chibicc.svmb`; the `real-browser` CI job builds it so the test
      runs there (fail-soft → SKIP if the toolchain is absent, the Lua pattern).
-   Scope: header-free return-value programs (the compiled output has no libc; a `printf` compiles to an
-   unresolved `call.sym "printf"`). Follow-ups: `#include` support (seed a header image — the export
-   already accepts one), and a `printf`→Stream output convention for text-emitting programs.
+   **→ `#include` + text output DONE 2026-07-27.** A small guest-C libc ships as **headers seeded under
+   `/include`** (`browser/playground-include/*.h`, built into the cdylib via `playground_include_files`):
+   `<stdio.h>` (`printf`/`fprintf`/`snprintf`/`puts`/`putchar`/`fwrite`/`getchar`/`fgets`),
+   `<string.h>`, `<stdlib.h>` (`malloc` bump allocator, `atoi`/`strtol`, `qsort`, `rand`), `<ctype.h>`,
+   `<stdbool.h>`, `<stdint.h>`, `<stdarg.h>`. Everything is guest C **compiled into** the program on
+   `#include` — nothing is linked — so `printf` formats over the powerbox's ambient `write` and a
+   text-emitting program **actually prints** (the playground pane shows the program's output above the
+   emitted IR) instead of trapping on an unresolved `call.sym`. Integer/char/string/pointer conversions
+   with flags/width/precision are supported; **`%f`/`%e`/`%g` are not** (no dtoa in the powerbox — the
+   one deliberate gap). Gated by `browser/tests/chibicc_printf.rs` (compile-and-run a `printf` program
+   vs its exact output, both `<stdio.h>` and `<string.h>`/`<stdlib.h>`) and the `browser-play-editor-test.mjs`
+   Chromium assertion (`#include <stdio.h>` + `printf` → real output in-browser). A caller image can still
+   add/override headers (its keys win). The residual scope: floats in `printf`, and larger libc surface.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

@@ -2410,14 +2410,57 @@ pub extern "C" fn svm_run_pg(
     out.value
 }
 
+/// The built-in playground libc headers, seeded under `/include` for the C-compiler card (SELFHOST_C.md
+/// §7). They are guest C compiled *into* the user's program on `#include` — `printf`/`puts`/… format
+/// over the powerbox's ambient `write`, `malloc` is a bump allocator, `str*`/`ctype` are pure. Nothing
+/// is linked, and a header costs nothing unless the program includes it. Source: `browser/playground-include/`.
+pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
+    const HEADERS: &[(&str, &str)] = &[
+        (
+            "include/stdio.h",
+            include_str!("../playground-include/stdio.h"),
+        ),
+        (
+            "include/string.h",
+            include_str!("../playground-include/string.h"),
+        ),
+        (
+            "include/stdlib.h",
+            include_str!("../playground-include/stdlib.h"),
+        ),
+        (
+            "include/stdarg.h",
+            include_str!("../playground-include/stdarg.h"),
+        ),
+        (
+            "include/ctype.h",
+            include_str!("../playground-include/ctype.h"),
+        ),
+        (
+            "include/stdbool.h",
+            include_str!("../playground-include/stdbool.h"),
+        ),
+        (
+            "include/stdint.h",
+            include_str!("../playground-include/stdint.h"),
+        ),
+    ];
+    HEADERS
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
+        .collect()
+}
+
 /// **Run chibicc-the-guest to compile a C source** — the playground C-compiler demo (SELFHOST_C.md
 /// §7 step 5). Decode + verify the compiler module at `[mod_ptr, mod_len)`, build an in-memory `fs`
-/// mounting the user's source at `in.c` (the guest opens `/in.c`) plus, if `img_len > 0`, the chibicc
-/// headers from the `encode_image` blob at `[img_ptr, img_len)` (its `include/*.h`), seed
-/// `argv = ["chibicc", "/in.c"]`, and run. The emitted SVM-IR **text** comes back on
-/// `svm_stdout_ptr`/`_len`, ready to hand to [`svm_parse`] → a runnable module. Passing an empty
-/// header image compiles header-free sources (the return-value demo corpus). Sets
-/// [`svm_status`]/[`svm_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
+/// mounting the user's source at `in.c` (the guest opens `/in.c`), the built-in playground libc
+/// headers under `include/` ([`playground_include_files`] — `<stdio.h>` etc.), plus, if `img_len > 0`,
+/// any caller headers from the `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash).
+/// Seeds `argv = ["chibicc", "/in.c"]` and runs. The emitted SVM-IR **text** comes back on
+/// `svm_stdout_ptr`/`_len`, ready to hand to [`svm_parse`] → a runnable module. The seeded headers are
+/// guest C compiled in on `#include`, so a `printf` program prints (over the powerbox's ambient
+/// `write`) instead of trapping on an unresolved call. Sets [`svm_status`]/[`svm_exit_code`]; returns
+/// the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
 #[no_mangle]
 pub extern "C" fn svm_run_onramp_fs(
     mod_ptr: *const u8,
@@ -2445,7 +2488,7 @@ pub extern "C" fn svm_run_onramp_fs(
     // Assemble the memfs from the source + the optional header image (headers under `include/`,
     // which chibicc's fixed `/include` search path resolves against). The guest maps the absolute
     // `/in.c`/`/include/*` back to these cap-relative keys (`in.c`, `include/…`).
-    let (mut files, dirs) = if img_len == 0 {
+    let (mut files, mut dirs) = if img_len == 0 {
         (Vec::new(), Vec::new())
     } else {
         let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
@@ -2457,9 +2500,27 @@ pub extern "C" fn svm_run_onramp_fs(
             }
         }
     };
+    // Seed the built-in playground libc headers under `/include` so a compiled program can
+    // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
+    for (key, bytes) in playground_include_files() {
+        if !files.iter().any(|(k, _)| *k == key) {
+            files.push((key, bytes));
+        }
+    }
+    if !dirs.iter().any(|d| d == "include") {
+        dirs.push("include".to_string());
+    }
     files.push(("in.c".to_string(), src.to_vec()));
     let image = svm_fs::encode_image(&files, &dirs);
-    let out = onramp_fs_exec(&m, &image, &[b"chibicc", b"/in.c"], &[]);
+    // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
+    // read-only globals must not share a host page with writable data (D40) — chibicc pins the
+    // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
+    let out = onramp_fs_exec(
+        &m,
+        &image,
+        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[],
+    );
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {

@@ -15,6 +15,8 @@ bool opt_fpic;
 bool opt_emit_ir = true;
 bool opt_g = true; // -g always on: the W1 debugger consumes the waist (SELFHOST_C.md §5 A)
 bool opt_child_entry;
+int opt_data_page = 16384; // --data-page: RO/writable D40 isolation granularity; the browser (64 KiB
+                           // wasm host page) passes `--data-page 65536`. Matches main.c's default.
 char *base_file;
 
 // main.c's file_exists (preprocess.c calls it for __has_include); OP_STAT serves it (App. A.1).
@@ -31,15 +33,27 @@ int align_to(int n, int align) {
   return (n + align - 1) / align * align;
 }
 
-// usage: chibicc [-Idir] <in.c> [out]   ("-"/absent out → stdout). The include dir defaults to
-// /include — where the memfs seed mounts frontend/chibicc/include for the guest (§5 C). The
-// optional leading -Idir lets the native reference (self-host differential, run_selfhost_diff.sh)
+// usage: chibicc [-Idir] [--data-page N] <in.c> [out]   ("-"/absent out → stdout). The include dir
+// defaults to /include — where the memfs seed mounts frontend/chibicc/include for the guest (§5 C).
+// The optional leading -Idir lets the native reference (self-host differential, run_selfhost_diff.sh)
 // point at the real header tree instead, since /include doesn't exist on a host fs; it never
 // affects the emitted IR (headers aren't named in the output), so both sides stay comparable.
+// --data-page N sets the D40 RO/writable isolation granularity (the browser passes 65536 for its
+// 64 KiB wasm host page, so a compiled program's RO globals never share a host page with writable data).
 int main(int argc, char **argv) {
   char *inc = "/include";
   int ai = 1;
-  if (argc > ai && argv[ai][0] == '-' && argv[ai][1] == 'I') { inc = argv[ai] + 2; ai++; }
+  while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
+    if (argv[ai][1] == 'I') {
+      inc = argv[ai] + 2;
+      ai++;
+    } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
+      opt_data_page = atoi(argv[ai + 1]);
+      ai += 2;
+    } else {
+      break;
+    }
+  }
   if (argc <= ai) {
     fprintf(stderr, "usage: chibicc [-Idir] <in.c> [out]\n");
     return 2;

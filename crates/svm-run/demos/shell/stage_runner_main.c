@@ -80,22 +80,20 @@ static long rline(char *b, long lim) {
   return n;
 }
 
-static int regs[2];
-static int nregs = 0;
-
 int main(int argc, char **argv) {
+  /* `regs`/`nregs` are deliberately LOCAL (frame storage) and filled with an indexed post-increment
+     store — the exact shape ISSUES.md I35 was about. It regression-guards the I35 fix: the
+     `--child-entry` argv relocation must place `main`'s frame just above the argv array, not round it
+     up to the next 16 KiB page, or the frame collides with the ring this runner maps at 131072 and
+     these locals read back garbage. Keep it local; do not "harden" it to `static`. */
+  int regs[2];
+  int nregs = 0;
   /* Discover the grants by reflection: regions in grant order (rin, then rout when present). */
   int n = __vm_cap_count();
   for (int i = 0; i < n; i++) {
     int t = 0;
     int h = __vm_cap_at(i, &t);
-    /* (Indexed post-increment stores — `regs[nregs++] = h` — miscompile under chibicc, so the
-       slots are picked explicitly; see ISSUES.md.) */
-    if (t == 4) {
-      if (nregs == 0) regs[0] = h;
-      else if (nregs == 1) regs[1] = h;
-      nregs = nregs + 1;
-    }
+    if (t == 4 && nregs < 2) regs[nregs++] = h;
   }
   if (nregs > 2) nregs = 2;
   if (nregs == 0 || argc == 0) return 126;
