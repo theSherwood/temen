@@ -197,14 +197,14 @@ compiler bug is a clean error, never an escape.
    **→ Step-5 slice A done 2026-07-24 — engine parity settled (the prerequisite).** `chibicc_run.rs`
    takes `SVM_CHIBICC_BACKEND`; `run_selfhost_diff.sh` runs every case on **treewalk / bytecode / jit**
    and all three emit **byte-identical IR** vs native. Engine decision for the playground card:
-   **bytecode engine (`jit: false`)**. *(Correction 2026-07-28: the browser wasm-JIT is **no longer**
-   integer-subset only — `svm-wasm-jit` gained f32/f64 support, bit-exact-differential-tested against
-   the interpreter, so the old "chibicc uses floats → can't JIT" reasoning is stale. The one scalar-float
-   op still refused is `fma`; if `chibicc.svmb` still won't whole-module-JIT it's `fma` — likely from its
-   `%.17g`/`__vm_fmt` path — or a non-float op like an un-outlined `cap.call`, not float arithmetic
-   generally. Getting chibicc onto the wasm-JIT tier is the big open speed lever — a separate slice.)*
+   **bytecode engine** originally (`jit: false`). *(Superseded 2026-07-28: chibicc now runs on the
+   **wasm-JIT** — the card's `jit: true` with the toggle default-on, falling back to bytecode only if the
+   emit is unavailable. The old "chibicc uses floats → can't JIT" reasoning was already stale — the
+   emitter gained f32/f64 — and the whole `_start` in fact emits: `compile_module_reactor` at entry 0 puts
+   333/402 funcs on wasm and bounces the rest cross-tier. See the "wasm-JIT tier DONE" block below.)*
    The playground also runs other float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
-   per-demo `jit` flag (`browser/web/play.js`). chibicc's compiled *outputs* run on bytecode too.
+   per-demo `jit` flag (`browser/web/play.js`). chibicc's compiled *outputs* run on whichever tier their
+   card selects.
 
    **→ Step 5 DONE 2026-07-24 — the capstone runs in the browser.** The playground has a "C compiler
    (chibicc → SVM)" card (`browser/web/play.js`, `kind: 'chibicc'`): edit C → the page runs
@@ -243,10 +243,34 @@ compiler bug is a clean error, never an escape.
    dead-code pass (the native `codegen.c` already did) — so `#include <stdio.h>` no longer compiles the
    ~13 unused libc functions (`puts`/`snprintf`/`fgets`/…) into every program, only `printf`'s reachable
    closure; (b) the playground passes `-g0` (new guest-driver flag), dropping the `-g` debug info that
-   the compiled program never uses (~a third of the IR). The dominant residual cost is that chibicc runs
-   on the **bytecode interpreter** — the on-ramp's stale "integer-subset only" note (below) is wrong:
-   the browser wasm-JIT already supports f64/f32, so getting `chibicc.svmb` onto that tier (the one
-   blocker is scalar `fma`, not float arithmetic) is the big remaining lever — a separate investigation.
+   the compiled program never uses (~a third of the IR). The remaining lever was getting chibicc off the
+   bytecode interpreter and onto the wasm-JIT — done next.
+
+   **→ wasm-JIT tier DONE 2026-07-28 — chibicc compiles on emitted wasm.** The card's compile pass (the
+   slow half) now takes the **"wasm-JIT" toggle** (default on): chibicc's whole `_start` emits to wasm
+   via `compile_module_reactor(&m, /*entry*/ 0, …)` — **333/402 functions run on emitted wasm**, and the
+   ~69 reachable non-subset helpers (the `cap.call`/`call.import` wrappers `outline_cap_calls` hoists, all
+   integer-signature) **bounce cross-tier to the interpreter** over the shared window through
+   `env.call_interp`, so `fopen`/`read`/`write`/`exit` resolve against the powerbox and the seeded memfs.
+   This settles the old "chibicc uses floats → can't JIT" worry for good: `_start` **is** in-subset (floats
+   emit; the only refused scalar-float op, `fma`, isn't on chibicc's reachable path), so nothing is
+   integer-only about it. Built on the **pre-existing single-shot JIT runner** (`JitOnrampRun`, the
+   run-to-completion twin of the Doom `JitOnrampReactor`, added for Lua/SQLite): this slice added an
+   **fs+argv opener** (`open_owned_run_fs`/`open_shared_run_fs` + the `svm_onramp_jit_run_open_fs` FFI
+   export) that grants the same headless memfs powerbox the bytecode `onramp_fs_exec` does (shared
+   `chibicc_card_image` + `CHIBICC_CARD_ARGV`) and seeds argv at `POWERBOX_ARGS_BASE`, plus the
+   `runJitCompiler` JS driver (a sibling of `runJitModule`). **No substrate / TCB change** — the emitter,
+   the interpreter, and the powerbox are all untouched. Gated by:
+   - `browser/tests/chibicc_jit.rs` — a native `wasmi` differential (the `jit_module.rs` pattern): the
+     JIT-emitted IR is **byte-identical** to the interpreter oracle (`onramp_fs_exec`), and the emitted
+     program then parses + runs to its expected stdout.
+   - `browser-play-editor-test.mjs` — Chromium asserts the card compiles-and-runs **on the wasm-JIT**
+     in-browser (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback fails), and
+     the card's **"Prove interp ≡ JIT"** button (`proveChibiccParity`) shows byte-identical emitted IR
+     across both tiers live in the page.
+   A fallback to `svm_run_onramp_fs` (bytecode) remains if the emit is ever unavailable, so the card can
+   never regress to "won't run". Residual: chibicc's compiled *outputs* still run on whichever tier their
+   own card selects; shortest-round-trip floats and larger libc surface stay open (above).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
