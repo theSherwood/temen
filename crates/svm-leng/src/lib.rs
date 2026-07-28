@@ -73,6 +73,26 @@ pub fn translate(src: &str) -> Result<Module, LengError> {
     })
 }
 
+/// Translate a **single named proc** out of a full Leng module to SVM text — the "go deep" entry
+/// for real nimony output, where the enclosing module still carries constructs the skeleton does
+/// not lower (`gvar`/`type`/`if`/pointers). The named proc becomes func 0; any call it makes to a
+/// proc *other than itself* fail-closes (only the target is emitted). `name` is the mangled Leng
+/// symbol, e.g. `addTwo.0.`.
+pub fn translate_proc_to_text(src: &str, name: &str) -> Result<String, LengError> {
+    let root = nif::parse(src).map_err(LengError::Parse)?;
+    translate::Translator::new().one_proc(&root, name)
+}
+
+/// As [`translate_proc_to_text`], returning the parsed (unverified) [`Module`].
+pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
+    let text = translate_proc_to_text(src, name)?;
+    svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })
+}
+
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Val {
