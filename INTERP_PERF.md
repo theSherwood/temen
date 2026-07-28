@@ -279,8 +279,19 @@ stays the JIT's job).
   | vsum        | 96.0      | **107.2**| 0.58   | ~185×  | **bytecode ~0.9× the tree-walker — a regression to investigate in 5a** |
 
   Two findings: `chase_rand` confirms the ~26× compute gap collapses to ~3.7× when memory latency
-  dominates (dispatch is hidden behind cache-miss stalls); `vsum` is the one kernel where bytecode
-  *loses* to the tree-walker — the store-in-init + reduction shape is a concrete 5a target.
+  dominates (dispatch is hidden behind cache-miss stalls); `vsum` was the one kernel where bytecode
+  appeared to *lose* to the tree-walker on the box above.
+
+  **Re-measured (post-fuel-unification, different box):** `vsum` is **bytecode 69.8 vs tree-walk 89.4 ns
+  → ~1.28× faster** — the apparent regression was **box-specific and does not reproduce**. What remains
+  is that `vsum` sits in the *weak class* (~1.28×, next to `mem` ~1.25× — tw 108.4 / bc 86.8) rather
+  than the ~1.5× the compute kernels get. The mechanism is not an isolable bug: `vsum` is a store loop
+  (`i32.store` per iter) followed by a load-reduction loop (`i32.load` + accumulate), each carrying
+  three block params across its back-edge, so its cost is dominated by the two **already-named frontier
+  residuals** — software memory confinement (the `mem` weak spot) and edge-copy scatter/gather. The
+  5b-edge identity elision *does* fire for its one loop-invariant param (verified). So the real levers
+  for `vsum` are the general ones (edge-copy reduction; a compile-pass strength-reduction of the strided
+  address the JIT already does), not a `vsum`-specific fix — the "concrete 5a target" framing is retired.
 
 - **Slice 5a — `IntCmp`+`BrIf` → `BrIfCmp` fusion. ✅ LANDED, but the win is small (measured).** A
   peephole in `compile_func` fuses a block-final `IntCmp` whose result is its `BrIf`'s sole consumer
@@ -317,9 +328,36 @@ stays the JIT's job).
   actual `Vec` work, not a predicted branch. Semantics-transparent (a self-copy changes nothing; its
   removal can't perturb the gather/scatter of the aliasing copies), so it needs no `fuse` flag and
   touches no step trace. All gates green (`bytecode_diff`, `bytecode_debug*`, `jit_diff`, `simd`,
-  `escape_oracle`). *Not* pursued: the non-aliasing direct-copy path (skip `scratch` when no dst is a
-  src) — a struct/macro change for a sub-noise gain, which fights invariant 1; left until a profile
-  names edge-copies as a measured cost.
+  `escape_oracle`).
+
+- **Slice 5b-edge-2 — non-aliasing direct edge copy. ✅ LANDED — the profile named it, and it is *not*
+  sub-noise.** 5b-edge (above) predicted this path a "sub-noise gain … left until a profile names
+  edge-copies as a measured cost." A/B measurement retired that guess: edge copies fire at **every**
+  taken edge (every loop back-edge *and* every straight-line block transition), and the old `edge`
+  runtime always gathered every source into `self.scratch` then scattered — a `Vec` push + read per
+  copy — purely to be safe against a *dst re-read as a src* (a param swap/rotation). That aliasing is
+  rare. `Copies` now carries a compile-time `aliasing` flag (some dst also a src); a **non-aliasing**
+  edge (the common induction/accumulator case) copies directly in one pass with no `scratch` traffic,
+  and only a true parallel-move permutation takes the gather/scatter path. Removing real `Vec` work
+  from the hottest inner-loop operation, measured on `megabench` (ns/iter, bytecode, same box):
+
+  | kernel | before | after | Δ |
+  |--------|-------:|------:|----:|
+  | alu    | 21.7 | 16.8 | **−23%** |
+  | loopc  | 21.8 | 17.3 | **−21%** |
+  | fma    | 31.0 | 26.4 | −15% |
+  | call   | 38.0 | 33.1 | −13% |
+  | vsum   | 69.8 | 61.4 | −12% |
+  | mem    | 86.8 | 80.6 | −10% |
+
+  By far the largest safe-lever win in Phase 5 — an order of magnitude past the "low single digits"
+  the dispatch/superinstruction levers delivered, because it removes *real work* on the operation that
+  runs at every edge, not a predicted branch. `#![forbid(unsafe)]`, no `fuse` flag, transparent to the
+  step trace. The aliasing (`scratch`) path is kept and explicitly exercised by
+  `bytecode_matches_interp_on_aliasing_edge_swap` (a parity-sensitive param swap). All gates green
+  (`bytecode_diff` incl. tight-fuel remainder parity, `bytecode_debug*`, `bytecode_traced`, `coroutine`,
+  `threads`, `fiber_fuzz`, `quota`, `escape_oracle`, `simd`). **This is the profile correcting the plan
+  (AGENTS.md: the harness is the arbiter) — the "sub-noise" prediction was wrong.**
 
 - **Slice 5b — two-mode resume.** A fast `resume` loop that drops the per-op budget check and the
   per-op `step(fuel)` call — metering fuel at safepoints instead (see "Fuel unification") — whenever

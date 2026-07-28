@@ -55,8 +55,27 @@ use super::{
     Value, VarValue, DEFAULT_RESERVED_LOG2,
 };
 
-/// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative).
-type Copies = Box<[(u32, u32)]>;
+/// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
+/// a precomputed `aliasing` flag. A **non-aliasing** edge — the common case (an induction variable /
+/// accumulator reads distinct value slots and writes the successor's param slots) — is applied by a
+/// single direct pass. An **aliasing** edge, where some destination slot is also read as a source (a
+/// parallel move that permutes/swaps params), must gather into `scratch` then scatter, so a value
+/// isn't clobbered before it is read. Classifying once at compile time keeps the value off the hot
+/// path (the `scratch` `push`+read per copy is only paid where correctness needs it).
+struct Copies {
+    pairs: Box<[(u32, u32)]>,
+    aliasing: bool,
+}
+impl Copies {
+    /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
+    /// (so a one-pass sequential copy could clobber a not-yet-read source). O(n²) over a tiny edge.
+    fn new(pairs: Box<[(u32, u32)]>) -> Copies {
+        let aliasing = pairs
+            .iter()
+            .any(|&(_, d)| pairs.iter().any(|&(s, _)| s == d));
+        Copies { pairs, aliasing }
+    }
+}
 /// A resolved branch edge: its arg copies plus the target op index (`pc`).
 type Edge = (Copies, u32);
 
@@ -971,13 +990,13 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
             // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
-            let copies = args
+            let pairs: Box<[(u32, u32)]> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
                 .filter(|(src, dst)| src != dst)
                 .collect();
-            (copies, bidx as u32) // block index; patched to entry pc below
+            (Copies::new(pairs), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
@@ -1008,8 +1027,8 @@ fn compile_func(f: &Func, arities: &[usize], fuse: bool) -> Option<Program> {
                             ty,
                             op,
                         }) if *dst == cond_slot
-                            && !then_copies.iter().any(|(s, _)| *s == cond_slot)
-                            && !else_copies.iter().any(|(s, _)| *s == cond_slot) =>
+                            && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
+                            && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
                         {
                             Some((*a, *cb, *ty, *op))
                         }
@@ -9127,12 +9146,24 @@ impl Vm {
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
         macro_rules! edge {
             ($copies:expr) => {{
-                self.scratch.clear();
-                for &(s, _) in $copies.iter() {
-                    self.scratch.push(self.regs[base + s as usize]);
-                }
-                for (k, &(_, d)) in $copies.iter().enumerate() {
-                    self.regs[base + d as usize] = self.scratch[k];
+                let cp = $copies;
+                if cp.aliasing {
+                    // A destination is re-read as a source: gather all sources, then scatter, so a
+                    // value isn't clobbered before it is read (a param swap/rotation).
+                    self.scratch.clear();
+                    for &(s, _) in cp.pairs.iter() {
+                        self.scratch.push(self.regs[base + s as usize]);
+                    }
+                    for (k, &(_, d)) in cp.pairs.iter().enumerate() {
+                        self.regs[base + d as usize] = self.scratch[k];
+                    }
+                } else {
+                    // Non-aliasing (the common induction/accumulator edge): copy directly in one pass,
+                    // no `scratch` traffic — sources and destinations are disjoint slot sets.
+                    for &(s, d) in cp.pairs.iter() {
+                        let v = self.regs[base + s as usize];
+                        self.regs[base + d as usize] = v;
+                    }
                 }
             }};
         }
