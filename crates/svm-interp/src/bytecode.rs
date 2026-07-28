@@ -7956,6 +7956,24 @@ fn drive(
                 // handler resolution, and `child_offer` shape all read its module (tree-walk
                 // lockstep: the spawn sets `self_module` from the grant).
                 child_host.set_self_module(&cmodule);
+                // IMPORTS.md phase 3 / §3.3: bind the child module's import manifest against its
+                // granted powerbox — a chibicc child's generic imports (`write`/`read`/`exit`, and any
+                // named grant) resolve here, so a compiled command actually does I/O rather than
+                // `CapFault`ing on its first `write`. `spawn_named_child` registers the *names* but does
+                // not bind the manifest, so the driver does it (the same `bind_child_manifest` the tree-
+                // walker's op-13 arm and the JIT's `child_bind_imports` hook call). A `required` slot
+                // with nothing to bind fails the spawn closed with a probeable `-EINVAL` (as the tree-
+                // walker does), never a trap. Empty for a manifest-free child (imports is empty → Ok).
+                if child_host
+                    .bind_child_manifest(&cmodule.imports, &cmodule.types)
+                    .is_err()
+                {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
                 let child_args = if want_as {
                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                 } else {

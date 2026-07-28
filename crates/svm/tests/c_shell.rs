@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap};
+use svm_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap};
 use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
@@ -311,7 +311,80 @@ fn run_shell_ex(
         matches!(jout, JitOutcome::Returned(_) | JitOutcome::Exited(_)),
         "jit ended abnormally: {jout:?}\n--- IR ---\n{ir}"
     );
+
+    // Bytecode cooperative engine — the browser's wasm-safe entry (`posix_shell_exec` runs this exact
+    // path in the playground). External-command spawns (op 13) and concurrent ring pipelines
+    // (op 11 + `SharedRegion` + futex) run single-thread/clockless here; its output must match interp,
+    // making the differential interp==JIT==bytecode across the whole shell surface.
+    let bout = shell_bytecode_stdout(&m, &cmd_mods, win, stdin, env, files, args);
+    assert_eq!(
+        bout,
+        iposix.stdout(),
+        "bytecode (browser engine) output must match interp"
+    );
+
     (iposix.stdout(), jposix.stdout())
+}
+
+/// Run the already-built shell module on the **bytecode cooperative engine** — the browser's wasm-safe
+/// entry ([`bytecode::compile_and_run_with_host`], the same one `posix_shell_exec` drives in the
+/// playground). Unlike [`run_shell_ex`]'s interp/JIT arms (OS threads + a wall clock), this is
+/// single-thread and clockless: external-command spawns (op 13) and concurrent ring pipelines
+/// (op 11 + `SharedRegion` + futex) run cooperatively — the browser-parity path slices 1–2 unblocked,
+/// plus the op-13 child-manifest binding this slice added (a chibicc command's `write` resolves).
+/// Regions use the default software backing (`VecBacking`) — no OS shared memory, exactly as the
+/// browser gets (memfd shm is native-only). Returns the personality's captured stdout.
+#[allow(clippy::too_many_arguments)]
+fn shell_bytecode_stdout(
+    m: &svm_ir::Module,
+    cmd_mods: &[(&str, svm_ir::Module)],
+    win: usize,
+    stdin: &[u8],
+    env: &[(&str, &str)],
+    files: &[&str],
+    args: &[&str],
+) -> Vec<u8> {
+    let mut host = Host::new();
+    // NB: no `set_region_factory` — the cooperative engine uses the reference `VecBacking` (software
+    // aliasing, backing-agnostic), which is what the browser gets.
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _as_h = host.grant_address_space(0, win as u64);
+    let cmd_handles: Vec<(&str, i32)> = cmd_mods
+        .iter()
+        .map(|(n, cm)| (*n, host.grant_module(cm)))
+        .collect();
+    let (_px_h, posix) = svm_posix::grant(
+        &mut host,
+        (win - (64 << 10)) as u64,
+        win as u64,
+        stdin.to_vec(),
+    );
+    posix.set_stdout_sink(sink);
+    posix.set_exec_stdout(out_h);
+    for (n, h) in &cmd_handles {
+        posix.register_command(n, *h);
+    }
+    for (k, v) in env {
+        posix.set_env(k, v);
+    }
+    for path in files {
+        posix.write_file(path, b"");
+    }
+    if !args.is_empty() {
+        posix.set_args(args);
+    }
+    let mut fuel = 200_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+        Some(Ok(_)) | Some(Err(Trap::Exit(_))) => {}
+        Some(Err(e)) => panic!(
+            "bytecode trapped: {e:?}\n--- stdout so far ---\n{}",
+            String::from_utf8_lossy(&posix.stdout())
+        ),
+        None => panic!("bytecode engine declined the shell module (fell back to the tree-walker)"),
+    }
+    posix.stdout()
 }
 
 /// The headline milestone: a real script runs through the shell loop end to end on the personality,
