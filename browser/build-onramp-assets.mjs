@@ -356,6 +356,12 @@ try {
   copyFileSync(runner, join(ASSETS, 'stage_runner.svmb'));
   const rkb = (readFileSync(runner).length / 1024).toFixed(0);
   console.log(`  ✓ stage_runner.svmb (${rkb} KB)`);
+  // The `primes` external command — a separate compiled-C program the shell exec's as an op-13 child.
+  const primes = join(HERE, 'tests', 'fixtures', 'primes.svmb');
+  if (!existsSync(primes)) throw new Error('tests/fixtures/primes.svmb missing (run the generator)');
+  copyFileSync(primes, join(ASSETS, 'primes.svmb'));
+  const pkb = (readFileSync(primes).length / 1024).toFixed(0);
+  console.log(`  ✓ primes.svmb (${pkb} KB)`);
 } catch (e) {
   console.log(`  – shell skipped (${e.message})`);
 }

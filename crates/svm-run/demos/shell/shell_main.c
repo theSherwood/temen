@@ -237,6 +237,14 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
 #define SVM_STAGE_LOG2 18
 #endif
 #define SVM_STAGE_WIN (1L << SVM_STAGE_LOG2)
+/* The size an external command is spawned into — equal to the command module's declared window (a §14
+   child's carve must equal its declared memory). Default 17 (128 KiB), the size chibicc lands a small
+   command at under the native 16 KiB data page; the browser's 64 KiB page rounds it up to 19, so the
+   browser fixture builds the shell with `-D SVM_CMD_LOG2=19` to match its 64 KiB-page commands. */
+#ifndef SVM_CMD_LOG2
+#define SVM_CMD_LOG2 17
+#endif
+#define SVM_CMD_WIN (1L << SVM_CMD_LOG2)
 /* Forces a window large enough for the ring carves (3 stages × `SVM_STAGE_WIN`) + the parent's ring-0
    map slot + the spawn grant-record scratch (all kept in `pool`, below the stack), and the smaller
    128 KiB-aligned external-command carve. Only the (guarded-out) external-command / ring paths use it,
@@ -245,7 +253,7 @@ static char pool[4 * SVM_STAGE_WIN + 131072];
 static int spawn_cmd(long mod, int argc, char **argv) {
   long out = __px_exec_stdout(__px());
   long base = (long)pool;
-  long carve = (base + 131071) & ~131071;
+  long carve = (base + (SVM_CMD_WIN - 1)) & ~(SVM_CMD_WIN - 1);
   /* grant record at base: {name_off, name_len, out, flags}; "stdout" name follows at base+16 */
   int *rec = (int *)base;
   rec[0] = (int)(base + 16); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
@@ -261,7 +269,7 @@ static int spawn_cmd(long mod, int argc, char **argv) {
     for (long k = 0; k < L; k++) *p++ = s[k];
     *p++ = 0;
   }
-  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
+  long child = __spawn(__inst(), mod, base, 1, 0, carve, SVM_CMD_LOG2, 0);
   return (int)__join(__inst(), child);
 }
 #endif /* SVM_SHELL_SEQUENTIAL */

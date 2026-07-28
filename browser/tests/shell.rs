@@ -27,15 +27,22 @@ fn run(script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// As [`run`], with the `__stage` ring-filter runner registered on PATH — so pipelines take the
-/// concurrent ring path (op 11 + `SharedRegion` + futex) instead of sequential memfs staging, exactly
-/// as the playground grants it.
+/// As [`run`], with the full playground PATH registered: the `__stage` ring-filter runner (so
+/// pipelines take the concurrent ring path — op 11 + `SharedRegion` + futex — instead of sequential
+/// memfs staging) and the `primes` external command (an op-13 §14 child). Exactly what the browser's
+/// `svm_run_shell` grants, so these tests mirror the real playground registry.
 fn run_with_stage(script: &str) -> String {
     let bytes = include_bytes!("fixtures/shell.svmb");
     let m = svm_encode::decode_module(bytes).expect("decode shell.svmb");
     let rbytes = include_bytes!("fixtures/stage_runner.svmb");
     let runner = svm_encode::decode_module(rbytes).expect("decode stage_runner.svmb");
-    let out = posix_shell_exec_with(&m, script.as_bytes(), &[("__stage", &runner)]);
+    let pbytes = include_bytes!("fixtures/primes.svmb");
+    let primes = svm_encode::decode_module(pbytes).expect("decode primes.svmb");
+    let out = posix_shell_exec_with(
+        &m,
+        script.as_bytes(),
+        &[("__stage", &runner), ("primes", &primes)],
+    );
     assert_eq!(
         out.status, STATUS_OK,
         "the shell should run to EOF cleanly (script: {script:?})",
@@ -91,6 +98,14 @@ fn shell_ring_pipeline_status_and_early_exit() {
          cat f | grep zzz\necho rc $?\ncat f | head -n 1\necho rc $?\n",
     );
     assert_eq!(out, "rc 1\none\nrc 0\n");
+}
+
+#[test]
+fn shell_external_command_primes() {
+    // An **external command** (op-13 §14 child): `primes` is a separate compiled-C program on PATH, not
+    // a builtin. The shell spawns it, delivers `argv`, and its stdout streams into the shell's sink.
+    let out = run_with_stage("primes 20\n");
+    assert_eq!(out, "2\n3\n5\n7\n11\n13\n17\n19\n");
 }
 
 #[test]

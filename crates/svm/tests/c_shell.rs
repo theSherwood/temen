@@ -427,6 +427,11 @@ fn stage_runner_src() -> String {
     format!("{RING}\n{STAGE_RUNNER_MAIN}")
 }
 
+/// A demo **external command** (`primes N` → the primes ≤ N) — a `--child-entry` program the shell
+/// `exec`s as an op-13 child, granted only its stdout. The playground registers it on PATH; the
+/// browser fixture is built from this same source.
+const PRIMES_MAIN: &str = include_str!("../../svm-run/demos/shell/primes_main.c");
+
 /// An external command: echo every `argv[i]` on its own line, return `argc` (a non-zero status that
 /// tracks the argument count, so `$?` is observable).
 const CMD_ECHO: &str = r#"
@@ -480,6 +485,23 @@ fn stage0_shell_external_command_status_in_control_flow() {
         "interp: `ok`(0)&&echo → yes; `say a`(2, fail)||echo → fallback; `ok`(0)||echo → skipped"
     );
     assert_eq!(jout, iout, "jit: shell output must match interp");
+}
+
+/// The demo external command the browser playground registers (`primes N`) — a `--child-entry`
+/// program that computes, not just echoes: it prints every prime ≤ N to its granted stdout. Proves
+/// a real compiled-C command spawns, runs, and streams into the shell's sink across all three
+/// engines (the `run_shell_ex` differential is interp==JIT==bytecode).
+#[test]
+fn stage0_shell_runs_external_primes() {
+    let (iout, jout) = run_shell_ex(
+        b"primes 10\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("primes", PRIMES_MAIN)],
+    );
+    assert_eq!(iout, b"2\n3\n5\n7\n", "interp: primes \u{2264} 10");
+    assert_eq!(jout, iout, "jit: primes output must match interp");
 }
 
 /// EOF (no trailing `exit`) cleanly ends the loop — the personality's `read(0, …)` returns `0` at the
@@ -1096,11 +1118,22 @@ fn gen_browser_shell_fixture() {
     // `--data-page 65536`: the playground runs on a 64 KiB wasm host page, so the read-only string
     // data must share no host page with a writable global (else the shell's own write to a global
     // faults — D40 host-page RO/RW protection is enforced under wasm). Native chibicc defaults to
-    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19`: under the
-    // 64 KiB page the `__stage` runner's data sections round up so its window is 19 (512 KiB), not the
-    // native 18 — the shell must carve its ring stages to match. Verified end to end against a real
+    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19` /
+    // `-D SVM_CMD_LOG2=19`: under the 64 KiB page a child module's data sections round up so its window
+    // is 19 (512 KiB) — the `__stage` runner and external commands alike — not the native 18/17; the
+    // shell must carve its ring stages and command spawns to match. Verified end to end against a real
     // Chromium run by `browser-shell-test.mjs`.
-    let ir = c_to_ir_with(&src, &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"]);
+    let ir = c_to_ir_with(
+        &src,
+        &[
+            "--data-page",
+            "65536",
+            "-D",
+            "SVM_STAGE_LOG2=19",
+            "-D",
+            "SVM_CMD_LOG2=19",
+        ],
+    );
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");
@@ -1135,4 +1168,20 @@ fn gen_browser_shell_fixture() {
     let rout = dir.join("stage_runner.svmb");
     std::fs::write(&rout, &rbytes).expect("write stage_runner.svmb");
     eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
+
+    // A demo external command (`primes`), 64 KiB-page like the rest. A small command's data sections
+    // round up to a 19 (512 KiB) window, so it must equal the shell's `SVM_CMD_LOG2=19` command carve
+    // (a §14 child's carve equals its declared memory). The browser registers it on PATH under `primes`.
+    let primes_ir = c_to_ir_child_with(PRIMES_MAIN, &["--data-page", "65536"]);
+    let praw = parse_module_raw(&primes_ir).expect("parse primes IR");
+    verify_module(&praw).expect("verify primes");
+    assert_eq!(
+        praw.memory.map(|mm| mm.size_log2),
+        Some(19),
+        "the 64 KiB-page `primes` command must declare memory 19 (the shell's SVM_CMD_LOG2 carve)"
+    );
+    let pbytes = svm_encode::encode_module(&praw);
+    let pout = dir.join("primes.svmb");
+    std::fs::write(&pout, &pbytes).expect("write primes.svmb");
+    eprintln!("wrote {} ({} bytes)", pout.display(), pbytes.len());
 }

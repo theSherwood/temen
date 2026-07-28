@@ -817,7 +817,12 @@ int main(void) {
     editable: true,
     lang: 'shell',
     url: './assets/shell.svmb',
-    stageUrl: './assets/stage_runner.svmb', // the __stage ring-filter runner → concurrent pipelines
+    // The shell's PATH registry: the __stage ring-filter runner (concurrent pipelines) and the `primes`
+    // external command (a separate compiled-C program the shell exec's as an op-13 §14 child).
+    cmds: [
+      { name: '__stage', url: './assets/stage_runner.svmb' },
+      { name: 'primes', url: './assets/primes.svmb' },
+    ],
     mode: 'io',
     desc: 'A real POSIX-style shell — a command interpreter compiled by the in-tree chibicc C ' +
       'compiler onto the svm-posix personality — running client-side in the sandbox. The same shell ' +
@@ -826,13 +831,19 @@ int main(void) {
       'output appears below. Builtins include echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/' +
       'uniq/ls, test/[ ], redirection (> >> <), command lists (; && ||), if/then/else, and globbing ' +
       '— all over an in-memory filesystem. Pipelines run as concurrent stages over shared-memory ' +
-      'rings (op 11 + SharedRegion + futex), spawned as separate §14 children.',
+      'rings (op 11 + SharedRegion + futex); an unknown name like `primes` is exec’d as a separate ' +
+      'compiled-C program (op 13 §14 child) — both spawned client-side in the sandbox.',
     src: `# A real shell, running in the sandbox. Type commands, then click Run.
 echo hello from the sandbox
 
 # variables
 NAME=world
 echo hi $NAME
+
+# primes is not a builtin — it is a separate compiled-C program the shell
+# exec's as a sandboxed child, streaming its stdout back.
+echo -- primes up to 30 --
+primes 30
 
 # a file, then a concurrent ring pipeline: sort and dedupe run as separate
 # stages, streaming over shared-memory rings with backpressure.
@@ -842,10 +853,6 @@ echo banana >> fruits
 echo cherry >> fruits
 echo -- sorted, deduped --
 cat fruits | sort | uniq
-echo -- matching lines --
-cat fruits | grep a
-echo -- line count --
-cat fruits | wc
 
 if test -f fruits; then echo fruits exists; fi
 `,
@@ -1078,37 +1085,60 @@ function moduleInterp(bytes, stdinBytes) {
   return { rv, status, stdout };
 }
 
+// Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `svm_run_shell` parses: a u32 entry
+// count, then per entry u32 name-length + UTF-8 name + u32 module-length + module bytes (all
+// little-endian). The `__stage` ring runner and every external command (`primes`, …) travel in one
+// buffer. Returns null for an empty registry (the shell then runs bare).
+function buildCmdsBlob(cmds) {
+  if (!cmds || !cmds.length) return null;
+  const enc = new TextEncoder();
+  const parts = cmds.map((c) => ({ name: enc.encode(c.name), bytes: c.bytes }));
+  let total = 4;
+  for (const p of parts) total += 4 + p.name.length + 4 + p.bytes.length;
+  const blob = new Uint8Array(total);
+  const dv = new DataView(blob.buffer);
+  let o = 0;
+  dv.setUint32(o, parts.length, true); o += 4;
+  for (const p of parts) {
+    dv.setUint32(o, p.name.length, true); o += 4;
+    blob.set(p.name, o); o += p.name.length;
+    dv.setUint32(o, p.bytes.length, true); o += 4;
+    blob.set(p.bytes, o); o += p.bytes.length;
+  }
+  return blob;
+}
+
 // Run the `svm-posix` **shell** single-shot on the bytecode cooperative engine, through the
-// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `stageBytes` is given)
-// the `__stage` ring-filter runner, the editor text feeding the shell's stdin as the script. With the
-// runner registered, `cat f | sort | uniq`-style pipelines take the concurrent ring path (op 11 +
-// SharedRegion + futex); without it they fall back to sequential memfs staging. Returns
-// { rv, status, stdout }.
-function shellInterp(bytes, stdinBytes, stageBytes) {
+// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `cmdsBlob` is given)
+// the shell's PATH registry: the `__stage` ring-filter runner and any external commands. The editor
+// text feeds the shell's stdin as the script. With `__stage` registered, `cat f | sort | uniq`-style
+// pipelines take the concurrent ring path (op 11 + SharedRegion + futex); external commands (`primes`)
+// spawn as op-13 §14 children. Returns { rv, status, stdout }.
+function shellInterp(bytes, stdinBytes, cmdsBlob) {
   const p = eng.ex.svm_alloc(bytes.length);
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
   if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
-  let stageP = 0;
-  const stageLen = stageBytes ? stageBytes.length : 0;
-  if (stageLen) stageP = eng.ex.svm_alloc(stageLen);
+  let cmdsP = 0;
+  const cmdsLen = cmdsBlob ? cmdsBlob.length : 0;
+  if (cmdsLen) cmdsP = eng.ex.svm_alloc(cmdsLen);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(bytes, p);
   if (stdinP) view.set(stdinBytes, stdinP);
-  if (stageP) view.set(stageBytes, stageP);
-  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen, stageP, stageLen);
+  if (cmdsP) view.set(cmdsBlob, cmdsP);
+  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen, cmdsP, cmdsLen);
   const status = eng.ex.svm_status();
   const stdout = readModuleStdout();
   eng.ex.svm_dealloc(p, bytes.length);
   if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
-  if (stageP) eng.ex.svm_dealloc(stageP, stageLen);
+  if (cmdsP) eng.ex.svm_dealloc(cmdsP, cmdsLen);
   return { rv, status, stdout };
 }
 
-// A card's Run for the shell: fetch the module (+ the __stage ring runner), feed the editor's script
-// as stdin, run it, show the captured stdout. The shell runs on the bytecode cooperative engine (the
-// wasm-safe interpreter tier that lowers its Instantiator/SharedRegion cap.calls), so there is no JIT
-// toggle.
+// A card's Run for the shell: fetch the module (+ its PATH registry — the __stage ring runner and any
+// external commands), feed the editor's script as stdin, run it, show the captured stdout. The shell
+// runs on the bytecode cooperative engine (the wasm-safe interpreter tier that lowers its
+// Instantiator/SharedRegion cap.calls), so there is no JIT toggle.
 async function runShell(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching shell…');
@@ -1124,18 +1154,21 @@ async function runShell(c) {
     return;
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B shell`);
-  // The `__stage` ring-filter runner enables concurrent pipelines (op 11 + SharedRegion + futex). It's
-  // an optional companion asset: if it's missing, the shell still runs — pipelines just fall back to
-  // sequential memfs staging — so a fetch failure here is logged, not fatal.
-  let stageBytes = null;
-  if (ex.stageUrl) {
+  // The PATH registry (`ex.cmds`: `[{ name, url }]`) — the `__stage` ring runner (concurrent pipelines:
+  // op 11 + SharedRegion + futex) and external commands like `primes`. Each is an optional companion
+  // asset: a fetch failure drops just that command (pipelines fall back to memfs staging; a missing
+  // external command is `not found`), so it is logged, not fatal.
+  const cmds = [];
+  for (const cmd of ex.cmds || []) {
     try {
-      stageBytes = await fetchModule(ex.stageUrl, onFetchProgress(c, baseName(ex.stageUrl)));
-      logTo(c, `fetched ${ex.stageUrl}: ${stageBytes.length}B ring runner`);
+      const cb = await fetchModule(cmd.url, onFetchProgress(c, baseName(cmd.url)));
+      cmds.push({ name: cmd.name, bytes: cb });
+      logTo(c, `fetched ${cmd.url}: ${cb.length}B (${cmd.name})`);
     } catch (e) {
-      logTo(c, `ring runner unavailable (${e.message}) — pipelines use memfs staging`);
+      logTo(c, `command '${cmd.name}' unavailable (${e.message})`);
     }
   }
+  const cmdsBlob = buildCmdsBlob(cmds);
   // The editor holds the shell script — it is the shell's stdin. Ensure a trailing newline so the last
   // line runs (the read-eval loop acts on a completed line).
   let script = c.editor.getValue();
@@ -1143,7 +1176,7 @@ async function runShell(c) {
   const stdinBytes = new TextEncoder().encode(script);
   setState(c, 'running', 'running…');
   const t0 = performance.now();
-  const { rv, status, stdout } = shellInterp(bytes, stdinBytes, stageBytes);
+  const { rv, status, stdout } = shellInterp(bytes, stdinBytes, cmdsBlob);
   const ms = (performance.now() - t0).toFixed(0);
   c.el.stdout.textContent = stdout;
   c.el.result.textContent = `${rv}`;
