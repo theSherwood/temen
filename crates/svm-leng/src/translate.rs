@@ -221,6 +221,7 @@ impl Translator {
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
         match node.tag() {
             Some("ptr") | Some("aptr") => Ok(TyDesc::Scalar(ValType::I64)),
+            Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
                 Some(name) => Ok(TyDesc::Agg(name.to_string())),
@@ -500,12 +501,12 @@ impl Translator {
         Ok(())
     }
 
-    /// Return type: `(void)`/`.` → None, otherwise an integer ValType.
+    /// Return type: `(void)`/`.` → None, otherwise the scalar value type (int, float, or pointer).
     fn ret_ty(&self, node: &Node) -> Result<Option<ValType>, LengError> {
         if node.tag() == Some("void") || node.is_empty_marker() {
             return Ok(None);
         }
-        Ok(Some(int_ty(node)?))
+        Ok(Some(val_ty(node)?))
     }
 
     /// Emit one proc's `func {…}` into `out`; returns whether it touched the window (so the caller
@@ -1005,9 +1006,47 @@ impl<'a> FuncGen<'a> {
         Err(LengError::Unsupported("`at` on a non-array".into()))
     }
 
-    /// `(asgn Lvalue Expr)`: a symbol lvalue rebinds a slot; `deref`/`dot`/`at`/`pat` store through
-    /// the computed address.
+    /// The type descriptor of an lvalue, computed **without emitting** (for dispatching aggregate
+    /// vs scalar assignment). `None` for a plain SSA-scalar local (which has no address).
+    fn lvalue_type(&self, node: &Node) -> Option<TyDesc> {
+        match node {
+            Node::Atom(name) => {
+                if let Some((_, d)) = self.mem.get(name) {
+                    return Some(d.clone());
+                }
+                if let Some((_, d)) = self.t.globals.get(name) {
+                    return Some(d.clone());
+                }
+                self.local_desc.get(name).cloned()
+            }
+            Node::List(_) => match node.tag() {
+                Some("deref" | "pat") => node
+                    .args()
+                    .first()
+                    .and_then(|n| n.as_atom())
+                    .and_then(|p| self.pointee.get(p).cloned()),
+                Some("dot") => {
+                    let a = node.args();
+                    let bd = self.lvalue_type(a.first()?)?;
+                    let f = a.get(1)?.as_atom()?;
+                    self.field_of(&bd, f).ok().map(|(_, d)| d)
+                }
+                Some("at") => {
+                    let bd = self.lvalue_type(node.args().first()?)?;
+                    self.array_of(&bd).ok().map(|(_, d)| d)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// `(asgn Lvalue Expr)`. An **aggregate** destination copies/constructs whole; a scalar symbol
+    /// rebinds its slot; a scalar `deref`/`dot`/`at`/`pat`/global stores through its address.
     fn assign(&mut self, lhs: &Node, rhs: &Node) -> Result<(), LengError> {
+        if let Some(ddesc @ TyDesc::Agg(_)) = self.lvalue_type(lhs) {
+            let (daddr, _) = self.lvalue_addr(lhs)?;
+            return self.assign_aggregate(daddr, &ddesc, rhs);
+        }
         if matches!(lhs.tag(), Some("deref" | "dot" | "at" | "pat")) {
             return self.store_lvalue(lhs, rhs);
         }
@@ -1020,6 +1059,69 @@ impl<'a> FuncGen<'a> {
         }
         let v = self.expr(rhs)?;
         self.write_local(name, v)
+    }
+
+    /// Assign into an aggregate at address `daddr`: an `oconstr`/`aconstr` constructs field-by-field
+    /// in place; any other rhs is a whole-aggregate copy (`mem.copy` of the source's bytes).
+    fn assign_aggregate(
+        &mut self,
+        daddr: u32,
+        ddesc: &TyDesc,
+        rhs: &Node,
+    ) -> Result<(), LengError> {
+        match rhs.tag() {
+            Some("oconstr") => {
+                // `(oconstr T (kv Field Expr)*)`.
+                for kv in &rhs.args()[1..] {
+                    if kv.tag() != Some("kv") {
+                        continue;
+                    }
+                    let ka = kv.args();
+                    let fname = ka
+                        .first()
+                        .and_then(|n| n.as_atom())
+                        .ok_or_else(|| LengError::Malformed("kv needs a field name".into()))?;
+                    let (foff, fdesc) = self.field_of(ddesc, fname)?;
+                    let faddr = self.add_const_off(daddr, foff);
+                    self.store_member(faddr, &fdesc, &ka[1])?;
+                }
+                Ok(())
+            }
+            Some("aconstr") => {
+                // `(aconstr T Elem*)`.
+                let (esize, edesc) = self.array_of(ddesc)?;
+                for (i, ee) in rhs.args()[1..].iter().enumerate() {
+                    let eaddr = self.add_const_off(daddr, i as u64 * esize);
+                    self.store_member(eaddr, &edesc, ee)?;
+                }
+                Ok(())
+            }
+            _ => {
+                // Whole-aggregate copy: the rhs is an aggregate lvalue; copy its bytes.
+                let (saddr, _) = self.lvalue_addr(rhs)?;
+                let size = self.t.sizeof(ddesc);
+                let szc = self.emit_const(ValType::I64, size as i64);
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  mem.copy v{daddr} v{saddr} v{}\n", szc.id));
+                Ok(())
+            }
+        }
+    }
+
+    /// Store one member (field/element) at `addr`: a scalar stores directly; a nested aggregate
+    /// constructs/copies via [`assign_aggregate`].
+    fn store_member(&mut self, addr: u32, desc: &TyDesc, expr: &Node) -> Result<(), LengError> {
+        match desc {
+            TyDesc::Scalar(ty) => {
+                let v = self.expr_typed(expr, *ty)?;
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  {}.store v{addr} v{}\n", prefix(*ty), v.id));
+                Ok(())
+            }
+            TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
+        }
     }
 
     /// `StmtList ::= (stmts SCOPE? Stmt*)` — real hexer often omits the leading SCOPE atom.
@@ -1058,7 +1160,12 @@ impl<'a> FuncGen<'a> {
                 let term = if a.is_empty() || a[0].is_empty_marker() {
                     "return".to_string()
                 } else {
-                    let v = self.expr(&a[0])?;
+                    // Coerce the returned value to the function's result type (a bare literal
+                    // defaults to i64, but the proc may return i32).
+                    let v = match self.ret {
+                        Some(t) => self.expr_typed(&a[0], t)?,
+                        None => self.expr(&a[0])?,
+                    };
                     format!("return v{}", v.id)
                 };
                 self.finish_block(term, self.next_block);
@@ -1072,14 +1179,18 @@ impl<'a> FuncGen<'a> {
                 }
                 let name = sym_def(&a[0])?;
                 // An aggregate frame local's storage is the (zeroed) frame: a default-init is a
-                // no-op; an aggregate initializer (constructor) is a later slice.
-                if matches!(self.mem.get(&name), Some((_, TyDesc::Agg(_)))) {
-                    return match a.get(3) {
-                        Some(init) if !init.is_empty_marker() => Err(LengError::Unsupported(
-                            "aggregate initializer (oconstr/aconstr) not yet supported".into(),
-                        )),
-                        _ => Ok(()),
-                    };
+                // no-op; an initializer (`oconstr`/`aconstr`/another aggregate) constructs in place.
+                if let Some((off, ddesc)) = self.mem.get(&name).cloned() {
+                    if matches!(ddesc, TyDesc::Agg(_)) {
+                        return match a.get(3) {
+                            Some(init) if !init.is_empty_marker() => {
+                                let sp = self.cur[0];
+                                let daddr = self.add_const_off(sp, off);
+                                self.assign_aggregate(daddr, &ddesc, init)
+                            }
+                            _ => Ok(()),
+                        };
+                    }
                 }
                 let ty = val_ty(&a[2])?;
                 let v = match a.get(3) {
@@ -1118,6 +1229,7 @@ impl<'a> FuncGen<'a> {
             }
             Some("if") => self.if_stmt(s),
             Some("while") => self.while_stmt(s),
+            Some("case") => self.case_stmt(s),
             // A bare label with no live jmp target (e.g. hexer's trailing `whileStmtLabel`) is inert
             // for our structured lowering; `jmp` itself is not yet supported.
             Some("lab") => Ok(()),
@@ -1215,6 +1327,163 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
+    /// `(case Disc (of (ranges V+) Body)* (else Body)?)` → a `br_table` over a dense integer span
+    /// (normalized index; out-of-range → default). Sparse/large-span or non-integer discriminants
+    /// fail-closed (a comparison-chain lowering for those is a later refinement).
+    fn case_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let a = s.args();
+        if a.is_empty() {
+            return Err(LengError::Malformed("case needs a discriminant".into()));
+        }
+        // Parse the `of`/`else` clauses into integer value sets.
+        struct Branch<'n> {
+            vals: Vec<i64>,
+            ranges: Vec<(i64, i64)>,
+            body: &'n Node,
+        }
+        let mut branches: Vec<Branch> = Vec::new();
+        let mut else_body: Option<&Node> = None;
+        for clause in &a[1..] {
+            match clause.tag() {
+                Some("of") => {
+                    let c = clause.args();
+                    if c.len() < 2 || c[0].tag() != Some("ranges") {
+                        return Err(LengError::Malformed(
+                            "of needs (ranges …) and a body".into(),
+                        ));
+                    }
+                    let mut vals = Vec::new();
+                    let mut ranges = Vec::new();
+                    for v in c[0].args() {
+                        if let Some(n) = int_literal(v) {
+                            vals.push(n);
+                        } else if v.tag() == Some("range") {
+                            let ra = v.args();
+                            let lo = ra.first().and_then(int_literal);
+                            let hi = ra.get(1).and_then(int_literal);
+                            match (lo, hi) {
+                                (Some(l), Some(h)) => ranges.push((l, h)),
+                                _ => {
+                                    return Err(LengError::Unsupported(
+                                        "non-integer case range".into(),
+                                    ))
+                                }
+                            }
+                        } else {
+                            return Err(LengError::Unsupported(
+                                "non-integer case branch value (symbol/char) — later slice".into(),
+                            ));
+                        }
+                    }
+                    branches.push(Branch {
+                        vals,
+                        ranges,
+                        body: &c[1],
+                    });
+                }
+                Some("else") => else_body = clause.args().first(),
+                _ => return Err(LengError::Malformed("case expects of/else clauses".into())),
+            }
+        }
+        if branches.is_empty() {
+            return Err(LengError::Malformed("case with no `of`".into()));
+        }
+
+        // Dense span across all branch values; bail (fail-closed) if sparse/huge.
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for b in &branches {
+            for &v in &b.vals {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            for &(l, h) in &b.ranges {
+                lo = lo.min(l);
+                hi = hi.max(h);
+            }
+        }
+        let span = (hi as i128) - (lo as i128) + 1;
+        if !(1..=256).contains(&span) {
+            return Err(LengError::Unsupported(
+                "case span too large/sparse for a br_table (comparison-chain lowering is a later slice)"
+                    .into(),
+            ));
+        }
+        let span = span as usize;
+
+        // Discriminant → i32 index normalized to `lo`. Out-of-range → br_table default (a negative
+        // or over-large index selects `default`).
+        let disc = self.expr(&a[0])?;
+        let disc32 = if disc.ty == ValType::I32 {
+            disc
+        } else {
+            self.convert(disc, ValType::I32)
+        };
+        let loc = self.emit_const(ValType::I32, lo);
+        let nidx = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{nidx} = i32.sub v{} v{}\n", disc32.id, loc.id));
+
+        // Blocks: one per branch body, an optional else, and the continuation.
+        let cont = self.new_block_id();
+        let bblocks: Vec<u32> = (0..branches.len()).map(|_| self.new_block_id()).collect();
+        let else_block = else_body.map(|_| self.new_block_id());
+        let default_target = else_block.unwrap_or(cont);
+
+        // One table entry per value in [lo, hi]; each maps to its covering branch, else default.
+        let args = self.branch_args();
+        let mut targets = Vec::with_capacity(span);
+        for i in 0..span {
+            let v = lo + i as i64;
+            let tgt = branches
+                .iter()
+                .position(|b| {
+                    b.vals.contains(&v) || b.ranges.iter().any(|&(l, h)| v >= l && v <= h)
+                })
+                .map(|bi| bblocks[bi])
+                .unwrap_or(default_target);
+            targets.push(format!("{tgt}{args}"));
+        }
+        self.finish_block(
+            format!(
+                "br_table v{nidx} [{}] {default_target}{args}",
+                targets.join(", ")
+            ),
+            bblocks[0],
+        );
+
+        // Branch bodies, each falling through to `cont`.
+        let nbr = branches.len();
+        for bi in 0..nbr {
+            let body = branches[bi].body;
+            let next = if bi + 1 < nbr {
+                bblocks[bi + 1]
+            } else {
+                else_block.unwrap_or(cont)
+            };
+            self.stmt_list_or_single(body)?;
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), next);
+            } else {
+                self.cur_id = next;
+                self.reset_cur_state();
+            }
+        }
+        // else body (cur is `else_block` if present).
+        if let Some(eb) = else_body {
+            self.stmt_list_or_single(eb)?;
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), cont);
+            } else {
+                self.cur_id = cont;
+                self.reset_cur_state();
+            }
+        }
+        Ok(())
+    }
+
     /// A control-flow arm body: a `(stmts …)`, or a single statement.
     fn stmt_list_or_single(&mut self, node: &Node) -> Result<(), LengError> {
         if node.tag() == Some("stmts") {
@@ -1250,6 +1519,9 @@ impl<'a> FuncGen<'a> {
                 if let Ok(n) = parse_int(a) {
                     return Ok(self.emit_const(ValType::I64, n));
                 }
+                if let Ok(f) = a.parse::<f64>() {
+                    return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
+                }
                 Err(LengError::Unsupported(format!("atom expression `{a}`")))
             }
             Node::List(_) => match e.tag() {
@@ -1257,18 +1529,43 @@ impl<'a> FuncGen<'a> {
                 Some(op @ ("eq" | "neq" | "lt" | "le")) => self.compare(op, e),
                 Some("neg") => {
                     let a = e.args();
-                    let ty = int_ty(&a[0])?;
+                    let ty = val_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
-                    let zero = self.emit_const(ty, 0);
-                    Ok(self.emit_bin("sub", ty, zero, x))
+                    if is_float(ty) {
+                        // `fN.neg` (a proper negate — handles signed zero).
+                        let id = self.fresh();
+                        self.cur_buf
+                            .push_str(&format!("  v{id} = {}.neg v{}\n", prefix(ty), x.id));
+                        Ok(Val { id, ty })
+                    } else {
+                        let zero = self.emit_const(ty, 0);
+                        Ok(self.emit_bin("sub", ty, zero, x))
+                    }
                 }
                 Some("conv") => {
+                    // Value-preserving numeric conversion (int width, int↔float, f32↔f64).
                     let a = e.args();
-                    let ty = int_ty(&a[0])?;
+                    let ty = val_ty(&a[0])?;
+                    let x = self.expr(&a[1])?;
+                    Ok(self.convert(x, ty))
+                }
+                Some("cast") => {
+                    // A C-style cast — for the scalar/pointer subset, a width reinterpretation
+                    // (pointer↔pointer and same-width are no-ops; i32↔i64 extend/wrap).
+                    let a = e.args();
+                    let ty = val_ty(&a[0])?;
                     let x = self.expr(&a[1])?;
                     Ok(self.convert(x, ty))
                 }
                 Some("par") => self.expr(&e.args()[0]),
+                // Literals: booleans are `i32` 0/1; `nil` is a null `i64` pointer.
+                Some("true") => Ok(self.emit_const(ValType::I32, 1)),
+                Some("false") => Ok(self.emit_const(ValType::I32, 0)),
+                Some("nil") => Ok(self.emit_const(ValType::I64, 0)),
+                // Float specials.
+                Some("inf") => Ok(self.emit_fconst(ValType::F64, f64::INFINITY)),
+                Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
+                Some("nan") => Ok(self.emit_fconst(ValType::F64, f64::NAN)),
                 Some("addr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
                     let (id, _desc) = self.lvalue_addr(&e.args()[0])?;
@@ -1304,13 +1601,31 @@ impl<'a> FuncGen<'a> {
         })
     }
 
-    /// `(add|sub|mul|div|mod Type Expr Expr)`.
+    /// `(add|sub|mul|div|mod Type Expr Expr)` — integer or floating-point per the carried `Type`.
     fn arith(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
         let a = e.args();
         if a.len() != 3 {
             return Err(LengError::Malformed(format!(
                 "`{op}` needs Type and two operands"
             )));
+        }
+        // Floating-point arithmetic: `fN.{add,sub,mul,div}` (no signedness, no `mod`).
+        if a[0].tag() == Some("f") {
+            let ty = float_ty(&a[0])?;
+            let l = self.expr_typed(&a[1], ty)?;
+            let r = self.expr_typed(&a[2], ty)?;
+            let name = match op {
+                "add" => "add",
+                "sub" => "sub",
+                "mul" => "mul",
+                "div" => "div",
+                _ => {
+                    return Err(LengError::Unsupported(format!(
+                        "float `{op}` (no `mod` on floats)"
+                    )))
+                }
+            };
+            return Ok(self.emit_bin(name, ty, l, r));
         }
         let (ty, signed) = int_ty_signed(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
@@ -1347,12 +1662,23 @@ impl<'a> FuncGen<'a> {
         }
         let l = self.expr(&a[0])?;
         let r = self.expr_typed(&a[1], l.ty)?;
-        let name = match op {
-            "eq" => "eq",
-            "neq" => "ne",
-            "lt" => "lt_s",
-            "le" => "le_s",
-            _ => unreachable!(),
+        // Float compares use unsigned-free names (`lt`/`le`); int compares are signed here.
+        let name = if is_float(l.ty) {
+            match op {
+                "eq" => "eq",
+                "neq" => "ne",
+                "lt" => "lt",
+                "le" => "le",
+                _ => unreachable!(),
+            }
+        } else {
+            match op {
+                "eq" => "eq",
+                "neq" => "ne",
+                "lt" => "lt_s",
+                "le" => "le_s",
+                _ => unreachable!(),
+            }
         };
         let id = self.fresh();
         self.cur_buf.push_str(&format!(
@@ -1483,6 +1809,14 @@ impl<'a> FuncGen<'a> {
         Val { id, ty }
     }
 
+    /// A float constant (`{:?}` round-trips through svm-text's `parse_float`).
+    fn emit_fconst(&mut self, ty: ValType, f: f64) -> Val {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.const {f:?}\n", prefix(ty)));
+        Val { id, ty }
+    }
+
     fn emit_bin(&mut self, op: &str, ty: ValType, l: Val, r: Val) -> Val {
         let id = self.fresh();
         self.cur_buf.push_str(&format!(
@@ -1494,16 +1828,30 @@ impl<'a> FuncGen<'a> {
         Val { id, ty }
     }
 
-    /// Integer width conversion between i32/i64 (value-preserving, signed).
+    /// Scalar numeric conversion: integer widths, int↔float (signed trunc/convert), and f32↔f64.
     fn convert(&mut self, v: Val, to: ValType) -> Val {
+        use ValType::{F32, F64, I32, I64};
         if v.ty == to {
             return v;
         }
         let id = self.fresh();
         let insn = match (v.ty, to) {
-            (ValType::I32, ValType::I64) => format!("i64.extend_i32_s v{}", v.id),
-            (ValType::I64, ValType::I32) => format!("i32.wrap_i64 v{}", v.id),
-            _ => format!("i64.extend_i32_s v{}", v.id),
+            (I32, I64) => format!("i64.extend_i32_s v{}", v.id),
+            (I64, I32) => format!("i32.wrap_i64 v{}", v.id),
+            // int → float (value-preserving, signed).
+            (I32, F32) => format!("f32.convert_i32_s v{}", v.id),
+            (I32, F64) => format!("f64.convert_i32_s v{}", v.id),
+            (I64, F32) => format!("f32.convert_i64_s v{}", v.id),
+            (I64, F64) => format!("f64.convert_i64_s v{}", v.id),
+            // float → int (truncate toward zero, signed — matches Nim `int(x)`).
+            (F32, I32) => format!("i32.trunc_f32_s v{}", v.id),
+            (F32, I64) => format!("i64.trunc_f32_s v{}", v.id),
+            (F64, I32) => format!("i32.trunc_f64_s v{}", v.id),
+            (F64, I64) => format!("i64.trunc_f64_s v{}", v.id),
+            // float ↔ float.
+            (F32, F64) => format!("f64.promote_f32 v{}", v.id),
+            (F64, F32) => format!("f32.demote_f64 v{}", v.id),
+            _ => format!("i64.extend_i32_s v{}", v.id), // unreachable in this subset
         };
         self.cur_buf.push_str(&format!("  v{id} = {insn}\n"));
         Val { id, ty: to }
@@ -1515,16 +1863,35 @@ impl<'a> FuncGen<'a> {
 // ---------------------------------------------------------------------------
 
 /// SVM value type of a Leng type: pointers (`ptr`/`aptr`) and named aggregates (held by address)
-/// are `i64`; else an integer scalar.
+/// are `i64`; floats are `f32`/`f64`; else an integer scalar.
 fn val_ty(node: &Node) -> Result<ValType, LengError> {
     match node.tag() {
         Some("ptr") | Some("aptr") => Ok(ValType::I64),
+        Some("f") => float_ty(node),
         Some(_) => int_ty(node),
         None => match node.as_atom() {
             Some(_) => Ok(ValType::I64),
             None => Err(LengError::Malformed("expected a type".into())),
         },
     }
+}
+
+/// `(f N)` → `f32` (N ≤ 32) or `f64`.
+fn float_ty(node: &Node) -> Result<ValType, LengError> {
+    let bits = node
+        .args()
+        .first()
+        .and_then(|n| n.as_atom())
+        .ok_or_else(|| LengError::Malformed("`f` type needs a bit width".into()))?;
+    Ok(if int_bits(bits)? <= 32 {
+        ValType::F32
+    } else {
+        ValType::F64
+    })
+}
+
+fn is_float(t: ValType) -> bool {
+    matches!(t, ValType::F32 | ValType::F64)
 }
 
 /// A proc needs a frame iff it takes the address of a local, or declares an aggregate-typed local

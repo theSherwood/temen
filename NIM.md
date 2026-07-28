@@ -187,6 +187,16 @@ drops the build-time clang/LLVM dependency and shapes SVM-IR straight from Leng,
 supported extension pattern — C/C++/LLVM-IR/arkham already coexist behind Leng, plus the
 shoggoth optimizer.
 
+> **Capstone reached 2026-07-28: whole real modules verify.** `svm-leng` translates **entire**
+> real `hexer` modules — every proc plus globals, type decls, and cross-module imports — for three
+> real Nim programs (`addTwo`+`main`, `maxi`+`sumto`, `dot2`+`idx`), each **parsing and passing
+> `svm-verify`**, and the user `main` (an intra-module call) **runs end-to-end on both engines**
+> (`crates/svm-leng/tests/whole_real_module.rs`). Driving a whole module out turned the "what's
+> left" list into a measured one — the last gaps that blocked real modules were small: `(true)`/
+> `(false)`/`(nil)` literals, `cast`, and coercing a bare-literal `ret` to the proc's result type
+> (an i32 `main` returning `0`). The remaining breadth (below) is genuinely optional for coverage,
+> not structural.
+
 **Placement decision (2026-07-28): a Rust crate `crates/svm-leng` in *this* repo** — the
 **fourth SVM frontend**, beside `svm-wasm` and `svm-llvm` (both Rust, both untrusted, both
 verifier-rechecked). Rationale: it matches the established frontend pattern, reuses
@@ -289,11 +299,32 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
-  **State:** `svm-leng` translates whole real-ish modules — integers, control flow, pointers,
-  frames, objects/arrays, globals, intra- and cross-module calls — fail-closed on the rest, and is
-  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`). Remaining for full
-  real modules: `case`→`br_table`, `cast`/`conv` breadth, whole-aggregate copy/`oconstr`, floats,
-  and non-zero global/data initializers — plus wiring nimony's real export signatures for imports.
+  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow,
+  pointers, frames, objects/arrays (incl. constructors + copy), globals, intra- and cross-module
+  calls — fail-closed on the rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`,
+  `dot2`, `sumto`, `classify`, `favg`, `mkSum`). Remaining for full real modules: aggregate
+  **return** (sret) and non-zero global/data initializers — plus wiring nimony's real export
+  signatures for imports.
+    - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
+      (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
+      `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
+      nested aggregates recursing), and any other rhs is a whole-aggregate `mem.copy` of the
+      source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
+      an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
+      y:b); p.x+p.y`), interp == JIT. Aggregate **return** by sret is the remaining half.
+    - **✅ floats — DONE 2026-07-28.** `(f 32)`/`(f 64)` types; float arithmetic
+      (`fN.add/sub/mul/div`), `neg` (`fN.neg`), and comparisons (`fN.lt/le/eq/ne`); int↔float and
+      f32↔f64 `conv`/`cast` (`convert_iN_s`/`trunc_fN_s`/`promote`/`demote`); float literals
+      (`2.0`, `1e3`) and `(inf)`/`(neginf)`/`(nan)`; float loads/stores follow from the scalar
+      type. Tested on hand fixtures and **real nimony `favg`** (`(a+b)/2.0`) + `toF` (`float(n)*1.5`),
+      interp == JIT (bit-exact).
+    - **✅ `case` → `br_table` — DONE 2026-07-28.** A dense-integer `case` (`(case Disc (of
+      (ranges V+) Body)* (else Body)?)`) lowers to a normalized `br_table`: the discriminant is
+      offset to the value span's minimum, a table entry per value maps to its covering branch, and
+      an out-of-range index (negative or over-large) selects the `else`/continuation via the table
+      default. Single values, multi-value `of`s, and `(range lo hi)` are handled; sparse/huge spans
+      (>256) fail-close (a comparison-chain lowering is the refinement). Tested on hand fixtures and
+      **real nimony `classify`** (`0 / 1,2 / 3 / else`), interp == JIT.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
