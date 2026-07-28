@@ -2203,8 +2203,31 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      queue entry or tolerating the duplicate), or (b) exactly-once in-cut by making the
      ticket recoverable at thaw (spill-visible tickets — a heavier ABI change). Current
      lean: (a), validated against reload-not-reissue (R8/R11) before widening.
-5. **Cross-cut O10 re-issue** — freeze-boundary calls complete with a re-issue marker on
-   thaw; validate against reload-not-reissue (R8/R11) before widening.
+5. **Cross-cut O10 re-issue — RESOLVED-AS-REACHABLE 2026-07-28.** A cross-cut caller is a
+   dispatch enqueued from *outside* the freeze cut. The reachable shape — an **embedder /
+   external** dispatch queued when the serving domain freezes — is **already built and now
+   pinned on both O10 halves**: the flagship
+   (`serving_freeze_serialize_restore_thaw_through_the_codec`) captures the in-flight
+   dispatch in the v13 serve trio and the thaw's re-issued serve op drains it *exactly once*
+   (served-once), and the new guard
+   (`a_completed_cross_cut_dispatch_is_not_resurrected_on_refreeze`, `svm-snapshot/tests/
+   roundtrip.rs`) pins the other half — a *completed* boundary call is **not resurrected**:
+   thaw → serve → re-freeze → restore yields an empty queue (no re-dispatch) and the delivered
+   result **reloads** from the completion cell rather than re-issuing (R8/R11 at the serve
+   boundary). So there is no re-issue *marker* to add for the reachable case — the serve trio
+   codec already carries reload-not-reissue.
+
+   The **in-cut guest caller** (a vCPU/fiber parked in `CapReply` on a live offer *inside* the
+   same run) is **not reachable under today's freeze triggers**, so it stays correctly
+   fail-closed: enqueuing a live-offer call `svc_wake`s the callee, so the server runs and
+   replies *before* the run can quiesce, and freeze-on-quiesce drains only `svc_waiters`,
+   never `ticket_waiters` — a `CapReply` fiber park still fails the freeze closed (the
+   classification at `freeze_drive`; a cap park's `Leaf` spill would reload the placeholder as
+   the call's result, unsound). Admitting it is a *future trigger slice* — a "freeze drains
+   cap-parked callers" step parallel to 4c-bis's `svc_waiters` drain — at which point the
+   caller's rewound frame re-issues the `cap.call` on thaw under the decided policy (a), the
+   same O10 the guard above already fixes as the boundary semantics. Recorded as the entry so
+   the invariant-9 divergence is enumerated rather than silently normalized.
 
 Fail-closed stays the default at every step: anything the current step can't capture keeps
 refusing the freeze, exactly as `has_blocked_parks` does today.
