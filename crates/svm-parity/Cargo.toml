@@ -1,0 +1,27 @@
+[package]
+name = "svm-parity"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The op × backend **parity matrix** (DESIGN.md §3, INVARIANTS.md #9): a single, exhaustive,
+# code-derived source of truth for which ops each of the four backends runs vs. folds back to the
+# oracle, and why. The library is pure data over `svm-ir` (no backend deps, so it stays cheap and
+# the classification cannot accidentally depend on a backend's internals); the *conformance* test
+# (`tests/`) is the honesty pin — it dev-deps all four backends and proves the manifest matches what
+# they actually compile.
+[dependencies]
+svm-ir.workspace = true
+
+[dev-dependencies]
+svm-verify.workspace = true
+svm-interp.workspace = true
+svm-jit.workspace = true
+svm-wasm-jit.workspace = true
+
+[[bin]]
+# Regenerate the checked-in human-readable matrix (`OPS_PARITY.md`): `cargo run -p svm-parity`.
+name = "svm-parity-gen"
+path = "src/bin/gen.rs"

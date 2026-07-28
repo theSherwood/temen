@@ -748,6 +748,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-parity"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+ "svm-jit",
+ "svm-verify",
+ "svm-wasm-jit",
+]
+
+[[package]]
 name = "svm-peval"
 version = "0.0.0"
 dependencies = [
