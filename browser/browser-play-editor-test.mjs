@@ -115,17 +115,18 @@ try {
 
     // #include + printf: the seeded <stdio.h> makes a text-emitting program actually print (its
     // output shows in the stdout pane, above the emitted IR) instead of trapping on an unresolved call.
+    // Includes a %f/%g line — guest-C float formatting compiled into the program.
     await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
-      '#include <stdio.h>\nint main(void){ for(int i=1;i<=3;i++) printf("i=%d\\n", i); return 0; }'),
+      '#include <stdio.h>\nint main(void){ for(int i=1;i<=3;i++) printf("i=%d\\n", i); printf("pi=%.2f e=%g\\n", 3.14159, 2.5); return 0; }'),
       card(ccName));
     await runCard(page, ccName, 30_000);
     const pf = await page.evaluate((sel) => ({
       state: document.querySelector(`${sel} .state`).dataset.state,
       out: document.querySelector(`${sel} .stdout`).textContent,
     }), card(ccName));
-    pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\n') && pf.out.includes('SVM IR')
-      ? ok('chibicc #include <stdio.h> + printf → real output in-browser')
-      : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 80) })}`);
+    pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\npi=3.14 e=2.5\n') && pf.out.includes('SVM IR')
+      ? ok('chibicc #include <stdio.h> + printf (incl. %f/%g floats) → real output in-browser')
+      : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
   }

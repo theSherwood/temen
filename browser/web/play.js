@@ -750,18 +750,24 @@ print("squares:", table.concat(sq, " "))
       'a module and runs it. Your program’s output (what printf writes) appears in the pane, with the ' +
       'emitted SVM IR below it, and main()’s return value as the result. A small libc ships as headers ' +
       '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h> and printf/puts/malloc/' +
-      'str* work as guest C over the powerbox’s ambient write. Compile a program and run it, entirely in ' +
-      'the browser, on the SVM. (Integer/string formatting; %f is not yet supported.)',
+      'str* work as guest C over the powerbox’s ambient write, including %f/%e/%g float formatting ' +
+      '(correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
+      'exact-tie roundings can differ from glibc). Compile a program and run it, entirely in the browser, on the SVM.',
     src: `// Write C here, then click Run. printf output shows in the pane on the
 // right; the emitted SVM IR appears below it, and main()'s return is the result.
 #include <stdio.h>
 
-int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
-
 int main(void) {
   printf("Hello from C — compiled to SVM IR in your browser!\\n\\n");
-  for (int i = 0; i < 10; i++)
-    printf("  fib(%d) = %d\\n", i, fib(i));
+
+  // A little numerical integration: estimate pi via the Leibniz series.
+  double pi = 0.0;
+  for (int k = 0; k < 100000; k++)
+    pi += (k % 2 ? -4.0 : 4.0) / (2 * k + 1);
+
+  printf("  pi  ~ %.6f   (%%e: %e)\\n", pi, pi);
+  printf("  e   ~ %.10g\\n", 2.718281828459045);
+  printf("  1/7 = %.4f,  2^0.5 rounds to %.3g\\n", 1.0 / 7.0, 1.41421356);
   return 0;
 }
 `,
