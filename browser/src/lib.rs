@@ -2491,6 +2491,46 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/math.h",
             include_str!("../playground-include/math.h"),
         ),
+        // The system-header surface chibicc's *own* sources #include (SELFHOST_C.md §7, stage-2). Most
+        // are thin stubs — the sandbox has no processes/globbing/wall-clock — present so `chibicc.h`
+        // parses; `<time.h>` returns a fixed 1970 epoch (for the `__DATE__`/`__TIME__` macros), and the
+        // fs syscalls (`open`/`read` in `<unistd.h>`) match `<stdio.h>`'s `fopen`/`fread`.
+        (
+            "include/stdnoreturn.h",
+            include_str!("../playground-include/stdnoreturn.h"),
+        ),
+        (
+            "include/strings.h",
+            include_str!("../playground-include/strings.h"),
+        ),
+        (
+            "include/glob.h",
+            include_str!("../playground-include/glob.h"),
+        ),
+        (
+            "include/libgen.h",
+            include_str!("../playground-include/libgen.h"),
+        ),
+        (
+            "include/unistd.h",
+            include_str!("../playground-include/unistd.h"),
+        ),
+        (
+            "include/time.h",
+            include_str!("../playground-include/time.h"),
+        ),
+        (
+            "include/sys/stat.h",
+            include_str!("../playground-include/sys/stat.h"),
+        ),
+        (
+            "include/sys/types.h",
+            include_str!("../playground-include/sys/types.h"),
+        ),
+        (
+            "include/sys/wait.h",
+            include_str!("../playground-include/sys/wait.h"),
+        ),
     ];
     HEADERS
         .iter()
@@ -2537,6 +2577,10 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
     }
     if !dirs.iter().any(|d| d == "include") {
         dirs.push("include".to_string());
+    }
+    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs), so register `include/sys`.
+    if !dirs.iter().any(|d| d == "include/sys") {
+        dirs.push("include/sys".to_string());
     }
     // Split the editor buffer into a **multi-file** project: the compile targets `/in.c` (the text
     // before the first marker), and each `//// file: NAME` marker seeds a sibling file the entry can

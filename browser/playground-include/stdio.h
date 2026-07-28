@@ -10,6 +10,7 @@
 // exact-tie roundings can differ from glibc; see the float helpers below) are all supported.
 
 #include <stdarg.h>
+#include <stdlib.h> // malloc/realloc — the growable buffer behind open_memstream
 
 // Ambient powerbox syscalls (the frontend lowers these to `cap.call` on the stashed handles).
 int write(int fd, char *buf, long n);
@@ -19,25 +20,60 @@ void exit(int code);
 typedef unsigned long size_t;
 typedef long ssize_t;
 
-// A FILE* is just its fd (0/1/2). No buffered stdio object — the powerbox stream is the buffer.
-typedef void FILE;
-#define stdin ((FILE *)0)
-#define stdout ((FILE *)1)
-#define stderr ((FILE *)2)
+// A real buffered FILE: either **fd-backed** (0/1/2 = the powerbox stream, or an `fopen` fd) or
+// **memory-backed** (`open_memstream`, fd == -1 → bytes accumulate in a growable malloc buffer whose
+// pointer/length are handed back through `memp`/`memlenp`). chibicc's `format()` builds every string
+// through a memory stream — `open_memstream` → `vfprintf` → `fclose` — so a real FILE is what lets
+// chibicc compile *its own source* in the sandbox (SELFHOST_C.md §7, stage-2).
+typedef struct __pg_FILE {
+  int fd;                       // >= 0: powerbox/fs fd; -1: memory stream
+  char **memp;                  // open_memstream: where to publish the buffer pointer
+  size_t *memlenp;              // open_memstream: where to publish the length
+  char *mem;                    // the growable buffer (memory stream)
+  size_t memcap, memlen;
+} FILE;
+static FILE __pg_std[3] = {
+  {0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0}, {2, 0, 0, 0, 0, 0},
+};
+#define stdin (&__pg_std[0])
+#define stdout (&__pg_std[1])
+#define stderr (&__pg_std[2])
 #define EOF (-1)
 
-// ---- output sink: either an fd (batched through a local buffer) or a caller string (s[n]printf) ----
+// The one low-level write: append to a memory stream (kept NUL-terminated, buffer republished), or
+// write straight to the fd through the powerbox. Every fputc/fputs/fwrite/printf path funnels here.
+static inline void __pg_fwrite_raw(FILE *f, const char *p, size_t n) {
+  if (!f)
+    return;
+  if (f->fd == -1) {
+    if (f->memlen + n + 1 > f->memcap) {
+      size_t cap = f->memcap ? f->memcap : 128;
+      while (f->memlen + n + 1 > cap) cap *= 2;
+      f->mem = (char *)realloc(f->mem, cap);
+      f->memcap = cap;
+    }
+    for (size_t i = 0; i < n; i++) f->mem[f->memlen + i] = p[i];
+    f->memlen += n;
+    f->mem[f->memlen] = 0;
+    if (f->memp) *f->memp = f->mem;
+    if (f->memlenp) *f->memlenp = f->memlen;
+  } else if (n) {
+    write(f->fd, (char *)p, (long)n);
+  }
+}
+
+// ---- output sink: either a FILE (batched through a local buffer) or a caller string (s[n]printf) ----
 struct __pf_sink {
-  char *out;   // non-null → writing into a string (snprintf); null → writing to fd
+  char *out;   // non-null → writing into a string (snprintf); null → writing to `file`
   size_t cap;  // string capacity (incl. space for the NUL)
   size_t n;    // total chars the full output *would* be (printf return value)
-  int fd;      // target fd when out == 0
+  FILE *file;  // target FILE when out == 0
   char buf[128];
   int bn;
 };
 static inline void __pf_flush(struct __pf_sink *s) {
   if (!s->out && s->bn) {
-    write(s->fd, s->buf, s->bn);
+    __pg_fwrite_raw(s->file, s->buf, (size_t)s->bn);
     s->bn = 0;
   }
 }
@@ -344,7 +380,7 @@ static inline int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) 
 
 static inline int vfprintf(FILE *stream, const char *fmt, va_list ap) {
   struct __pf_sink s;
-  s.out = 0; s.cap = 0; s.n = 0; s.fd = (int)(long)stream; s.bn = 0;
+  s.out = 0; s.cap = 0; s.n = 0; s.file = stream; s.bn = 0;
   int r = __pf_vprint(&s, fmt, ap);
   __pf_flush(&s);
   return r;
@@ -363,7 +399,7 @@ static inline int printf(const char *fmt, ...) {
 }
 static inline int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   struct __pf_sink s;
-  s.out = str; s.cap = size; s.n = 0; s.fd = 0; s.bn = 0;
+  s.out = str; s.cap = size; s.n = 0; s.file = 0; s.bn = 0;
   int r = __pf_vprint(&s, fmt, ap);
   if (size) s.out[s.n < size ? s.n : size - 1] = 0;
   return r;
@@ -383,15 +419,15 @@ static inline int sprintf(char *str, const char *fmt, ...) {
 
 static inline int fputc(int c, FILE *stream) {
   char b = (char)c;
-  write((int)(long)stream, &b, 1);
+  __pg_fwrite_raw(stream, &b, 1);
   return c;
 }
 static inline int putc(int c, FILE *stream) { return fputc(c, stream); }
 static inline int putchar(int c) { return fputc(c, stdout); }
 static inline int fputs(const char *s, FILE *stream) {
-  long n = 0;
+  size_t n = 0;
   while (s[n]) n++;
-  write((int)(long)stream, (char *)s, n);
+  __pg_fwrite_raw(stream, s, n);
   return 0;
 }
 static inline int puts(const char *s) {
@@ -399,9 +435,51 @@ static inline int puts(const char *s) {
   return putchar('\n');
 }
 static inline size_t fwrite(const void *ptr, size_t sz, size_t nm, FILE *stream) {
-  long n = (long)(sz * nm);
-  if (n) write((int)(long)stream, (char *)ptr, n);
+  __pg_fwrite_raw(stream, (const char *)ptr, sz * nm);
   return nm;
+}
+static inline int fflush(FILE *stream) { (void)stream; return 0; }
+
+// `fopen`/`fread` over the powerbox fs: the compiled program reads a served file (chibicc reads its
+// `/in.c`). `open` is the fs-cap syscall; in the plain compile-and-run card there is no fs cap, so a
+// program that only writes stdout never calls these — they exist so file-reading C (chibicc's own
+// sources) compiles. A memory stream (`open_memstream`, fd -1) needs no fs.
+int open(const char *path, int flags, ...);
+int close(int fd);
+static inline FILE *fopen(const char *path, const char *mode) {
+  int flags = 0; // r=RDONLY(0); w=WRONLY|CREAT|TRUNC; a=WRONLY|CREAT|APPEND (octal per the fs cap)
+  if (mode[0] == 'w') flags = 01 | 0100 | 01000;
+  else if (mode[0] == 'a') flags = 01 | 0100 | 02000;
+  int fd = open(path, flags);
+  if (fd < 0) return 0;
+  FILE *f = (FILE *)malloc(sizeof(FILE));
+  if (!f) { close(fd); return 0; }
+  f->fd = fd; f->memp = 0; f->memlenp = 0; f->mem = 0; f->memcap = 0; f->memlen = 0;
+  return f;
+}
+static inline FILE *open_memstream(char **bufp, size_t *lenp) {
+  FILE *f = (FILE *)malloc(sizeof(FILE));
+  if (!f) return 0;
+  f->fd = -1; f->memp = bufp; f->memlenp = lenp;
+  f->memcap = 128; f->memlen = 0;
+  f->mem = (char *)malloc(f->memcap);
+  if (!f->mem) return 0;
+  f->mem[0] = 0;
+  if (bufp) *bufp = f->mem;
+  if (lenp) *lenp = 0;
+  return f;
+}
+static inline size_t fread(void *ptr, size_t sz, size_t nm, FILE *stream) {
+  if (!stream || stream->fd < 0) return 0;
+  long r = read(stream->fd, (char *)ptr, (long)(sz * nm));
+  if (r <= 0) return 0;
+  return sz ? (size_t)r / sz : 0;
+}
+static inline int fclose(FILE *stream) {
+  if (!stream) return EOF;
+  if (stream->fd >= 0 && stream->fd > 2) close(stream->fd);
+  // A memory stream's buffer belongs to the caller (handed back via memp) — don't free it here.
+  return 0;
 }
 
 static inline int getchar(void) {
@@ -409,7 +487,7 @@ static inline int getchar(void) {
   return read(0, &c, 1) == 1 ? (unsigned char)c : EOF;
 }
 static inline char *fgets(char *s, int size, FILE *stream) {
-  int fd = (int)(long)stream, i = 0;
+  int fd = stream ? stream->fd : 0, i = 0;
   while (i < size - 1) {
     char c;
     if (read(fd, &c, 1) != 1) { if (i == 0) return 0; break; }
