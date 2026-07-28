@@ -407,23 +407,39 @@ on) **already lowers and drives the core §14 ops, wasm-safely:**
 
 What the browser bytecode engine still **declines** (the real remaining gaps, in rough order):
 
-1. **`instantiate_module_named` (op 13)** — exec-with-inherited-stdout, what the shell's external-
-   command path uses. It has no bytecode lowering (only ops 0/1/5 do) and the cooperative driver
-   doesn't build the child's by-name powerbox. **This is the first parity slice**: lower op 13 (=
-   op 5 + op 11 grants) and drive it cooperatively, following the op-5 pattern that already works —
-   which unblocks *external commands* in the playground shell.
-2. **The ring / `AddressSpace` / `SharedRegion` ops** — `compile_inst` rejects these (concurrent
-   pipelines). Needed for the stripped ring-pipeline path.
-3. **True concurrency.** The cooperative driver runs a child *to completion synchronously*, which is
-   exactly right for sequential spawn/wait but not for *concurrently* live children (a `poll` that
-   must see a still-running child; a pipeline whose stages run interleaved). That needs a cooperative
-   **scheduler** that interleaves live children on one thread (logical clock, no OS threads) — the
-   wasm-safe analogue of the native M:N/JIT-OS-thread executors.
+1. **`instantiate_module_named` (op 13)** *(done — parity slice 1, `bytecode_instantiate_named.rs`)* —
+   exec-with-inherited-stdout, what the shell's external-command path uses. Lowered in `compile_inst`
+   to `Op::InstantiateModule` with a `grants: Option<(ptr, n)>` field (op 5 = `None`); the cooperative
+   `drive` arm reads the by-name grant records from the parent window and builds the child powerbox via
+   the shared `Host::spawn_named_child`. Unblocks *external commands* in the playground shell.
+2. **The ring / `AddressSpace` / `SharedRegion` ops + concurrent stages** *(done — parity slice 2,
+   `bytecode_concurrent_stages.rs`)* — the full concurrent ring pipeline (the tree-walk oracle's
+   `concurrent_stages.rs`, same 410) now runs on the cooperative bytecode driver. The gap turned out
+   **narrower than "lower the region ops"**: `SharedRegion.map`/`page_size` (ops 0/3) and
+   `AddressSpace.create_region` (op 5) already ride the generic `cap.call` dispatch (they service from
+   `(Host, Mem)` alone — only `SharedRegion.grant` op 4 needs a child-powerbox seam, and the ring path
+   doesn't use it), and the production `drive` scheduler was **already** a cooperative multi-vCPU
+   scheduler that parks a task on `memory.wait` and wakes it on `notify` (so item 3 below was already
+   built). Two real changes closed it: (a) **`instantiate_named` (op 11)** — `instantiate` (op 0) plus a
+   by-name grant list, the same-module twin of op 13 — lowered by extending `Op::Instantiate` with the
+   same `grants` field, and `scan_seams` corrected to classify ops 11/13 as `has_instantiate` (not
+   `has_coro`, which with `memory.wait`'s `has_thread` tripped the `has_coro && has_thread` veto → whole-
+   module fallback); and (b) the drive's futex wait/notify now key on the **backing identity**
+   (`Mem::futex_key`, `FutexKey::Region`) computed against the **waiting task's own confined window**
+   (`extra_envs`), not the raw window offset against the root `mem` — so two children that mapped the
+   same `SharedRegion` into separate windows rendezvous (S1c), instead of a child re-reading an
+   unrelated root byte and spinning. Confinement (D38 masking) untouched — authority-TCB only (§2a).
+3. **True concurrency** *(already built — folded into slice 2)* — the cooperative `drive` scheduler
+   already interleaves live children on one thread with a logical clock (`TaskState::BlockedWait` parks,
+   `notify`/child-completion wakes, a stuck set advances the clock, deadlock → `ThreadFault`); a
+   confined `instantiate` child runs as a task slot exactly like a `thread.spawn` sibling. The earlier
+   "runs a child to completion synchronously" note was stale for this driver. `poll` (WNOHANG) is the
+   one remaining nuance and is already backend-portable (see the `poll` note above).
 4. **`fork`** — durable clone over the `Instantiator` child model (§7). Whether the durable
    freeze/thaw path itself runs on the bytecode engine in wasm is the open question that gates *bash*
-   specifically; ops 1–3 are the parity groundwork it sits on.
+   specifically; slices 1–2 are the parity groundwork it sits on.
 
 So this is a **sequence of scoped slices on the bytecode engine**, not an unbounded design problem:
-op 13 → ring ops → cooperative child scheduler → fork. The wasm-JIT tier can defer each §14 seam to
-the bytecode engine (as it already does for its cross-tier helpers), so bringing bytecode to parity
-brings *both* browser engines along. Slice 1 (op 13) is the immediate next step.
+op 13 → ring ops + op 11 → (scheduler, already built) → fork. The wasm-JIT tier can defer each §14 seam
+to the bytecode engine (as it already does for its cross-tier helpers), so bringing bytecode to parity
+brings *both* browser engines along. Slices 1 and 2 are done; **`fork` is the next frontier**.
