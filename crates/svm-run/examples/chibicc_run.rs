@@ -26,6 +26,9 @@ fn main() {
     let input = a.next().expect("missing <input.c>");
     let argv_path = a.next().expect("missing <argv-path>");
     let include_dir = a.next();
+    // Any remaining args are forwarded to the guest chibicc as leading options (e.g. `-g0`,
+    // `--data-page 65536`) — chibicc parses options before the input path.
+    let extra: Vec<String> = a.collect();
 
     // Seed: the source at its cap-relative key (argv-path minus any leading '/'), plus every header
     // in the optional include dir under `include/` (mounted at the guest's fixed `/include`).
@@ -68,7 +71,12 @@ fn main() {
         },
         stdin: vec![],
         memory_size_log2: None,
-        args: vec![b"chibicc".to_vec(), argv_path.into_bytes()],
+        args: {
+            let mut v = vec![b"chibicc".to_vec()];
+            v.extend(extra.iter().map(|s| s.clone().into_bytes()));
+            v.push(argv_path.into_bytes());
+            v
+        },
         env: vec![],
     };
     let run = inst

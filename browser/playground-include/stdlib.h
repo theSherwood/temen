@@ -16,7 +16,7 @@ void exit(int code);
 static char __pg_heap[__PG_HEAP_BYTES];
 static size_t __pg_brk = 0;
 
-static void *malloc(size_t n) {
+static inline void *malloc(size_t n) {
   size_t need = ((n + 8) + 15) & ~(size_t)15; // 8-byte header + 16-byte align
   if (__pg_brk + need > __PG_HEAP_BYTES) return NULL;
   char *p = __pg_heap + __pg_brk;
@@ -24,14 +24,14 @@ static void *malloc(size_t n) {
   *(size_t *)p = n;
   return p + 8;
 }
-static void free(void *p) { (void)p; }
-static void *calloc(size_t nm, size_t sz) {
+static inline void free(void *p) { (void)p; }
+static inline void *calloc(size_t nm, size_t sz) {
   size_t n = nm * sz;
   char *p = malloc(n);
   if (p) for (size_t i = 0; i < n; i++) p[i] = 0;
   return p;
 }
-static void *realloc(void *old, size_t n) {
+static inline void *realloc(void *old, size_t n) {
   if (!old) return malloc(n);
   size_t oldn = *(size_t *)((char *)old - 8);
   char *p = malloc(n);
@@ -42,26 +42,26 @@ static void *realloc(void *old, size_t n) {
   return p;
 }
 
-static void abort(void) { exit(134); }
+static inline void abort(void) { exit(134); }
 
-static int abs(int x) { return x < 0 ? -x : x; }
-static long labs(long x) { return x < 0 ? -x : x; }
+static inline int abs(int x) { return x < 0 ? -x : x; }
+static inline long labs(long x) { return x < 0 ? -x : x; }
 
-static int atoi(const char *s) {
+static inline int atoi(const char *s) {
   int sign = 1, v = 0;
   while (*s == ' ' || *s == '\t' || *s == '\n') s++;
   if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
   while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
   return sign * v;
 }
-static long atol(const char *s) {
+static inline long atol(const char *s) {
   long sign = 1, v = 0;
   while (*s == ' ' || *s == '\t' || *s == '\n') s++;
   if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
   while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
   return sign * v;
 }
-static long strtol(const char *s, char **end, int base) {
+static inline long strtol(const char *s, char **end, int base) {
   long sign = 1, v = 0;
   while (*s == ' ' || *s == '\t' || *s == '\n') s++;
   if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
@@ -83,11 +83,11 @@ static long strtol(const char *s, char **end, int base) {
 
 // Deterministic LCG (no wall clock in the sandbox).
 static unsigned long __pg_rng = 1;
-static int rand(void) { __pg_rng = __pg_rng * 6364136223846793005UL + 1442695040888963407UL; return (int)((__pg_rng >> 33) & 0x7fffffff); }
-static void srand(unsigned s) { __pg_rng = s; }
+static inline int rand(void) { __pg_rng = __pg_rng * 6364136223846793005UL + 1442695040888963407UL; return (int)((__pg_rng >> 33) & 0x7fffffff); }
+static inline void srand(unsigned s) { __pg_rng = s; }
 
 // Simple qsort (insertion sort — fine for demo-sized arrays; stable enough, no recursion depth).
-static void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *)) {
+static inline void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *)) {
   char *a = base;
   char tmp[256];
   if (sz > sizeof(tmp)) return; // demo cap

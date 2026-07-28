@@ -28,7 +28,7 @@ fn compile_and_run(chibicc: &svm_ir::Module, src: &str) -> (i32, String) {
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"],
         b"",
     );
     assert!(

@@ -3093,12 +3093,19 @@ void codegen_ir(Obj *prog, FILE *out) {
 
   // Order the function definitions with `main` first. A `_start` wrapper (function 0)
   // then sets up the data-SP and calls `main`, so real functions begin at index 1.
+  //
+  // Skip dead functions (`!is_live`): chibicc's `mark_live` pass (parse.c) marks every function
+  // reachable from a root (any non-`static`, or non-`inline`, definition) through the call/reference
+  // graph; the native `codegen.c` skips the rest, and so do we. This is what makes a `static inline`
+  // library function (e.g. the playground's seeded <stdio.h>) cost nothing unless the program uses it
+  // — an unused `snprintf`/`puts` is not codegen'd, emitted, or bytecode-compiled. Filtering here (not
+  // just at emission) keeps `func_index` dense: a skipped function never claims an index.
   nfuncs = 0;
   for (Obj *fn = prog; fn; fn = fn->next)
-    if (fn->is_function && fn->is_definition && fn->name && !strcmp(fn->name, "main"))
+    if (fn->is_function && fn->is_definition && fn->is_live && fn->name && !strcmp(fn->name, "main"))
       funcs[nfuncs++] = fn;
   for (Obj *fn = prog; fn; fn = fn->next)
-    if (fn->is_function && fn->is_definition && !(fn->name && !strcmp(fn->name, "main")))
+    if (fn->is_function && fn->is_definition && fn->is_live && !(fn->name && !strcmp(fn->name, "main")))
       funcs[nfuncs++] = fn;
 
   bool has_main = nfuncs > 0 && funcs[0]->name && !strcmp(funcs[0]->name, "main");

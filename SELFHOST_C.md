@@ -197,13 +197,14 @@ compiler bug is a clean error, never an escape.
    **→ Step-5 slice A done 2026-07-24 — engine parity settled (the prerequisite).** `chibicc_run.rs`
    takes `SVM_CHIBICC_BACKEND`; `run_selfhost_diff.sh` runs every case on **treewalk / bytecode / jit**
    and all three emit **byte-identical IR** vs native. Engine decision for the playground card:
-   **bytecode engine (`jit: false`)**. The browser's whole-module wasm-JIT tier is *integer-subset
-   only* — `svm_wasmjit::compile_module(chibicc.svmb)` fails "a function is outside the integer
-   subset" (chibicc uses floats: the `%.17g`/`__vm_fmt` path). That is expected and not a blocker: the
-   playground already runs float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
-   per-demo `jit` flag (`browser/web/play.js`); the wasm-JIT is an opt-in accelerator for integer
-   modules, not the only path. chibicc's compiled *outputs* run on bytecode too (integer-only ones may
-   opt into wasm-JIT later). No substrate change; making the wasm tier accept floats is out of scope.
+   **bytecode engine (`jit: false`)**. *(Correction 2026-07-28: the browser wasm-JIT is **no longer**
+   integer-subset only — `svm-wasm-jit` gained f32/f64 support, bit-exact-differential-tested against
+   the interpreter, so the old "chibicc uses floats → can't JIT" reasoning is stale. The one scalar-float
+   op still refused is `fma`; if `chibicc.svmb` still won't whole-module-JIT it's `fma` — likely from its
+   `%.17g`/`__vm_fmt` path — or a non-float op like an un-outlined `cap.call`, not float arithmetic
+   generally. Getting chibicc onto the wasm-JIT tier is the big open speed lever — a separate slice.)*
+   The playground also runs other float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
+   per-demo `jit` flag (`browser/web/play.js`). chibicc's compiled *outputs* run on bytecode too.
 
    **→ Step 5 DONE 2026-07-24 — the capstone runs in the browser.** The playground has a "C compiler
    (chibicc → SVM)" card (`browser/web/play.js`, `kind: 'chibicc'`): edit C → the page runs
@@ -235,6 +236,17 @@ compiler bug is a clean error, never an escape.
    floats, `<string.h>`/`<stdlib.h>`) and the `browser-play-editor-test.mjs` Chromium assertion
    (`#include <stdio.h>` + `printf`, incl. `%f`/`%g`, → real output in-browser). A caller image can still
    add/override headers (its keys win). Residual scope: shortest-round-trip floats, and larger libc surface.
+
+   **→ Compile-speed pass DONE 2026-07-28.** Compiling `#include <stdio.h>` + `printf("hi")` on the
+   bytecode interpreter went from **3.36 s / 495 KB IR → 1.41 s / 330 KB** (2.4× faster). Two changes:
+   (a) the seeded libc headers are now `static inline`, and `codegen_ir.c` honours chibicc's `is_live`
+   dead-code pass (the native `codegen.c` already did) — so `#include <stdio.h>` no longer compiles the
+   ~13 unused libc functions (`puts`/`snprintf`/`fgets`/…) into every program, only `printf`'s reachable
+   closure; (b) the playground passes `-g0` (new guest-driver flag), dropping the `-g` debug info that
+   the compiled program never uses (~a third of the IR). The dominant residual cost is that chibicc runs
+   on the **bytecode interpreter** — the on-ramp's stale "integer-subset only" note (below) is wrong:
+   the browser wasm-JIT already supports f64/f32, so getting `chibicc.svmb` onto that tier (the one
+   blocker is scalar `fma`, not float arithmetic) is the big remaining lever — a separate investigation.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

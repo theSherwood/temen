@@ -2515,10 +2515,13 @@ pub extern "C" fn svm_run_onramp_fs(
     // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
     // read-only globals must not share a host page with writable data (D40) — chibicc pins the
     // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
+    // `-g0`: the playground never debugs the compiled program, so drop debug info (~a third of the
+    // emitted IR). With the seeded libc's `static inline` + chibicc's dead-code elimination, a small
+    // program then compiles far less IR — much faster on the bytecode interpreter.
     let out = onramp_fs_exec(
         &m,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"],
         &[],
     );
     set(out.status);
