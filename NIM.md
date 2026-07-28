@@ -263,10 +263,17 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       `inc(addr i)` (a frameless pointer helper called from a frame-needing counter) and a mixed
       SSA-accumulator/framed-counter sum, interp == JIT. Address-taken *params* and recursion
       depth beyond one frame are the remaining refinements.
-    - **Next: `at`/`dot`/`pat`** — array/field/pointer indexing over the frame + windows, the
-      gateway to `seq`/`string`/`object`. And whole-module: `gvar`/`type` top-levels +
-      cross-module `call` (`…sysvq0asl`) as imports, so real `sumto` (whose `inc` is a system
-      import) runs, not just its hand-modeled shape.
+    - **✅ `at`/`dot`/`pat` + type layouts — DONE 2026-07-28.** Named `(type … (object …))` /
+      `(array Elem Count)` layouts are registered (with forward-ref resolution); a unified
+      `lvalue_addr` (the `codegen_ir.c` `gen_addr`) resolves `dot` (field), `at` (array element),
+      `pat` (pointer index), `deref`, and frame/aggregate symbols to `(address, type descriptor)`,
+      then a scalar leaf loads/stores. Object params are passed by address; aggregate `var`s are
+      frame-resident (default-zeroed). Tested on hand fixtures (object field set/get, array `at`,
+      pointer `pat`, a framed local array) **and real nimony object bytes** (`dot2`, `p.x*p.x+…`),
+      interp == JIT. Whole-aggregate copy/`oconstr`/`aconstr` and C-ABI (SysV) field offsets remain.
+    - **Next: whole-module** — `gvar`/`type` top-levels (types done) + cross-module `call`
+      (`…sysvq0asl`) as imports, so real `sumto` (whose `inc` is a system import) and multi-proc
+      modules run end-to-end, not just single procs.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
