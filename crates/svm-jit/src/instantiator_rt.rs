@@ -254,6 +254,21 @@ pub(crate) struct Nursery {
     /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
+    /// Address of the parent run's **counted-fuel** cell (`0` ⇒ the parent isn't fuel-armed, so
+    /// children stay un-metered — byte-identical to before). Read (not decremented) at each spawn to
+    /// derive the child's budget `min(quota, *parent_fuel_addr)` — the JIT mirror of the interpreter's
+    /// `child_fuel` contract (INTERP_PERF.md "Fuel unification" step 5). Same-thread as the spawning
+    /// vCPU that owns this cell, so the read needs no synchronization.
+    parent_fuel_addr: usize,
+    /// Each fuel-armed child's own budget cell, kept alive here until run teardown (after
+    /// [`Nursery::join_children`]) because an **async** child's OS thread — or a suspended **coro** —
+    /// decrements it after the spawning thunk has returned. `Box<u64>` gives a stable heap address to
+    /// bake into the child's code; the cells are never merged back into the parent (no credit-back,
+    /// exactly like the interpreter's value-copy `child_fuel`).
+    // `Box` is load-bearing: the baked address must survive a `push`, which a `Vec<u64>`'s realloc
+    // would move — so the clippy `vec_box` "simplification" would dangle the address in a child's code.
+    #[allow(clippy::vec_box)]
+    child_fuel_cells: Mutex<Vec<Box<u64>>>,
     /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none — the durable
     /// nested nursery). Children compile their `atomic.wait`/`notify` against this **shared** futex
     /// table, so concurrent children (and the parent's own vCPUs) rendezvous — the pipeline
@@ -433,6 +448,7 @@ impl Nursery {
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
         epoch_addr: usize,
+        parent_fuel_addr: usize,
         futex_sched: usize,
         my_task: usize,
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -444,6 +460,8 @@ impl Nursery {
             cap_ctx,
             resolve_module,
             epoch_addr,
+            parent_fuel_addr,
+            child_fuel_cells: Mutex::new(Vec::new()),
             futex_sched,
             children: Mutex::new(Vec::new()),
             child_threads: Mutex::new(Vec::new()),
@@ -478,6 +496,38 @@ impl Nursery {
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
+    }
+
+    /// Derive and allocate a child's counted-fuel cell, exactly as the interpreter derives `child_fuel`
+    /// (INTERP_PERF.md "Fuel unification" step 5; the tree-walker at `lib.rs` "Quota: the child's fuel,
+    /// sub-allocated from (and capped by) ours"): the child's budget is `min(quota, parent_remaining)`,
+    /// or the parent's *entire* remaining fuel when `quota <= 0` (the "unspecified" sentinel). The
+    /// operand the lowering passes to the instantiate thunks as `fuel` is that same `quota`. Returns the
+    /// cell's stable address to bake into the child's code, or `0` when the parent isn't fuel-armed (the
+    /// child stays un-metered, byte-identical to before this slice). The cell lives in the nursery until
+    /// teardown so an async/coro child can decrement it after the spawning thunk has returned; it is
+    /// never merged back into the parent (no credit-back — the interpreter's `child_fuel` is a value copy).
+    ///
+    /// # Safety
+    /// Runs on the spawning vCPU's own thread, the sole writer of `*parent_fuel_addr`, so the read is
+    /// race-free; `parent_fuel_addr` (when nonzero) is the live host-owned parent fuel cell.
+    unsafe fn arm_child_fuel(&self, quota: i64) -> usize {
+        if self.parent_fuel_addr == 0 {
+            return 0; // parent un-metered ⇒ child un-metered
+        }
+        let parent_remaining = *(self.parent_fuel_addr as *const u64);
+        let child_fuel = if quota <= 0 {
+            parent_remaining
+        } else {
+            (quota as u64).min(parent_remaining)
+        };
+        let cell = Box::new(child_fuel);
+        let addr = &*cell as *const u64 as usize;
+        self.child_fuel_cells
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cell);
+        addr
     }
 
     /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
@@ -678,7 +728,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     entry: i64,
     off: i64,
     size_log2: i64,
-    _fuel: i64,
+    fuel: i64,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
@@ -732,6 +782,12 @@ pub(crate) unsafe extern "C" fn instantiate(
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
+    // Fuel unification (step 5): derive this child's own budget cell from the `fuel` operand (the
+    // interpreter's `quota`) clamped to the parent's remaining fuel — `0` when the parent isn't armed,
+    // leaving the child un-metered as before. Owned by the nursery until teardown (an async child
+    // decrements it on its own thread). SAFETY: on the spawning vCPU's thread, sole writer of the cell.
+    let child_fuel_addr = rt.arm_child_fuel(fuel);
+
     // Durable children stay **synchronous** (their baked per-child nursery + freeze residue can't ride
     // the cached OS-thread path yet): re-compile + run inline, record the outcome (and any freeze
     // unwind), and return the join slot.
@@ -749,6 +805,7 @@ pub(crate) unsafe extern "C" fn instantiate(
             mem_base as *mut u8,
             &args,
             rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
+            child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
             durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
             false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
             child_task,
@@ -793,18 +850,33 @@ pub(crate) unsafe extern "C" fn instantiate(
         entry as u32,
         size_log2 as u8,
     );
-    let code = {
+    // A fuel-armed child bakes its **per-spawn** budget-cell address into its code, so that code can't
+    // be shared across spawns — compile fresh and bypass the cache. (Fuel arming is opt-in, so the
+    // common un-armed production path keeps the cache byte-identically.)
+    let compile_fresh = || {
+        crate::compile_nondurable_child(
+            child_funcs,
+            entry as FuncIdx,
+            size_log2 as u8,
+            rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
+            child_fuel_addr, // §5 fuel: 0 ⇒ un-metered (cacheable); nonzero ⇒ per-spawn (not cached)
+            rt.futex_sched,  // wait/notify against the parent domain's shared futex
+        )
+    };
+    let code = if child_fuel_addr != 0 {
+        match compile_fresh() {
+            Ok(cc) => std::sync::Arc::new(cc),
+            Err(_) => {
+                *trap_out = TrapKind::CapFault as i64;
+                return 0;
+            }
+        }
+    } else {
         let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.get(&key) {
             std::sync::Arc::clone(c)
         } else {
-            match crate::compile_nondurable_child(
-                child_funcs,
-                entry as FuncIdx,
-                size_log2 as u8,
-                rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
-                rt.futex_sched, // wait/notify against the parent domain's shared futex
-            ) {
+            match compile_fresh() {
                 Ok(cc) => {
                     let a = std::sync::Arc::new(cc);
                     cache.insert(key, std::sync::Arc::clone(&a));
@@ -873,7 +945,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
     entry: i64,
     off: i64,
     size_log2: i64,
-    _fuel: i64,
+    fuel: i64,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
@@ -938,6 +1010,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
     // it **asynchronously** on its own OS thread (S1c — granted children are concurrent, so a spawned
     // pair can pipeline). Uncached — the per-spawn child ctx is baked into the code. The child gets no
     // nesting `InstEnv` (like every non-durable JIT child today).
+    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
         entry as FuncIdx,
@@ -945,7 +1018,8 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
-        rt.futex_sched, // wait/notify against the parent domain's shared futex
+        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
+        rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
     let code = match compiled {
@@ -1001,7 +1075,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     entry: i64,
     off: i64,
     size_log2: i64,
-    _fuel: i64,
+    fuel: i64,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
@@ -1068,6 +1142,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         return 0; // `*trap_out` already set by the builder
     }
 
+    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
         entry as FuncIdx,
@@ -1075,7 +1150,8 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
-        rt.futex_sched, // wait/notify against the parent domain's shared futex
+        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
+        rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
     let code = match compiled {
@@ -1130,7 +1206,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     entry: i64,
     off: i64,
     size_log2: i64,
-    _fuel: i64,
+    fuel: i64,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
@@ -1223,6 +1299,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
 
     // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its
     // `cap.self.resolve(name)` routes to the granted caps. Per-spawn ctx ⇒ uncached (like op 11).
+    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,
         entry as FuncIdx,
@@ -1230,7 +1307,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         rt.cap_thunk,
         gc.ctx,
         rt.epoch_addr,
-        rt.futex_sched, // wait/notify against the parent domain's shared futex
+        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
+        rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
     );
     let code = match compiled {
@@ -1515,7 +1593,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
     entry: i64,
     off: i64,
     size_log2: i64,
-    _fuel: i64,
+    fuel: i64,
     demand: i32,
     trap_out: *mut i64,
 ) -> i32 {
@@ -1577,13 +1655,15 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         trap: UnsafeCell::new(0),
     });
     // Bake the child's code against its `Yielder` thunk + the stable `CoroShared` address.
+    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let code = match crate::compile_child(
         child_funcs,
         entry as FuncIdx,
         size_log2 as u8,
         coro_cap_thunk,
         &*shared as *const CoroShared as *mut core::ffi::c_void,
-        rt.epoch_addr, // §5: the co-fiber child polls the parent's kill-path cell
+        rt.epoch_addr,   // §5: the co-fiber child polls the parent's kill-path cell
+        child_fuel_addr, // §5 fuel: the co-fiber decrements its own clamped budget cell
         0, // a co-fiber runs inline on the parent's thread — no futex sharing (waits stay rejected)
         crate::InstEnv::null(), // a co-fiber child cannot itself nest (its Instantiator → CapFault)
     ) {

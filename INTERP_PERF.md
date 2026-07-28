@@ -366,8 +366,8 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > ones that assert `OutOfFuel` on *straight-line* code, which crosses zero safepoints and so never
 > exhausts; each was rewritten to loop so a back-edge exists to charge at. The Cranelift JIT
 > counted-fuel half landed in #452; the top-level-entry reconciliation and the harness flip to
-> **assert** `OutOfFuel` parity across all three engines landed after (see the Sequence, steps 3–4).
-> **Still separable:** the `instantiate`-child fuel threading (step 5).
+> **assert** `OutOfFuel` parity across all three engines landed after (see the Sequence, steps 3–4); the
+> `instantiate`-child fuel threading (step 5) closed the last nested-run gap. Fuel unification complete.
 >
 > **One fuzzer needed rescaling — and it exposed a real metering gap.** `fiber_fuzz`'s
 > `generated_fiber_programs_never_panic_and_are_deterministic` uses a *cyclic* generator (a `call` /
@@ -480,11 +480,19 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
    850 exhaustion cases); `jit_fuzz` arms the JIT at the interp's budget and asserts interp↔JIT parity
    (`…_under_tight_fuel`, 604 cases); `jit_fuel` tightened from `== interp+1` to strict `== interp`.
    INVARIANTS §9 gained the fuel-parity clause.
-5. Follow-on (**pending, separable**): the `instantiate` child honors its `fuel` uniformly on the JIT
-   (`lib.rs` nested-child compile bakes `fuel_addr=0`; `instantiator_rt.rs` drops `_fuel` at the five
-   instantiation entry points), closing the last `_fuel`-ignored divergence for nested runs. The
-   generative corpus emits no `instantiate` ops, so top-level three-engine parity (steps 1–4) does not
-   depend on it.
+5. Follow-on: the `instantiate` child honors its `fuel` uniformly on the JIT. ✅ **DONE.** `compile_child`
+   (and `compile_child_and_run` / `compile_nondurable_child`) gained a `fuel_addr` threaded to the
+   child's `build_clif` (mirroring `epoch_addr`); the `Nursery` reads the parent's remaining fuel and
+   derives each child's cell as `min(quota, parent_remaining)` (`arm_child_fuel`, the interpreter's
+   `child_fuel` contract exactly — including the `quota <= 0` "inherit parent" sentinel and no
+   credit-back), owning the cells until teardown so async/coro children can decrement them. Because the
+   per-spawn cell address is baked, a fuel-armed run skips the non-durable child-code cache (recompiles
+   per spawn); un-armed runs keep the cache byte-identically. All five instantiation thunks
+   (`instantiate`, `_granted`, `_named`, `_module_named`, `coro_spawn`) arm the child. Validated by
+   `jit_instantiate_fuel.rs`: a runaway nested child now traps `OutOfFuel` via counted fuel (not the §5
+   watchdog), matching the interpreter, and a `quota`-capped child exhausts at its cap — both
+   differentially pinned against the oracle. (Durable *thaw* re-attach of a frozen subtree child stays
+   un-metered, consistent with the freeze slice's other durable-nesting deferrals.)
 
 ---
 

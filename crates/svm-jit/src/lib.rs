@@ -2793,6 +2793,7 @@ impl CompiledModule {
                 cap_ctx,
                 resolve_module,
                 epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
                 // The run's thread `Domain` (always stood up for a nesting module, above): children
                 // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
                 // the parent rendezvous in one table.
@@ -3696,6 +3697,7 @@ impl CompiledModule {
                         mem_base,
                         &args,
                         epoch,
+                        0, // durable thaw re-attach: metering a frozen subtree child is a later slice
                         true, // durable
                         true, // thaw: rewind from the carve's frozen continuation
                         my_task,
@@ -4221,6 +4223,10 @@ pub(crate) unsafe fn compile_child_and_run(
     parent_mem_base: *mut u8,
     args: &[i64],
     epoch_addr: usize,
+    // This child's own counted-fuel cell (`0` ⇒ un-metered). Baked into the child's code *and* handed
+    // to its grandchild nursery as the parent-fuel cell, so a grandchild clamps against this child's
+    // remaining budget — the recursive form of the `min(quota, parent_remaining)` contract.
+    fuel_addr: usize,
     durable: bool,
     thaw: bool,
     my_task: usize,
@@ -4256,7 +4262,8 @@ pub(crate) unsafe fn compile_child_and_run(
             &*child_win_size as *const u64 as *mut core::ffi::c_void,
             None, // same-module grandchildren only (separate-module is a later slice)
             epoch_addr,
-            0,       // durable subtree: no shared futex domain (child futex ops stay rejected)
+            fuel_addr, // §5 parent-fuel: a grandchild clamps its budget against this child's remaining
+            0,         // durable subtree: no shared futex domain (child futex ops stay rejected)
             my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
             std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
             std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
@@ -4294,6 +4301,7 @@ pub(crate) unsafe fn compile_child_and_run(
         empty_cap_thunk,
         core::ptr::null_mut(),
         epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
+        fuel_addr,  // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
         0,          // durable path: no shared futex domain — child futex ops stay rejected
         child_inst,
     )?;
@@ -4382,6 +4390,7 @@ pub(crate) unsafe fn compile_child_and_run(
                     child_base,
                     &gc_args,
                     epoch_addr,
+                    0, // durable thaw re-attach: metering a frozen subtree child is a later slice
                     true, // durable
                     true, // thaw
                     gc_task,
@@ -4512,6 +4521,12 @@ fn compile_child(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     epoch_addr: usize,
+    // Address of this child's **own** counted-fuel cell (`0` ⇒ un-metered — byte-identical to before
+    // fuel threading). Unlike `epoch_addr` (one stable host cell shared by the whole run), each child
+    // gets its own budget (`min(quota, parent_remaining)`, INTERP_PERF.md "Fuel unification" step 5),
+    // so this address is **per-spawn** and is baked here — the caller (a fuel-armed run) must therefore
+    // not reuse cached child code across spawns (see the async cache guard in `instantiator_rt`).
+    fuel_addr: usize,
     // The parent domain's futex (`os_thread_rt::Domain` address), or `0`. Nonzero lets the child's
     // `atomic.wait`/`notify` compile against the **parent's shared futex table** — how concurrent
     // §14 children (and the parent) rendezvous, e.g. a pipeline over a granted `SharedRegion` ring.
@@ -4625,7 +4640,7 @@ fn compile_child(
             0,          // top-level confinement over the child's own window
             guard_offset_of(child_size), // its own window's trailing guard
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
-            0, // counted fuel: nested children stay un-metered in this slice (a follow-up threads it)
+            fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
@@ -4714,6 +4729,9 @@ pub(crate) fn compile_nondurable_child(
     child_entry: FuncIdx,
     child_size_log2: u8,
     epoch_addr: usize,
+    // This child's own counted-fuel cell (`0` ⇒ un-metered). Baked, so a fuel-armed run must not reuse
+    // this `ChildCode` across spawns — the caller (`instantiate`) skips the cache when this is nonzero.
+    fuel_addr: usize,
     futex_sched: usize,
 ) -> Result<ChildCode, JitError> {
     compile_child(
@@ -4723,6 +4741,7 @@ pub(crate) fn compile_nondurable_child(
         empty_cap_thunk,
         core::ptr::null_mut(),
         epoch_addr,
+        fuel_addr,
         futex_sched,
         InstEnv::null(),
     )
