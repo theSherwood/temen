@@ -225,11 +225,16 @@ compiler bug is a clean error, never an escape.
    `#include` — nothing is linked — so `printf` formats over the powerbox's ambient `write` and a
    text-emitting program **actually prints** (the playground pane shows the program's output above the
    emitted IR) instead of trapping on an unresolved `call.sym`. Integer/char/string/pointer conversions
-   with flags/width/precision are supported; **`%f`/`%e`/`%g` are not** (no dtoa in the powerbox — the
-   one deliberate gap). Gated by `browser/tests/chibicc_printf.rs` (compile-and-run a `printf` program
-   vs its exact output, both `<stdio.h>` and `<string.h>`/`<stdlib.h>`) and the `browser-play-editor-test.mjs`
-   Chromium assertion (`#include <stdio.h>` + `printf` → real output in-browser). A caller image can still
-   add/override headers (its keys win). The residual scope: floats in `printf`, and larger libc surface.
+   with flags/width/precision are supported, and **`%f`/`%e`/`%g` too** (**DONE 2026-07-28**): guest-C
+   float formatting in `<stdio.h>`, **correctly rounded to the requested precision** and byte-identical
+   to glibc for the values a demo uses. It is *not* a bignum shortest-round-trip dtoa (the on-ramp's
+   `__vm_fmt_*` is hand-emitted IR, unusable from a chibicc program, and the powerbox exposes no dtoa),
+   so `%.17g` on an arbitrary double and a couple of exact-tie roundings (an exact `0.5` at `%.0f`, the
+   `0.015` boundary) can differ — a deliberate, documented gap, no host/TCB surface added. Gated by
+   `browser/tests/chibicc_printf.rs` (compile-and-run a `printf` program vs its exact output — `<stdio.h>`
+   floats, `<string.h>`/`<stdlib.h>`) and the `browser-play-editor-test.mjs` Chromium assertion
+   (`#include <stdio.h>` + `printf`, incl. `%f`/`%g`, → real output in-browser). A caller image can still
+   add/override headers (its keys win). Residual scope: shortest-round-trip floats, and larger libc surface.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

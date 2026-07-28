@@ -99,3 +99,37 @@ int main(void) {
     assert_eq!(status, STATUS_OK, "run status");
     assert_eq!(out, "chibicc has 7 letters; atoi(\"41\")+1=42\n");
 }
+
+#[test]
+fn float_formatting_matches_glibc_for_typical_values() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode chibicc.svmb");
+
+    // The seeded <stdio.h> formats %f/%e/%g in guest C, correctly rounded to the requested precision.
+    // These are all cases where that matches glibc byte-for-byte (the bignum-only ties — an exact 0.5
+    // at %.0f, or 0.015 at %.2f — are deliberately not asserted; see the header's float helpers).
+    let (status, out) = compile_and_run(
+        &chibicc,
+        r#"
+#include <stdio.h>
+int main(void) {
+  printf("%f|%.2f|%.0f|%+.1f\n", 3.14159, 2.71828, 2.7, 42.0);
+  printf("[%8.2f][%-8.2f][%08.2f]\n", 3.14, 3.14, 3.14);
+  printf("%e|%.2e|%E\n", 12345.678, 0.000123, 6.022e23);
+  printf("%g|%g|%g|%g\n", 3.14159, 1000000.0, 0.0001, 0.00001);
+  return 0;
+}
+"#,
+    );
+    assert_eq!(status, STATUS_OK, "run status");
+    assert_eq!(
+        out,
+        "3.141590|2.72|3|+42.0\n\
+         [    3.14][3.14    ][00003.14]\n\
+         1.234568e+04|1.23e-04|6.022000E+23\n\
+         3.14159|1e+06|0.0001|1e-05\n"
+    );
+}

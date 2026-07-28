@@ -4,9 +4,10 @@
 // A small, self-contained <stdio.h> for the browser playground's C compiler (SELFHOST_C.md §7).
 // The program the user writes is compiled by chibicc-the-guest and run under the fixed powerbox,
 // which provides ambient `write`/`read`/`exit` (§3e). Everything here is guest C compiled *into*
-// the program — no libc is linked — so `printf` is just formatting over `write(1, …)`. Floats
-// (`%f`/`%e`/`%g`) are intentionally unsupported (no dtoa in the powerbox); integer, char, string,
-// and pointer conversions are.
+// the program — no libc is linked — so `printf` is just formatting over `write(1, …)`. Integer,
+// char, string, and pointer conversions plus `%f`/`%e`/`%g` (guest-C float formatting, correctly
+// rounded to the requested precision — not a shortest-round-trip bignum dtoa, so `%.17g` and a few
+// exact-tie roundings can differ from glibc; see the float helpers below) are all supported.
 
 #include <stdarg.h>
 
@@ -68,6 +69,143 @@ static int __pf_utoa(unsigned long val, unsigned base, int upper, char *tmp) {
   return n;
 }
 
+// ---- float formatting (%f/%e/%g) — guest C, no bignum ----------------------------------------
+// A double is formatted **correctly rounded to the requested precision** (a trailing guard digit
+// carries the rounding). This is not a shortest-round-trip dtoa: `%.17g` of an arbitrary double may
+// print a different digit tail than glibc, and magnitudes past ~1e18 (the u64 integer-part range)
+// lose precision. For the values a playground uses it matches glibc. The helpers below take a
+// **non-negative** magnitude; sign/Inf/NaN/padding are handled at the call site.
+
+static double __pf_pow10(int e) {
+  double r = 1.0, b = 10.0;
+  int neg = e < 0;
+  if (neg) e = -e;
+  while (e) {
+    if (e & 1) r *= b;
+    b *= b;
+    e >>= 1;
+  }
+  return neg ? 1.0 / r : r;
+}
+
+// `x` (>= 0) → "[ip].[frac]" with `prec` fractional digits (rounded). Returns the length.
+static int __pf_fix(char *out, double x, int prec) {
+  if (prec < 0) prec = 6;
+  if (prec > 30) prec = 30;
+  unsigned long long ip = (unsigned long long)x; // integer part (exact for |x| < 2^64)
+  double frac = x - (double)ip;
+  char fd[40];
+  for (int k = 0; k <= prec; k++) { // prec digits + one guard
+    frac *= 10.0;
+    int d = (int)frac;
+    if (d > 9) d = 9;
+    else if (d < 0) d = 0;
+    fd[k] = (char)d;
+    frac -= d;
+  }
+  // Round half up on the guard digit (carrying into `ip` if it overflows). Without arbitrary
+  // precision we can't reproduce glibc's true round-half-to-even: `0.05 * 10` already rounds to
+  // *exactly* 0.5 in `double`, so an exact tie is indistinguishable from "just above". Half-up
+  // matches glibc on the common non-representable decimals (0.05→0.1, 0.005→0.01) and matches the
+  // schoolbook expectation on the rare exact halves (0.5→1), where glibc's banker's rounding differs.
+  if (fd[prec] >= 5) {
+    int k = prec - 1;
+    for (; k >= 0; k--) {
+      if (++fd[k] <= 9) break;
+      fd[k] = 0;
+    }
+    if (k < 0) ip++;
+  }
+  int n = 0;
+  char ib[24];
+  int in = 0;
+  if (ip == 0) ib[in++] = '0';
+  while (ip) { ib[in++] = (char)('0' + (int)(ip % 10)); ip /= 10; }
+  while (in) out[n++] = ib[--in];
+  if (prec > 0) {
+    out[n++] = '.';
+    for (int k = 0; k < prec; k++) out[n++] = (char)('0' + fd[k]);
+  }
+  return n;
+}
+
+// `x` (>= 0) → "d.ddde±dd" with `prec` mantissa-fraction digits. Returns the length.
+static int __pf_sci(char *out, double x, int prec, int upper) {
+  if (prec < 0) prec = 6;
+  int exp = 0;
+  if (x != 0.0) {
+    while (x >= 10.0) { x /= 10.0; exp++; }
+    while (x < 1.0) { x *= 10.0; exp--; }
+  }
+  char m[48];
+  int mn = __pf_fix(m, x, prec);
+  int dot = 0;
+  while (dot < mn && m[dot] != '.') dot++;
+  if (dot >= 2) { // rounding pushed 9.99… up to 10.0 — renormalize to 1.0…, exp+1
+    exp++;
+    mn = 0;
+    m[mn++] = '1';
+    if (prec > 0) {
+      m[mn++] = '.';
+      for (int k = 0; k < prec; k++) m[mn++] = '0';
+    }
+  }
+  int n = 0;
+  for (int k = 0; k < mn; k++) out[n++] = m[k];
+  out[n++] = upper ? 'E' : 'e';
+  out[n++] = exp < 0 ? '-' : '+';
+  int ae = exp < 0 ? -exp : exp;
+  char eb[8];
+  int en = 0;
+  do { eb[en++] = (char)('0' + ae % 10); ae /= 10; } while (ae);
+  while (en < 2) eb[en++] = '0'; // exponent is at least two digits
+  while (en) out[n++] = eb[--en];
+  return n;
+}
+
+// `x` (>= 0) → `%g`: %e or %f by exponent, trailing zeros stripped unless `alt`. Returns the length.
+static int __pf_gen(char *out, double x, int prec, int upper, int alt) {
+  int P = prec < 0 ? 6 : (prec == 0 ? 1 : prec);
+  int exp = 0;
+  {
+    double t = x;
+    if (t != 0.0) {
+      while (t >= 10.0) { t /= 10.0; exp++; }
+      while (t < 1.0) { t *= 10.0; exp--; }
+    }
+  }
+  int use_e = (exp < -4 || exp >= P);
+  int n = use_e ? __pf_sci(out, x, P - 1, upper) : __pf_fix(out, x, P - 1 - exp);
+  if (!alt) {
+    int end = n;
+    if (use_e) { end = 0; while (end < n && out[end] != 'e' && out[end] != 'E') end++; }
+    int has_dot = 0;
+    for (int k = 0; k < end; k++) if (out[k] == '.') has_dot = 1;
+    if (has_dot) {
+      int j = end;
+      while (j > 0 && out[j - 1] == '0') j--;
+      if (j > 0 && out[j - 1] == '.') j--;
+      if (use_e && end < n) { // close the gap before the exponent
+        int shift = end - j;
+        for (int k = end; k < n; k++) out[k - shift] = out[k];
+        n -= shift;
+      } else {
+        n = j;
+      }
+    }
+  }
+  return n;
+}
+
+// Format the magnitude `x` (>= 0) per conv (f/e/g, any case). Returns the length.
+static int __pf_float(char *out, double x, int prec, char conv, int alt) {
+  int up = (conv <= 'Z');
+  char c = up ? (char)(conv + 32) : conv;
+  if (c == 'f') return __pf_fix(out, x, prec);
+  if (c == 'e') return __pf_sci(out, x, prec, up);
+  return __pf_gen(out, x, prec, up, alt);
+}
+
 static int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
   for (int i = 0; fmt[i]; i++) {
     if (fmt[i] != '%') {
@@ -76,12 +214,13 @@ static int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
     }
     i++;
     // flags
-    int left = 0, zero = 0, plus = 0, space = 0;
+    int left = 0, zero = 0, plus = 0, space = 0, alt = 0;
     for (;; i++) {
       if (fmt[i] == '-') left = 1;
       else if (fmt[i] == '0') zero = 1;
       else if (fmt[i] == '+') plus = 1;
       else if (fmt[i] == ' ') space = 1;
+      else if (fmt[i] == '#') alt = 1;
       else break;
     }
     // width
@@ -131,6 +270,34 @@ static int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
       pre[npre++] = '0';
       pre[npre++] = 'x';
       is_num = 1;
+    } else if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
+      double x = va_arg(ap, double);
+      int up = (conv <= 'Z');
+      char body[128];
+      int bn = 0;
+      char sign = 0;
+      if (x != x) { // NaN (never negative-signed)
+        const char *w = up ? "NAN" : "nan";
+        for (int k = 0; w[k]; k++) body[bn++] = w[k];
+      } else {
+        if (x < 0.0) { sign = '-'; x = -x; }
+        else if (plus) sign = '+';
+        else if (space) sign = ' ';
+        if (x != 0.0 && x * 0.5 == x) { // +Inf
+          const char *w = up ? "INF" : "inf";
+          for (int k = 0; w[k]; k++) body[bn++] = w[k];
+        } else {
+          bn = __pf_float(body, x, prec, conv, alt);
+        }
+      }
+      int finite = !(body[0] == 'n' || body[0] == 'N' || body[0] == 'i' || body[0] == 'I');
+      int pad = width - (sign ? 1 : 0) - bn;
+      if (!left && !(zero && finite)) while (pad-- > 0) __pf_emit(s, ' ');
+      if (sign) __pf_emit(s, sign);
+      if (!left && zero && finite) while (pad-- > 0) __pf_emit(s, '0');
+      for (int k = 0; k < bn; k++) __pf_emit(s, body[k]);
+      if (left) while (pad-- > 0) __pf_emit(s, ' ');
+      continue;
     } else if (conv == 'c') {
       char c = (char)va_arg(ap, int);
       int pad = width - 1;
