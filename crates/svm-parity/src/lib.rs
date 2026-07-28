@@ -168,12 +168,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // Scalar fused multiply-add: Cranelift has `fma`; core wasm has no scalar FMA opcode.
         Inst::Fma { .. } => row(F, cell(Status::Declines, NO_WASM_OP)),
 
-        // Pointer provenance ops (off-CHERI plain i64): Cranelift lowers them; the wasm-JIT subset
-        // does not type them yet (a trivial `i64.add`/no-op — a gap, not a design fold).
-        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(
-            F,
-            cell(Status::NotYet, "trivial i64 op, not yet in the wasm subset"),
-        ),
+        // Pointer provenance ops (off-CHERI plain i64): both JITs lower them — Cranelift natively,
+        // the wasm-JIT as a wrapping `i64.add` / identity forward.
+        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(F, F),
 
         // ---- Guest linear memory: both JITs emit confined accesses / bulk memory. ---------------
         Inst::Load { .. }
@@ -194,10 +191,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
                 "single-threaded lowering (concurrency-free module)",
             ),
         ),
-        // Standalone fence: Cranelift emits it; the wasm-JIT subset does not lower it yet.
-        Inst::AtomicFence { .. } => {
-            row(F, cell(Status::NotYet, "fence not yet in the wasm subset"))
-        }
+        // Standalone fence: both JITs handle it — Cranelift emits it; the wasm-JIT (single-threaded)
+        // treats it as an observable no-op.
+        Inst::AtomicFence { .. } => row(F, F),
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------
         Inst::Call { .. } | Inst::CallIndirect { .. } => row(F, F),
@@ -278,9 +274,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::Swizzle { .. }
         | Inst::SimdWidthBytes => row(F, F),
 
-        // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift can't
-        // legalize it; wasm has no `i64x2` min/max op at all (so it never appears there — but as an
-        // `Inst` it's outside the wasm subset just the same).
+        // `i64x2` min/max: Cranelift synthesizes it (per-lane compare + `bitselect`, since x86/aarch64
+        // have no native `i64` vector min/max); wasm has no `i64x2` min/max opcode, so the wasm-JIT
+        // folds it to the interp — the same treatment as `i8x16.mul`.
         Inst::VIntBin { shape, op, .. }
             if matches!(
                 (*shape, *op),
@@ -290,13 +286,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
                 )
             ) =>
         {
-            row(
-                cell(
-                    Status::NotYet,
-                    "i64x2 min/max: no single-instr ISA lowering",
-                ),
-                cell(Status::Declines, "no i64x2 min/max op in wasm"),
-            )
+            row(F, cell(Status::Declines, "no i64x2 min/max op in wasm"))
         }
         // `i8x16.mul` has no wasm opcode (wasm omits byte-lane multiply); Cranelift synthesizes it
         // (widen → `i16x8` multiply → low-byte pack).

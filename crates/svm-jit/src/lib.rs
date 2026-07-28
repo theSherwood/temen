@@ -5007,21 +5007,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12.8 4A.5 durable-runtime-internal: a baked thunk over a per-OS-thread word (like
                 // the TLS register), so supported on every target.
                 Inst::DurableShadowBase => {}
-                // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift
-                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it, and wasm
-                // never emits it — `i64x2` has no min/max op). `i8x16.mul` *is* now lowered (widen →
-                // `i16x8` multiply → low-byte pack; see the `VIntBin` lowering), so it stays supported.
-                Inst::VIntBin { shape, op, .. }
-                    if !matches!(
-                        (*shape, *op),
-                        (
-                            VShape::I64x2,
-                            VIntBinOp::MinS
-                                | VIntBinOp::MinU
-                                | VIntBinOp::MaxS
-                                | VIntBinOp::MaxU
-                        )
-                    ) => {}
+                // Every `VIntBin` lane op is lowered: `i8x16.mul` via widen → `i16x8` multiply →
+                // low-byte pack, and `i64x2` min/max via per-lane compare + `bitselect` (x86/aarch64
+                // have no native `i64` vector min/max) — see the `VIntBin` lowering.
+                Inst::VIntBin { .. } => {}
                 // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
                 Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
                 // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
@@ -6580,6 +6569,26 @@ fn lower_block(
                         b.ins().unarrow(pl, ph)
                     }
                     VIntBinOp::Mul => b.ins().imul(x, y),
+                    // `i64x2` min/max: x86/aarch64 have no native `i64` vector min/max, so Cranelift
+                    // cannot legalize `smin`/`umin`/`smax`/`umax` here. Synthesize per-lane
+                    // compare + `bitselect` (both legalize on every target): `bitselect(m, x, y)` ==
+                    // `(x & m) | (y & !m)` keeps `x` in the lanes where the compare mask is all-ones.
+                    VIntBinOp::MinS if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::SignedLessThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MinU if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::UnsignedLessThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MaxS if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::SignedGreaterThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MaxU if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::UnsignedGreaterThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
                     VIntBinOp::MinS => b.ins().smin(x, y),
                     VIntBinOp::MinU => b.ins().umin(x, y),
                     VIntBinOp::MaxS => b.ins().smax(x, y),
