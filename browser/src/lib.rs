@@ -3745,22 +3745,36 @@ pub extern "C" fn svm_run_shell(
     out.value
 }
 
-/// **In-browser JACL link + run** (docs/SVM_BROWSER_PLAN.md option (b)): the live-editing path.
-/// Given the SVM-IR **text** a browser frontend emitted for a program (`jacl_emit_ir`, optionally
-/// followed by a `%%RELOCS%%\n` sentinel + SelfData relocs) and the JACL **runtime** as SVM-IR text
-/// (`jaclrt.svm`, its exports inline), this parses both, links them (`link_with_manifest`), wraps the
-/// program entry in a powerbox `_start` (`synth_manifest_start`), and runs it through the same on-ramp
-/// powerbox as [`svm_run_onramp`] — so edited source runs without a native link/encode step. Results
-/// are read back through the same accessors (`svm_stdout_ptr`/`_len`, `svm_status`, `svm_exit_code`).
+/// **In-browser link + run of a frontend-emitted program** (docs/SVM_BROWSER_PLAN.md option (b)):
+/// the live-editing path, language-agnostic. Given a **program** module as SVM-IR **text**, a
+/// **library** module as SVM-IR text (its exports inline — e.g. a language runtime blob), and the
+/// name of the export to run, this parses both, links them (`link_with_manifest`), wraps the named
+/// entry in a powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same
+/// on-ramp powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native
+/// link/encode step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
+/// `svm_status`, `svm_exit_code`).
 ///
-/// The extern **catalog** is a test-only artifact (only `buf_extern_c.jacl` uses `extern`), so it is
-/// not linked here; a program that uses no `extern` needs only the runtime.
+/// This is the generic browser counterpart to the native link path: **nothing here is specific to
+/// any source language.** The caller supplies the program's own-data relocations as a flat buffer of
+/// little-endian `u32` triples `(func, block, inst)` at `[reloc_ptr, reloc_ptr + reloc_len)` — each
+/// applied as a [`RelocKind::SelfData`] patch on the program unit (self-data addressing; a trailing
+/// partial triple is ignored). A frontend's own wire format (how it delivers those relocs alongside
+/// the module text, what it names its entry export, which blob is its runtime) stays entirely on the
+/// caller's side; it lands here already decomposed into these generic parameters.
+///
+/// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
+/// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
+/// resolve by name.
 #[no_mangle]
-pub extern "C" fn svm_link_run_jacl(
+pub extern "C" fn svm_link_run(
     prog_ptr: *const u8,
     prog_len: usize,
-    rt_ptr: *const u8,
-    rt_len: usize,
+    lib_ptr: *const u8,
+    lib_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    reloc_ptr: *const u8,
+    reloc_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
@@ -3768,51 +3782,47 @@ pub extern "C" fn svm_link_run_jacl(
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
         if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
     };
-    let prog_raw = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
+    let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
         Ok(s) => s,
         Err(_) => { set(STATUS_DECODE_ERR); return 0; }
     };
-    let rt_text = match core::str::from_utf8(slice(rt_ptr, rt_len)) {
+    let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
+        Ok(s) => s,
+        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+    };
+    let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
         Ok(s) => s,
         Err(_) => { set(STATUS_DECODE_ERR); return 0; }
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
-    // Split the frontend output into module text + SelfData relocs (the native `--file` wire format).
-    let (prog_text, relocs) = match prog_raw.find("%%RELOCS%%") {
-        None => (prog_raw, Vec::new()),
-        Some(i) => {
-            let r = prog_raw[i..]
-                .lines()
-                .skip(1)
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| {
-                    let n: Vec<u32> = l.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                    (n.len() == 3).then(|| svm_ir::DataReloc {
-                        func: n[0], block: n[1], inst: n[2], kind: svm_ir::RelocKind::SelfData,
-                    })
-                })
-                .collect::<Vec<_>>();
-            (&prog_raw[..i], r)
-        }
-    };
+    // The program's own-data relocations: a flat buffer of LE u32 triples (func, block, inst), each a
+    // SelfData patch. Alignment-free (read the bytes little-endian) since the host buffer is align-1.
+    let reloc_bytes = slice(reloc_ptr, reloc_len);
+    let relocs: Vec<svm_ir::DataReloc> = reloc_bytes
+        .chunks_exact(12)
+        .map(|c| {
+            let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
+            svm_ir::DataReloc { func: u(0), block: u(4), inst: u(8), kind: svm_ir::RelocKind::SelfData }
+        })
+        .collect();
 
     let program = match svm_text::parse_module(prog_text) {
         Ok(m) => m,
         Err(_) => { set(STATUS_DECODE_ERR); return 0; }
     };
-    let rt = match svm_text::parse_module(rt_text) {
+    let lib = match svm_text::parse_module(lib_text) {
         Ok(m) => m,
         Err(_) => { set(STATUS_DECODE_ERR); return 0; }
     };
-    let rt_exports: Vec<(String, svm_ir::FuncIdx)> =
-        rt.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+    let lib_exports: Vec<(String, svm_ir::FuncIdx)> =
+        lib.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
 
     let linked = match svm_ir::link_with_manifest(&[
-        svm_ir::LinkUnit { module: rt, exports: rt_exports, ..Default::default() },
+        svm_ir::LinkUnit { module: lib, exports: lib_exports, ..Default::default() },
         svm_ir::LinkUnit {
             module: program,
-            exports: vec![("__jacl_entry".to_string(), 0)],
+            exports: vec![(entry_name.to_string(), 0)],
             relocations: relocs,
             ..Default::default()
         },
@@ -3820,7 +3830,7 @@ pub extern "C" fn svm_link_run_jacl(
         Ok(m) => m,
         Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
     };
-    let entry = match linked.resolve_export("__jacl_entry") {
+    let entry = match linked.resolve_export(entry_name) {
         Some(e) => e,
         None => { set(STATUS_UNSUPPORTED); return 0; }
     };
