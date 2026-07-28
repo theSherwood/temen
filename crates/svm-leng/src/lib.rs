@@ -93,6 +93,20 @@ pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
     })
 }
 
+/// Translate a **named subset** of a module's procs together — the multi-proc generalization of
+/// [`translate_proc`], so a real caller→callee pair (e.g. an sret `mk` and its `mkSum` caller) lifts
+/// out of a module whose other top-levels the skeleton can't lower yet. Procs are func-indexed in
+/// `names` order. Returns the parsed (unverified) [`Module`].
+pub fn translate_procs(src: &str, names: &[&str]) -> Result<Module, LengError> {
+    let root = nif::parse(src).map_err(LengError::Parse)?;
+    let text = translate::Translator::new().some_procs(&root, names)?;
+    svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })
+}
+
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Val {
