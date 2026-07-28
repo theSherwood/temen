@@ -242,8 +242,9 @@ compiler bug is a clean error, never an escape.
    (a) the seeded libc headers are now `static inline`, and `codegen_ir.c` honours chibicc's `is_live`
    dead-code pass (the native `codegen.c` already did) — so `#include <stdio.h>` no longer compiles the
    ~13 unused libc functions (`puts`/`snprintf`/`fgets`/…) into every program, only `printf`'s reachable
-   closure; (b) the playground passes `-g0` (new guest-driver flag), dropping the `-g` debug info that
-   the compiled program never uses (~a third of the IR). The dominant residual cost is that chibicc runs
+   closure; (b) debug info is **off by default** in the guest driver (`cc1_main.c`) — the `debug.*` waist
+   is ~a third of the IR, so a plain compile drops it; the playground passes `-g` only when the user opts
+   into source-level C debugging (the Debug button — DEBUGGING.md). The dominant residual cost is that chibicc runs
    on the **bytecode interpreter** — the on-ramp's stale "integer-subset only" note (below) is wrong:
    the browser wasm-JIT already supports f64/f32, so getting `chibicc.svmb` onto that tier (the one
    blocker is scalar `fma`, not float arithmetic) is the big remaining lever — a separate investigation.
@@ -261,8 +262,10 @@ compiler bug is a clean error, never an escape.
   `OP_REALLOC` (host allocator owns block metadata, matching the POSIX.md split; personality
   growth, not substrate) or a guest size-header shim over the existing `malloc` op. Decide at
   implementation; both are small.
-- `-g` cost in the guest: always emit debug info, or a flag? Always-on pairs with the W1 debugger;
-  measure the size hit on `chibicc.svmb`.
+- ~~`-g` cost in the guest: always emit debug info, or a flag?~~ **Settled 2026-07-28: a flag, off by
+  default.** The `debug.*` waist is ~a third of the emitted IR, so `cc1_main.c` defaults `opt_g` off and
+  takes `-g` to turn it on; the playground passes `-g` only for a source-level debug session (the Debug
+  button on the C card), and compiles clean/fast otherwise.
 
 ## 9. Non-goals
 

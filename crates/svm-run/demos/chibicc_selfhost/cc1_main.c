@@ -13,7 +13,8 @@ StringArray include_paths;
 bool opt_fcommon = true;
 bool opt_fpic;
 bool opt_emit_ir = true;
-bool opt_g = true; // -g always on: the W1 debugger consumes the waist (SELFHOST_C.md §5 A)
+bool opt_g; // debug info off by default (`-g` turns it on); the `debug.*` waist is ~a third of the
+            // emitted IR, so the playground compiles clean+fast unless the user opts into debugging.
 bool opt_child_entry;
 int opt_data_page = 16384; // --data-page: RO/writable D40 isolation granularity; the browser (64 KiB
                            // wasm host page) passes `--data-page 65536`. Matches main.c's default.
@@ -40,8 +41,9 @@ int align_to(int n, int align) {
 // affects the emitted IR (headers aren't named in the output), so both sides stay comparable.
 // --data-page N sets the D40 RO/writable isolation granularity (the browser passes 65536 for its
 // 64 KiB wasm host page, so a compiled program's RO globals never share a host page with writable data).
-// -g0 turns off debug info (`-g` is on by default for the W1 debugger); the playground passes it since
-// it never debugs the compiled program, and the `debug.*` sections are ~a third of the emitted IR.
+// Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR); `-g` turns it
+// on so the W1 debugger can consume the source-line/variable waist, `-g0` is the explicit off (a no-op
+// against the default). The playground passes `-g` only when the user opts into source-level debugging.
 int main(int argc, char **argv) {
   char *inc = "/include";
   int ai = 1;
@@ -52,6 +54,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
       opt_data_page = atoi(argv[ai + 1]);
       ai += 2;
+    } else if (!strcmp(argv[ai], "-g")) {
+      opt_g = true;
+      ai++;
     } else if (!strcmp(argv[ai], "-g0")) {
       opt_g = false;
       ai++;
