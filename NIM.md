@@ -132,11 +132,25 @@ chibicc does not.
      `exit`, `strlen`. *Far* smaller than chibicc's 41; no libc fill needed for this corpus.
    - **One gotcha found:** Nim installs SIGSEGV/etc. handlers at startup (`signal()` →
      stubbed → `Unreachable` trap); `-d:noSignalHandler` avoids it. Recorded in `build_nim.sh`.
-   - **Still to do for step 2 proper — nimony itself.** Getting `lengc c` output (post-monomorph,
-     hexer-lowered Leng→C) needs a nimony bootstrap, which is **blocked on Nim version**: `hastur`
-     won't compile under 2.2.10 and `choosenim devel` couldn't fetch a 2.3.x nightly here. The
-     stock-Nim result de-risks the *codegen model*; swapping in genuine nimony output is the
-     remaining delta. Commands recorded below.
+   - **Step 2 proper — genuine nimony output runs on SVM. → DONE 2026-07-28.** Built **Nim 2.3.1
+     from source** (stable 2.2.10 can't compile `hastur`), bootstrapped **nimony** (`nim c -r
+     src/hastur build all` → `bin/{nimony,hexer,lengc,nifler,…}`), and on-ramped nimony's *own*
+     `lengc c` output. `crates/svm-run/demos/nimony/sum_sq_nimony.nim` (an ARC `seq[int]` + a
+     `var object`) compiles via the real pipeline (nifler → nimony → hexer → **Leng** → lengc C),
+     and `build_nimony.sh` on-ramps that C to a **95-func `.svmb`** that decodes / verifies /
+     bytecode-compiles and runs **byte-identical to nimony's native run (`sum_sq=385 / count=10`,
+     exit 0) on treewalk / bytecode / JIT.** This is authentic nimony Leng→C→SVM-IR, not a
+     stand-in. **Two concrete on-ramp findings** (both normalized in `build_nimony.sh`, both
+     recorded as follow-ups for a proper backend):
+     - **nimony's runtime allocates via `mmap`, not `malloc`** (libc-free stdlib), plus a handful
+       of syscalls (`getpid`/`kill`/`dlopen`/`dlsym`/`_exit`; `write`/`exit` are on-ramp-recognized).
+       A 20-line page-aligned bump-allocator shim (`nimony_runtime_shim.c`) over the window covers
+       it — the allocator masks addresses to 4096, so `mmap` must return **absolutely** page-aligned
+       pointers (the load-bearing subtlety).
+     - **TLS gap:** nimony marks the allocator/exception globals `__thread`; the on-ramp has no
+       `llvm.threadlocal.address` lowering. For a single-threaded guest these are plain globals
+       (stripped in the build). *A real Leng→SVM-IR backend (Phase 2) would map these onto SVM's
+       own thread-local/global model instead; the on-ramp TLS gap is worth a `LLVM.md` follow-up.*
 3. **On-ramp the real C**, `-mlong-double-64` if nimony emits `long double` (the chibicc F3
    lesson), `--host-page 65536` for a browser-targetable asset. Fill the libc bottom edge by
    **reusing the Postgres/chibicc guest-libc shims** (`SELFHOST_C.md` Appendix B) — the
@@ -155,14 +169,16 @@ program runs on SVM matching native; (c) the libc fill-list is measured (the `--
 
 - ✅ `clang-18` present; ✅ `svm-llvm-translate` built; ✅ **step-1 probe green on all three
   engines** (above).
-- ✅ Nim **2.2.10** installed via choosenim; ✅ **stock-Nim ARC program green on all three
-  engines** (step 2 above) — genuine Nim-runtime codegen runs on SVM.
-- ⏳ **nimony bootstrap blocked on Nim version.** `nim c -r src/hastur build all` fails to
-  compile `hastur` itself under 2.2.10 (`typedthreads.nim` `Cannot prove that 'result' is
-  initialized`); `doc/install.md` calls for Nim **2.3.x** (devel), and `choosenim devel`
-  couldn't fetch a nightly here. Getting real Leng/`lengc` C output needs a devel Nim (source
-  build) — deferred rather than sink the session into a compiler-of-a-compiler bootstrap. The
-  stock-Nim result de-risks the codegen model; step 2 proper swaps in genuine nimony output.
+- ✅ Nim **2.2.10** (choosenim) + **Nim 2.3.1 built from source**; ✅ **nimony bootstrapped**
+  (`bin/{nimony,hexer,lengc,…}`); ✅ **genuine nimony Leng→C output runs on SVM, all three
+  engines, byte-identical to native nimony** (step 2 above); ✅ stock-Nim ARC program green too.
+- The C-on-ramp path (Phase 1) is now **proven end-to-end with the real compiler.** Remaining
+  Phase-1 breadth: wider Nim/nimony corpus (strings, exceptions, closures, floats), the `mmap`
+  allocator shim → a real Memory-cap allocator, and the TLS follow-up above. Then Phase 2 is the
+  open design choice.
+- **Reproduce the nimony demo:** build Nim 2.3.1 (`git clone nim-lang/Nim && sh build_all.sh`),
+  bootstrap nimony (`nim c -r src/hastur build all`), then
+  `NIMONY_BIN=…/nimony/bin/nimony bash crates/svm-run/demos/nimony/build_nimony.sh`.
 
 ## 3. Phase 2 — native `Leng → SVM-IR` backend (optional)
 
