@@ -349,6 +349,13 @@ try {
   copyFileSync(fixture, join(ASSETS, 'shell.svmb'));
   const kb = (readFileSync(fixture).length / 1024).toFixed(0);
   console.log(`  ✓ shell.svmb (${kb} KB)`);
+  // The `__stage` ring-filter runner — granted alongside the shell so pipelines take the concurrent
+  // ring path (op 11 + SharedRegion + futex). Committed next to shell.svmb by the same generator.
+  const runner = join(HERE, 'tests', 'fixtures', 'stage_runner.svmb');
+  if (!existsSync(runner)) throw new Error('tests/fixtures/stage_runner.svmb missing (run the generator)');
+  copyFileSync(runner, join(ASSETS, 'stage_runner.svmb'));
+  const rkb = (readFileSync(runner).length / 1024).toFixed(0);
+  console.log(`  ✓ stage_runner.svmb (${rkb} KB)`);
 } catch (e) {
   console.log(`  – shell skipped (${e.message})`);
 }

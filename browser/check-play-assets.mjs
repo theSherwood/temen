@@ -42,6 +42,7 @@ const BUILT_AT_DEPLOY = new Set([
   'lua_eval.svmb',        // build-onramp-assets.mjs (fetches Lua source)
   'sqlite_repl.svmb',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
   'shell.svmb',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.svmb)
+  'stage_runner.svmb',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
   'tcl_init.svmb',        // build-onramp-assets.mjs (fetches Tcl + openlibm; full Tcl_Init)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
