@@ -25,6 +25,7 @@ members = [
     "crates/svm-wasi",
     "crates/svm-posix",
     "crates/svm-capi",
+    "crates/svm-parity",
 ]
 # `fuzz/` is a cargo-fuzz crate (nightly + libfuzzer-sys); `bench/` pulls in Wasmtime for
 # the comparison harness; `crates/svm-llvm` is the AOT LLVM→IR on-ramp (D54 — an opt-in,
