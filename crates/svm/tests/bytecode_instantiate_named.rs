@@ -10,14 +10,12 @@
 //! re-granted but unused), so the test isolates **op-13 lowering + cooperative named-child spawn**;
 //! a follow-up has the child actually `write` through the granted `stdout`.
 //!
-//! `#[ignore]`d until the slice lands: today `compile_inst` lowers only Instantiator ops 0/1/5, so op
-//! 13 makes `compile_and_run_with_host` return `None`. Implementing it =
-//!   1. a `compile_inst` arm for `(INSTANTIATOR, 13)` → a named-grant executor op (mirror op 5 at
-//!      `bytecode.rs` ~1354), carrying `grants_ptr`/`grants_n`;
-//!   2. the cooperative driver reads the grant records from guest memory and builds the child's by-name
-//!      powerbox via the shared `Host::spawn_named_child` (`lib.rs` ~14982), the same path the
-//!      tree-walker's op-13 arm (~7734) uses;
-//!   3. flip this test to run and un-`ignore` it.
+//! **Landed.** `compile_inst` now lowers op 13 (`(INSTANTIATOR, 13)` → `Op::InstantiateModule` with a
+//! `grants: Some((grants_ptr, grants_n))` field; op 5 stays `None`, byte-identical). The cooperative
+//! `drive` path reads the grant records from the parent window and builds the child's by-name powerbox
+//! via the shared `Host::spawn_named_child` (`lib.rs` ~14982) — the same builder the tree-walker's
+//! op-13 arm (~7734) uses. The other bytecode drivers (debugger replay, OS-thread parallel) fail op 13
+//! closed, since only the cooperative single-thread driver is the browser's wasm-safe entry.
 #![cfg(unix)]
 
 use svm_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
@@ -138,8 +136,6 @@ fn bytecode_cooperative() -> Option<Result<Vec<Value>, Trap>> {
 }
 
 #[test]
-#[ignore = "slice-1 target: op 13 (instantiate_module_named) on the bytecode engine — needs the \
-            compile_inst lowering arm + cooperative named-child driver (see module docs)"]
 fn instantiate_module_named_join_matches_oracle_on_cooperative_bytecode() {
     let want = oracle().expect("oracle runs");
     assert_eq!(
