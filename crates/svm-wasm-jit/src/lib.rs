@@ -724,6 +724,11 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
             Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
             Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
             Inst::Cast { op, .. } => tys.push(op.sig().2),
+            // Pointer provenance ops are plain `i64` off-CHERI: `ptr.add` a wrapping add, `ptr.cast`
+            // a no-op. Both yield `i64`.
+            Inst::PtrAdd { .. } | Inst::PtrCast { .. } => tys.push(ValType::I64),
+            // A standalone fence orders accesses without touching memory; no SSA result.
+            Inst::AtomicFence { .. } => {}
             // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
             Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
@@ -2278,6 +2283,23 @@ fn emit_block_body(
                 code.push(OP_SELECT);
                 set_result(cx, code, k, &mut next_val);
             }
+            // Pointer provenance ops (off-CHERI, plain `i64`): `ptr.add` is a wrapping `i64.add`;
+            // `ptr.cast` is a free identity that forwards its operand into the result local.
+            Inst::PtrAdd { a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(0x7c); // i64.add (wrapping)
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::PtrCast { a, .. } => {
+                get(code, cx, *a);
+                set_result(cx, code, k, &mut next_val);
+            }
+            // Standalone fence: a pure ordering barrier with no data effect. The wasm-JIT only
+            // compiles single-threaded guests (concurrency folds to the interp), where a fence is
+            // observably a no-op — so emit nothing (matching the oracle, which honors it identically
+            // single-threaded).
+            Inst::AtomicFence { .. } => {}
             Inst::Load {
                 op, addr, offset, ..
             } => {

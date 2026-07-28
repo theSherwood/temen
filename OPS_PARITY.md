@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**454 ops.** Across the two JIT columns: 850 ✅ Full · 43 ⛔ Declines · 5 🚧 Not-yet · 10 🔶 Conditional.
+**454 ops.** Across the two JIT columns: 851 ✅ Full · 43 ⛔ Declines · 4 🚧 Not-yet · 10 🔶 Conditional.
 
 ## scalar integer
 
@@ -225,7 +225,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i64.atomic.rmw.xor` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
 | `i64.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
 | `i64.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `atomic.fence` | ✅ | ✅ | ✅ | 🚧 | fence not yet in the wasm subset |
+| `atomic.fence` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.atomic.wait` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `atomic.notify` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 

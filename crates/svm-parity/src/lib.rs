@@ -168,12 +168,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // Scalar fused multiply-add: Cranelift has `fma`; core wasm has no scalar FMA opcode.
         Inst::Fma { .. } => row(F, cell(Status::Declines, NO_WASM_OP)),
 
-        // Pointer provenance ops (off-CHERI plain i64): Cranelift lowers them; the wasm-JIT subset
-        // does not type them yet (a trivial `i64.add`/no-op — a gap, not a design fold).
-        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(
-            F,
-            cell(Status::NotYet, "trivial i64 op, not yet in the wasm subset"),
-        ),
+        // Pointer provenance ops (off-CHERI plain i64): both JITs lower them — Cranelift natively,
+        // the wasm-JIT as a wrapping `i64.add` / identity forward.
+        Inst::PtrAdd { .. } | Inst::PtrCast { .. } => row(F, F),
 
         // ---- Guest linear memory: both JITs emit confined accesses / bulk memory. ---------------
         Inst::Load { .. }
@@ -194,10 +191,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
                 "single-threaded lowering (concurrency-free module)",
             ),
         ),
-        // Standalone fence: Cranelift emits it; the wasm-JIT subset does not lower it yet.
-        Inst::AtomicFence { .. } => {
-            row(F, cell(Status::NotYet, "fence not yet in the wasm subset"))
-        }
+        // Standalone fence: both JITs handle it — Cranelift emits it; the wasm-JIT (single-threaded)
+        // treats it as an observable no-op.
+        Inst::AtomicFence { .. } => row(F, F),
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------
         Inst::Call { .. } | Inst::CallIndirect { .. } => row(F, F),
