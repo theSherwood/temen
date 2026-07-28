@@ -298,14 +298,25 @@ Security posture is unchanged: children keep their **own guarded windows**; the
 D38 confinement lowering (the most sensitive code in the tree) is not touched.
 Stage 1 only *composes* existing, fuzzed primitives.
 
-## Known caveat — crash handling waits for async convergence
+## Resolved — `poll` is WNOHANG; its terminal status is backend-portable
 
 A crashing command must not crash the shell, which needs `poll` (op 9:
 `0` running / `1` returned / `2` trapped) to detect a trapped child and
 `detach` instead of `join` (a `join` propagates the child's trap to the
-parent). But **`poll` after a synchronous spawn is not yet backend-portable**:
-the interpreter runs a child lazily (at `join`), so `poll` reports `0`
-(running); the JIT runs it eagerly on its own OS thread, so `poll` reports `1`
-(returned). A differential `poll`-based control flow therefore disagrees today.
-This converges with the async-children work (slice 5 / PROCESS.md §4), which is
-where crash-status mapping (`$?` = 128 + signal) lands — not before.
+parent). The original concern was that an *immediate* `poll` after a
+synchronous spawn reads differently across backends: the interpreter's M:N
+scheduler defers a child (so an immediate `poll` reads `0` running); the JIT
+runs it eagerly on its own OS thread (so an immediate `poll` may already read
+`1`/`2`).
+
+That is the **defined semantics of a non-blocking probe (WNOHANG)**, not a
+divergence: `0` ("not done yet") is a valid answer at any time, and a caller
+does not control how many `0`s it sees first. Making the interpreter "eager"
+cannot converge the immediate poll for the deterministic single-worker configs
+anyway (the JIT is 1:1 OS-thread; a single-worker interp run has no thread to
+run the child ahead of the parent). The **portable idiom** is to loop `poll`
+(yielding the worker between probes) until non-zero; the **terminal** value is
+identical across backends — `1` returning, `2` trapping. That is now pinned by
+`crates/svm/tests/lifecycle_poll_convergence.rs` (interp vs JIT, both cases).
+See ISSUES.md I43. The `$?` = 128 + signal crash-status mapping is a shell/guest
+convention (not a substrate contract) and remains guest-personality work.
