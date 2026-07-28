@@ -983,20 +983,17 @@ fn stage0_shell_ring_pipeline_falls_back_on_redirect() {
 #[test]
 fn stage0_shell_hash_comments() {
     let (i, j) = run_shell(
-        b"# a full-line comment
-          echo hi   # trailing comment
-          #
-          echo a#b
-",
+        b"# a full-line comment\n\
+          echo hi   # trailing comment\n\
+          #\n\
+          echo a#b\n",
         &[],
         &[],
         &[],
     );
     assert_eq!(
         i,
-        b"hi
-a#b
-".as_slice(),
+        b"hi\na#b\n".as_slice(),
         "interp: comment lines vanish; inline `#` strips to EOL; `a#b` keeps its mid-word `#`"
     );
     assert_eq!(j, i, "jit: comment handling matches interp");
