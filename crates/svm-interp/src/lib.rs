@@ -3824,10 +3824,14 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
-    /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by the dispatch
-    /// ticket (exactly one caller per ticket; woken by [`Scheduler::cap_reply_or_stash`] with
-    /// the result).
-    ticket_waiters: BTreeMap<u64, Waiter>,
+    /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by
+    /// `(callee domain id, dispatch ticket)` (exactly one caller per key; woken by
+    /// [`Scheduler::cap_reply_or_stash`] with the result). The **callee** must be part of the key:
+    /// tickets are per-callee-domain (each host's `svc_next_ticket` starts at 0), so two in-flight
+    /// calls to *different* callees can share a ticket number — a serve chain (a handler that itself
+    /// calls another server) does exactly that, and keying by the bare ticket would let the second
+    /// park clobber the first's waiter (I49).
+    ticket_waiters: BTreeMap<(usize, u64), Waiter>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -4013,7 +4017,8 @@ impl Scheduler {
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
-        match s.ticket_waiters.remove(&ticket) {
+        let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+        match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
                 s.runnable.push_back(v);
@@ -4185,9 +4190,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
 /// dispatch tickets with the probeable [`CAP_REVOKED`] errno (the [`Scheduler::cap_reply_or_stash`]
 /// wake shape) — a dying callee never strands its callers. A caller not yet parked is handled at
 /// its park instead (the `CapReply` arms probe [`Sched::dead`]).
-fn wake_dead_tickets(s: &mut Sched, tickets: impl IntoIterator<Item = u64>) {
+fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<Item = u64>) {
     for t in tickets {
-        match s.ticket_waiters.remove(&t) {
+        match s.ticket_waiters.remove(&(callee, t)) {
             Some(Waiter::VCpu(mut w)) => {
                 w.pending = Some(Pending::CapResult(CAP_REVOKED));
                 s.runnable.push_back(w);
@@ -4270,7 +4275,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     // Members parked as *callers* through some other domain die too (their tickets there go
     // unclaimed — the callee's eventual reply finds no waiter and stashes, harmlessly).
     let tw = std::mem::take(&mut s.ticket_waiters);
-    for (t, w) in tw {
+    for (k, w) in tw {
         let member = match &w {
             Waiter::VCpu(v) => domain_key_of(v) == key,
             Waiter::Fiber { svc, .. } => *svc == key,
@@ -4280,7 +4285,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
                 victims.push(v);
             }
         } else {
-            s.ticket_waiters.insert(t, w);
+            s.ticket_waiters.insert(k, w);
         }
     }
     if let Some(vs) = s.svc_waiters.remove(&key) {
@@ -4299,7 +4304,9 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             .drain(..)
             .map(|d| d.ticket),
     );
-    wake_dead_tickets(s, tickets);
+    // Every ticket collected here is a dispatch *to* the dying domain `key` (its members' admitted
+    // handler/serve tickets and its queued dispatches), so its callers are keyed `(key, ticket)`.
+    wake_dead_tickets(s, key, tickets);
 }
 
 /// Rule 3 of the domain-lifetime decision (DESIGN.md §12, owner 2026-07-24): the **root's**
@@ -4360,7 +4367,8 @@ fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
     // unobservable — the batch activation is over — so any terminal trap will do.
     let reason = s.dead.get(&key).cloned().unwrap_or(Trap::ThreadFault);
     let tickets = reap(s, v, reason);
-    wake_dead_tickets(s, tickets);
+    // `tickets` are dispatches admitted *by* this reaped vCPU — i.e. to its own domain `key`.
+    wake_dead_tickets(s, key, tickets);
     None
 }
 
@@ -4742,7 +4750,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             if !froze {
                 if let Some(t) = &died {
                     teardown_domain(&mut s, key, t, &dying_host);
-                    wake_dead_tickets(&mut s, own_tickets);
+                    wake_dead_tickets(&mut s, key, own_tickets);
                 }
                 if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
                     teardown_run(&mut s);
@@ -4841,10 +4849,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // D37 death-is-revocation: a callee torn down between the enqueue and this park will
             // never reply (its queue was drained by the teardown before we got here) — complete
             // with the probeable errno instead of stranding the caller.
-            let callee_dead = {
-                let cg = callee.lock().unwrap_or_else(|e| e.into_inner());
-                s.dead.contains_key(&(cg.domain_id() as usize))
-            };
+            let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+            let callee_dead = s.dead.contains_key(&callee_id);
             let early = callee
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4862,7 +4868,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                 }
                 None => {
-                    s.ticket_waiters.insert(ticket, Waiter::VCpu(v));
+                    s.ticket_waiters
+                        .insert((callee_id, ticket), Waiter::VCpu(v));
                 }
             }
         }
@@ -8842,7 +8849,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
                                             } else {
                                                 sg.ticket_waiters.insert(
-                                                    t,
+                                                    (callee_id as usize, t),
                                                     Waiter::Fiber {
                                                         reg: Arc::clone(&regc),
                                                         slot,
@@ -9001,7 +9008,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
                                             } else {
                                                 sg.ticket_waiters.insert(
-                                                    t,
+                                                    (callee_id as usize, t),
                                                     Waiter::Fiber {
                                                         reg: Arc::clone(&regc),
                                                         slot,

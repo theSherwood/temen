@@ -1424,9 +1424,9 @@ when nothing else in the domain is runnable.
 
 ---
 
-### I49 — durable **nested-holder re-link** blocked on a serve-chain deadlock; the underlying grandchild serve-capture bug is FIXED (S3) — surfaced 2026-07-28 building the §13.4 4d follow-up
+### I49 — the **serve chain** deadlock (a handler that calls another server) — ticket-namespace collision, **FIX LANDED 2026-07-28**; grandchild serve-capture also fixed — surfaced building the §13.4 4d follow-up
 
-**What.** Two threads split out of the "nested holder" 4d follow-up (a *child* C1 holding a live
+**What.** Three threads split out of the "nested holder" 4d follow-up (a *child* C1 holding a live
 `child_offer` cap onto a *grandchild* C2, durably frozen and re-linked on thaw):
 
 1. **FIXED — depth-2 serve-state keying.** A live-spawned nested child never stamped its own
@@ -1438,25 +1438,23 @@ when nothing else in the domain is runnable.
    One line at the spawn fixes it (direct children unchanged; root id is `0`). Pinned by
    `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`.
 
-2. **DEFERRED — the nested re-link + its blocking observable.** Generalizing the thaw re-link from
-   root-only to every holder (a `(holder task, join slot)` edge map) was implemented and *proven to
-   fire* for the C1→C2 edge, but its only end-to-end observable — C1 serving a dispatch whose
-   **handler forwards** to C2 through the re-linked cap — **dead-locks** on the single worker (the
-   handler fiber parks on C2's reply and C2 is never scheduled to serve it). That is a **pre-existing
-   serve-chain gap** (a handler making a live-offer call to a grandchild), independent of durability
-   and never exercised before, not a fault of the re-link. Per INVARIANTS #1 (no production change
-   without a passing test that fails without it), the re-link generalization is **held back** until
-   the serve-chain deadlock is fixed and a non-hanging end-to-end pin exists.
+2. **FIXED — the serve-chain deadlock (root cause: a ticket-namespace collision).** The "handler
+   forwards to another server" observable dead-locked, and reproduces with **zero durability** (a
+   general serving-correctness bug, not thaw-specific — a front-end server delegating to a back-end
+   is the common jacl shape). Root cause: `Sched::ticket_waiters` was keyed by the **bare dispatch
+   ticket**, but tickets are per-callee-domain (each host's `svc_next_ticket` starts at 0). In
+   `root → C1.fwd → C2.leaf`, root parked on C1's ticket 0, then C1's handler parked on C2's ticket
+   0 — **overwriting root's waiter at key 0** — so when C1's handler returned, its reply to ticket 0
+   found no waiter and stashed, stranding root forever (traced: `reply … -> STASH (no waiter)`). Fix:
+   key `ticket_waiters` by `(callee domain id, ticket)`; every park/reply/teardown site threads the
+   callee domain (all teardown tickets are dispatches *to* the dying domain, so its key is in scope).
+   Pinned by `svm-interp/tests/svc_serve_chain.rs` (root → C1.fwd → C2.leaf(7) → 107; hung before,
+   passes in 0.00s after).
 
-**Why tracked, not built now.** The keying fix is the load-bearing, testable win and ships. The
-re-link + the serve-chain deadlock are their own slice (the deadlock lands on the scheduler's
-handler-fiber park/dispatch core, the most sensitive concurrency surface — §18 tree-walk-oracle
-first). Also open from the same 4d note: the wire/child-regrant **sibling-provenance** durable name.
-
-**Shape if/when built.** Fix the handler-forwards-to-grandchild schedule (a parked handler fiber
-must hand the single worker to the grandchild it is waiting on), add a non-hanging differential pin
-(root drives C1 → C1's handler reaches C2 → 107), then land the `(holder task, join slot)` re-link
-generalization behind it.
+3. **STILL OPEN — the nested re-link generalization.** With the deadlock fixed, the `(holder task,
+   join slot)` re-link generalization (root-only → every holder, so C1's durable cap onto C2 re-links
+   on thaw) can be re-landed behind a now-non-hanging end-to-end pin. Held back only pending that
+   re-add + test. Also from the same 4d note: the wire/child-regrant **sibling-provenance** name.
 
 ---
 
