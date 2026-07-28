@@ -47,9 +47,10 @@ fn results_eq(a: &Result<Vec<Value>, Trap>, b: &Result<Vec<Value>, Trap>) -> boo
 }
 
 /// Run `m`'s entry on both engines with equal fuel and assert equality — unless the bytecode engine
-/// doesn't support the module (`None` → skip) or either side runs out of fuel (per-op fuel
-/// accounting can differ by a hair near the limit; not a semantic divergence). Returns `true` if
-/// the bytecode engine supported (and matched) the module.
+/// doesn't support the module (`None` → skip). Since fuel unification (safepoint-anchored: both
+/// engines charge one fuel per taken back-edge + function entry off the *same* IR structure), the
+/// two exhaust at the identical safepoint, so `OutOfFuel` is asserted for parity like any other trap
+/// rather than skipped. Returns `true` if the bytecode engine supported (and matched) the module.
 fn check(m: &svm_ir::Module, args: &[Value], seed: u64) -> bool {
     if m.funcs.is_empty() {
         return false;
@@ -60,9 +61,6 @@ fn check(m: &svm_ir::Module, args: &[Value], seed: u64) -> bool {
     let Some(bc) = bytecode::compile_and_run(m, 0, args, &mut fb) else {
         return false;
     };
-    if matches!(interp, Err(Trap::OutOfFuel)) || matches!(bc, Err(Trap::OutOfFuel)) {
-        return false;
-    }
     if !results_eq(&bc, &interp) {
         panic!(
             "bytecode disagrees with interpreter\n seed={seed}\n args={args:?}\n interp={interp:?}\n bc    ={bc:?}\n module:\n{}",
@@ -80,14 +78,14 @@ fn check(m: &svm_ir::Module, args: &[Value], seed: u64) -> bool {
         if let Some((bc_res, bc_bt, _)) =
             bytecode::compile_and_run_with_host_traced(m, 0, args, &mut fbt, &mut Host::new())
         {
-            if !matches!(tw_res, Err(Trap::OutOfFuel)) && !matches!(bc_res, Err(Trap::OutOfFuel)) {
-                assert_eq!(
-                    tw_bt,
-                    bc_bt,
-                    "trap backtrace disagrees\n seed={seed}\n args={args:?}\n tw_res={tw_res:?} bc_res={bc_res:?}\n module:\n{}",
-                    svm::text::print_module(m)
-                );
-            }
+            // Fuel unification: `OutOfFuel` traps at the same safepoint on both engines, so its
+            // backtrace is asserted too (no longer excluded from the trap-parity check).
+            assert_eq!(
+                tw_bt,
+                bc_bt,
+                "trap backtrace disagrees\n seed={seed}\n args={args:?}\n tw_res={tw_res:?} bc_res={bc_res:?}\n module:\n{}",
+                svm::text::print_module(m)
+            );
         }
     }
     true
@@ -115,6 +113,55 @@ fn bytecode_matches_interp_on_generated_modules() {
 }
 
 #[test]
+fn bytecode_matches_interp_under_tight_fuel() {
+    // Non-vacuous `OutOfFuel` parity. The main harness runs at 2M fuel, where almost nothing
+    // exhausts; here a deliberately tight budget makes loop/recursion-heavy modules trip the limit,
+    // so the flip from "skip OutOfFuel" to "assert it" is actually exercised. Under fuel unification
+    // both engines charge one fuel per taken back-edge + function entry off the same IR, so they must
+    // (a) reach `OutOfFuel` at the identical safepoint (results_eq holds — never one trapping while
+    // the other completes) and (b) burn the identical amount (equal remainder).
+    let mut oof = 0u32;
+    let mut compared = 0u32;
+    let total = 4000u64;
+    for seed in 0..total {
+        let mut g = Gen::from_seed(seed);
+        let m = gen_module(&mut g);
+        if m.funcs.is_empty() {
+            continue;
+        }
+        let args = gen_args(&mut g, &m.funcs[0].params);
+        // Scan a few caps so the exhaustion boundary itself is probed from both sides.
+        for cap in [4u64, 32, 256, 2_048] {
+            let mut fi = cap;
+            let interp = run(&m, 0, &args, &mut fi);
+            let mut fb = cap;
+            let Some(bc) = bytecode::compile_and_run(&m, 0, &args, &mut fb) else {
+                continue;
+            };
+            assert!(
+                results_eq(&bc, &interp),
+                "fuel parity broke at cap={cap}\n seed={seed}\n args={args:?}\n interp={interp:?}\n bc    ={bc:?}\n module:\n{}",
+                svm::text::print_module(&m)
+            );
+            assert_eq!(
+                fi, fb,
+                "fuel remainder differs at cap={cap} (interp left {fi}, bc left {fb})\n seed={seed}\n module:\n{}",
+                svm::text::print_module(&m)
+            );
+            compared += 1;
+            if matches!(interp, Err(Trap::OutOfFuel)) {
+                oof += 1;
+            }
+        }
+    }
+    println!("tight-fuel parity: {compared} comparisons, {oof} OutOfFuel cases");
+    assert!(
+        oof > 50,
+        "too few OutOfFuel cases exercised ({oof}) — the parity assertion is near-vacuous"
+    );
+}
+
+#[test]
 fn bytecode_suspend_resume_preserves_result() {
     // Slice 1c-2: slicing a run at op boundaries (suspend, persist the `Vm`, resume) must be
     // bit-identical to running straight through, for any slice size — that is what proves the
@@ -133,9 +180,9 @@ fn bytecode_suspend_resume_preserves_result() {
         let Some(whole) = bytecode::compile_and_run(&m, 0, &args, &mut fw) else {
             continue;
         };
-        if matches!(whole, Err(Trap::OutOfFuel)) {
-            continue;
-        }
+        // Fuel unification: slicing suspends on the per-op `budget`, which is orthogonal to fuel, so
+        // a sliced run charges fuel at the same safepoints as the whole run and reaches `OutOfFuel`
+        // at the identical point — asserted below rather than skipped.
         for slice in [1u64, 3, 17] {
             let mut fs = cap;
             let sliced = bytecode::compile_and_run_sliced(&m, 0, &args, &mut fs, slice)
@@ -169,11 +216,8 @@ fn run_fast_matches_run_on_generated_modules() {
         let slow = run(&m, 0, &args, &mut f1);
         let mut f2 = 2_000_000u64;
         let fast = run_fast(&m, 0, &args, &mut f2);
-        // Near the fuel limit the two engines' per-op accounting can differ by a hair (not a
-        // semantic divergence) — skip those, like the main harness.
-        if matches!(slow, Err(Trap::OutOfFuel)) || matches!(fast, Err(Trap::OutOfFuel)) {
-            continue;
-        }
+        // Fuel unification: both charge at the same IR safepoints, so `OutOfFuel` lands identically
+        // and is asserted for parity (previously skipped when either side ran out).
         assert!(
             results_eq(&fast, &slow),
             "run_fast disagrees with run\n seed={seed}\n slow={slow:?}\n fast={fast:?}\n module:\n{}",

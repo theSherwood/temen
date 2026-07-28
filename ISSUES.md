@@ -48,6 +48,31 @@ a `pages.yml` `--site` step asserts every referenced asset is actually present i
 `_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
 with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
 automatically. This closes the residual guard gap I26 named.
+### I50 — CI flake: the `durable_concurrent_jit` binary fails on macOS in two modes (S4) — seen 2026-07-27, PR #455 runs 30263159591 + 30266760876
+
+**Symptom — two distinct nondeterministic modes on `build · test (macos-latest)`, same binary:**
+- **Mode A — SIGSEGV on exit** (run 30263159591, commit `9de4926`): all 15 tests in
+  `durable_concurrent_jit` print `... ok`, then the process crashes on teardown —
+  `process didn't exit successfully: durable_concurrent_jit-… (signal: 11, SIGSEGV: invalid memory
+  reference)`. A test-harness/teardown fault, not an assertion.
+- **Mode B — wake-race assertion** (run 30266760876, commit `5b8faa4`):
+  `durable_concurrent_jit.rs:1048` `assertion left == right failed: the root's re-issued atomic.wait
+  parked and was woken by the sibling's re-issued notify on thaw` (`left: 1, right: 0`) — the
+  sibling's re-issued `notify` didn't land the wake before the assertion read the counter.
+
+**Why it's a base-branch flake, not the PR (definitive).** PR #455 (the Tcl on-ramp target) touches
+only `svm-llvm` (workspace-excluded), `crates/svm-run/demos/tcl/` (C/sh/md, not compiled by this
+suite), `browser/`, and docs — **zero lines in `crates/svm`**. Mode A failed on the PR's *first*
+commit, which adds only `demos/tcl/` + an `#[ignore]`d test + docs and therefore *cannot* affect
+`crates/svm`; **20 of the 21 jobs were green** on that commit. Two different failure modes on
+commits that don't touch the code ⇒ a pre-existing macOS-flaky binary in the branch base (the #450
+merge), same family as **I44** (freeze × parked `svc.wait`).
+
+**Action.** Re-run the macOS job (a flake — expect green). Don't churn CI chasing it from an
+unrelated PR. Owner-side follow-up (the durability subsystem, not a Tcl-PR concern): Mode B is a
+thaw-time wake-ordering hole the I44 clamp doesn't cover (sibling-notify-on-thaw); Mode A is a macOS
+teardown SIGSEGV in the `durable_concurrent_jit` harness — both want a macOS-hammer repro
+(`stress-ng`-style loop over the full binary) to localize, as I44 needed the full-binary hammer.
 
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
@@ -422,8 +447,9 @@ a full page — the array is only `(argc+1)*8` bytes and the frame grows upward 
 alignment is all the ABI needs (`data_end` is already page-isolated from read-only globals, so D40
 still holds). This keeps the frame adjacent to `data_end`, below whatever offset a program maps
 regions at. The runner's grant-discovery loop is restored to its natural shape (local array +
-`regs[nregs++] = h`) in `crates/svm/tests/c_shell.rs` and now regression-guards the fix (it fails if
-the full-page rounding returns). Validated: full `c_frontend` + `c_shell` + `stage1_*` suites green.
+`regs[nregs++] = h`) in `crates/svm-run/demos/shell/stage_runner_main.c` (the `__stage` runner
+`crates/svm/tests/c_shell.rs` `include_str!`s) and now regression-guards the fix (it fails if the
+full-page rounding returns). Validated: full `c_frontend` + `c_shell` + `stage1_*` suites green.
 
 **Latent parallel (not changed):** `svm-llvm`'s `synth_start_argv` (the on-ramp frontend) does the
 same page-alignment, deliberately tied to D40. It is not currently triggered — on-ramp `main`s don't

@@ -230,6 +230,27 @@ if (ensureQuickJS() && ensureOpenlibm()) {
   console.log('  – qjs_repl rebuild skipped (quickjs/openlibm fetch failed) — using committed qjs_repl.svmb');
 }
 
+// 2c) Tcl (interactive) — the reference Tcl 8.6 interpreter with the minimal-embedding REPL driver
+//     (`demos/tcl/tcl_repl.c`, no `Tcl_Init`) that reads a Tcl script from **stdin**, evaluates it,
+//     and prints the completion result. Configure-based + multi-TU, so it's built by its demo script
+//     (`demos/tcl/build_bitcode.sh`: configure → native oracle → 162-TU bitcode + openlibm →
+//     llvm-link), then the linked `.ll` is translated to a 64 KiB-page `.svmb` with `--stub-externs`
+//     (the OS surface unreached by the minimal REPL — zlib/scanf/fts). Runs byte-identical to native
+//     (`demo_tcl_repl_stdin`). Fail-soft: skipped (the example simply absent) if the toolchain/fetch
+//     is unavailable, like SQLite/Doom/chibicc offline.
+try {
+  const tclScript = join(REPO, 'crates', 'svm-run', 'demos', 'tcl', 'build_bitcode.sh');
+  execFileSync('bash', [tclScript], { stdio: 'inherit' });
+  const linked = join(process.env.SVM_TCL_CACHE ?? '/tmp/svm_tcl_cache', 'tcl_linked.ll');
+  if (!existsSync(linked)) throw new Error('build script produced no tcl_linked.ll');
+  const svmb = join(ASSETS, 'tcl_repl.svmb');
+  execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE, '--stub-externs'], { stdio: 'inherit' });
+  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+  console.log(`  ✓ tcl_repl.svmb (${size} B)`);
+} catch (e) {
+  console.log(`  – tcl_repl skipped (${e.message} — offline, or no clang/llvm-link)`);
+}
+
 // 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest
 //    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
 //    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine
@@ -308,6 +329,24 @@ try {
   console.log(`  ✓ chibicc.svmb (${kb} KB)`);
 } catch (e) {
   console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
+}
+
+// Shell — the `svm-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
+// the shell is compiled by the in-tree **chibicc** onto the POSIX personality and run on the tree-walk
+// interpreter (it carries Instantiator cap.calls the wasm-JIT/bytecode paths don't take). Its module
+// bytes are the committed fixture `tests/fixtures/shell.svmb`, produced from the canonical source
+// (`crates/svm-run/demos/shell/*.c`) by the differential's generator:
+//   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
+// Copy it into web/assets/ (offline-safe, like the committed hello_c.svmb); rebuild the fixture with
+// the command above when the shell source changes.
+try {
+  const fixture = join(HERE, 'tests', 'fixtures', 'shell.svmb');
+  if (!existsSync(fixture)) throw new Error('tests/fixtures/shell.svmb missing (run the generator)');
+  copyFileSync(fixture, join(ASSETS, 'shell.svmb'));
+  const kb = (readFileSync(fixture).length / 1024).toFixed(0);
+  console.log(`  ✓ shell.svmb (${kb} KB)`);
+} catch (e) {
+  console.log(`  – shell skipped (${e.message})`);
 }
 
 console.log('done. Assets in web/assets/. Serve with `node serve.mjs` and open /web/play.html');

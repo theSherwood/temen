@@ -2111,6 +2111,115 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
+/// Run `m`'s function 0 under the **POSIX personality** (POSIX.md / STAGE1.md) instead of the fixed
+/// on-ramp powerbox — the seam that lets the real `svm-posix` shell (and any chibicc program linking
+/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostFn` capability
+/// implementing the libc/memfs surface (`read`/`write`/`open`/`opendir`/`getcwd`/…), and
+/// [`svm_posix::bind`] binds the module's manifest imports to it **by name** (IMPORTS.md phase 4 —
+/// slot `i` ↔ import `i`, bound at instantiation; the module bytes are never rewritten). `stdin`
+/// preloads `read(0, …)`; the guest's `write(1, …)` accumulates in the personality's stdout, returned
+/// here (the personality owns stdout, not the browser `Host`'s Stream cap).
+///
+/// The entry is the phase-4 shape ([`onramp_check`]): a paramless func 0 exported `_start`. A module
+/// whose imports are not all POSIX names fails closed ([`svm_posix::bind`] returns `false`) — the
+/// `Instantiator`/ring imports the shell's *concurrent* paths use are a later slice; this first slice
+/// runs the sequential personality (files, redirects, in-process pipelines) only.
+///
+/// Runs on the **bytecode** engine (the browser's interpreter tier), the same engine [`onramp_exec`]
+/// uses; the personality's `HostFn` dispatches through the guest window `bytecode` hands it.
+pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    let unsupported = || PbOutcome {
+        status: STATUS_UNSUPPORTED,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    if onramp_check(m).is_err() {
+        return unsupported();
+    }
+    let mut host = Host::new();
+    // The personality's `malloc` hands out the top 64 KiB of the guest window (window offsets, as the
+    // `c_shell` harness grants it); the shell's static data + stack sit below. `stdin` seeds `read(0)`.
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let heap_base = win.saturating_sub(64 << 10);
+    let (px_h, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    // Bind every manifest import to the personality by name; fail closed on a non-POSIX import.
+    if !svm_posix::bind(m, &mut host, px_h) {
+        return unsupported();
+    }
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) =
+        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+            None => (STATUS_UNSUPPORTED, 0, 0),
+            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+                _ => (STATUS_BAD_RESULT, 0, 0),
+            },
+        };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: posix.stdout(),
+        stderr: posix.stderr(),
+        framebuffer: None, // the personality grants no `display` cap
+    }
+}
+
+/// Run the **`svm-posix` shell** (STAGE1.md; `crates/svm/tests/c_shell.rs`) — a real command
+/// interpreter compiled by chibicc onto the personality — with `stdin` as the script. This is the
+/// playground's shell card: the same module bytes the differential test runs, executed in the browser.
+///
+/// Runs on the **bytecode** engine ([`bytecode::compile_and_run_with_host`]) — the browser's
+/// single-threaded, wasm-safe interpreter tier. (The tree-walk `drive` uses OS worker threads + a wall
+/// clock, neither of which exists under `wasm32-unknown-unknown`, so it can't run in the browser.) The
+/// shell *statically* carries `Instantiator`/`SharedRegion` cap.calls (its external-command / ring
+/// paths), but the sequential Stage-0 surface never **executes** them — with no commands registered,
+/// `exec_lookup` misses and pipelines fall back to the in-window memfs — so the module runs cleanly;
+/// only the *reserved-window* bytecode entry statically refuses such modules, and this plain entry does
+/// not. Cross-checked against the tree-walk/JIT oracle by `crates/svm/tests/c_shell.rs`'s bytecode arm.
+///
+/// Grants match the differential's setup and order so the shell's `cap.self` reflection discovers the
+/// same interfaces: a forwardable `stdout` `Stream`, an `Instantiator` + `AddressSpace` over the whole
+/// window (inert this slice — see above), and the POSIX personality itself (its captured stdout is the
+/// shell's output). The personality heap is the top 64 KiB (the shell never `malloc`s).
+pub fn posix_shell_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut host = Host::new();
+    // Grant order mirrors `c_shell.rs`'s `setup` (Stream, Instantiator, AddressSpace, then personality)
+    // so a run here discovers the same handles as the tested one.
+    let _out = host.grant_stream(StreamRole::Out);
+    let _inst = host.grant_instantiator(0, win);
+    let _as = host.grant_address_space(0, win);
+    let heap_base = win.saturating_sub(64 << 10);
+    let (_px, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    let mut fuel = 200_000_000u64;
+    let (status, value, exit_code) =
+        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+                _ => (STATUS_OK, 0, 0), // a shell that loops to EOF returns nothing meaningful
+            },
+            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            None => (STATUS_UNSUPPORTED, 0, 0),
+        };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: posix.stdout(),
+        stderr: posix.stderr(),
+        framebuffer: None,
+    }
+}
+
 /// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
 /// strings — for seeding at `POWERBOX_ARGS_BASE` (the browser twin of `svm-run`'s `build_args_blob`,
 /// no env). The on-ramp `_start` parses it into `argc`/`argv`.
@@ -2403,7 +2512,15 @@ pub extern "C" fn svm_run_onramp_fs(
     }
     files.push(("in.c".to_string(), src.to_vec()));
     let image = svm_fs::encode_image(&files, &dirs);
-    let out = onramp_fs_exec(&m, &image, &[b"chibicc", b"/in.c"], &[]);
+    // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
+    // read-only globals must not share a host page with writable data (D40) — chibicc pins the
+    // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
+    let out = onramp_fs_exec(
+        &m,
+        &image,
+        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[],
+    );
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -3539,6 +3656,85 @@ pub extern "C" fn svm_run_onramp(
         stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
         FB_W = fb_w;
         FB_H = fb_h;
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **POSIX personality** (see
+/// [`onramp_posix_exec`]) — the entry the real `svm-posix` shell runs through in the playground. Same
+/// capture/accessor contract as [`svm_run_onramp`]: seed stdin from `[stdin_ptr, stdin_len)`, read the
+/// captured streams via `svm_stdout_ptr`+`svm_stdout_len` / `svm_stderr_ptr`+`svm_stderr_len`, the
+/// exit code via [`svm_exit_code`], and the status via [`svm_status`]. Returns the guest's `i64`
+/// result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with `svm_run_onramp` — read them before
+/// the next call either export makes.
+#[no_mangle]
+pub extern "C" fn svm_run_onramp_posix(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let out = onramp_posix_exec(&m, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// Decode the module at `[mod_ptr, mod_len)` and run it as the **`svm-posix` shell** (see
+/// [`posix_shell_exec`]) with `[stdin_ptr, stdin_len)` as the script — the playground's shell card.
+/// Same capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via
+/// `svm_stdout_ptr`+`svm_stdout_len`, the exit code via [`svm_exit_code`], the status via
+/// [`svm_status`]. Returns the guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots
+/// with the other run exports — read them before the next call.
+#[no_mangle]
+pub extern "C" fn svm_run_shell(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let out = posix_shell_exec(&m, stdin);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
     }
     out.value

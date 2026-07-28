@@ -766,6 +766,40 @@ int main(void) {
 }
 `,
   },
+  'Shell (svm-posix — write & run a script)': {
+    kind: 'shell',
+    jit: false, // the shell carries Instantiator cap.calls → tree-walk interpreter, not the wasm-JIT
+    editable: true,
+    lang: 'shell',
+    url: './assets/shell.svmb',
+    mode: 'io',
+    desc: 'A real POSIX-style shell — a command interpreter compiled by the in-tree chibicc C ' +
+      'compiler onto the svm-posix personality — running client-side in the sandbox. The same shell ' +
+      'the differential test suite runs (crates/svm/tests/c_shell.rs). Type a script on the left and ' +
+      'click Run: it is fed to the shell as stdin and the output appears below. Builtins include ' +
+      'echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/uniq/ls, test/[ ], redirection ' +
+      '(> >> <), pipelines (cat f | grep x | wc), command lists (; && ||), if/then/else, and ' +
+      'globbing — all over an in-memory filesystem. (External commands and concurrent pipelines are a ' +
+      'later step.)',
+    src: `# A real shell, running in the sandbox. Type commands, then click Run.
+echo hello from the sandbox
+
+# variables
+NAME=world
+echo hi $NAME
+
+# a file, a pipeline, and a conditional — all in-process
+echo apple > fruits
+echo banana >> fruits
+echo cherry >> fruits
+echo -- matching lines --
+cat fruits | grep a
+echo -- line count --
+cat fruits | wc
+
+if test -f fruits; then echo fruits exists; fi
+`,
+  },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
@@ -818,6 +852,34 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
 
 // the completion value of the last expression is printed too:
 "0.1 + 0.2 = " + (0.1 + 0.2);
+`,
+  },
+  // Tcl — the reference Tcl 8.6 interpreter, minimal embedding (no Tcl_Init), reads a script from
+  // stdin and prints the completion result. The `tcl_repl.svmb` asset is built by
+  // `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_repl_stdin`). `jit: false` —
+  // the bytecode engine drives; proving `_start` wasm-JIT-emittable (near-native) is a follow-up.
+  'Tcl (8.6 — write & run)': {
+    kind: 'module',
+    jit: false,
+    editable: true,
+    lang: 'tcl',
+    url: './assets/tcl_repl.svmb',
+    mode: 'io',
+    desc: 'The reference Tcl 8.6.14 interpreter — its bytecode compiler + execution engine, expr, ' +
+      'string/list/dict, Henry Spencer regex, and libtommath bignums — compiled through the LLVM ' +
+      'on-ramp. Edit the Tcl on the left and click Run: your script is piped to the guest as stdin, ' +
+      'evaluated, and its output appears below. Real Tcl, running client-side in the sandbox.',
+    src: `# Write Tcl here, then click Run.
+proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }
+set out {}
+for {set i 0} {$i < 10} {incr i} { lappend out [fib $i] }
+puts "fib(0..9): $out"
+puts "sorted:   [lsort -integer {5 3 8 1 9 2 7}]"
+puts [format "pi ~ %.4f, 255 = 0x%X, sqrt2 = %.6f" 3.14159265 255 [expr {sqrt(2)}]]
+dict set d a 1; dict set d b 2
+puts "dict: $d"
+puts [string toupper "tcl on svm"]
+expr {2**10 + [string length "hello"]}
 `,
   },
   'PostgreSQL (17.5 — write & run SQL)': {
@@ -959,6 +1021,65 @@ function moduleInterp(bytes, stdinBytes) {
   eng.ex.svm_dealloc(p, bytes.length);
   if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
   return { rv, status, stdout };
+}
+
+// Run the `svm-posix` **shell** single-shot on the interpreter: like `moduleInterp`, but through the
+// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality (+ the external-command caps)
+// and runs the module on the tree-walk interpreter, the editor text feeding the shell's stdin as the
+// script. Returns { rv, status, stdout }.
+function shellInterp(bytes, stdinBytes) {
+  const p = eng.ex.svm_alloc(bytes.length);
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(bytes, p);
+  if (stdinP) view.set(stdinBytes, stdinP);
+  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen);
+  const status = eng.ex.svm_status();
+  const stdout = readModuleStdout();
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  return { rv, status, stdout };
+}
+
+// A card's Run for the shell: fetch the module, feed the editor's script as stdin, run it, show the
+// captured stdout. The shell runs on the tree-walk interpreter (it carries Instantiator cap.calls the
+// wasm-JIT/bytecode paths don't take), so there is no JIT toggle.
+async function runShell(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching shell…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  let bytes;
+  try {
+    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    logTo(c, `fetch failed: ${e.message}`);
+    return;
+  }
+  logTo(c, `fetched ${ex.url}: ${bytes.length}B shell`);
+  // The editor holds the shell script — it is the shell's stdin. Ensure a trailing newline so the last
+  // line runs (the read-eval loop acts on a completed line).
+  let script = c.editor.getValue();
+  if (!script.endsWith('\n')) script += '\n';
+  const stdinBytes = new TextEncoder().encode(script);
+  setState(c, 'running', 'running…');
+  const t0 = performance.now();
+  const { rv, status, stdout } = shellInterp(bytes, stdinBytes);
+  const ms = (performance.now() - t0).toFixed(0);
+  c.el.stdout.textContent = stdout;
+  c.el.result.textContent = `${rv}`;
+  // 0 = OK, 5 = clean Exit (the `exit` builtin); anything else is a decode error / trap.
+  if (status === 0 || status === 5) {
+    setState(c, 'done', `done · status ${status} · ${ms}ms`);
+    logTo(c, `shell run → ${rv} (status ${status}) in ${ms}ms`);
+  } else {
+    setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+    logTo(c, `shell run status ${status}`);
+  }
 }
 
 // A card's Run for an on-ramp module. The "wasm-JIT" toggle (offered on the emittable guests —
@@ -1901,6 +2022,7 @@ async function runDemo(c) {
   if (ex.kind === 'reactor') return runReactor(c);
   if (ex.kind === 'pg') return runPg(c);
   if (ex.kind === 'chibicc') return runChibicc(c);
+  if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
 }

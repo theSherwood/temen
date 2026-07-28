@@ -10,6 +10,7 @@ bool opt_fpic;
 bool opt_emit_ir; // emit SVM text IR instead of x86-64 assembly
 bool opt_g;       // -g: also emit the SVM debug-info section (DEBUGGING.md §6 waist)
 bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable via instantiate_module)
+int opt_data_page = 16384; // --data-page: RO/writable data isolation granularity (§3a / D40); 64 KiB for the wasm browser
 
 static FileType opt_x;
 static StringArray opt_include;
@@ -147,6 +148,16 @@ static void parse_args(int argc, char **argv) {
     // to the `i64` status the parent reads via `join`. For a command that needs no capabilities.
     if (!strcmp(argv[i], "--child-entry")) {
       opt_child_entry = true;
+      continue;
+    }
+
+    // `--data-page N`: the read-only/writable data isolation granularity (§3a / D40 — a `data ro`
+    // segment must share no *host* page with writable data, or its protection over-covers a writable
+    // global and the guest's own write faults). Defaults to 16 KiB (the largest common native host
+    // page); the browser runs on a 64 KiB wasm page, so a guest destined for the playground is built
+    // with `--data-page 65536`. Any power-of-two multiple of the real host page is safe (coarser).
+    if (!strcmp(argv[i], "--data-page")) {
+      opt_data_page = atoi(argv[++i]);
       continue;
     }
 

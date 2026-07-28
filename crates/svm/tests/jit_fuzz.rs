@@ -65,6 +65,35 @@ fn jit_matches_interp_on_generated_modules() {
     }
 }
 
+/// Non-vacuous JIT/interp `OutOfFuel` parity. `jit_matches_interp_on_generated_modules` arms both
+/// engines at 5M fuel, where almost nothing exhausts; here tight budgets force exhaustion, so the flip
+/// from *excluding* `OutOfFuel` to *asserting* it is actually exercised. Fuel unification charges one
+/// fuel per function entry + taken back-edge off the same IR on all three engines, so at any budget the
+/// JIT and interp complete together or trap `OutOfFuel` together — never one returning where the other
+/// ran out (enforced inside `jit_interp_fuel_agree` via `assert_outcomes_agree`).
+#[test]
+fn jit_matches_interp_under_tight_fuel() {
+    let iters: u64 = if cfg!(windows) { 300 } else { 2000 };
+    let mut oof = 0u32;
+    for seed in 0..iters {
+        let mut g =
+            Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xF0E1_D2C3_B4A5_9687);
+        let m = irgen::gen_module(&mut g);
+        let args = irgen::gen_args(&mut g, &m.funcs[0].params);
+        // Scan a few tight caps so the exhaustion boundary is probed from both sides.
+        for cap in [2u64, 16, 128, 1_024] {
+            if irgen::jit_interp_fuel_agree(&m, &args, cap) {
+                oof += 1;
+            }
+        }
+    }
+    println!("JIT/interp tight-fuel parity: {oof} OutOfFuel cases");
+    assert!(
+        oof > 50,
+        "too few OutOfFuel cases exercised ({oof}) — the parity assertion is near-vacuous"
+    );
+}
+
 /// Guard that the generator actually covers loops (back-edges), indirect calls, and cap.calls —
 /// so the differential above is exercising them, not silently regressing to forward-only DAGs.
 #[test]

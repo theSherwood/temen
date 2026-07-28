@@ -2499,7 +2499,12 @@ static void gen_func(Obj *fn) {
 // it is merely coarser, while on a 16 KiB host the RO region shares no host page with writable
 // data (otherwise the RO protection would over-protect adjacent writable globals → a spurious
 // MemoryFault on the guest's own writes).
-#define DATA_PAGE 16384
+//
+// Overridable via `--data-page` (`opt_data_page`): the browser runs on a 64 KiB wasm page, so a guest
+// built for the playground pins this to 65536 (a `main(void)` shell that shares an RO page with a
+// writable global would otherwise fault under D40 the moment it writes — the bug this closes).
+extern int opt_data_page;
+#define DATA_PAGE opt_data_page
 
 // A read-only data global (§3a / D40): a string literal — an anonymous (`.L..`) char array with
 // initializer bytes (this includes `__func__`/`__FUNCTION__`). chibicc tracks no `const`, and

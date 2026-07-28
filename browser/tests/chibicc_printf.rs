@@ -23,8 +23,14 @@ fn compile_and_run(chibicc: &svm_ir::Module, src: &str) -> (i32, String) {
     let dirs = vec!["include".to_string()];
     let image = svm_fs::encode_image(&files, &dirs);
 
-    // Pass 1 — chibicc.svmb emits SVM-IR text on stdout.
-    let compiled = onramp_fs_exec(chibicc, &image, &[b"chibicc", b"/in.c"], b"");
+    // Pass 1 — chibicc.svmb emits SVM-IR text on stdout. `--data-page 65536` mirrors the browser card
+    // (D40 isolation at the 64 KiB wasm host page), so this exercises exactly the shipped path.
+    let compiled = onramp_fs_exec(
+        chibicc,
+        &image,
+        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        b"",
+    );
     assert!(
         compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
         "compile status {}",

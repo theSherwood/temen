@@ -48,6 +48,11 @@ svm-durable = { path = "../crates/svm-durable" }
 # The wasm-JIT emitter (browser wasm-JIT tier, slice 1). Pure (only `svm-ir`); its output is
 # compiled + run by the JS host against this cdylib's own linear memory — see `svm_wasmjit_compile`.
 svm-wasm-jit = { path = "../crates/svm-wasm-jit" }
+# The POSIX personality (POSIX.md) — a `HostFn` provider implementing the libc/memfs surface a
+# fork-less shell links against, plus a §7 import-name resolver. Deps only `svm-ir` + `svm-interp`
+# (both already here and wasm-clean), so the on-ramp posix entry (`onramp_posix_exec`) compiles into
+# the wasm cdylib. This is what lets the real `svm-posix` shell run in the playground (STAGE1.md).
+svm-posix = { path = "../crates/svm-posix" }
 
 [profile.release]
 panic = "abort"
