@@ -180,28 +180,60 @@ program runs on SVM matching native; (c) the libc fill-list is measured (the `--
   bootstrap nimony (`nim c -r src/hastur build all`), then
   `NIMONY_BIN=…/nimony/bin/nimony bash crates/svm-run/demos/nimony/build_nimony.sh`.
 
-## 3. Phase 2 — native `Leng → SVM-IR` backend (optional)
+## 3. Phase 2 — native `Leng → SVM-IR` backend (started)
 
-Write a backend in Nim that consumes **Leng NIF** and emits **SVM text** (then `svm-encode`
-→ verify → run) — slotting in beside `lengc`'s C/C++/LLVM/arkham backends. Pursue **only if**
-Phase 1 proves the semantics *and* you want to (a) drop the clang/LLVM build-time dependency,
-or (b) shape SVM-IR directly from Leng instead of round-tripping through C.
+A translator that consumes **Leng NIF** and emits **SVM IR** directly, bypassing C/clang. It
+drops the build-time clang/LLVM dependency and shapes SVM-IR straight from Leng, and it is the
+supported extension pattern — C/C++/LLVM-IR/arkham already coexist behind Leng, plus the
+shoggoth optimizer.
+
+**Placement decision (2026-07-28): a Rust crate `crates/svm-leng` in *this* repo** — the
+**fourth SVM frontend**, beside `svm-wasm` and `svm-llvm` (both Rust, both untrusted, both
+verifier-rechecked). Rationale: it matches the established frontend pattern, reuses
+`svm-ir`/`svm-text`/`svm-verify` directly, and is **CI-testable with checked-in Leng fixtures,
+no nimony toolchain at build time**. (A Nim backend inside nimony's `src/lengc/` — the arkham
+analog — is the alternative; it is better for *eventual* pure self-hosting through Leng but
+couples to the nimony build and can't live in this repo. Revisit once the Rust translator has
+proven the mapping. The two aren't exclusive.) Like every frontend it is **outside the
+escape-TCB** (DESIGN.md §2a): the verifier re-checks its output, so a bug is a clean error.
+
+### Walking skeleton — DONE 2026-07-28
+
+`crates/svm-leng` translates the **integer / arithmetic / local / direct-call** subset with
+straight-line bodies and `ret`, and **fail-closes (`LengError::Unsupported`) on everything
+else** (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline — never a silent mistranslation). It
+emits SVM text (chibicc's `codegen_ir.c` model) via `svm_text::parse_module`. Six end-to-end
+tests translate hand-written Leng-NIF (faithful to `doc/leng-spec.md`) → verify → **run on both
+the interpreter and the JIT with identical results** (§9 parity): constant arithmetic
+(`3 + 4*2`), params+locals, `div`/`mod`, i32↔i64 `conv`, cross-proc `call`, and the fail-closed
+float case. `src/nif.rs` is a real NIF reader (parens, atoms, `:symdefs`, string literals,
+`@lineinfo` stripping, `.nif`/`.indexat` directives) so it grows toward *real* nimony Leng, not
+just fixtures.
+
+This proves the seam. The remaining work is adding grammar arms below (each a new match case),
+not rearchitecting.
 
 **The work (bounded — comparable to chibicc's `codegen_ir.c`, which exists and is proven):**
 
-- **SSA/block-param synthesis** from Leng's named locals + `lab`/`jmp` (the on-ramp's
-  φ→block-args, but from a tree IR — closer to `codegen_ir.c`'s data-SP-threading model).
-- **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
-  same ABI, so this is a match, not a negotiation).
-- **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
-  `ptr.add`; every access confined by the masking lowering (INVARIANTS §2).
-- **Control flow:** structured + `lab`/`jmp` → SVM branches/`br_table` (irreducible CFG is
-  native, `DESIGN.md` §3 — an advantage over wasm).
-- **Calls + ARC:** direct/indirect calls (threaded data-SP), destructor/dup calls pass
-  through as ordinary calls; `onerr`/`errv` → branch-on-flag.
-- **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
-- **Runtime bottom edge:** raw syscalls / allocator → POSIX personality named imports +
-  Memory cap, same as Phase 1.
+- **✅ integer scalars, arithmetic (`add`/`sub`/`mul`/`div`/`mod`), `neg`, width `conv`,
+  locals (`var`/`asgn`), direct `call`, `ret`** — the landed skeleton.
+- **Next: control flow** — `if`/`ite`/`while`/`case` + `lab`/`jmp` → SVM blocks/`br_table`
+  (irreducible CFG is native, `DESIGN.md` §3). This needs real block/SSA-param synthesis from
+  Leng's named locals across joins (the skeleton is single-block); the on-ramp's φ→block-args
+  is the reference, but from a tree IR it's closer to `codegen_ir.c`'s data-SP threading.
+
+- **Then, further out:**
+  - **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
+    same ABI, so this is a match, not a negotiation).
+  - **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
+    `ptr.add`; every access confined by the masking lowering (INVARIANTS §2). Address-taken
+    locals move from SSA values onto a data-stack frame (the `codegen_ir.c` model).
+  - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
+    `onerr`/`errv` → branch-on-flag.
+  - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
+  - **Runtime bottom edge:** raw syscalls / allocator → POSIX personality named imports +
+    Memory cap, same as Phase 1 — and mapping nimony's TLS onto SVM's own model (the on-ramp
+    gap found in Phase 1).
 
 **Risks:** nimony is v0.4.0, "heavy development" — the Leng grammar and C output are moving
 targets (Phase 1 is insulated: it only needs "nimony emits compilable C"; Phase 2 couples to
