@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use svm_interp::{bytecode, Value};
-use svm_wasm_jit::{compile_module_mixed, ENV_CELL_BYTES};
+use svm_wasm_jit::{compile_jit, DriveMode, Shape, ENV_CELL_BYTES};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -41,7 +41,12 @@ fn oracle(m: &svm_ir::Module, arg: i64) -> i64 {
 /// bytecode engine so an interp-leaf call runs on the interpreter. `Ok(result)`, or `Err` if the run
 /// trapped (an interp leaf that traps makes the callback trap the wasm — it surfaces here).
 fn mixed(m: &svm_ir::Module, arg: i64) -> Result<i64, ()> {
-    let wasm = compile_module_mixed(m, false).expect("mixed-eligible");
+    let artifact = compile_jit(m, Shape::Batch { entry: 0 }, false).expect("compile");
+    assert!(
+        matches!(artifact.drive, DriveMode::WasmDriven { entry: 0 }),
+        "a mixed-eligible guest is wasm-driven"
+    );
+    let wasm = artifact.wasm;
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
