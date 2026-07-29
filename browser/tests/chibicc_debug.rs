@@ -707,3 +707,282 @@ fn forward_then_back_oscillation_is_monotone_and_stays_in_main() {
         "forward next advanced the line again ({line} >= {prev_line})"
     );
 }
+
+// ---- Rich C inspection: struct/array/pointer locals + evaluate over chibicc-compiled C ------------
+// The powerbox/stepping tests above use only scalar `int` locals. These lock in the Variables-pane
+// aggregate expansion and the `evaluate` member/index/arrow paths — the debug info chibicc's `-g`
+// emits (`debug.type agg`/`array`/`ptr`, `debug.field`, `win`/`ssalist` var locations) end to end.
+
+const RICH_SRC: &str = r#"struct Point { int x; int y; };
+int main(void) {
+  int arr[3];
+  arr[0] = 10; arr[1] = 20; arr[2] = 30;
+  struct Point p;
+  p.x = 7; p.y = 9;
+  struct Point *pp = &p;
+  int sum = arr[0] + p.x;
+  return sum;
+}
+"#;
+// Line 8 (`int sum = arr[0] + p.x;`) is the stop: arr, p, and pp are all live and assigned there.
+const RICH_BP: i64 = 8;
+
+/// The `variablesReference` of the top frame's locals scope, at the current stop.
+fn locals_ref(s: &mut DapServer, seq: i64) -> i64 {
+    let st = s.handle(&req(
+        seq,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let sc = s.handle(&req(
+        seq + 1,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(fid))]),
+    ));
+    response(&sc)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+/// The `variables` list for a reference, as `(name, value, variablesReference)` triples.
+fn vars_of(s: &mut DapServer, seq: i64, vref: i64) -> Vec<(String, String, i64)> {
+    let out = s.handle(&req(
+        seq,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    response(&out)
+        .get("body")
+        .unwrap()
+        .get("variables")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            (
+                v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                v.get("value").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                v.get("variablesReference").and_then(|r| r.as_i64()).unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// `evaluate` an expression in the top frame; `Some(result)` on success, `None` if the DAP rejected it.
+fn eval_in_frame(s: &mut DapServer, seq: i64, expr: &str) -> Option<String> {
+    let st = s.handle(&req(
+        seq,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let fid = response(&st)
+        .get("body")?
+        .get("stackFrames")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_i64()?;
+    let out = s.handle(&req(
+        seq + 1,
+        "evaluate",
+        Json::obj(vec![
+            ("expression", Json::s(expr)),
+            ("frameId", Json::i(fid)),
+            ("context", Json::s("hover")),
+        ]),
+    ));
+    let r = response(&out);
+    (r.get("success") == Some(&Json::Bool(true)))
+        .then(|| {
+            r.get("body")
+                .and_then(|b| b.get("result"))
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .flatten()
+}
+
+/// **Struct, array, and pointer C locals inspect end to end.** At a stop where `arr`/`p`/`pp` are live:
+/// the Variables pane expands the struct (`p.x`,`p.y`) and array (`arr[0..2]`); `evaluate` reads array
+/// elements, struct members, arrow-through-pointer (`pp->x`), and arithmetic over them — the member/
+/// index/arrow paths, including the promoted-SSA pointer chibicc emits for `struct Point *pp = &p;`.
+#[test]
+fn inspect_struct_array_and_pointer_locals() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, RICH_SRC);
+    // The -g IR carries the aggregate/array/pointer type info and fields.
+    assert!(
+        ir.contains(r#"debug.type 2 agg "struct Point""#) && ir.contains(r#"debug.field 2 "x""#),
+        "-g IR describes the struct type and its fields"
+    );
+
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, RICH_BP, false); // compute-only: no powerbox needed
+    assert!(
+        event(
+            &s.handle(&req(4, "configurationDone", Json::obj(vec![]))),
+            "stopped"
+        ),
+        "stopped at line 8 with arr/p/pp live"
+    );
+
+    // Variables pane: the aggregates are expandable, the pointer shows a scalar value.
+    let vref = locals_ref(&mut s, 5);
+    let top = vars_of(&mut s, 7, vref);
+    let find = |n: &str| top.iter().find(|(name, _, _)| name == n).cloned();
+    let (_, _, p_ref) = find("p").expect("local p present");
+    let (_, _, arr_ref) = find("arr").expect("local arr present");
+    assert!(p_ref > 0, "the struct local p is expandable");
+    assert!(arr_ref > 0, "the array local arr is expandable");
+    assert!(find("pp").is_some(), "the pointer local pp is present");
+
+    // Expand the struct: fields x=7, y=9.
+    let pfields = vars_of(&mut s, 10, p_ref);
+    assert_eq!(
+        pfields
+            .iter()
+            .find(|(n, ..)| n == "x")
+            .map(|(_, v, _)| v.as_str()),
+        Some("7"),
+        "p.x = 7 in the Variables pane"
+    );
+    assert_eq!(
+        pfields
+            .iter()
+            .find(|(n, ..)| n == "y")
+            .map(|(_, v, _)| v.as_str()),
+        Some("9"),
+        "p.y = 9 in the Variables pane"
+    );
+
+    // Expand the array: [0]=10, [1]=20, [2]=30.
+    let elems = vars_of(&mut s, 12, arr_ref);
+    let vals: Vec<&str> = elems.iter().map(|(_, v, _)| v.as_str()).collect();
+    assert_eq!(vals, vec!["10", "20", "30"], "arr elements expand in order");
+
+    // evaluate: array index, struct member, arrow-through-pointer, and arithmetic over them.
+    assert_eq!(eval_in_frame(&mut s, 20, "arr[0]").as_deref(), Some("10"));
+    assert_eq!(eval_in_frame(&mut s, 22, "arr[2]").as_deref(), Some("30"));
+    assert_eq!(eval_in_frame(&mut s, 24, "p.x").as_deref(), Some("7"));
+    assert_eq!(eval_in_frame(&mut s, 26, "p.y").as_deref(), Some("9"));
+    assert_eq!(
+        eval_in_frame(&mut s, 28, "pp->x").as_deref(),
+        Some("7"),
+        "arrow through the promoted-SSA pointer resolves"
+    );
+    assert_eq!(eval_in_frame(&mut s, 30, "pp->y").as_deref(), Some("9"));
+    assert_eq!(
+        eval_in_frame(&mut s, 32, "arr[0] + p.x").as_deref(),
+        Some("17"),
+        "arithmetic over member/index results"
+    );
+}
+
+/// **A breakpoint on a bare `return x;` line is reported unverified, not silently dropped.** Such a
+/// line maps only to the block's `return` terminator, which no engine can pause at — so binding it
+/// used to verify-then-run-to-completion. The DAP now reports `verified: false` with a reason, while a
+/// line with a real op (line 8) still binds. Regression test for the terminator-only-line binding fix.
+#[test]
+fn breakpoint_on_bare_return_line_is_unverified() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, RICH_SRC);
+
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(&ir)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    // Line 9 is `return sum;` (only the return terminator); line 8 has the sum computation.
+    let out = s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![
+                    Json::obj(vec![("line", Json::i(9))]),
+                    Json::obj(vec![("line", Json::i(8))]),
+                ]),
+            ),
+        ]),
+    ));
+    let bps = response(&out)
+        .get("body")
+        .unwrap()
+        .get("breakpoints")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        bps[0].get("verified"),
+        Some(&Json::Bool(false)),
+        "the bare-return line is reported unverified"
+    );
+    assert!(
+        bps[0]
+            .get("message")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| !m.is_empty()),
+        "the unverified breakpoint carries an explanatory message"
+    );
+    assert_eq!(
+        bps[1].get("verified"),
+        Some(&Json::Bool(true)),
+        "a line with a real op still binds"
+    );
+
+    // And it really doesn't fire: running with only the (unverifiable) line-9 breakpoint set runs to
+    // completion — the honest outcome, versus the old silent verify-then-blow-past.
+    s.handle(&req(
+        4,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(9))])]),
+            ),
+        ]),
+    ));
+    let out = s.handle(&req(5, "configurationDone", Json::obj(vec![])));
+    assert!(
+        event(&out, "terminated") && !event(&out, "stopped"),
+        "with only the bare-return breakpoint, the program runs to completion"
+    );
+}

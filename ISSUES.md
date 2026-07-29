@@ -21,6 +21,30 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504
+
+**Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
+`build · test (windows-latest)` were **cancelled** (not failed) after ~45 min: the single test in
+`crates/svm-interp/tests/svc_serve_chain.rs`, `a_handler_forwarding_to_another_server_completes`,
+logged "has been running for over 60 seconds" and never completed (macOS killed an orphan
+`svc_serve_chain` process at cleanup). **Intermittent and unrelated to the diff** — Windows *passed*
+this test in an earlier run of the same PR; the change touches only the debug adapter and browser
+tests, nothing in the svc/fiber path. The Linux `build · test · fmt · clippy` lane (same test) went
+green both times.
+
+**Family.** Same svc-handler-forwarding × park surface as **I44** (freeze-on-quiesce, fixed
+2026-07-24) and I40/I41 — a serve-chain rendezvous that can wedge under parallel-test load on the
+slower/serialized CI runners. Not yet root-caused for *this* test.
+
+**Where.** `crates/svm-interp/tests/svc_serve_chain.rs` (the forwarding-chain rendezvous), exercised
+through the `svm-interp` svc serve loop.
+
+**Fix sketch.** Reproduce under the full-binary hammer the way I44 needed (`serve.rs`/`svc_*` tests
+in parallel threads under load, not in isolation), then apply the I44-style clamp / add a
+timeout-count **bail** to the forwarding wait loop so a rendezvous regression fails loudly in seconds
+instead of hanging the runner (ISSUES.md I44 §"add a timeout-count bail to every wait loop"). Until
+then, a re-run of the failed jobs clears it (the hang is intermittent).
+
 ### I51 — bytecode `vcpu.tls` is per-`Vm`, not per-vCPU: a fiber that migrates across workers reads a stale TLS word (S3, multi-worker only) — recorded 2026-07-28 landing the JACL-in-browser `vcpu.tls` lowering
 
 **Symptom.** `vcpu.tls.get` must return the word of the vCPU *currently executing* the op
