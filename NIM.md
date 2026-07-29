@@ -453,8 +453,9 @@ plumbing. Five workstreams, roughly independent:
 - **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
   the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
 
-**Near-term milestone (what we drive first): compile & run one real Nim program end-to-end** —
-source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right answer. That
+**Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
+end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
+answer (a real seq build-and-sum returns `3`). That
 exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
 concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
 especially) is bounded but real; the backend mapping is the part that's no longer in doubt.
@@ -509,6 +510,19 @@ Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs
 end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
 model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
 protocol runs correctly against a real allocator.
+
+**✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
+end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
+`sumSeq`/`makeSeq` to verified svm-ir with their stdlib ops as named imports; a tiny SVM **runtime
+shim** (the pure `toOpenArray`/`len`/`[]`/`inc` ops + a bump/realloc allocator for `newSeqUninit`/
+`add`, `=wasMoved`/`=destroy` as zero/no-op — eight functions, ~90 lines of svm-text) is **linked
+in** via `svm_ir::link`, binding each named import to a shim function. So the whole path — real Nim
+→ `nimony` → `hexer` → `svm-leng` → svm-ir → link → **run** — closes with the right answer:
+`sumSeq([10,20,30]) = 60`, `makeSeq(3)` builds `[0,1,2]` through the allocator, and a driver chaining
+`makeSeq(3)` → `sumSeq` returns `3` in one pass (`tests/end_to_end.rs`). Notably the shim is *SVM
+code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
+and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
+the shim is the placeholder the real compiled `system` module (Path A) will replace.
 
 ## 4. Invariants this must respect
 
