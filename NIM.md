@@ -300,14 +300,16 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
   **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
-  `break`/`block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl. constructors, copy, and
-  **sret return**), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), globals, intra-
-  and cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
+  `break`/`continue` and `block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl.
+  constructors, copy, and **sret return**), enum/distinct scalars, **exceptions** (nimony's
+  error-flag ABI), **seq/string** value layout + operations (as runtime imports), globals, intra- and
+  cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
   (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`,
-  `toNum`, `mayFail`, `guarded`, `counter`). Remaining for full real modules (W1 Leng totality,
-  §3a): seq/string, exception payloads with `object`-of-`RootObj` inheritance (vtables), and the
-  `jtrue`/`mflag`/`vflag` conditional-jump forms — plus wiring nimony's real export signatures for
-  imports.
+  `toNum`, `mayFail`, `guarded`, `counter`, `getAt`, `sumSeq`, `makeSeq`). Remaining for full real
+  modules (W1 Leng totality, §3a): exception payloads with `object`-of-`RootObj` inheritance
+  (vtables) and the `jtrue`/`mflag`/`vflag` conditional-jump forms. The bigger remaining lever is
+  **W3** — binding the seq/string (and other stdlib) imports to a real runtime so the lowered code
+  *runs*, not just verifies.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
       `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
@@ -315,6 +317,17 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
       y:b); p.x+p.y`), interp == JIT.
+    - **✅ seq/string (value layout + operations as imports) — DONE 2026-07-29.** nimony's `seq[T]`
+      is a `{len, data*}` fat-pointer **object** (`string` analogous), so its value layout and element
+      access already ride the object + pointer machinery — a hand-written seq summed over a
+      caller-provided buffer *runs* on both engines. Its *operations* (`add`/`[]`/`len`/`toOpenArray`/
+      `newSeq`) are stdlib procs that lower to **imports** (the **W3** runtime edge: they verify, and
+      run once bound). Getting real seq bytes to lower needed four fixes: (1) import **names** escaped
+      for svm-text (the `[]` operator mangles to `\5B\5D…`, whose bare backslash the lexer rejected);
+      (2) aggregate **args** to imports passed by address; (3) aggregate-**returning** imports (sret
+      imports, e.g. `toOpenArray`/`newSeqUninit`); (4) structured `break`/`continue` (a `for` lowers
+      to `while (true) { … else break }`). Real nimony `getAt`/`firstLen` (index/len) and
+      `sumSeq`/`makeSeq` (the full `for`-read and `add`-write paths) now **translate and verify**.
     - **✅ non-zero global initializers — DONE 2026-07-29.** A `gvar` with a non-zero scalar-int
       initializer becomes a module `data` segment (little-endian bytes at the global's window offset)
       — the window is otherwise zero, so a zero initializer stays a no-op, and a non-scalar/aggregate
