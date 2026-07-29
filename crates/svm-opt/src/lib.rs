@@ -2213,6 +2213,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         // operands to renumber.
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest

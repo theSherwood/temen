@@ -76,6 +76,28 @@ a `pages.yml` `--site` step asserts every referenced asset is actually present i
 `_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
 with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
 automatically. This closes the residual guard gap I26 named.
+
+### I52 — CI flake: `svc_serve_chain::a_handler_forwarding_to_another_server_completes` hangs on Windows (S4) — seen 2026-07-29, PR #509 run 30470197189
+
+**Symptom.** `build · test (windows-latest)` was cancelled at its `timeout-minutes` ceiling
+(cancelled, not failed): the single test `a_handler_forwarding_to_another_server_completes`
+(`crates/svm/tests/svc_serve_chain.rs`) logged "has been running for over 60 seconds" and then hung
+until the job was killed ~35 min later. Every other job in the run was green — Linux
+(`build · test · fmt · clippy`), macOS, and all wasm/differential lanes.
+
+**Why it's a base-branch flake, not the PR (definitive).** PR #509 (chibicc `--emit-object` cross-TU
+data + `data.top`) touches only the linker, the `Inst::DataTop` match arms, chibicc `codegen_ir.c`,
+and `c_link.rs` (`#![cfg(unix)]` — never runs on Windows). It touches **no** serve-loop / `svc.*` /
+cross-domain-scheduler code. Same class as I44 (a serve-loop test hung to `timeout-minutes`) but a
+distinct test — the I44 fix (2026-07-24) closed the freeze-on-quiesce case in `serve.rs`; a
+handler→server *forwarding* chain has its own intermittent park/wake window, here surfacing under the
+Windows scheduler.
+
+**Action.** Re-run the Windows job (a flake — expect green); don't churn the PR chasing it (I50
+posture). Root cause not yet isolated — a forwarding serve chain (handler A dispatches to server B)
+has a wake ordering that can strand under load; if it recurs, hammer the full `svc_serve_chain`
+binary the way I44 was pinned (per-crate parallel runs don't reproduce the cross-binary load).
+
 ### I50 — CI flake: the `durable_concurrent_jit` binary fails on macOS in two modes (S4) — seen 2026-07-27, PR #455 runs 30263159591 + 30266760876
 
 **Symptom — two distinct nondeterministic modes on `build · test (macos-latest)`, same binary:**

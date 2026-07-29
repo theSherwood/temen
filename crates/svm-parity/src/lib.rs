@@ -208,6 +208,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // link-form ops for exhaustiveness.
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 

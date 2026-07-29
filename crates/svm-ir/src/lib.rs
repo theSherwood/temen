@@ -1806,6 +1806,17 @@ pub enum Inst {
     DataSelf {
         offset: u64,
     },
+    /// A **link-form data-stack base**: the address just above *all* of the linked program's data
+    /// (the post-link top-of-data, [`powerbox_entry_sp`]-aligned), materialized as a value. A
+    /// separately-compiled entry unit cannot bake its data-stack pointer as a constant — its own
+    /// `data_end` is only this unit's top, but the linker stacks every unit's data into one window,
+    /// so the true stack base is not known until link time. A frontend emits `data.top` where a
+    /// whole-program build would emit `i64.const data_end` (the `_start` data-SP, and the argv/scratch
+    /// scratch it builds there). [`link`] rewrites it to [`Inst::ConstI64`] once the window layout is
+    /// fixed and grows the merged window to reserve the data stack above it; surviving into a runnable
+    /// module is a verify error. Result is `i64`. (Order-independent — the value is the whole
+    /// program's, not any one unit's — so the entry unit still links wherever `_start` needs it.)
+    DataTop,
     /// **Dynamic-mode** interface dispatch by type-section reference (IMPORTS.md §3.5): drive
     /// the capability behind a runtime `handle` value as interface `ty` (an index into
     /// [`Module::types`] naming a [`TypeEntry::Interface`]), op `op`. The use-site check is
@@ -2411,6 +2422,7 @@ impl Inst {
             // to real consts before any backend runs.
             | Inst::DataSym { .. }
             | Inst::DataSelf { .. }
+            | Inst::DataTop
             | Inst::PtrAdd { .. }
             | Inst::PtrCast { .. }
             | Inst::SimdWidthBytes
@@ -3829,6 +3841,15 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         disps.push(d);
     }
     // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
+    // The data-stack base for a `data.top` (the `_start` data-SP of a linked powerbox program): the
+    // window address just above *all* placed data, aligned exactly as [`powerbox_entry_sp`] does for
+    // the on-ramp entry. It is the whole program's, not any one unit's, so every unit resolves the
+    // same value regardless of link order — the entry unit's `_start` can still be function 0.
+    let entry_sp = dtotal
+        .max(POWERBOX_STACK_ALIGN)
+        .div_ceil(POWERBOX_STACK_ALIGN)
+        * POWERBOX_STACK_ALIGN;
+    let mut has_data_top = false;
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
     for ((u, ((&fbase, &dbase), &tbase)), disp) in units
@@ -3852,7 +3873,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // layout is fixed: `data.self <off>` → `dbase + off` (own data), `data.sym "name" +addend`
         // → `addr(name) + addend` (a cross-unit symbol, fail-closed if unexported). This is the
         // data twin of the `call.sym → call` rewrite below — a 1:1, position-independent edit.
-        resolve_unit_data_addrs(&mut m, dbase, &data_tab)?;
+        has_data_top |= resolve_unit_data_addrs(&mut m, dbase, entry_sp, &data_tab)?;
         offset_func_indices(&mut m, fbase);
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
@@ -3898,11 +3919,35 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     }
     Ok(Module {
         funcs,
-        // The merged window is the largest any unit declared (they share one linear memory).
+        // The merged window (one shared linear memory) must (a) be at least as large as any unit
+        // declared, (b) cover every relocated data segment — the units' data is **stacked** into
+        // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB — and
+        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] above
+        // `entry_sp` for it (as [`synth_manifest_start`] does for the on-ramp entry), since the
+        // entry unit sized its own window for a stack that has since been pushed up by the other
+        // units' data. Grow to the smallest power-of-two window that holds the max of these — never
+        // shrinking a unit's request. No unit declaring memory ⇒ no data segments, so `None` stays
+        // `None`.
         memory: units
             .iter()
             .filter_map(|u| u.module.memory)
-            .max_by_key(|m| m.size_log2),
+            .map(|m| m.size_log2)
+            .max()
+            .map(|declared| {
+                let cover = if has_data_top {
+                    entry_sp + POWERBOX_STACK_RESERVE
+                } else {
+                    dtotal
+                };
+                let need = if cover <= 1 {
+                    0
+                } else {
+                    (64 - (cover - 1).leading_zeros()) as u8
+                };
+                Memory {
+                    size_log2: declared.max(need),
+                }
+            }),
         data,
         // Empty for [`link`]; the deduped host-bound slots for [`link_with_manifest`].
         imports: merged_imports,
@@ -4016,16 +4061,25 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
 /// `data_tab`; an unexported name is fail-closed ([`LinkError::Unresolved`], like a missing function
 /// symbol). Rewrites **1:1** in place (the result value index is unchanged), so no value
 /// renumbering — the same discipline the call-symbol rewrite follows.
+/// `data.top` resolves to `entry_sp` (the whole program's post-link data-stack base, the same for
+/// every unit). Returns `true` if any `data.top` was rewritten, so [`link`] knows to reserve the
+/// data stack above it in the merged window.
 fn resolve_unit_data_addrs(
     m: &mut Module,
     dbase: u64,
+    entry_sp: u64,
     data_tab: &alloc::collections::BTreeMap<String, u64>,
-) -> Result<(), LinkError> {
+) -> Result<bool, LinkError> {
+    let mut saw_data_top = false;
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 let addr = match inst {
                     Inst::DataSelf { offset } => dbase.wrapping_add(*offset),
+                    Inst::DataTop => {
+                        saw_data_top = true;
+                        entry_sp
+                    }
                     Inst::DataSym { name, addend } => {
                         // The name is stored as raw bytes (Copy-clone friendly); resolve it against
                         // the string-keyed symbol table. Non-UTF-8 or unexported ⇒ fail closed.
@@ -4043,7 +4097,7 @@ fn resolve_unit_data_addrs(
             }
         }
     }
-    Ok(())
+    Ok(saw_data_top)
 }
 
 /// Apply a unit's **data-image pointer relocations** ([`Module::data_ptrs`], the data→data case):

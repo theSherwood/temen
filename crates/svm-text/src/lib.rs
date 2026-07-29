@@ -360,6 +360,7 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
             format!("data.sym \"{}\" {addend}", String::from_utf8_lossy(name))
         }
         Inst::DataSelf { offset } => format!("data.self {offset}"),
+        Inst::DataTop => "data.top".to_string(),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
@@ -2528,6 +2529,9 @@ impl<'a> Parser<'a> {
             let offset = u64::try_from(n)
                 .map_err(|_| ParseError(format!("data.self offset out of range: {n}")))?;
             return Ok(Inst::DataSelf { offset });
+        }
+        if op == "data.top" {
+            return Ok(Inst::DataTop);
         }
         // Phase-2 `import.attach <idx> v<handle>` (IMPORTS.md): rebind a rebindable import slot.
         if op == "import.attach" {

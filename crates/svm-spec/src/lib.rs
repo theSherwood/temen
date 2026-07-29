@@ -1735,6 +1735,7 @@ pub fn coverage(inst: &Inst) -> Class {
         // with the other link-form ops (provisional, gates nothing until a slice lands).
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
