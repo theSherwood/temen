@@ -53,16 +53,21 @@ fn compile_tu(chibicc: &svm_ir::Module, tu: &str) -> (i32, usize, bool) {
     (out.status, ir.len(), parses)
 }
 
-/// Each of these real chibicc `-cc1` translation units compiles to valid SVM IR in the sandbox. The
-/// set is chosen to cover the new libc surface: `strings.c` is the load-bearing one — chibicc's
-/// `format()` there builds strings through `open_memstream` + `vfprintf` + `fclose`, the buffered
-/// `FILE*` the playground `<stdio.h>` gained for exactly this.
+/// Real chibicc `-cc1` translation units compile to valid SVM IR in the sandbox. `strings.c` is the
+/// libc-surface load-bearer (chibicc's `format()` builds strings through `open_memstream` +
+/// `vfprintf` + `fclose`). Also pins the **`vm_map`-growable heap**: removing chibicc's fixed 24 MiB
+/// static arena (so `malloc` grows into the reserved tail on demand) dropped chibicc.svmb's declared
+/// memory — the arena was the bloat — which the `size_log2` check gates structurally.
 #[test]
 fn chibicc_translation_units_compile_to_valid_ir() {
     let Some(chibicc) = chibicc_svmb() else {
         eprintln!("SKIP: chibicc.svmb absent");
         return;
     };
+    assert!(
+        chibicc.memory.map_or(0, |m| m.size_log2) <= 24,
+        "growable heap ⇒ chibicc.svmb no longer carries a multi-MiB static arena in its window"
+    );
     for tu in ["tokenize.c", "strings.c", "hashmap.c", "unicode.c"] {
         let (status, ir_len, parses) = compile_tu(&chibicc, tu);
         assert!(
@@ -71,6 +76,25 @@ fn chibicc_translation_units_compile_to_valid_ir() {
         );
         eprintln!("chibicc {tu} → {ir_len} B of SVM IR (parses + verifies)");
     }
+}
+
+/// The **growable-heap** proof, on chibicc's largest translation unit: `codegen_ir.c` emits ~1.4 MB of
+/// IR, a compiler working set that overran the old fixed 24 MiB guest arena (silent corruption →
+/// spurious type errors). With `malloc` now growing into the reserved tail on demand, it compiles
+/// cleanly. `#[ignore]`d because it takes ~70 s on the interpreter — run with `--ignored` on demand.
+#[test]
+#[ignore = "heavy (~70s): chibicc's largest TU — the growable-heap stress proof"]
+fn largest_tu_compiles_with_the_growable_heap() {
+    let Some(chibicc) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let (status, ir_len, parses) = compile_tu(&chibicc, "codegen_ir.c");
+    assert!(
+        parses,
+        "chibicc codegen_ir.c should compile to valid SVM IR (status {status}, {ir_len} B IR)"
+    );
+    eprintln!("chibicc codegen_ir.c → {ir_len} B of SVM IR (parses + verifies)");
 }
 
 /// The load-bearing new capability, exercised at **runtime**: `open_memstream` → `fprintf` into the

@@ -3,10 +3,12 @@
  * AFTER os_shim.c (uses its open/read/write/close), so declarations resolve within the one TU.
  *
  * Two pieces the Postgres shims don't supply because Postgres doesn't need them:
- *   (1) a real malloc/free/realloc/calloc — chibicc reallocs growable arrays, so realloc must
- *       copy the right length. A self-contained size-header bump allocator over a static arena
- *       (the on-ramp's own synth allocator is powerbox-gated; a static arena sidesteps that for
- *       the first bring-up — grow via __vm_map is the follow-up, SELFHOST_C.md §8).
+ *   (1) the allocator: `malloc`/`realloc` are LEFT UNDEFINED so the LLVM on-ramp synthesizes its
+ *       **`vm_map`-growable** heap for them (grows into the reserved tail on demand, §1a) — this is
+ *       what lets chibicc compile a whole *multi-file* program (its own source) whose working set
+ *       exceeds a fixed arena. Only `calloc` (a thin zeroing wrapper over the synth `malloc`) and
+ *       `free` (a no-op — the synth heap never reclaims) stay in C. (Earlier bring-up used a fixed
+ *       24 MiB static arena; the grow-via-`__vm_map` follow-up is now done — SELFHOST_C.md §8.)
  *   (2) open_memstream — strings.c format()/tokenize.c build strings through a memory FILE*; the
  *       stdio here is fd-backed OR memory-backed, so vfprintf (printf_shim) composes with both.
  * Plus the trivial string/ctype/time gaps.
@@ -23,33 +25,20 @@ extern int open(const char *path, int flags, ...);
 extern int close(int fd);
 extern long lseek(int fd, long off, int whence);
 
-/* ---- allocator: size-header bump over a static arena (SELFHOST_C.md §8, v1) ------------------ */
-#define ARENA_BYTES (24u << 20) /* 24 MiB — one source file's worth; grows to __vm_map later */
-static unsigned char g_arena[ARENA_BYTES];
-static unsigned long g_off;
-
-void *malloc(unsigned long n) {
-  n = (n + 15u) & ~15ul;                 /* 16-byte align the payload */
-  if (g_off + 16u + n > ARENA_BYTES) return (void *)0; /* OOM → NULL (chibicc checks) */
-  unsigned long *hdr = (unsigned long *)(g_arena + g_off);
-  hdr[0] = n;                            /* payload size, for realloc */
-  g_off += 16u + n;
-  return (void *)(hdr + 2);
-}
-void free(void *p) { (void)p; }          /* bump allocator: no reclaim (chibicc is arena-ish) */
+/* ---- allocator ---------------------------------------------------------------------------------
+ * `malloc`/`realloc` are intentionally NOT defined here: the on-ramp synthesizes its vm_map-growable
+ * heap for any undefined `malloc`/`realloc` in a module with a `main` (svm-llvm `synth_malloc`/
+ * `synth_realloc`), so chibicc's heap grows into the reserved tail instead of hitting a fixed cap —
+ * the difference between compiling one source file and compiling the whole compiler. `calloc` wraps
+ * the synth `malloc` (fresh vm_map pages are already zero, but zero explicitly for clarity); `free`
+ * is a no-op (the bump-style synth heap does not reclaim). Only these two stay in C. */
+extern void *malloc(unsigned long n);
+void free(void *p) { (void)p; }
 void *calloc(unsigned long nm, unsigned long sz) {
   unsigned long n = nm * sz;
   unsigned char *p = (unsigned char *)malloc(n);
-  if (p) for (unsigned long i = 0; i < n; i++) p[i] = 0; /* fresh arena is zero, but be explicit */
+  if (p) for (unsigned long i = 0; i < n; i++) p[i] = 0;
   return p;
-}
-void *realloc(void *p, unsigned long n) {
-  if (!p) return malloc(n);
-  unsigned long old = ((unsigned long *)p)[-2];
-  if (n <= old) return p;
-  unsigned char *q = (unsigned char *)malloc(n);
-  if (q) { unsigned char *s = (unsigned char *)p; for (unsigned long i = 0; i < old; i++) q[i] = s[i]; }
-  return q;
 }
 
 /* ---- trivial string/ctype gaps (Appendix A.5) ----------------------------------------------- */
