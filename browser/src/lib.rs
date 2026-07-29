@@ -4090,12 +4090,11 @@ pub extern "C" fn svm_run_shell(
 /// `svm_status`, `svm_exit_code`).
 ///
 /// This is the generic browser counterpart to the native link path: **nothing here is specific to
-/// any source language.** The caller supplies the program's own-data relocations as a flat buffer of
-/// little-endian `u32` triples `(func, block, inst)` at `[reloc_ptr, reloc_ptr + reloc_len)` — each
-/// applied as a [`RelocKind::SelfData`] patch on the program unit (self-data addressing; a trailing
-/// partial triple is ignored). A frontend's own wire format (how it delivers those relocs alongside
-/// the module text, what it names its entry export, which blob is its runtime) stays entirely on the
-/// caller's side; it lands here already decomposed into these generic parameters.
+/// any source language.** A program's own-data addresses ride in its module text as `data.self
+/// <offset>` instructions (resolved to the program unit's assigned window base by the linker), so no
+/// separate relocation buffer is passed — the self-describing link forms replaced the old
+/// `(func, block, inst)` reloc table. A frontend's own wire format (what it names its entry export,
+/// which blob is its runtime) stays entirely on the caller's side.
 ///
 /// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
 /// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
@@ -4108,8 +4107,6 @@ pub extern "C" fn svm_link_run(
     lib_len: usize,
     entry_ptr: *const u8,
     entry_len: usize,
-    reloc_ptr: *const u8,
-    reloc_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
@@ -4144,22 +4141,6 @@ pub extern "C" fn svm_link_run(
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
-    // The program's own-data relocations: a flat buffer of LE u32 triples (func, block, inst), each a
-    // SelfData patch. Alignment-free (read the bytes little-endian) since the host buffer is align-1.
-    let reloc_bytes = slice(reloc_ptr, reloc_len);
-    let relocs: Vec<svm_ir::DataReloc> = reloc_bytes
-        .chunks_exact(12)
-        .map(|c| {
-            let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
-            svm_ir::DataReloc {
-                func: u(0),
-                block: u(4),
-                inst: u(8),
-                kind: svm_ir::RelocKind::SelfData,
-            }
-        })
-        .collect();
-
     let program = match svm_text::parse_module(prog_text) {
         Ok(m) => m,
         Err(_) => {
@@ -4189,7 +4170,6 @@ pub extern "C" fn svm_link_run(
         svm_ir::LinkUnit {
             module: program,
             exports: vec![(entry_name.to_string(), 0)],
-            relocations: relocs,
             ..Default::default()
         },
     ]) {
