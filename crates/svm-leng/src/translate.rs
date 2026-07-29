@@ -55,6 +55,23 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// Escape a symbol for an svm-text string literal (e.g. an `import` name). Printable ASCII passes
+/// through; `\` and `"` are backslash-escaped; anything else is `\xHH`. Necessary because mangled
+/// Leng names carry NIF hex escapes — the `[]` operator is literally `\5B\5D…`, whose bare backslash
+/// the lexer would reject as an unknown escape.
+fn escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
+}
+
 /// The svm-text prefix for a value type (`i32`/`i64`). This subset only produces integer types.
 fn prefix(ty: ValType) -> &'static str {
     match ty {
@@ -182,7 +199,10 @@ impl Translator {
                 .collect::<Vec<_>>()
                 .join(", ");
             let rs = d.ret.map(prefix).unwrap_or("");
-            out.push_str(&format!("import {slot} \"{}\" ({ps}) -> ({rs})\n", d.name));
+            out.push_str(&format!(
+                "import {slot} \"{}\" ({ps}) -> ({rs})\n",
+                escape_str(&d.name)
+            ));
         }
         if !t.decls.is_empty() {
             out.push('\n');
@@ -793,6 +813,10 @@ struct FuncGen<'a> {
     /// label defined later (forward jumps: `break`, `block`-`break`). All labels are declared before
     /// any body statement is emitted.
     label_block: HashMap<String, u32>,
+    /// Stack of enclosing `while` loops as `(header, exit)` block ids, so a bare `(break)` branches to
+    /// the innermost exit and `(continue)` to the innermost header (nimony's `for` lowers to
+    /// `while (true) { … else break }`).
+    loop_stack: Vec<(u32, u32)>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -838,6 +862,7 @@ impl<'a> FuncGen<'a> {
             frame_size,
             sret,
             label_block: HashMap::new(),
+            loop_stack: Vec::new(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -1421,6 +1446,8 @@ impl<'a> FuncGen<'a> {
             Some("case") => self.case_stmt(s),
             Some("jmp") => self.jmp_stmt(s),
             Some("lab") => self.lab_stmt(s),
+            Some("break") => self.loop_jump(false, "break"),
+            Some("continue") => self.loop_jump(true, "continue"),
             other => Err(LengError::Unsupported(format!(
                 "statement `{}`",
                 other.unwrap_or("<headless>")
@@ -1503,8 +1530,11 @@ impl<'a> FuncGen<'a> {
         let vc = self.as_i32_cond(vc);
         let hargs = self.branch_args();
         self.finish_block(format!("br_if v{vc} {body}{hargs} {exit}{hargs}"), body);
-        // Body: run, then back to header.
-        self.stmt_list_or_single(&a[1])?;
+        // Body: run (with this loop's break/continue targets in scope), then back to header.
+        self.loop_stack.push((header, exit));
+        let r = self.stmt_list_or_single(&a[1]);
+        self.loop_stack.pop();
+        r?;
         if !self.terminated {
             let bargs = self.branch_args();
             self.finish_block(format!("br {header}{bargs}"), exit);
@@ -1512,6 +1542,20 @@ impl<'a> FuncGen<'a> {
             self.cur_id = exit;
             self.reset_cur_state();
         }
+        Ok(())
+    }
+
+    /// `(break)` / `(continue)` → branch to the innermost enclosing loop's `exit` / `header` block,
+    /// threading the current slots. The block is terminated (following code is dead until a `lab`).
+    fn loop_jump(&mut self, to_header: bool, kw: &str) -> Result<(), LengError> {
+        let &(header, exit) = self
+            .loop_stack
+            .last()
+            .ok_or_else(|| LengError::Malformed(format!("`{kw}` outside a loop")))?;
+        let target = if to_header { header } else { exit };
+        let args = self.branch_args();
+        self.finish_block(format!("br {target}{args}"), self.next_block);
+        self.terminated = true;
         Ok(())
     }
 
@@ -2021,11 +2065,11 @@ impl<'a> FuncGen<'a> {
         let callee = a[0]
             .as_atom()
             .ok_or_else(|| LengError::Unsupported("indirect aggregate-returning call".into()))?;
-        let sig = self.t.procs.get(callee).ok_or_else(|| {
-            LengError::Unsupported(format!(
-                "aggregate-returning call to external `{callee}` (import sret is a later slice)"
-            ))
-        })?;
+        // A cross-module aggregate-returning callee (e.g. `toOpenArray`) becomes an sret import.
+        if !self.t.procs.contains_key(callee) {
+            return self.call_import_sret(callee, &a[1..], dest_addr);
+        }
+        let sig = self.t.procs.get(callee).expect("checked above");
         if sig.sret.is_none() {
             return Err(LengError::Unsupported(format!(
                 "`{callee}` does not return an aggregate, but is used in aggregate position"
@@ -2091,9 +2135,16 @@ impl<'a> FuncGen<'a> {
         let mut argvals = Vec::new();
         let mut argtys = Vec::new();
         for arg in args {
-            let v = self.expr(arg)?;
-            argvals.push(v.id);
-            argtys.push(v.ty);
+            // Aggregate args pass by address (matching by-address params); scalars by value.
+            if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+                let (addr, _) = self.lvalue_addr(arg)?;
+                argvals.push(addr);
+                argtys.push(ValType::I64);
+            } else {
+                let v = self.expr(arg)?;
+                argvals.push(v.id);
+                argtys.push(v.ty);
+            }
         }
         let ret = if want_value { Some(ValType::I64) } else { None };
         let slot = self.t.register_import(name, &argtys, ret)?;
@@ -2118,6 +2169,39 @@ impl<'a> FuncGen<'a> {
                 })
             }
         }
+    }
+
+    /// An aggregate-returning cross-module call (e.g. `toOpenArray`): the import takes a leading
+    /// `$sret` pointer (`dest_addr`) and returns void, so the runtime writes the aggregate straight
+    /// into the destination. Aggregate args pass by address, scalars by value.
+    fn call_import_sret(
+        &mut self,
+        name: &str,
+        args: &[Node],
+        dest_addr: u32,
+    ) -> Result<(), LengError> {
+        let mut argvals = vec![dest_addr];
+        let mut argtys = vec![ValType::I64]; // the sret pointer
+        for arg in args {
+            if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+                let (addr, _) = self.lvalue_addr(arg)?;
+                argvals.push(addr);
+                argtys.push(ValType::I64);
+            } else {
+                let v = self.expr(arg)?;
+                argvals.push(v.id);
+                argtys.push(v.ty);
+            }
+        }
+        let slot = self.t.register_import(name, &argtys, None)?; // void: writes via the sret pointer
+        let arglist = argvals
+            .iter()
+            .map(|id| format!("v{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.cur_buf
+            .push_str(&format!("  call.import {slot} ({arglist})\n"));
+        Ok(())
     }
 
     fn emit_const(&mut self, ty: ValType, n: i64) -> Val {
