@@ -301,11 +301,12 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 
   **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
   `break`/`block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl. constructors, copy, and
-  **sret return**), globals, intra- and cross-module calls — fail-closed on the rest, and is
-  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`,
-  `mkSum`, `mk`, `firstHit`, `labeled`). Remaining for full real modules (W1 Leng totality, §3a):
-  exceptions (`try`/`onerr`/`raise`), seq/string, the `jtrue`/`mflag`/`vflag` conditional-jump
-  forms, and non-zero global/data initializers — plus wiring nimony's real export signatures for
+  **sret return**), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), globals, intra-
+  and cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
+  (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`,
+  `toNum`, `mayFail`, `guarded`, `counter`). Remaining for full real modules (W1 Leng totality,
+  §3a): seq/string, exception payloads with `object`-of-`RootObj` inheritance (vtables), and the
+  `jtrue`/`mflag`/`vflag` conditional-jump forms — plus wiring nimony's real export signatures for
   imports.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
@@ -314,6 +315,31 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
       y:b); p.x+p.y`), interp == JIT.
+    - **✅ non-zero global initializers — DONE 2026-07-29.** A `gvar` with a non-zero scalar-int
+      initializer becomes a module `data` segment (little-endian bytes at the global's window offset)
+      — the window is otherwise zero, so a zero initializer stays a no-op, and a non-scalar/aggregate
+      initializer fail-closes. Tested on hand fixtures (i32 + i64) and **real nimony `var counter:
+      int = 42`** with `getCounter`/`addCounter`: the data segment seeds the window so `getCounter()`
+      reads 42, interp == JIT.
+    - **✅ enum/distinct scalars — DONE 2026-07-29.** A named type is an aggregate only when it's a
+      locally-declared `(object …)`/`(array …)`; every other named type — an `(enum …)`, a `distinct`
+      int, a `proctype`, or a type external to the module — is an integer scalar (its values are
+      plain integers). `collect_types` records the aggregate names up front, so `tydesc` classifies
+      as it resolves. Also hardened `if`-condition truthiness: a wide (`i64`) condition — e.g. an
+      enum error code — reduces via `!= 0`, not an `i64→i32` wrap that would drop the high word.
+      Tested on hand fixtures and **real nimony `toNum`** (enum compares) + **`roundtrip`** (enum
+      passthrough, a scalar return, not sret).
+    - **✅ exceptions (error-flag ABI) — DONE 2026-07-29.** nimony lowers exceptions with *no new
+      node type*: a `.raises` proc returns an `(object (fld :fld.0 ErrorCode) (fld :fld.1 result))`
+      tuple by **sret** (`fld.0` the error code — an enum, hence scalar — `fld.1` the real result);
+      `raise E` is `ret (oconstr tuple (kv fld.0 <nonzero>) (kv fld.1 <default>))`; the normal return
+      sets `fld.0 = 0`; and `try/except` is `var canRaise = call; if canRaise.fld.0: jmp exlab;
+      result = canRaise.fld.1` with the handler under an `if (false) { lab exlab; … }` guard reached
+      only via the `jmp`. So it falls straight out of sret + objects + `if` + `jmp`/`lab` +
+      enum-scalar error codes — no translator change beyond the enum slice. Tested on a hand-written
+      model and **real nimony `mayFail`/`guarded`** (a `distinct`-int raiser + its `try/except`
+      caller), interp == JIT: the happy path doubles the input, the error path returns the handler's
+      -1. Exception payloads carrying `object`-of-`RootObj` inheritance (vtables) stay fail-closed.
     - **✅ general `goto` (`jmp`/`lab`) — DONE 2026-07-28.** hexer keeps `if`/`while` structured and
       emits the low-level jump family only for `break`/`block`-`break`: `(jmp L)` an unconditional
       branch, `(lab :L)` a label. Both fall straight out of the block-parameter (slot-threading)
