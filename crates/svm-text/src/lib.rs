@@ -343,7 +343,9 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         Inst::ConstI64(c) => format!("i64.const {c}"),
         // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
         // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
-        Inst::DataSym { name, addend } => format!("data.sym \"{name}\" {addend}"),
+        Inst::DataSym { name, addend } => {
+            format!("data.sym \"{}\" {addend}", String::from_utf8_lossy(name))
+        }
         Inst::DataSelf { offset } => format!("data.self {offset}"),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
@@ -2469,8 +2471,7 @@ impl<'a> Parser<'a> {
         // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
         // them to `i64.const`. The name rides inline — there is no separate relocation table.
         if op == "data.sym" {
-            let name = String::from_utf8(self.parse_str()?)
-                .map_err(|_| ParseError("data.sym name is not valid UTF-8".into()))?;
+            let name = self.parse_str()?; // raw bytes (Copy-clone friendly Inst field)
             let addend = self.parse_int()?;
             return Ok(Inst::DataSym { name, addend });
         }

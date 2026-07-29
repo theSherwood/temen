@@ -1789,9 +1789,13 @@ pub enum Inst {
     /// fails the link ([`LinkError::Unresolved`]), and a `DataSym` that *survives* into a runnable
     /// module is a verify error (an object is not executable — the same guarantee as a surviving
     /// `CallSym`). The name rides in the instruction, so instruction insertion/reordering never
-    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`.
+    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`. The name is a
+    /// `Vec<u8>` (not `String`) so `Inst: Clone` monomorphizes to a `Copy`-element `Vec` clone — like
+    /// `CallSym`'s `args` — and never pulls in the concrete `alloc` `String::clone`, keeping every
+    /// `Inst`-manipulating crate (e.g. `svm-peval`) translatable by the strict LLVM on-ramp (the
+    /// data-oriented IR invariant that keeps the partial evaluator self-hostable).
     DataSym {
-        name: alloc::string::String,
+        name: alloc::vec::Vec<u8>,
         addend: i64,
     },
     /// A **link-form own-data address**: this unit's assigned data base plus `offset` (a unit-local
@@ -3972,9 +3976,14 @@ fn resolve_unit_data_addrs(
                 let addr = match inst {
                     Inst::DataSelf { offset } => dbase.wrapping_add(*offset),
                     Inst::DataSym { name, addend } => {
+                        // The name is stored as raw bytes (Copy-clone friendly); resolve it against
+                        // the string-keyed symbol table. Non-UTF-8 or unexported ⇒ fail closed.
+                        let key = core::str::from_utf8(name).map_err(|_| {
+                            LinkError::Unresolved(String::from_utf8_lossy(name).into_owned())
+                        })?;
                         let base = *data_tab
-                            .get(name)
-                            .ok_or_else(|| LinkError::Unresolved(name.clone()))?;
+                            .get(key)
+                            .ok_or_else(|| LinkError::Unresolved(key.to_string()))?;
                         base.wrapping_add(*addend as u64)
                     }
                     _ => continue,
