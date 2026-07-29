@@ -140,6 +140,20 @@ fn object_unit_cc1_entry() -> LinkUnit {
     emit_object_real(&cfile, &[src_dir, selfhost_dir()], "cc1_main.c")
 }
 
+/// Compile the **emit-object guest libc** (`emit_libc.c`) — the reusable, intrinsic-free core of the
+/// libc the linked cc1 runs on (task #20, increment 2b). Needs the chibicc, self-host, and Postgres-
+/// shim dirs on the include path.
+#[cfg(target_os = "linux")]
+fn object_unit_emit_libc() -> LinkUnit {
+    let cfile = selfhost_dir().join("emit_libc.c");
+    let dirs = [
+        repo_root().join("frontend/chibicc"),
+        selfhost_dir(),
+        repo_root().join("crates/svm-run/demos/postgres"),
+    ];
+    emit_object_real(&cfile, &dirs, "emit_libc.c")
+}
+
 /// Compile one C source string to a **linkable unit** (`--emit-object`) and parse it, turning the
 /// emitted `export` directives into the `LinkUnit::exports` the linker resolves against.
 fn object_unit(tag: &str, src: &str) -> LinkUnit {
@@ -793,7 +807,9 @@ fn all_cc1_tus_compile_link_and_verify_under_emit_object() {
     // Everything left unresolved is host-bound libc (a manifest), never a dangling cross-TU symbol.
     // This is exactly the surface the increment-2b emit-object libc must supply: the stdio + string
     // helpers as guest C (`fopen`/`vfprintf`/`strlen`/…) over the powerbox syscall + memory caps
-    // (`exit`/`vm_map`; the heap allocator itself chibicc synthesizes inline via `vm_map`).
+    // (`exit`/`vm_map`). The heap allocator is NOT here: each TU that `#include <stdlib.h>` gets
+    // chibicc's *bundled* header, whose `static malloc`/`calloc`/`free`/`realloc` grow the window via
+    // `__vm_map` inline — so `malloc` never appears as a cross-unit symbol at all.
     let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
     for name in &imports {
         assert!(!name.is_empty(), "retained manifest import has a name");
@@ -802,6 +818,86 @@ fn all_cc1_tus_compile_link_and_verify_under_emit_object() {
         assert!(
             imports.contains(&expected),
             "libc/cap `{expected}` retained as a manifest import (increment-2b target); imports: {imports:?}"
+        );
+    }
+}
+
+/// **The emit-object guest libc's reusable core compiles under `--emit-object` and is intrinsic-free**
+/// (task #20, increment 2b). `emit_libc.c` aggregates the pieces the linked cc1 runs on that carry no
+/// dependency on the LLVM on-ramp: the bundled-`<stdlib.h>` allocator, `mem`/`str`, ctype
+/// (`__ctype_b_loc`), errno, `strtod`, and the fd-backed + `open_memstream` stdio (`chibicc_extra.c`,
+/// with its allocator now guarded out under the bundled header). It defines the real `stdin`/`stdout`/
+/// `stderr` the 2a link stubbed.
+///
+/// The guard this pins: **no svm-llvm intrinsic survives.** The on-ramp's `os_shim.c`/`printf_shim.c`
+/// reach the host via `__vm_stream_write`/`__vm_host_call`/`__vm_cap_resolve` and format floats via
+/// `__vm_fmt_*` — names chibicc's own `--emit-object` codegen does not lower (it knows `__vm_map`/
+/// `__vm_jit_`/… but not those). So the emit-object libc must replace both bottom-edge shims (an os
+/// layer over plain `call.sym "write"`/`"read"` + an fs cap, and a `__vm_fmt_*`-free `vfprintf`) — the
+/// next slice. This test compiles the intrinsic-free core today and fails if an on-ramp intrinsic ever
+/// leaks back in, or if the shared `chibicc_extra.c` allocator guard regresses (a redefinition).
+///
+/// Linux-only, like the other real-source tests.
+#[cfg(target_os = "linux")]
+#[test]
+fn emit_object_libc_core_compiles_and_is_intrinsic_free() {
+    let libc = object_unit_emit_libc();
+
+    // The reusable surface is exported as guest C.
+    for f in [
+        "memcpy",
+        "memset",
+        "strlen",
+        "strchr",
+        "__ctype_b_loc",
+        "__errno_location",
+        "strtoul",
+        "strtod",
+        "fopen",
+        "fwrite",
+        "fread",
+        "fputc",
+        "fclose",
+        "open_memstream",
+    ] {
+        assert!(
+            libc.exports.iter().any(|(n, _)| n == f),
+            "emit-object libc exports `{f}`"
+        );
+    }
+    // The real stdio streams (fd 0/1/2), defined here rather than stubbed as in the 2a link.
+    for g in ["stdin", "stdout", "stderr"] {
+        assert!(
+            libc.data_exports.iter().any(|(n, _)| n == g),
+            "emit-object libc defines the `{g}` global"
+        );
+    }
+    // The load-bearing guard: not one on-ramp svm-llvm intrinsic is referenced. If `os_shim.c`/
+    // `printf_shim.c` were pulled in (or the bundled-header allocator guard regressed), one of these
+    // would appear as an unbindable import and the linked cc1 could never instantiate.
+    for imp in &libc.module.imports {
+        let n = imp.name.as_str();
+        assert!(
+            !n.starts_with("__vm_fmt")
+                && n != "__vm_stream_write"
+                && n != "__vm_stream_read"
+                && n != "__vm_host_call"
+                && n != "__vm_cap_resolve",
+            "emit-object libc must not reference on-ramp intrinsic `{n}`"
+        );
+    }
+    // What it *does* leave undefined is only host-bindable caps + the two documented bottom-edge
+    // seams (fs `open`/`close`, the printf formatters) — never an intrinsic.
+    let imports: Vec<&str> = libc
+        .module
+        .imports
+        .iter()
+        .map(|i| i.name.as_str())
+        .collect();
+    for cap in ["write", "read"] {
+        assert!(
+            imports.contains(&cap),
+            "emit-object libc reaches stdout/stdin via the powerbox `{cap}` cap; imports: {imports:?}"
         );
     }
 }

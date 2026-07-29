@@ -423,13 +423,32 @@ compiler bug is a clean error, never an escape.
      grows the window via the `vm_map`/`vm_page_size` builtins), so the libc need not provide them —
      a real simplification vs the clang-tuned aggregator.
 
-   **Remaining for increment 2b (make the linked cc1 *run*).** Supply that function surface as an
-   emit-object-compilable libc that defines real `stdin`/`stdout`/`stderr` (fd-backed + `open_memstream`
-   memory streams), then link it with the nine TUs and run a `.c → SVM IR` compile through `_start` on
-   interp==JIT under the fs-powerbox. The clang-tuned aggregator (`chibicc_libc.c`) does **not** compile
-   under emit-object as-is (e.g. `chibicc_extra.c`'s `free` redefines chibicc's own; float formatting
-   wants `__vm_fmt_*` or a guest dtoa) — increment 1's `mini_libc.c` + the enumerated surface above are
-   the seed and spec to grow the real one. Then (c) the **bootstrap-fixpoint** differential (§5 E).
+   **→ Emit-object increment 2b (started) — the libc's intrinsic-free core compiles.** `emit_libc.c`
+   is the emit-object twin of `chibicc_libc.c`, aggregating the parts of the guest libc that carry **no**
+   on-ramp dependency: the allocator (from chibicc's *bundled* `<stdlib.h>` — `static`
+   `malloc`/`calloc`/`free`/`realloc` growing the window via `__vm_map`, so `malloc` is never a
+   cross-unit symbol), `mem_shim`/`libc_shim` (mem/str/ctype `__ctype_b_loc`/`strtoul`), `strtod`, and
+   `chibicc_extra.c`'s fd-backed + `open_memstream` stdio — the last with its `free`/`calloc` now
+   `#ifndef __SVM_STDLIB_H`-guarded (the bundled header already defines them under emit-object; the
+   on-ramp's clang, on system headers, still gets them — verified `chibicc_libc.c` still builds under
+   clang). This core compiles under `--emit-object` and is **intrinsic-free** — regression-guarded by
+   `c_link.rs::emit_object_libc_core_compiles_and_is_intrinsic_free`, which also fails if the guard
+   regresses. It defines the real `stdin`/`stdout`/`stderr` the 2a link stubbed.
+
+   **Remaining for 2b — the two bottom-edge shims.** `os_shim.c` and `printf_shim.c` are on-ramp-only:
+   they invoke the host through svm-llvm intrinsics — `__vm_stream_write`/`__vm_host_call`/
+   `__vm_cap_resolve` (os) and `__vm_fmt_gen`/`__vm_fmt_fix`/`__vm_fmt_sci` (float printf) — that
+   chibicc's own `--emit-object` codegen does not lower (its `scan_caps` knows `__vm_map`/`__vm_jit_`/…
+   but not those). The emit-object regime reaches the host by plain `call.sym "write"`/`"read"`/… bound
+   by the powerbox instead. So 2b needs (i) an **os bottom edge**: fd-dispatch over `write`/`read`
+   (Stream cap, fd 0/1/2) and an **fs cap for fd≥3** — note the reference `default_cap_resolver` binds
+   `write`/`read`/`exit`/`vm_*` but **not** `open`/`close`/`stat`, so the full cc1 (which `fopen`s its
+   input `.c`) needs a richer fs-powerbox resolver + memfs; and (ii) a **`__vm_fmt_*`-free `vfprintf`**
+   over the `%d`/`%s`/`%x`/`%ld`/`%02d`/`%.*s`/`%+ld`/`%*s` surface chibicc actually uses (`%e`/`%.17g`
+   float emission — 58 call sites, all in float-constant codegen — needs a guest dtoa but is unexercised
+   on integer inputs). Then link libc + the nine TUs (only host caps remain) and run a `.c → SVM IR`
+   compile through `_start` on interp==JIT under the fs-powerbox. Then (c) the **bootstrap-fixpoint**
+   differential (§5 E).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
