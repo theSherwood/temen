@@ -402,6 +402,12 @@ signals ladder). In dependency order:
    image-replace) on the durable-clone capstone.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
+   **[Slice 3 done 2026-07-29 — the L0 doorbell.]** `signal`/`kill`/`sigcheck` landed as personality
+   ops (POSIX.md 30–32, cross-backend). A raised signal (guest `kill`, or the embedder's
+   `Posix::raise_signal` for a terminal `^C`) sets a pending bit; the guest polls `sigcheck` at a safe
+   point and it returns the installed handler pointer of the lowest pending **caught** signal (ignored
+   and default dispositions dropped) — exact for `trap`, no async interruption. **Remaining:** L1
+   interruptible parks + L2 safepoint handlers (interrupt a running loop; default actions), parked S13.
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for
    interactive use. Deferrable behind `--noediting` (batch bash is still real bash); the terminal is
    its own large frontend effort.
