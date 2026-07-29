@@ -382,6 +382,12 @@ signals ladder). In dependency order:
    durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
    it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).
 4. **`exec`/`wait`/`waitpid`/`pipe`/`dup2`** wired to the child machinery. *Medium.*
+   **[Slice 1 done 2026-07-29 — the fd surface.]** `pipe`/`dup2`/`dup`/`fcntl` landed as real
+   personality ops (POSIX.md ops 23–26) over a generalized fd table (stdio `0`/`1`/`2` are now ordinary
+   sentinels, so `dup2(pipe_w, 1)` redirect and `close`/reuse of a stdio fd work as POSIX). Pipes are
+   intra-personality (a single guest's two ends share one buffer, non-blocking). **Remaining:** POSIX-
+   shaped `execve`/`waitpid` wrapping the built `Instantiator` op 13 + `join`/`poll`, and *inheriting*
+   a redirected fd across a spawn (handing a pipe/file end to the spawned child as its stdin/stdout).
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for

@@ -69,12 +69,38 @@ pub const OP_EXEC_STDIN: u32 = 21;
 /// in size). Returns `-1` for an unregistered handle. The embedder records it in [`Posix::register_command`].
 pub const OP_EXEC_WIN: u32 = 22;
 
+/// **POSIX process/fd surface** (STAGE1.md slice 1 — the ABI a real shell links against, replacing the
+/// hand-shell's bespoke `open`/`close` fd juggling). `pipe(fds_ptr) -> 0` creates an in-personality byte
+/// FIFO and stores `[read_fd, write_fd]` (two `i32`s) at `fds_ptr`. `dup2(oldfd, newfd) -> newfd`
+/// re-points `newfd` at `oldfd`'s object (closing whatever `newfd` was), the primitive a shell uses to
+/// wire a redirect (`dup2(pipe_w, 1)`) before launching a command. `dup(oldfd) -> fd` clones `oldfd`
+/// onto the lowest free fd. `fcntl(fd, cmd, arg)` covers `F_DUPFD`/`F_DUPFD_CLOEXEC` (dup ≥ `arg`) and
+/// accepts `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` as no-ops (there is no exec-in-place, so `FD_CLOEXEC`
+/// has nothing to act on yet). These are **intra-personality** pipes: a single guest's write end and read
+/// end share one buffer, non-blocking (an empty pipe reads `0`/EOF). Handing a pipe end to a *spawned
+/// child* as its stdin/stdout is the next slice (`execve` inheritance); this slice lands the fd surface.
+pub const OP_PIPE: u32 = 23;
+pub const OP_DUP2: u32 = 24;
+pub const OP_DUP: u32 = 25;
+pub const OP_FCNTL: u32 = 26;
+
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
 const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a directory
+const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
+
+/// `fcntl` commands this personality serves (Linux `<fcntl.h>` values). `F_DUPFD`/`F_DUPFD_CLOEXEC`
+/// duplicate to the lowest free fd `>= arg`; `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are accepted no-ops
+/// (there is no exec-in-place here, so `FD_CLOEXEC` and status flags have nothing to gate yet).
+const F_DUPFD: i64 = 0;
+const F_GETFD: i64 = 1;
+const F_SETFD: i64 = 2;
+const F_GETFL: i64 = 3;
+const F_SETFL: i64 = 4;
+const F_DUPFD_CLOEXEC: i64 = 1030;
 
 /// `struct stat` **mode** bits this personality reports (Linux `<sys/stat.h>` `S_IFMT` values). The
 /// personality's `struct stat` is a deliberately minimal **`{ i64 st_mode; i64 st_size; }`** (16
@@ -103,15 +129,51 @@ const SEEK_SET: i64 = 0;
 const SEEK_CUR: i64 = 1;
 const SEEK_END: i64 = 2;
 
-/// The first fd the file table hands out — `0`/`1`/`2` are the reserved stdio streams.
-const FIRST_FD: usize = 3;
-
-/// One entry in the host-side fd table: which memfs file it refers to, the current offset, and whether
-/// it was opened for writing. Independent offsets per fd, shared file contents (POSIX file semantics).
+/// One open **memfs file** entry: which file it refers to, the current offset, and whether it was opened
+/// for writing. Independent offsets per fd, shared file contents (POSIX file semantics).
 struct OpenFile {
     path: String,
     pos: usize,
     writable: bool,
+}
+
+/// A shared, in-personality **pipe buffer** — a byte FIFO both ends of a `pipe()` hold via `Arc`.
+/// Non-blocking: a `read` on an empty buffer returns `0` (EOF), since a single cooperative guest cannot
+/// block on itself. Cross-process pipe semantics (a spawned child draining a parent's write end) arrive
+/// with the `execve`/spawn slice; this type gives the fd surface its buffering.
+type PipeBuf = Arc<Mutex<VecDeque<u8>>>;
+
+/// One entry in the host-side fd table. The three stdio streams start as sentinels (`Stdin`/`Stdout`/
+/// `Stderr`) so `dup2`/`dup`/`close` treat fds `0`/`1`/`2` uniformly with the rest; `open` adds `File`;
+/// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. `dup`/`dup2` clone an entry —
+/// pipe ends clone the `Arc` (shared buffer); a `File` clones its description (independent offset — the
+/// POSIX shared-offset nuance is a follow-up, irrelevant to the shell redirect pattern).
+enum FdEntry {
+    Stdin,
+    Stdout,
+    Stderr,
+    File(OpenFile),
+    PipeRead(PipeBuf),
+    PipeWrite(PipeBuf),
+}
+
+impl FdEntry {
+    /// Clone this entry for `dup`/`dup2`: pipe ends share the buffer (`Arc` clone), a file copies its
+    /// (independent) description, stdio sentinels are trivial.
+    fn dup_clone(&self) -> FdEntry {
+        match self {
+            FdEntry::Stdin => FdEntry::Stdin,
+            FdEntry::Stdout => FdEntry::Stdout,
+            FdEntry::Stderr => FdEntry::Stderr,
+            FdEntry::File(of) => FdEntry::File(OpenFile {
+                path: of.path.clone(),
+                pos: of.pos,
+                writable: of.writable,
+            }),
+            FdEntry::PipeRead(p) => FdEntry::PipeRead(Arc::clone(p)),
+            FdEntry::PipeWrite(p) => FdEntry::PipeWrite(Arc::clone(p)),
+        }
+    }
 }
 
 /// One open directory stream: the immediate child names under the opened path, snapshotted at
@@ -157,9 +219,11 @@ struct Inner {
     /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
     /// follow-up. Shared file bytes; per-fd offsets live in [`Inner::fds`].
     files: HashMap<String, Vec<u8>>,
-    /// The host-side fd table (indexed by fd; `0`/`1`/`2` are always `None` — stdio is handled
-    /// specially). `open` allocates the first free slot at [`FIRST_FD`] or above.
-    fds: Vec<Option<OpenFile>>,
+    /// The host-side fd table (indexed by fd). Seeded with the three stdio sentinels at `0`/`1`/`2`
+    /// (`FdEntry::Stdin`/`Stdout`/`Stderr`), so `dup2`/`dup`/`close`/`fcntl` treat every fd uniformly.
+    /// `open`/`pipe`/`dup` allocate the lowest free slot; a closed fd (including a closed stdio fd) is
+    /// reused, matching POSIX "lowest available".
+    fds: Vec<Option<FdEntry>>,
     /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
     /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
     /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
@@ -346,6 +410,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "exec_stdout" => OP_EXEC_STDOUT,
         "exec_stdin" => OP_EXEC_STDIN,
         "exec_win" => OP_EXEC_WIN,
+        "pipe" => OP_PIPE,
+        "dup2" => OP_DUP2,
+        "dup" => OP_DUP,
+        "fcntl" => OP_FCNTL,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -396,7 +464,11 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         allocated: HashMap::new(),
         free_list: Vec::new(),
         files: HashMap::new(),
-        fds: Vec::new(),
+        fds: vec![
+            Some(FdEntry::Stdin),
+            Some(FdEntry::Stdout),
+            Some(FdEntry::Stderr),
+        ],
         dirs: Vec::new(),
         args: Vec::new(),
         cwd: "/".to_string(),
@@ -442,6 +514,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
             OP_EXEC_STDIN => st.exec_stdin(args, mem),
             OP_EXEC_WIN => st.exec_win(args),
+            OP_PIPE => st.pipe(args, mem),
+            OP_DUP2 => Ok(vec![st.dup2(args)]),
+            OP_DUP => Ok(vec![st.dup(args)]),
+            OP_FCNTL => Ok(vec![st.fcntl(args)]),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -452,9 +528,10 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
 }
 
 impl Inner {
-    /// `write(fd, buf, len) -> n | -errno`: `1`/`2` append to the captured stdout/stderr; an fd `>= 3`
-    /// writes into its memfs file at the fd's offset (extending it), advancing the offset. `0` (stdin)
-    /// and an unopened / read-only fd are `-EBADF`.
+    /// `write(fd, buf, len) -> n | -errno`: the `Stdout`/`Stderr` sentinels append to the captured
+    /// stdout/stderr; a `File` fd writes into its memfs file at the offset (extending it), advancing it;
+    /// a `PipeWrite` fd appends to its shared buffer. `Stdin`, a `PipeRead`, a read-only file, and an
+    /// unopened fd are `-EBADF`.
     fn write(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
@@ -464,43 +541,86 @@ impl Inner {
             return Ok(vec![0]);
         }
         let data = mem.read_bytes(buf, len).ok_or(Trap::Malformed)?;
-        match fd {
-            1 => match &self.stdout_sink {
-                Some(sink) => sink
+        // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.fds` while
+        // mutating `self.stdout`/`self.stderr`/the memfs.
+        enum Sink {
+            Stdout,
+            Stderr,
+            File,
+            Pipe(PipeBuf),
+            Bad,
+        }
+        let sink = match self.fd(fd) {
+            Some(FdEntry::Stdout) => Sink::Stdout,
+            Some(FdEntry::Stderr) => Sink::Stderr,
+            Some(FdEntry::File(_)) => Sink::File,
+            Some(FdEntry::PipeWrite(p)) => Sink::Pipe(Arc::clone(p)),
+            _ => Sink::Bad,
+        };
+        match sink {
+            Sink::Stdout => match &self.stdout_sink {
+                Some(s) => s
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend_from_slice(&data),
                 None => self.stdout.extend_from_slice(&data),
             },
-            2 => self.stderr.extend_from_slice(&data),
-            f if f >= FIRST_FD as i64 => return Ok(vec![self.file_write(f as usize, &data)]),
-            _ => return Ok(vec![EBADF]),
+            Sink::Stderr => self.stderr.extend_from_slice(&data),
+            Sink::File => return Ok(vec![self.file_write(fd as usize, &data)]),
+            Sink::Pipe(p) => p.lock().unwrap_or_else(|e| e.into_inner()).extend(data),
+            Sink::Bad => return Ok(vec![EBADF]),
         }
         Ok(vec![len as i64])
     }
 
-    /// `read(fd, buf, len) -> n | -errno`: `0` drains preloaded stdin; an fd `>= 3` reads its memfs file
-    /// from the fd's offset, advancing it (`0` at EOF). `1`/`2` and an unopened fd are `-EBADF`.
+    /// `read(fd, buf, len) -> n | -errno`: the `Stdin` sentinel drains preloaded stdin; a `File` fd reads
+    /// its memfs file from the offset, advancing it (`0` at EOF); a `PipeRead` fd drains its shared buffer
+    /// (`0` when empty). `Stdout`/`Stderr`, a `PipeWrite`, and an unopened fd are `-EBADF`.
     fn read(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let fd = *args.first().ok_or(Trap::Malformed)?;
         let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let len = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as usize;
-        let chunk: Vec<u8> = match fd {
-            0 => {
+        enum Src {
+            Stdin,
+            File,
+            Pipe(PipeBuf),
+            Bad,
+        }
+        let src = match self.fd(fd) {
+            Some(FdEntry::Stdin) => Src::Stdin,
+            Some(FdEntry::File(_)) => Src::File,
+            Some(FdEntry::PipeRead(p)) => Src::Pipe(Arc::clone(p)),
+            _ => Src::Bad,
+        };
+        let chunk: Vec<u8> = match src {
+            Src::Stdin => {
                 let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
                 let n = len.min(avail.len());
                 self.stdin_pos += n;
                 avail[..n].to_vec()
             }
-            f if f >= FIRST_FD as i64 => match self.file_read(f as usize, len) {
+            Src::File => match self.file_read(fd as usize, len) {
                 Ok(c) => c,
                 Err(e) => return Ok(vec![e]),
             },
-            _ => return Ok(vec![EBADF]),
+            Src::Pipe(p) => {
+                let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
+                let n = len.min(g.len());
+                g.drain(..n).collect()
+            }
+            Src::Bad => return Ok(vec![EBADF]),
         };
         mem.write_bytes(buf, &chunk).ok_or(Trap::Malformed)?;
         Ok(vec![chunk.len() as i64])
+    }
+
+    /// Borrow the entry at `fd` if it is a valid, open fd (`fd >= 0` and the slot is `Some`).
+    fn fd(&self, fd: i64) -> Option<&FdEntry> {
+        if fd < 0 {
+            return None;
+        }
+        self.fds.get(fd as usize).and_then(|s| s.as_ref())
     }
 
     /// `open(path_ptr, path_len, flags) -> fd | -errno`: open (or `O_CREAT`) a memfs file, returning a
@@ -526,17 +646,18 @@ impl Inner {
         let pos = if flags & O_APPEND != 0 { file.len() } else { 0 };
         let acc = flags & O_ACCMODE;
         let writable = acc == O_WRONLY || acc == O_RDWR;
-        Ok(vec![self.alloc_fd(OpenFile {
+        Ok(vec![self.alloc_fd(FdEntry::File(OpenFile {
             path,
             pos,
             writable,
-        })])
+        }))])
     }
 
-    /// `close(fd) -> 0 | -errno`: release a file fd. stdio / unopened fds are `-EBADF`.
+    /// `close(fd) -> 0 | -errno`: release any open fd (a file, a pipe end, or a stdio sentinel — a shell
+    /// closes and reuses `0`/`1`/`2` freely). An out-of-range / already-closed fd is `-EBADF`.
     fn close(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
-        if fd >= FIRST_FD as i64 {
+        if fd >= 0 {
             if let Some(slot @ Some(_)) = self.fds.get_mut(fd as usize) {
                 *slot = None;
                 return 0;
@@ -545,17 +666,15 @@ impl Inner {
         EBADF
     }
 
-    /// `lseek(fd, offset, whence) -> new_offset | -errno`: reposition a file fd (`SEEK_SET`/`CUR`/`END`).
-    /// A negative result or bad whence is `-EINVAL`; stdio / unopened fds are `-EBADF`.
+    /// `lseek(fd, offset, whence) -> new_offset | -errno`: reposition a `File` fd (`SEEK_SET`/`CUR`/`END`).
+    /// A negative result or bad whence is `-EINVAL`; a pipe/stdio fd is `-ESPIPE`; an unopened fd `-EBADF`.
     fn lseek(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
         let offset = *args.get(1).unwrap_or(&0);
         let whence = *args.get(2).unwrap_or(&-1);
-        if fd < FIRST_FD as i64 {
-            return EBADF;
-        }
-        let (path, pos) = match self.fds.get(fd as usize).and_then(|s| s.as_ref()) {
-            Some(of) => (of.path.clone(), of.pos as i64),
+        let (path, pos) = match self.fd(fd) {
+            Some(FdEntry::File(of)) => (of.path.clone(), of.pos as i64),
+            Some(_) => return ESPIPE,
             None => return EBADF,
         };
         let size = self.files.get(&path).map_or(0, |f| f.len()) as i64;
@@ -568,8 +687,82 @@ impl Inner {
         if newpos < 0 {
             return EINVAL;
         }
-        self.fds[fd as usize].as_mut().unwrap().pos = newpos as usize;
+        if let Some(FdEntry::File(of)) = self.fds[fd as usize].as_mut() {
+            of.pos = newpos as usize;
+        }
         newpos
+    }
+
+    /// `pipe(fds_ptr) -> 0 | -errno`: create an in-personality byte FIFO and store the read and write fds
+    /// (`[i32; 2]`, little-endian) at `fds_ptr`. Both ends share one [`PipeBuf`]; the write end is the
+    /// higher fd, matching Linux (which allocates the read end first). Non-blocking (see [`PipeBuf`]).
+    fn pipe(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let buf: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+        let rfd = self.alloc_fd(FdEntry::PipeRead(Arc::clone(&buf)));
+        let wfd = self.alloc_fd(FdEntry::PipeWrite(buf));
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&(rfd as i32).to_le_bytes());
+        out.extend_from_slice(&(wfd as i32).to_le_bytes());
+        mem.write_bytes(ptr, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// `dup2(oldfd, newfd) -> newfd | -errno`: re-point `newfd` at `oldfd`'s object, closing whatever
+    /// `newfd` referred to. `dup2(fd, fd)` is a no-op returning `fd` (POSIX). `oldfd` must be open;
+    /// `newfd` must be non-negative. This is the redirect primitive (`dup2(pipe_w, 1)` before a spawn).
+    fn dup2(&mut self, args: &[i64]) -> i64 {
+        let oldfd = *args.first().unwrap_or(&-1);
+        let newfd = *args.get(1).unwrap_or(&-1);
+        let Some(entry) = self.fd(oldfd) else {
+            return EBADF;
+        };
+        if newfd < 0 {
+            return EBADF;
+        }
+        if oldfd == newfd {
+            return newfd;
+        }
+        let dup = entry.dup_clone();
+        let n = newfd as usize;
+        if self.fds.len() <= n {
+            self.fds.resize_with(n + 1, || None);
+        }
+        self.fds[n] = Some(dup);
+        newfd
+    }
+
+    /// `dup(oldfd) -> fd | -errno`: clone `oldfd` onto the lowest free fd. `oldfd` must be open.
+    fn dup(&mut self, args: &[i64]) -> i64 {
+        let oldfd = *args.first().unwrap_or(&-1);
+        match self.fd(oldfd) {
+            Some(entry) => {
+                let dup = entry.dup_clone();
+                self.alloc_fd(dup)
+            }
+            None => EBADF,
+        }
+    }
+
+    /// `fcntl(fd, cmd, arg) -> result | -errno`: `F_DUPFD`/`F_DUPFD_CLOEXEC` clone `fd` onto the lowest
+    /// free fd `>= arg`; `F_GETFD`/`F_GETFL` return `0`, `F_SETFD`/`F_SETFL` accept and return `0` (no
+    /// exec-in-place here, so `FD_CLOEXEC`/status flags have nothing to gate). `fd` must be open.
+    fn fcntl(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&-1);
+        let cmd = *args.get(1).unwrap_or(&-1);
+        let arg = *args.get(2).unwrap_or(&0);
+        let Some(entry) = self.fd(fd) else {
+            return EBADF;
+        };
+        match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let dup = entry.dup_clone();
+                self.alloc_fd_from(dup, arg.max(0) as usize)
+            }
+            F_GETFD | F_GETFL | F_SETFD | F_SETFL => 0,
+            _ => EINVAL,
+        }
     }
 
     /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
@@ -802,28 +995,34 @@ impl Inner {
         Ok(vec![self.exec_stdin_handle as i64])
     }
 
-    /// Allocate the first free fd at [`FIRST_FD`] or above for `of`, extending the table if needed.
-    fn alloc_fd(&mut self, of: OpenFile) -> i64 {
-        while self.fds.len() < FIRST_FD {
+    /// Allocate the lowest free fd for `entry`, extending the table if needed.
+    fn alloc_fd(&mut self, entry: FdEntry) -> i64 {
+        self.alloc_fd_from(entry, 0)
+    }
+
+    /// Allocate the lowest free fd `>= min` for `entry` (the `F_DUPFD`/`dup2` "at or above" contract),
+    /// extending the table if needed.
+    fn alloc_fd_from(&mut self, entry: FdEntry, min: usize) -> i64 {
+        while self.fds.len() < min {
             self.fds.push(None);
         }
-        match (FIRST_FD..self.fds.len()).find(|&i| self.fds[i].is_none()) {
+        match (min..self.fds.len()).find(|&i| self.fds[i].is_none()) {
             Some(i) => {
-                self.fds[i] = Some(of);
+                self.fds[i] = Some(entry);
                 i as i64
             }
             None => {
-                self.fds.push(Some(of));
+                self.fds.push(Some(entry));
                 (self.fds.len() - 1) as i64
             }
         }
     }
 
     /// Write `data` into fd `fd`'s memfs file at its offset (extending with zeros if the offset is
-    /// past the end), advancing the offset. Returns the count, or `-EBADF` for an unopened / read-only fd.
+    /// past the end), advancing the offset. Returns the count, or `-EBADF` for a non-file / read-only fd.
     fn file_write(&mut self, fd: usize, data: &[u8]) -> i64 {
         let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(of) if of.writable => (of.path.clone(), of.pos),
+            Some(FdEntry::File(of)) if of.writable => (of.path.clone(), of.pos),
             _ => return EBADF,
         };
         let file = self.files.entry(path).or_default();
@@ -832,21 +1031,25 @@ impl Inner {
             file.resize(end, 0);
         }
         file[pos..end].copy_from_slice(data);
-        self.fds[fd].as_mut().unwrap().pos = end;
+        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
+            of.pos = end;
+        }
         data.len() as i64
     }
 
-    /// Read up to `len` bytes from fd `fd`'s memfs file at its offset, advancing it. `Err(-errno)` for
-    /// an unopened fd.
+    /// Read up to `len` bytes from fd `fd`'s memfs file at its offset, advancing it. `Err(-EBADF)` for
+    /// a non-file fd.
     fn file_read(&mut self, fd: usize, len: usize) -> Result<Vec<u8>, i64> {
         let (path, pos) = match self.fds.get(fd).and_then(|s| s.as_ref()) {
-            Some(of) => (of.path.clone(), of.pos),
-            None => return Err(EBADF),
+            Some(FdEntry::File(of)) => (of.path.clone(), of.pos),
+            _ => return Err(EBADF),
         };
         let file = self.files.get(&path).map(|v| v.as_slice()).unwrap_or(&[]);
         let n = len.min(file.len().saturating_sub(pos));
         let chunk = file[pos..pos + n].to_vec();
-        self.fds[fd].as_mut().unwrap().pos = pos + n;
+        if let Some(FdEntry::File(of)) = self.fds[fd].as_mut() {
+            of.pos = pos + n;
+        }
         Ok(chunk)
     }
 
@@ -1337,6 +1540,202 @@ block 0 (vph: i32) {\n\
             "jit: must match interp, got {jo:?}"
         );
         assert_eq!(jposix.read_file("g"), None, "jit: file is gone");
+    }
+
+    /// func 0 `(handle) -> i64`: `open("f", O_WRONLY|O_CREAT|O_TRUNC=577)` → fd, `dup2(fd, 1)` (redirect
+    /// stdout onto the file), then `write(1, "Yo", 2)`. Because fd 1 now names the file, the bytes land in
+    /// the memfs, **not** in captured stdout — the shell-redirect shape (`cmd > f`). Returns the write
+    /// count (2). The `577` = `O_WRONLY(1) | O_CREAT(0o100) | O_TRUNC(0o1000)`.
+    const DUP2_REDIRECT: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vph: i32) {\n\
+  vp = i64.const 100\n\
+  vf = i32.const 102\n\
+  i32.store8 vp vf\n\
+  vlen = i64.const 1\n\
+  vflags = i64.const 577\n\
+  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vp, vlen, vflags)\n\
+  vone = i64.const 1\n\
+  vd = cap.call 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
+  vsz = i64.const 2\n\
+  vbuf = cap.call 13 2 (i64) -> (i64) vph (vsz)\n\
+  vY = i32.const 89\n\
+  i32.store8 vbuf vY\n\
+  vbuf1 = i64.add vbuf vone\n\
+  voo = i32.const 111\n\
+  i32.store8 vbuf1 voo\n\
+  vn = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vone, vbuf, vsz)\n\
+  return vn\n\
+  }\n\
+}\n";
+
+    #[test]
+    fn dup2_redirects_stdout_to_a_file_on_both_backends() {
+        let (ir, iout) = run_interp(DUP2_REDIRECT, b"");
+        let (jo, jout) = run_jit(DUP2_REDIRECT, b"");
+        assert_eq!(ir, Ok(vec![Value::I64(2)]), "interp: write count 2");
+        assert_eq!(
+            iout, b"",
+            "interp: nothing reached stdout — fd 1 was redirected to the file"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[2]),
+            "jit: must match interp, got {jo:?}"
+        );
+        assert_eq!(jout, b"", "jit: nothing reached stdout either");
+        // Both backends wrote "Yo" into the memfs file the redirected fd 1 named.
+        let (mut ih, mut jh) = (Host::new(), Host::new());
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, Vec::new());
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, Vec::new());
+        let m = parse_module(DUP2_REDIRECT).expect("parse");
+        let mut fuel = 5_000_000u64;
+        let _ = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        );
+        compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[jhh as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit");
+        assert_eq!(
+            iposix.read_file("f").as_deref(),
+            Some(&b"Yo"[..]),
+            "interp: file holds redirected bytes"
+        );
+        assert_eq!(
+            jposix.read_file("f").as_deref(),
+            Some(&b"Yo"[..]),
+            "jit: file holds redirected bytes"
+        );
+    }
+
+    #[test]
+    fn pipe_dup_fcntl_over_the_fd_table() {
+        // A host-level unit for the POSIX process/fd surface (slice 1). Exercises the whole fd model:
+        // pipe round-trip, dup2 redirect + shared buffer, dup lowest-free, F_DUPFD ≥ arg, ESPIPE on a
+        // pipe lseek, EBADF fail-closed, and stdio fds as ordinary (closable, reusable) table entries.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut st = posix.inner.lock().unwrap();
+        let mut win = vec![0u8; WIN];
+        win[16..21].copy_from_slice(b"hello");
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+
+        // pipe(fds@0) → 0, and stores [rfd=3, wfd=4] (the first free fds after stdio 0/1/2).
+        assert_eq!(
+            st.pipe(&[0], Some(&mut mem)).unwrap(),
+            vec![0],
+            "pipe returns 0"
+        );
+        let got = mem.read_bytes(0, 8).unwrap();
+        let rfd = i32::from_le_bytes(got[0..4].try_into().unwrap()) as i64;
+        let wfd = i32::from_le_bytes(got[4..8].try_into().unwrap()) as i64;
+        assert_eq!((rfd, wfd), (3, 4), "read end below write end (Linux order)");
+
+        // write "hello" to the write end, then drain it from the read end.
+        assert_eq!(
+            st.write(&[wfd, 16, 5], Some(&mut mem)).unwrap(),
+            vec![5],
+            "pipe write"
+        );
+        assert_eq!(
+            st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
+            vec![5],
+            "pipe read count"
+        );
+        assert_eq!(
+            mem.read_bytes(64, 5).unwrap(),
+            b"hello",
+            "pipe delivered the bytes in order"
+        );
+        assert_eq!(
+            st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
+            vec![0],
+            "empty pipe reads 0 (EOF)"
+        );
+        // Reading a write end / writing a read end is -EBADF (wrong direction).
+        assert_eq!(
+            st.read(&[wfd, 64, 5], Some(&mut mem)).unwrap(),
+            vec![EBADF],
+            "read a write end is EBADF"
+        );
+        assert_eq!(
+            st.write(&[rfd, 16, 5], Some(&mut mem)).unwrap(),
+            vec![EBADF],
+            "write a read end is EBADF"
+        );
+        // A pipe is not seekable.
+        assert_eq!(
+            st.lseek(&[rfd, 0, SEEK_SET]),
+            ESPIPE,
+            "lseek on a pipe is ESPIPE"
+        );
+
+        // dup2(wfd, 8): fd 8 becomes a second write end sharing the same buffer.
+        assert_eq!(st.dup2(&[wfd, 8]), 8, "dup2 returns newfd");
+        assert_eq!(
+            st.write(&[8, 16, 5], Some(&mut mem)).unwrap(),
+            vec![5],
+            "write via the dup'd end"
+        );
+        assert_eq!(
+            st.read(&[rfd, 64, 5], Some(&mut mem)).unwrap(),
+            vec![5],
+            "the original read end sees it"
+        );
+        assert_eq!(
+            mem.read_bytes(64, 5).unwrap(),
+            b"hello",
+            "shared buffer, same bytes"
+        );
+        // dup2(fd, fd) is a no-op; dup2 of an unopened old fd is EBADF.
+        assert_eq!(st.dup2(&[wfd, wfd]), wfd, "dup2(fd, fd) is a no-op");
+        assert_eq!(st.dup2(&[99, 9]), EBADF, "dup2 of an unopened fd is EBADF");
+
+        // dup(rfd) → lowest free fd (5, since 3/4 and 8 are taken).
+        assert_eq!(st.dup(&[rfd]), 5, "dup takes the lowest free fd");
+        // F_DUPFD ≥ 10 → 10; a bad fd is EBADF; an unknown cmd is EINVAL.
+        assert_eq!(
+            st.fcntl(&[rfd, F_DUPFD, 10]),
+            10,
+            "F_DUPFD honours the floor"
+        );
+        assert_eq!(
+            st.fcntl(&[rfd, F_SETFD, 1]),
+            0,
+            "F_SETFD is an accepted no-op"
+        );
+        assert_eq!(
+            st.fcntl(&[99, F_DUPFD, 0]),
+            EBADF,
+            "fcntl on a bad fd is EBADF"
+        );
+        assert_eq!(
+            st.fcntl(&[rfd, 999, 0]),
+            EINVAL,
+            "unknown fcntl cmd is EINVAL"
+        );
+
+        // stdio fds are ordinary table entries: close(1) then write(1,…) is EBADF, and the next open
+        // reuses fd 1 (lowest free). Restoring via dup2 makes fd 1 a stdout sink again.
+        assert_eq!(st.close(&[1]), 0, "close(1) succeeds");
+        assert_eq!(
+            st.write(&[1, 16, 5], Some(&mut mem)).unwrap(),
+            vec![EBADF],
+            "write to a closed fd 1 is EBADF"
+        );
+        assert_eq!(st.close(&[1]), EBADF, "double close is EBADF");
     }
 
     /// func 0 `(handle) -> i64`: `getenv("PATH")` (name bytes staged at offset 0 by the harness), then

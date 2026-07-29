@@ -121,9 +121,14 @@ only to mark the boundary.
 | 18 | `argv(i, buf, cap)` | `-> len \| -errno` | host arg vector | **done** — NUL-terminated arg `i`; `-EINVAL`/`-ERANGE` |
 | 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 13 + `join` |
 | 20 | `exec_stdout()` | `-> stream` | host stdout `Stream` | **done** — the handle the shell re-grants to a child under the name `"stdout"` |
+| 21 | `exec_stdin(ptr, len)` | `-> stream` | host input-pipe `Stream` + FIFO | **done** — a filter command's `"stdin"`: pushes `[ptr,len)` into the FIFO, returns the read end |
+| 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell carves each spawn to match |
+| 23 | `pipe(fds_ptr)` | `-> 0 \| -errno` | host fd table + shared byte FIFO | **done** — stores `[read_fd, write_fd]` (`i32`×2); intra-personality, non-blocking (empty reads `0`) |
+| 24 | `dup2(oldfd, newfd)` | `-> newfd \| -errno` | host fd table | **done** — the redirect primitive; pipe ends share the buffer, a `File` copies its description |
+| 25 | `dup(oldfd)` | `-> fd \| -errno` | host fd table | **done** — clone onto the lowest free fd |
+| 26 | `fcntl(fd, cmd, arg)` | `-> res \| -errno` | host fd table | **done** — `F_DUPFD`/`F_DUPFD_CLOEXEC` (dup ≥ arg); `F_GET/SETFD`/`F_GET/SETFL` accepted no-ops |
 | — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
-| — | `pipe/dup/dup2/fcntl` | `-> fd \| -errno` | `Pipe` cap + host fd table | todo |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
 | — | `fork/execve/waitpid` | Stage 3 | `Instantiator` / clone (§7) | partial — spawn+wait landed as `Instantiator` op 13 + `join` (Stage 1, STAGE1.md; ops 19/20 above); `fork` itself parked |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
