@@ -105,6 +105,27 @@ pub const OP_SPAWN: u32 = 27;
 pub const OP_WAITPID: u32 = 28;
 pub const OP_WAIT: u32 = 29;
 
+/// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
+/// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
+/// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
+/// is exact for `trap`: a *caught* signal (a handler installed) is delivered; an *ignored* one is dropped;
+/// a *default*-disposition one is dropped in L0 (default actions — terminate a running loop — are L1/L2).
+///
+/// `signal(signum, handler) -> prev_handler | -errno`: record the disposition for `signum` (`SIG_DFL = 0`,
+/// `SIG_IGN = 1`, else a guest handler pointer), returning the previous. `kill(pid, sig) -> 0 | -errno`
+/// raises `sig` (sets its pending bit; `pid` is advisory in this single-process model — `raise(s)` is the
+/// guest one-liner `kill(0, s)`). `sigcheck(_) -> handler | 0`: the doorbell poll — clear and return the
+/// handler pointer of the lowest-numbered pending **caught** signal (skipping/dropping ignored and default
+/// ones), or `0` when none is deliverable, so the guest runtime runs `((void(*)(void))handler)()` at its
+/// safe point. The embedder raises an external signal (a terminal `^C`) via [`Posix::raise_signal`].
+pub const OP_SIGNAL: u32 = 30;
+pub const OP_KILL: u32 = 31;
+pub const OP_SIGCHECK: u32 = 32;
+
+/// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
+const SIG_DFL: i64 = 0;
+const SIG_IGN: i64 = 1;
+
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
 const ECHILD: i64 = -10; // waitpid on a pid that is not a live child
@@ -308,6 +329,12 @@ struct Inner {
     /// The next synthetic pid `spawn` hands out. Starts at `1000` (well clear of small fd/int values, so
     /// a pid is never confused with an fd in a test).
     next_pid: i32,
+    /// **Pending signals** — the L0 doorbell. Bit `s` set ⇒ signal `s` has been raised (`kill`/
+    /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`).
+    sig_pending: u64,
+    /// **Signal dispositions**: `signum → handler` (`SIG_DFL`/`SIG_IGN`/a guest handler pointer), set by
+    /// `signal`. Absent ⇒ `SIG_DFL`. `sigcheck` consults this to deliver caught signals and drop the rest.
+    sig_handler: HashMap<i32, i64>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -437,6 +464,19 @@ impl Posix {
             .unwrap_or_else(|e| e.into_inner())
             .spawn_fn = Some(Box::new(f));
     }
+
+    /// Raise a signal from the **embedder** — how a terminal `^C` (SIGINT) or a `kill(1)` reaches the
+    /// guest (the L0 doorbell's external door, the twin of the guest's own `kill` op). Sets the pending
+    /// bit; the guest delivers it at its next `sigcheck` poll if it has a handler installed. Out-of-range
+    /// `signum` (`< 1` or `> 63`) is ignored.
+    pub fn raise_signal(&self, signum: i32) {
+        if (1..=63).contains(&signum) {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sig_pending |= 1 << signum;
+        }
+    }
 }
 
 /// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
@@ -480,6 +520,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
+        "signal" => OP_SIGNAL,
+        "kill" => OP_KILL,
+        "sigcheck" => OP_SIGCHECK,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -547,6 +590,8 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         spawn_fn: None,
         children: HashMap::new(),
         next_pid: 1000,
+        sig_pending: 0,
+        sig_handler: HashMap::new(),
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -590,6 +635,9 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_SPAWN => st.spawn(args, mem),
             OP_WAITPID => st.waitpid(args, mem),
             OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
+            OP_SIGNAL => Ok(vec![st.signal(args)]),
+            OP_KILL => Ok(vec![st.kill(args)]),
+            OP_SIGCHECK => Ok(vec![st.sigcheck()]),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -969,6 +1017,52 @@ impl Inner {
                 .ok_or(Trap::Malformed)?;
         }
         Ok(vec![p as i64])
+    }
+
+    /// `signal(signum, handler) -> prev_handler | -errno`: record `signum`'s disposition (`SIG_DFL`/
+    /// `SIG_IGN`/a guest handler pointer) and return the previous (`SIG_DFL` if never set). Out-of-range
+    /// `signum` is `-EINVAL`.
+    fn signal(&mut self, args: &[i64]) -> i64 {
+        let signum = *args.first().unwrap_or(&0);
+        let handler = *args.get(1).unwrap_or(&SIG_DFL);
+        if !(1..=63).contains(&signum) {
+            return EINVAL;
+        }
+        self.sig_handler
+            .insert(signum as i32, handler)
+            .unwrap_or(SIG_DFL)
+    }
+
+    /// `kill(pid, sig) -> 0 | -errno`: raise `sig` (set its pending bit). `pid` is advisory in this
+    /// single-process doorbell (`raise(s)` is the guest `kill(0, s)`). Out-of-range `sig` is `-EINVAL`;
+    /// `sig == 0` (the POSIX existence probe) is a `0` no-op.
+    fn kill(&mut self, args: &[i64]) -> i64 {
+        let sig = *args.get(1).unwrap_or(&0);
+        if sig == 0 {
+            return 0; // kill(pid, 0): liveness probe — the (single) process exists
+        }
+        if !(1..=63).contains(&sig) {
+            return EINVAL;
+        }
+        self.sig_pending |= 1 << sig;
+        0
+    }
+
+    /// `sigcheck(_) -> handler | 0`: the L0 doorbell poll. Clear and return the handler pointer of the
+    /// lowest-numbered pending **caught** signal (`handler > SIG_IGN`); pending **ignored** (`SIG_IGN`) and
+    /// **default** (`SIG_DFL`) signals are cleared and skipped (L0 does not deliver default actions). `0`
+    /// when nothing is deliverable — so the guest runs `((void(*)(void))handler)()` at its safe point.
+    fn sigcheck(&mut self) -> i64 {
+        while self.sig_pending != 0 {
+            let s = self.sig_pending.trailing_zeros() as i32;
+            self.sig_pending &= !(1u64 << s);
+            let handler = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            if handler > SIG_IGN {
+                return handler;
+            }
+            // SIG_DFL / SIG_IGN: dropped in L0, keep scanning for a caught one.
+        }
+        0
     }
 
     /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
@@ -2136,6 +2230,105 @@ block 0 (vph: i32) {\n\
             "jit: child stdout followed the dup2 into the file"
         );
         assert_eq!(jposix.stdout(), b"", "jit: nothing leaked to real stdout");
+    }
+
+    #[test]
+    fn signal_kill_sigcheck_l0_doorbell() {
+        // Host-level unit for the L0 signal doorbell (slice 3): install dispositions, raise (guest `kill`
+        // and embedder `raise_signal`), and poll — caught signals deliver their handler once, ignored and
+        // default ones are dropped, lowest number first.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut st = posix.inner.lock().unwrap();
+
+        assert_eq!(st.sigcheck(), 0, "nothing pending");
+        // Install then re-install a caught handler for SIGINT(2); `signal` returns the previous.
+        assert_eq!(
+            st.signal(&[2, 0xABCD]),
+            SIG_DFL,
+            "first signal returns SIG_DFL"
+        );
+        assert_eq!(
+            st.signal(&[2, 0x1234]),
+            0xABCD,
+            "signal returns the prior handler"
+        );
+        // Raise (guest kill), poll delivers the handler once, then it's cleared.
+        assert_eq!(st.kill(&[0, 2]), 0, "kill raises");
+        assert_eq!(
+            st.sigcheck(),
+            0x1234,
+            "sigcheck delivers the caught handler"
+        );
+        assert_eq!(st.sigcheck(), 0, "delivered once, then cleared");
+
+        // An ignored signal is raised but dropped, never delivered.
+        assert_eq!(st.signal(&[15, SIG_IGN]), SIG_DFL, "SIGTERM set to SIG_IGN");
+        st.kill(&[0, 15]);
+        assert_eq!(st.sigcheck(), 0, "ignored signal is dropped");
+        // A default-disposition signal (never `signal`'d) is likewise dropped in L0.
+        st.kill(&[0, 3]);
+        assert_eq!(st.sigcheck(), 0, "default-disposition signal dropped in L0");
+
+        // Lowest-numbered caught signal delivers first.
+        st.signal(&[10, 0xAA]);
+        st.signal(&[7, 0xBB]);
+        st.kill(&[0, 10]);
+        st.kill(&[0, 7]);
+        assert_eq!(st.sigcheck(), 0xBB, "signal 7 before signal 10");
+        assert_eq!(st.sigcheck(), 0xAA, "then signal 10");
+        assert_eq!(st.sigcheck(), 0, "drained");
+
+        // Range / probe edges.
+        assert_eq!(st.signal(&[0, 5]), EINVAL, "signum 0 is EINVAL");
+        assert_eq!(st.signal(&[64, 5]), EINVAL, "signum 64 out of range");
+        assert_eq!(st.kill(&[0, 0]), 0, "kill(pid, 0) is a liveness no-op");
+        assert_eq!(
+            st.kill(&[0, 99]),
+            EINVAL,
+            "kill with a bad signal is EINVAL"
+        );
+        assert_eq!(st.sigcheck(), 0, "the probe/edge calls raised nothing");
+
+        // The embedder's door (a terminal ^C) reaches the still-installed SIGINT handler.
+        drop(st);
+        posix.raise_signal(2);
+        let mut st = posix.inner.lock().unwrap();
+        assert_eq!(
+            st.sigcheck(),
+            0x1234,
+            "raise_signal delivers to the caught handler"
+        );
+    }
+
+    // func 0 `(handle) -> i64`: `signal(SIGINT=2, 999)` (a caught handler), `kill(0, 2)` (raise), then
+    // `sigcheck(_)` — which must return the installed handler `999`. Ops: signal=30, kill=31, sigcheck=32.
+    const SIG_DOORBELL: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vph: i32) {\n\
+  vsig = i64.const 2\n\
+  vh = i64.const 999\n\
+  vprev = cap.call 13 30 (i64, i64) -> (i64) vph (vsig, vh)\n\
+  vz = i64.const 0\n\
+  vk = cap.call 13 31 (i64, i64) -> (i64) vph (vz, vsig)\n\
+  vc = cap.call 13 32 (i64) -> (i64) vph (vz)\n\
+  return vc\n\
+  }\n\
+}\n";
+
+    #[test]
+    fn signal_doorbell_round_trips_on_both_backends() {
+        let (ir, _) = run_interp(SIG_DOORBELL, b"");
+        let (jo, _) = run_jit(SIG_DOORBELL, b"");
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(999)]),
+            "interp: signal→kill→sigcheck delivers the installed handler"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[999]),
+            "jit: doorbell must match interp, got {jo:?}"
+        );
     }
 
     /// func 0 `(handle) -> i64`: `getenv("PATH")` (name bytes staged at offset 0 by the harness), then

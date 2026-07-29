@@ -130,8 +130,11 @@ only to mark the boundary.
 | 27 | `spawn(name, nlen, argv, alen)` | `-> pid \| -errno` | embedder spawn delegate (`set_spawn`) | **done** — fork-free child; inherits fd 0/1 (drains stdin, routes stdout); `-ENOSYS` unwired. `posix_spawn(p)` bind here |
 | 28 | `waitpid(pid, status, opts)` | `-> pid \| -errno` | host child table | **done** — reaps `pid` (or `-1` = any); writes wait-encoded status (`WEXITSTATUS` in bits 8–15); `-ECHILD` unknown |
 | 29 | `wait(status)` | `-> pid \| -errno` | host child table | **done** — `waitpid(-1, status, 0)` |
+| 30 | `signal(signum, handler)` | `-> prev \| -errno` | host signal state | **done (L0)** — records disposition (`SIG_DFL`/`SIG_IGN`/handler ptr); returns previous |
+| 31 | `kill(pid, sig)` | `-> 0 \| -errno` | host signal state | **done (L0)** — sets the pending bit (`raise(s)` = `kill(0,s)`); `sig 0` = liveness no-op |
+| 32 | `sigcheck(_)` | `-> handler \| 0` | host signal state | **done (L0)** — doorbell poll: clears+returns the next pending **caught** handler; ignored/default dropped |
 | — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
-| — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
+| — | `sigaction` + default actions | doorbell (§9 L1/L2) | host signal state | **partial** — `signal`/`kill`/`sigcheck` (ops 30–32) are the L0 doorbell (exact for `trap`); async interrupt of a running loop + default actions are L1/L2, parked |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
 | — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
