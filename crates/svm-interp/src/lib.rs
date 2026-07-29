@@ -10120,6 +10120,7 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::CallSym { .. }
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop

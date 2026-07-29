@@ -386,3 +386,101 @@ fn static_global_stays_internal() {
         "static secret must stay internal: {names:?}"
     );
 }
+
+/// **Run a linked multi-TU program through `_start` under the powerbox** — the slice this suite was
+/// building toward. The entry unit's `main` reads a global defined in another unit, and its own
+/// stack frame (an address-taken local array) must sit **above every unit's data**. A whole-program
+/// build bakes the data-SP as `i64.const data_end` (this unit's own top), but after linking the
+/// provider's data is stacked *above* the entry unit — so that baked SP would drop `main`'s frame
+/// on top of `provider`'s `base_val`. `--emit-object` instead emits `data.top`, which the linker
+/// resolves to the post-link top of all data; the frame clears everything and the read is correct.
+#[test]
+fn links_and_runs_under_powerbox() {
+    use svm_run::{instantiate, Outcome, RunConfig, Value};
+
+    // main sums a stack array (0²+1²+…+7² = 140) and adds a cross-TU global (1234) → 1374. The
+    // array is address-taken, so it lives on the data stack at the `_start` SP; a wrong SP (inside
+    // the provider's data) would corrupt `base_val` and change the result.
+    let main_unit = object_unit(
+        "pbmain",
+        "extern int base_val;\n\
+         int main(void) {\n\
+         \x20 int a[8];\n\
+         \x20 for (int i = 0; i < 8; i++) a[i] = i * i;\n\
+         \x20 int s = 0;\n\
+         \x20 for (int i = 0; i < 8; i++) s += a[i];\n\
+         \x20 return s + base_val;\n\
+         }\n",
+    );
+    let provider = object_unit("pbprov", "int base_val = 1234;\n");
+
+    // The entry unit is linked **first** so its `_start` is merged function 0 (the powerbox entry).
+    let linked = link(&[main_unit, provider]).expect("link entry + provider");
+    svm_verify::verify_module(&linked).expect("verify linked powerbox program");
+
+    // Sanity: the `data.top` SP really is above the entry unit's own data — i.e. the provider's data
+    // was stacked on top, so a baked `data_end` SP would have collided. `powerbox_entry_sp` is the
+    // value the linker rewrote `data.top` to.
+    let sp = svm_ir::powerbox_entry_sp(&linked);
+    let data_top = linked
+        .data
+        .iter()
+        .map(|d| d.offset + d.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    assert!(sp >= data_top, "data-stack base clears all data");
+
+    // Runs identically on the tree-walk oracle and the JIT (§18), and returns main's 1374.
+    let inst = instantiate(linked).expect("instantiate");
+    let run = inst.run_diff(&RunConfig::default()).expect("run _start");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(1374)]));
+}
+
+/// The **argv path** through a linked `_start`: `main(int, char**)` builds its `argv[]` array at the
+/// data-stack base (`data.top` in emit-object mode — the blocks that a wrong SP would scribble over
+/// the linked data). Here `main` writes a cross-TU greeting to `stdout` `argc` times, proving the
+/// argv scaffold, a cross-TU data read, and a powerbox cap (`write`) all compose in one linked run.
+#[test]
+fn links_and_runs_under_powerbox_with_argv() {
+    use svm_run::{instantiate, Backend, Outcome, RunConfig, Value};
+
+    let main_unit = object_unit(
+        "avmain",
+        "extern char *msg;\n\
+         extern long msglen;\n\
+         int write(int fd, void *buf, unsigned long n);\n\
+         int main(int argc, char **argv) {\n\
+         \x20 (void)argv;\n\
+         \x20 for (int i = 0; i < argc; i++) write(1, msg, msglen);\n\
+         \x20 return argc;\n\
+         }\n",
+    );
+    let provider = object_unit(
+        "avprov",
+        "char *msg = \"hi\\n\";\n\
+         long msglen = 3;\n",
+    );
+
+    // `write` is a powerbox capability, not a cross-TU function: no unit defines it, so it lowers to
+    // a `call.sym "write"` the *host* binds to the stdout stream at instantiation. `link_with_manifest`
+    // retains such unresolved names as a merged import manifest (vs plain `link`, which fails closed).
+    let linked = svm_ir::link_with_manifest(&[main_unit, provider]).expect("link argv entry + provider");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert!(
+        linked.imports.iter().any(|i| i.name == "write"),
+        "write retained as a host-bound manifest import: {:?}",
+        linked.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+
+    // Two argv entries → the loop runs twice → "hi\n" twice; `main` returns argc (2).
+    let cfg = RunConfig {
+        args: vec![b"prog".to_vec(), b"x".to_vec()],
+        ..RunConfig::default()
+    };
+    let inst = instantiate(linked).expect("instantiate");
+    let run = inst
+        .run_with_caps(Backend::TreeWalk, &cfg, &[])
+        .expect("run _start with argv");
+    assert_eq!(run.stdout, b"hi\nhi\n", "wrote the cross-TU msg argc times");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(2)]));
+}

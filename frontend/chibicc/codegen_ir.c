@@ -2786,6 +2786,19 @@ static unsigned scan_prog_caps(Obj *prog) {
 // placed by module-level `data` segments (§3a, see `emit_data_segments`), not written here. The
 // runtime grants the fixed powerbox and invokes this with **no** arguments (§7 name binding).
 // `cap_mask` (from `scan_prog_caps`) selects which caps to resolve — only the ones the program uses.
+// Emit the program's **data-stack base** into value `vn` — where `_start` builds the argv array and
+// cap-name scratch, and `main`'s initial data-SP. Whole-program (`--emit-ir`): the fixed `data_end`
+// (this module's top-of-data). Separate compilation (`--emit-object`): `data.top`, the link form the
+// linker rewrites to the post-link top of *all* units' data — this unit's own `data_end` is only its
+// own top, but the linker stacks every unit's data into one window and the stack must clear all of
+// it. A single-value producer either way, so it drops into `_start`'s hand-numbered blocks 1:1.
+static void emit_data_base_at(int vn) {
+  if (opt_emit_object)
+    cg("  v%d = data.top\n", vn);
+  else
+    cg("  v%d = i64.const %d\n", vn, data_end);
+}
+
 static void emit_start(Obj *main_fn, unsigned cap_mask) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
@@ -2829,13 +2842,26 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     int len = (int)strlen(nm);
     for (int k = 0; k < len; k++) {
       int vp = nv++;
-      cg("  v%d = i64.const %d\n", vp, data_end + k);
+      // The scratch cell base + k. `data.top` (emit-object) is only a base, so add `k`; the
+      // whole-program `data_end + k` folds it into the constant.
+      if (opt_emit_object) {
+        cg("  v%d = data.top\n", vp);
+        if (k) {
+          int vk = nv++;
+          cg("  v%d = i64.const %d\n", vk, k);
+          int vs = nv++;
+          cg("  v%d = i64.add v%d v%d\n", vs, vp, vk);
+          vp = vs;
+        }
+      } else {
+        cg("  v%d = i64.const %d\n", vp, data_end + k);
+      }
       int vc = nv++;
       cg("  v%d = i32.const %d\n", vc, (unsigned char)nm[k]);
       cg("  i32.store8 v%d v%d\n", vp, vc);
     }
     int vptr = nv++;
-    cg("  v%d = i64.const %d\n", vptr, data_end);
+    emit_data_base_at(vptr);
     int vlen = nv++;
     cg("  v%d = i64.const %d\n", vlen, len);
     int vh = nv++;
@@ -2873,7 +2899,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  }\n");
     // body: argv[i] = p, then scan p to the byte past its NUL.
     cg("block 2 (v0: i64, v1: i64, v2: i64) {\n");
-    cg("  v3 = i64.const %d\n", data_end);
+    emit_data_base_at(3); // v3 = argv[] base (data-stack base)
     cg("  v4 = i64.const 8\n");
     cg("  v5 = i64.mul v1 v4\n");
     cg("  v6 = i64.add v3 v5\n");
@@ -2896,7 +2922,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  }\n");
     // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
     cg("block 5 (v0: i64) {\n");
-    cg("  v1 = i64.const %d\n", data_end);
+    emit_data_base_at(1); // v1 = argv[] base (data-stack base)
     cg("  v2 = i64.const 8\n");
     cg("  v3 = i64.mul v0 v2\n");
     cg("  v4 = i64.add v1 v3\n");
@@ -2935,7 +2961,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   }
 
   int sp = nv++;
-  cg("  v%d = i64.const %d\n", sp, data_end);
+  emit_data_base_at(sp);
   // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
   // pointer; main never reads it, so any in-window pointer (the sp) does.
   char va[24] = "";

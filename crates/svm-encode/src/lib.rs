@@ -618,8 +618,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
         // (`--emit-ir` units) that `link` rewrites to `ConstI64` before a module is finalized, so a
         // module reaching the binary encoder (a linked/runnable module) never carries one. Encoding
         // one is a producer bug, not untrusted input — the "never panic" discipline governs *decode*.
-        Inst::DataSym { .. } | Inst::DataSelf { .. } => {
-            unreachable!("data.sym/data.self are link-form; resolve via link before encoding")
+        Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => {
+            unreachable!(
+                "data.sym/data.self/data.top are link-form; resolve via link before encoding"
+            )
         }
         // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
         // self-describing sig, runtime handle operand, args.

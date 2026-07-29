@@ -233,7 +233,7 @@ fn check_inst(
         Inst::ConstF32(_) => vec![V::F32],
         Inst::ConstF64(_) => vec![V::F64],
         // Link-form data addresses append their resolved-to `i64`; immediates only, no operands.
-        Inst::DataSym { .. } | Inst::DataSelf { .. } => vec![V::I64],
+        Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => vec![V::I64],
         Inst::IntBin { ty, a, b, .. } => {
             w(*a, ty.val())?;
             w(*b, ty.val())?;

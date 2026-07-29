@@ -703,6 +703,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CallSym { .. }
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
