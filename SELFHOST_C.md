@@ -400,14 +400,36 @@ compiler bug is a clean error, never an escape.
    (`svm-ir::link_impl`; regression `svm-ir::link_layout_tests`). Same class as the Doom read-only-page
    fault, now for stacked link units.
 
-   **Remaining for increment 2 (make the *real* ~9 cc1 TUs compile + run).** The clang-tuned aggregator
-   does **not** compile under emit-object; gaps found: (i) `tokenize.c`'s `strtoul` reads as implicitly
-   declared — glibc 2.38+ redirects it to `__isoc23_strtoul` via `__REDIRECT_NTH` (an `__asm__`-rename
-   macro chibicc's parser doesn't follow), so a self-host prelude decl or a feature-macro that avoids
-   the ISO C23 redirect is needed; (ii) `chibicc_extra.c`'s `free` redefines a `free` chibicc's headers
-   already supply (the aggregator assumed clang's headers); (iii) float formatting needs `__vm_fmt_*`
-   (on-ramp-synthesized today) or a guest dtoa. Increment 1's `mini_libc.c` is the seed to grow into
-   this real emit-object libc.
+   **→ Emit-object increment 2a DONE 2026-07-29 — all ~9 cc1 TUs compile + link + verify.** The whole
+   `-cc1` slice (eight upstream TUs + the `cc1_main.c` entry) compiles under `--emit-object` and links
+   into one **verified** module (`c_link.rs::all_cc1_tus_compile_link_and_verify_under_emit_object`).
+   Two things unblocked it:
+   - **`selfhost_prelude.h`** (`-include`d) closes chibicc's own parser gap against modern glibc: when
+     the compiler doesn't define glibc's `__REDIRECT`, `<stdlib.h>` takes its ISO C23 branch that
+     declares `__isoc23_strtoul`/… behind attribute forms chibicc doesn't resolve and then
+     `#define strtoul __isoc23_strtoul`, so `strtoul`/`strtol`/`atoi`/`strtold`/… land *implicitly
+     declared* (fatal). The prelude force-includes plain prototypes. (The on-ramp never hit this —
+     clang defines `__REDIRECT`.) Also fixed the harness's `-I`: chibicc reads `-I<dir>` **joined**
+     (`argv+2`), so a spaced `-I dir` was a silent no-op masked by sibling resolution.
+   - **The only unresolved *data* symbols across the whole cc1 are `stdin`/`stdout`/`stderr`** — a
+     cross-TU data reference must resolve to a concrete address (it can't be a manifest import like a
+     function), so the linker fails closed on them until the libc's stdio globals exist; a stub unit
+     defining the three lets the whole cc1 link. Every `ty_*`/`opt_*`/`include_paths`/`base_file`
+     resolves cross-TU. All remaining unbound names are the libc **function** surface + host caps —
+     the exact increment-2b target: `fopen`/`fwrite`/`vfprintf`/`snprintf`/the `str`/`mem` family/
+     `open_memstream`/`__ctype_b_loc`/… as guest C over the powerbox syscall + memory caps
+     (`write`/`read`/`open`/`close`/`exit`/`stat`/`vm_map`). Note the **heap allocator is *not* on that
+     list**: chibicc's emit-object synthesizes `malloc`/`calloc`/`free` **inline** (a bump heap that
+     grows the window via the `vm_map`/`vm_page_size` builtins), so the libc need not provide them —
+     a real simplification vs the clang-tuned aggregator.
+
+   **Remaining for increment 2b (make the linked cc1 *run*).** Supply that function surface as an
+   emit-object-compilable libc that defines real `stdin`/`stdout`/`stderr` (fd-backed + `open_memstream`
+   memory streams), then link it with the nine TUs and run a `.c → SVM IR` compile through `_start` on
+   interp==JIT under the fs-powerbox. The clang-tuned aggregator (`chibicc_libc.c`) does **not** compile
+   under emit-object as-is (e.g. `chibicc_extra.c`'s `free` redefines chibicc's own; float formatting
+   wants `__vm_fmt_*` or a guest dtoa) — increment 1's `mini_libc.c` + the enumerated surface above are
+   the seed and spec to grow the real one. Then (c) the **bootstrap-fixpoint** differential (§5 E).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

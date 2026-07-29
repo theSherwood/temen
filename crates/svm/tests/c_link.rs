@@ -58,42 +58,48 @@ fn chibicc() -> &'static Path {
     .as_path()
 }
 
-/// Compile one of chibicc's **own** upstream source files (`frontend/chibicc/<name>`) to a linkable
-/// unit — `-I frontend/chibicc` for `chibicc.h`. Same pipeline as [`object_unit`], but on real
-/// self-host source rather than a crafted string, so the tests exercise the actual shared globals
-/// (`ty_int`, …) and cross-TU call graph the compiler is written with.
-///
-/// **Linux-only** (like `svm-llvm` and the self-host build scripts): `chibicc.h` pulls system headers
-/// (`<assert.h>`, `<stdio.h>`, …) and chibicc's default include search path is Linux-hardcoded
-/// (`/usr/include/x86_64-linux-gnu`, main.c) — macOS/Windows runners have no such path, so compiling
-/// chibicc's own source is a Linux operation here. The crafted-string tests carry no `#include` and
-/// stay cross-platform.
+/// The self-host demo directory (`cc1_main.c`, the emit-object libc, and the self-host prelude).
 #[cfg(target_os = "linux")]
-fn object_unit_real(name: &str) -> LinkUnit {
-    let src_dir = repo_root().join("frontend/chibicc");
-    let cfile = src_dir.join(name);
+fn selfhost_dir() -> PathBuf {
+    repo_root().join("crates/svm-run/demos/chibicc_selfhost")
+}
+
+/// Compile one real self-host `.c` file to a linkable unit via `--emit-object`, force-including the
+/// self-host prelude (`selfhost_prelude.h`) that closes chibicc's own parser gaps against modern
+/// glibc's `<stdlib.h>` (the `strtoul`/`atoi`/… implicit-declaration wall — see the prelude header).
+/// `include_dirs` are passed as chibicc's **joined** `-I<dir>` form (its parser reads `argv+2`, so a
+/// spaced `-I dir` is a no-op — a real cc1 TU that isn't a sibling of `chibicc.h` needs this).
+#[cfg(target_os = "linux")]
+fn emit_object_real(cfile: &Path, include_dirs: &[PathBuf], tag: &str) -> LinkUnit {
     let irfile = std::env::temp_dir().join(format!(
         "svm_clink_real_{}_{}.svm",
-        name.replace(['.', '/'], "_"),
+        tag.replace(['.', '/'], "_"),
         std::process::id()
     ));
+    let prelude = selfhost_dir().join("selfhost_prelude.h");
+    let mut args: Vec<String> = vec![
+        "-cc1".into(),
+        "-include".into(),
+        prelude.to_str().unwrap().into(),
+    ];
+    for dir in include_dirs {
+        args.push(format!("-I{}", dir.to_str().unwrap())); // joined form — chibicc reads argv+2
+    }
+    args.extend([
+        "--emit-object".into(),
+        "-cc1-input".into(),
+        cfile.to_str().unwrap().into(),
+        "-cc1-output".into(),
+        irfile.to_str().unwrap().into(),
+        cfile.to_str().unwrap().into(),
+    ]);
     let status = Command::new(chibicc())
-        .args([
-            "-cc1",
-            "-I",
-            src_dir.to_str().unwrap(),
-            "--emit-object",
-            "-cc1-input",
-            cfile.to_str().unwrap(),
-            "-cc1-output",
-            irfile.to_str().unwrap(),
-            cfile.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()
         .expect("run chibicc");
-    assert!(status.success(), "chibicc --emit-object failed on {name}");
+    assert!(status.success(), "chibicc --emit-object failed on {tag}");
     let ir = std::fs::read_to_string(&irfile).unwrap();
-    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse {tag}: {e:?}"));
     let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
     let data_exports = m
         .data_exports
@@ -105,6 +111,33 @@ fn object_unit_real(name: &str) -> LinkUnit {
         exports,
         data_exports,
     }
+}
+
+/// Compile one of chibicc's **own** upstream source files (`frontend/chibicc/<name>`) to a linkable
+/// unit, on real self-host source rather than a crafted string, so the tests exercise the actual
+/// shared globals (`ty_int`, …) and cross-TU call graph the compiler is written with.
+///
+/// **Linux-only** (like `svm-llvm` and the self-host build scripts): `chibicc.h` pulls system headers
+/// (`<assert.h>`, `<stdio.h>`, …) and chibicc's default include search path is Linux-hardcoded
+/// (`/usr/include/x86_64-linux-gnu`, main.c) — macOS/Windows runners have no such path, so compiling
+/// chibicc's own source is a Linux operation here. The crafted-string tests carry no `#include` and
+/// stay cross-platform.
+#[cfg(target_os = "linux")]
+fn object_unit_real(name: &str) -> LinkUnit {
+    let src_dir = repo_root().join("frontend/chibicc");
+    let cfile = src_dir.join(name);
+    emit_object_real(&cfile, &[src_dir.clone()], name)
+}
+
+/// Compile the cc1 **entry** TU — `crates/svm-run/demos/chibicc_selfhost/cc1_main.c`, which replaces
+/// `main.c` for the `-cc1` slice (defines `main` + the globals `main.c` owned, drives
+/// tokenize→preprocess→parse→codegen_ir). It lives outside `frontend/chibicc`, so it needs both the
+/// chibicc source dir (for `chibicc.h`) and its own dir on the include path.
+#[cfg(target_os = "linux")]
+fn object_unit_cc1_entry() -> LinkUnit {
+    let src_dir = repo_root().join("frontend/chibicc");
+    let cfile = selfhost_dir().join("cc1_main.c");
+    emit_object_real(&cfile, &[src_dir, selfhost_dir()], "cc1_main.c")
 }
 
 /// Compile one C source string to a **linkable unit** (`--emit-object`) and parse it, turning the
@@ -689,6 +722,86 @@ fn links_multiple_real_chibicc_tus() {
         assert!(
             !imp.name.is_empty(),
             "retained manifest import has a name (host-bound libc)"
+        );
+    }
+}
+
+/// **All ~9 cc1 translation units compile, link, and verify under `--emit-object`** (task #20,
+/// increment 2a). The whole `-cc1` slice — the eight upstream TUs (`tokenize`, `preprocess`, `parse`,
+/// `type`, `codegen_ir`, `hashmap`, `unicode`, `strings`) plus the `cc1_main.c` entry that replaces
+/// `main.c` — each compiled separately by chibicc itself and linked into one module. This is the
+/// compile-and-link half of "chibicc compiles its own source": every cross-TU function and data symbol
+/// resolves, and only libc names survive as host-bound manifest imports (the increment-2b runtime).
+///
+/// Getting here needed the self-host prelude (`selfhost_prelude.h`): modern glibc's `<stdlib.h>` hides
+/// `strtoul`/`atoi`/`strtold`/… behind ISO C23 `__isoc23_*` redirect + attribute forms chibicc's own
+/// parser doesn't resolve, so those calls were implicitly declared (a hard error) — the prelude
+/// force-includes plain prototypes. (The LLVM on-ramp never hit this: clang parses the redirects.)
+///
+/// Linux-only, like the other real-source tests (chibicc's system-header path).
+#[cfg(target_os = "linux")]
+#[test]
+fn all_cc1_tus_compile_link_and_verify_under_emit_object() {
+    // Entry unit first, so its `main`-derived `_start` is merged function 0 (the powerbox entry the
+    // increment-2b run will use); the order is otherwise immaterial to linking.
+    let mut units = vec![object_unit_cc1_entry()];
+    for tu in [
+        "tokenize.c",
+        "preprocess.c",
+        "parse.c",
+        "type.c",
+        "codegen_ir.c",
+        "hashmap.c",
+        "unicode.c",
+        "strings.c",
+    ] {
+        units.push(object_unit_real(tu));
+    }
+    // The three stdio streams are the *only* data symbols no cc1 TU defines (they belong to the libc's
+    // stdio) — and a cross-TU **data** reference must resolve to a concrete address, so unlike a libc
+    // *function* it can't be left as a manifest import. A minimal unit defines them, standing in for
+    // the increment-2b libc's stdio globals; with it, the whole cc1 links. (Verified: `stdin`/`stdout`/
+    // `stderr` are the complete unresolved-data set — every `ty_*`/`opt_*`/`include_paths`/`base_file`
+    // resolves cross-TU.)
+    units.push(object_unit(
+        "stdio_globals",
+        "void *stdin;\nvoid *stdout;\nvoid *stderr;\n",
+    ));
+
+    let linked = svm_ir::link_with_manifest(&units).expect("link all cc1 TUs");
+    svm_verify::verify_module(&linked).expect("verify the whole linked cc1");
+
+    // The entry unit contributes a `_start` powerbox entry at function 0 (its `main` wrapped by the
+    // emit-object `_start` that carries `data.top`), so the linked module is a runnable shape.
+    assert!(
+        linked
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0),
+        "cc1_main's _start is merged function 0: {:?}",
+        linked
+            .exports
+            .iter()
+            .map(|e| (&e.name, e.func))
+            .collect::<Vec<_>>()
+    );
+    // The shared `Type *` globals from type.c survived cross-TU into the merged data exports.
+    assert!(
+        linked.data_exports.iter().any(|e| e.name == "ty_int"),
+        "ty_int present in the linked cc1's data exports"
+    );
+    // Everything left unresolved is host-bound libc (a manifest), never a dangling cross-TU symbol.
+    // This is exactly the surface the increment-2b emit-object libc must supply: the stdio + string
+    // helpers as guest C (`fopen`/`vfprintf`/`strlen`/…) over the powerbox syscall + memory caps
+    // (`exit`/`vm_map`; the heap allocator itself chibicc synthesizes inline via `vm_map`).
+    let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
+    for name in &imports {
+        assert!(!name.is_empty(), "retained manifest import has a name");
+    }
+    for expected in ["fopen", "vfprintf", "strlen", "exit", "vm_map"] {
+        assert!(
+            imports.contains(&expected),
+            "libc/cap `{expected}` retained as a manifest import (increment-2b target); imports: {imports:?}"
         );
     }
 }
