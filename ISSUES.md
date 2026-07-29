@@ -1460,10 +1460,16 @@ when nothing else in the domain is runnable.
    Pinned by `svm-interp/tests/svc_serve_chain.rs` (root → C1.fwd → C2.leaf(7) → 107; hung before,
    passes in 0.00s after).
 
-3. **STILL OPEN — the nested re-link generalization.** With the deadlock fixed, the `(holder task,
-   join slot)` re-link generalization (root-only → every holder, so C1's durable cap onto C2 re-links
-   on thaw) can be re-landed behind a now-non-hanging end-to-end pin. Held back only pending that
-   re-add + test. Also from the same 4d note: the wire/child-regrant **sibling-provenance** name.
+3. **FIXED — the nested re-link generalization.** With the deadlock gone, the thaw re-link was
+   generalized from root-only to **every holder**, keyed by the `(holder task, join slot)` edge
+   (root-direct children key on `(id, slot)`, a grandchild on `(its parent-child cid, slot)`), so a
+   child C1's durable cap onto a grandchild C2 re-links on thaw. Pinned end to end by
+   `svm-durable/tests/serve.rs::a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked`:
+   freeze the three-level cap-holding subtree, thaw, seed a dispatch into the root's queue, and the
+   root drives `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails
+   with `-11`/`EAGAIN` if the nested edge is not re-linked; the test also confirms the serve chain
+   no longer hangs). Remaining from the same 4d note: the wire/child-regrant **sibling-provenance**
+   durable name (a live cap with no §14 child behind it).
 
 ---
 

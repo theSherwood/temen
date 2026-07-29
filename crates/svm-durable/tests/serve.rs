@@ -607,3 +607,164 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
         "the re-frozen grandchild is still attributed to C1, not the root"
     );
 }
+
+/// §13.4 slice 4d follow-up — the **nested holder** end to end. A *child* C1 holds a live
+/// `child_offer` cap onto a *grandchild* C2 (not the root onto a direct child). All three idle in
+/// `svc.wait` at freeze: root holds a cap onto C1's **fwd** export (export 1 → func 3); C1 holds a
+/// cap onto C2's **leaf** export (export 0 → func 1), stashed at `mem[65608]`. Freeze-on-quiesce
+/// captures the subtree; C1's `LiveImpl` onto C2 rides its `FrozenChildState` as a durable handle.
+/// On thaw the runtime re-creates C1 + C2 and re-links **C1's** placeholder to the re-created C2 by
+/// the `(C1 task, C2 slot)` edge — the generalization the root-only re-link did not cover. A
+/// dispatch seeded into the **root's** queue then drives `fwd(7)` through the root's cap onto C1;
+/// C1's handler loads its re-linked cap and forwards `leaf(7)` to C2, which returns `7 + 100`. The
+/// chained reply `107` is observable only if the nested re-link succeeded and the serve chain (I49)
+/// threads the reply back C2 → C1's handler → root.
+///
+/// Fixture notes: child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it
+/// to scratch and reloads the low word with `i32.load` for the `i32` instantiator handle (the
+/// durable transform types loads/stores but not width conversions). Scratch sits above the 64 KiB
+/// `DURABLE_RESERVE`, below each child's own sub-carve.
+const SRC_NESTED_HOLDER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { call: 0 }
+export 0 interface "leaf" 1 { call: 1 }
+export 1 interface "fwd" 1 { call: 3 }
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ventry = i64.const 2
+  voff = i64.const 262144
+  vsl = i64.const 18
+  vq = i64.const 0
+  vc1 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)
+  vexp = i64.const 1
+  vh1 = cap.call 6 14 (i32, i64) -> (i32) v0 (vc1, vexp)
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  varg = i64.const 7
+  vr = cap.call 268435456 0 (i64) -> (i64) vh1 (varg)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v1 = i64.const 100
+  vr = i64.add vx v1
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 65600
+  i64.store vk v0
+  vh = i32.load vk
+  ventry = i64.const 4
+  voff = i64.const 131072
+  vsl = i64.const 17
+  vq = i64.const 0
+  vc2 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
+  vexp = i64.const 0
+  vh2 = cap.call 6 14 (i32, i64) -> (i32) vh (vc2, vexp)
+  vk2 = i64.const 65608
+  i32.store vk2 vh2
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vk2 = i64.const 65608
+  vh2 = i32.load vk2
+  vr = cap.call 268435456 0 (i64) -> (i64) vh2 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+"#;
+
+#[test]
+fn a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked() {
+    use svm_durable::{arm_freeze_on_quiesce, begin_thaw};
+
+    const P_LOG2: u8 = 19;
+    const P_WINDOW: usize = 1 << P_LOG2;
+
+    let mut m = svm_text::parse_module(SRC_NESTED_HOLDER).expect("parse");
+    m.memory = Some(Memory { size_log2: P_LOG2 });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    svm_verify::verify_module(&inst).expect("verify");
+
+    // Freeze the idle three-level subtree (root holds a cap onto C1; C1 holds a cap onto C2).
+    let (nested, child_state, root_handles, root_sp, snap) = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_self_module(&inst);
+        let ih = h.grant_instantiator(0, P_WINDOW as u64);
+        let mut win = init_durable_window(P_WINDOW);
+        arm_freeze_on_quiesce(&mut win);
+        let mut fuel = 20_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(ih)],
+            &mut fuel,
+            &win,
+            P_LOG2,
+            &mut h,
+        );
+        assert!(r.is_ok(), "the idle nested-holder subtree freezes: {r:?}");
+        assert_eq!(h.frozen_nested().len(), 2, "C1 and C2 both recorded nested");
+        assert_eq!(
+            h.frozen_child_state().len(),
+            2,
+            "both C1 and C2 captured serve state"
+        );
+        (
+            h.frozen_nested().to_vec(),
+            h.frozen_child_state().to_vec(),
+            // The root's own durable handle table (its LiveImpl onto C1) — the snapshot codec
+            // carries this in the artifact; the manual harness threads it explicitly.
+            h.capture_durable_handles()
+                .expect("root holds only durable handles"),
+            h.frozen_root_sp().expect("root extent"),
+            snap,
+        )
+    };
+
+    // Thaw: re-create C1 + C2, re-link both edges (root→C1 direct, C1→C2 nested), then seed a
+    // dispatch into the root's queue so it wakes and drives the forward chain fwd(7) → leaf(7).
+    let mut h2 = Host::new();
+    h2.set_durable(true);
+    h2.set_self_module(&inst);
+    h2.set_frozen_nested(nested);
+    h2.set_frozen_child_state(child_state);
+    h2.set_frozen_root_sp(root_sp);
+    h2.restore_durable_handles(&root_handles);
+    let ih2 = h2.grant_instantiator(0, P_WINDOW as u64);
+    h2.svc_enqueue(0, 0, vec![0])
+        .expect("seed a dispatch so the root's svc.wait returns");
+    let mut win = snap.clone();
+    begin_thaw(&mut win, 0);
+    let mut fuel = 20_000_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(ih2)],
+        &mut fuel,
+        &win,
+        P_LOG2,
+        &mut h2,
+    );
+    assert_eq!(
+        thawed,
+        Ok(vec![Value::I64(107)]),
+        "the thawed root drove fwd(7) → C1 forwarded leaf(7) through the re-linked grandchild cap → 107"
+    );
+}
