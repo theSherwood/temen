@@ -627,6 +627,7 @@ dependencies = [
  "svm-ir",
  "svm-jit",
  "svm-peval",
+ "svm-posix",
  "svm-run",
  "svm-text",
  "svm-verify",
@@ -662,6 +663,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-posix"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
@@ -674,6 +683,7 @@ dependencies = [
  "svm-jit",
  "svm-opt",
  "svm-peval",
+ "svm-posix",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",

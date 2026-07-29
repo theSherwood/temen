@@ -807,6 +807,7 @@ dependencies = [
  "svm-jit",
  "svm-opt",
  "svm-peval",
+ "svm-posix",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",
