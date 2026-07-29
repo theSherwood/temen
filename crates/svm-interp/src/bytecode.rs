@@ -4570,8 +4570,12 @@ impl DebugRun {
     }
 
     /// **Step out**: run until the current function returns, stopping at the op in the caller it
-    /// returned to (from the outermost frame, runs to completion). The counterpart of
-    /// `Inspector::step_out`.
+    /// returned to. Runs to completion (returns `None`) when no caller frame has a remaining
+    /// *steppable* op — from the outermost frame, and equally when the caller's only remaining action
+    /// is its own `return` terminator: `step_to` stops only where `cur_ir_pc` is `Some`, and a
+    /// terminator (`SRC_TERM`) yields `None`, so there is no op at the caller's depth to land on. The
+    /// counterpart of `Inspector::step_out`; both engines agree — see the `debug_parity` pin
+    /// `stepout_runs_to_completion_when_caller_immediately_returns`.
     pub fn step_out(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
         let d = self.step_depth();
         self.step_to(Some(d.saturating_sub(1)), fuel)
