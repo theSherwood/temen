@@ -299,19 +299,41 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
       the real export sigs (and JIT-side import binding in tests) are refinements.
 
-  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow,
-  pointers, frames, objects/arrays (incl. constructors + copy), globals, intra- and cross-module
-  calls — fail-closed on the rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`,
-  `dot2`, `sumto`, `classify`, `favg`, `mkSum`). Remaining for full real modules: aggregate
-  **return** (sret) and non-zero global/data initializers — plus wiring nimony's real export
-  signatures for imports.
+  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
+  `break`/`block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl. constructors, copy, and
+  **sret return**), globals, intra- and cross-module calls — fail-closed on the rest, and is
+  validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`,
+  `mkSum`, `mk`, `firstHit`, `labeled`). Remaining for full real modules (W1 Leng totality, §3a):
+  exceptions (`try`/`onerr`/`raise`), seq/string, the `jtrue`/`mflag`/`vflag` conditional-jump
+  forms, and non-zero global/data initializers — plus wiring nimony's real export signatures for
+  imports.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
       `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
       nested aggregates recursing), and any other rhs is a whole-aggregate `mem.copy` of the
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
-      y:b); p.x+p.y`), interp == JIT. Aggregate **return** by sret is the remaining half.
+      y:b); p.x+p.y`), interp == JIT.
+    - **✅ general `goto` (`jmp`/`lab`) — DONE 2026-07-28.** hexer keeps `if`/`while` structured and
+      emits the low-level jump family only for `break`/`block`-`break`: `(jmp L)` an unconditional
+      branch, `(lab :L)` a label. Both fall straight out of the block-parameter (slot-threading)
+      model — labels are pre-scanned and each assigned a block id, a `(jmp L)` is a `br` to that
+      block passing the live slot set, and a `(lab :L)` opens it (fall-through if the prior block is
+      live, else reached only by jumps). Dead statements after a `jmp` are skipped until the next
+      `lab` reopens a reachable block; forward and backward edges both work. Tested on hand fixtures
+      and **real nimony `firstHit`** (`while`+`break`) and **`labeled`** (`block done:`/`break done`
+      out of a nested loop), interp == JIT. The `jtrue`/`mflag`/`vflag` conditional-jump forms (not
+      emitted by hexer's default lowering) stay fail-closed.
+    - **✅ aggregate return (sret) — DONE 2026-07-28.** A proc whose return type is a named aggregate
+      returns `void` and takes a hidden `$sret` pointer param (after `$sp`, before the Leng params);
+      `(ret aggval)` constructs/copies the result into that pointer (composing with `oconstr`/copy).
+      A caller assigning the call to an aggregate destination (`var`/`asgn`/`ret`) hands that
+      destination's address down as `$sret` — the callee writes in place, no temporary; a scalar or
+      discarded use of an aggregate-returning call fail-closes. Aggregate call *arguments* pass by
+      address to match by-address params. Tested (both engines, incl. the window bytes the callee
+      wrote): a direct sret build, a caller→callee round-trip, return-by-copy, and **real nimony
+      `mk`/`mkSum`** — the genuine `var result; result = Pt(…); ret result` + `var p = mk(a,b)` bytes,
+      lifted out together via the new multi-proc `translate_procs`.
     - **✅ floats — DONE 2026-07-28.** `(f 32)`/`(f 64)` types; float arithmetic
       (`fN.add/sub/mul/div`), `neg` (`fN.neg`), and comparisons (`fN.lt/le/eq/ne`); int↔float and
       f32↔f64 `conv`/`cast` (`convert_iN_s`/`trunc_fN_s`/`promote`/`demote`); float literals
@@ -336,6 +358,50 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 targets (Phase 1 is insulated: it only needs "nimony emits compilable C"; Phase 2 couples to
 the grammar). Effect inference (pipeline phase 3) and parts of CPS are not yet implemented
 *in nimony itself* — a limit of the source compiler, not the backend.
+
+## 3a. Self-hosting roadmap — Path 2a (no C compiler)
+
+The end state we're building toward: **nimony compiles itself on SVM with no C compiler in the
+loop.** nimony is written in Nim, and `svm-leng` is its Leng→svm-ir backend. So the loop closes
+when both the nimony compiler *and* `svm-leng` itself run as svm modules. Two sub-questions —
+"can we translate the Leng nimony emits?" and "can the translator itself run on svm?" — and Path
+2a answers the second by bootstrapping the Rust `svm-leng` onto svm the same way any Rust program
+reaches svm: **Rust → wasm → the svm-wasm on-ramp → svm-ir.** No C compiler anywhere.
+
+**Why not 2b (a Nim backend inside nimony's `lengc`, an arkham analog).** It would let nimony
+emit svm-ir directly, no separate translator. Ruled out: we have **no influence over the nimony
+repo**, so a backend living upstream is not a lever we control. `svm-leng` as an *external* Rust
+translator keeps the whole path in this tree.
+
+**The mapping is largely proven** (§3 above): integers, floats, control flow, pointers, frames,
+objects/arrays + constructors + copy, globals, intra-/cross-module calls — all validated against
+genuine `hexer` bytes, interp == JIT. The remaining work is not "can it be done" but breadth +
+plumbing. Five workstreams, roughly independent:
+
+- **W1 — Leng totality.** Close the Leng subset so *every* construct a real nimony program emits
+  translates or fail-closes cleanly. Load-bearing next slices: **sret (aggregate return)**, then
+  general **`goto`** (the low-level `jmp`/`lab`/`jtrue`/`mflag`/`vflag` jump family), then
+  **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
+  built-in containers). Non-zero global/data initializers land here too.
+- **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
+  module. Today `svm-leng` translates one module in isolation. W2 resolves cross-module symbols,
+  merges globals/data, and lays out one svm module from N Leng inputs — the analog of what the C
+  on-ramp gets from `clang`+`lld` for free.
+- **W3 — Runtime bottom edge.** Raw syscalls / the allocator → POSIX-personality named imports +
+  the Memory cap (same seam as Phase 1), and mapping nimony's TLS onto svm's model (the on-ramp
+  gap Phase 1 already surfaced). ARC destructors/dup calls pass through as ordinary calls.
+- **W4 — Multi-binary architecture (the other long pole).** nimony is not one binary: `nifmake`
+  spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
+  means either driving those phases in-process or giving svm a subprocess/exec personality. This
+  is an architecture question, not a translation one, and it's the biggest unknown.
+- **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
+  the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
+
+**Near-term milestone (what we drive first): compile & run one real Nim program end-to-end** —
+source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right answer. That
+exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
+concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
+especially) is bounded but real; the backend mapping is the part that's no longer in doubt.
 
 ## 4. Invariants this must respect
 

@@ -8,12 +8,13 @@
 //!
 //! ## Scope — a walking skeleton
 //!
-//! This first slice handles the **integer / arithmetic / local / direct-call** subset with
-//! straight-line bodies and `ret`. Everything outside it — control flow (`if`/`while`/`case`/
-//! `jmp`), aggregates (`object`/`array`/`union`), pointers (`ptr`/`aptr`/`deref`/`addr`), floats,
-//! `onerr`/`try`, `emit` — is a fail-closed [`LengError::Unsupported`], never a silent
-//! mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline). Growing the frontend means
-//! adding grammar arms below, not rearchitecting.
+//! The frontend now lowers integers/floats, arithmetic, locals and direct/indirect calls, control
+//! flow (`if`/`while`/`case`, and the low-level `jmp`/`lab` jump family for `break`/`block`), memory
+//! (`ptr`/`aptr`/`deref`/`addr` + window frames), aggregates (`object`/`array` with constructors,
+//! copy, and sret return), and globals. What remains outside the subset — exceptions (`onerr`/`try`/
+//! `raise`), seq/string, `union`, `emit`, the `jtrue`/`mflag`/`vflag` jump forms — is a fail-closed
+//! [`LengError::Unsupported`], never a silent mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)`
+//! discipline). Growing the frontend means adding grammar arms below, not rearchitecting.
 //!
 //! Like chibicc's `codegen_ir.c`, it emits **SVM text** and hands it to [`svm_text::parse_module`];
 //! [`translate`] returns the parsed (but not-yet-verified) [`Module`].
@@ -86,6 +87,20 @@ pub fn translate_proc_to_text(src: &str, name: &str) -> Result<String, LengError
 /// As [`translate_proc_to_text`], returning the parsed (unverified) [`Module`].
 pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
     let text = translate_proc_to_text(src, name)?;
+    svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })
+}
+
+/// Translate a **named subset** of a module's procs together — the multi-proc generalization of
+/// [`translate_proc`], so a real caller→callee pair (e.g. an sret `mk` and its `mkSum` caller) lifts
+/// out of a module whose other top-levels the skeleton can't lower yet. Procs are func-indexed in
+/// `names` order. Returns the parsed (unverified) [`Module`].
+pub fn translate_procs(src: &str, names: &[&str]) -> Result<Module, LengError> {
+    let root = nif::parse(src).map_err(LengError::Parse)?;
+    let text = translate::Translator::new().some_procs(&root, names)?;
     svm_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"

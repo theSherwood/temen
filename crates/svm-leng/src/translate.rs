@@ -64,6 +64,10 @@ struct Sig {
     /// True if the proc takes the address of a local, so its emitted signature has a leading
     /// stack-pointer param and callers must pass a fresh frame.
     needs_frame: bool,
+    /// `Some(desc)` if the proc returns an aggregate by value: it returns `void` and instead takes a
+    /// hidden `$sret` pointer param (after `$sp`, before the Leng params) into which `ret` copies the
+    /// result. Callers pass the destination's address as that pointer.
+    sret: Option<TyDesc>,
 }
 
 /// What a computed lvalue address points at — a scalar (with load/store width) or a named
@@ -323,7 +327,9 @@ impl Translator {
         for item in root.args() {
             match item.tag() {
                 Some("proc") => {
-                    let (name, params, ret) = self.proc_sig(item)?;
+                    let (name, params, ret0) = self.proc_sig(item)?;
+                    let sret = self.ret_sret(&item.args()[2])?;
+                    let ret = if sret.is_some() { None } else { ret0 };
                     let index = proc_nodes.len() as u32;
                     let needs_frame = proc_needs_frame(item);
                     self.procs.insert(
@@ -333,6 +339,7 @@ impl Translator {
                             params,
                             ret,
                             needs_frame,
+                            sret,
                         },
                     );
                     proc_nodes.push(item);
@@ -379,7 +386,9 @@ impl Translator {
             if pname.as_deref() != Some(name) {
                 continue;
             }
-            let (n, params, ret) = self.proc_sig(item)?;
+            let (n, params, ret0) = self.proc_sig(item)?;
+            let sret = self.ret_sret(&item.args()[2])?;
+            let ret = if sret.is_some() { None } else { ret0 };
             let needs_frame = proc_needs_frame(item);
             self.procs.insert(
                 n,
@@ -388,6 +397,7 @@ impl Translator {
                     params,
                     ret,
                     needs_frame,
+                    sret,
                 },
             );
             let mut out = String::new();
@@ -397,6 +407,54 @@ impl Translator {
         Err(LengError::Malformed(format!(
             "proc `{name}` not found in module"
         )))
+    }
+
+    /// Translate a **named subset** of a module's procs together (in the order `names` lists them),
+    /// so intra-subset calls resolve by index — the multi-proc generalization of [`one_proc`], for
+    /// running a real caller→callee pair (e.g. `mkSum` calling the sret `mk`) lifted out of a module
+    /// whose `ini`/`main`/`gvar` top-levels the skeleton can't lower wholesale. A call to any proc
+    /// outside the subset (and not a defined import) fail-closes as usual.
+    pub fn some_procs(&mut self, root: &Node, names: &[&str]) -> Result<String, LengError> {
+        if root.tag() != Some("stmts") {
+            return Err(LengError::Malformed("module root must be (stmts …)".into()));
+        }
+        self.collect_types(root)?;
+        self.collect_globals(root)?;
+        // Register the requested procs first (indices in `names` order), so calls between them bind.
+        let mut selected: Vec<&Node> = Vec::new();
+        for (index, want) in names.iter().enumerate() {
+            let node = root.args().iter().find(|item| {
+                item.tag() == Some("proc")
+                    && item
+                        .args()
+                        .first()
+                        .and_then(|n| n.as_atom())
+                        .map(|a| a.strip_prefix(':').unwrap_or(a))
+                        == Some(want)
+            });
+            let node =
+                node.ok_or_else(|| LengError::Malformed(format!("proc `{want}` not found")))?;
+            let (n, params, ret0) = self.proc_sig(node)?;
+            let sret = self.ret_sret(&node.args()[2])?;
+            let ret = if sret.is_some() { None } else { ret0 };
+            self.procs.insert(
+                n,
+                Sig {
+                    index: index as u32,
+                    params,
+                    ret,
+                    needs_frame: proc_needs_frame(node),
+                    sret,
+                },
+            );
+            selected.push(node);
+        }
+        let mut out = String::new();
+        let mut used_memory = false;
+        for node in &selected {
+            used_memory |= self.proc_body(node, &mut out)?;
+        }
+        Ok(self.assemble(used_memory, out))
     }
 
     /// Extract `(proc :Sym Params RetType Pragmas [Body])` → (name, param types, ret).
@@ -509,12 +567,33 @@ impl Translator {
         Ok(Some(val_ty(node)?))
     }
 
+    /// `Some(desc)` if the return type is a named aggregate (object/array) — returned by sret rather
+    /// than as a scalar. A named non-aggregate type (enum/distinct-int/proctype) is still scalar.
+    fn ret_sret(&self, node: &Node) -> Result<Option<TyDesc>, LengError> {
+        if node.tag() == Some("void") || node.is_empty_marker() {
+            return Ok(None);
+        }
+        let d = self.tydesc(node)?;
+        if let TyDesc::Agg(n) = &d {
+            if self.types.contains_key(n) {
+                return Ok(Some(d));
+            }
+        }
+        Ok(None)
+    }
+
     /// Emit one proc's `func {…}` into `out`; returns whether it touched the window (so the caller
     /// can emit the module `memory` declaration).
     fn proc_body(&self, p: &Node, out: &mut String) -> Result<bool, LengError> {
         let a = p.args();
         let params = self.params(&a[1])?;
-        let ret = self.ret_ty(&a[2])?;
+        // An aggregate return is by sret: the proc returns `void` and gets a hidden `$sret` pointer.
+        let sret_desc = self.ret_sret(&a[2])?;
+        let ret = if sret_desc.is_some() {
+            None
+        } else {
+            self.ret_ty(&a[2])?
+        };
         let body = a.get(4);
 
         // Type descriptor of every local (aggregate params are by-address), and the pointee of every
@@ -567,19 +646,30 @@ impl Translator {
             }
         }
         let needs_frame = !mem.is_empty();
+        let has_sret = sret_desc.is_some();
 
-        // SSA slots (block-parameter set): [$sp] ++ params ++ non-framed scalar vars.
+        // SSA slots (block-parameter set): [$sp] ++ [$sret] ++ params ++ non-framed scalar vars.
+        // `$sret` (the aggregate-return destination pointer) sits right after `$sp` so `$sp` stays
+        // slot 0 and callers thread the frame the same way.
         let mut slots: Vec<(String, ValType)> = Vec::new();
         if needs_frame {
             slots.push(("$sp".into(), ValType::I64));
         }
+        if has_sret {
+            slots.push(("$sret".into(), ValType::I64));
+        }
         slots.extend(params.clone());
         slots.extend(ssa_vars);
-        let nparams = usize::from(needs_frame) + params.len();
+        let nparams = usize::from(needs_frame) + usize::from(has_sret) + params.len();
+        let sret = sret_desc.map(|d| (usize::from(needs_frame), d));
 
-        // Signature: a leading `i64` stack pointer when frame-needing, then the Leng params.
+        // Signature: `i64` stack pointer (if frame-needing), `i64` sret pointer (if agg-returning),
+        // then the Leng params. The return type is `void` when sret.
         let mut ptys: Vec<String> = Vec::new();
         if needs_frame {
+            ptys.push("i64".into());
+        }
+        if has_sret {
             ptys.push("i64".into());
         }
         ptys.extend(params.iter().map(|(_, t)| prefix(*t).to_string()));
@@ -596,10 +686,15 @@ impl Translator {
             needs_frame,
             mem,
             frame_size,
+            sret,
         );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
         // assigned reads 0 until its declaration binds it (matches Leng default-init semantics).
         f.open_entry();
+        // Pre-allocate a block id for every `(lab :L)` so forward `(jmp L)` can target it.
+        if let Some(b) = body {
+            f.declare_labels(b);
+        }
         match body {
             Some(b) if !matches!(b, Node::Atom(_)) => {
                 f.stmt_list(b)?;
@@ -638,6 +733,13 @@ struct FuncGen<'a> {
     mem: HashMap<String, (u64, TyDesc)>,
     /// Total frame bytes; a call to a frame-needing proc passes `sp + frame_size` as its frame.
     frame_size: u64,
+    /// `Some((slot, desc))` when this proc returns an aggregate by sret: `cur[slot]` is the caller's
+    /// destination pointer, into which `ret` copies/constructs the aggregate before a void return.
+    sret: Option<(usize, TyDesc)>,
+    /// Leng label name (`(lab :L)`) → its pre-allocated block id, so a `(jmp L)` can branch to a
+    /// label defined later (forward jumps: `break`, `block`-`break`). All labels are declared before
+    /// any body statement is emitted.
+    label_block: HashMap<String, u32>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -663,6 +765,7 @@ impl<'a> FuncGen<'a> {
         has_sp: bool,
         mem: HashMap<String, (u64, TyDesc)>,
         frame_size: u64,
+        sret: Option<(usize, TyDesc)>,
     ) -> Self {
         let slot_of = slots
             .iter()
@@ -680,6 +783,8 @@ impl<'a> FuncGen<'a> {
             has_sp,
             mem,
             frame_size,
+            sret,
+            label_block: HashMap::new(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -726,6 +831,19 @@ impl<'a> FuncGen<'a> {
             let ty = self.slots[i].1;
             let v = self.emit_const(ty, 0);
             self.cur.push(v.id);
+        }
+    }
+
+    /// Assign a fresh block id to each `(lab :L)` in the body (document order), so a `(jmp L)` to a
+    /// forward label resolves. Structured control flow allocates its blocks after these.
+    fn declare_labels(&mut self, body: &Node) {
+        let mut names = Vec::new();
+        collect_labels(body, &mut names);
+        for name in names {
+            if !self.label_block.contains_key(&name) {
+                let id = self.new_block_id();
+                self.label_block.insert(name, id);
+            }
         }
     }
 
@@ -1096,6 +1214,11 @@ impl<'a> FuncGen<'a> {
                 }
                 Ok(())
             }
+            Some("call") => {
+                // An aggregate-returning call: hand `daddr` to the callee as its `$sret` pointer, so
+                // it writes the result straight into the destination (no temporary).
+                self.call_sret(rhs, daddr)
+            }
             _ => {
                 // Whole-aggregate copy: the rhs is an aggregate lvalue; copy its bytes.
                 let (saddr, _) = self.lvalue_addr(rhs)?;
@@ -1135,8 +1258,10 @@ impl<'a> FuncGen<'a> {
         let children = node.args();
         let start = usize::from(matches!(children.first(), Some(Node::Atom(_))));
         for stmt in &children[start..] {
-            if self.terminated {
-                break; // dead code after a terminator
+            // After a terminator, statements are dead — except a `(lab L)`, which reopens a block
+            // reachable via `(jmp L)` from elsewhere.
+            if self.terminated && stmt.tag() != Some("lab") {
+                continue;
             }
             self.stmt(stmt)?;
         }
@@ -1157,6 +1282,17 @@ impl<'a> FuncGen<'a> {
             }
             Some("ret") => {
                 let a = s.args();
+                // Aggregate return by sret: construct/copy the result into the caller's destination
+                // pointer (`cur[slot]`), then a plain void return.
+                if let Some((slot, desc)) = self.sret.clone() {
+                    if !(a.is_empty() || a[0].is_empty_marker()) {
+                        let dst = self.cur[slot];
+                        self.assign_aggregate(dst, &desc, &a[0])?;
+                    }
+                    self.finish_block("return".into(), self.next_block);
+                    self.terminated = true;
+                    return Ok(());
+                }
                 let term = if a.is_empty() || a[0].is_empty_marker() {
                     "return".to_string()
                 } else {
@@ -1230,9 +1366,8 @@ impl<'a> FuncGen<'a> {
             Some("if") => self.if_stmt(s),
             Some("while") => self.while_stmt(s),
             Some("case") => self.case_stmt(s),
-            // A bare label with no live jmp target (e.g. hexer's trailing `whileStmtLabel`) is inert
-            // for our structured lowering; `jmp` itself is not yet supported.
-            Some("lab") => Ok(()),
+            Some("jmp") => self.jmp_stmt(s),
+            Some("lab") => self.lab_stmt(s),
             other => Err(LengError::Unsupported(format!(
                 "statement `{}`",
                 other.unwrap_or("<headless>")
@@ -1323,6 +1458,50 @@ impl<'a> FuncGen<'a> {
         } else {
             self.cur_id = exit;
             self.reset_cur_state();
+        }
+        Ok(())
+    }
+
+    /// `(jmp L)` → an unconditional branch to label `L`'s block, threading the current slot values.
+    /// Forward (`break`, `block`-`break`) and backward jumps both work: every block carries all
+    /// slots, so any edge just passes the live slot set. The block is terminated; following code is
+    /// dead until the next `(lab …)` reopens a reachable block.
+    fn jmp_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let name = s
+            .args()
+            .first()
+            .and_then(|n| n.as_atom())
+            .ok_or_else(|| LengError::Malformed("jmp needs a label".into()))?;
+        let lb = *self
+            .label_block
+            .get(name)
+            .ok_or_else(|| LengError::Unsupported(format!("jmp to unknown label `{name}`")))?;
+        let args = self.branch_args();
+        self.finish_block(format!("br {lb}{args}"), self.next_block);
+        self.terminated = true;
+        Ok(())
+    }
+
+    /// `(lab :L)` → open label `L`'s pre-allocated block. If the current block is still live it falls
+    /// through into `L` (threading slots); otherwise `L` is reached only by `(jmp L)` edges and we
+    /// just switch to emitting there.
+    fn lab_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let name = s
+            .args()
+            .first()
+            .map(sym_def)
+            .transpose()?
+            .ok_or_else(|| LengError::Malformed("lab needs a name".into()))?;
+        let lb = *self
+            .label_block
+            .get(&name)
+            .ok_or_else(|| LengError::Unsupported(format!("undeclared label `{name}`")))?;
+        if self.terminated {
+            self.cur_id = lb;
+            self.reset_cur_state();
+        } else {
+            let args = self.branch_args();
+            self.finish_block(format!("br {lb}{args}"), lb);
         }
         Ok(())
     }
@@ -1708,6 +1887,20 @@ impl<'a> FuncGen<'a> {
         if !self.t.procs.contains_key(callee) {
             return self.call_import(callee, &a[1..], want_value);
         }
+        // An aggregate-returning call must flow to an aggregate destination (`asgn`/`var`/`ret`),
+        // which routes through `call_sret`. Reaching plain `call` means it was used as a scalar
+        // value or a bare statement — fail closed rather than emit a mismatched call.
+        if self
+            .t
+            .procs
+            .get(callee)
+            .and_then(|s| s.sret.as_ref())
+            .is_some()
+        {
+            return Err(LengError::Unsupported(format!(
+                "aggregate-returning call to `{callee}` must be directly assigned to an aggregate destination"
+            )));
+        }
         let sig = self.t.procs.get(callee).expect("checked above");
         let index = sig.index;
         let ptys = sig.params.clone();
@@ -1736,7 +1929,7 @@ impl<'a> FuncGen<'a> {
             argvals.push(spid);
         }
         for (arg, want) in a[1..].iter().zip(ptys) {
-            argvals.push(self.expr_typed(arg, want)?.id);
+            argvals.push(self.call_arg(arg, want)?);
         }
         let arglist = argvals
             .iter()
@@ -1759,6 +1952,72 @@ impl<'a> FuncGen<'a> {
                 })
             }
         }
+    }
+
+    /// `(call P Expr*)` where `P` returns an aggregate by sret. Emits a void call passing `dest_addr`
+    /// as `P`'s hidden `$sret` pointer, so the callee writes its result straight into the
+    /// destination. Arg order matches `P`'s signature: `[$sp?] [dest_addr] [params…]`.
+    fn call_sret(&mut self, e: &Node, dest_addr: u32) -> Result<(), LengError> {
+        let a = e.args();
+        let callee = a[0]
+            .as_atom()
+            .ok_or_else(|| LengError::Unsupported("indirect aggregate-returning call".into()))?;
+        let sig = self.t.procs.get(callee).ok_or_else(|| {
+            LengError::Unsupported(format!(
+                "aggregate-returning call to external `{callee}` (import sret is a later slice)"
+            ))
+        })?;
+        if sig.sret.is_none() {
+            return Err(LengError::Unsupported(format!(
+                "`{callee}` does not return an aggregate, but is used in aggregate position"
+            )));
+        }
+        let index = sig.index;
+        let ptys = sig.params.clone();
+        let callee_needs_frame = sig.needs_frame;
+        if a.len() - 1 != ptys.len() {
+            return Err(LengError::Malformed(format!(
+                "call to `{callee}`: {} args for {} params",
+                a.len() - 1,
+                ptys.len()
+            )));
+        }
+        let mut argvals = Vec::new();
+        if callee_needs_frame {
+            if !self.has_sp {
+                return Err(LengError::Unsupported(format!(
+                    "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
+                )));
+            }
+            let sp = self.cur[0];
+            let fs = self.emit_const(ValType::I64, self.frame_size as i64);
+            let spid = self.fresh();
+            self.cur_buf
+                .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
+            argvals.push(spid);
+        }
+        argvals.push(dest_addr); // the `$sret` destination pointer
+        for (arg, want) in a[1..].iter().zip(ptys) {
+            argvals.push(self.call_arg(arg, want)?);
+        }
+        let arglist = argvals
+            .iter()
+            .map(|id| format!("v{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.cur_buf
+            .push_str(&format!("  call {index} ({arglist})\n"));
+        Ok(())
+    }
+
+    /// One call argument → its SVM value id. An **aggregate** argument is passed by address (the
+    /// callee's param is a by-address pointer); a scalar is evaluated and coerced to the param type.
+    fn call_arg(&mut self, arg: &Node, want: ValType) -> Result<u32, LengError> {
+        if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            let (addr, _) = self.lvalue_addr(arg)?;
+            return Ok(addr);
+        }
+        Ok(self.expr_typed(arg, want)?.id)
     }
 
     /// Lower a cross-module call to a declared SVM `import` + `call.import`. Param types come from
@@ -1918,6 +2177,20 @@ fn has_aggregate_var(node: &Node) -> bool {
         return node.args().iter().any(has_aggregate_var);
     }
     false
+}
+
+/// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
+fn collect_labels(node: &Node, out: &mut Vec<String>) {
+    if let Node::List(_) = node {
+        if node.tag() == Some("lab") {
+            if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
+                out.push(name.strip_prefix(':').unwrap_or(name).to_string());
+            }
+        }
+        for child in node.args() {
+            collect_labels(child, out);
+        }
+    }
 }
 
 /// Collect the names of locals whose address is taken (`(addr name)`).
