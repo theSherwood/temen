@@ -58,6 +58,48 @@ fn chibicc() -> &'static Path {
     .as_path()
 }
 
+/// Compile one of chibicc's **own** upstream source files (`frontend/chibicc/<name>`) to a linkable
+/// unit — `-I frontend/chibicc` for `chibicc.h`. Same pipeline as [`object_unit`], but on real
+/// self-host source rather than a crafted string, so the tests exercise the actual shared globals
+/// (`ty_int`, …) and cross-TU call graph the compiler is written with.
+fn object_unit_real(name: &str) -> LinkUnit {
+    let src_dir = repo_root().join("frontend/chibicc");
+    let cfile = src_dir.join(name);
+    let irfile = std::env::temp_dir().join(format!(
+        "svm_clink_real_{}_{}.svm",
+        name.replace(['.', '/'], "_"),
+        std::process::id()
+    ));
+    let status = Command::new(chibicc())
+        .args([
+            "-cc1",
+            "-I",
+            src_dir.to_str().unwrap(),
+            "--emit-object",
+            "-cc1-input",
+            cfile.to_str().unwrap(),
+            "-cc1-output",
+            irfile.to_str().unwrap(),
+            cfile.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run chibicc");
+    assert!(status.success(), "chibicc --emit-object failed on {name}");
+    let ir = std::fs::read_to_string(&irfile).unwrap();
+    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse {name}: {e:?}"));
+    let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
+    let data_exports = m
+        .data_exports
+        .iter()
+        .map(|e| (e.name.clone(), e.offset))
+        .collect();
+    LinkUnit {
+        module: m,
+        exports,
+        data_exports,
+    }
+}
+
 /// Compile one C source string to a **linkable unit** (`--emit-object`) and parse it, turning the
 /// emitted `export` directives into the `LinkUnit::exports` the linker resolves against.
 fn object_unit(tag: &str, src: &str) -> LinkUnit {
@@ -464,7 +506,8 @@ fn links_and_runs_under_powerbox_with_argv() {
     // `write` is a powerbox capability, not a cross-TU function: no unit defines it, so it lowers to
     // a `call.sym "write"` the *host* binds to the stdout stream at instantiation. `link_with_manifest`
     // retains such unresolved names as a merged import manifest (vs plain `link`, which fails closed).
-    let linked = svm_ir::link_with_manifest(&[main_unit, provider]).expect("link argv entry + provider");
+    let linked =
+        svm_ir::link_with_manifest(&[main_unit, provider]).expect("link argv entry + provider");
     svm_verify::verify_module(&linked).expect("verify");
     assert!(
         linked.imports.iter().any(|i| i.name == "write"),
@@ -483,4 +526,87 @@ fn links_and_runs_under_powerbox_with_argv() {
         .expect("run _start with argv");
     assert_eq!(run.stdout, b"hi\nhi\n", "wrote the cross-TU msg argc times");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(2)]));
+}
+
+/// The mechanism on **unmodified upstream chibicc source**: `type.c` is the TU that defines the
+/// shared `Type *` globals (`ty_int`/`ty_void`/…) as pointers to anonymous `Type` compound literals.
+/// Under `--emit-object` it publishes each as a data symbol and lowers each pointer to a `data.ptr …
+/// self` relocation — the exact cross-TU data the self-host build shares. It links + verifies on its
+/// own (its libc calls — `strcmp`, `calloc`, … — stay retained manifest imports via
+/// `link_with_manifest`), so this pins that real source flows through emit-object → link, while the
+/// crafted tests above pin the runtime read behavior.
+#[test]
+fn real_chibicc_type_tu_emits_and_links() {
+    let type_tu = object_unit_real("type.c");
+    let data_names: Vec<&str> = type_tu
+        .data_exports
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    for g in ["ty_int", "ty_void", "ty_long", "ty_char", "ty_bool"] {
+        assert!(
+            data_names.contains(&g),
+            "{g} exported as a data symbol: {data_names:?}"
+        );
+    }
+    // Each `ty_* = &(Type){…}` is a data→data pointer the linker resolves and clears.
+    assert!(
+        !type_tu.module.data_ptrs.is_empty(),
+        "type.c's Type structs carry data.ptr relocations"
+    );
+    let linked = svm_ir::link_with_manifest(&[type_tu]).expect("link real type.c");
+    assert!(
+        linked.data_ptrs.is_empty(),
+        "data.ptr relocations resolved and cleared at link"
+    );
+    svm_verify::verify_module(&linked).expect("verify real type.c");
+}
+
+/// **Multiple real cc1 TUs linked together.** Four of chibicc's own translation units —
+/// `type` (defines `ty_int`/…), `hashmap`, `unicode`, `strings` — compiled separately with
+/// `--emit-object` and linked into one module. `type`'s data symbols and each unit's file-local
+/// `static`s coexist without collision, cross-TU calls resolve to direct calls, and the compiler's
+/// libc (`calloc`, `memcpy`, …) stays a retained host-bound manifest — the module links and verifies.
+///
+/// This is the "drive the chibicc TUs through emit-object + link" result on real source. Running the
+/// *whole* cc1 additionally needs a self-host libc for the emit-object path (`tokenize.c` wants
+/// `strtoul` declared; the runtime needs `malloc`/`printf`/file I/O) — a separate slice; every
+/// linking mechanism it stands on (cross-TU functions, cross-TU data, the `data.top` stack base) is
+/// proven here and above.
+#[test]
+fn links_multiple_real_chibicc_tus() {
+    let units = [
+        object_unit_real("type.c"),
+        object_unit_real("hashmap.c"),
+        object_unit_real("unicode.c"),
+        object_unit_real("strings.c"),
+    ];
+    // `type.c` publishes the shared `Type` globals the others link against.
+    let type_data: Vec<&str> = units[0]
+        .data_exports
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(
+        type_data.contains(&"ty_int"),
+        "type.c exports ty_int: {type_data:?}"
+    );
+
+    let linked = svm_ir::link_with_manifest(&units).expect("link four real cc1 TUs");
+    svm_verify::verify_module(&linked).expect("verify the linked cc1 subset");
+
+    // The shared globals survive into the merged module's data-export table at their window offsets.
+    for g in ["ty_int", "ty_void"] {
+        assert!(
+            linked.data_exports.iter().any(|e| e.name == g),
+            "{g} present in the linked module's data exports"
+        );
+    }
+    // Any unresolved names left are host-bound libc (a manifest), never a dangling cross-TU call.
+    for imp in &linked.imports {
+        assert!(
+            !imp.name.is_empty(),
+            "retained manifest import has a name (host-bound libc)"
+        );
+    }
 }
