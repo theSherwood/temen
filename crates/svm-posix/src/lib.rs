@@ -78,19 +78,42 @@ pub const OP_EXEC_WIN: u32 = 22;
 /// accepts `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` as no-ops (there is no exec-in-place, so `FD_CLOEXEC`
 /// has nothing to act on yet). These are **intra-personality** pipes: a single guest's write end and read
 /// end share one buffer, non-blocking (an empty pipe reads `0`/EOF). Handing a pipe end to a *spawned
-/// child* as its stdin/stdout is the next slice (`execve` inheritance); this slice lands the fd surface.
+/// child* as its stdin/stdout is `spawn`'s job (below); this group lands the fd surface.
 pub const OP_PIPE: u32 = 23;
 pub const OP_DUP2: u32 = 24;
 pub const OP_DUP: u32 = 25;
 pub const OP_FCNTL: u32 = 26;
 
+/// **POSIX spawn/wait surface** (STAGE1.md slice 2). The fork-free process primitive: `spawn` launches a
+/// registered command as a child, runs it to completion (sequential — there is no fork-returns-twice),
+/// and `waitpid`/`wait` reap its exit status. Because a spawn is *authority* the libc personality does
+/// not itself hold (children are born destitute; the shell mints and grants), the actual instantiate+run
+/// is an **embedder-wired delegate** ([`Posix::set_spawn`]) — opt-in, exactly like the stdout `Stream`.
+/// Absent a delegate, `spawn` is `-ENOSYS` (a program links and its fork-free paths run; spawning fails
+/// closed). The child **inherits the caller's fd 0 and fd 1**: `spawn` drains the current fd-0 binding
+/// (preloaded stdin, a file, or a pipe) as the child's input and routes the child's captured stdout to
+/// the current fd-1 binding — so a `dup2(pipe_w, 1)` / `dup2(file, 1)` redirect before the spawn lands
+/// the child's output exactly where POSIX would. `fork`/`vfork`/`execve` (return-twice / image-replace)
+/// remain parked on the durable-clone capstone.
+///
+/// `spawn(name_ptr, name_len, argv_ptr, argv_len) -> pid | -errno`: look up the command by name; `argv`
+/// is the `argv_len` bytes at `argv_ptr` as a NUL-separated blob (empty ⇒ `[name]`). Returns a synthetic
+/// pid. `waitpid(pid, status_ptr, options) -> pid | -errno`: reap `pid` (or any child if `pid == -1`),
+/// writing the wait-encoded status (`WEXITSTATUS` in bits 8–15) to `status_ptr` when non-null;
+/// `-ECHILD` for an unknown pid. `wait(status_ptr)` is `waitpid(-1, status_ptr, 0)`.
+pub const OP_SPAWN: u32 = 27;
+pub const OP_WAITPID: u32 = 28;
+pub const OP_WAIT: u32 = 29;
+
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
+const ECHILD: i64 = -10; // waitpid on a pid that is not a live child
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
 const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a directory
 const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
+const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
 
 /// `fcntl` commands this personality serves (Linux `<fcntl.h>` values). `F_DUPFD`/`F_DUPFD_CLOEXEC`
 /// duplicate to the lowest free fd `>= arg`; `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are accepted no-ops
@@ -142,6 +165,21 @@ struct OpenFile {
 /// block on itself. Cross-process pipe semantics (a spawned child draining a parent's write end) arrive
 /// with the `execve`/spawn slice; this type gives the fd surface its buffering.
 type PipeBuf = Arc<Mutex<VecDeque<u8>>>;
+
+/// The result of one embedder-wired [`spawn`](Posix::set_spawn): the child's captured `stdout` (which
+/// the personality routes to the caller's current fd-1 binding) and its `status` (an exit code, `0`–
+/// `255`, which `waitpid` returns wait-encoded). A crash/abnormal exit is out of scope for the
+/// sequential fork-free primitive — model it as a nonzero code (`128 + signal`, the shell convention).
+pub struct SpawnResult {
+    pub stdout: Vec<u8>,
+    pub status: i32,
+}
+
+/// The embedder's **spawn delegate**: `(command_name, argv, stdin_bytes) -> SpawnResult`. This is the
+/// authority the libc personality does not itself hold — the embedder wires it ([`Posix::set_spawn`])
+/// with whatever *running a child* means in its world (an `Instantiator` op-13 instantiate + `join`, a
+/// scripted table, a real subprocess). Runs to completion synchronously (the sequential, no-fork model).
+type SpawnFn = Box<dyn FnMut(&str, &[String], &[u8]) -> SpawnResult + Send>;
 
 /// One entry in the host-side fd table. The three stdio streams start as sentinels (`Stdin`/`Stdout`/
 /// `Stderr`) so `dup2`/`dup`/`close` treat fds `0`/`1`/`2` uniformly with the rest; `open` adds `File`;
@@ -261,6 +299,15 @@ struct Inner {
     /// returns, so it is empty and ready for the next command.
     exec_stdin_handle: i32,
     exec_stdin_fifo: Option<Arc<Mutex<VecDeque<u8>>>>,
+    /// The embedder-wired **spawn delegate** ([`Posix::set_spawn`]) — the authority `spawn` needs to run
+    /// a child. `None` until wired, in which case `spawn` is `-ENOSYS` (fail closed).
+    spawn_fn: Option<SpawnFn>,
+    /// Reaped-pending children: synthetic `pid → wait-encoded status`. `spawn` runs the child to
+    /// completion and records its status here; `waitpid`/`wait` remove and return it.
+    children: HashMap<i32, i32>,
+    /// The next synthetic pid `spawn` hands out. Starts at `1000` (well clear of small fd/int values, so
+    /// a pid is never confused with an fd in a test).
+    next_pid: i32,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -374,6 +421,22 @@ impl Posix {
         st.exec_stdin_handle = handle;
         st.exec_stdin_fifo = Some(fifo);
     }
+
+    /// Wire the **spawn delegate** — the authority the `spawn` op needs to run a child (POSIX.md ops
+    /// 27–29). `f(name, argv, stdin) -> SpawnResult` runs the named command to completion and returns its
+    /// captured stdout + exit status; the personality routes the stdout to the caller's current fd 1 and
+    /// records the status for `waitpid`. Opt-in like [`Self::set_exec_stdout`]: until it is set, `spawn`
+    /// is `-ENOSYS`. The embedder supplies whatever *running a child* means (an `Instantiator` op-13
+    /// instantiate + `join`, a scripted table, a real subprocess).
+    pub fn set_spawn<F>(&self, f: F)
+    where
+        F: FnMut(&str, &[String], &[u8]) -> SpawnResult + Send + 'static,
+    {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn_fn = Some(Box::new(f));
+    }
 }
 
 /// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
@@ -414,6 +477,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "dup2" => OP_DUP2,
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
+        "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
+        "waitpid" => OP_WAITPID,
+        "wait" => OP_WAIT,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -478,6 +544,9 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         exec_stdout_handle: 0,
         exec_stdin_handle: 0,
         exec_stdin_fifo: None,
+        spawn_fn: None,
+        children: HashMap::new(),
+        next_pid: 1000,
     }));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -518,6 +587,9 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
             OP_DUP2 => Ok(vec![st.dup2(args)]),
             OP_DUP => Ok(vec![st.dup(args)]),
             OP_FCNTL => Ok(vec![st.fcntl(args)]),
+            OP_SPAWN => st.spawn(args, mem),
+            OP_WAITPID => st.waitpid(args, mem),
+            OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
             OP_GETCWD => st.getcwd(args, mem),
             OP_CHDIR => st.chdir(args, mem),
             OP_GETENV => st.getenv(args, mem),
@@ -541,6 +613,17 @@ impl Inner {
             return Ok(vec![0]);
         }
         let data = mem.read_bytes(buf, len).ok_or(Trap::Malformed)?;
+        Ok(vec![self.sink_write(fd, &data)])
+    }
+
+    /// Write `data` to fd `fd`'s current binding, returning the count or `-EBADF`: the `Stdout`/`Stderr`
+    /// sentinels append to captured stdout/stderr, a `File` writes at its offset, a `PipeWrite` appends to
+    /// its shared buffer. Factored out of [`Inner::write`] so `spawn` can route a child's captured stdout
+    /// to *whatever the caller's fd 1 currently is* (the fd-inheritance path). Empty `data` is a `0` no-op.
+    fn sink_write(&mut self, fd: i64, data: &[u8]) -> i64 {
+        if data.is_empty() {
+            return 0;
+        }
         // Decide the sink first (cloning the pipe `Arc`) so we don't hold a borrow of `self.fds` while
         // mutating `self.stdout`/`self.stderr`/the memfs.
         enum Sink {
@@ -562,15 +645,18 @@ impl Inner {
                 Some(s) => s
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(&data),
-                None => self.stdout.extend_from_slice(&data),
+                    .extend_from_slice(data),
+                None => self.stdout.extend_from_slice(data),
             },
-            Sink::Stderr => self.stderr.extend_from_slice(&data),
-            Sink::File => return Ok(vec![self.file_write(fd as usize, &data)]),
-            Sink::Pipe(p) => p.lock().unwrap_or_else(|e| e.into_inner()).extend(data),
-            Sink::Bad => return Ok(vec![EBADF]),
+            Sink::Stderr => self.stderr.extend_from_slice(data),
+            Sink::File => return self.file_write(fd as usize, data),
+            Sink::Pipe(p) => p
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(data.iter().copied()),
+            Sink::Bad => return EBADF,
         }
-        Ok(vec![len as i64])
+        data.len() as i64
     }
 
     /// `read(fd, buf, len) -> n | -errno`: the `Stdin` sentinel drains preloaded stdin; a `File` fd reads
@@ -763,6 +849,126 @@ impl Inner {
             F_GETFD | F_GETFL | F_SETFD | F_SETFL => 0,
             _ => EINVAL,
         }
+    }
+
+    /// Drain **all** currently-available bytes from fd `fd`'s binding, advancing it: preloaded stdin (the
+    /// `Stdin` sentinel), the rest of a `File`, or the whole of a `PipeRead` buffer. Anything else yields
+    /// no bytes. This is how `spawn` hands the child its inherited stdin (fd 0).
+    fn drain_fd(&mut self, fd: i64) -> Vec<u8> {
+        enum Src {
+            Stdin,
+            File,
+            Pipe(PipeBuf),
+            None,
+        }
+        let src = match self.fd(fd) {
+            Some(FdEntry::Stdin) => Src::Stdin,
+            Some(FdEntry::File(_)) => Src::File,
+            Some(FdEntry::PipeRead(p)) => Src::Pipe(Arc::clone(p)),
+            _ => Src::None,
+        };
+        match src {
+            Src::Stdin => {
+                let out = self.stdin[self.stdin_pos.min(self.stdin.len())..].to_vec();
+                self.stdin_pos = self.stdin.len();
+                out
+            }
+            // A file has a bounded length; read from the offset to EOF in one shot.
+            Src::File => {
+                let n = match self.fds.get(fd as usize).and_then(|s| s.as_ref()) {
+                    Some(FdEntry::File(of)) => self
+                        .files
+                        .get(&of.path)
+                        .map_or(0, |f| f.len())
+                        .saturating_sub(of.pos),
+                    _ => 0,
+                };
+                self.file_read(fd as usize, n).unwrap_or_default()
+            }
+            Src::Pipe(p) => p
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+                .collect(),
+            Src::None => Vec::new(),
+        }
+    }
+
+    /// `spawn(name_ptr, name_len, argv_ptr, argv_len) -> pid | -errno`: run a registered command as a
+    /// child via the embedder's [`spawn delegate`](Posix::set_spawn), inheriting the caller's fd 0
+    /// (drained as the child's stdin) and fd 1 (its captured stdout is routed there). `argv` is the
+    /// `argv_len` bytes at `argv_ptr` split on NUL (empty ⇒ `[name]`). Returns a synthetic pid whose
+    /// status `waitpid` reaps. `-ENOSYS` if no delegate is wired; `-EINVAL` on a non-UTF-8 name.
+    fn spawn(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let name_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let name_len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let argv_ptr = *args.get(2).unwrap_or(&0) as u64;
+        let argv_len = (*args.get(3).unwrap_or(&0)).max(0) as u64;
+        let name_bytes = mem.read_bytes(name_ptr, name_len).ok_or(Trap::Malformed)?;
+        let Ok(name) = String::from_utf8(name_bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        // argv: the blob split on NUL, trailing empties dropped; empty ⇒ [name] (argv[0] = program name).
+        let mut argv: Vec<String> = if argv_len == 0 {
+            Vec::new()
+        } else {
+            let blob = mem.read_bytes(argv_ptr, argv_len).ok_or(Trap::Malformed)?;
+            blob.split(|&b| b == 0)
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        };
+        while argv.last().is_some_and(|s| s.is_empty()) {
+            argv.pop();
+        }
+        if argv.is_empty() {
+            argv.push(name.clone());
+        }
+        // Fail closed *before* any side effect (draining stdin) if no delegate is wired.
+        if self.spawn_fn.is_none() {
+            return Ok(vec![ENOSYS]);
+        }
+        // The child inherits fd 0 as stdin — drain it before invoking the delegate.
+        let stdin = self.drain_fd(0);
+        // Take the delegate out to call it (a `&mut self` method cannot also borrow the boxed closure),
+        // then restore it.
+        let mut f = self.spawn_fn.take().unwrap();
+        let res = f(&name, &argv, &stdin);
+        self.spawn_fn = Some(f);
+        // Route the child's stdout to the caller's current fd 1 (inheritance: a prior `dup2(_, 1)` redirect
+        // lands it in a file or pipe; otherwise the stdout sink).
+        self.sink_write(1, &res.stdout);
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
+        self.children.insert(pid, (res.status & 0xff) << 8);
+        Ok(vec![pid as i64])
+    }
+
+    /// `waitpid(pid, status_ptr, options) -> pid | -errno`: reap `pid` (or any pending child when
+    /// `pid == -1`), writing its wait-encoded status to `status_ptr` when non-null. `options` (e.g.
+    /// `WNOHANG`) is ignored — a spawned child has already run to completion, so a reap never blocks.
+    /// `-ECHILD` when there is no such child.
+    fn waitpid(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let pid = *args.first().ok_or(Trap::Malformed)?;
+        let status_ptr = *args.get(1).unwrap_or(&0) as u64;
+        let reaped = if pid == -1 {
+            self.children.keys().min().copied()
+        } else if self.children.contains_key(&(pid as i32)) {
+            Some(pid as i32)
+        } else {
+            None
+        };
+        let Some(p) = reaped else {
+            return Ok(vec![ECHILD]);
+        };
+        let status: i32 = self.children.remove(&p).unwrap_or(0);
+        if status_ptr != 0 {
+            mem.write_bytes(status_ptr, &status.to_le_bytes())
+                .ok_or(Trap::Malformed)?;
+        }
+        Ok(vec![p as i64])
     }
 
     /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
@@ -1736,6 +1942,200 @@ block 0 (vph: i32) {\n\
             "write to a closed fd 1 is EBADF"
         );
         assert_eq!(st.close(&[1]), EBADF, "double close is EBADF");
+    }
+
+    #[test]
+    fn spawn_waitpid_over_the_delegate() {
+        // Host-level unit for the spawn/wait surface (slice 2): fail-closed without a delegate, then a
+        // wired delegate sees the command/argv/inherited-stdin, its stdout is routed to fd 1, and
+        // waitpid/wait reap the encoded status.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, b"data".to_vec());
+
+        // No delegate ⇒ spawn is ENOSYS and there are no children to reap.
+        {
+            let mut st = posix.inner.lock().unwrap();
+            let mut win = vec![0u8; WIN];
+            win[0..2].copy_from_slice(b"up");
+            let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+            assert_eq!(
+                st.spawn(&[0, 2, 0, 0], Some(&mut mem)).unwrap(),
+                vec![ENOSYS],
+                "spawn with no delegate fails closed"
+            );
+            assert_eq!(
+                st.waitpid(&[-1, 0, 0], Some(&mut mem)).unwrap(),
+                vec![ECHILD],
+                "no children ⇒ ECHILD"
+            );
+        }
+
+        // Wire a delegate that records what it saw and uppercases the inherited stdin, exiting 7.
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<String>, Vec<u8>)>::new()));
+        let rec = Arc::clone(&seen);
+        posix.set_spawn(move |name, argv, stdin| {
+            rec.lock()
+                .unwrap()
+                .push((name.to_string(), argv.to_vec(), stdin.to_vec()));
+            SpawnResult {
+                stdout: stdin.to_ascii_uppercase(),
+                status: 7,
+            }
+        });
+
+        let (pid, status_word, stdin_after) = {
+            let mut st = posix.inner.lock().unwrap();
+            let mut win = vec![0u8; WIN];
+            win[0..2].copy_from_slice(b"up"); // name
+            win[8..13].copy_from_slice(b"up\0-n"); // argv blob: ["up", "-n"]
+            let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+            // spawn("up", argv "up\0-n"): drains preloaded stdin "data", delegate → "DATA" to fd 1.
+            let pid = st.spawn(&[0, 2, 8, 5], Some(&mut mem)).unwrap()[0];
+            // stdin is now consumed (the child inherited and drained it).
+            let after = st.read(&[0, 32, 4], Some(&mut mem)).unwrap()[0];
+            // waitpid(pid, status@64, 0) reaps it.
+            let r = st.waitpid(&[pid, 64, 0], Some(&mut mem)).unwrap()[0];
+            assert_eq!(r, pid, "waitpid returns the reaped pid");
+            let status = i32::from_le_bytes(mem.read_bytes(64, 4).unwrap().try_into().unwrap());
+            // A second reap of the same pid is ECHILD (already reaped).
+            assert_eq!(
+                st.waitpid(&[pid, 64, 0], Some(&mut mem)).unwrap(),
+                vec![ECHILD],
+                "double waitpid is ECHILD"
+            );
+            (pid, status, after)
+        };
+
+        assert_eq!(pid, 1000, "first synthetic pid");
+        assert_eq!(
+            stdin_after, 0,
+            "the child drained the inherited stdin (fd 0 now EOF)"
+        );
+        assert_eq!(
+            status_word >> 8 & 0xff,
+            7,
+            "WEXITSTATUS = the delegate's exit code"
+        );
+        assert_eq!(
+            posix.stdout(),
+            b"DATA",
+            "child stdout routed to fd 1 (no redirect ⇒ the sink)"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the delegate ran exactly once");
+        assert_eq!(seen[0].0, "up", "delegate saw the command name");
+        assert_eq!(
+            seen[0].1,
+            vec!["up".to_string(), "-n".to_string()],
+            "delegate saw argv"
+        );
+        assert_eq!(seen[0].2, b"data", "delegate saw the inherited stdin");
+    }
+
+    /// func 0 `(handle) -> i64`: `open("out", 577)` → fd, `dup2(fd, 1)`, `spawn("up", argv=[])`, then
+    /// `waitpid(pid, &status, 0)`. With a delegate that uppercases the inherited stdin ("hi"), the child's
+    /// "HI" follows the `dup2` into the file `out` (fd inheritance) rather than to stdout. Returns the
+    /// reaped pid (1000). Ops: open=5, dup2=24, spawn=27, waitpid=28.
+    const SPAWN_REDIRECT: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vph: i32) {\n\
+  vp0 = i64.const 110\n\
+  voo = i32.const 111\n\
+  i32.store8 vp0 voo\n\
+  vp1 = i64.const 111\n\
+  vu2 = i32.const 117\n\
+  i32.store8 vp1 vu2\n\
+  vp2 = i64.const 112\n\
+  vtt = i32.const 116\n\
+  i32.store8 vp2 vtt\n\
+  vn0 = i64.const 100\n\
+  vuu = i32.const 117\n\
+  i32.store8 vn0 vuu\n\
+  vn1 = i64.const 101\n\
+  vpp = i32.const 112\n\
+  i32.store8 vn1 vpp\n\
+  vpath = i64.const 110\n\
+  vplen = i64.const 3\n\
+  vflags = i64.const 577\n\
+  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vone = i64.const 1\n\
+  vd = cap.call 13 24 (i64, i64) -> (i64) vph (vfd, vone)\n\
+  vnm = i64.const 100\n\
+  vnl = i64.const 2\n\
+  vz = i64.const 0\n\
+  vpid = cap.call 13 27 (i64, i64, i64, i64) -> (i64) vph (vnm, vnl, vz, vz)\n\
+  vsb = i64.const 120\n\
+  vr = cap.call 13 28 (i64, i64, i64) -> (i64) vph (vpid, vsb, vz)\n\
+  return vr\n\
+  }\n\
+}\n";
+
+    #[test]
+    fn spawn_child_inherits_redirected_stdout_on_both_backends() {
+        let m = parse_module(SPAWN_REDIRECT).expect("parse");
+        verify_module(&m).expect("verify");
+        let up = |_n: &str, _a: &[String], stdin: &[u8]| SpawnResult {
+            stdout: stdin.to_ascii_uppercase(),
+            status: 0,
+        };
+
+        // Interp.
+        let mut ih = Host::new();
+        let (h, iposix) = grant(&mut ih, HEAP_BASE, HEAP_END, b"hi".to_vec());
+        iposix.set_spawn(up);
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut ih,
+        )
+        .0;
+
+        // JIT.
+        let mut jh = Host::new();
+        let (jhh, jposix) = grant(&mut jh, HEAP_BASE, HEAP_END, b"hi".to_vec());
+        jposix.set_spawn(up);
+        let jo = compile_and_run_capture_reserved_with_host(
+            &m,
+            0,
+            &[jhh as i64],
+            &[0u8; WIN],
+            0,
+            svm_run::cap_thunk,
+            &mut jh as *mut Host as *mut core::ffi::c_void,
+        )
+        .expect("jit")
+        .0;
+
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(1000)]),
+            "interp: waitpid returns the spawned pid"
+        );
+        assert_eq!(
+            iposix.read_file("out").as_deref(),
+            Some(&b"HI"[..]),
+            "interp: child stdout followed the dup2 into the file"
+        );
+        assert_eq!(
+            iposix.stdout(),
+            b"",
+            "interp: nothing leaked to real stdout"
+        );
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[1000]),
+            "jit: must match interp, got {jo:?}"
+        );
+        assert_eq!(
+            jposix.read_file("out").as_deref(),
+            Some(&b"HI"[..]),
+            "jit: child stdout followed the dup2 into the file"
+        );
+        assert_eq!(jposix.stdout(), b"", "jit: nothing leaked to real stdout");
     }
 
     /// func 0 `(handle) -> i64`: `getenv("PATH")` (name bytes staged at offset 0 by the harness), then

@@ -385,9 +385,16 @@ signals ladder). In dependency order:
    **[Slice 1 done 2026-07-29 — the fd surface.]** `pipe`/`dup2`/`dup`/`fcntl` landed as real
    personality ops (POSIX.md ops 23–26) over a generalized fd table (stdio `0`/`1`/`2` are now ordinary
    sentinels, so `dup2(pipe_w, 1)` redirect and `close`/reuse of a stdio fd work as POSIX). Pipes are
-   intra-personality (a single guest's two ends share one buffer, non-blocking). **Remaining:** POSIX-
-   shaped `execve`/`waitpid` wrapping the built `Instantiator` op 13 + `join`/`poll`, and *inheriting*
-   a redirected fd across a spawn (handing a pipe/file end to the spawned child as its stdin/stdout).
+   intra-personality (a single guest's two ends share one buffer, non-blocking).
+   **[Slice 2 done 2026-07-29 — spawn/wait + fd inheritance.]** `spawn`/`waitpid`/`wait` landed as
+   personality ops (POSIX.md 27–29). A spawn is *authority* the libc personality does not hold, so the
+   instantiate+run is an **embedder-wired delegate** (`Posix::set_spawn`) — opt-in like the stdout
+   `Stream`, `-ENOSYS` unwired. The child **inherits the caller's fd 0 and fd 1**: `spawn` drains the
+   current fd-0 binding as the child's stdin and routes its captured stdout to the current fd-1 binding,
+   so a `dup2(pipe_w, 1)` / `dup2(file, 1)` redirect before the spawn lands the child's output exactly
+   where POSIX would (proven cross-backend). **Remaining:** `fork`/`vfork`/`execve` (return-twice /
+   image-replace) on the durable-clone capstone, and wiring an `Instantiator`-op-13 delegate in the
+   `svm-run` embedder so a *compiled* shell drives real children through this surface.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for

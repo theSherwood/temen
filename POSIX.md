@@ -127,10 +127,13 @@ only to mark the boundary.
 | 24 | `dup2(oldfd, newfd)` | `-> newfd \| -errno` | host fd table | **done** — the redirect primitive; pipe ends share the buffer, a `File` copies its description |
 | 25 | `dup(oldfd)` | `-> fd \| -errno` | host fd table | **done** — clone onto the lowest free fd |
 | 26 | `fcntl(fd, cmd, arg)` | `-> res \| -errno` | host fd table | **done** — `F_DUPFD`/`F_DUPFD_CLOEXEC` (dup ≥ arg); `F_GET/SETFD`/`F_GET/SETFL` accepted no-ops |
+| 27 | `spawn(name, nlen, argv, alen)` | `-> pid \| -errno` | embedder spawn delegate (`set_spawn`) | **done** — fork-free child; inherits fd 0/1 (drains stdin, routes stdout); `-ENOSYS` unwired. `posix_spawn(p)` bind here |
+| 28 | `waitpid(pid, status, opts)` | `-> pid \| -errno` | host child table | **done** — reaps `pid` (or `-1` = any); writes wait-encoded status (`WEXITSTATUS` in bits 8–15); `-ECHILD` unknown |
+| 29 | `wait(status)` | `-> pid \| -errno` | host child table | **done** — `waitpid(-1, status, 0)` |
 | — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
 | — | `signal/sigaction/kill` | doorbell (§9 L0) | host signal state, checked at command boundaries | todo |
 | — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
-| — | `fork/execve/waitpid` | Stage 3 | `Instantiator` / clone (§7) | partial — spawn+wait landed as `Instantiator` op 13 + `join` (Stage 1, STAGE1.md; ops 19/20 above); `fork` itself parked |
+| — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
 
 ## 6. Roadmap
