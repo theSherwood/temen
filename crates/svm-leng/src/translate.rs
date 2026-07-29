@@ -259,8 +259,21 @@ impl Translator {
                 Some("const") => {
                     let a = item.args();
                     if a.len() >= 4 {
-                        if let (Ok(name), Some(v)) = (sym_def(&a[0]), int_literal(&a[3])) {
+                        let name = sym_def(&a[0])?;
+                        if let Some(v) = int_literal(&a[3]) {
                             self.consts.insert(name, v);
+                        } else {
+                            // A non-scalar const — e.g. an `Rtti` vtable (`Type.vt`) or its RTTI
+                            // internals. Reserve an addressable, opaque placeholder global so
+                            // `(addr Type.vt)` yields a valid window address. Its bytes are never read
+                            // by translatable code (an object stores the vtable pointer, but only
+                            // *dynamic dispatch* reads through it, and that fail-closes), so a zeroed
+                            // fixed-size placeholder is sound — and we avoid resolving exotic RTTI
+                            // types (`flexarray`, external `Rtti`).
+                            const VT_PLACEHOLDER: u64 = 64;
+                            self.globals
+                                .insert(name, (off, TyDesc::Scalar(ValType::I64)));
+                            off += VT_PLACEHOLDER;
                         }
                     }
                 }
@@ -339,6 +352,34 @@ impl Translator {
                 // `(object [Empty|Base] (fld :f pragmas Type)*)` — packed at natural size.
                 let mut fields = Vec::new();
                 let mut off = 0u64;
+                // The first son is the base: `.` = no base; a symbol = inheritance. An inheritable
+                // object carries a leading vtable/type-header pointer (the positional slot an
+                // `(oconstr T <vtable> …)` fills), then the base's fields, then its own — so the base
+                // layout is inlined at the front.
+                if let Some(base) = body.args().first().and_then(|n| n.as_atom()) {
+                    if base != "." {
+                        self.resolve_type(base, raw)?;
+                        match self.types.get(base).cloned() {
+                            Some(Layout::Object {
+                                fields: bf,
+                                size: bsize,
+                            }) => {
+                                fields.extend(bf);
+                                off = bsize;
+                            }
+                            // External inheritable root (`RootObj`/`Exception`): a single 8-byte
+                            // vtable/type-header pointer at offset 0.
+                            _ => {
+                                fields.push((
+                                    "$vtable".to_string(),
+                                    0,
+                                    TyDesc::Scalar(ValType::I64),
+                                ));
+                                off = 8;
+                            }
+                        }
+                    }
+                }
                 for fld in body.args() {
                     if fld.tag() != Some("fld") {
                         continue; // skip the base/Empty slot
@@ -1267,19 +1308,25 @@ impl<'a> FuncGen<'a> {
     ) -> Result<(), LengError> {
         match rhs.tag() {
             Some("oconstr") => {
-                // `(oconstr T (kv Field Expr)*)`.
-                for kv in &rhs.args()[1..] {
-                    if kv.tag() != Some("kv") {
-                        continue;
+                // `(oconstr T [Vtable] (kv Field Expr)*)`. For an inheritable object the first
+                // positional element is the vtable/type-header pointer → the synthetic `$vtable`
+                // field at offset 0; the rest are keyed fields.
+                for elem in &rhs.args()[1..] {
+                    if elem.tag() == Some("kv") {
+                        let ka = elem.args();
+                        let fname = ka
+                            .first()
+                            .and_then(|n| n.as_atom())
+                            .ok_or_else(|| LengError::Malformed("kv needs a field name".into()))?;
+                        let (foff, fdesc) = self.field_of(ddesc, fname)?;
+                        let faddr = self.add_const_off(daddr, foff);
+                        self.store_member(faddr, &fdesc, &ka[1])?;
+                    } else if !elem.is_empty_marker() {
+                        // A positional element: the vtable pointer of an inheritable object.
+                        let (voff, vdesc) = self.field_of(ddesc, "$vtable")?;
+                        let vaddr = self.add_const_off(daddr, voff);
+                        self.store_member(vaddr, &vdesc, elem)?;
                     }
-                    let ka = kv.args();
-                    let fname = ka
-                        .first()
-                        .and_then(|n| n.as_atom())
-                        .ok_or_else(|| LengError::Malformed("kv needs a field name".into()))?;
-                    let (foff, fdesc) = self.field_of(ddesc, fname)?;
-                    let faddr = self.add_const_off(daddr, foff);
-                    self.store_member(faddr, &fdesc, &ka[1])?;
                 }
                 Ok(())
             }

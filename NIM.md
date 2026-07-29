@@ -301,15 +301,17 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 
   **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
   `break`/`continue` and `block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl.
-  constructors, copy, and **sret return**), enum/distinct scalars, **exceptions** (nimony's
-  error-flag ABI), **seq/string** value layout + operations (as runtime imports), globals, intra- and
-  cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
-  (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`,
-  `toNum`, `mayFail`, `guarded`, `counter`, `getAt`, `sumSeq`, `makeSeq`). Remaining for full real
-  modules (W1 Leng totality, §3a): exception payloads with `object`-of-`RootObj` inheritance
-  (vtables) and the `jtrue`/`mflag`/`vflag` conditional-jump forms. The bigger remaining lever is
-  **W3** — binding the seq/string (and other stdlib) imports to a real runtime so the lowered code
-  *runs*, not just verifies.
+  constructors, copy, and **sret return**), **object-of-`RootObj` inheritance** (base-inlining +
+  vtable header), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), **seq/string**
+  value layout + operations (as runtime imports), globals, intra- and cross-module calls —
+  fail-closed on the rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`,
+  `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`, `toNum`, `mayFail`, `guarded`,
+  `counter`, `getAt`, `sumSeq`, `makeSeq`, `kindOf`, `mkDerived`). **W1 (Leng totality) is
+  essentially closed** — what's left is genuinely runtime, not translation: dynamic method dispatch
+  and value-object exception payloads fail-close cleanly (both need the vtable/`exc`-threadvar
+  runtime), and the `jtrue`/`mflag`/`vflag` cfvar forms never reach us (hexer's `xelim` lowers them
+  away before the final IR). The remaining lever is **W3** — binding the seq/string (and other
+  stdlib) imports to a real runtime so the lowered code *runs*, not just verifies.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
       `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
@@ -317,6 +319,18 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
       y:b); p.x+p.y`), interp == JIT.
+    - **✅ object-of-`RootObj` inheritance — DONE 2026-07-29.** An inheritable object carries a
+      leading vtable/type-header pointer (the positional slot an `(oconstr T <vtable> …)` fills), then
+      the base's fields, then its own — `resolve_type` inlines a local base's layout at the front, and
+      an external inheritable root (`RootObj`) contributes a single 8-byte header. A `Type.vt` (`Rtti`)
+      const gets a zeroed, addressable placeholder global so `(addr Type.vt)` resolves; the stored
+      vtable pointer is opaque (only *dynamic dispatch* reads through it, and that fail-closes).
+      Tested on hand fixtures (construct-and-read-back a `Derived` — base field before derived field,
+      both past the header — and a base-field read through a pointer, both engines) and **real nimony
+      `kindOf`** (reads `e.value` through a `ptr BaseError`, *runs*) + **`mkDerived`** (constructs the
+      inherited object with its vtable — translates + verifies; running needs the ARC destructor
+      imports, W3). Value-object exception payloads (an object punned into the error tuple's scalar
+      `ErrorCode` slot) stay fail-closed.
     - **✅ seq/string (value layout + operations as imports) — DONE 2026-07-29.** nimony's `seq[T]`
       is a `{len, data*}` fat-pointer **object** (`string` analogous), so its value layout and element
       access already ride the object + pointer machinery — a hand-written seq summed over a
