@@ -517,16 +517,31 @@ diverge). Pinned by `svm/tests/revocation_errno.rs`: revoked → `-9009` on tree
 JIT (the JIT case exercising the fast path), forged → `CapFault` on all three, live-wrong-type
 → still `CapFault`.
 
-### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
+### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4) — **FIX LANDED 2026-07-29** (`claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Where:** a completed dispatch whose caller didn't (or can't) claim the reply parks the value in
 `Host::svc_results` keyed by ticket. If the caller died between enqueue and claim, nothing sweeps
 the entry — a long-lived serving domain accumulates orphaned tickets. Bounded by call volume, not
-by live state.
+by live state. The teardown code named it outright ("the callee's eventual reply finds no waiter and
+stashes, **harmlessly**") — harmless for correctness, but an unbounded slow leak as child callers
+come and go against a surviving server.
 
-**Fix sketch:** sweep a caller's outstanding tickets on its death/revocation (the
-death-is-revocation path already visits the waiter structures), or bound the map with an LRU/TTL.
-Small; suitable as a rider on any §3.6 residue slice.
+**FIX LANDED — drop the reply at its stash site instead of sweeping the callee.** Rather than chase
+`svc_results` (per-callee, keyed by bare ticket, with no caller attribution — nothing to sweep *by*),
+the fix records the *caller's* death and drops the reply when it arrives. A scheduler-side
+`Sched::orphan_tickets: BTreeSet<(callee_id, ticket)>` is populated wherever a caller with an
+in-flight call is reaped — `teardown_domain`'s caller sweep (the parked case, the one the old comment
+described) and the `CapReply` park gate (the rarer enqueue→park-window case) — and consumed at
+`Scheduler::cap_reply_or_stash`'s stash arm: a recorded ticket is dropped, not stashed. Tickets are
+unique per run (monotone `svc_next_ticket`), so a recorded key can **never** collide with a live
+dispatch — the fix cannot drop a live caller's reply. `orphan_tickets` is self-bounded: a callee that
+itself dies sweeps its own entries (their replies can't come), and each entry is removed the moment
+its reply lands. Scheduler-local — **no** change to the public `Host` API or the durability snapshot
+format. Scope is the tree-walker scheduler; the JIT/embedder serve loop has no cross-domain
+ticket-parked callers yet (I36 slice 3), so no orphan arises there. Pinned by
+`svm-interp` unit tests `orphan_reply_tests`: the consume invariant (dead-caller reply dropped, live
+reply stashed, cross-callee key isolation) and the populate + self-GC path (`teardown_domain` records
+a dying caller's outstanding ticket and sweeps orphans awaiting the now-dead domain).
 
 ### I35 — NOT a miscompile: a `--child-entry` `main`'s argv-relocated frame was rounded up to the next 16 KiB page and collided with a SharedRegion the program mapped there; a local array on that frame read back garbage (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner — **FIX LANDED 2026-07-27** (`claude/chibicc-playground-status-7n6eh0`)
 
