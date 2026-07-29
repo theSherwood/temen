@@ -254,6 +254,21 @@ enum Engine {
     Threaded(Box<ScheduledDebugRun>),
 }
 
+/// A cached map of the run's **stoppable positions** — `(clock, depth)` for every op that sits at a
+/// real IR instruction — over `[0, high_water]`. The op timeline of a deterministic replay is fixed
+/// for the whole session (breakpoints never change *which* ops run, and cap-input `tape` records are
+/// append-only + positional, so an earlier op's behavior can't change as the run goes further
+/// forward), so this is built once by a single fresh-run scan and reused by every `step_back` target
+/// search — replacing the per-`step_back` probe scan that re-derived it. Rebuilt only when a forward
+/// step advances the current position past `high_water`.
+struct RevTrace {
+    /// The furthest clock/turn the scan covered; the cache is valid for any position `<= high_water`.
+    high_water: u64,
+    /// `(clock, depth)` of each stoppable op in `[0, high_water)`, ascending — a `step_back` target is
+    /// the last entry strictly before the current position at call depth `<=` the current frame count.
+    stoppable: Vec<(u64, usize)>,
+}
+
 /// The **bytecode backend** — the resumable bytecode debug session ([`Engine`]) plus the persistent
 /// breakpoint set `DapServer` expects, the module (for `source_loc`/`func_name`, which are
 /// engine-neutral free functions keyed on the `IrPc`), and the launch `func`/`args` so reverse
@@ -281,6 +296,9 @@ pub struct BytecodeBackend {
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
     /// reverse replay is deterministic by re-execution alone; the tape covers the input-reading case.
     tape: CapTape,
+    /// Cached stoppable-position timeline for `step_back` target search (see [`RevTrace`]). `None` until
+    /// the first `step_back`; rebuilt when a forward step moves the position past its `high_water`.
+    rev_trace: Option<RevTrace>,
 }
 
 impl BytecodeBackend {
@@ -317,6 +335,7 @@ impl BytecodeBackend {
             powerbox,
             stdin,
             tape,
+            rev_trace: None,
         })
     }
 
@@ -367,6 +386,66 @@ impl BytecodeBackend {
             Engine::Single(run) => run.set_watchpoints(ranges),
             Engine::Threaded(run) => run.set_watchpoints(ranges),
         }
+    }
+
+    /// Ensure [`Self::rev_trace`] covers `[0, now]`, (re)building it with a single fresh-run scan when
+    /// absent or stale (a forward step moved the position past the cached `high_water`). This is the one
+    /// replay `step_back` used to pay *in addition to* the `seek`; caching it means a `step_back` at or
+    /// below a position already scanned pays only the `seek`. The op timeline is deterministic, so a
+    /// cached entry stays valid across later forward progress and `tape` growth (see [`RevTrace`]).
+    /// Returns `false` if the run couldn't be rebuilt (module outside the engine's subset) — the caller
+    /// reports `Stop::Blocked`, matching the pre-cache behavior.
+    fn ensure_rev_trace(&mut self, now: u64) -> bool {
+        if let Some(t) = &self.rev_trace {
+            if now <= t.high_water {
+                return true;
+            }
+        }
+        let mut fuel = self.fuel;
+        let mut stoppable = Vec::new();
+        match &self.engine {
+            Engine::Single(_) => {
+                let Some(mut probe) = self.fresh_single() else {
+                    return false;
+                };
+                loop {
+                    let c = probe.op_clock();
+                    if c >= now {
+                        break;
+                    }
+                    if probe.frame_pc(0).is_some() {
+                        stoppable.push((c, probe.depth()));
+                    }
+                    if !probe.tick(&mut fuel) {
+                        break;
+                    }
+                }
+            }
+            Engine::Threaded(_) => {
+                let Some(mut probe) = ScheduledDebugRun::new(&self.module, self.func, &self.args)
+                else {
+                    return false;
+                };
+                loop {
+                    let c = probe.op_turn();
+                    if c >= now {
+                        break;
+                    }
+                    probe.locate();
+                    if probe.frame_pc(0).is_some() {
+                        stoppable.push((c, probe.depth()));
+                    }
+                    if !probe.tick(&mut fuel) {
+                        break;
+                    }
+                }
+            }
+        }
+        self.rev_trace = Some(RevTrace {
+            high_water: now,
+            stoppable,
+        });
+        true
     }
 
     /// Map an engine completion (a resume/step returned no pc) to a `Stop`: the finished result (or
@@ -491,8 +570,8 @@ impl Debuggee for BytecodeBackend {
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // (single-vCPU, no capabilities), so seeking to an earlier op clock = rebuild a fresh run and
-    // replay to that many ops. `step_back` = one op earlier. (A checkpoint ladder to bound the replay
-    // cost is a future optimization; the debugged programs here are small.)
+    // replay to that many ops. `step_back` = one op earlier. (A checkpoint ladder to bound the `seek`
+    // replay cost is a future optimization; the debugged programs here are small.)
     fn step_back(&mut self) -> Stop {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
         // terminator slot, where there's nothing to inspect) strictly before now, then seek there. The
@@ -503,53 +582,26 @@ impl Debuggee for BytecodeBackend {
         // `printf` → the guest libc) rewinds to the previous op **in the caller's frame**, not down into
         // the callee's last op. Without this, stepping back from a `printf` descends into the libc
         // internals (`__pf_flush`, …) instead of the previous source line — the reverse of stepping over.
+        //
+        // The candidate positions come from the cached [`RevTrace`] (the run's fixed stoppable-op
+        // timeline), so the target search is a lookup rather than a second full replay — only the `seek`
+        // below re-executes. The first `step_back` past a new high-water builds the trace with one scan.
         let (now, now_depth) = match &self.engine {
             Engine::Single(run) => (run.op_clock(), run.depth()),
             Engine::Threaded(run) => (run.op_turn(), run.depth()),
         };
-        let mut fuel = self.fuel;
-        let target = match &self.engine {
-            Engine::Single(_) => {
-                let Some(mut probe) = self.fresh_single() else {
-                    return Stop::Blocked;
-                };
-                let mut target = 0;
-                loop {
-                    let c = probe.op_clock();
-                    if c >= now {
-                        break;
-                    }
-                    if probe.frame_pc(0).is_some() && probe.depth() <= now_depth {
-                        target = c;
-                    }
-                    if !probe.tick(&mut fuel) {
-                        break;
-                    }
-                }
-                target
-            }
-            Engine::Threaded(_) => {
-                let Some(mut probe) = ScheduledDebugRun::new(&self.module, self.func, &self.args)
-                else {
-                    return Stop::Blocked;
-                };
-                let mut target = 0;
-                loop {
-                    let c = probe.op_turn();
-                    if c >= now {
-                        break;
-                    }
-                    probe.locate();
-                    if probe.frame_pc(0).is_some() && probe.depth() <= now_depth {
-                        target = c;
-                    }
-                    if !probe.tick(&mut fuel) {
-                        break;
-                    }
-                }
-                target
-            }
-        };
+        if !self.ensure_rev_trace(now) {
+            return Stop::Blocked;
+        }
+        let target = self
+            .rev_trace
+            .as_ref()
+            .expect("ensure_rev_trace populated the cache")
+            .stoppable
+            .iter()
+            .rev()
+            .find(|(c, d)| *c < now && *d <= now_depth)
+            .map_or(0, |(c, _)| *c);
         self.seek(target)
     }
     fn seek(&mut self, t: u64) -> Stop {

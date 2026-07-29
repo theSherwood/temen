@@ -809,6 +809,72 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
     assert!(!frames.is_empty(), "a live frame after stepBack");
 }
 
+#[test]
+fn dap_over_bytecode_step_back_after_forward_progress_matches_the_tree_walker() {
+    // Exercises the `step_back` stoppable-position cache across a forward advance that moves the
+    // position *past* the cache's high-water: a first stepBack builds the trace at i=3, two forward
+    // `continue`s advance well beyond it (i=1), then a second stepBack must rebuild the trace to the
+    // new high-water and still land correctly. The observations must match the tree-walker's
+    // time-travel at every landing — the cache is a pure optimization, not a behavior change.
+    fn script(engine: Option<&str>) -> (String, String, String) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/work/sum.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // hit 1: i=3
+        s.handle(&req(5, "stepBack", Json::obj(vec![]))); // builds the trace (high-water at i=3)
+                                                          // Forward again, well past that high-water: the first `continue` re-hits i=3 (we rewound to
+                                                          // before it), then i=2, then i=1 — the furthest-forward position of the session.
+        s.handle(&req(6, "continue", Json::obj(vec![]))); // hit: i=3 (re-hit)
+        s.handle(&req(7, "continue", Json::obj(vec![]))); // hit: i=2
+        s.handle(&req(8, "continue", Json::obj(vec![]))); // hit: i=1
+        let at1 = read_locals(&mut s, 9); // (i=1, acc=5)
+        let back = s.handle(&req(10, "stepBack", Json::obj(vec![]))); // now > high-water ⇒ rebuild, then seek
+        let reason = event(&back, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after_back = read_locals(&mut s, 11); // one op before the i=1 stop
+        (
+            format!("{},{}", at1.0, at1.1),
+            reason,
+            format!("{},{}", after_back.0, after_back.1),
+        )
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert_eq!(bytecode.0, "1,5", "furthest-forward hit is i=1, acc=5");
+    assert_eq!(bytecode.1, "step", "the rebuild-then-seek stepBack is a step stop");
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode step_back across a cache rebuild ≡ tree-walker time-travel",
+    );
+}
+
 // A `thread.spawn` guest (two workers each load/add/store mem[0]; root spawns + joins). Auto debug
 // info makes the worker's `vc = i64.load vaddr` breakpointable — it's on line 18 (leading newline is
 // line 1). Drives the multithreaded scheduled bytecode engine over DAP.
