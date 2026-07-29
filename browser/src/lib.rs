@@ -5173,18 +5173,30 @@ pub extern "C" fn svm_wasmjit_compile_full(
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
     };
-    // `compile_module_mixed_entry` (slice 3) emits the reachable in-subset functions and routes a
-    // call to an interp leaf through `env.call_interp` → [`svm_wasmjit_call_interp`]; a
+    // This FFI services cross-tier leaves on a *throwaway* window ([`svm_wasmjit_call_interp`], via
+    // `bytecode::compile_and_run` with no window), so it can only accept guests whose cross-tier
+    // callees are memory-free leaves — the `mixed_ok` condition. `compile_jit`'s wasm-driven path can
+    // *also* emit reactor guests with memory/cap-touching cross-tier callees over a *shared* window,
+    // which this callback can't service — so gate on `mixed_ok` first and fail closed otherwise. For a
+    // `mixed_ok` guest the emitted wasm is byte-identical to the old `compile_module_mixed_entry`
+    // (reactor's cross-tier set collapses to exactly the memory-free leaves). Emits `f{entry}`; a
     // fully-in-subset guest is the special case with no leaves.
-    match svm_wasm_jit::compile_module_mixed_entry(&m, entry, shared != 0) {
-        Ok(wasm) => {
+    if !svm_wasm_jit::analyze_from(&m, entry).mixed_ok {
+        return 0;
+    }
+    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry }, shared != 0) {
+        Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) => {
             // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
             // Keep the decoded module for the cross-tier callback (it runs an interp leaf).
             unsafe { *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m) };
             1
         }
-        Err(_) => 0,
+        _ => 0,
     }
 }
 

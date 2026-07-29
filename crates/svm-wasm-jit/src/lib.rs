@@ -1075,42 +1075,6 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
 }
 
-/// The **leaf-only / throwaway-window** mixed-tier strategy (`BROWSER.md` § "wasm-JIT tier", slice 3),
-/// rooted at `entry` (the function the host calls): emit the reachable in-subset functions and route a
-/// call to a strict [`interp_leaf`] (memory-free, call-free, cap-free — so the host may run it on a
-/// throwaway window) through `env.call_interp`. [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
-///
-/// This is *not* subsumed by the `compile_jit` front door's wasm-driven path (which uses
-/// [`compile_module_reactor`]): reactor widens cross-tier callees to any integer-signature function —
-/// including memory/cap-touching ones — which the host must then run over the **shared** window. This
-/// entry's leaf-only guarantee is what lets a host with a *throwaway*-window cross-tier callback
-/// (`svm_wasmjit_compile`, the legacy demo/bench FFI) stay correct. Retiring it means moving that FFI
-/// to the shared-window model. Every emitted
-/// function is still exported as `f{svm_idx}`, so the host calls `f{entry}`.
-pub fn compile_module_mixed_entry(
-    m: &Module,
-    entry: u32,
-    shared_memory: bool,
-) -> Result<Vec<u8>, Error> {
-    let a = analyze_from(m, entry);
-    if !a.mixed_ok {
-        return Err(Error::Unsupported("guest is not mixed-tier runnable"));
-    }
-    // Emit the reachable in-subset functions in SVM-index order; each gets the next wasm index.
-    // Interp leaves (and unreachable / non-subset functions) get no wasm index — a call to a leaf
-    // goes to the import. Restricting to `reachable` keeps an unreachable in-subset function (whose
-    // own callees `mixed_ok` never checked) from being emitted with an unroutable call.
-    let mut wasm_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
-    let mut emitted: Vec<usize> = Vec::new();
-    for (i, slot) in wasm_of.iter_mut().enumerate() {
-        if a.reachable[i] && a.in_subset[i] {
-            *slot = Some(IMPORTED_FUNCS + emitted.len() as u32);
-            emitted.push(i);
-        }
-    }
-    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
-}
-
 /// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
 /// function, rewriting the call site to a plain [`Inst::Call`]. Semantics-preserving (the wrapper
 /// does the *identical* `cap.call`), but it moves the host-boundary op out of otherwise-emittable
@@ -1292,7 +1256,7 @@ pub fn outline_cap_calls(m: &mut Module) {
 /// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
 /// reachable in-subset function to wasm and route a **direct** `Call` to any reachable, non-emitted,
 /// **integer-signature** function through `env.call_interp` — not just the strict memory-free/call-free
-/// [`interp_leaf`]s [`compile_module_mixed_entry`] allows. A cross-tier callee here may touch memory,
+/// `interp_leaf`s the throwaway-window path allows. A cross-tier callee here may touch memory,
 /// call other functions, and use capabilities, so the host's `call_interp` callback **must run it over
 /// the SAME (shared) window + host** as the emitted code (a fresh window would lose its memory
 /// effects) — the contract this mode adds over the leaf-only modes, which run leaves over a throwaway
@@ -1346,7 +1310,7 @@ pub fn compile_module_reactor(
 }
 
 /// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
-/// per-Worker JIT). Unlike [`compile_module_mixed_entry`], eligibility is **not** rooted at one
+/// per-Worker JIT). Unlike the rooted, wasm-driven [`compile_module_reactor`], eligibility is **not** rooted at one
 /// entry: the guest keeps running on the resumable interpreter (which drives `thread.spawn`/`join`,
 /// atomics, `memory.wait`), and a direct `Call` to any emitted function surfaces as a *tier-up* the
 /// host runs on the emitted region — so a pure compute leaf reachable **only** through

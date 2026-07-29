@@ -1,10 +1,10 @@
 //! Coverage for the two capabilities the cross-engine bench needs (BROWSER.md § "wasm-JIT tier"):
-//! **entry-rooting** (`compile_module_mixed_entry` — the JIT entry is an arbitrary function, not
-//! func 0) and **data tolerance** (the emitter no longer rejects `data` segments; the host lays them
-//! into the window before running). Both are exercised by emitting under `wasmi`, initializing the
-//! window from `m.data`, and comparing to the tree-walk oracle.
+//! **entry-rooting** (`compile_jit` with `Shape::Batch { entry }` — the JIT entry is an arbitrary
+//! function, not func 0) and **data tolerance** (the emitter no longer rejects `data` segments; the
+//! host lays them into the window before running). Both are exercised by emitting under `wasmi`,
+//! initializing the window from `m.data`, and comparing to the tree-walk oracle.
 
-use svm_wasm_jit::{analyze_from, compile_module_mixed_entry};
+use svm_wasm_jit::{analyze_from, compile_jit, DriveMode, Shape};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -19,7 +19,12 @@ fn parse(src: &str) -> svm_ir::Module {
 /// Run the emitted `f{entry}` under wasmi over a window seeded with `m.data`, returning its i64
 /// result. `arg` is the single i64 param.
 fn jit_run(m: &svm_ir::Module, entry: u32, arg: i64) -> i64 {
-    let wasm = compile_module_mixed_entry(m, entry, false).expect("mixed-eligible");
+    let artifact = compile_jit(m, Shape::Batch { entry }, false).expect("compile");
+    assert!(
+        matches!(artifact.drive, DriveMode::WasmDriven { .. }),
+        "a mixed-eligible guest is wasm-driven"
+    );
+    let wasm = artifact.wasm;
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
