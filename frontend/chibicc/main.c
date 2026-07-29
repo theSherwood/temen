@@ -8,6 +8,7 @@ StringArray include_paths;
 bool opt_fcommon = true;
 bool opt_fpic;
 bool opt_emit_ir; // emit SVM text IR instead of x86-64 assembly
+bool opt_emit_object; // --emit-object: emit a linkable SVM unit (cc -c), not a whole program
 bool opt_g;       // -g: also emit the SVM debug-info section (DEBUGGING.md §6 waist)
 bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable via instantiate_module)
 int opt_data_page = 16384; // --data-page: RO/writable data isolation granularity (§3a / D40); 64 KiB for the wasm browser
@@ -137,6 +138,17 @@ static void parse_args(int argc, char **argv) {
     }
 
     if (!strcmp(argv[i], "--emit-ir")) {
+      opt_emit_ir = true;
+      continue;
+    }
+
+    // `--emit-object`: emit a *linkable SVM unit* (native `cc -c`) instead of a whole program —
+    // non-`static` functions are `export`ed and calls to undefined externs become function-symbol
+    // imports (`call.sym "name"`) for `svm_ir::link` to resolve cross-unit. Implies `--emit-ir`
+    // (units are always SVM IR). Used to compile a multi-TU program (e.g. chibicc's own source) one
+    // TU at a time and link the units, mirroring separate compilation.
+    if (!strcmp(argv[i], "--emit-object")) {
+      opt_emit_object = true;
       opt_emit_ir = true;
       continue;
     }

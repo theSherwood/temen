@@ -13,6 +13,7 @@ StringArray include_paths;
 bool opt_fcommon = true;
 bool opt_fpic;
 bool opt_emit_ir = true;
+bool opt_emit_object; // --emit-object: emit a linkable SVM unit (cc -c) instead of a whole program
 bool opt_g; // debug info off by default (`-g` turns it on); the `debug.*` waist is ~a third of the
             // emitted IR, so the playground compiles clean+fast unless the user opts into debugging.
 bool opt_child_entry;
@@ -54,6 +55,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
       opt_data_page = atoi(argv[ai + 1]);
       ai += 2;
+    } else if (!strcmp(argv[ai], "--emit-object")) {
+      opt_emit_object = true; // emit a linkable unit (cc -c) — see codegen_ir.c
+      ai++;
     } else if (!strcmp(argv[ai], "-g")) {
       opt_g = true;
       ai++;
