@@ -45,6 +45,16 @@ struct ImportTable {
     slot_of: HashMap<String, u32>,
 }
 
+/// Escape raw bytes as an svm-text string body: every byte as `\xHH` (round-trips through the
+/// lexer's `\xHH` escape; simple and unambiguous for the short scalar-initializer payloads here).
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 4);
+    for b in bytes {
+        s.push_str(&format!("\\x{b:02x}"));
+    }
+    s
+}
+
 /// The svm-text prefix for a value type (`i32`/`i64`). This subset only produces integer types.
 fn prefix(ty: ValType) -> &'static str {
     match ty {
@@ -107,6 +117,9 @@ pub(crate) struct Translator {
     globals: HashMap<String, (u64, TyDesc)>,
     /// Scalar integer `const`s, inlined at use.
     consts: HashMap<String, i64>,
+    /// Non-zero scalar global initializers → `(window offset, little-endian bytes)`, emitted as
+    /// module `data` segments (the window is otherwise zero at start).
+    data_inits: Vec<(u64, Vec<u8>)>,
     /// Cross-module callees lowered to SVM imports (discovered during emission).
     imports: RefCell<ImportTable>,
 }
@@ -117,6 +130,7 @@ impl Translator {
             procs: HashMap::new(),
             types: HashMap::new(),
             agg_names: std::collections::HashSet::new(),
+            data_inits: Vec::new(),
             globals: HashMap::new(),
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
@@ -151,10 +165,12 @@ impl Translator {
         Ok(slot)
     }
 
-    /// Assemble the final module text: `memory` (if used) + `import` declarations + funcs.
+    /// Assemble the final module text: `memory` (if used) + `import` declarations + `data` segments
+    /// (non-zero global initializers) + funcs.
     fn assemble(&self, used_memory: bool, funcs: String) -> String {
         let mut out = String::new();
-        if used_memory {
+        // Any data segment writes into the window, so the module must declare `memory`.
+        if used_memory || !self.data_inits.is_empty() {
             out.push_str("memory 16\n\n");
         }
         let t = self.imports.borrow();
@@ -169,6 +185,12 @@ impl Translator {
             out.push_str(&format!("import {slot} \"{}\" ({ps}) -> ({rs})\n", d.name));
         }
         if !t.decls.is_empty() {
+            out.push('\n');
+        }
+        for (off, bytes) in &self.data_inits {
+            out.push_str(&format!("data {off} \"{}\"\n", escape_bytes(bytes)));
+        }
+        if !self.data_inits.is_empty() {
             out.push('\n');
         }
         out.push_str(&funcs);
@@ -188,11 +210,26 @@ impl Translator {
                     }
                     let name = sym_def(&a[0])?;
                     let desc = self.tydesc(&a[2])?;
+                    // A non-zero scalar initializer becomes a `data` segment at the global's offset
+                    // (the window is otherwise zero). Non-int / aggregate initializers fail-close.
                     if let Some(init) = a.get(3) {
-                        if !init.is_empty_marker() && int_literal(init) != Some(0) {
-                            return Err(LengError::Unsupported(format!(
-                                "non-zero global initializer for `{name}`"
-                            )));
+                        if !init.is_empty_marker() {
+                            match (int_literal(init), &desc) {
+                                (Some(0), _) => {}
+                                (Some(v), TyDesc::Scalar(t)) => {
+                                    let w = match t {
+                                        ValType::I32 | ValType::F32 => 4,
+                                        _ => 8,
+                                    };
+                                    self.data_inits
+                                        .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                                }
+                                _ => {
+                                    return Err(LengError::Unsupported(format!(
+                                        "non-scalar-int global initializer for `{name}`"
+                                    )))
+                                }
+                            }
                         }
                     }
                     let sz = self.sizeof(&desc);

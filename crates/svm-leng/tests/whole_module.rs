@@ -61,14 +61,45 @@ fn globals_const_and_intramodule_calls() {
 }
 
 #[test]
-fn nonzero_global_init_is_fail_closed() {
-    // A non-zero global initializer isn't supported yet → clean error, never a wrong zero.
+fn nonzero_global_initializer_via_data() {
+    // A non-zero scalar global initializer becomes a `data` segment seeding the window; the global
+    // reads back its initial value. (i32 and i64 widths both.)
     let leng = "\
 (stmts
  (gvar :g.0. . (i +64) 5)
- (proc :main.0. . (i +64) . (stmts . (ret g.0.))))";
+ (gvar :h.0. . (i +32) 7)
+ (proc :sum.0. . (i +64) . (stmts . (ret (add (i +64) g.0. (conv (i +64) h.0.))))))";
+    let text = svm_leng::translate_to_text(leng).unwrap();
+    assert!(
+        text.contains("data "),
+        "non-zero init emits a data segment:\n{text}"
+    );
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 12, "5 + 7");
+}
+
+#[test]
+fn nonint_global_initializer_is_fail_closed() {
+    // A non-scalar-int (here aggregate) initializer still fail-closes.
+    let leng = "\
+(stmts
+ (type :Pt.0. . (object . (fld :x.0 . (i +64))))
+ (gvar :g.0. . Pt.0. (oconstr Pt.0. (kv x.0 1)))
+ (proc :main.0. . (i +64) . (stmts . (ret 0))))";
     match svm_leng::translate(leng) {
         Err(svm_leng::LengError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported for non-zero global init, got {other:?}"),
+        other => panic!("expected Unsupported for aggregate global init, got {other:?}"),
     }
+}
+
+/// Real nimony `hexer` output for `var counter: int = 42` plus `getCounter`/`addCounter` — the
+/// static non-zero initializer must seed the window so `getCounter()` reads 42.
+#[test]
+fn real_nimony_global_init() {
+    const REAL: &str = include_str!("fixtures/real_global.leng.nif");
+    let m = svm_leng::translate_procs(REAL, &["getCounter.0.", "addCounter.0."])
+        .unwrap_or_else(|e| panic!("translate real getCounter/addCounter: {e}"));
+    assert_eq!(run(&m, 0, &[]), 42, "counter initialized to 42");
+    assert_eq!(run(&m, 1, &[8]), 50, "42 + 8");
+    assert_eq!(run(&m, 1, &[-42]), 0, "42 - 42");
 }

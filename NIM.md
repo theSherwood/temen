@@ -304,10 +304,10 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
   **sret return**), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), globals, intra-
   and cross-module calls — fail-closed on the rest, and is validated against genuine `hexer` bytes
   (`addTwo`, `maxi`, `dot2`, `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`,
-  `toNum`, `mayFail`, `guarded`). Remaining for full real modules (W1 Leng totality, §3a): seq/string,
-  exception payloads with `object`-of-`RootObj` inheritance (vtables), the `jtrue`/`mflag`/`vflag`
-  conditional-jump forms, and non-zero global/data initializers — plus wiring nimony's real export
-  signatures for imports.
+  `toNum`, `mayFail`, `guarded`, `counter`). Remaining for full real modules (W1 Leng totality,
+  §3a): seq/string, exception payloads with `object`-of-`RootObj` inheritance (vtables), and the
+  `jtrue`/`mflag`/`vflag` conditional-jump forms — plus wiring nimony's real export signatures for
+  imports.
     - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
       (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
       `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
@@ -315,6 +315,12 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
       an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
       y:b); p.x+p.y`), interp == JIT.
+    - **✅ non-zero global initializers — DONE 2026-07-29.** A `gvar` with a non-zero scalar-int
+      initializer becomes a module `data` segment (little-endian bytes at the global's window offset)
+      — the window is otherwise zero, so a zero initializer stays a no-op, and a non-scalar/aggregate
+      initializer fail-closes. Tested on hand fixtures (i32 + i64) and **real nimony `var counter:
+      int = 42`** with `getCounter`/`addCounter`: the data segment seeds the window so `getCounter()`
+      reads 42, interp == JIT.
     - **✅ enum/distinct scalars — DONE 2026-07-29.** A named type is an aggregate only when it's a
       locally-declared `(object …)`/`(array …)`; every other named type — an `(enum …)`, a `distinct`
       int, a `proctype`, or a type external to the module — is an integer scalar (its values are
