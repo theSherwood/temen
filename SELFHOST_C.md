@@ -381,6 +381,33 @@ compiler bug is a clean error, never an escape.
    runtime needs `malloc`/`printf`/file I/O (the LLVM-on-ramp self-host build synthesizes these; the
    emit-object path does not yet); (c) the **bootstrap-fixpoint** differential (§5 E). The cross-TU
    function + data linking, the `data.top` stack base, headers, and heap it all stands on are done.
+
+   **→ Emit-object libc (b′) increment 1 DONE 2026-07-29 — the *mechanism* proven.** A from-scratch
+   libc **designed for chibicc's own frontend** (`crates/svm/tests/fixtures/emit_libc/mini_libc.c`),
+   not the clang-tuned aggregator: a bump `malloc`, the `mem`/`str` family, and a **varargs** `printf`
+   that writes through the powerbox `write` cap. `demo1.c` malloc's an array, copies a string, and
+   prints a deterministic line; the two units link (`link_with_manifest`, `write` a host-bound
+   manifest import) and run through `_start` on interp==JIT with a byte-exact stdout oracle
+   (`c_link.rs::links_and_runs_emit_libc_under_powerbox`). This pins that varargs printf + heap +
+   cross-TU linking + a powerbox cap compose end-to-end through emit-object.
+
+   *Increment 1 surfaced and fixed a real linker confinement bug.* The linker stacked units' data
+   16-byte-tight, so the entry unit's read-only tail (a symbol-name string at the args-region boundary)
+   shared a **host page** with the libc unit's writable arena; the D40 read-only protection (host-page
+   granular) marked the page `PROT_READ` and the arena's first store faulted (`MemoryFault`). Fix:
+   page-align each unit's data base to `POWERBOX_STACK_ALIGN` (64 KiB, the max host page), so units
+   never share a host page and each unit's internal ro/rw page separation survives relocation
+   (`svm-ir::link_impl`; regression `svm-ir::link_layout_tests`). Same class as the Doom read-only-page
+   fault, now for stacked link units.
+
+   **Remaining for increment 2 (make the *real* ~9 cc1 TUs compile + run).** The clang-tuned aggregator
+   does **not** compile under emit-object; gaps found: (i) `tokenize.c`'s `strtoul` reads as implicitly
+   declared — glibc 2.38+ redirects it to `__isoc23_strtoul` via `__REDIRECT_NTH` (an `__asm__`-rename
+   macro chibicc's parser doesn't follow), so a self-host prelude decl or a feature-macro that avoids
+   the ISO C23 redirect is needed; (ii) `chibicc_extra.c`'s `free` redefines a `free` chibicc's headers
+   already supply (the aggregator assumed clang's headers); (iii) float formatting needs `__vm_fmt_*`
+   (on-ramp-synthesized today) or a guest dtoa. Increment 1's `mini_libc.c` is the seed to grow into
+   this real emit-object libc.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

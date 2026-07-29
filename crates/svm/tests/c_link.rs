@@ -150,6 +150,22 @@ fn object_unit(tag: &str, src: &str) -> LinkUnit {
     }
 }
 
+/// Compile a crafted fixture `.c` file (repo-relative path) to a linkable unit via `--emit-object`.
+/// Like [`object_unit`] but sourced from a file so larger units (the emit-object libc) live as real C
+/// on disk. Fixtures carry no system `#include` (only the compiler-provided `<stdarg.h>`), so this is
+/// cross-platform — unlike [`object_unit_real`], which compiles chibicc's own Linux-header source.
+fn object_unit_file(rel_path: &str) -> LinkUnit {
+    let full = repo_root().join(rel_path);
+    let src =
+        std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read fixture {rel_path}: {e}"));
+    let tag = full
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture")
+        .to_string();
+    object_unit(&tag, &src)
+}
+
 /// Run function `idx` of an already-verified module on interp **and** JIT with a leading data-SP
 /// (`i64`) followed by `i32` args, assert the backends agree, and return the `i32` result. The SP is
 /// above the module's data window; these functions do only SP arithmetic (no load/store), so any
@@ -533,6 +549,57 @@ fn links_and_runs_under_powerbox_with_argv() {
         .expect("run _start with argv");
     assert_eq!(run.stdout, b"hi\nhi\n", "wrote the cross-TU msg argc times");
     assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(2)]));
+}
+
+/// **A self-host libc TU for the emit-object path, run under the powerbox** (task #20, increment 1).
+/// The whole point of #20 is that chibicc's `--emit-object` backend — unlike the LLVM on-ramp — does
+/// *not* synthesize `malloc`/`memcpy`/`printf`, so running a compiled-by-chibicc program needs a libc
+/// chibicc itself can compile. This links two emit-object units: `mini_libc.c` (a from-scratch libc:
+/// bump `malloc`, the `mem`/`str` family, and a **varargs** `printf` that writes through the powerbox
+/// `write` cap) and `demo1.c` (a consumer whose `main` malloc's an array, copies a string, and prints
+/// a deterministic line). Every libc call crosses the unit boundary and resolves at link; `write`
+/// stays a host-bound manifest import. The linked program then runs through `_start` on interp==JIT,
+/// so this pins that the libc *mechanism* the full self-host needs — varargs printf + heap + cross-TU
+/// linking + a powerbox cap — composes end-to-end through emit-object. Later increments grow the libc
+/// toward the surface that runs all ~9 cc1 TUs (the clang-tuned aggregator does not compile here).
+#[test]
+fn links_and_runs_emit_libc_under_powerbox() {
+    use svm_run::{instantiate, Outcome, RunConfig, Value};
+
+    // Entry unit first so its `_start` is merged function 0 (the powerbox entry); the libc unit has
+    // no `main`, so it contributes no `_start`.
+    let demo = object_unit_file("crates/svm/tests/fixtures/emit_libc/demo1.c");
+    let libc = object_unit_file("crates/svm/tests/fixtures/emit_libc/mini_libc.c");
+
+    // `demo` imports `malloc`/`printf`/`strcpy`/`strlen` (cross-TU, resolved to direct calls); `libc`
+    // imports only `write` (a powerbox cap). `link_with_manifest` resolves the cross-TU calls and
+    // retains `write` as a host-bound manifest import.
+    let linked = svm_ir::link_with_manifest(&[demo, libc]).expect("link demo + emit-object libc");
+    assert!(
+        linked.imports.iter().any(|i| i.name == "write"),
+        "write retained as a host-bound manifest import: {:?}",
+        linked.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !linked
+            .imports
+            .iter()
+            .any(|i| i.name == "malloc" || i.name == "printf"),
+        "libc calls resolved to direct cross-TU calls, not left as imports"
+    );
+    svm_verify::verify_module(&linked).expect("verify linked emit-object libc program");
+
+    // Runs `_start` on the tree-walk oracle and the JIT (§18); `run_diff` asserts their stdout/stderr
+    // agree. `main` returns the array sum (0²+…+7² = 140); the printf line is a fixed oracle.
+    let inst = instantiate(linked).expect("instantiate");
+    let run = inst
+        .run_diff(&RunConfig::default())
+        .expect("run _start on interp+jit");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(140)]));
+    assert_eq!(
+        run.stdout, b"sum=140 first=0 last=49 len=5 str=hello hex=ff char=!\n",
+        "malloc + strcpy/strlen + varargs printf composed through the emit-object libc"
+    );
 }
 
 /// The mechanism on **unmodified upstream chibicc source**: `type.c` is the TU that defines the
