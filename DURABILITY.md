@@ -2208,11 +2208,19 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      are unchanged (root id is `0`). Pinned by
      `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`
      (freeze → thaw → re-freeze; the grandchild's serve state is attributed to C1, not the root,
-     at every step — the assertion fails without the fix). **Still open** (deferred, ISSUES.md
-     I49): the nested-holder *re-link* itself (proven to fire, but its only end-to-end observable
-     — a serving child's handler forwarding to a grandchild through the re-linked cap — dead-locks
-     on the single worker, a pre-existing serve-chain gap independent of durability), plus the
-     wire/child-regrant sibling-provenance name.
+     at every step — the assertion fails without the fix).
+   * **Nested-holder re-link — BUILT 2026-07-28.** With the depth-2 keying fixed and the
+     serve-chain deadlock resolved (ISSUES.md I49: `ticket_waiters` keyed by `(callee, ticket)` —
+     a handler forwarding to another server no longer clobbers the outer caller's waiter), the
+     thaw re-link is generalized from **root-only to every holder**, keyed by the
+     `(holder task, join slot)` edge (root-direct children key on `(id, slot)`, a grandchild on
+     `(its parent-child cid, slot)`). A child C1's durable cap onto a grandchild C2 now re-links
+     on thaw. Pinned end to end by
+     `svm-durable/tests/serve.rs::a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked`:
+     freeze the three-level cap-holding subtree, thaw, seed the root's queue, and the root drives
+     `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails with
+     `-11`/`EAGAIN` without the generalization). **Still open:** the wire/child-regrant
+     **sibling-provenance** durable name (a live cap with no §14 child behind it).
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options

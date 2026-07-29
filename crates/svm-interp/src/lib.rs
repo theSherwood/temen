@@ -2135,10 +2135,18 @@ fn drive_arc(
             // absolute base + its own recorded offset — accumulated down the chain here.
             let mut abs_off: std::collections::BTreeMap<TaskId, u64> =
                 std::collections::BTreeMap::new();
-            // §13.4 slice 4d: the re-created **direct** children's host Arcs, by join slot, so a
-            // holder's restored `LiveImpl` can be re-linked to its callee after the rebuild.
-            let mut direct_child_hosts: std::collections::BTreeMap<usize, Arc<Mutex<Host>>> =
-                std::collections::BTreeMap::new();
+            // §13.4 slice 4d: the re-created children's host Arcs, so a holder's restored
+            // `LiveImpl` can be re-linked to its callee after the whole subtree is rebuilt.
+            // `child_hosts_by_edge` resolves a callee by the **(holder task, join slot)** edge —
+            // root-direct children key on `(id, slot)`, a grandchild on `(its parent-child's cid,
+            // slot)` — so a *nested* holder (a child holding a cap onto a grandchild) re-links too,
+            // not just the root. `holder_hosts` pairs every re-created child with its own cid, so
+            // each is drained as a potential holder (the root is prepended explicitly below).
+            let mut child_hosts_by_edge: std::collections::BTreeMap<
+                (TaskId, usize),
+                Arc<Mutex<Host>>,
+            > = std::collections::BTreeMap::new();
+            let mut holder_hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
             for fnr in nseed {
                 let parent = fnr.parent_task as TaskId;
                 // The parent-child's absolute carve base (0 for a direct child of the root).
@@ -2283,11 +2291,12 @@ fn drive_arc(
                 };
                 let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
                 // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
-                // can be re-linked to it once the whole subtree is rebuilt (below).
+                // can be re-linked to it once the whole subtree is rebuilt (below). Key the callee
+                // by its `(parent task, join slot)` edge and record the child as a holder under its
+                // own cid, so both root-direct and nested (child→grandchild) re-links resolve.
                 let child_host = Arc::new(Mutex::new(ch));
-                if parent == id {
-                    direct_child_hosts.insert(fnr.slot, Arc::clone(&child_host));
-                }
+                child_hosts_by_edge.insert((parent, fnr.slot), Arc::clone(&child_host));
+                holder_hosts.push((cid, Arc::clone(&child_host)));
                 let mut child = Box::new(VCpu::new(
                     Arc::clone(&cfuncs),
                     fnr.entry,
@@ -2335,20 +2344,25 @@ fn drive_arc(
                 abs_off.insert(cid, abs_carve);
                 children.insert(cid, child);
             }
-            // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-created
-            // direct children now that the subtree exists — the holder's rewound call then
-            // dispatches to the live callee exactly as before the freeze. (A nested holder's
-            // pending re-links — a child holding a cap onto a grandchild — are a follow-up.)
-            let pending = host_shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take_pending_live_impls();
-            for (idx, cslot, export) in pending {
-                if let Some(chost) = direct_child_hosts.get(&cslot) {
-                    host_shared
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .relink_live_impl(idx, Arc::clone(chost), export);
+            // §13.4 slice 4d: re-link every holder's restored `LiveImpl` handles to their
+            // re-created callees now that the subtree exists — the holder's rewound call then
+            // dispatches to the live callee exactly as before the freeze. Each holder (the root and
+            // every re-created child) resolves its callee by the `(holder task, join slot)` edge, so
+            // a nested holder (a child holding a cap onto a grandchild) re-links against its *own*
+            // children, not just the root against its direct children.
+            let holders = std::iter::once((id, Arc::clone(&host_shared))).chain(holder_hosts);
+            for (htask, hhost) in holders {
+                let pending = hhost
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take_pending_live_impls();
+                for (idx, cslot, export) in pending {
+                    if let Some(chost) = child_hosts_by_edge.get(&(htask, cslot)) {
+                        hhost
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .relink_live_impl(idx, Arc::clone(chost), export);
+                    }
                 }
             }
             // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
