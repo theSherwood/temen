@@ -102,6 +102,15 @@ thaw-time wake-ordering hole the I44 clamp doesn't cover (sibling-notify-on-thaw
 teardown SIGSEGV in the `durable_concurrent_jit` harness — both want a macOS-hammer repro
 (`stress-ng`-style loop over the full binary) to localize, as I44 needed the full-binary hammer.
 
+**Recurrence 2026-07-29 (PR #510, the posix→LLVM-on-ramp bridge).** `build · test (macos-latest)`
+hung in `svm-interp/tests/svc_serve_chain.rs::a_handler_forwarding_to_another_server_completes`
+("running for over 60 seconds" → job cancelled at the 45-min cap); the other 20 jobs were green
+(Linux `build · test · fmt · clippy`, `svm-llvm`, windows, all differentials). Same I44 family (a
+service-point handler forwarding — the fixed root→C1.fwd→C2.leaf deadlock's macOS scheduling twin,
+now intermittent). Definitively base-branch, not the PR: #510 touches only `svm-posix`/`svm-run`/
+`svm-llvm`/docs — **zero lines in `crates/svm-interp`**, so that test binary is byte-identical to
+main. Re-ran (expect green).
+
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
 `cargo run --release --example megabench -p svm` panics after the first four kernels
