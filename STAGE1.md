@@ -392,9 +392,14 @@ signals ladder). In dependency order:
    `Stream`, `-ENOSYS` unwired. The child **inherits the caller's fd 0 and fd 1**: `spawn` drains the
    current fd-0 binding as the child's stdin and routes its captured stdout to the current fd-1 binding,
    so a `dup2(pipe_w, 1)` / `dup2(file, 1)` redirect before the spawn lands the child's output exactly
-   where POSIX would (proven cross-backend). **Remaining:** `fork`/`vfork`/`execve` (return-twice /
-   image-replace) on the durable-clone capstone, and wiring an `Instantiator`-op-13 delegate in the
-   `svm-run` embedder so a *compiled* shell drives real children through this surface.
+   where POSIX would (proven cross-backend). **[Slice 2.5 done 2026-07-29 — end-to-end with a real
+   child.]** A **compiled-C shell** now drives a **separate compiled-C command** through `spawn`/`waitpid`
+   (`c_posix_spawn.rs`, interp==JIT): the embedder wires the spawn delegate to instantiate + run the
+   child domain on its own Posix personality, and the child's uppercased stdin output flows to the
+   shell's fd 1 while its exit status returns through `waitpid`. (The delegate is the test embedder —
+   promoting a reusable builder into `svm-run` waits on `svm-run` gaining an `svm-posix` dep, deferred
+   until a second consumer needs it.) **Remaining:** `fork`/`vfork`/`execve` (return-twice /
+   image-replace) on the durable-clone capstone.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for
