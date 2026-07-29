@@ -86,3 +86,68 @@ fn posix_probe_bytecode() {
 fn posix_probe_jit() {
     check(Backend::Jit);
 }
+
+// A real shell **pipeline** `gen | up` (`pipeline.c` over the libc-shaped `posix_shim.h`): the plumbing a
+// shell does for `a | b` — wire stage 1's stdout to a pipe, run it, restore stdout, wire the pipe to
+// stage 2's stdin, run that — all through the personality's fork-free `sh_spawn`. `gen` emits "hello",
+// `up` uppercases it, so the personality's captured stdout is "HELLO".
+fn pipeline_instance() -> svm_run::Instance {
+    let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pipeline.ll");
+    let t = svm_llvm::translate_ll_path(bc).expect("translate pipeline");
+    svm_run::instantiate(t.module).expect("instantiate")
+}
+
+fn run_pipeline(backend: Backend) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    posix.set_spawn(|name: &str, _argv: &[String], stdin: &[u8]| match name {
+        "gen" => SpawnResult {
+            stdout: b"hello".to_vec(),
+            status: 0,
+        },
+        "up" => SpawnResult {
+            stdout: stdin.to_ascii_uppercase(),
+            status: 0,
+        },
+        _ => SpawnResult {
+            stdout: Vec::new(),
+            status: 127,
+        },
+    });
+    let out = pipeline_instance()
+        .run_with_caps(backend, &config(), &[("posix", cap)])
+        .expect("run pipeline");
+    (out.outcome, out.stdout, posix.stdout())
+}
+
+fn check_pipeline(backend: Backend) {
+    let (outcome, run_stdout, personality_stdout) = run_pipeline(backend);
+    assert_eq!(
+        outcome,
+        Outcome::Returned(vec![Value::I32(0)]),
+        "{backend:?}: pipeline failed (exit = failing step)",
+    );
+    assert_eq!(
+        personality_stdout, b"HELLO",
+        "{backend:?}: `gen | up` — the piped \"hello\", uppercased by stage 2, on the real stdout",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_stdout),
+        "pipeline ok\n",
+        "{backend:?}: the shell's marker on the powerbox stdout",
+    );
+}
+
+#[test]
+fn pipeline_tree_walker() {
+    check_pipeline(Backend::TreeWalk);
+}
+
+#[test]
+fn pipeline_bytecode() {
+    check_pipeline(Backend::Bytecode);
+}
+
+#[test]
+fn pipeline_jit() {
+    check_pipeline(Backend::Jit);
+}

@@ -382,6 +382,11 @@ signals ladder). In dependency order:
    instead of the Postgres demo's inert process stubs. *(A program that reaches the host only through
    `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip svm-llvm's
    `needs_powerbox_entry` and get the synthesized `_start`; a real shell links libc, so it always does.)*
+   **[Slice 4b done 2026-07-29 — the libc shim + a pipeline.]** `posix_shim.h` gives the on-ramp real-C
+   `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + a fork-free `sh_spawn` over the `"posix"` cap — the
+   World-B analogue of `demos/shell/shim.c`, the layer a shell links. `pipeline.c` runs a real `gen | up`
+   pipeline through it (wire stdout→pipe, run stage 1, restore stdout, wire pipe→stdin, run stage 2 —
+   the classic redirect save/restore), landing "HELLO" on the personality's stdout, cross-backend.
 2. **Build `bash.svmb`** — autoconf cross-config for the svm "platform", `--noediting`, through the
    `clang → svm-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
    *Medium/mechanical.* Gets bash to *link and start*.
