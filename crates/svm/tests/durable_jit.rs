@@ -17,6 +17,36 @@ fn freeze_thaw_cross_backend_over_generated_modules() {
     }
 }
 
+// R8, deterministic: a `call_indirect` to a may-suspend target must freeze byte-identically and thaw
+// across the interp/JIT boundary, exactly like a direct propagated `call` — not left to fuzz-seed
+// luck. `A →(call_indirect slot 1)→ B(leaf cap.call)`; the natural table maps slot 1 → func 1.
+#[test]
+fn indirect_call_freeze_thaw_cross_backend() {
+    let src = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i32.const 1
+  v2 = call_indirect (i32) -> (i64) v1 (v0)
+  v3 = i64.const 1000
+  v4 = i64.add v2 v3
+  return v4
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i32.const 0
+  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)
+  v3 = i64.const 100
+  v4 = i64.add v2 v3
+  return v4
+  }
+}
+"#;
+    let mut m = svm_text::parse_module(src).expect("parse indirect module");
+    m.memory = Some(svm_ir::Memory { size_log2: 18 });
+    durjit::check_xbackend(&m, 42);
+}
+
 #[test]
 fn loop_freeze_thaw_cross_backend_over_generated_modules() {
     // Phase-4 Slice A: the loop-header back-edge poll is ordinary IR, so the JIT must freeze a

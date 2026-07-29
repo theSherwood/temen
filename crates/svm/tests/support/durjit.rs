@@ -161,7 +161,7 @@ pub fn fuzz_loop_one_xbackend(g: &mut Gen) {
     check_xbackend(&m, clock_v);
 }
 
-fn check_xbackend(m: &Module, clock_v: i64) {
+pub fn check_xbackend(m: &Module, clock_v: i64) {
     let inst = transform_module(m).expect("an in-scope module must transform");
     svm_verify::verify_module(&inst).expect("instrumented IR must verify");
 

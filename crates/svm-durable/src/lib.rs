@@ -42,9 +42,13 @@
 //! own operands. An unmodelled instruction in the tail falls back to spilling the whole
 //! range, so the analysis never under-spills.
 //!
-//! Out of scope (rejected / treated non-suspending): `call_indirect` and indirect tail
-//! calls to a may-suspend target (unresolved); a direct tail call into a may-suspend
-//! callee (the frame is replaced — no poll to unwind at).
+//! A **`call_indirect`** to a may-suspend target is instrumented too (R8, the fork-critical
+//! case): the target is a runtime table index, so the analysis taints *by signature* (a
+//! `call_indirect` of type `T` suspends iff some function of type `T` does — the natural table
+//! admits any signature match), and the site re-issues the call on thaw with the reloaded index
+//! (`SuspendKind::PropagatedIndirect`), so the re-selected — and, by the taint rule, instrumented
+//! — callee rewinds in turn. Out of scope (rejected — the frame is replaced, so there is no poll to
+//! unwind at): a **tail** call, direct or indirect, into a may-suspend callee.
 //!
 //! The remaining extensions (DURABILITY.md §9) are fibers / multi-vCPU / STW (Phase 3).
 
@@ -214,6 +218,7 @@ pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformE
 fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
     let may_suspend = compute_may_suspend(m);
+    let tainted_sigs = tainted_signatures(m, &may_suspend);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
     // R9 enforcement: the durable region shares the window with guest memory at fixed low
@@ -235,7 +240,7 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
 
     for (i, f) in m.funcs.iter().enumerate() {
         if may_suspend[i] {
-            let (nf, frame_size) = transform_func(f, &func_results, &may_suspend)?;
+            let (nf, frame_size) = transform_func(f, &func_results, &may_suspend, &tainted_sigs)?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
         }
@@ -388,10 +393,21 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
     }
 }
 
-/// Mark each function that can suspend: it contains a `cap.call`, or (transitively) a
-/// direct `Call` to a may-suspend function. A least-fixed-point over the direct-call
-/// graph. `call_indirect` targets are unresolved and treated as non-suspending (see the
-/// module-level scope note).
+/// Mark each function that can suspend: it contains a `cap.call` (or fiber/thread/futex
+/// safepoint), or (transitively) a **direct** `Call`, or an **indirect** `call_indirect`
+/// whose target could suspend. A least-fixed-point over the call graph.
+///
+/// **R8 — `call_indirect`.** The target is a runtime table index, so the transform can't
+/// name the callee statically. But dispatch is signature-checked and the natural table
+/// maps *every* function into a slot (and `Jit.install` can add more at run time), so the
+/// only sound static rule is by **signature**: a `call_indirect` of type `T` can reach any
+/// function whose signature equals `T`, hence it suspends iff **some may-suspend function
+/// shares its signature**. This is the ceiling of static precision here — there is no
+/// element/table section in the IR to narrow it (DURABILITY.md §6; the breadth cost is R7).
+/// The taint set grows with `ms`, so it is re-read each fixpoint round (a newly-may-suspend
+/// function taints its own signature). Marking the caller (rather than ignoring the
+/// indirect call) is what flips R8 from fail-**open** — silent under-instrumentation — to
+/// sound: `transform_func` then either instruments the site or fails the module closed.
 fn compute_may_suspend(m: &Module) -> Vec<bool> {
     let mut ms = vec![false; m.funcs.len()];
     for (i, f) in m.funcs.iter().enumerate() {
@@ -413,30 +429,68 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
         }
     }
     loop {
-        let mut changed = false;
-        for (i, f) in m.funcs.iter().enumerate() {
-            if ms[i] {
-                continue;
-            }
-            let calls_ms = f.blocks.iter().any(|b| {
-                b.insts
-                    .iter()
-                    .any(|x| matches!(x, Inst::Call { func, .. } if ms[*func as usize]))
-                    // a direct tail call into a may-suspend callee also suspends (rejected
-                    // by `transform_func` as out of scope, but it must be marked so the
-                    // module fails closed rather than leaving the caller uninstrumented)
-                    || matches!(&b.term, Terminator::ReturnCall { func, .. } if ms[*func as usize])
-            });
-            if calls_ms {
-                ms[i] = true;
-                changed = true;
-            }
-        }
-        if !changed {
+        // A `call_indirect` of type `ty` reaches a may-suspend target iff some already-may-suspend
+        // function has that exact signature. Re-derived each round from the live `ms`. Collect the
+        // newly-tainted functions first (read-only over `ms`), then apply — so the taint predicate's
+        // borrow of `ms` doesn't clash with the mutation.
+        let tainted = |ty: &svm_ir::FuncType| -> bool {
+            m.funcs
+                .iter()
+                .enumerate()
+                .any(|(j, g)| ms[j] && g.params == ty.params && g.results == ty.results)
+        };
+        let to_mark: Vec<usize> = m
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|&(i, f)| {
+                !ms[i]
+                    && f.blocks.iter().any(|b| {
+                        b.insts.iter().any(|x| match x {
+                            Inst::Call { func, .. } => ms[*func as usize],
+                            Inst::CallIndirect { ty, .. } => tainted(ty),
+                            _ => false,
+                        })
+                        // A direct or indirect **tail** call into a may-suspend callee also suspends
+                        // (both rejected by `transform_func` as out of scope — a replaced frame has
+                        // no poll to unwind at — but marked so the module fails closed, not silently
+                        // under-instrumented).
+                        || match &b.term {
+                            Terminator::ReturnCall { func, .. } => ms[*func as usize],
+                            Terminator::ReturnCallIndirect { ty, .. } => tainted(ty),
+                            _ => false,
+                        }
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if to_mark.is_empty() {
             break;
+        }
+        for i in to_mark {
+            ms[i] = true;
         }
     }
     ms
+}
+
+/// The distinct signatures of the may-suspend functions — the tainted set a `call_indirect`
+/// checks its type against (see [`compute_may_suspend`]). Computed once from the final `ms`
+/// and threaded into `transform_func` so it recognizes indirect suspend sites the same way.
+fn tainted_signatures(m: &Module, ms: &[bool]) -> Vec<svm_ir::FuncType> {
+    let mut sigs: Vec<svm_ir::FuncType> = Vec::new();
+    for (i, f) in m.funcs.iter().enumerate() {
+        if ms[i] {
+            let ty = svm_ir::FuncType {
+                params: f.params.clone(),
+                results: f.results.clone(),
+            };
+            if !sigs.contains(&ty) {
+                sigs.push(ty);
+            }
+        }
+    }
+    sigs
 }
 
 /// The single may-suspend operation in an instrumented block.
@@ -445,6 +499,16 @@ enum SuspendKind {
     Leaf,
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
+    /// `call_indirect` to a (by-signature, conservatively) may-suspend target (R8): the indirect
+    /// analog of `Propagated`. Re-issued on thaw with the **reloaded table index** — the runtime
+    /// re-selects the same slot, and because the taint rule instruments *every* function of that
+    /// signature, whatever the `idx` resolves to has a `REWINDING`-aware prologue and rewinds in
+    /// turn. `ty` reconstructs the op; `idx`/`args` are its block-local operands (spilled + reloaded).
+    PropagatedIndirect {
+        ty: svm_ir::FuncType,
+        idx: ValIdx,
+        args: Vec<ValIdx>,
+    },
     /// `cont.resume` (resumer side): like a propagated call, **re-issued on thaw** so the fiber
     /// rewinds in turn and redelivers its `(status: i32, value: i64)` (slice 3.1.2). The
     /// re-issued resume reconstructs the fiber via its own rewind (the `Yield` re-park, slice
@@ -538,12 +602,24 @@ fn transform_func(
     f: &Func,
     func_results: &[Vec<ValType>],
     may_suspend: &[bool],
+    tainted_sigs: &[svm_ir::FuncType],
 ) -> Result<(Func, u64), TransformError> {
-    // Out of scope: a direct tail call into a may-suspend callee (the frame is replaced, so
-    // there is no poll to unwind at). An *indirect* tail call is treated as non-suspending
-    // (its target is unresolved — same stance as `call_indirect`, see the module doc).
+    // Whether a `call_indirect` of this signature could reach a may-suspend target (R8) — the same
+    // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
+    // place. Kept identical to that rule so the instrumentation set == the taint set (re-issue
+    // soundness: every possible indirect target is instrumented, so the reloaded `idx` can only
+    // resolve to a `REWINDING`-aware callee).
+    let is_tainted = |ty: &svm_ir::FuncType| tainted_sigs.iter().any(|s| s == ty);
+    // Out of scope: a **tail** call (direct or indirect) into a may-suspend callee — the frame is
+    // replaced, so there is no poll to unwind at. Rejected (fail closed), so a tail-dispatched
+    // suspending callee never leaves a caller silently under-instrumented.
     for blk in &f.blocks {
-        if matches!(&blk.term, Terminator::ReturnCall { func, .. } if may_suspend[*func as usize]) {
+        let reject = match &blk.term {
+            Terminator::ReturnCall { func, .. } => may_suspend[*func as usize],
+            Terminator::ReturnCallIndirect { ty, .. } => is_tainted(ty),
+            _ => false,
+        };
+        if reject {
             return Err(TransformError::UnsupportedShape);
         }
     }
@@ -569,6 +645,7 @@ fn transform_func(
                 | Inst::ThreadJoin { .. }
                 | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
+                Inst::CallIndirect { ty, .. } => is_tainted(ty),
                 _ => false,
             })
             .map(|(pos, _)| pos)
@@ -780,6 +857,11 @@ fn transform_func(
                         callee: *func,
                         args: args.clone(),
                     },
+                    Inst::CallIndirect { ty, idx, args } => SuspendKind::PropagatedIndirect {
+                        ty: ty.clone(),
+                        idx: *idx,
+                        args: args.clone(),
+                    },
                     Inst::ContResume { k, arg } => SuspendKind::Resume { k: *k, arg: *arg },
                     Inst::Suspend { value } => SuspendKind::Yield { value: *value },
                     Inst::ThreadJoin { handle } => SuspendKind::ThreadJoin { handle: *handle },
@@ -804,6 +886,7 @@ fn transform_func(
                     (SuspendKind::Propagated { callee, .. }, _) => {
                         func_results[*callee as usize].len()
                     }
+                    (SuspendKind::PropagatedIndirect { ty, .. }, _) => ty.results.len(),
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
                     (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
@@ -818,6 +901,7 @@ fn transform_func(
                     // The op's results are recomputed (re-issue) or redelivered (resume), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
+                    | SuspendKind::PropagatedIndirect { .. }
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
                     | SuspendKind::ThreadJoin { .. }
@@ -856,6 +940,12 @@ fn transform_func(
                 if let SuspendKind::Propagated { args, .. } = &kind {
                     for &a in args {
                         used[a as usize] = true; // operands of the re-issued call
+                    }
+                }
+                if let SuspendKind::PropagatedIndirect { idx, args, .. } = &kind {
+                    used[*idx as usize] = true; // the table index must be reloaded to re-select the slot
+                    for &a in args {
+                        used[a as usize] = true; // operands of the re-issued call_indirect
                     }
                 }
                 if let SuspendKind::Resume { k, arg } = &kind {
@@ -1027,6 +1117,25 @@ fn transform_func(
                 ab.many(
                     Inst::Call {
                         func: *callee,
+                        args: mapped,
+                    },
+                    pt.nres,
+                )
+            }
+            // `call_indirect` re-issue (R8): reload the (spilled) table index + args and re-execute
+            // the indirect call. The reloaded `idx` re-selects the same slot, whose (instrumented)
+            // callee rewinds in turn — the indirect twin of `Propagated`; no state-word flip (the
+            // resolved callee is the frame that flips at its own deepest leaf).
+            SuspendKind::PropagatedIndirect { ty, idx, args } => {
+                let ridx = reloaded[spill_slot(*idx as usize).expect("call_indirect idx spilled")];
+                let mapped: Vec<ValIdx> = args
+                    .iter()
+                    .map(|&a| reloaded[spill_slot(a as usize).expect("call_indirect arg spilled")])
+                    .collect();
+                ab.many(
+                    Inst::CallIndirect {
+                        ty: ty.clone(),
+                        idx: ridx,
                         args: mapped,
                     },
                     pt.nres,
