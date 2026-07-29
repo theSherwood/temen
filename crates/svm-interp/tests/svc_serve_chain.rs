@@ -7,8 +7,10 @@
 //! is a general serving-correctness bug (a front-end server delegating to a back-end is the common
 //! jacl shape), reproduced here with zero durability.
 
+use std::sync::mpsc;
 use std::sync::Arc;
-use svm_interp::{run_with_host, Host, Value};
+use std::time::Duration;
+use svm_interp::{run_with_host, Host, Trap, Value};
 
 fn module(text: &str) -> Arc<svm_ir::Module> {
     let m = svm_text::parse_module(text).expect("parse");
@@ -85,14 +87,48 @@ block 0 (v0: i64) {
 }
 "#;
 
+/// Drive the chain on a worker thread under a wall-clock **watchdog** (ISSUES.md I52).
+///
+/// The forwarding-chain rendezvous can, on the slower/serialized macOS + Windows CI runners, hit a
+/// wake-ordering window that strands a vCPU parked forever (a `BlockedTicket`/`BlockedSvc` with no
+/// wake left to fire). The cooperative scheduler's `worker_loop` then blocks on its idle condvar
+/// with `live > 0` — the multi-worker `drive` path shuts down only when `live == 0`, so it has no
+/// quiescence-deadlock detector (unlike the deterministic explorer) and the run never returns. That
+/// hangs the whole `svc_serve_chain` test binary to the job's `timeout-minutes` ceiling (cancelled
+/// after ~45 min, taking sibling jobs and runner budget with it).
+///
+/// This run is tiny — it finishes in milliseconds on any runner — so a generous wall-clock bound
+/// converts that intermittent *hang* into an intermittent *fast failure*: CI goes red in seconds and
+/// a re-run clears it, instead of burning the runner. **Fail-fast mitigation, not a root-cause fix**
+/// (the wake-ordering window is still open; see ISSUES.md I52). On the timeout the run's worker
+/// threads are left parked and reaped at process exit — they hold no cross-test locks, so leaking
+/// them cannot wedge the rest of the binary.
+fn run_chain_with_watchdog() -> Result<Vec<Value>, Trap> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let m = module(CHAIN);
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let ih = host.grant_instantiator(0, 1u64 << 19);
+        let mut fuel = 20_000_000u64;
+        let r = run_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &mut host);
+        // The receiver is gone if the watchdog already fired; the send error is expected there.
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| {
+        panic!(
+            "I52: root -> C1.fwd -> C2.leaf serve chain did not complete within 60s (it normally \
+             finishes in milliseconds) — the forwarding-chain rendezvous stranded a parked vCPU and \
+             the scheduler's worker_loop blocked forever on its idle condvar. Fail-fast watchdog \
+             fired instead of hanging the runner to the job's timeout ceiling; a re-run typically \
+             clears it. See ISSUES.md I52."
+        )
+    })
+}
+
 #[test]
 fn a_handler_forwarding_to_another_server_completes() {
-    let m = module(CHAIN);
-    let mut host = Host::new();
-    host.set_self_module(&m);
-    let ih = host.grant_instantiator(0, 1u64 << 19);
-    let mut fuel = 20_000_000u64;
-    let r = run_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &mut host);
+    let r = run_chain_with_watchdog();
     assert_eq!(
         r,
         Ok(vec![Value::I64(107)]),

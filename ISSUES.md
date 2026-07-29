@@ -21,7 +21,7 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504
+### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **FAIL-FAST MITIGATION LANDED 2026-07-29** (`claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
 `build · test (windows-latest)` were **cancelled** (not failed) after ~45 min: the single test in
@@ -32,18 +32,48 @@ this test in an earlier run of the same PR; the change touches only the debug ad
 tests, nothing in the svc/fiber path. The Linux `build · test · fmt · clippy` lane (same test) went
 green both times.
 
+**Recurrences.** Same hang on **PR #509** (`windows-latest`, run 30470197189, chibicc `--emit-object`
+cross-TU change — no serve-loop code; cancelled ~35 min) and on **PR #510** (`macos-latest`, the
+posix→LLVM-on-ramp bridge — zero lines in `crates/svm-interp`; see the I50 recurrence note). Every
+other job (Linux gate, `svm-llvm`, all wasm/differential lanes) was green in each run. Definitively a
+base-branch flake, not the PR diff, in every sighting. *(This entry absorbs a duplicate that was also
+filed as "I52" for the PR #509 sighting — the two were the same flake; consolidated 2026-07-29.)*
+
 **Family.** Same svc-handler-forwarding × park surface as **I44** (freeze-on-quiesce, fixed
 2026-07-24) and I40/I41 — a serve-chain rendezvous that can wedge under parallel-test load on the
-slower/serialized CI runners. Not yet root-caused for *this* test.
+slower/serialized CI runners.
 
 **Where.** `crates/svm-interp/tests/svc_serve_chain.rs` (the forwarding-chain rendezvous), exercised
 through the `svm-interp` svc serve loop.
 
-**Fix sketch.** Reproduce under the full-binary hammer the way I44 needed (`serve.rs`/`svc_*` tests
-in parallel threads under load, not in isolation), then apply the I44-style clamp / add a
-timeout-count **bail** to the forwarding wait loop so a rendezvous regression fails loudly in seconds
-instead of hanging the runner (ISSUES.md I44 §"add a timeout-count bail to every wait loop"). Until
-then, a re-run of the failed jobs clears it (the hang is intermittent).
+**Root cause located (2026-07-29, this review) — the hang is a scheduler-quiescence gap, not just
+this test.** The `root → C1.fwd → C2.leaf` chain has a wake-ordering window that can strand a vCPU
+parked forever (a `BlockedTicket`/`BlockedSvc` with no wake left to fire). When that happens the
+cooperative scheduler's `worker_loop` (`crates/svm-interp/src/lib.rs`) blocks on its idle condvar
+(`sched.work.wait`) with `live > 0` — and the **multi-worker `drive` path shuts down only when
+`live == 0`** (the `s.live -= 1; if s.live == 0 { s.shutdown = true }` reaps), so it has **no
+quiescence-deadlock detector**. The deterministic explorer already detects exactly this ("`live > 0`
+but quiescent: a join-deadlock" → `DriverStop::Done` → `ThreadFault`), but the production
+multi-worker driver does not, so a stranded park hangs the run indefinitely instead of failing. That
+is why it wedges to the `timeout-minutes` ceiling rather than erroring.
+
+**Fail-fast mitigation LANDED (2026-07-29).** Wrapped the test's run in a wall-clock **watchdog**
+(`run_chain_with_watchdog`): the run executes on a worker thread and the test `recv_timeout`s on it,
+`panic!`-ing with an I52-tagged diagnostic if it doesn't finish within 60 s (it normally finishes in
+**milliseconds**). This converts the intermittent *hang* into an intermittent *fast failure* — CI
+goes red in seconds and a re-run clears it, instead of cancelling the job at the 45-min ceiling and
+taking sibling jobs + runner budget with it (exactly the I44 §"fail loudly in seconds instead of
+hanging a runner" posture). Test-only; the scheduler TCB is untouched.
+
+**Still open (the real fix).** The wake-ordering window itself is unfixed (it reproduces only on the
+slower macOS/Windows runners — not on Linux, so not reproduced locally this review). Two follow-ups,
+in order of value: **(a)** give the multi-worker `drive`/`worker_loop` a genuine quiescence-deadlock
+detector — when nothing is runnable, no timers are pending, no async-ring job is in flight, and every
+worker is simultaneously idle with `live > 0`, declare the join-deadlock and shut down with
+`ThreadFault` (the explorer's logic, generalized to the M:N driver; benefits the whole
+`svc_serve_chain`/`durable_concurrent_jit`/`serve.rs` family, and makes the watchdog redundant).
+**(b)** root-cause the forwarding-chain park/wake race under the full-binary hammer the way I44 was
+pinned (parallel threads under load, not per-crate isolation).
 
 ### I51 — bytecode `vcpu.tls` is per-`Vm`, not per-vCPU: a fiber that migrates across workers reads a stale TLS word (S3, multi-worker only) — recorded 2026-07-28 landing the JACL-in-browser `vcpu.tls` lowering
 
@@ -100,27 +130,6 @@ a `pages.yml` `--site` step asserts every referenced asset is actually present i
 `_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
 with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
 automatically. This closes the residual guard gap I26 named.
-
-### I52 — CI flake: `svc_serve_chain::a_handler_forwarding_to_another_server_completes` hangs on Windows (S4) — seen 2026-07-29, PR #509 run 30470197189
-
-**Symptom.** `build · test (windows-latest)` was cancelled at its `timeout-minutes` ceiling
-(cancelled, not failed): the single test `a_handler_forwarding_to_another_server_completes`
-(`crates/svm/tests/svc_serve_chain.rs`) logged "has been running for over 60 seconds" and then hung
-until the job was killed ~35 min later. Every other job in the run was green — Linux
-(`build · test · fmt · clippy`), macOS, and all wasm/differential lanes.
-
-**Why it's a base-branch flake, not the PR (definitive).** PR #509 (chibicc `--emit-object` cross-TU
-data + `data.top`) touches only the linker, the `Inst::DataTop` match arms, chibicc `codegen_ir.c`,
-and `c_link.rs` (`#![cfg(unix)]` — never runs on Windows). It touches **no** serve-loop / `svc.*` /
-cross-domain-scheduler code. Same class as I44 (a serve-loop test hung to `timeout-minutes`) but a
-distinct test — the I44 fix (2026-07-24) closed the freeze-on-quiesce case in `serve.rs`; a
-handler→server *forwarding* chain has its own intermittent park/wake window, here surfacing under the
-Windows scheduler.
-
-**Action.** Re-run the Windows job (a flake — expect green); don't churn the PR chasing it (I50
-posture). Root cause not yet isolated — a forwarding serve chain (handler A dispatches to server B)
-has a wake ordering that can strand under load; if it recurs, hammer the full `svc_serve_chain`
-binary the way I44 was pinned (per-crate parallel runs don't reproduce the cross-binary load).
 
 ### I50 — CI flake: the `durable_concurrent_jit` binary fails on macOS in two modes (S4) — seen 2026-07-27, PR #455 runs 30263159591 + 30266760876
 
