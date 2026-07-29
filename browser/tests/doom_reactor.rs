@@ -56,8 +56,16 @@ fn doom_boots_and_renders_in_the_reactor() {
         let (status, _stdout) = r.frame();
         assert_eq!(status, STATUS_OK, "tick {i} keeps going (of {frames})");
         if let Some(f) = r.take_frame() {
-            assert_eq!((f.width, f.height), (resx, resy), "doomgeneric {resx}x{resy} frame");
-            assert_eq!(f.rgba.len(), resx as usize * resy as usize * 4, "RGBA framebuffer");
+            assert_eq!(
+                (f.width, f.height),
+                (resx, resy),
+                "doomgeneric {resx}x{resy} frame"
+            );
+            assert_eq!(
+                f.rgba.len(),
+                resx as usize * resy as usize * 4,
+                "RGBA framebuffer"
+            );
             assert!(f.rgba.iter().any(|&b| b != 0), "frame {i} is not all-black");
             presented += 1;
         }

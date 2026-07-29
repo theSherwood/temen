@@ -686,9 +686,16 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
             return 0;
         };
         // Emit the tier-up module against the shared linear memory (the browser threads build) and take
-        // its per-function emit set. `Err` only if the assembler itself rejects the set — treat as "no
-        // tier-up" (fail-closed: the guest keeps interpreting).
-        let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup(&m, true) else {
+        // its per-function emit set. The `Threaded` shape is interpreter-driven by construction (no
+        // single top-level frame — vCPUs enter via `thread.spawn`), so `compile_jit` picks tier-up. `Err`
+        // only if the assembler itself rejects the set — treat as "no tier-up" (fail-closed: the guest
+        // keeps interpreting).
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            emitted: emit,
+            ..
+        }) = svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Threaded, true)
+        else {
             return 0;
         };
         let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
@@ -879,7 +886,15 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
         let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
             return 0;
         };
-        let Ok(wasm) = svm_wasm_jit::compile_module_mixed_entry(&service_m, 0, true) else {
+        // The §22 codegen service unit is a fixed, fully-in-subset scalar function, so `compile_jit`
+        // emits it whole and wasm-driven (rooted at func 0). Defensively require that — the §22 path
+        // runs the unit as emitted `f0`, so an interpreter-driven fallback would be a bug; fail closed.
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) = svm_wasm_jit::compile_jit(&service_m, svm_wasm_jit::Shape::Batch { entry: 0 }, true)
+        else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
@@ -1050,7 +1065,14 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         let Some(m) = &cfg.module else {
             return 0;
         };
-        let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_tierup(m, true) else {
+        // A §14 instantiator child runs interpreter-driven on its own Worker (the `Threaded` shape),
+        // tiering up its in-subset functions.
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            emitted: eligible,
+            ..
+        }) = svm_wasm_jit::compile_jit(m, svm_wasm_jit::Shape::Threaded, true)
+        else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
