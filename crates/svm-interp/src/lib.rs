@@ -1521,7 +1521,11 @@ impl Inspector {
     }
 
     /// **Step out** (DEBUGGING.md W2): run until the current function returns, stopping at the op in
-    /// the caller that the call returned to. From the outermost frame this runs to completion.
+    /// the caller that the call returned to. Runs to completion when no caller frame has a remaining
+    /// *steppable* op to land on — from the outermost frame, and equally when the caller's only
+    /// remaining action is its own `return` terminator (terminators are non-stoppable positions, so
+    /// there is nothing to stop at). Both engines agree here — see the `debug_parity` pin
+    /// `stepout_runs_to_completion_when_caller_immediately_returns`.
     pub fn step_out(&mut self) -> Stop {
         self.step_to_depth(|depth| depth.saturating_sub(1))
     }
