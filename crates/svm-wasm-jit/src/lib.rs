@@ -1036,20 +1036,13 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
 
 // ---- the emitter ---------------------------------------------------------------------------------
 
-/// Compile every function of a **verified** `m` into one wasm module, importing a **non-shared**
-/// `env.memory`. See [`compile_module_shared`] for the browser (threads-build) link target.
+/// Compile every function of a **verified** `m` into one wasm module (whole-module, all in-subset),
+/// importing a **non-shared** `env.memory` — the differential/link helper. Pass `shared_memory` to
+/// [`compile_module_with`] for the browser threads-build link target (shared `env.memory`); the
+/// emitted code is otherwise byte-identical (only the memory-import limits differ), so the
+/// `tests/differential.rs` run under `wasmi` — which has no shared memory — covers both.
 pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
     compile_module_with(m, false)
-}
-
-/// Like [`compile_module`] but the imported `env.memory` is declared **shared** — the browser
-/// wasm-JIT tier links the emitted module against the cdylib's shared linear memory (the threads
-/// build), and wasm requires the import's shared flag to match the provided memory's. The emitted
-/// code is otherwise byte-identical to the non-shared form (only the memory-import limits differ),
-/// so the `compile_module` differential (`tests/differential.rs`, under `wasmi`, which has no
-/// shared-memory support) fully covers this variant's codegen.
-pub fn compile_module_shared(m: &Module) -> Result<Vec<u8>, Error> {
-    compile_module_with(m, true)
 }
 
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
@@ -1068,7 +1061,7 @@ pub const ENV_CELL_BYTES: usize = ENV_SCRATCH_OFF as usize + XCALL_MAX_SLOTS * 8
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per SVM function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
 /// and `env.call_interp`. Returns [`Error::Unsupported`] if *any* function is outside the v1 subset
-/// — for a mixed integer/interp guest use [`compile_module_mixed`].
+/// — for a partly-emittable guest use the [`compile_jit`] front door.
 pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     let a = analyze(m);
     if !a.in_subset.iter().all(|&s| s) {
@@ -1082,15 +1075,17 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
 }
 
-/// Compile a **mixed-tier** guest (`BROWSER.md` § "wasm-JIT tier", slice 3): emit the in-subset
-/// functions and route a call to an interp leaf through `env.call_interp` (the engine runs it on the
-/// bytecode interpreter — see [`Analysis`]). [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
-pub fn compile_module_mixed(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
-    compile_module_mixed_entry(m, 0, shared_memory)
-}
-
-/// Like [`compile_module_mixed`] but eligibility is rooted at `entry` (the function the host calls),
-/// not func 0 — for a module whose entry kernel isn't func 0 (the cross-engine bench). Every emitted
+/// The **leaf-only / throwaway-window** mixed-tier strategy (`BROWSER.md` § "wasm-JIT tier", slice 3),
+/// rooted at `entry` (the function the host calls): emit the reachable in-subset functions and route a
+/// call to a strict [`interp_leaf`] (memory-free, call-free, cap-free — so the host may run it on a
+/// throwaway window) through `env.call_interp`. [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
+///
+/// This is *not* subsumed by the `compile_jit` front door's wasm-driven path (which uses
+/// [`compile_module_reactor`]): reactor widens cross-tier callees to any integer-signature function —
+/// including memory/cap-touching ones — which the host must then run over the **shared** window. This
+/// entry's leaf-only guarantee is what lets a host with a *throwaway*-window cross-tier callback
+/// (`svm_wasmjit_compile`, the legacy demo/bench FFI) stay correct. Retiring it means moving that FFI
+/// to the shared-window model. Every emitted
 /// function is still exported as `f{svm_idx}`, so the host calls `f{entry}`.
 pub fn compile_module_mixed_entry(
     m: &Module,
