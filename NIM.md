@@ -440,9 +440,12 @@ plumbing. Five workstreams, roughly independent:
   module. Today `svm-leng` translates one module in isolation. W2 resolves cross-module symbols,
   merges globals/data, and lays out one svm module from N Leng inputs — the analog of what the C
   on-ramp gets from `clang`+`lld` for free.
-- **W3 — Runtime bottom edge.** Raw syscalls / the allocator → POSIX-personality named imports +
-  the Memory cap (same seam as Phase 1), and mapping nimony's TLS onto svm's model (the on-ramp
-  gap Phase 1 already surfaced). ARC destructors/dup calls pass through as ordinary calls.
+- **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
+  POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
+  onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
+  through as ordinary calls. **Key finding (§3b): the bottom edge is only ~15 C functions, and
+  Phase 1 already binds them** — so the lever between "translates real nimony" and "runs it" is
+  mostly W2 (linking the compiled `system` module), or a Phase-1-style host runtime shim.
 - **W4 — Multi-binary architecture (the other long pole).** nimony is not one binary: `nifmake`
   spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
   means either driving those phases in-process or giving svm a subprocess/exec personality. This
@@ -455,6 +458,57 @@ source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines w
 exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
 concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
 especially) is bounded but real; the backend mapping is the part that's no longer in doubt.
+
+## 3b. W3 scope — the runtime bottom edge (W1 is done; this is the next lever)
+
+With W1 closed, `svm-leng` **translates real nimony modules to verified svm-ir** — but the lowered
+code doesn't yet *run*, because it calls procs that aren't defined in the one module we translate.
+Scoping W3 means answering exactly *what* those calls are and *how* they bind. Two layers, and the
+boundary between them is the whole story:
+
+**Layer 1 — compiled Nim stdlib (this is W2, not W3).** The seq/string/ARC ops a program calls —
+`newSeqUninit`, `add`, `[]`, `len`, `toOpenArray`, `=destroy`, `=wasMoved` — are **ordinary Nim
+code** that nimony compiles into the `system` module's Leng (`sysvq0asl.x.nif`). They look like
+"imports" to us only because we translate one module in isolation. In a whole-program build they're
+*defined*, reached by **linking** the user module with the compiled `system` module — the `Func`/
+`Slot` bindings of `svm_ir::resolve_imports_with`. That's W2 (the linker), and it's the bulk of the
+gap.
+
+**Layer 2 — the true bottom edge (this is W3).** What does the `system` module *itself* bottom out
+at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **entire** external
+(`importc`) surface, minus pure C *type* names, is ~15 functions:
+
+| Group | Symbols | SVM binding |
+| --- | --- | --- |
+| Allocator | `mmap`, `munmap` | the **Memory cap** (Phase 1 seam) |
+| Syscalls / process | `write`, `_exit`, `getpid`, `kill` | the **POSIX personality** (Phase 1 seam) |
+| libc mem | `memcpy`, `memset`, `memcmp` | host cap, or lower to `mem.copy`/`mem.fill` |
+| Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | single-threaded guest → plain loads/stores |
+| Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct svm ops (`bswap`/`clz`/`ctz`) |
+| Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
+
+**The key finding: W3's hard part is already retired.** This is the *same* C bottom edge Phase 1's
+on-ramp already binds — `crates/svm-run/demos/nimony/` runs a nimony-shaped module on all three
+engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
+cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
+already lowers a named import to a host capability (`Cap`) — that's the seam.
+
+**Two paths to the near-term milestone (run one real program):**
+
+- **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
+  bind the *high-level* ops (`newSeqUninit`/`add`/`[]`/`len`/`=destroy`/`=wasMoved` + `memcpy`/
+  `memset`) directly to a small host implementation via capability bindings, exactly as Phase 1's
+  `nimony_runtime_shim.c` did. Gets end-to-end *running* fast, decoupled from the W2 linker. The
+  handful of ops is small and well-understood (a `{len,data*}`/`{len,cap,data}` bump/realloc
+  allocator over the window).
+- **Path A — link the real `system` module (fidelity, needs W2).** Merge `sysvq0asl.x.nif` into the
+  user module so the stdlib ops resolve to *compiled Nim* (`Func`/`Slot`), and only the ~15 C
+  primitives hit the host (`Cap`). Faithful, but gated on the W2 linker.
+
+Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
+end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
+model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
+protocol runs correctly against a real allocator.
 
 ## 4. Invariants this must respect
 
