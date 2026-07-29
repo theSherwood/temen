@@ -4909,7 +4909,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .svc_queue
                 .is_empty();
-            if empty {
+            // Lost-wakeup guard (the macOS/Windows serve-chain flake, ISSUES.md I52): a reply may
+            // have woken one of THIS vCPU's parked handler fibers between the serve loop deciding
+            // to park (its `handler_parks` claim saw the handler still blocked) and this point.
+            // That reply's `svc_wake` found no parked consumer here yet, so it was dropped — but
+            // the woken handler is runnable work. Both this recheck and the reply's `wake_blocked`
+            // are ordered by the scheduler lock (the reply holds it across `wake_blocked` +
+            // `svc_wake`; we hold it here), so observing any woken `handler_parks` slot closes the
+            // window: re-admit instead of parking, and the rewound `svc.wait` re-claims and
+            // resumes the handler. Each vCPU checks only its own `handler_parks`, so this is
+            // correct for a multi-consumer domain too.
+            let woken_handler = v
+                .handler_parks
+                .keys()
+                .any(|slot| v.registry.slot_woken(*slot));
+            if empty && !woken_handler {
                 if deadline_ns >= 0 {
                     s.svc_timers.push(Reverse((
                         Instant::now() + std::time::Duration::from_nanos(deadline_ns as u64),
@@ -6291,6 +6305,21 @@ impl FiberRegistry {
             }
             _ => false,
         }
+    }
+
+    /// §3.6 slice 3 — is fiber `slot` an event-park that has already been **woken**
+    /// ([`wake_blocked`] set `woken`), i.e. runnable handler work its owning serve loop should
+    /// resume rather than sleep through? Non-consuming, unlike [`claim`]. The `svc.wait` park
+    /// recheck uses this to close a lost-wakeup: a reply that wakes a parked handler fiber wakes
+    /// its serve loop with `svc_wake`, but if that lands in the window after the serve loop
+    /// decided to park and before it registered in `svc_waiters`, the `svc_wake` finds no parked
+    /// consumer and is dropped — the recheck must then observe the woken handler directly.
+    fn slot_woken(&self, slot: usize) -> bool {
+        let t = self.lock();
+        matches!(
+            t.fibers.get(slot),
+            Some(RegFiber::ParkedOn { woken: true, .. })
+        )
     }
 
     /// Park the claimant's current fiber as an **active resumer** (it just executed

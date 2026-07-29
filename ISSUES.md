@@ -21,7 +21,7 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **FAIL-FAST MITIGATION LANDED 2026-07-29** (`claude/ci-flakiness-review-fix-3xrmgg`)
+### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
 `build · test (windows-latest)` were **cancelled** (not failed) after ~45 min: the single test in
@@ -46,34 +46,48 @@ slower/serialized CI runners.
 **Where.** `crates/svm-interp/tests/svc_serve_chain.rs` (the forwarding-chain rendezvous), exercised
 through the `svm-interp` svc serve loop.
 
-**Root cause located (2026-07-29, this review) — the hang is a scheduler-quiescence gap, not just
-this test.** The `root → C1.fwd → C2.leaf` chain has a wake-ordering window that can strand a vCPU
-parked forever (a `BlockedTicket`/`BlockedSvc` with no wake left to fire). When that happens the
-cooperative scheduler's `worker_loop` (`crates/svm-interp/src/lib.rs`) blocks on its idle condvar
-(`sched.work.wait`) with `live > 0` — and the **multi-worker `drive` path shuts down only when
-`live == 0`** (the `s.live -= 1; if s.live == 0 { s.shutdown = true }` reaps), so it has **no
-quiescence-deadlock detector**. The deterministic explorer already detects exactly this ("`live > 0`
-but quiescent: a join-deadlock" → `DriverStop::Done` → `ThreadFault`), but the production
-multi-worker driver does not, so a stranded park hangs the run indefinitely instead of failing. That
-is why it wedges to the `timeout-minutes` ceiling rather than erroring.
+**Root cause (definitive, 2026-07-29) — a lost-wakeup in the `svc.wait` re-park.** The chain is
+`root → C1.fwd → C2.leaf`. A §3.6 handler runs as a **fiber of its serving vCPU** (slice 5b), so
+`C1`'s `fwd` handler calling `leaf` **fiber-parks** and its serve loop moves on. When `C2` replies to
+that handler's ticket, `Scheduler::cap_reply_or_stash` (Fiber arm) does two things under the
+scheduler lock: `registry.wake_blocked(slot)` (marks the handler fiber `ParkedOn { woken: true }`)
+**and** `svc_wake(C1)` (re-admit `C1`'s serve loop so it re-executes `svc.wait` and re-claims the
+woken handler). The serve loop's `svc.wait` re-execution re-claims woken handlers from
+`handler_parks` **before** it decides to park — but the `Blocked::SvcWait` park handler's
+compare-and-park recheck tested **only `svc_queue.is_empty()`**, never "did one of my handler fibers
+just get woken?". So if the reply lands in the window *after* the serve loop's `handler_parks` claim
+saw the handler still-blocked and *before* the vCPU registered in `svc_waiters`, the `svc_wake` finds
+no parked consumer and is **dropped**; the vCPU then parks with a woken-but-unresumed handler and
+nothing left to wake it — `root` and both serve loops strand, and `worker_loop` sleeps on its idle
+condvar forever (hence the 45-min ceiling; the multi-worker driver has no quiescence-deadlock
+detector, unlike the deterministic explorer). Timing-sensitive, which is why it surfaced only on the
+slower/serialized macOS + Windows runners under `cargo test --workspace` load. **Reproduced on Linux**
+this review by widening that exact window with a temporary sleep — a stall-detector then fired
+deterministically (all vCPUs parked, nothing runnable, no timers).
 
-**Fail-fast mitigation LANDED (2026-07-29).** Wrapped the test's run in a wall-clock **watchdog**
-(`run_chain_with_watchdog`): the run executes on a worker thread and the test `recv_timeout`s on it,
-`panic!`-ing with an I52-tagged diagnostic if it doesn't finish within 60 s (it normally finishes in
-**milliseconds**). This converts the intermittent *hang* into an intermittent *fast failure* — CI
-goes red in seconds and a re-run clears it, instead of cancelling the job at the 45-min ceiling and
-taking sibling jobs + runner budget with it (exactly the I44 §"fail loudly in seconds instead of
-hanging a runner" posture). Test-only; the scheduler TCB is untouched.
+**FIX LANDED (2026-07-29) — observe the woken handler in the re-park.** The `Blocked::SvcWait` park
+handler now parks only when the queue is empty **and** none of this vCPU's `handler_parks` slots is
+already woken (`FiberRegistry::slot_woken`, a non-consuming peek). Because the reply holds the
+scheduler lock across `wake_blocked` + `svc_wake` and this recheck reads under the same lock, the two
+are serialized: either the recheck runs first and parks *before* the reply's `svc_wake` (which then
+finds it in `svc_waiters` and wakes it), or the reply runs first and the recheck observes the woken
+handler and re-admits instead of parking. The window is closed on every architecture (all
+synchronization rides the scheduler `Mutex`, not memory-ordering assumptions). Each vCPU checks only
+its own `handler_parks`, so the guard is correct for a multi-consumer domain too. The common park
+path (empty queue, no woken handler) is unchanged.
 
-**Still open (the real fix).** The wake-ordering window itself is unfixed (it reproduces only on the
-slower macOS/Windows runners — not on Linux, so not reproduced locally this review). Two follow-ups,
-in order of value: **(a)** give the multi-worker `drive`/`worker_loop` a genuine quiescence-deadlock
-detector — when nothing is runnable, no timers are pending, no async-ring job is in flight, and every
-worker is simultaneously idle with `live > 0`, declare the join-deadlock and shut down with
-`ThreadFault` (the explorer's logic, generalized to the M:N driver; benefits the whole
-`svc_serve_chain`/`durable_concurrent_jit`/`serve.rs` family, and makes the watchdog redundant).
-**(b)** root-cause the forwarding-chain park/wake race under the full-binary hammer the way I44 was
-pinned (parallel threads under load, not per-crate isolation).
+**Fail-fast watchdog RETAINED (from PR #512).** The test still runs under a 60 s wall-clock watchdog
+(`run_chain_with_watchdog`), converting any *future* re-strand into a fast red instead of a 45-min
+runner burn. Defense-in-depth behind the real fix, not the fix itself.
+
+**Residual hardening (optional, not blocking).** The multi-worker `drive`/`worker_loop` still lacks a
+genuine quiescence-deadlock detector — if any *other* strand class ever arises it would hang rather
+than `ThreadFault`. The deterministic explorer already does this ("`live > 0` but quiescent: a
+join-deadlock"); generalizing it to the M:N driver (nothing runnable, no timers, no async-ring job in
+flight, every worker simultaneously idle with `live > 0` ⇒ shut down with `ThreadFault`) would make
+the watchdog redundant and cover the whole `svc_serve_chain`/`durable_concurrent_jit`/`serve.rs`
+family. Deferred: it is delicate (false-positive risk of aborting a correct run), and the specific
+bug that caused this flake is now fixed.
 
 ### I51 — bytecode `vcpu.tls` is per-`Vm`, not per-vCPU: a fiber that migrates across workers reads a stale TLS word (S3, multi-worker only) — recorded 2026-07-28 landing the JACL-in-browser `vcpu.tls` lowering
 
