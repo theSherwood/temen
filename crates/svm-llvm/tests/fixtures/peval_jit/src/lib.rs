@@ -152,6 +152,7 @@ fn build_module(win_log2: u8) -> Module {
         imports: Vec::new(),
         exports: Vec::new(),
         data_exports: Vec::new(),
+        data_ptrs: Vec::new(),
         impl_exports: Vec::new(),
         debug_info: None,
     }

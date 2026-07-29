@@ -2995,6 +2995,18 @@ pub struct Module {
     /// address before anything runs); empty for a module with no exported data. Names share the
     /// export namespace with [`Module::exports`].
     pub data_exports: Vec<DataExport>,
+    /// **Data-image pointer relocations** (D-LINK, the data→data case): pointers baked into a
+    /// global's own initializer whose target address the frontend cannot know at emit time because
+    /// the linker assigns each unit's data base — `int *p = &g;`, `static char *kw[] = {…}`,
+    /// chibicc's `Type *ty_int = &(Type){…}`. Each [`DataPtr`] names a byte offset in this module's
+    /// data image and the data address to write there; [`link`] resolves and writes it once the
+    /// window layout is fixed, then clears the list. The code→data case rides the instruction stream
+    /// ([`Inst::DataSelf`]/[`Inst::DataSym`]) — a data pointer has no instruction to carry it, so it
+    /// rides a data-offset-keyed slot instead. Unlike the retired `(func,block,inst)` `DataReloc`,
+    /// the key is a **data** offset, and data images are never instrumented or reordered by a pass
+    /// (only instruction streams are), so it cannot desync. Empty for a runnable module (a survivor
+    /// is a verify error, since nothing would patch the placeholder bytes before they are read).
+    pub data_ptrs: Vec<DataPtr>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -3391,6 +3403,33 @@ pub struct DataExport {
     pub offset: u64,
 }
 
+/// A **data-image pointer relocation** ([`Module::data_ptrs`], D-LINK): write the 8-byte
+/// little-endian window address of `target` into this unit's data image at byte offset `at`. Models
+/// a pointer stored inside a global's initializer (`int *p = &g;`) — the data→data counterpart of
+/// the code→data [`Inst::DataSelf`]/[`Inst::DataSym`] forms, for the case where the pointer lives in
+/// static data rather than in an instruction. The frontend emits placeholder bytes (any 8 bytes) in
+/// a `data` segment covering `[at, at+8)` and one of these to fix them up; [`link`] overwrites the
+/// full 8 bytes with the resolved absolute address (the addend rides `target`, not the placeholder).
+/// Pointers are 8 bytes because window addresses are `i64` (the width `DataSym`/`DataSelf` yield).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataPtr {
+    /// Byte offset within this unit's (un-relocated) data image where the 8-byte pointer sits.
+    pub at: u64,
+    /// The data address the pointer resolves to, once the linker has placed the units' data.
+    pub target: DataPtrTarget,
+}
+
+/// What a [`DataPtr`] points at — the data-image twin of the code→data link forms.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DataPtrTarget {
+    /// This unit's own data at `offset` → `dbase + offset` (self-relative; the twin of
+    /// [`Inst::DataSelf`]). Any `&g + k` arithmetic is folded into `offset` by the frontend.
+    SelfOff(u64),
+    /// An exported data symbol `name` plus `addend` → `addr(name) + addend` (cross-unit; the twin of
+    /// [`Inst::DataSym`]). Fail-closed at link if no unit exports `name` ([`LinkError::Unresolved`]).
+    Sym { name: String, addend: i64 },
+}
+
 /// One entry in the module-level type section ([`Module::types`]): every declared shape is
 /// either a function signature or an interface built from them. One index space, so imports,
 /// call sites, and impl exports can all reference the same entries (D59: identity is the
@@ -3618,6 +3657,9 @@ pub enum LinkError {
     BadExport { symbol: String, index: FuncIdx },
     /// A unit imports a symbol no unit exports.
     Unresolved(String),
+    /// A `data.ptr` slot (`at`) does not lie within any of the unit's data segments — the frontend
+    /// must emit an 8-byte placeholder in a `data` segment covering `[at, at+8)`. A malformed unit.
+    BadDataPtr { at: u64 },
     /// A `CallImport` referenced an out-of-range import (a malformed unit).
     BadImportIndex(u32),
     /// Retained-manifest linking ([`link_with_manifest`]) found units disagreeing on a shared
@@ -3796,6 +3838,12 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     {
         let mut m = u.module.clone();
         offset_type_indices(&mut m, tbase);
+        // Patch this unit's data-image pointers (`data.ptr`, the data→data case) while segment
+        // offsets are still unit-local: overwrite the 8 placeholder bytes at each slot with the
+        // resolved absolute window address. Must precede the segment shift below so `at` and the
+        // covering segment share one coordinate frame; the address written is already absolute
+        // (`dbase`-relative for `self`, the symbol's window address for `sym`).
+        apply_unit_data_ptrs(&mut m, dbase, &data_tab)?;
         // Relocate this unit's data segments into its assigned window region…
         for d in &mut m.data {
             d.offset += dbase;
@@ -3861,6 +3909,9 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         exports,
         // Every unit's data symbols at their merged window offsets (symmetric with `exports`).
         data_exports,
+        // Every unit's `data.ptr` slots were resolved and cleared per-unit above; the linked
+        // module is runnable and carries none.
+        data_ptrs: Vec::new(),
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
@@ -3995,6 +4046,49 @@ fn resolve_unit_data_addrs(
     Ok(())
 }
 
+/// Apply a unit's **data-image pointer relocations** ([`Module::data_ptrs`], the data→data case):
+/// for each [`DataPtr`], resolve its `target` to an absolute window address — `SelfOff(off)` →
+/// `dbase + off` (own data), `Sym { name, addend }` → `addr(name) + addend` (fail-closed on an
+/// unexported name) — and overwrite the 8 little-endian bytes at slot `at` in the covering data
+/// segment. Called with segment offsets still **unit-local**, so `at` indexes directly into the
+/// segment whose `[offset, offset+len)` contains `[at, at+8)`; a slot with no covering segment (or
+/// one whose tail would run past the segment end) is fail-closed ([`LinkError::BadDataPtr`]). Clears
+/// `data_ptrs` on success — the linked module carries none, mirroring the `data.sym`/`data.self`
+/// rewrite that leaves no link form behind.
+fn apply_unit_data_ptrs(
+    m: &mut Module,
+    dbase: u64,
+    data_tab: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<(), LinkError> {
+    for p in &m.data_ptrs {
+        let addr: u64 = match &p.target {
+            DataPtrTarget::SelfOff(off) => dbase.wrapping_add(*off),
+            DataPtrTarget::Sym { name, addend } => {
+                let base = *data_tab
+                    .get(name.as_str())
+                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?;
+                base.wrapping_add(*addend as u64)
+            }
+        };
+        // Find the segment covering `[at, at+8)` and overwrite those 8 bytes (little-endian).
+        // Untrusted unit: use checked arithmetic so a bogus offset fails closed, never panics.
+        let end =
+            p.at.checked_add(8)
+                .ok_or(LinkError::BadDataPtr { at: p.at })?;
+        let seg = m.data.iter_mut().find(|d| {
+            d.offset <= p.at
+                && d.offset
+                    .checked_add(d.bytes.len() as u64)
+                    .is_some_and(|seg_end| end <= seg_end)
+        });
+        let seg = seg.ok_or(LinkError::BadDataPtr { at: p.at })?;
+        let lo = (p.at - seg.offset) as usize;
+        seg.bytes[lo..lo + 8].copy_from_slice(&addr.to_le_bytes());
+    }
+    m.data_ptrs.clear();
+    Ok(())
+}
+
 /// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
 /// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
 /// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
@@ -4114,6 +4208,7 @@ mod import_tests {
             term: Terminator::Unreachable,
         };
         let mut m = Module {
+            data_ptrs: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],

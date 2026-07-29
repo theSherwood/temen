@@ -295,6 +295,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let has_memory = m.memory.is_some();
     let optimized = Module {
+        data_ptrs: Vec::new(),
         funcs: m
             .funcs
             .iter()
