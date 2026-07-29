@@ -98,6 +98,10 @@ enum Layout {
 pub(crate) struct Translator {
     procs: HashMap<String, Sig>,
     types: HashMap<String, Layout>,
+    /// Names of locally-declared `object`/`array` aggregate types. A bare-symbol type is treated as
+    /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
+    /// type (`enum`, `distinct` int, `proctype`, opaque/external) is an integer scalar.
+    agg_names: std::collections::HashSet<String>,
     /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
     /// starts zeroed); non-zero initializers are a later slice.
     globals: HashMap<String, (u64, TyDesc)>,
@@ -112,6 +116,7 @@ impl Translator {
         Translator {
             procs: HashMap::new(),
             types: HashMap::new(),
+            agg_names: std::collections::HashSet::new(),
             globals: HashMap::new(),
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
@@ -228,7 +233,10 @@ impl Translator {
             Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
-                Some(name) => Ok(TyDesc::Agg(name.to_string())),
+                // A bare-symbol type is an aggregate only if it's a declared object/array; any other
+                // named type (enum, distinct int, proctype, opaque external) is an integer scalar.
+                Some(name) if self.agg_names.contains(name) => Ok(TyDesc::Agg(name.to_string())),
+                Some(_) => Ok(TyDesc::Scalar(ValType::I64)),
                 None => Err(LengError::Malformed("expected a type".into())),
             },
         }
@@ -246,6 +254,14 @@ impl Translator {
                 }
             }
         }
+        // Record which declared types are aggregates (object/array) *before* resolving, so
+        // `tydesc` classifies every other named type (enum/distinct/…) as a scalar as it resolves
+        // fields.
+        self.agg_names = raw
+            .iter()
+            .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
+            .map(|(n, _)| n.clone())
+            .collect();
         let names: Vec<String> = raw.keys().cloned().collect();
         for name in names {
             self.resolve_type(&name, &raw)?;
@@ -1672,14 +1688,20 @@ impl<'a> FuncGen<'a> {
         }
     }
 
-    /// Ensure a value is an `i32` condition (comparisons already produce i32; an integer coerces).
+    /// Ensure a value is an `i32` condition (comparisons already produce i32). A wider integer
+    /// condition — e.g. an `i64` enum error code from `if canRaise.fld.0` — is reduced to a correct
+    /// 0/1 via `!= 0` (an i64→i32 *wrap* would drop the high word and misjudge truthiness).
     fn as_i32_cond(&mut self, v: Val) -> u32 {
-        if v.ty == ValType::I32 {
-            v.id
-        } else {
-            // Reduce i64 to an i32 truthiness via wrap (nonzero-preserving for our comparison
-            // results, which are already 0/1; general i64 conditions aren't produced by this subset).
-            self.convert(v, ValType::I32).id
+        match v.ty {
+            ValType::I32 => v.id,
+            ValType::I64 => {
+                let z = self.emit_const(ValType::I64, 0);
+                let id = self.fresh();
+                self.cur_buf
+                    .push_str(&format!("  v{id} = i64.ne v{} v{}\n", v.id, z.id));
+                id
+            }
+            _ => self.convert(v, ValType::I32).id,
         }
     }
 
