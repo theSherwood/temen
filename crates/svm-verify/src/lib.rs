@@ -1025,6 +1025,11 @@ fn check_inst(
     let ty = match inst {
         Inst::ConstI32(_) => ValType::I32,
         Inst::ConstI64(_) => ValType::I64,
+        // Link-form data addresses (the `call.sym` analogue for data): type as the `i64` address
+        // they resolve to, so a pre-link *unit* type-checks. `link` rewrites them to `ConstI64`
+        // before anything runs; if one ever survives into an executed module the backends fail
+        // closed (they never reach a legitimate execution path).
+        Inst::DataSym { .. } | Inst::DataSelf { .. } => ValType::I64,
         // §7 executable named imports + phase-2 attach append their results in the
         // multi-result/call section of `verify_func` (manifest-checked there); unreachable here.
         Inst::CallImport { .. }

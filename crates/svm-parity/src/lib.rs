@@ -203,6 +203,11 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
+        // Link-form data addresses: pure link scaffolding (`link` rewrites them to `i64.const`), so
+        // like `call.sym` they never appear in an executed corpus — classified with the other
+        // link-form ops for exhaustiveness.
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 

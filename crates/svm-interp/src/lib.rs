@@ -10113,9 +10113,13 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // §7 executable named imports (+ phase-2 attach) need the host's import-binding table,
         // so they're serviced in the eval loop (like `cap.call`), never in this pure-op helper.
         // `CallSym` (the v8 link-form placeholder) never verifies, so it can never execute.
+        // `DataSym`/`DataSelf` are the data-side link forms — `link` rewrites them to `i64.const`
+        // before a module runs, so reaching one here is a malformed (unlinked) module: fail closed.
         Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §7 reflection intrinsics need the host table, so they're serviced in the eval loop
@@ -12824,6 +12828,9 @@ fn module_digest(m: &Module) -> [u8; 32] {
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
         imports: Vec::new(),
+        // Data exports are resolved-away link metadata (backends ignore them) — like imports, they
+        // don't affect execution, so they stay out of the module-identity digest.
+        data_exports: Vec::new(),
         debug_info: None,
     };
     svm_encode::digest256(&svm_encode::encode_module(&canon))

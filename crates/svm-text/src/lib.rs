@@ -119,6 +119,13 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
+    // Data exports (their own dense index sequence): `export <idx> data "<name>" <offset>`.
+    if !m.data_exports.is_empty() {
+        for (i, e) in m.data_exports.iter().enumerate() {
+            let _ = writeln!(s, "export {i} data \"{}\" {}", e.name, e.offset);
+        }
+        s.push('\n');
+    }
     // Interface offers (§3.5 surface): `export <idx> interface "<name>" <t> { op: funcidx,
     // ... }` — map keys are the interface's declared op names; if the interface reference
     // does not resolve (an unverifiable module), fall back to bare positional funcidxs.
@@ -334,6 +341,10 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
     match inst {
         Inst::ConstI32(c) => format!("i32.const {c}"),
         Inst::ConstI64(c) => format!("i64.const {c}"),
+        // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
+        // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
+        Inst::DataSym { name, addend } => format!("data.sym \"{name}\" {addend}"),
+        Inst::DataSelf { offset } => format!("data.self {offset}"),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
@@ -1078,6 +1089,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
+    let mut data_exports: Vec<svm_ir::DataExport> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
@@ -1419,7 +1431,18 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                             ops,
                         });
                     }
-                    k => return err(format!("export kind must be func or interface: {k}")),
+                    // `export <idx> data "<name>" <offset>`: a data symbol at a window byte offset,
+                    // its own dense index sequence (like func/interface exports each have theirs).
+                    "data" => {
+                        if idx < 0 || idx as usize != data_exports.len() {
+                            return err(
+                                "data export indices must be dense and in declaration order",
+                            );
+                        }
+                        let offset = p.parse_u64()?;
+                        data_exports.push(svm_ir::DataExport { name, offset });
+                    }
+                    k => return err(format!("export kind must be func, interface, or data: {k}")),
                 }
             }
             _ => funcs.push(p.parse_func(funcs.len() as u32)?),
@@ -1460,6 +1483,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         data,
         imports: std::mem::take(&mut p.imports),
         exports,
+        data_exports,
         impl_exports,
         types: p.types,
         debug_info,
@@ -2440,6 +2464,21 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
+        // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
+        // them to `i64.const`. The name rides inline — there is no separate relocation table.
+        if op == "data.sym" {
+            let name = String::from_utf8(self.parse_str()?)
+                .map_err(|_| ParseError("data.sym name is not valid UTF-8".into()))?;
+            let addend = self.parse_int()?;
+            return Ok(Inst::DataSym { name, addend });
+        }
+        if op == "data.self" {
+            let n = self.parse_int()?;
+            let offset = u64::try_from(n)
+                .map_err(|_| ParseError(format!("data.self offset out of range: {n}")))?;
+            return Ok(Inst::DataSelf { offset });
         }
         // Phase-2 `import.attach <idx> v<handle>` (IMPORTS.md): rebind a rebindable import slot.
         if op == "import.attach" {

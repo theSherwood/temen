@@ -1781,6 +1781,27 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// A **link-form data-symbol address** — the data-side analogue of [`Inst::CallSym`] (D-LINK):
+    /// the window address of the exported data symbol `name`, plus `addend`, materialized as a
+    /// value. Emitted by a separately-compiled unit that references a global it does **not** define
+    /// (a cross-unit `extern`); [`link`] rewrites it **1:1** into a [`Inst::ConstI64`] holding the
+    /// resolved address once it has placed the defining unit's data. Fail-closed: an unresolved name
+    /// fails the link ([`LinkError::Unresolved`]), and a `DataSym` that *survives* into a runnable
+    /// module is a verify error (an object is not executable — the same guarantee as a surviving
+    /// `CallSym`). The name rides in the instruction, so instruction insertion/reordering never
+    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`.
+    DataSym {
+        name: alloc::string::String,
+        addend: i64,
+    },
+    /// A **link-form own-data address**: this unit's assigned data base plus `offset` (a unit-local
+    /// data offset), materialized as a value — the self-relative counterpart of [`Inst::DataSym`],
+    /// for a reference to the unit's *own* global whose final window placement the frontend did not
+    /// know at emit time (it is the linker that assigns each unit's data region). [`link`] rewrites
+    /// it to [`Inst::ConstI64`]; surviving into a runnable module is a verify error. Result is `i64`.
+    DataSelf {
+        offset: u64,
+    },
     /// **Dynamic-mode** interface dispatch by type-section reference (IMPORTS.md §3.5): drive
     /// the capability behind a runtime `handle` value as interface `ty` (an index into
     /// [`Module::types`] naming a [`TypeEntry::Interface`]), op `op`. The use-site check is
@@ -2381,6 +2402,11 @@ impl Inst {
             | Inst::Cast { .. }
             | Inst::Fma { .. }
             | Inst::RefFunc { .. }
+            // Link-form address materialization: pure (a to-be-`ConstI64`), no fault/mem/effect.
+            // CSE/DCE on them is sound (same name+addend ⇒ same address); the linker rewrites them
+            // to real consts before any backend runs.
+            | Inst::DataSym { .. }
+            | Inst::DataSelf { .. }
             | Inst::PtrAdd { .. }
             | Inst::PtrCast { .. }
             | Inst::SimdWidthBytes
@@ -2957,6 +2983,14 @@ pub struct Module {
     /// verifier checks each `func` is in range and names are unique; both backends ignore the table
     /// (they execute a funcidx). Empty for a module with no named entry points.
     pub exports: Vec<Export>,
+    /// Named **data exports** (name → window offset): the data-symbol counterpart of
+    /// [`Module::exports`], the runtime-`Module` analogue of [`LinkUnit::data_exports`]. A
+    /// separately-compiled unit publishes its external-linkage globals here so another unit's
+    /// [`Inst::DataSym`] / `data.ptr` can bind to them at [`link`] time. Declared in the text IR as
+    /// `export <k> data "<name>" <offset>`. Backends ignore it (a data symbol resolves to a plain
+    /// address before anything runs); empty for a module with no exported data. Names share the
+    /// export namespace with [`Module::exports`].
+    pub data_exports: Vec<DataExport>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -3342,6 +3376,17 @@ pub struct Export {
     pub func: FuncIdx,
 }
 
+/// A named **data export**: a `name` a linker binds a cross-unit data reference to, mapping to a
+/// byte `offset` in this unit's (un-relocated) data window — the data-symbol counterpart of
+/// [`Export`], and the in-`Module` form of a [`LinkUnit::data_exports`] entry. Declared in the text
+/// IR as `export <k> data "<name>" <offset>`. [`link`] adds each unit's base to `offset` to place
+/// the symbol in the merged window, then resolves every [`Inst::DataSym`] / `data.ptr` naming it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataExport {
+    pub name: String,
+    pub offset: u64,
+}
+
 /// One entry in the module-level type section ([`Module::types`]): every declared shape is
 /// either a function signature or an interface built from them. One index space, so imports,
 /// call sites, and impl exports can all reference the same entries (D59: identity is the
@@ -3545,10 +3590,12 @@ fn patch_placeholder(
     }
 }
 
-/// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
-/// own data references need. Function symbols (`exports`) and its named `Module::imports` are resolved
-/// against the other units by [`link`]; `data_exports` name window offsets within the unit's data; and
-/// `relocations` patch the unit's address constants once its data is placed (see [`DataReloc`]).
+/// One unit to statically link: a module plus the symbols it **exports**. Function symbols
+/// (`exports`) and the unit's named `Module::imports` (`call.sym`) resolve against the other units
+/// by [`link`]; `data_exports` name window offsets within the unit's (un-relocated) data, which the
+/// unit's [`Inst::DataSym`] / `data.ptr` references bind to. A unit's own data addresses ride in the
+/// instruction stream ([`Inst::DataSelf`] / [`Inst::DataSym`]) and in `data.ptr` slots, not in a
+/// side table — the linker rewrites them in place once it has placed the unit's data.
 #[derive(Clone, Debug, Default)]
 pub struct LinkUnit {
     pub module: Module,
@@ -3556,30 +3603,6 @@ pub struct LinkUnit {
     pub exports: Vec<(String, FuncIdx)>,
     /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
     pub data_exports: Vec<(String, u64)>,
-    /// Relocations the unit's data references need after the linker places its data (§ELF-style).
-    pub relocations: Vec<DataReloc>,
-}
-
-/// A relocation: at link time, patch the **constant** at `(func, block, inst)` — which must be a
-/// `ConstI64`/`ConstI32` (an address the frontend left at a unit-local value) — by **adding** a base
-/// resolved from `kind`; the const's current value is the **addend** (so `&g + 4` works). This is how
-/// a unit's data references survive relocation into the one shared window — no IR change, no value
-/// renumbering, just a const edit. `func`/`block`/`inst` are unit-local (applied before concatenation).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DataReloc {
-    pub func: u32,
-    pub block: u32,
-    pub inst: u32,
-    pub kind: RelocKind,
-}
-
-/// What base a [`DataReloc`] adds.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RelocKind {
-    /// This unit's own assigned data base — the const holds a unit-local data offset (an own-data ref).
-    SelfData,
-    /// The resolved address of an exported **data** symbol (a cross-unit data import).
-    DataSymbol(String),
 }
 
 /// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
@@ -3593,8 +3616,6 @@ pub enum LinkError {
     Unresolved(String),
     /// A `CallImport` referenced an out-of-range import (a malformed unit).
     BadImportIndex(u32),
-    /// A relocation pointed at a missing instruction, or one that isn't an address constant.
-    BadReloc(DataReloc),
     /// Retained-manifest linking ([`link_with_manifest`]) found units disagreeing on a shared
     /// import's structural shape or mode, a malformed shape reference, or a grouped
     /// (interface-shaped) call site whose name resolved to a single exported function. The
@@ -3608,8 +3629,9 @@ pub enum LinkError {
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
 /// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
 /// references by its base offset; place each unit's **data** in a non-overlapping window region and
-/// apply its **relocations** so its address constants follow; build function + data symbol tables from
-/// all exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
+/// rewrite its link-form data addresses ([`Inst::DataSelf`]/[`Inst::DataSym`], `data.ptr`) to
+/// concrete `ConstI64`s so they follow the data; build function + data symbol tables from all
+/// exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
 /// symbol to a **constant address** — against them. The result is one import-free, relocated module —
 /// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
 /// signature mismatch is caught there).
@@ -3663,6 +3685,9 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // The merged module's first-class export table — every unit's function exports, in declaration
     // order (deterministic, unlike a by-name map walk), at their reindexed global funcidxs.
     let mut exports: Vec<Export> = Vec::new();
+    // The merged module's first-class data-export table — every unit's data exports at their
+    // reindexed (base-added) window offsets, in declaration order. Symmetric with `exports`.
+    let mut data_exports: Vec<DataExport> = Vec::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {
@@ -3682,11 +3707,14 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
             });
         }
         for (name, local_off) in &u.data_exports {
-            if data_tab.insert(name.clone(), dbase + local_off).is_some()
-                || funcs_tab.contains_key(name)
-            {
+            let addr = dbase + local_off;
+            if data_tab.insert(name.clone(), addr).is_some() || funcs_tab.contains_key(name) {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
+            data_exports.push(DataExport {
+                name: name.clone(),
+                offset: addr,
+            });
         }
     }
     // Per-unit type-section bases (prefix sums), so instruction-level type references
@@ -3768,16 +3796,11 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         for d in &mut m.data {
             d.offset += dbase;
         }
-        // …and patch its address constants so they point at the relocated data (own or imported).
-        for r in &u.relocations {
-            let base = match &r.kind {
-                RelocKind::SelfData => dbase,
-                RelocKind::DataSymbol(name) => *data_tab
-                    .get(name)
-                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?,
-            };
-            apply_reloc(&mut m, r, base)?;
-        }
+        // …and rewrite its link-form data addresses to concrete `ConstI64`s, now that the window
+        // layout is fixed: `data.self <off>` → `dbase + off` (own data), `data.sym "name" +addend`
+        // → `addr(name) + addend` (a cross-unit symbol, fail-closed if unexported). This is the
+        // data twin of the `call.sym → call` rewrite below — a 1:1, position-independent edit.
+        resolve_unit_data_addrs(&mut m, dbase, &data_tab)?;
         offset_func_indices(&mut m, fbase);
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
@@ -3832,6 +3855,8 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // Empty for [`link`]; the deduped host-bound slots for [`link_with_manifest`].
         imports: merged_imports,
         exports,
+        // Every unit's data symbols at their merged window offsets (symmetric with `exports`).
+        data_exports,
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
@@ -3929,19 +3954,34 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
     Ok(())
 }
 
-/// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
-/// `ConstI32`). A reloc pointing at a missing or non-constant instruction is fail-closed.
-fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError> {
-    let inst = m
-        .funcs
-        .get_mut(r.func as usize)
-        .and_then(|f| f.blocks.get_mut(r.block as usize))
-        .and_then(|b| b.insts.get_mut(r.inst as usize))
-        .ok_or_else(|| LinkError::BadReloc(r.clone()))?;
-    match inst {
-        Inst::ConstI64(c) => *c = c.wrapping_add(base as i64),
-        Inst::ConstI32(c) => *c = (*c as i64).wrapping_add(base as i64) as i32,
-        _ => return Err(LinkError::BadReloc(r.clone())),
+/// Resolve a unit's **link-form data addresses** to concrete `ConstI64`s, now that the linker has
+/// fixed the window layout (the data twin of [`resolve_imports_with`]'s `call.sym → call` rewrite).
+/// [`Inst::DataSelf`] `{offset}` → `ConstI64(dbase + offset)` (own data). [`Inst::DataSym`]
+/// `{name, addend}` → `ConstI64(addr(name) + addend)`, where `addr` comes from the merged
+/// `data_tab`; an unexported name is fail-closed ([`LinkError::Unresolved`], like a missing function
+/// symbol). Rewrites **1:1** in place (the result value index is unchanged), so no value
+/// renumbering — the same discipline the call-symbol rewrite follows.
+fn resolve_unit_data_addrs(
+    m: &mut Module,
+    dbase: u64,
+    data_tab: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<(), LinkError> {
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                let addr = match inst {
+                    Inst::DataSelf { offset } => dbase.wrapping_add(*offset),
+                    Inst::DataSym { name, addend } => {
+                        let base = *data_tab
+                            .get(name)
+                            .ok_or_else(|| LinkError::Unresolved(name.clone()))?;
+                        base.wrapping_add(*addend as u64)
+                    }
+                    _ => continue,
+                };
+                *inst = Inst::ConstI64(addr as i64);
+            }
+        }
     }
     Ok(())
 }
@@ -4075,6 +4115,7 @@ mod import_tests {
             data: vec![],
             imports: vec![],
             exports: vec![],
+            data_exports: vec![],
             impl_exports: vec![],
             debug_info: None,
         };

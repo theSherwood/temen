@@ -330,6 +330,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        data_exports: m.data_exports.clone(),
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
         debug_info: None,
@@ -2207,6 +2208,10 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         | Inst::ConstF32(_)
         | Inst::ConstF64(_)
         | Inst::ConstV128(_)
+        // Link-form data addresses carry only immediates (a name+addend, or an offset) — no value
+        // operands to renumber.
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
         | Inst::RefFunc { .. }
         | Inst::CapSelfCount
         | Inst::CapSelfAttest

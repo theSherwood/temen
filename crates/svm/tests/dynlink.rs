@@ -252,10 +252,10 @@ fn link_duplicate_symbol_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Milestone 2: data symbols + per-unit data relocation (LinkUnit data_exports + relocations).
+// Milestone 2: cross-unit data symbols via the **self-describing** link forms — `export … data`
+// (provider), `data.sym "name" <addend>` / `data.self <offset>` (consumer). No relocation
+// side-table: the symbol rides in the instruction, so the linker rewrites it 1:1 to `i64.const`.
 // ---------------------------------------------------------------------------------------------
-
-use svm_ir::{DataReloc, RelocKind};
 
 /// 16 bytes of padding data so the unit that follows lands at a **non-zero** data base — making the
 /// relocation observable (a coincidental base of 0 would prove nothing).
@@ -269,42 +269,58 @@ block 0 (v0: i32) {
 }
 ";
 
-/// A **cross-unit data symbol**: `store` exports the byte 42 as data symbol "answer"; `load` reads it
-/// by name. The linker places `store`'s data at a non-zero base (after `pad`), records "answer" at
-/// that window address, and patches `load`'s address constant (left at 0) to it — so `load` reads the
-/// byte wherever the linker put it. Proves the data moved and the reference followed.
+/// Build a link unit from text, taking its function and data exports from the module's own
+/// `export`/`export … data` directives — so this exercises the text round-trip of both.
+fn text_unit(src: &str) -> LinkUnit {
+    let module = svm_text::parse_module(src).expect("parse unit");
+    let exports = module
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    let data_exports = module
+        .data_exports
+        .iter()
+        .map(|e| (e.name.clone(), e.offset))
+        .collect();
+    LinkUnit {
+        module,
+        exports,
+        data_exports,
+    }
+}
+
+/// A **cross-unit data symbol**: `store` exports the byte 42 as data symbol "answer" (`export … data`);
+/// `load` reads it with `data.sym "answer"`. The linker places `store`'s data at a non-zero base
+/// (after `pad`), records "answer" at that window address, and rewrites `load`'s `data.sym` to an
+/// `i64.const` of it — so `load` reads the byte wherever the linker put it. Proves data moved + ref
+/// followed, with the symbol carried in the instruction (no relocation table).
 #[test]
-fn cross_unit_data_symbol_is_relocated() {
-    let store = LinkUnit {
-        module: svm_text::parse_module(
-            "memory 16\ndata 0 \"\\x2a\"\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
-        )
-        .unwrap(),
-        data_exports: vec![("answer".into(), 0)],
-        ..Default::default()
-    };
-    let load = LinkUnit {
-        module: svm_text::parse_module(
-            "memory 16\n\
-             func (i32) -> (i32) {\n\
-             block 0 (v0: i32) {\n\
-             \x20 v1 = i64.const 0\n\
-             \x20 v2 = i32.load8_u v1\n\
-             \x20 return v2\n\
-               }\n\
-             }\n",
-        )
-        .unwrap(),
-        // The address const (func 0, block 0, inst 0) is the address of "answer".
-        relocations: vec![DataReloc {
-            func: 0,
-            block: 0,
-            inst: 0,
-            kind: RelocKind::DataSymbol("answer".into()),
-        }],
-        ..Default::default()
-    };
+fn cross_unit_data_symbol_resolves() {
+    let store = text_unit(
+        "memory 16\ndata 0 \"\\x2a\"\nexport 0 data \"answer\" 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    let load = text_unit(
+        "memory 16\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.sym \"answer\" 0\n\
+         \x20 v2 = i32.load8_u v1\n\
+         \x20 return v2\n\
+           }\n\
+         }\n",
+    );
     let linked = link(&[unit(PAD16, &[]), store, load]).expect("link");
+    assert!(
+        !linked
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, svm_ir::Inst::DataSym { .. })),
+        "every data.sym is rewritten to a const at link"
+    );
     svm_verify::verify_module(&linked).expect("verify");
     // `load` is the 3rd unit's function → global index 2.
     assert_eq!(
@@ -314,33 +330,51 @@ fn cross_unit_data_symbol_is_relocated() {
     );
 }
 
-/// **Self-data relocation**: a unit references its *own* data by a unit-local offset; linked after
-/// `pad`, its data moves to a non-zero base and its own address const is shifted by the same base
-/// (`SelfData`), so the reference still lands on its data. The const here is the local offset 0, so a
-/// passing read proves the `+ base` was applied to both the segment and the reference identically.
+/// The **addend** rides through: `store` exports a 4-byte array as "arr"; `load` reads element 2 with
+/// `data.sym "arr" 8` (offset 8 = index 2 of `i32`). The linker resolves to `addr(arr) + 8`.
 #[test]
-fn self_data_is_relocated() {
-    let me = LinkUnit {
-        module: svm_text::parse_module(
-            "memory 16\n\
-             data 0 \"\\x07\"\n\
-             func (i32) -> (i32) {\n\
-             block 0 (v0: i32) {\n\
-             \x20 v1 = i64.const 0\n\
-             \x20 v2 = i32.load8_u v1\n\
-             \x20 return v2\n\
-               }\n\
-             }\n",
-        )
-        .unwrap(),
-        relocations: vec![DataReloc {
-            func: 0,
-            block: 0,
-            inst: 0,
-            kind: RelocKind::SelfData,
-        }],
-        ..Default::default()
-    };
+fn cross_unit_data_symbol_addend() {
+    let store = text_unit(
+        // arr = {10, 20, 30, 40} as i32 LE.
+        "memory 16\ndata 0 \"\\x0a\\x00\\x00\\x00\\x14\\x00\\x00\\x00\\x1e\\x00\\x00\\x00\\x28\\x00\\x00\\x00\"\n\
+         export 0 data \"arr\" 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    let load = text_unit(
+        "memory 16\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.sym \"arr\" 8\n\
+         \x20 v2 = i32.load v1\n\
+         \x20 return v2\n\
+           }\n\
+         }\n",
+    );
+    let linked = link(&[unit(PAD16, &[]), store, load]).expect("link");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert_eq!(
+        run_entry(&linked, 2, &[0]),
+        30,
+        "arr[2] via the data.sym addend"
+    );
+}
+
+/// **Own-data address**: a unit references its *own* data with `data.self <offset>`; linked after
+/// `pad`, its data moves to a non-zero base and the `data.self` resolves to `base + offset`, so the
+/// reference still lands on its data — proving the base was applied to segment and reference alike.
+#[test]
+fn self_data_address_resolves() {
+    let me = text_unit(
+        "memory 16\n\
+         data 0 \"\\x07\"\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.self 0\n\
+         \x20 v2 = i32.load8_u v1\n\
+         \x20 return v2\n\
+           }\n\
+         }\n",
+    );
     let linked = link(&[unit(PAD16, &[]), me]).expect("link");
     svm_verify::verify_module(&linked).expect("verify");
     assert_eq!(
@@ -350,24 +384,46 @@ fn self_data_is_relocated() {
     );
 }
 
-/// A relocation that points at a non-constant instruction is fail-closed.
+/// A `data.sym` naming a symbol no unit exports is fail-closed — the linker's `Unresolved`, the same
+/// guarantee a missing function symbol gets, now for data.
 #[test]
-fn bad_relocation_fails_closed() {
-    let u = LinkUnit {
-        module: svm_text::parse_module(
-            "func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
-        )
-        .unwrap(),
-        // inst 0 of an empty block body doesn't exist → BadReloc.
-        relocations: vec![DataReloc {
-            func: 0,
-            block: 0,
-            inst: 0,
-            kind: RelocKind::SelfData,
-        }],
-        ..Default::default()
-    };
-    assert!(matches!(link(&[u]), Err(svm_ir::LinkError::BadReloc(_))));
+fn unresolved_data_symbol_fails_closed() {
+    let u = text_unit(
+        "memory 16\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.sym \"nowhere\" 0\n\
+         \x20 v2 = i32.load8_u v1\n\
+         \x20 return v2\n\
+           }\n\
+         }\n",
+    );
+    assert_eq!(
+        link(&[u]),
+        Err(svm_ir::LinkError::Unresolved("nowhere".into()))
+    );
+}
+
+/// The text round-trips: `data.sym`/`data.self`/`export … data` print and re-parse identically.
+#[test]
+fn data_link_forms_round_trip() {
+    let src = "memory 16\n\
+               data 0 \"\\x2a\"\n\n\
+               export 0 data \"answer\" 0\n\n\
+               func (i64) -> (i64) {\n\
+               block 0 (v0: i64) {\n\
+               \x20 v1 = data.sym \"answer\" 8\n\
+               \x20 v2 = data.self 4\n\
+               \x20 v3 = i64.add v1 v2\n\
+               \x20 return v3\n\
+                 }\n\
+               }\n";
+    let m = svm_text::parse_module(src).expect("parse");
+    let printed = svm_text::print_module(&m);
+    let m2 = svm_text::parse_module(&printed).expect("re-parse");
+    assert_eq!(m, m2, "print ∘ parse is identity for the data link forms");
+    assert_eq!(m.data_exports.len(), 1);
+    assert_eq!(m.data_exports[0].name, "answer");
 }
 
 // ---------------------------------------------------------------------------------------------

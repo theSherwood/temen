@@ -1731,6 +1731,10 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
+        // Link-form data addresses: resolved by the linker, never executed by the spec — grouped
+        // with the other link-form ops (provisional, gates nothing until a slice lands).
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
