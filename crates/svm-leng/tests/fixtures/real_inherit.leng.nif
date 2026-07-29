@@ -1,0 +1,193 @@
+(.nif27)
+(.indexat 3368             )
+(stmts@,1,../../../tmp/inh.nim
+ (const :DerivedError.0.dy. .
+  (flexarray
+   (u 32))
+  (aconstr
+   (flexarray
+    (u 32))1294232418u 3314435237u 2689532107u))
+ (const :DerivedError.0.vt. . Rtti.0.sysvq0asl
+  (oconstr Rtti.0.sysvq0asl
+   (kv dl.0 3)
+   (kv dy.0
+    (cast
+     (ptr
+      (u 32))DerivedError.0.dy.))
+   (kv mt.0
+    (aconstr
+     (ptr
+      (void))
+     (nil)))))
+ (const :BaseError.0.dy. .
+  (flexarray
+   (u 32))
+  (aconstr
+   (flexarray
+    (u 32))1294232418u 3314435237u))
+ (const :BaseError.0.vt. . Rtti.0.sysvq0asl
+  (oconstr Rtti.0.sysvq0asl
+   (kv dl.0 2)
+   (kv dy.0
+    (cast
+     (ptr
+      (u 32))BaseError.0.dy.))
+   (kv mt.0
+    (aconstr
+     (ptr
+      (void))
+     (nil)))))
+ (type@C,1 :BaseError.0.~A .~A
+  (object@2 RootObj.0.sysvq0asl@A
+   (fld~A,1 :value.0 .
+    (i@7 64))))
+ (type@F,3 :DerivedError.0.~D .~D
+  (object@2 BaseError.0.@A
+   (fld~D,1 :extra.0 .
+    (i@7 64))))
+ (proc@,6 :kindOf.0.@5
+  (params@B
+   (param@1 :e.0 .
+    (ptr@3 BaseError.0.)))
+  (i@G 64)
+  (pragmas
+   (smry
+    (param 0 0 reads)result 0))
+  (stmts@2,1
+   (var@7 :result.0 .
+    (i@2,~5 64).@2,~5)
+   (asgn@7 result.0~7
+    (dot@3
+     (deref~1 e.0)value.0 0))
+   (ret@A result.0)))
+ (proc@,9 :mkDerived.0.@5
+  (params@E
+   (param@1 :a.0 .
+    (i@3 64))
+   (param@9 :b.0 .
+    (i@3 64)))DerivedError.0.@I
+  (pragmas
+   (smry writeGlobal readGlobal
+    (param 0 0 reads)
+    (param 1 1 reads)))
+  (stmts@2,1
+   (var@7 :result.1 . DerivedError.0.@9,~1 .@9,~1)
+   (call@7 =wasmoved_SX44erivedX45rror0inh556g6k1.0.
+    (addr result.1))
+   (asgn@7 result.1~7
+    (oconstr@E DerivedError.0.~5,~1
+     (addr DerivedError.0.vt.)
+     (kv@6 value.0~5 a.0@2 1~5)
+     (kv@G extra.0~5 b.0@2)))
+   (ret@d result.1)))
+ (proc@F,3 :=wasmoved_SX42aseX45rror0inh556g6k1.0.
+  (params
+   (param :dest.0 .
+    (ptr BaseError.0.~3,~2))).
+  (pragmas
+   (smry
+    (param 0 0 reads writes)))
+  (stmts
+   (asgn
+    (dot
+     (deref dest.0)vt.00 1)
+    (addr BaseError.0.vt.))))
+ (proc@F,3 :=wasmoved_SX44erivedX45rror0inh556g6k1.0.
+  (params
+   (param :dest.0 .
+    (ptr DerivedError.0.))).
+  (pragmas
+   (smry
+    (param 0 0 reads writes)))
+  (stmts
+   (asgn
+    (dot
+     (deref dest.0)vt.00 2)
+    (addr DerivedError.0.vt.))))
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl)))
+ (type :`cchar.0.
+  (pragmas
+   (importc "char")
+   (nodecl))
+  (i 8))
+ (gvar :`cmdCount.0.
+  (pragmas
+   (exportc "cmdCount"))
+  (i 32).)
+ (gvar :`cmdLine.0.
+  (pragmas
+   (exportc "cmdLine"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (gvar :`nimEnviron.0.
+  (pragmas
+   (exportc "nimEnviron"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (proc :`main.0.
+  (params
+   (param :`argc.0. .
+    (i 32))
+   (param :`argv.0. .
+    (ptr
+     (ptr `cchar.0.)))
+   (param :`envp.0. .
+    (ptr
+     (ptr `cchar.0.))))
+  (i 32)
+  (pragmas
+   (exportc "main")
+   (smry callsUnknown
+    (param 0 0 reads)
+    (param 1 1 reads)
+    (param 2 2 reads)))
+  (stmts
+   (asgn `cmdCount.0. `argc.0.)
+   (asgn `cmdLine.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`argv.0.))
+   (asgn `nimEnviron.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`envp.0.))
+   (call `ini.0.)
+   (call nimFlushStdStreams.0.sysvq0asl)
+   (ret 0))))(.index@,1,../../../tmp/inh.nim
+ (h DerivedError.0.dy. 68)
+ (h DerivedError.0.vt. 128)
+ (h BaseError.0.dy. 220)
+ (h BaseError.0.vt. 113)
+ (h BaseError.0. 214)
+ (h DerivedError.0. 104)
+ (x kindOf.0. 100)
+ (x mkDerived.0. 287)
+ (x =wasmoved_SX42aseX45rror0inh556g6k1.0. 522)
+ (x =wasmoved_SX44erivedX45rror0inh556g6k1.0. 248)
+ (h `iniGuard.0. 252)
+ (x `ini.0. 34)
+ (x `cchar.0. 194)
+ (x `cmdCount.0. 71)
+ (x `cmdLine.0. 68)
+ (x `nimEnviron.0. 84)
+ (x `main.0. 90)
+ (h `argc.0. 27)
+ (h `argv.0. 34)
+ (h `envp.0. 54))

@@ -9,15 +9,21 @@
 //! ## Scope — a walking skeleton
 //!
 //! The frontend now lowers integers/floats, arithmetic, locals and direct/indirect calls, control
-//! flow (`if`/`while`/`case`, and the low-level `jmp`/`lab` jump family for `break`/`block`), memory
+//! flow (`if`/`while`/`case`, `break`/`continue`, and the low-level `jmp`/`lab` jump family), memory
 //! (`ptr`/`aptr`/`deref`/`addr` + window frames), aggregates (`object`/`array` with constructors,
 //! copy, and sret return), enum/distinct/opaque named types (integer scalars), globals, and — falling
 //! straight out of those — nimony's **exception ABI** (a `.raises` proc returns an `(ErrorCode,
 //! result)` tuple by sret; `try`/`except` is an error-code check plus a `jmp` to a handler label).
-//! What remains outside the subset — seq/string, `union`, `emit`, the `jtrue`/`mflag`/`vflag` jump
-//! forms, exception payloads carrying `object`-of-`RootObj` inheritance (vtables) — is a fail-closed
-//! [`LengError::Unsupported`], never a silent mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)`
-//! discipline). Growing the frontend means adding grammar arms below, not rearchitecting.
+//! `seq`/`string` are `{len, data*}` objects: their value layout and element access lower here, and
+//! their stdlib operations (`add`/`[]`/`len`/`toOpenArray`) lower to **imports** — valid IR that runs
+//! once those imports are bound to a real seq runtime (the W3 runtime edge). `object of RootObj`
+//! **inheritance** lowers too: a derived object inlines its base's layout after a leading vtable
+//! header, and the vtable pointer is stored but opaque (dynamic dispatch fail-closes). What remains
+//! outside the subset — `union`, `emit`, dynamic method dispatch, value-object exception payloads
+//! (an object punned into the error tuple's scalar slot) — is a fail-closed [`LengError::Unsupported`],
+//! never a silent mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline). (The
+//! `jtrue`/`mflag`/`vflag` cfvar jump forms never reach us — hexer's `xelim` lowers them away before
+//! the final IR.) Growing the frontend means adding grammar arms below, not rearchitecting.
 //!
 //! Like chibicc's `codegen_ir.c`, it emits **SVM text** and hands it to [`svm_text::parse_module`];
 //! [`translate`] returns the parsed (but not-yet-verified) [`Module`].
