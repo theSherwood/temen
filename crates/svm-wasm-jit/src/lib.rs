@@ -1422,6 +1422,98 @@ pub fn compile_module_tierup(
     Ok((wasm, emit))
 }
 
+// ---- the unified front door -----------------------------------------------------------------------
+
+/// The embedder's **invocation intent** — the one thing that is *not* derivable from the IR (two
+/// guests can have byte-identical IR and differ only in how the host chooses to drive them). Everything
+/// else — which functions emit, who owns the top-level frame, where the bytecode fallback kicks in — is
+/// derived from the module by [`compile_jit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// Run `entry` once to completion (a batch `_start`, or the cross-engine bench's kernel).
+    Batch { entry: u32 },
+    /// A long-lived reactor re-entered at `entry` (`tick`) each activation.
+    Reactor { entry: u32 },
+    /// Threaded / no single root — vCPUs enter through `thread.spawn`, so there is no top-level
+    /// wasm frame the host can own; the interpreter must drive.
+    Threaded,
+}
+
+/// How the host must drive the wasm [`Artifact::wasm`] — the strategy [`compile_jit`] picked from the
+/// IR. The two variants are the irreducible fork (who owns the top-level stack frame), forced by
+/// wasm's inability to unwind a frame across a suspension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveMode {
+    /// **Wasm owns the top-level frame:** the host calls `f{entry}` directly; a reachable function
+    /// with `emitted[i] == false` is a cross-tier callee run on the bytecode interpreter over the
+    /// shared window via `env.call_interp`. Chosen when the guest is rooted and nothing reachable can
+    /// suspend (a wasm frame can't unwind for a stack switch).
+    WasmDriven { entry: u32 },
+    /// **The bytecode interpreter owns the top-level frame** and drives scheduling / suspension /
+    /// threads; a direct `Call` to an `emitted[i]` function tiers up onto the emitted region. The
+    /// universal fallback — it runs any guest, JIT-accelerating whatever compute it can (possibly
+    /// nothing, i.e. a pure-bytecode run).
+    InterpDriven,
+}
+
+/// A compiled guest plus how to drive it: the emitted wasm, the per-function **emitted** bitmap
+/// (`emitted[i]` ⇒ `f{i}` is exported and runs as wasm; the rest are interpreter-serviced), and the
+/// [`DriveMode`] the host must use.
+pub struct Artifact {
+    pub wasm: Vec<u8>,
+    pub emitted: Vec<bool>,
+    pub drive: DriveMode,
+}
+
+/// Whether any function reachable from `entry` uses a §12 concurrency op (`cont.*`/`suspend`/
+/// `thread.*`/futex). Such a guest cannot be wasm-driven: the interpreter must own the stack so it can
+/// unwind across a suspension / block a vCPU (a wasm frame can neither).
+fn reachable_concurrency(m: &Module, entry: u32) -> bool {
+    let a = analyze_from(m, entry);
+    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_concurrency())
+}
+
+/// **The single wasm-JIT front door.** The embedder supplies only the invocation [`Shape`]; the
+/// execution *strategy* is derived from the IR: a rooted, suspension-free guest is **wasm-driven**
+/// (the whole hot path is emitted wasm, fastest), everything else is **interpreter-driven** with
+/// per-function tier-up (the interpreter owns scheduling/suspension and lifts hot compute). Either
+/// way non-emitted functions fall back to the bytecode interpreter, so this never fails to produce a
+/// runnable artifact for a verified module.
+///
+/// This removes the strategy choice from consumers: picking wrong could previously only cost
+/// performance (never correctness), so deriving it here is pure upside. The one honest parameter left
+/// is the `shape` — the host's own invocation intent, which the bytes can't express.
+pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Artifact, Error> {
+    let interp_driven = |m: &Module| -> Result<Artifact, Error> {
+        let (wasm, emitted) = compile_module_tierup(m, shared_memory)?;
+        Ok(Artifact {
+            wasm,
+            emitted,
+            drive: DriveMode::InterpDriven,
+        })
+    };
+    match shape {
+        // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
+        Shape::Threaded => interp_driven(m),
+        Shape::Batch { entry } | Shape::Reactor { entry } => {
+            // Wasm-drivable iff rooted-eligible AND nothing reachable can suspend across a wasm frame.
+            // The concurrency check makes this selection strictly more conservative than the raw
+            // `compile_module_reactor` entry (which would emit a suspending cross-tier callee it can't
+            // safely unwind) — closing that latent sharp edge.
+            if !reachable_concurrency(m, entry) {
+                if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
+                    return Ok(Artifact {
+                        wasm,
+                        emitted,
+                        drive: DriveMode::WasmDriven { entry },
+                    });
+                }
+            }
+            interp_driven(m)
+        }
+    }
+}
+
 /// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
 /// take wasm indices), routing each `Call` via `wasm_of` (a direct wasm call) or, for an interp
 /// leaf, through `env.call_interp`. See the module docs for the emitted shape.
