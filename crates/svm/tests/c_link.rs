@@ -62,6 +62,13 @@ fn chibicc() -> &'static Path {
 /// unit — `-I frontend/chibicc` for `chibicc.h`. Same pipeline as [`object_unit`], but on real
 /// self-host source rather than a crafted string, so the tests exercise the actual shared globals
 /// (`ty_int`, …) and cross-TU call graph the compiler is written with.
+///
+/// **Linux-only** (like `svm-llvm` and the self-host build scripts): `chibicc.h` pulls system headers
+/// (`<assert.h>`, `<stdio.h>`, …) and chibicc's default include search path is Linux-hardcoded
+/// (`/usr/include/x86_64-linux-gnu`, main.c) — macOS/Windows runners have no such path, so compiling
+/// chibicc's own source is a Linux operation here. The crafted-string tests carry no `#include` and
+/// stay cross-platform.
+#[cfg(target_os = "linux")]
 fn object_unit_real(name: &str) -> LinkUnit {
     let src_dir = repo_root().join("frontend/chibicc");
     let cfile = src_dir.join(name);
@@ -535,6 +542,10 @@ fn links_and_runs_under_powerbox_with_argv() {
 /// own (its libc calls — `strcmp`, `calloc`, … — stay retained manifest imports via
 /// `link_with_manifest`), so this pins that real source flows through emit-object → link, while the
 /// crafted tests above pin the runtime read behavior.
+///
+/// Linux-only: compiling chibicc's own source needs its Linux system-header path (see
+/// [`object_unit_real`]).
+#[cfg(target_os = "linux")]
 #[test]
 fn real_chibicc_type_tu_emits_and_links() {
     let type_tu = object_unit_real("type.c");
@@ -573,6 +584,10 @@ fn real_chibicc_type_tu_emits_and_links() {
 /// `strtoul` declared; the runtime needs `malloc`/`printf`/file I/O) — a separate slice; every
 /// linking mechanism it stands on (cross-TU functions, cross-TU data, the `data.top` stack base) is
 /// proven here and above.
+///
+/// Linux-only: compiling chibicc's own source needs its Linux system-header path (see
+/// [`object_unit_real`]).
+#[cfg(target_os = "linux")]
 #[test]
 fn links_multiple_real_chibicc_tus() {
     let units = [
