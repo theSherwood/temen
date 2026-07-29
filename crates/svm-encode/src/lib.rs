@@ -614,6 +614,13 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
         }
+        // Link-form data addresses have no binary wire form: they are text-IR link scaffolding
+        // (`--emit-ir` units) that `link` rewrites to `ConstI64` before a module is finalized, so a
+        // module reaching the binary encoder (a linked/runnable module) never carries one. Encoding
+        // one is a producer bug, not untrusted input — the "never panic" discipline governs *decode*.
+        Inst::DataSym { .. } | Inst::DataSelf { .. } => {
+            unreachable!("data.sym/data.self are link-form; resolve via link before encoding")
+        }
         // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
         // self-describing sig, runtime handle operand, args.
         Inst::CallImportDyn {
@@ -1795,6 +1802,9 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         data,
         imports,
         exports,
+        // Data exports are text-IR link metadata (a runnable module resolves them to addresses at
+        // link time and backends ignore them); the binary wire form does not carry them yet.
+        data_exports: Vec::new(),
         impl_exports,
         types,
         debug_info,
@@ -2720,6 +2730,7 @@ mod debug_tests {
             data: vec![],
             imports: vec![],
             exports: vec![],
+            data_exports: vec![],
             impl_exports: vec![],
             debug_info,
         }

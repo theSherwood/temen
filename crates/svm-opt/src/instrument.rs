@@ -350,6 +350,7 @@ mod tests {
             data: vec![],
             imports: vec![],
             exports: vec![],
+            data_exports: vec![],
             impl_exports: vec![],
             debug_info: None,
         }

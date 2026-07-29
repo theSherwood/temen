@@ -1111,6 +1111,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         data,
         imports: Vec::new(),
         exports: Vec::new(),
+        data_exports: Vec::new(),
         impl_exports: Vec::new(),
         types: Vec::new(),
         debug_info: None,

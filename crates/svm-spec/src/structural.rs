@@ -701,6 +701,8 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount

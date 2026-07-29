@@ -1140,6 +1140,9 @@ fn translate_impl(
         module: Module {
             types,
             impl_exports: vec![],
+            // The on-ramp bakes pointer-valued globals whole-module (all offsets known at translate
+            // time), so it emits no cross-unit data symbols — nothing to export here.
+            data_exports: vec![],
             funcs,
             memory,
             data,

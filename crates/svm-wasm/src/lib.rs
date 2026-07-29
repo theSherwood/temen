@@ -736,6 +736,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
                     func: *func,
                 })
                 .collect(),
+            // wasm has no cross-unit data-symbol exports (its own linking is already resolved).
+            data_exports: vec![],
             // wasm has no provider-side interface offers (IMPORTS.md §3.2) — nothing to transpile.
             impl_exports: vec![],
             types: manifest_types,
