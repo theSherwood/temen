@@ -126,7 +126,7 @@ fn emit_object_real(cfile: &Path, include_dirs: &[PathBuf], tag: &str) -> LinkUn
 fn object_unit_real(name: &str) -> LinkUnit {
     let src_dir = repo_root().join("frontend/chibicc");
     let cfile = src_dir.join(name);
-    emit_object_real(&cfile, &[src_dir.clone()], name)
+    emit_object_real(&cfile, std::slice::from_ref(&src_dir), name)
 }
 
 /// Compile the cc1 **entry** TU — `crates/svm-run/demos/chibicc_selfhost/cc1_main.c`, which replaces
