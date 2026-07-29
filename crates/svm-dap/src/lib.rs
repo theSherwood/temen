@@ -1217,15 +1217,16 @@ fn dap_reason(r: StopReason) -> &'static str {
     }
 }
 
+/// The source-line breakpoint tables: `(file, line) → smallest stoppable IR pc`, and the set of
+/// `(file, line)`s that map *only* to a block terminator (so they can't bind — see `build_line_index`).
+type LineTables = (BTreeMap<(u32, u32), IrPc>, BTreeSet<(u32, u32)>);
+
 /// Build the `(file, line) → smallest stoppable IR pc` index used to bind source-line breakpoints,
 /// plus the set of lines that map *only* to block terminators. A terminator (`Block::term`, whose IR
 /// `inst` index is `>= block.insts.len()`) is never a stoppable position — no engine pauses at one —
 /// so it is excluded from the index; a line left with no stoppable pc is recorded as terminator-only
 /// so `setBreakpoints` can report it honestly instead of binding a breakpoint that never fires.
-fn build_line_index(
-    di: &DebugInfo,
-    module: &Module,
-) -> (BTreeMap<(u32, u32), IrPc>, BTreeSet<(u32, u32)>) {
+fn build_line_index(di: &DebugInfo, module: &Module) -> LineTables {
     let is_terminator = |pc: &IrPc| {
         module
             .funcs
