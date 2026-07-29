@@ -361,13 +361,26 @@ compiler bug is a clean error, never an escape.
    C TUs compiled separately, linked, verified, run on interp+JIT. This generalizes — any multi-TU C
    program to SVM now links the same way, not just chibicc.
 
+   **→ Cross-TU data + linked `_start` under the powerbox DONE 2026-07-29 — items (a) and (b)'s
+   mechanism.** `--emit-object` now emits the **data** side too: each non-`static` global is published
+   as a data symbol (`export … data`), a global's own address materializes as `data.self` and a
+   cross-TU global's as `data.sym`, and a pointer initializer (`&global`, `char *p = "…"`, `int *p =
+   &extern`) lowers to a `data.ptr … self`/`sym` relocation — so chibicc's shared `ty_int`/`ty_void`
+   (each a `Type *` → an anonymous `Type` body) link across units. Running the *linked* program through
+   `_start` needed one more link form: **`data.top`**, the post-link top-of-data the frontend emits for
+   the `_start` data-SP and argv scaffold where a whole-program build bakes `i64.const data_end` (this
+   unit's own top, wrong once the linker stacks every unit's data above it). Proven end-to-end
+   (`crates/svm/tests/c_link.rs`): crafted units read cross-TU data on interp==JIT; a two-TU program
+   runs through `_start` under the powerbox (return value + argv + stdout); and **real** chibicc source
+   — `type.c` emits its `ty_*` data symbols + 13 `data.ptr` relocations, and `type`+`hashmap`+`unicode`+
+   `strings` link and verify together.
+
    **What remains for the whole-compiler self-compile** (chibicc compiling its *own* source into one
-   runnable module): (a) **cross-TU data** — a global defined in one unit and referenced in another
-   (chibicc shares e.g. `ty_int`/`ty_void`) needs `LinkUnit::data_exports` + relocations, which the
-   linker already models but `codegen_ir` doesn't yet emit (it needs a small `.syms` sidecar, like the
-   LLVM on-ramp's); (b) run a linked program through `_start` under an **fs-capable powerbox** (drive
-   all ~9 chibicc TUs through `--emit-object` + link + run); (c) the **bootstrap-fixpoint** differential
-   (§5 E). The function-linking mechanism, libc, headers, and heap it all stands on are done.
+   runnable module): (b′) a **self-host libc for the emit-object path** so all ~9 cc1 TUs not only link
+   but *run* — `tokenize.c` wants `strtoul` declared (a header gap, identical in `--emit-ir`), and the
+   runtime needs `malloc`/`printf`/file I/O (the LLVM-on-ramp self-host build synthesizes these; the
+   emit-object path does not yet); (c) the **bootstrap-fixpoint** differential (§5 E). The cross-TU
+   function + data linking, the `data.top` stack base, headers, and heap it all stands on are done.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
