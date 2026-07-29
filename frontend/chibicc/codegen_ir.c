@@ -71,6 +71,13 @@
 
 extern bool opt_g; // -g: emit the debug-info section (DEBUGGING.md §6 waist)
 extern bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable)
+// --emit-object: emit a *linkable unit* (native `cc -c`), not a whole program. Each non-`static`
+// function is `export`ed by name, and a call to a declared-but-undefined function is lowered to a
+// **function-symbol import** (`call.sym "name"` with the callee's real signature) instead of the
+// generic capability import — so `svm_ir::link` resolves it to a direct cross-unit call. `static`
+// functions stay internal (never exported), so same-named file-local statics across TUs never
+// collide. `_start` is still emitted only for the unit that defines `main` (the entry unit).
+extern bool opt_emit_object;
 
 static FILE *o;
 
@@ -1739,7 +1746,14 @@ static int gen_expr(Node *node) {
         // not a recognized builtin above) is a named host capability — lower it to `call.import`
         // with arg0 as the handle. The host resolves the name at load (fail-closed if unknown), so
         // a new capability needs no frontend change. (Defined functions fall through to `call`.)
-        if (!node->lhs->var->is_definition)
+        //
+        // In `--emit-object` mode this is different: an undefined extern is a **cross-TU function**,
+        // not a capability. Fall through to the normal call path, which emits a `call.sym "name"`
+        // function-symbol import (see the emission below) for `svm_ir::link` to resolve to a direct
+        // call against the defining unit. The intercepted builtins above (`write`/`read`/`exit`,
+        // `__vm_*`) still win in both modes — a personality that needs a raw capability reaches it
+        // through those, exactly as it does today.
+        if (!node->lhs->var->is_definition && !opt_emit_object)
           return gen_builtin_import(node);
       }
     }
@@ -1841,6 +1855,17 @@ static int gen_expr(Node *node) {
       idx32 = nv++;
       cg("  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
     }
+    // A direct call to a declared-but-undefined function is a cross-TU **function-symbol import**
+    // (only reached under `--emit-object` — the gate above returns to `gen_builtin_import`
+    // otherwise). It lowers to `call.sym "name"` with the callee's real signature; the linker's
+    // `Resolved::Func` drops this placeholder handle and rewrites it to a direct `call`. Materialize
+    // the (unused) handle before the result index so block-local value numbering stays monotonic.
+    bool fn_import = direct && !node->lhs->var->is_definition;
+    int imp_handle = -1;
+    if (fn_import) {
+      imp_handle = nv++;
+      cg("  v%d = i32.const 0\n", imp_handle);
+    }
     int sret_addr = 0;
     if (agg_ret) {
       int so = nv++;
@@ -1850,7 +1875,24 @@ static int gen_expr(Node *node) {
     }
     bool ir_void = is_void || agg_ret; // a struct-returning call is void at the IR level
     int r = ir_void ? 0 : nv++;
-    if (direct) {
+    if (fn_import) {
+      // Cross-unit function-symbol import: `call.sym "name" (SIG) -> (RET) <handle> (args)`. SIG is
+      // the callee's static signature, built exactly as the indirect path builds it (leading
+      // data-SP i64, optional sret pointer, params, optional varargs pointer) so it matches the
+      // definition emitted in the other unit. The linker binds "name" to that unit's export.
+      const char *name = node->lhs->var->name;
+      if (ir_void)
+        cg("  call.sym \"%s\" (i64", name);
+      else
+        cg("  v%d = call.sym \"%s\" (i64", r, name);
+      if (agg_ret)
+        cg(", i64"); // the hidden sret pointer
+      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+        cg(", %s", pass_irty(pt));
+      if (variadic)
+        cg(", i64"); // the hidden varargs-buffer pointer
+      cg(") -> (%s) v%d (v%d", ir_void ? "" : irty(node->ty), imp_handle, csp);
+    } else if (direct) {
       int idx = func_index(node->lhs->var);
       if (ir_void)
         cg("  call %d (v%d", idx, csp);
@@ -3152,6 +3194,22 @@ void codegen_ir(Obj *prog, FILE *out) {
     emit_start(funcs[0], scan_prog_caps(prog));
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
+
+  // `--emit-object`: publish this unit's external-linkage symbols so `svm_ir::link` can resolve
+  // another unit's `call.sym` to a direct call. Every non-`static` function is exported by name at
+  // its module index; `static` functions stay internal (unexported), so file-local statics of the
+  // same name in different TUs never collide. `emit_start` already exported `_start` as export 0
+  // when this unit defines `main`, so the numbering continues past it. (Data-symbol exports for
+  // cross-TU globals — `LinkUnit::data_exports`/relocations — are the next slice; this unit shares
+  // only functions.)
+  if (opt_emit_object) {
+    int k = has_main ? 1 : 0; // export 0 is `_start` in the entry unit
+    for (int i = 0; i < nfuncs; i++) {
+      if (funcs[i]->is_static || !funcs[i]->name)
+        continue;
+      cg("export %d func \"%s\" %d\n", k++, funcs[i]->name, start_off + i);
+    }
+  }
 
   // `-g`: the §6 debug-info section, after the functions (module-level, strippable): the source
   // file table, then `debug.loc` source lines (collected during emission), then the structured

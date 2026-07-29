@@ -345,15 +345,29 @@ compiler bug is a clean error, never an escape.
    funcs, verifies); every existing test still passes, and `codegen_ir.c` (chibicc's largest TU, ~1.4 MB
    IR) now compiles cleanly where the arena silently corrupted (gated, `#[ignore]`d as a ~70 s heavy run).
 
+   **→ Separate-compilation model (native `cc -c` + link) DONE 2026-07-29 — the multi-TU mechanism.**
+   The heap stopped being the wall; the next wall was source *organization*. chibicc's TUs are written
+   for **separate** compilation — the whole-program-per-invocation backend either can't see a cross-TU
+   callee at all, or (a naive unity amalgamation) hits file-local `static` helpers that reuse the same
+   name for different functions across TUs (e.g. `eval2` is `static` in both `parse.c` and
+   `codegen_ir.c`, with incompatible signatures). Rather than rename statics for a unity blob, we chose
+   the honest native model, which the substrate *already* supports: `svm_ir::link` (`LinkUnit` +
+   exports + relocations, proven by `dynlink.rs`) is a real static linker. So `codegen_ir` gained a
+   `--emit-object` mode (native `cc -c`): each non-`static` function is `export`ed by name, and a call
+   to a function *declared but not defined* in the TU lowers to a **function-symbol import**
+   (`call.sym "name"` carrying the callee's real SVM signature) instead of the generic capability
+   import — which `link` resolves to a direct cross-unit call. `static` stays internal per unit, so the
+   name collisions *evaporate* (no renaming). Proven end-to-end (`crates/svm/tests/c_link.rs`): two/three
+   C TUs compiled separately, linked, verified, run on interp+JIT. This generalizes — any multi-TU C
+   program to SVM now links the same way, not just chibicc.
+
    **What remains for the whole-compiler self-compile** (chibicc compiling its *own* source into one
-   runnable module): the heap is no longer the wall — a naive **unity** amalgamation (`#include` every
-   TU) now runs cleanly *past* the memory issue and stops on a genuine source-organization problem:
-   chibicc's TUs are written for *separate* compilation and reuse the same `static` helper names for
-   different functions (~60 collisions — `eval2`, `expr`, `assign`, `cast`, …), so one TU redefines
-   another's. Resolving that needs either mechanical per-TU renaming of the colliding statics or a
-   guest-side IR **linker** (compile each TU to its own module, then link) — plus running the result
-   under an fs-capable powerbox and the bootstrap-fixpoint differential (§5 E). That's the last, larger
-   self-host slice; the libc, headers, and heap it stands on are all done.
+   runnable module): (a) **cross-TU data** — a global defined in one unit and referenced in another
+   (chibicc shares e.g. `ty_int`/`ty_void`) needs `LinkUnit::data_exports` + relocations, which the
+   linker already models but `codegen_ir` doesn't yet emit (it needs a small `.syms` sidecar, like the
+   LLVM on-ramp's); (b) run a linked program through `_start` under an **fs-capable powerbox** (drive
+   all ~9 chibicc TUs through `--emit-object` + link + run); (c) the **bootstrap-fixpoint** differential
+   (§5 E). The function-linking mechanism, libc, headers, and heap it all stands on are done.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
@@ -376,8 +390,9 @@ compiler bug is a clean error, never an escape.
 
 ## 9. Non-goals
 
-- A general POSIX C toolchain (assembler, linker, `.o`/`ar`). The output is a single SVM IR module;
-  `-cc1 --emit-ir` only.
+- A general POSIX C toolchain (assembler, `.o`/`ar`, an in-guest `ld`). Multi-TU builds use
+  `--emit-object` (SVM text-IR units) linked by the host `svm_ir::link` — the SVM link model, not a
+  POSIX object/archive format. The per-TU output is still `-cc1 --emit-ir`; there is no x86/ELF path.
 - Matching GCC/Clang language breadth. chibicc's C99 + the frontend's proven coverage is the bar;
   heavy C/C++ stays on the AOT on-ramp lane (`LLVM.md`), which is not a runtime guest.
 - Making the chibicc frontend self-compile as the shipping path (§3 — LLVM-built artifact ships).
