@@ -210,9 +210,22 @@ different things depending on which pair you compare:
   `crates/svm-dap/tests/dap_checkpoints.rs` (a checkpoint-restored `seek` ≡ a from-0 `seek` at every
   probe, forward and on a full backward sweep, with `checkpoint_count > 0` proving the ladder is
   exercised) — the bytecode counterpart of `crates/svm/tests/debug_checkpoints.rs`. Measured **~42×** on
-  a 64k-op reverse sweep (an `#[ignore]`d timing bench in the same file). The multi-vCPU
-  `ScheduledDebugRun` still replays from turn 0 (its `seek` is a follow-up — the scheduled continuation
-  is a larger snapshot surface).
+  a 64k-op reverse sweep (an `#[ignore]`d timing bench in the same file).
+
+  **Extended to the multi-vCPU `ScheduledDebugRun` (slice 4-perf, threaded).** The scheduled `seek`
+  (keyed on the global `turn`) got the same ladder, so threaded reverse debugging is bounded too.
+  `ScheduledDebugRun` gained `checkpointable`/`snapshot`/`restore` (`ScheduledSnapshot` = every task's
+  active `Vm` + join table + run state, the shared window bytes, the host substate, and both scheduler
+  clocks; `DbgTaskState` derives `Clone`, `VTask::from_active` rebuilds a root-only task on restore).
+  The transient `stopped`/`focus`/`last_watch` are **not** captured — `locate` rederives them from the
+  task states after the replay. The checkpointable subset is slice-1's extended over all tasks: no §14
+  `instantiate` children (`extra_envs` empty), no §12 fibers, every task root-only (no active
+  fiber/chain/coroutine) — otherwise fall back to replay-from-turn-0. `BytecodeBackend` carries a second
+  turn-keyed ladder (`sched_checkpoints`); the threaded `seek` restarts from the nearest snapshot and
+  `drive_scheduled_to`/`maybe_sched_checkpoint` mirror the single-vCPU pair. Gated by a threaded
+  warm≡cold oracle (`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero`):
+  a checkpoint-restored `seek` reproduces the global turn, live-thread count, stopped thread, shared
+  counter, and **every** thread's stack (`select_task` each) — forward and on a full backward sweep.
 
   **Watchpoints landed on the bytecode engine (slice 5).** `DebugRun` gained a `set_watchpoints`
   replace-API + a per-op check (`watch_hit_before`) that computes the op-about-to-run's effective
@@ -441,10 +454,12 @@ different things depending on which pair you compare:
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
   (slices 14b/14c, 15a/15b/15c, 16), and **source-variable inspection inside a separate-module child body**
   on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
-  (never enabled on the debug engine). The **single-vCPU reverse-replay checkpoint ladder** is built
-  (slice 4-perf above, ~42× on a long sweep). Follow-ups: the §3.6 serve/live-call machinery inside a
-  confined child, env teardown / D37 revocation, and extending the checkpoint ladder to the multi-vCPU
-  `ScheduledDebugRun` (its `seek` still replays from turn 0 — a larger scheduled-continuation snapshot).
+  (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
+  engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
+  is bounded too, for the fiber/coroutine/§14-child-free threaded subset). Follow-ups: the §3.6
+  serve/live-call machinery inside a confined child, env teardown / D37 revocation, and — if a use case
+  demands it — extending the checkpointable subset to snapshot §12 fibers / §14 coroutines / `instantiate`
+  children (today those fall back to replay-from-0, which stays correct, just unbounded).
 
 ---
 

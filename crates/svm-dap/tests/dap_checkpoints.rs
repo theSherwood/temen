@@ -40,6 +40,48 @@ block 3 (v6: i32, v7: i32) {
   }
 }";
 
+/// A `thread.spawn`/`join` guest that runs **well past the checkpoint stride**: the root spawns two
+/// workers (each looping its arg times, bumping a shared window counter), joins both, and returns the
+/// counter. Drives the multi-vCPU `ScheduledDebugRun`, whose checkpoint must restore every task's `Vm`,
+/// the join tables, the run states, and the shared window bytes.
+const LOOP_THREADS: &str = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vsp = i64.const 0
+  vh0 = thread.spawn 1 vsp vn
+  vh1 = thread.spawn 1 vsp vn
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1(varg)
+}
+block 1 (vi: i64) {
+  vz = i64.eqz vi
+  br_if vz 2() 3(vi)
+}
+block 2 () {
+  vr = i64.const 0
+  return vr
+}
+block 3 (vi2: i64) {
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  v1 = i64.const 1
+  vsum = i64.add vc v1
+  i64.store vaddr vsum
+  vm1 = i64.const -1
+  vnext = i64.add vi2 vm1
+  br 1(vnext)
+  }
+}";
+
 /// A stable per-`seek` observation: the logical clock, the call stack (each frame's IR pc), and the
 /// running-sum window bytes. Identical between a from-0 replay and a checkpoint-restored replay iff
 /// restore is faithful.
@@ -105,6 +147,76 @@ fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     assert!(
         warm.checkpoint_count() > 0,
         "checkpointing stays on for a pure single-vCPU memory loop",
+    );
+}
+
+/// A stable per-`seek` observation on the **threaded** engine: the global turn, the live-thread count,
+/// which thread is stopped, the shared counter bytes, and *every* live thread's call stack (selecting
+/// each). A faithful checkpoint restore reproduces the whole cross-thread state; an unfaithful one
+/// diverges in the counter, a stack, or the schedule position.
+fn obs_sched(b: &mut BytecodeBackend, t: u64) -> (u64, usize, Option<u64>, Vec<u8>, String) {
+    b.seek(t);
+    let turn = b.turn();
+    let threads = b.threads();
+    let stopped = b.stopped_task();
+    let mem = b.read_window(0, 8).unwrap_or_default();
+    let mut stacks = Vec::new();
+    for &tid in &threads {
+        b.select_task(tid);
+        let s = b
+            .backtrace()
+            .iter()
+            .map(|f| format!("{}:{}:{}:{}", f.pc.module, f.pc.func, f.pc.block, f.pc.inst))
+            .collect::<Vec<_>>()
+            .join(",");
+        stacks.push(format!("{tid}=[{s}]"));
+    }
+    (turn, threads.len(), stopped, mem, stacks.join(";"))
+}
+
+#[test]
+fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
+    let m = parse_module(LOOP_THREADS).expect("parses");
+    let args = [Value::I64(400)]; // two workers × 400 iters ⇒ several thousand turns, many strides
+    let mk = || {
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+            .expect("the scheduled bytecode engine accepts the thread.spawn loop")
+    };
+
+    let probes: Vec<u64> = (0..=6000).step_by(149).collect();
+
+    // Cold baseline: a fresh backend per probe (empty ladder ⇒ always a from-turn-0 replay).
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs_sched(&mut b, t)
+        })
+        .collect();
+
+    // Warm: one backend, a deep seek to populate the scheduled ladder, then the probes reuse it.
+    let mut warm = mk();
+    warm.seek(6000);
+    assert!(
+        warm.checkpoint_count() > 0,
+        "a deep scheduled seek past the stride lays down checkpoints",
+    );
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_sched(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm (checkpoint-restored) scheduled seek ≡ cold (replay-from-turn-0) at every forward probe",
+    );
+
+    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs_sched(&mut warm, t)).collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(
+        warm_back, cold_back,
+        "warm scheduled backward sweep ≡ cold (restore is faithful across the whole task set)",
+    );
+
+    assert!(
+        warm.checkpoint_count() > 0,
+        "checkpointing stays on for a pure thread.spawn/join loop (no fibers/coroutines/§14 children)",
     );
 }
 

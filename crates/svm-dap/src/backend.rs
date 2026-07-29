@@ -26,7 +26,7 @@
 //! (server level).
 
 use svm_interp::bytecode::{
-    self, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
+    self, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledSnapshot,
 };
 use svm_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
@@ -309,10 +309,15 @@ pub struct BytecodeBackend {
     /// as `seek` drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s
     /// ladder.
     checkpoints: Vec<DebugRunSnapshot>,
+    /// Multi-vCPU checkpoint ladder (same role as `checkpoints`, keyed on the global scheduler `turn`)
+    /// for a threaded session's `ScheduledDebugRun`. Only one of the two ladders is ever populated —
+    /// a session is single-vCPU xor threaded for its whole life.
+    sched_checkpoints: Vec<ScheduledSnapshot>,
     /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
-    /// boundary falls outside the [`DebugRun::snapshot`] subset (a fiber/coroutine/thread seam, a
-    /// non-pristine memory layout, or a host that grew unrestorable state), after which `seek` reverts
-    /// to replay-from-clock-0 for the rest of the session — mirroring `Inspector::maybe_checkpoint`.
+    /// boundary falls outside the [`DebugRun::snapshot`] / [`ScheduledDebugRun::snapshot`] subset (a
+    /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable
+    /// state), after which `seek` reverts to replay-from-0 for the rest of the session — mirroring
+    /// `Inspector::maybe_checkpoint`.
     checkpointing: bool,
 }
 
@@ -357,16 +362,17 @@ impl BytecodeBackend {
             tape,
             rev_trace: None,
             checkpoints: Vec::new(),
+            sched_checkpoints: Vec::new(),
             checkpointing: true,
         })
     }
 
-    /// Number of time-travel checkpoints currently in the ladder — test/introspection hook (mirrors
-    /// `Inspector::checkpoint_count`). `0` for a run not yet seeked far enough to lay one down, or one
-    /// outside the checkpointable subset (multithreaded, fibers, coroutines, stateful host), which
-    /// replays from clock 0.
+    /// Number of time-travel checkpoints currently in the ladder (single-vCPU or scheduled — only one
+    /// is ever populated) — test/introspection hook (mirrors `Inspector::checkpoint_count`). `0` for a
+    /// run not yet seeked far enough to lay one down, or one outside the checkpointable subset (fibers,
+    /// coroutines, §14 children, stateful host), which replays from clock 0 / turn 0.
     pub fn checkpoint_count(&self) -> usize {
-        self.checkpoints.len()
+        self.checkpoints.len() + self.sched_checkpoints.len()
     }
 
     /// Build a fresh single-vCPU [`DebugRun`] with this session's engine config — under the on-ramp I/O
@@ -426,6 +432,46 @@ impl BytecodeBackend {
         // can fill a gap below an existing entry).
         let at = self.checkpoints.partition_point(|c| c.clock() < clock);
         self.checkpoints.insert(at, snap);
+    }
+
+    /// Scheduled-engine counterpart of [`drive_single_to`](BytecodeBackend::drive_single_to): drive a
+    /// freshly rebuilt (and possibly checkpoint-restored) `ScheduledDebugRun` forward to global turn `t`,
+    /// laying down a checkpoint at each [`CHECKPOINT_STRIDE`] boundary. With checkpointing off it is a
+    /// straight tick-to-`t`. Ticking is the same raw quantum regardless, so the state at `t` equals a
+    /// single run from the restore point to `t`.
+    fn drive_scheduled_to(&mut self, run: &mut ScheduledDebugRun, t: u64, fuel: &mut u64) {
+        loop {
+            let turn = run.op_turn();
+            if turn >= t {
+                break;
+            }
+            if self.checkpointing && turn > 0 && turn.is_multiple_of(CHECKPOINT_STRIDE) {
+                self.maybe_sched_checkpoint(run);
+            }
+            if !run.tick(fuel) {
+                break;
+            }
+        }
+    }
+
+    /// Scheduled-engine counterpart of [`maybe_checkpoint`](BytecodeBackend::maybe_checkpoint): snapshot
+    /// `run` into the scheduled ladder at its current turn, or disable checkpointing + drop the ladder if
+    /// the continuation left the [`ScheduledDebugRun::snapshot`]-able subset.
+    fn maybe_sched_checkpoint(&mut self, run: &ScheduledDebugRun) {
+        if !self.checkpointing {
+            return;
+        }
+        let Some(snap) = run.snapshot() else {
+            self.checkpointing = false;
+            self.sched_checkpoints.clear();
+            return;
+        };
+        let turn = snap.turn();
+        if self.sched_checkpoints.iter().any(|c| c.turn() == turn) {
+            return;
+        }
+        let at = self.sched_checkpoints.partition_point(|c| c.turn() < turn);
+        self.sched_checkpoints.insert(at, snap);
     }
 
     /// Absorb the live single-vCPU run's recorded cap-input tape if it now reaches further than the one
@@ -695,7 +741,14 @@ impl Debuggee for BytecodeBackend {
                     .map(|(_, a, l, k)| (*a, *l, *k))
                     .collect(),
             );
-            while run.op_turn() < t && run.tick(&mut fuel) {}
+            // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
+            // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
+            if self.checkpointing {
+                if let Some(cp) = self.sched_checkpoints.iter().rev().find(|c| c.turn() <= t) {
+                    run.restore(cp);
+                }
+            }
+            self.drive_scheduled_to(&mut run, t, &mut fuel);
             run.locate();
             if let Some(pc) = run.frame_pc(0) {
                 if self.breakpoints.contains(&pc) {
