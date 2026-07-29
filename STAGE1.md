@@ -382,6 +382,24 @@ signals ladder). In dependency order:
    durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
    it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).
 4. **`exec`/`wait`/`waitpid`/`pipe`/`dup2`** wired to the child machinery. *Medium.*
+   **[Slice 1 done 2026-07-29 — the fd surface.]** `pipe`/`dup2`/`dup`/`fcntl` landed as real
+   personality ops (POSIX.md ops 23–26) over a generalized fd table (stdio `0`/`1`/`2` are now ordinary
+   sentinels, so `dup2(pipe_w, 1)` redirect and `close`/reuse of a stdio fd work as POSIX). Pipes are
+   intra-personality (a single guest's two ends share one buffer, non-blocking).
+   **[Slice 2 done 2026-07-29 — spawn/wait + fd inheritance.]** `spawn`/`waitpid`/`wait` landed as
+   personality ops (POSIX.md 27–29). A spawn is *authority* the libc personality does not hold, so the
+   instantiate+run is an **embedder-wired delegate** (`Posix::set_spawn`) — opt-in like the stdout
+   `Stream`, `-ENOSYS` unwired. The child **inherits the caller's fd 0 and fd 1**: `spawn` drains the
+   current fd-0 binding as the child's stdin and routes its captured stdout to the current fd-1 binding,
+   so a `dup2(pipe_w, 1)` / `dup2(file, 1)` redirect before the spawn lands the child's output exactly
+   where POSIX would (proven cross-backend). **[Slice 2.5 done 2026-07-29 — end-to-end with a real
+   child.]** A **compiled-C shell** now drives a **separate compiled-C command** through `spawn`/`waitpid`
+   (`c_posix_spawn.rs`, interp==JIT): the embedder wires the spawn delegate to instantiate + run the
+   child domain on its own Posix personality, and the child's uppercased stdin output flows to the
+   shell's fd 1 while its exit status returns through `waitpid`. (The delegate is the test embedder —
+   promoting a reusable builder into `svm-run` waits on `svm-run` gaining an `svm-posix` dep, deferred
+   until a second consumer needs it.) **Remaining:** `fork`/`vfork`/`execve` (return-twice /
+   image-replace) on the durable-clone capstone.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for
