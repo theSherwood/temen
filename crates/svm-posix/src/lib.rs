@@ -562,7 +562,38 @@ pub fn bind(m: &svm_ir::Module, host: &mut Host, handle: i32) -> bool {
 /// shares this **one** handle (svm-wasm/chibicc thread a single capability handle); the op number
 /// distinguishes the call, so pass the handle as the entry's leading argument.
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
-    let inner = Arc::new(Mutex::new(Inner {
+    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let posix = Posix {
+        inner: Arc::clone(&inner),
+    };
+    let handle = host.grant_host_fn(handler(inner));
+    (handle, posix)
+}
+
+/// Build the personality as a re-grantable **capability factory** for the powerbox model (svm-run's
+/// `HostCap`), instead of granting it on a specific `Host` by name binding like [`grant`]. Returns a
+/// shared [`Posix`] handle (read captured output, `set_spawn`, `raise_signal`) and a `make` closure that
+/// produces the `HostFn` handler over the *same* shared state each time it is called (once per backend,
+/// so the interp and JIT hosts share one personality state). This is how the **LLVM on-ramp** reaches
+/// the personality: the embedder wraps `make` in a `HostCap` at [`cap_id::HOST_FN`] and grants it under a
+/// name (e.g. `"posix"`), and an on-ramp guest calls `__vm_host_call(__vm_cap_resolve("posix"), op, …)`.
+pub fn cap(
+    heap_base: u64,
+    heap_end: u64,
+    stdin: Vec<u8>,
+) -> (Posix, impl Fn() -> HostFn + Send + Sync + 'static) {
+    let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
+    let posix = Posix {
+        inner: Arc::clone(&inner),
+    };
+    let make = move || handler(Arc::clone(&inner));
+    (posix, make)
+}
+
+/// A fresh personality state: preloaded `stdin`, the window-heap arena bounded by `[heap_base, heap_end)`,
+/// and the three stdio sentinels seeded in the fd table. Shared by [`grant`] and [`cap`].
+fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
+    Inner {
         stdout: Vec::new(),
         stdout_sink: None,
         stderr: Vec::new(),
@@ -592,12 +623,7 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         next_pid: 1000,
         sig_pending: 0,
         sig_handler: HashMap::new(),
-    }));
-    let posix = Posix {
-        inner: Arc::clone(&inner),
-    };
-    let handle = host.grant_host_fn(handler(inner));
-    (handle, posix)
+    }
 }
 
 /// Build the POSIX [`HostFn`] handler over shared `inner`. Dispatches on the op number; an unknown op

@@ -32,6 +32,7 @@ pub use svm_interp::{Quota, Value};
 pub use svm_opt::instrument::MemHookStats;
 pub mod exec;
 pub mod fs;
+pub mod posix;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};
 

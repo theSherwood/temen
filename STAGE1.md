@@ -372,6 +372,21 @@ signals ladder). In dependency order:
 
 1. **Guest libc for bash** — assemble bash's link surface (`glob`/`fnmatch`, regex, `getpwnam`/
    `getgrnam`, `setjmp` — proven — on top of the Postgres shim set). *Medium; incremental.*
+   **[Slice 4a done 2026-07-29 — the two-worlds bridge.]** The POSIX personality (the process/fd/signal
+   ABI of slices 1–3) lived only in the chibicc/name-binding world; the LLVM on-ramp reaches host caps by
+   name via `__vm_cap_resolve` + `__vm_host_call` (the `fs`-cap idiom). `svm_run::posix::posix_cap`
+   (over new `svm_posix::cap`) now exposes the personality as a named powerbox `HostCap`, so an on-ramp
+   guest resolves `"posix"` and drives `pipe`/`dup2`/`posix_spawn`/`waitpid` through it — proven
+   cross-backend (interp==bytecode==JIT) by `crates/svm-llvm/tests/posix_cap.rs` (a compiled-C mini-shell
+   spawns a child with fd inheritance). This is the substrate a bash-on-LLVM `proc_shim` will call
+   instead of the Postgres demo's inert process stubs. *(A program that reaches the host only through
+   `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip svm-llvm's
+   `needs_powerbox_entry` and get the synthesized `_start`; a real shell links libc, so it always does.)*
+   **[Slice 4b done 2026-07-29 — the libc shim + a pipeline.]** `posix_shim.h` gives the on-ramp real-C
+   `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + a fork-free `sh_spawn` over the `"posix"` cap — the
+   World-B analogue of `demos/shell/shim.c`, the layer a shell links. `pipeline.c` runs a real `gen | up`
+   pipeline through it (wire stdout→pipe, run stage 1, restore stdout, wire pipe→stdin, run stage 2 —
+   the classic redirect save/restore), landing "HELLO" on the personality's stdout, cross-backend.
 2. **Build `bash.svmb`** — autoconf cross-config for the svm "platform", `--noediting`, through the
    `clang → svm-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
    *Medium/mechanical.* Gets bash to *link and start*.
