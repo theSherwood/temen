@@ -1,0 +1,35 @@
+(.nif27)
+(.indexat 591              )
+(stmts@,1,pkg/modb.nim
+ (proc :helper.0.@5
+  (params@C
+   (param@1 :x.0 .
+    (i@3 64)))
+  (i@A 64)
+  (pragmas
+   (smry
+    (param 0 0 reads)))
+  (stmts@2,1
+   (var@7 :result.0 .
+    (i@7,~1 64).@7,~1)
+   (asgn@7 result.0~7
+    (mul@4
+     (i@G,x,../nimony/lib/std/system/arithmetics.nim 64)x.0~2 3@2))
+   (ret@D result.0)))
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl))))(.index@,1,pkg/modb.nim
+ (x helper.0. 60)
+ (h `iniGuard.0. 302)
+ (x `ini.0. 34))

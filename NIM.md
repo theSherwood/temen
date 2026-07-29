@@ -437,12 +437,24 @@ plumbing. Five workstreams, roughly independent:
   **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
   built-in containers). Non-zero global/data initializers land here too.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
-  module. Today `svm-leng` translates one module in isolation. W2 resolves cross-module symbols,
-  merges globals/data, and lays out one svm module from N Leng inputs — the analog of what the C
-  on-ramp gets from `clang`+`lld` for free.
-- **W3 — Runtime bottom edge.** Raw syscalls / the allocator → POSIX-personality named imports +
-  the Memory cap (same seam as Phase 1), and mapping nimony's TLS onto svm's model (the on-ramp
-  gap Phase 1 already surfaced). ARC destructors/dup calls pass through as ordinary calls.
+  module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
+  Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
+  (2026-07-29): `svm_leng::link_units` links real cross-module nimony code.** nimony references a
+  proc `P.` defined in module `stem` from elsewhere as `P.<stem>`; `link_units` translates each
+  module's procs, exports them under those global names, and resolves every unit's cross-module
+  calls (named imports) against the exports via `svm_ir::link` — one merged, re-verified, import-free
+  module. Proven on a genuine 2-module program (`moda` importing `pkg/modb`: `useit(5)` calls
+  `modb`'s compiled `helper` → 16) and a transitive A→B→C chain, both engines (`tests/link.rs`).
+  This is the same link mechanism the end-to-end shim used, now across *real translated modules* —
+  the shim's stand-in replaced by compiled Nim. **Remaining for full W2:** merging module
+  globals/`data` (cross-module data symbols + relocations) and translating the `ini`/`main`/`gvar`
+  scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
+- **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
+  POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
+  onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
+  through as ordinary calls. **Key finding (§3b): the bottom edge is only ~15 C functions, and
+  Phase 1 already binds them** — so the lever between "translates real nimony" and "runs it" is
+  mostly W2 (linking the compiled `system` module), or a Phase-1-style host runtime shim.
 - **W4 — Multi-binary architecture (the other long pole).** nimony is not one binary: `nifmake`
   spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
   means either driving those phases in-process or giving svm a subprocess/exec personality. This
@@ -450,11 +462,76 @@ plumbing. Five workstreams, roughly independent:
 - **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
   the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
 
-**Near-term milestone (what we drive first): compile & run one real Nim program end-to-end** —
-source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right answer. That
+**Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
+end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
+answer (a real seq build-and-sum returns `3`). That
 exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
 concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
 especially) is bounded but real; the backend mapping is the part that's no longer in doubt.
+
+## 3b. W3 scope — the runtime bottom edge (W1 is done; this is the next lever)
+
+With W1 closed, `svm-leng` **translates real nimony modules to verified svm-ir** — but the lowered
+code doesn't yet *run*, because it calls procs that aren't defined in the one module we translate.
+Scoping W3 means answering exactly *what* those calls are and *how* they bind. Two layers, and the
+boundary between them is the whole story:
+
+**Layer 1 — compiled Nim stdlib (this is W2, not W3).** The seq/string/ARC ops a program calls —
+`newSeqUninit`, `add`, `[]`, `len`, `toOpenArray`, `=destroy`, `=wasMoved` — are **ordinary Nim
+code** that nimony compiles into the `system` module's Leng (`sysvq0asl.x.nif`). They look like
+"imports" to us only because we translate one module in isolation. In a whole-program build they're
+*defined*, reached by **linking** the user module with the compiled `system` module — the `Func`/
+`Slot` bindings of `svm_ir::resolve_imports_with`. That's W2 (the linker), and it's the bulk of the
+gap.
+
+**Layer 2 — the true bottom edge (this is W3).** What does the `system` module *itself* bottom out
+at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **entire** external
+(`importc`) surface, minus pure C *type* names, is ~15 functions:
+
+| Group | Symbols | SVM binding |
+| --- | --- | --- |
+| Allocator | `mmap`, `munmap` | the **Memory cap** (Phase 1 seam) |
+| Syscalls / process | `write`, `_exit`, `getpid`, `kill` | the **POSIX personality** (Phase 1 seam) |
+| libc mem | `memcpy`, `memset`, `memcmp` | host cap, or lower to `mem.copy`/`mem.fill` |
+| Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | single-threaded guest → plain loads/stores |
+| Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct svm ops (`bswap`/`clz`/`ctz`) |
+| Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
+
+**The key finding: W3's hard part is already retired.** This is the *same* C bottom edge Phase 1's
+on-ramp already binds — `crates/svm-run/demos/nimony/` runs a nimony-shaped module on all three
+engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
+cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
+already lowers a named import to a host capability (`Cap`) — that's the seam.
+
+**Two paths to the near-term milestone (run one real program):**
+
+- **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
+  bind the *high-level* ops (`newSeqUninit`/`add`/`[]`/`len`/`=destroy`/`=wasMoved` + `memcpy`/
+  `memset`) directly to a small host implementation via capability bindings, exactly as Phase 1's
+  `nimony_runtime_shim.c` did. Gets end-to-end *running* fast, decoupled from the W2 linker. The
+  handful of ops is small and well-understood (a `{len,data*}`/`{len,cap,data}` bump/realloc
+  allocator over the window).
+- **Path A — link the real `system` module (fidelity, needs W2).** Merge `sysvq0asl.x.nif` into the
+  user module so the stdlib ops resolve to *compiled Nim* (`Func`/`Slot`), and only the ~15 C
+  primitives hit the host (`Cap`). Faithful, but gated on the W2 linker.
+
+Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
+end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
+model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
+protocol runs correctly against a real allocator.
+
+**✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
+end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
+`sumSeq`/`makeSeq` to verified svm-ir with their stdlib ops as named imports; a tiny SVM **runtime
+shim** (the pure `toOpenArray`/`len`/`[]`/`inc` ops + a bump/realloc allocator for `newSeqUninit`/
+`add`, `=wasMoved`/`=destroy` as zero/no-op — eight functions, ~90 lines of svm-text) is **linked
+in** via `svm_ir::link`, binding each named import to a shim function. So the whole path — real Nim
+→ `nimony` → `hexer` → `svm-leng` → svm-ir → link → **run** — closes with the right answer:
+`sumSeq([10,20,30]) = 60`, `makeSeq(3)` builds `[0,1,2]` through the allocator, and a driver chaining
+`makeSeq(3)` → `sumSeq` returns `3` in one pass (`tests/end_to_end.rs`). Notably the shim is *SVM
+code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
+and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
+the shim is the placeholder the real compiled `system` module (Path A) will replace.
 
 ## 4. Invariants this must respect
 

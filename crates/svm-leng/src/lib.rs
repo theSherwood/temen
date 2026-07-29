@@ -16,9 +16,11 @@
 //! result)` tuple by sret; `try`/`except` is an error-code check plus a `jmp` to a handler label).
 //! `seq`/`string` are `{len, data*}` objects: their value layout and element access lower here, and
 //! their stdlib operations (`add`/`[]`/`len`/`toOpenArray`) lower to **imports** — valid IR that runs
-//! once those imports are bound to a real seq runtime (the W3 runtime edge). `object of RootObj`
-//! **inheritance** lowers too: a derived object inlines its base's layout after a leading vtable
-//! header, and the vtable pointer is stored but opaque (dynamic dispatch fail-closes). What remains
+//! once those imports are bound to a real seq runtime (the W3 runtime edge). Multiple modules **link**
+//! into one ([`link_units`], NIM.md W2): nimony's cross-module calls resolve against the defining
+//! module's exports. `object of RootObj` **inheritance** lowers too: a derived object inlines its
+//! base's layout after a leading vtable header, and the vtable pointer is stored but opaque (dynamic
+//! dispatch fail-closes). What remains
 //! outside the subset — `union`, `emit`, dynamic method dispatch, value-object exception payloads
 //! (an object punned into the error tuple's scalar slot) — is a fail-closed [`LengError::Unsupported`],
 //! never a silent mistranslation (the `svm-wasm`/`svm-llvm` `unsup(...)` discipline). (The
@@ -115,6 +117,45 @@ pub fn translate_procs(src: &str, names: &[&str]) -> Result<Module, LengError> {
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
         ))
     })
+}
+
+/// One nimony module in a multi-module link (NIM.md W2 — the linker). `src` is the module's `hexer`
+/// Leng; `stem` is the file id that qualifies its symbols globally — a proc `P.` defined here is
+/// referenced from *other* modules as `P.<stem>` (nimony's cross-module mangling); `names` are the
+/// local proc names to translate out of it.
+pub struct LengModule<'a> {
+    pub stem: &'a str,
+    pub src: &'a str,
+    pub names: &'a [&'a str],
+}
+
+/// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2). Each module's `names` are
+/// translated and exported under their **global** (stem-suffixed) names; every unit's cross-module
+/// calls — which nimony emits as named imports `callee.<defining-stem>` — resolve against those
+/// exports via [`svm_ir::link`]. Units keep the given order, so the first module's first proc is
+/// func 0 (a natural entry). The linked module is **not** verified here (untrusted frontend — the
+/// caller runs `svm_verify::verify_module`, which re-checks the whole linked result).
+///
+/// This is the same mechanism the end-to-end runtime shim uses, generalized: a real dependency
+/// module takes the place the hand-written shim held, so `helper` in module B resolves a `call`
+/// from module A to *compiled Nim*, not a stand-in.
+pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
+    let mut link_units = Vec::with_capacity(units.len());
+    for u in units {
+        let module = translate_procs(u.src, u.names)?;
+        let exports = u
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, local)| (format!("{local}{}", u.stem), i as u32))
+            .collect();
+        link_units.push(svm_ir::LinkUnit {
+            module,
+            exports,
+            ..Default::default()
+        });
+    }
+    svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
 }
 
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.
