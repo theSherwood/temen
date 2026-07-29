@@ -19,6 +19,10 @@
 //! another → `LinkUnit::data_exports` + relocations) and running a linked program through `_start`
 //! under the powerbox are the next slices; here the linked functions are run directly by index
 //! (as `dynlink.rs` does), which is all the function-linking mechanism needs to prove.
+//!
+//! `#![cfg(unix)]` — like `c_frontend.rs`, this builds the chibicc fork with `make`, and chibicc's
+//! headers (`<glob.h>`, …) are POSIX; Windows lacks the toolchain, so the whole suite is Unix-only.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
