@@ -11,13 +11,25 @@
 //! supplies the resolver that reads the interpreter's window through the neutral debug info — so
 //! this module has no dependency on `svm-ir`/`svm-interp` or any frontend.
 
-/// An evaluated value: an integer, a float, or a typed location (`Place`) the resolver can navigate
-/// / read. `type_id` indexes the caller's structured type table (opaque to this module).
+/// An evaluated value: an integer, a float, a typed location (`Place`) the resolver can navigate /
+/// read, or a **pointer rvalue** (`Ptr`) — a pointer value that is *not* stored in a window slot
+/// (e.g. a promoted-SSA `struct Point *p`). A `Place { .. }` with a pointer type means "a pointer is
+/// stored at `addr`" (an lvalue); a `Ptr { addr, .. }` means "the pointer *is* `addr`" (an rvalue),
+/// so `->`/`[]` navigate from `addr` directly rather than reading it out of memory first. `type_id`
+/// indexes the caller's structured type table (opaque to this module).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Value {
     Int(i64),
     Float(f64),
-    Place { addr: u64, type_id: u32 },
+    Place {
+        addr: u64,
+        type_id: u32,
+    },
+    /// A pointer whose value is `addr`, pointing at a `pointee`-typed object.
+    Ptr {
+        addr: u64,
+        pointee: u32,
+    },
 }
 
 /// The semantic callbacks the evaluator needs — implemented by the caller against its debug info +
@@ -72,14 +84,15 @@ pub fn eval_int(expr: &str, resolve: &dyn Fn(&str) -> Option<i64>) -> Option<i64
         fn load(&mut self, v: &Value) -> Option<Value> {
             match v {
                 Value::Int(_) | Value::Float(_) => Some(*v),
-                Value::Place { .. } => None,
+                // Simple (scalar-only, conditional-breakpoint) path never mints Place/Ptr.
+                Value::Place { .. } | Value::Ptr { .. } => None,
             }
         }
     }
     match eval(expr, &mut Simple(resolve))? {
         Value::Int(n) => Some(n),
         Value::Float(x) => Some(x as i64),
-        Value::Place { .. } => None,
+        Value::Place { .. } | Value::Ptr { .. } => None,
     }
 }
 
@@ -275,6 +288,8 @@ impl Parser<'_> {
         match self.resolver.load(v)? {
             Value::Int(n) => Some(Num::I(n)),
             Value::Float(x) => Some(Num::F(x)),
+            // A pointer used in arithmetic / comparison behaves as its integer value (`p == 0`).
+            Value::Ptr { addr, .. } => Some(Num::I(addr as i64)),
             Value::Place { .. } => None,
         }
     }
@@ -582,13 +597,113 @@ mod tests {
         fn load(&mut self, v: &Value) -> Option<Value> {
             match v {
                 Value::Int(_) | Value::Float(_) => Some(*v),
-                Value::Place { .. } => None,
+                Value::Place { .. } | Value::Ptr { .. } => None,
             }
         }
     }
 
     fn evf(e: &str) -> Option<Value> {
         eval(e, &mut Vars)
+    }
+
+    // A pointer rvalue `p` (a promoted `struct Point *`) pointing at a two-`int` struct {x=7, y=9} laid
+    // out at address 100, stride 8 (so `p[1]` is the next struct). Type ids: 0 = int, 1 = Point.
+    struct PtrRes;
+    impl PtrRes {
+        fn read(addr: u64) -> Option<i64> {
+            match addr {
+                100 => Some(7), // p->x
+                104 => Some(9), // p->y
+                108 => Some(1), // p[1].x
+                _ => None,
+            }
+        }
+    }
+    impl Resolver for PtrRes {
+        fn ident(&mut self, name: &str) -> Option<Value> {
+            (name == "p").then_some(Value::Ptr {
+                addr: 100,
+                pointee: 1,
+            })
+        }
+        fn member(&mut self, base: &Value, name: &str) -> Option<Value> {
+            let &Value::Place { addr, type_id: 1 } = base else {
+                return None;
+            };
+            match name {
+                "x" => Some(Value::Place { addr, type_id: 0 }),
+                "y" => Some(Value::Place {
+                    addr: addr + 4,
+                    type_id: 0,
+                }),
+                _ => None,
+            }
+        }
+        fn index(&mut self, base: &Value, index: i64) -> Option<Value> {
+            let &Value::Ptr { addr, pointee } = base else {
+                return None;
+            };
+            Some(Value::Place {
+                addr: addr + index as u64 * 8,
+                type_id: pointee,
+            })
+        }
+        fn deref(&mut self, base: &Value) -> Option<Value> {
+            let &Value::Ptr { addr, pointee } = base else {
+                return None;
+            };
+            Some(Value::Place {
+                addr,
+                type_id: pointee,
+            })
+        }
+        fn load(&mut self, v: &Value) -> Option<Value> {
+            match v {
+                Value::Int(_) | Value::Float(_) => Some(*v),
+                Value::Ptr { addr, .. } => Some(Value::Int(*addr as i64)),
+                &Value::Place { addr, type_id: 0 } => Self::read(addr).map(Value::Int),
+                Value::Place { .. } => None, // aggregate: not directly loadable
+            }
+        }
+    }
+
+    /// A promoted-SSA pointer (`Value::Ptr`) navigates with `->` / `[]` / `*` from its own value —
+    /// the path chibicc's `struct T *p = &x;` locals take (they aren't window-resident). Pins the
+    /// evaluator side of the SSA-pointer deref the DAP `evaluate` backend relies on.
+    #[test]
+    fn pointer_rvalue_navigation() {
+        let e = |s| eval(s, &mut PtrRes);
+        // Navigation yields an unloaded `Place` (the real `evaluate` reads it); `+ 0` forces the load.
+        assert_eq!(
+            e("p->x"),
+            Some(Value::Place {
+                addr: 100,
+                type_id: 0
+            }),
+            "arrow navigates to the field's place"
+        );
+        assert_eq!(e("p->x + 0"), Some(Value::Int(7)), "…which reads 7");
+        assert_eq!(e("p->y + 0"), Some(Value::Int(9)), "arrow + field offset");
+        assert_eq!(
+            e("p->x + p->y"),
+            Some(Value::Int(16)),
+            "arrow in arithmetic"
+        );
+        assert_eq!(
+            e("p[1].x + 0"),
+            Some(Value::Int(1)),
+            "pointer indexing by stride"
+        );
+        // A bare pointer is its address value; arithmetic/comparison treat it as that integer.
+        assert_eq!(
+            e("p"),
+            Some(Value::Ptr {
+                addr: 100,
+                pointee: 1
+            })
+        );
+        assert_eq!(e("p == 100"), Some(Value::Int(1)));
+        assert_eq!(e("p != 0"), Some(Value::Int(1)));
     }
 
     #[test]

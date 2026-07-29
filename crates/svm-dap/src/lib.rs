@@ -12,10 +12,10 @@
 //! scripting a DAP conversation; [`run_stdio`] is the thin `Content-Length`-framed wire loop a real
 //! client connects to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
-use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
+use svm_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod backend;
 mod expr;
@@ -42,9 +42,16 @@ pub struct DapServer {
 struct Session {
     inspector: Box<dyn Debuggee>,
     debug: Option<DebugInfo>,
-    /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
-    /// binding source-line breakpoints.
+    /// `(file, line) → first *stoppable* IR pc on that line` — the reverse of `Inspector::source_loc`,
+    /// for binding source-line breakpoints. Only non-terminator pcs are indexed (a terminator is never
+    /// a stoppable position — see [`terminator_only_lines`](Session::terminator_only_lines)).
     line_index: BTreeMap<(u32, u32), IrPc>,
+    /// `(file, line)`s whose *only* mapped ops are block terminators (`return`/`br`) — e.g. a bare
+    /// `return x;` where `x` was computed on an earlier line. No engine can pause at a terminator
+    /// (`cur_ir_pc`/`before_op` never fire there), so a breakpoint on such a line can never stop:
+    /// `setBreakpoints` reports it `verified: false` rather than falsely binding it (which silently ran
+    /// the guest to completion). Kept distinct from "line has no code at all" so the message can say why.
+    terminator_only_lines: BTreeSet<(u32, u32)>,
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
     /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
@@ -283,7 +290,10 @@ impl DapServer {
             .unwrap_or(1_000_000_000) as u64;
 
         let debug = module.debug_info.clone();
-        let line_index = debug.as_ref().map(build_line_index).unwrap_or_default();
+        let (line_index, terminator_only_lines) = debug
+            .as_ref()
+            .map(|di| build_line_index(di, &module))
+            .unwrap_or_default();
         // Execution mode (DEBUGGING.md Milestone B): `seed` ⇒ a fuzzed interleaving; `schedule`
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
@@ -336,6 +346,7 @@ impl DapServer {
             inspector,
             debug,
             line_index,
+            terminator_only_lines,
             breakpoints: Vec::new(),
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
@@ -375,6 +386,22 @@ impl DapServer {
         let mut out = Vec::new();
         for bp in &requested {
             let line = bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32;
+            // A line whose only ops are terminators (a bare `return x;` etc.) has no stoppable pc:
+            // report it unverified with a reason, rather than binding a breakpoint that never fires.
+            if file_idx.is_some_and(|fi| session.terminator_only_lines.contains(&(fi, line))) {
+                out.push(Json::obj(vec![
+                    ("verified", Json::Bool(false)),
+                    ("line", Json::i(line as i64)),
+                    (
+                        "message",
+                        Json::s(
+                            "no stoppable instruction on this line (it maps only to a return/branch); \
+                             set the breakpoint on an earlier line",
+                        ),
+                    ),
+                ]));
+                continue;
+            }
             match file_idx.and_then(|fi| resolve_line(&session.line_index, fi, line)) {
                 Some((actual_line, pc)) => {
                     session.inspector.set_breakpoint(pc);
@@ -1064,6 +1091,8 @@ impl DapServer {
         let (result, ty) = match expr::eval(&expr, &mut env) {
             Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
             Some(expr::Value::Float(x)) => (x.to_string(), String::new()),
+            // A bare pointer rvalue renders as its address value (navigate it with `->`/`[]`/`*`).
+            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new()),
             Some(expr::Value::Place { addr, type_id }) => {
                 if matches!(
                     types.get(type_id as usize),
@@ -1188,9 +1217,24 @@ fn dap_reason(r: StopReason) -> &'static str {
     }
 }
 
-/// `(file, line) → smallest IR pc on that line`, the reverse of `Inspector::source_loc`.
-fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
+/// Build the `(file, line) → smallest stoppable IR pc` index used to bind source-line breakpoints,
+/// plus the set of lines that map *only* to block terminators. A terminator (`Block::term`, whose IR
+/// `inst` index is `>= block.insts.len()`) is never a stoppable position — no engine pauses at one —
+/// so it is excluded from the index; a line left with no stoppable pc is recorded as terminator-only
+/// so `setBreakpoints` can report it honestly instead of binding a breakpoint that never fires.
+fn build_line_index(
+    di: &DebugInfo,
+    module: &Module,
+) -> (BTreeMap<(u32, u32), IrPc>, BTreeSet<(u32, u32)>) {
+    let is_terminator = |pc: &IrPc| {
+        module
+            .funcs
+            .get(pc.func as usize)
+            .and_then(|f| f.blocks.get(pc.block))
+            .is_none_or(|b| pc.inst >= b.insts.len())
+    };
     let mut idx: BTreeMap<(u32, u32), IrPc> = BTreeMap::new();
+    let mut has_term: BTreeSet<(u32, u32)> = BTreeSet::new(); // lines seen with a terminator loc
     for l in &di.locs {
         let pc = IrPc {
             module: 0,
@@ -1198,6 +1242,10 @@ fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
             block: l.block as usize,
             inst: l.inst as usize,
         };
+        if is_terminator(&pc) {
+            has_term.insert((l.file, l.line));
+            continue;
+        }
         idx.entry((l.file, l.line))
             .and_modify(|e| {
                 if pc < *e {
@@ -1206,7 +1254,12 @@ fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
             })
             .or_insert(pc);
     }
-    idx
+    // Terminator-only = saw a terminator on this line and *no* non-terminator op (order-independent).
+    let term_only = has_term
+        .into_iter()
+        .filter(|k| !idx.contains_key(k))
+        .collect();
+    (idx, term_only)
 }
 
 /// Bind a requested line to the nearest line at/after it that has code (so a breakpoint on a blank
@@ -1465,9 +1518,21 @@ impl expr::Resolver for EvalEnv<'_> {
                 }
             }
             // A promoted scalar (single value / location list): the Inspector resolves it at the
-            // frame's pc; map the read-back value to an Int/Float operand.
+            // frame's pc; map the read-back value to an Int/Float operand — or, for a **pointer**-typed
+            // promoted value, a `Ptr` rvalue so `p->field` / `p[i]` navigate from its value (the
+            // window-var path already yields a `Place`; this is the SSA-promoted pointer chibicc emits
+            // for `struct T *p = &x;`).
             VarLoc::Ssa { .. } | VarLoc::SsaList(_) => {
                 let width = scalar_width(self.types, var.type_id, &var.ty);
+                if let Some(&TypeDef::Pointer { pointee, .. }) =
+                    var.type_id.and_then(|t| self.types.get(t as usize))
+                {
+                    let v = self.inspector.read_var(self.frame_idx, name, width)?;
+                    return var_to_i64(&v).map(|addr| expr::Value::Ptr {
+                        addr: addr as u64,
+                        pointee,
+                    });
+                }
                 match self.inspector.read_var(self.frame_idx, name, width)? {
                     VarValue::Value(Value::F32(x)) => Some(expr::Value::Float(x as f64)),
                     VarValue::Value(Value::F64(x)) => Some(expr::Value::Float(x)),
@@ -1494,6 +1559,14 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn index(&mut self, base: &expr::Value, index: i64) -> Option<expr::Value> {
+        // A pointer *rvalue* indexes from its own value: `p[i] == *(p + i)`, no read-out first.
+        if let &expr::Value::Ptr { addr, pointee } = base {
+            let stride = type_size(self.types, pointee) as u64;
+            return Some(expr::Value::Place {
+                addr: addr.wrapping_add((index as u64).wrapping_mul(stride)),
+                type_id: pointee,
+            });
+        }
         let &expr::Value::Place { addr, type_id } = base else {
             return None;
         };
@@ -1505,7 +1578,7 @@ impl expr::Resolver for EvalEnv<'_> {
                     type_id: *elem,
                 })
             }
-            // `p[i] == *(p + i)`: dereference, then offset by the element stride.
+            // `p[i] == *(p + i)`: dereference (read the stored pointer), then offset by the stride.
             TypeDef::Pointer { pointee, .. } => {
                 let base = self.read_ptr(addr)?;
                 let stride = type_size(self.types, *pointee) as u64;
@@ -1519,6 +1592,13 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn deref(&mut self, base: &expr::Value) -> Option<expr::Value> {
+        // A pointer rvalue derefs to a `Place` at its own value (`*p` where `p` is a promoted pointer).
+        if let &expr::Value::Ptr { addr, pointee } = base {
+            return Some(expr::Value::Place {
+                addr,
+                type_id: pointee,
+            });
+        }
         let &expr::Value::Place { addr, type_id } = base else {
             return None;
         };
@@ -1532,6 +1612,10 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn load(&mut self, v: &expr::Value) -> Option<expr::Value> {
+        // A pointer rvalue loads to its numeric value (so `p` on its own prints as an address).
+        if let &expr::Value::Ptr { addr, .. } = v {
+            return Some(expr::Value::Int(addr as i64));
+        }
         let &expr::Value::Place { addr, type_id } = v else {
             return Some(*v); // an Int/Float literal resolves to itself
         };
