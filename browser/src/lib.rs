@@ -657,7 +657,8 @@ static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
 /// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
 /// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
-/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_module_tierup`]).
+/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_jit`] with
+/// [`svm_wasm_jit::Shape::Threaded`]).
 ///
 /// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
 /// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
@@ -910,7 +911,7 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
 /// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
 /// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
-/// [`svm_wasm_jit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
+/// [`svm_wasm_jit::compile_jit`] with [`svm_wasm_jit::Shape::Batch`], shared memory) + stashed so a guest `Jit.invoke`
 /// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
 /// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
 /// (on the main thread) before the run.
@@ -1040,7 +1041,7 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The granted unit's per-function tier-up eligibility (`compile_module_tierup`): `f{i}` is emitted
+/// The granted unit's per-function tier-up eligibility (`compile_jit` / `Shape::Threaded`): `f{i}` is emitted
 /// + safe to call. A confined child whose entry is eligible runs on wasm; else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 
@@ -3352,11 +3353,21 @@ impl JitOnrampReactor {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
         }
-        // Emit the whole `tick` (cross-tier helpers routed to `env.call_interp`). Fall back if the
-        // guest isn't reactor-emittable (e.g. its `tick` directly makes a cap.call → not in-subset).
-        let (emitted_wasm, emitted) =
-            svm_wasm_jit::compile_module_reactor(&module, tick, shared_memory)
-                .map_err(|_| STATUS_UNSUPPORTED)?;
+        // Emit the whole `tick`, wasm-driven (cross-tier helpers routed to `env.call_interp`). The
+        // front door derives the strategy: a `tick` whose reachable set can suspend is *not*
+        // wasm-drivable (a JITted frame can't unwind across a stack switch), so it reports
+        // `InterpDriven` instead of emitting a reactor this driver couldn't run — fall back to the
+        // pure interpreter then, exactly as when the `tick` is out of subset.
+        let artifact = svm_wasm_jit::compile_jit(
+            &module,
+            svm_wasm_jit::Shape::Reactor { entry: tick },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampReactor {
             module,
             program,
@@ -3686,11 +3697,19 @@ impl JitOnrampRun {
                 }
             }
         }
-        // Emit rooted at func 0 (`_start`); cross-tier helpers route to `env.call_interp`. Fall back if
-        // `_start` itself is out of subset.
-        let (emitted_wasm, emitted) =
-            svm_wasm_jit::compile_module_reactor(&module, 0, shared_memory)
-                .map_err(|_| STATUS_UNSUPPORTED)?;
+        // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to `env.call_interp`.
+        // The front door reports `InterpDriven` (→ fall back to the pure interpreter) if `_start` is out
+        // of subset or its reachable set can suspend — this driver can only run a wasm-driven artifact.
+        let artifact = svm_wasm_jit::compile_jit(
+            &module,
+            svm_wasm_jit::Shape::Batch { entry: 0 },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampRun {
             module,
             program,
