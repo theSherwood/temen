@@ -345,6 +345,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         .collect();
 
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
@@ -448,6 +449,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
     };
 
     Module {
+        data_ptrs: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
             results: vec![ValType::I64],
@@ -591,6 +593,7 @@ fn gen_fiber_root(g: &mut Gen, suspends: u32) -> Func {
 pub fn gen_fiber_module(g: &mut Gen) -> Module {
     let suspends = 1 + g.below(3); // 1..=3
     Module {
+        data_ptrs: Vec::new(),
         funcs: vec![gen_fiber_root(g, suspends), gen_fiber_func(g, suspends)],
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
@@ -785,6 +788,7 @@ pub fn gen_recycle_fiber_module(g: &mut Gen) -> RecycleModule {
     let fiber_a = gen_fiber_func(g, 0); // func 2: zero suspends ⇒ finishes immediately
     RecycleModule {
         module: Module {
+            data_ptrs: Vec::new(),
             funcs: vec![root, fiber_b, fiber_a],
             memory: Some(Memory {
                 size_log2: SIZE_LOG2,

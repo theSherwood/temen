@@ -178,6 +178,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
         .collect();
 
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
@@ -615,6 +616,7 @@ pub fn inline_calls(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
@@ -912,6 +914,7 @@ pub fn const_prop(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
@@ -1017,6 +1020,7 @@ pub fn devirtualize(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),

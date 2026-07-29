@@ -11,6 +11,7 @@ use svm_verify::verify_module;
 
 fn module(f: Func) -> Module {
     Module {
+        data_ptrs: Vec::new(),
         types: vec![],
         funcs: vec![f],
         memory: Some(Memory { size_log2: 16 }),

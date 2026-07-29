@@ -64,6 +64,19 @@ pub fn print_module(m: &Module) -> String {
             escape_bytes(&d.bytes)
         );
     }
+    // Data-image pointer relocations (the data→data case): `data.ptr <at> self <off>` for a pointer
+    // into this unit's own data, `data.ptr <at> sym "<name>" <addend>` for a cross-unit one. `link`
+    // resolves and clears these, so they print only on a pre-link object.
+    for p in &m.data_ptrs {
+        match &p.target {
+            svm_ir::DataPtrTarget::SelfOff(off) => {
+                let _ = writeln!(s, "data.ptr {} self {off}", p.at);
+            }
+            svm_ir::DataPtrTarget::Sym { name, addend } => {
+                let _ = writeln!(s, "data.ptr {} sym \"{name}\" {addend}", p.at);
+            }
+        }
+    }
     if let Some(mem) = &m.memory {
         let _ = writeln!(s, "memory {}", mem.size_log2);
         s.push('\n');
@@ -1090,6 +1103,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut funcs = Vec::new();
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
+    let mut data_ptrs: Vec<svm_ir::DataPtr> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
     let mut data_exports: Vec<svm_ir::DataExport> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
@@ -1365,6 +1379,28 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     bytes,
                 });
             }
+            // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
+            // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
+            // sym "<name>" <addend>` writes a cross-unit data symbol's address. `link` resolves and
+            // clears these; a runnable module carries none. (`data.ptr` lexes as one ident, like the
+            // `debug.*` directives, so it never collides with the `data` segment arm above.)
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                let at = p.parse_u64()?;
+                let kind = p.parse_ident()?;
+                let target = match kind.as_str() {
+                    "self" => svm_ir::DataPtrTarget::SelfOff(p.parse_u64()?),
+                    "sym" => {
+                        let name = String::from_utf8(p.parse_str()?).map_err(|_| {
+                            ParseError("data.ptr sym name is not valid UTF-8".into())
+                        })?;
+                        let addend = p.parse_int()?;
+                        svm_ir::DataPtrTarget::Sym { name, addend }
+                    }
+                    k => return err(format!("data.ptr target must be self or sym: {k}")),
+                };
+                data_ptrs.push(svm_ir::DataPtr { at, target });
+            }
             // The type section (OQ3; §3.5 surface): `type <idx> func (params) -> (results)`
             // declares a signature entry; `type <idx> interface { name: ty, ... }` declares an
             // interface entry with **required op names**. The index is a checked positional
@@ -1483,6 +1519,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         funcs,
         memory,
         data,
+        data_ptrs,
         imports: std::mem::take(&mut p.imports),
         exports,
         data_exports,
@@ -1544,6 +1581,17 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
                 p.parse_int()?;
                 p.parse_str()?;
+            }
+            // `data.ptr <at> self <off>` / `data.ptr <at> sym "<name>" <addend>` — skip in the
+            // header prescan (carries no function; lexes as its own ident, distinct from `data`).
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                p.parse_int()?; // at
+                let kind = p.parse_ident()?;
+                if kind == "sym" {
+                    p.parse_str()?; // name
+                }
+                p.parse_int()?; // self off / sym addend
             }
             // Type-section entries — skip in the header prescan. v7 form: `type <idx> func
             // (sig)` / `type <idx> interface { ... }`; legacy: `type (sig)`.

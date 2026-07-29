@@ -1797,6 +1797,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         return Err(DecodeError::TrailingBytes);
     }
     Ok(Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory,
         data,
@@ -2724,6 +2725,7 @@ mod debug_tests {
 
     fn module(debug_info: Option<DebugInfo>) -> Module {
         Module {
+            data_ptrs: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,

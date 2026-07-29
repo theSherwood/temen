@@ -12819,6 +12819,7 @@ struct ModuleGrant {
 /// the identity tolerant of a debug-stripped re-grant.
 fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
+        data_ptrs: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
         data: m.data.clone(),

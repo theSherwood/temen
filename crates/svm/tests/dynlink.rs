@@ -427,6 +427,169 @@ fn data_link_forms_round_trip() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// data → data: a pointer baked into a global's *own* initializer (`int *p = &g;`). The pointer
+// lives in static data, not in an instruction, so it rides a `data.ptr` slot the linker patches
+// into the data image — the data→data twin of `data.self`/`data.sym`.
+// ---------------------------------------------------------------------------------------------
+
+/// **Own-data pointer** (`int *p = &g;`, same TU): a unit stores a pointer *to its own datum* in its
+/// data image. `g` (byte 99) sits at offset 0; an 8-byte pointer slot at offset 8 is fixed up by
+/// `data.ptr 8 self 0`. Linked behind `pad`, the datum and the slot both move to base 16, and the
+/// linker writes `base+0` into the slot — so loading the pointer (`i64.load`) and dereferencing it
+/// yields 99 wherever the data landed. Proves the *stored bytes* were relocated, not just an instr.
+#[test]
+fn data_ptr_self_pointer_resolves() {
+    let me = text_unit(
+        "memory 16\n\
+         data 0 \"\\x63\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 8 self 0\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.self 8\n\
+         \x20 v2 = i64.load v1\n\
+         \x20 v3 = i32.load8_u v2\n\
+         \x20 return v3\n\
+           }\n\
+         }\n",
+    );
+    let linked = link(&[unit(PAD16, &[]), me]).expect("link");
+    // The relocation was applied and consumed — a runnable module carries no `data.ptr`.
+    assert!(linked.data_ptrs.is_empty(), "data.ptr resolved and cleared");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert_eq!(
+        run_entry(&linked, 1, &[0]),
+        99,
+        "load the stored self-pointer and deref it"
+    );
+}
+
+/// **Cross-unit data pointer** (`extern int g; int *p = &g;`): unit `store` exports datum "answer"
+/// (byte 55); unit `hold` keeps an 8-byte pointer to it, fixed up by `data.ptr 0 sym "answer" 0`.
+/// The linker writes `addr(answer)` into `hold`'s slot, so `hold`'s function loads the pointer and
+/// dereferences the *other unit's* datum. The data-image twin of `cross_unit_data_symbol_resolves`.
+#[test]
+fn data_ptr_cross_unit_pointer_resolves() {
+    let store = text_unit(
+        "memory 16\ndata 0 \"\\x37\"\nexport 0 data \"answer\" 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    let hold = text_unit(
+        "memory 16\n\
+         data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 0 sym \"answer\" 0\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.self 0\n\
+         \x20 v2 = i64.load v1\n\
+         \x20 v3 = i32.load8_u v2\n\
+         \x20 return v3\n\
+           }\n\
+         }\n",
+    );
+    let linked = link(&[unit(PAD16, &[]), store, hold]).expect("link");
+    assert!(linked.data_ptrs.is_empty());
+    svm_verify::verify_module(&linked).expect("verify");
+    // hold's function is the 3rd unit → global index 2.
+    assert_eq!(
+        run_entry(&linked, 2, &[0]),
+        55,
+        "deref a cross-unit pointer stored in data"
+    );
+}
+
+/// The **addend** rides through the data pointer: `store` exports `arr = {10,20,30,40}` as "arr";
+/// `hold` keeps a pointer to `arr[2]` via `data.ptr 0 sym "arr" 8`. The linker writes `addr(arr)+8`
+/// into the slot, so dereferencing the stored pointer reads `30`.
+#[test]
+fn data_ptr_addend_rides() {
+    let store = text_unit(
+        "memory 16\ndata 0 \"\\x0a\\x00\\x00\\x00\\x14\\x00\\x00\\x00\\x1e\\x00\\x00\\x00\\x28\\x00\\x00\\x00\"\n\
+         export 0 data \"arr\" 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    let hold = text_unit(
+        "memory 16\n\
+         data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 0 sym \"arr\" 8\n\
+         func (i32) -> (i32) {\n\
+         block 0 (v0: i32) {\n\
+         \x20 v1 = data.self 0\n\
+         \x20 v2 = i64.load v1\n\
+         \x20 v3 = i32.load v2\n\
+         \x20 return v3\n\
+           }\n\
+         }\n",
+    );
+    let linked = link(&[unit(PAD16, &[]), store, hold]).expect("link");
+    svm_verify::verify_module(&linked).expect("verify");
+    assert_eq!(run_entry(&linked, 2, &[0]), 30, "&arr[2] baked into data");
+}
+
+/// The text round-trips: both `data.ptr <at> self <off>` and `data.ptr <at> sym "<name>" <addend>`
+/// print and re-parse identically (print ∘ parse is identity, including the `data_ptrs` table).
+#[test]
+fn data_ptr_forms_round_trip() {
+    let src = "memory 16\n\
+               data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+               data.ptr 0 self 8\n\
+               data.ptr 8 sym \"g\" 4\n\
+               func (i32) -> (i32) {\n\
+               block 0 (v0: i32) {\n  return v0\n  }\n}\n";
+    let m = svm_text::parse_module(src).expect("parse");
+    assert_eq!(m.data_ptrs.len(), 2);
+    let printed = svm_text::print_module(&m);
+    let m2 = svm_text::parse_module(&printed).expect("re-parse");
+    assert_eq!(m, m2, "print ∘ parse is identity for data.ptr");
+}
+
+/// A `data.ptr … sym` naming a symbol no unit exports is fail-closed — the linker's `Unresolved`,
+/// the same guarantee `data.sym` gets, now for a pointer stored in data.
+#[test]
+fn unresolved_data_ptr_fails_closed() {
+    let u = text_unit(
+        "memory 16\n\
+         data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 0 sym \"nowhere\" 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    assert_eq!(
+        link(&[u]),
+        Err(svm_ir::LinkError::Unresolved("nowhere".into()))
+    );
+}
+
+/// A `data.ptr` slot with no covering data segment is a malformed unit — fail-closed with
+/// `BadDataPtr` (the frontend must emit an 8-byte placeholder covering `[at, at+8)`).
+#[test]
+fn data_ptr_outside_segment_fails_closed() {
+    let u = text_unit(
+        "memory 16\n\
+         data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 100 self 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    );
+    assert_eq!(link(&[u]), Err(svm_ir::LinkError::BadDataPtr { at: 100 }));
+}
+
+/// A `data.ptr` **surviving** into a would-be-runnable module fails verification: unlike the
+/// instruction link forms (which trap at execution), a data pointer has no execution site, so its
+/// placeholder bytes would be read unpatched. `verify_module` is the fail-closed gate.
+#[test]
+fn surviving_data_ptr_fails_verify() {
+    let m = svm_text::parse_module(
+        "memory 16\n\
+         data 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data.ptr 0 self 0\n\
+         func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+    )
+    .expect("parse");
+    assert_eq!(
+        svm_verify::verify_module(&m),
+        Err(svm_verify::VerifyError::UnlinkedDataPtr { at: 0 })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Milestone 3: dynamic linking — resolve a symbol to a call_indirect TABLE SLOT (Resolved::Slot).
 // A separately-compiled unit reaches a function it doesn't share an index space with, by slot.
 // ---------------------------------------------------------------------------------------------

@@ -336,6 +336,7 @@ mod tests {
             }, // v4
         ];
         Module {
+            data_ptrs: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![],

@@ -1106,6 +1106,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         Vec::new()
     };
     Module {
+        data_ptrs: Vec::new(),
         funcs,
         memory,
         data,

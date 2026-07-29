@@ -531,6 +531,7 @@ fn verifier_rejects_forward_value_reference() {
     // would refuse a forward name, so we construct the IR directly).
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
+        data_ptrs: Vec::new(),
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I32],
@@ -564,6 +565,7 @@ fn verifier_rejects_forward_value_reference() {
 fn verifier_rejects_bad_branch_target() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
+        data_ptrs: Vec::new(),
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I32],
@@ -595,6 +597,7 @@ fn verifier_rejects_bad_branch_target() {
 fn verifier_rejects_entry_param_mismatch() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
+        data_ptrs: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
             results: vec![],
@@ -1090,6 +1093,7 @@ fn verifier_rejects_call_to_missing_function() {
     // we construct the IR directly to exercise the verifier's range check.
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
+        data_ptrs: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
             results: vec![ValType::I32],
