@@ -3898,11 +3898,27 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     }
     Ok(Module {
         funcs,
-        // The merged window is the largest any unit declared (they share one linear memory).
+        // The merged window (one shared linear memory) must (a) be at least as large as any unit
+        // declared and (b) cover every relocated data segment: the units' data is **stacked** into
+        // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB. Grow
+        // to the smallest power-of-two window that holds `dtotal` — never shrinking a unit's request
+        // — else `verify` rejects the linked module (a segment past `1 << size_log2`). No unit
+        // declaring memory ⇒ no data segments either, so `None` stays `None`.
         memory: units
             .iter()
             .filter_map(|u| u.module.memory)
-            .max_by_key(|m| m.size_log2),
+            .map(|m| m.size_log2)
+            .max()
+            .map(|declared| {
+                let need = if dtotal <= 1 {
+                    0
+                } else {
+                    (64 - (dtotal - 1).leading_zeros()) as u8
+                };
+                Memory {
+                    size_log2: declared.max(need),
+                }
+            }),
         data,
         // Empty for [`link`]; the deduped host-bound slots for [`link_with_manifest`].
         imports: merged_imports,

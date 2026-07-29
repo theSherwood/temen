@@ -702,9 +702,21 @@ static int gen_addr(Node *node) {
       cg("  v%d = i64.add " SP " v%d\n", r, off);
       return r;
     }
-    // A global lives at a fixed window offset in the data region below the stack.
+    // A global's address. Whole-program (`--emit-ir`): a fixed window offset, known now. Separate
+    // compilation (`--emit-object`): a **link form** the linker relocates once it fixes each unit's
+    // window base — `data.self <off>` for a global defined in *this* unit (its data moves as a
+    // block), `data.sym "name"` for one defined in another TU (resolved to the exporter's window
+    // address, fail-closed if unexported). Never a raw `i64.const` here: the linker would not
+    // relocate it, so it would point into whatever unit happened to land at that base offset.
     int r = nv++;
-    cg("  v%d = i64.const %d\n", r, node->var->offset);
+    if (opt_emit_object) {
+      if (node->var->is_definition)
+        cg("  v%d = data.self %d\n", r, node->var->offset);
+      else
+        cg("  v%d = data.sym \"%s\" 0\n", r, node->var->name);
+    } else {
+      cg("  v%d = i64.const %d\n", r, node->var->offset);
+    }
     return r;
   }
   case ND_DEREF:
@@ -2571,6 +2583,12 @@ static bool layout_globals(Obj *prog) {
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || is_rodata(g))
       continue;
+    // `--emit-object`: an `extern` global (declared here, defined in another TU) gets **no** local
+    // storage — its references lower to `data.sym` and the linker resolves them to the exporter's
+    // window address. Reserving a slot for it here would waste space and, worse, its `data.self`-
+    // free references would silently read this unit's uninitialized slot.
+    if (opt_emit_object && !g->is_definition)
+      continue;
     off = align_to(off, g->align);
     g->offset = off;
     off += g->ty->size;
@@ -2609,6 +2627,15 @@ static long symbol_value(Obj *prog, char *name) {
   return 0; // unreachable for a well-formed whole-program module (defensive NULL)
 }
 
+// The Obj a relocation names, or NULL if this unit only *declares* it (a cross-TU symbol — under
+// `--emit-object` the linker resolves it). Used to pick the link form for a data→data pointer.
+static Obj *find_symbol(Obj *prog, char *name) {
+  for (Obj *s = prog; s; s = s->next)
+    if (s->name && !strcmp(s->name, name))
+      return s;
+  return NULL;
+}
+
 // Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
 // the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
 // Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
@@ -2616,16 +2643,47 @@ static long symbol_value(Obj *prog, char *name) {
 // window address of its target symbol + addend into the image, computed here since all
 // offsets/indices are known.
 static void emit_data_segments(Obj *prog) {
+  long span_top = 0;    // high-water of every defined global's window extent (`--emit-object` span)
+  long covered_top = 0; // high-water of the bytes an actual `data` segment writes
   for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function || !g->init_data)
+    if (g->is_function)
       continue;
+    // `--emit-object`: an `extern` has no storage in this unit (see `layout_globals`) — skip it.
+    // Otherwise every defined global counts toward the span the linker must reserve so the next
+    // unit's window never overlaps this one's data (including BSS, which emits no segment below).
+    if (opt_emit_object) {
+      if (!g->is_definition)
+        continue;
+      long gt = (long)g->offset + g->ty->size;
+      if (gt > span_top)
+        span_top = gt;
+    }
+    if (!g->init_data)
+      continue; // BSS: the window is zero-filled at instantiation, so no segment is needed
     int size = g->ty->size;
     unsigned char *buf = calloc(size ? size : 1, 1);
     memcpy(buf, g->init_data, size);
+    // Pointer initializers become relocations. Whole-program (`--emit-ir`): bake the target's
+    // absolute window value now — every offset/index is fixed. Separate compilation
+    // (`--emit-object`): leave a zero placeholder and emit a link-form `data.ptr` slot the linker
+    // patches once the window layout is known (below), the data→data twin of `data.self`/`data.sym`.
     for (Relocation *r = g->rel; r; r = r->next) {
-      unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
-      for (int i = 0; i < 8 && r->offset + i < size; i++)
-        buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+      if (opt_emit_object) {
+        Obj *t = find_symbol(prog, *r->label);
+        if (t && t->is_function)
+          // A function pointer baked into static data would need the *reindexed* funcref, which the
+          // linker rewrites only for `ref.func`/`call` operands, not opaque data bytes. No unit in
+          // the chibicc cc1 set does this; fail closed rather than emit a stale index.
+          error("codegen_ir: `--emit-object` cannot relocate a function pointer in static data "
+                "(`%s`); it needs a cross-TU funcref relocation the link model does not carry",
+                *r->label);
+        for (int i = 0; i < 8 && r->offset + i < size; i++)
+          buf[r->offset + i] = 0; // placeholder; the linker overwrites [at, at+8)
+      } else {
+        unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+        for (int i = 0; i < 8 && r->offset + i < size; i++)
+          buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+      }
     }
     cg("data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
     for (int i = 0; i < size; i++) {
@@ -2641,7 +2699,28 @@ static void emit_data_segments(Obj *prog) {
     }
     cg("\"\n");
     free(buf);
+    if (opt_emit_object) {
+      long ct = (long)g->offset + size;
+      if (ct > covered_top)
+        covered_top = ct;
+      // Emit the `data.ptr` slots now that the segment covering `[at, at+8)` exists: `self` for a
+      // target defined in this unit (relocated with our data), `sym` for a cross-TU data symbol.
+      for (Relocation *r = g->rel; r; r = r->next) {
+        Obj *t = find_symbol(prog, *r->label);
+        long at = (long)g->offset + r->offset;
+        if (t && t->is_definition)
+          cg("data.ptr %ld self %ld\n", at, (long)t->offset + r->addend);
+        else
+          cg("data.ptr %ld sym \"%s\" %ld\n", at, *r->label, r->addend);
+      }
+    }
   }
+  // `--emit-object`: if the unit's top-most global is BSS (no segment reached `span_top`), emit a
+  // 1-byte zero sentinel so the linker's data span (max segment end) covers all globals — otherwise
+  // the next unit's window base would overlap this unit's trailing BSS. Whole-program needs none:
+  // nothing is placed after its data.
+  if (opt_emit_object && span_top > covered_top)
+    cg("data %ld \"\\x00\"\n", span_top - 1);
 }
 
 // Which fixed powerbox caps (by `VM_CAP_*`/slot index) does `n`'s subtree actually reach? Sets bit
@@ -3199,15 +3278,26 @@ void codegen_ir(Obj *prog, FILE *out) {
   // another unit's `call.sym` to a direct call. Every non-`static` function is exported by name at
   // its module index; `static` functions stay internal (unexported), so file-local statics of the
   // same name in different TUs never collide. `emit_start` already exported `_start` as export 0
-  // when this unit defines `main`, so the numbering continues past it. (Data-symbol exports for
-  // cross-TU globals — `LinkUnit::data_exports`/relocations — are the next slice; this unit shares
-  // only functions.)
+  // when this unit defines `main`, so the numbering continues past it.
   if (opt_emit_object) {
     int k = has_main ? 1 : 0; // export 0 is `_start` in the entry unit
     for (int i = 0; i < nfuncs; i++) {
       if (funcs[i]->is_static || !funcs[i]->name)
         continue;
       cg("export %d func \"%s\" %d\n", k++, funcs[i]->name, start_off + i);
+    }
+    // Data-symbol exports (their own dense index sequence, § dynlink): each externally-visible
+    // global — non-`static`, defined here, source-named (not a compiler-internal `.L..` string
+    // literal or compound-literal temporary) — is published at its window offset so another unit's
+    // `data.sym`/`data.ptr … sym` resolves to it. Internal globals stay unexported: a file-local
+    // `static` global of the same name in two TUs never collides, exactly as for functions.
+    int d = 0;
+    for (Obj *g = prog; g; g = g->next) {
+      if (g->is_function || !g->is_definition || g->is_static)
+        continue;
+      if (!g->name || g->name[0] == '\0' || g->name[0] == '.')
+        continue;
+      cg("export %d data \"%s\" %d\n", d++, g->name, g->offset);
     }
   }
 
