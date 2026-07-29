@@ -21,6 +21,7 @@
  * `vm_map`/`vm_page_size` from the header's heap) — no other libc.
  */
 #define SVM_GUEST 1
+#define __SVM_LIBC_OWNER 1           /* this unit holds the ONE shared allocator state (2c); see stdlib.h */
 #include <stdlib.h>                  /* bundled: static malloc/free/calloc/realloc; defines __SVM_STDLIB_H */
 #include "../postgres/shim_errno.h"  /* errno cell + __errno_location */
 #include "../postgres/mem_shim.c"    /* memcpy/memset/memmove/memcmp/strcmp/strncmp/strlen */

@@ -460,12 +460,37 @@ compiler bug is a clean error, never an escape.
    are real definitions, not the 2a stub. The `chibicc_extra.c` allocator stays `__SVM_STDLIB_H`-guarded
    so the on-ramp `chibicc_libc.c` still builds under clang.
 
-   **Remaining for 2c (run the compiler).** The one thing between the linked cc1 and a running compiler
-   is input: `os_emit.c` stubs fd≥3, so `fopen`'ing the source `.c` returns NULL. 2c wires the
-   **fs-powerbox harness** — a memfs seeded with the input `.c` + `/include`, and a resolver that binds
-   the fs ops (`open`/`close`/`read`/`write`/`stat` for fd≥3) — then runs a real `.c → SVM IR` compile
-   through `_start` on interp==JIT and diffs it against the native `chibicc_ref`. Then the float-input
-   dtoa, and (c) the **bootstrap-fixpoint** differential (§5 E).
+   **→ Emit-object 2c increment 1 DONE 2026-07-29 — the linked compiler *runs* and self-hosts a
+   compile.** The whole cc1 (nine TUs + `emit_libc.c`) now runs through `_start` under the powerbox and
+   **compiles a real C program to SVM IR inside the sandbox**, proven three ways at once
+   (`c_link.rs::whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit`): the emitted IR is
+   **byte-identical on the interpreter and the JIT** (§18), it **parses** as a real module, and it is
+   **byte-identical to the native reference** (`chibicc_ref` — the same `cc1_main` entry built with
+   system clang + libc, so the guest libc + SVM engine reproduce the native frontend exactly). Source is
+   fed on **stdin** (`chibicc -` → `read_file("-")`) and IR comes back on stdout — the recognized
+   `read`/`write` powerbox builtins already serve fd 0/1, so this needs no filesystem cap.
+
+   *This surfaced and fixed a real multi-TU allocator bug.* chibicc's bundled `<stdlib.h>` keeps its bump
+   pointer in file-scope `static` state; that is self-contained in a whole-program build, but under
+   emit-object **every** cc1 TU `#include`s it and so minted its *own* `static __svm_brk` at the same
+   256 MiB heap base — the per-TU allocators handed out **overlapping** addresses and corrupted each
+   other (the guest's `hashmap` `unreachable()`d on a full-but-never-grown table). 2a/2b only linked +
+   verified, so it surfaced only on this first *run*. Fix: the four allocator-state globals
+   (`__svm_brk`/`__svm_committed`/`__svm_page`/`__svm_grow_lock`) are now **one shared instance** across
+   the linked program — `selfhost_prelude.h` sets `__SVM_LIBC_EXTERN` so each TU sees an `extern`, and
+   `emit_libc.c` sets `__SVM_LIBC_OWNER` to hold the single definition, resolved cross-TU by
+   `svm_ir::link` exactly like chibicc's shared `ty_int` (the allocator *functions* stay `static`
+   per-TU; only the bump pointer is shared). The whole-program on-ramp path is textually unchanged (the
+   `#else static` branch). Subset-link tests that omit the libc gained a tiny `alloc_state_stub()` owner.
+
+   **Remaining for 2c.** (a) The `#include`/filesystem path: a source that `#include`s a header needs a
+   real fd≥3 file read, but `gen_builtin_stream` **ignores fd today** (`write`→stdout, `read`→stdin
+   always) and the generic host-cap lowering `gen_builtin_import` is **disabled under `--emit-object`**
+   (an undefined extern is a cross-TU function there, fail-closed) — so reaching an fs cap needs an
+   fd-aware `read`/`write` + an fs seam in the frontend (a recognized `__vm_*` builtin family or a
+   memfs-on-stdin shim), a `chibicc.svmb`-independent frontend slice. (b) The float-input dtoa
+   (`printf_emit.c`'s `%.17g` is best-effort, so a float-literal source won't diff byte-exact yet).
+   (c) The **bootstrap-fixpoint** differential (§5 E).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

@@ -22,6 +22,16 @@
 #ifndef SVM_SELFHOST_PRELUDE_H
 #define SVM_SELFHOST_PRELUDE_H
 
+/* Shared allocator state for the multi-TU emit-object build (SELFHOST_C.md §7, 2c). The bundled
+ * `<stdlib.h>` bump allocator keeps its free-pointer in file-scope state; in a whole-program build
+ * that is a self-contained `static`, but here every cc1 TU `#include`s `<stdlib.h>` separately and
+ * would mint its *own* `static` bump pointer at the same 256 MiB heap base — so the per-TU allocators
+ * would hand out overlapping addresses and corrupt each other at run time. Defining `__SVM_LIBC_EXTERN`
+ * (this prelude is force-included in every emit-object TU) makes that state a single **shared** symbol:
+ * each TU sees an `extern`, and the libc unit (`emit_libc.c`, which sets `__SVM_LIBC_OWNER`) holds the
+ * one definition — resolved cross-TU by `svm_ir::link` exactly like chibicc's shared `ty_int`. */
+#define __SVM_LIBC_EXTERN 1
+
 /* The ISO C23 `strto*` family glibc hides behind its `__isoc23_*` redirect (the core gap). */
 unsigned long strtoul(const char *, char **, int);
 long strtol(const char *, char **, int);

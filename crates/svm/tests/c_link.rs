@@ -28,8 +28,9 @@
 //! headers (`<glob.h>`, …) are POSIX; Windows lacks the toolchain, so the whole suite is Unix-only.
 #![cfg(unix)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use svm_interp::Value;
@@ -659,6 +660,24 @@ fn links_and_runs_emit_libc_under_powerbox() {
 ///
 /// Linux-only: compiling chibicc's own source needs its Linux system-header path (see
 /// [`object_unit_real`]).
+/// A stand-in **owner** for the shared bump-allocator state (`__svm_brk`/`__svm_committed`/
+/// `__svm_page`/`__svm_grow_lock`). The emit-object cc1 TUs now *import* these four globals from the
+/// libc (`stdlib.h`'s `__SVM_LIBC_EXTERN` sharing — one bump pointer across all units, so the per-TU
+/// allocators don't hand out overlapping addresses), so a link of a *subset* that omits `emit_libc.c`
+/// must still resolve them. Compiled without the self-host prelude, so these are plain exported data
+/// symbols (not `extern`); the values mirror the libc's initializers (heap base 256 MiB). Subset tests
+/// link+verify only, so only the *symbols* need to resolve.
+#[cfg(target_os = "linux")]
+fn alloc_state_stub() -> LinkUnit {
+    object_unit(
+        "alloc_state",
+        "long __svm_brk = 268435456L;\n\
+         long __svm_committed = 268435456L;\n\
+         long __svm_page = 0;\n\
+         int __svm_grow_lock = 0;\n",
+    )
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn real_chibicc_type_tu_emits_and_links() {
@@ -679,7 +698,8 @@ fn real_chibicc_type_tu_emits_and_links() {
         !type_tu.module.data_ptrs.is_empty(),
         "type.c's Type structs carry data.ptr relocations"
     );
-    let linked = svm_ir::link_with_manifest(&[type_tu]).expect("link real type.c");
+    let linked =
+        svm_ir::link_with_manifest(&[type_tu, alloc_state_stub()]).expect("link real type.c");
     assert!(
         linked.data_ptrs.is_empty(),
         "data.ptr relocations resolved and cleared at link"
@@ -709,6 +729,9 @@ fn links_multiple_real_chibicc_tus() {
         object_unit_real("hashmap.c"),
         object_unit_real("unicode.c"),
         object_unit_real("strings.c"),
+        // These TUs' `calloc`/`malloc` share the libc's bump-allocator state; without `emit_libc.c`
+        // in this subset, a stand-in owns those four globals so the cross-TU import resolves.
+        alloc_state_stub(),
     ];
     // `type.c` publishes the shared `Type` globals the others link against.
     let type_data: Vec<&str> = units[0]
@@ -771,16 +794,20 @@ fn all_cc1_tus_compile_link_and_verify_under_emit_object() {
     ] {
         units.push(object_unit_real(tu));
     }
-    // The three stdio streams are the *only* data symbols no cc1 TU defines (they belong to the libc's
-    // stdio) — and a cross-TU **data** reference must resolve to a concrete address, so unlike a libc
-    // *function* it can't be left as a manifest import. A minimal unit defines them, standing in for
-    // the increment-2b libc's stdio globals; with it, the whole cc1 links. (Verified: `stdin`/`stdout`/
-    // `stderr` are the complete unresolved-data set — every `ty_*`/`opt_*`/`include_paths`/`base_file`
-    // resolves cross-TU.)
+    // Two families of data symbols no cc1 TU defines on its own, both belonging to the libc — and a
+    // cross-TU **data** reference must resolve to a concrete address (unlike a libc *function*, it
+    // can't be a manifest import). Minimal units stand in for them so the whole cc1 links:
+    //   * the three stdio streams (`stdin`/`stdout`/`stderr`);
+    //   * the shared bump-allocator state (`__svm_brk`/…) — each TU's `#include <stdlib.h>` allocator
+    //     now imports one shared bump pointer (see `stdlib.h`'s `__SVM_LIBC_EXTERN`) instead of minting
+    //     its own, so the state is a cross-TU symbol the libc owns.
+    // (Verified: these are the complete unresolved-data set — every `ty_*`/`opt_*`/`include_paths`/
+    // `base_file` resolves cross-TU.)
     units.push(object_unit(
         "stdio_globals",
         "void *stdin;\nvoid *stdout;\nvoid *stderr;\n",
     ));
+    units.push(alloc_state_stub());
 
     let linked = svm_ir::link_with_manifest(&units).expect("link all cc1 TUs");
     svm_verify::verify_module(&linked).expect("verify the whole linked cc1");
@@ -807,9 +834,11 @@ fn all_cc1_tus_compile_link_and_verify_under_emit_object() {
     // Everything left unresolved is host-bound libc (a manifest), never a dangling cross-TU symbol.
     // This is exactly the surface the increment-2b emit-object libc must supply: the stdio + string
     // helpers as guest C (`fopen`/`vfprintf`/`strlen`/…) over the powerbox syscall + memory caps
-    // (`exit`/`vm_map`). The heap allocator is NOT here: each TU that `#include <stdlib.h>` gets
-    // chibicc's *bundled* header, whose `static malloc`/`calloc`/`free`/`realloc` grow the window via
-    // `__vm_map` inline — so `malloc` never appears as a cross-unit symbol at all.
+    // (`exit`/`vm_map`). The heap allocator *functions* are NOT here: each TU that `#include
+    // <stdlib.h>` gets chibicc's *bundled* header, whose `static malloc`/`calloc`/`free`/`realloc` grow
+    // the window via `__vm_map` inline — so `malloc` never appears as a cross-unit *function* symbol.
+    // Its *state* (`__svm_brk`/…) is shared cross-TU (one bump pointer, `__SVM_LIBC_EXTERN`), stubbed
+    // above alongside the stdio globals.
     let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
     for name in &imports {
         assert!(!name.is_empty(), "retained manifest import has a name");
@@ -965,18 +994,11 @@ fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
     );
 }
 
-/// **The whole cc1 links against the real emit-object libc** (task #20, increment 2b): the nine cc1
-/// TUs + `emit_libc.c`, linked and verified into one module whose *every* remaining import is a
-/// default-powerbox-bindable cap — so the linked compiler instantiates, not just verifies. This is the
-/// 2a link (which stood the libc's stdio globals in with a stub) now closed against the actual libc:
-/// `stdin`/`stdout`/`stderr`, the `str`/`mem`/ctype/stdio/printf surface, and `strtod` all resolve
-/// cross-unit, and what is left — `write`/`read`/`exit`/`vm_map`/`vm_page_size` — the powerbox binds.
-///
-/// The one thing still between here and a running compiler is the input: `os_emit.c` stubs fd≥3, so
-/// `fopen`'ing the source `.c` returns NULL until the 2c fs cap. Linux-only.
+/// Link the whole `-cc1` slice — the eight upstream chibicc TUs, the `cc1_main.c` entry, and the
+/// emit-object guest libc (`emit_libc.c`) — into one verified module. The shared machinery behind
+/// both the "links with only powerbox caps" gate and the 2c self-compile run below. Linux-only.
 #[cfg(target_os = "linux")]
-#[test]
-fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
+fn link_whole_cc1() -> svm_ir::Module {
     let mut units = vec![object_unit_cc1_entry()];
     for tu in [
         "tokenize.c",
@@ -994,6 +1016,19 @@ fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
 
     let linked = svm_ir::link_with_manifest(&units).expect("link whole cc1 + emit-object libc");
     svm_verify::verify_module(&linked).expect("verify the whole linked cc1 + libc");
+    linked
+}
+
+/// **The whole cc1 links against the real emit-object libc** (task #20, increment 2b): the nine cc1
+/// TUs + `emit_libc.c`, linked and verified into one module whose *every* remaining import is a
+/// default-powerbox-bindable cap — so the linked compiler instantiates, not just verifies. This is the
+/// 2a link (which stood the libc's stdio globals in with a stub) now closed against the actual libc:
+/// `stdin`/`stdout`/`stderr`, the `str`/`mem`/ctype/stdio/printf surface, and `strtod` all resolve
+/// cross-unit, and what is left — `write`/`read`/`exit`/`vm_map`/`vm_page_size` — the powerbox binds.
+#[cfg(target_os = "linux")]
+#[test]
+fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
+    let linked = link_whole_cc1();
 
     // `_start` at function 0 and the shared `ty_int` global both survived (as in 2a).
     assert!(
@@ -1020,3 +1055,145 @@ fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
         );
     }
 }
+
+/// Build the **native reference compiler** `chibicc_ref` — the *same* `-cc1` slice the guest is made
+/// of (the eight upstream TUs + `cc1_main.c`), but built with the system clang + libc instead of
+/// chibicc-`--emit-object` + the guest libc. This is the apples-to-apples oracle for the self-host
+/// differential (`run_selfhost_diff.sh`): identical frontend both sides, so the only variables are the
+/// substrate (guest libc + SVM engine vs system libc + native CPU). Built with `-mlong-double-64` (F3:
+/// the guest bounds `long double` to `double`) + `native_ref_shims.c` (`strtold`→`strtod`, so the
+/// 64-bit `long double` ABI does not clash with glibc's 80-bit `strtold` — see that file). Cached.
+#[cfg(target_os = "linux")]
+fn chibicc_ref() -> &'static Path {
+    static REF: OnceLock<PathBuf> = OnceLock::new();
+    REF.get_or_init(|| {
+        let src = repo_root().join("frontend/chibicc");
+        let here = selfhost_dir();
+        let out = std::env::temp_dir().join(format!("svm_chibicc_ref_{}", std::process::id()));
+        // Prefer clang-18 (the pinned version the on-ramp uses), else whatever `clang` is on PATH.
+        let clang = if Command::new("clang-18")
+            .arg("--version")
+            .status()
+            .map_or(false, |s| s.success())
+        {
+            "clang-18"
+        } else {
+            "clang"
+        };
+        let mut cmd = Command::new(clang);
+        cmd.args(["-O2", "-mlong-double-64", "-Wno-switch"])
+            .arg(format!("-I{}", src.display()));
+        for t in [
+            "tokenize",
+            "preprocess",
+            "parse",
+            "type",
+            "codegen_ir",
+            "strings",
+            "hashmap",
+            "unicode",
+        ] {
+            cmd.arg(src.join(format!("{t}.c")));
+        }
+        cmd.arg(here.join("cc1_main.c"))
+            .arg(here.join("native_ref_shims.c"))
+            .arg("-o")
+            .arg(&out);
+        let status = cmd.status().expect("run clang to build chibicc_ref");
+        assert!(status.success(), "native chibicc_ref build failed");
+        out
+    })
+    .as_path()
+}
+
+/// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The
+/// nine cc1 TUs + `emit_libc.c` link into one module ([`link_whole_cc1`]); here that module runs
+/// through `_start` under the powerbox and **compiles a C program to SVM IR inside the sandbox** — the
+/// self-host lever, now executed rather than merely linked. Proven three ways at once: the emitted IR
+/// is byte-identical on the **interpreter and the JIT** (§18 oracle), it **parses** as a real module,
+/// and it is **byte-identical to the native reference** (`chibicc_ref`, the same `cc1_main` entry built
+/// with system clang + libc) — so the guest libc + SVM engine reproduce the native frontend exactly.
+///
+/// The source is fed on **stdin** (`chibicc -` → `read_file("-")`), and the IR comes back on stdout:
+/// the recognized `read`/`write` powerbox builtins already serve fd 0/1, so this first run of the
+/// linked compiler needs no filesystem cap. A `#include`-bearing program needs a real fd≥3 file read —
+/// an fd-aware `read` in the frontend (`gen_builtin_stream` ignores fd today, and the generic host-cap
+/// lowering `gen_builtin_import` is disabled under `--emit-object`) — which is the next 2c sub-slice.
+///
+/// Heavy (`make`s chibicc, compiles ten TUs `--emit-object`, links + verifies the module, runs it on
+/// two engines, and clang-builds the native reference), so `#[ignore]`d like the `codegen_ir.c` compile
+/// — run explicitly: `cargo test -p svm --test c_link -- --ignored self_compiles`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "heavy: builds + links + runs the whole cc1 on two engines and clang-builds the reference"]
+fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
+    use svm_run::{instantiate, Backend, RunConfig};
+
+    let linked = link_whole_cc1();
+
+    // A no-`#include` program (its result is `main`'s exit code): recursion, an array + loop, a couple
+    // of calls — enough that the emitted IR exercises the codegen, not a one-liner. Read on stdin.
+    let src: &[u8] = b"int add(int a, int b) { return a + b; }\n\
+        int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\n\
+        int main(void) {\n\
+        \x20 int xs[4];\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 4; i++) { xs[i] = i * i; s += xs[i]; }\n\
+        \x20 return add(s, fib(10));\n\
+        }\n";
+
+    let cfg = RunConfig {
+        args: vec![b"chibicc".to_vec(), b"-".to_vec()],
+        stdin: src.to_vec(),
+        ..RunConfig::default()
+    };
+    let inst = instantiate(linked).expect("instantiate the linked cc1");
+    let interp = inst
+        .run_with_caps(Backend::TreeWalk, &cfg, &[])
+        .expect("run the linked cc1 on the interpreter");
+    let jit = inst
+        .run_with_caps(Backend::Jit, &cfg, &[])
+        .expect("run the linked cc1 on the JIT");
+
+    assert!(
+        !interp.stdout.is_empty(),
+        "the compiler emitted SVM IR (interp stderr: {})",
+        String::from_utf8_lossy(&interp.stderr)
+    );
+    assert_eq!(
+        interp.stdout, jit.stdout,
+        "the linked compiler emits byte-identical IR on the interpreter and the JIT (§18)"
+    );
+
+    // The emitted IR is a real, parseable SVM module.
+    let ir = String::from_utf8(interp.stdout.clone()).expect("emitted IR is UTF-8");
+    svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("emitted IR should parse: {e:?}\n{ir}"));
+
+    // The native oracle: the same `cc1_main` entry, built with system clang + libc, fed the same
+    // source on stdin. `-g` is off by default on both sides, so there is no `debug.file <path>` line —
+    // the compare is a true byte-for-byte diff of the emitted IR.
+    let mut child = Command::new(chibicc_ref())
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chibicc_ref");
+    child
+        .stdin
+        .take()
+        .expect("chibicc_ref stdin")
+        .write_all(src)
+        .expect("write source to chibicc_ref");
+    let native = child.wait_with_output().expect("wait for chibicc_ref");
+    assert!(
+        native.status.success(),
+        "native chibicc_ref failed: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        interp.stdout, native.stdout,
+        "guest-emitted IR is byte-identical to the native reference (same frontend, different substrate)"
+    );
+}
+
