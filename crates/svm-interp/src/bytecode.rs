@@ -3677,6 +3677,29 @@ impl ModuleDebug {
     }
 }
 
+/// A single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
+/// [`DebugRun`]'s root continuation at logical time [`clock`](DebugRunSnapshot::clock), so a reverse
+/// `seek`/`step_back` on the DAP backend can restart a replay here instead of from clock 0 — bounding
+/// the replay to the checkpoint stride. The bytecode counterpart of the tree-walker's `SeekCheckpoint`.
+/// Opaque to the backend, which only stores it in a ladder and hands it back to [`DebugRun::restore`].
+pub struct DebugRunSnapshot {
+    clock: u64,
+    /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
+    active: Vm,
+    /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
+    /// a memoryless run.
+    mem: Option<Vec<u8>>,
+    /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
+    host: super::HostReplaySubstate,
+}
+
+impl DebugRunSnapshot {
+    /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
+    pub fn clock(&self) -> u64 {
+        self.clock
+    }
+}
+
 /// A minimal **resumable bytecode debug session** (DEBUGGING.md §1b G3) — the engine-level primitive a
 /// DAP-over-bytecode backend would wire into, the first prerequisite for that second backend. Holds the
 /// running [`Vm`] across stops: [`DebugRun::run_to`] steps until the current op's [`crate::IrPc`] is a
@@ -4361,6 +4384,62 @@ impl DebugRun {
     /// forward resume makes progress instead of re-reporting the same stop.
     pub fn arm_breakpoint_skip(&mut self) {
         self.at_bp = true;
+    }
+
+    /// Whether this run's state is fully captured by its active `Vm` + the window bytes + the host's
+    /// replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
+    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector) on the tree-walker: the
+    /// **root** continuation is running (no §12 fiber resume-chain or step-into coroutine), there are
+    /// no `cont.new` fibers or §14 coroutine children (whose frames/windows live outside the capture),
+    /// the host has grown no state a checkpoint can't restore (`checkpoint_safe`), and memory has a
+    /// pristine layout (`snapshot_safe`, so `window_snapshot`/`seed` of the mapped prefix round-trips).
+    /// Outside this subset the DAP backend stops checkpointing and falls back to replay-from-clock-0.
+    fn checkpointable(&self) -> bool {
+        self.done.is_none()
+            && self.vt.active_id == ROOT_FIBER
+            && self.vt.chain.is_empty()
+            && self.vt.active_coro.is_none()
+            && self.vt.coroutines.iter().all(|c| c.is_none())
+            && self.fibers.is_empty()
+            && self.host.checkpoint_safe()
+            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+    }
+
+    /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
+    /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
+    /// subset. Reused by the DAP backend to restart a reverse `seek`/`step_back` from the nearest
+    /// snapshot instead of clock 0. Cheap deep copy: the active `Vm` (plain data), the window bytes, and
+    /// the host's run-mutable replay substate.
+    pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
+        if !self.checkpointable() {
+            return None;
+        }
+        Some(DebugRunSnapshot {
+            clock: self.op_clock,
+            active: self.vt.active.clone(),
+            mem: self.mem.as_ref().map(|m| m.window_snapshot()),
+            host: self.host.replay_substate(),
+        })
+    }
+
+    /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
+    /// re-created + tape re-armed by the backend), so a subsequent replay resumes exactly at the
+    /// snapshot's logical time rather than clock 0. Replaces the active `Vm`, reseeds the window bytes,
+    /// restores the host replay substate (cap cursor, captured stdout, clock), and sets the clock. The
+    /// shared structure (`source`/`table`/`funcs`) already matches — a checkpoint is only taken for the
+    /// root-only run this rebuilds. A checkpointable snapshot had an empty fiber/coroutine set, so the
+    /// fresh run's already-empty `chain`/`coroutines`/`fibers` need no reset.
+    pub fn restore(&mut self, snap: &DebugRunSnapshot) {
+        self.vt.active = snap.active.clone();
+        self.vt.active_id = ROOT_FIBER;
+        self.vt.active_coro = None;
+        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.seed(bytes);
+        }
+        self.host.restore_replay_substate(&snap.host);
+        self.op_clock = snap.clock;
+        self.done = None;
+        self.at_bp = false;
     }
 
     /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
@@ -9289,6 +9368,12 @@ struct ByteSetJmp {
     dst: u32,
 }
 
+// `Clone` for time-travel checkpointing (DEBUGGING.md W1): a single-vCPU `DebugRun` snapshots its
+// active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
+// (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
+// guest page store is **not** here (it lives in `DebugRun::mem`, snapshotted separately via
+// `Mem::window_snapshot`), so cloning a `Vm` never aliases another run's memory.
+#[derive(Clone)]
 struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.

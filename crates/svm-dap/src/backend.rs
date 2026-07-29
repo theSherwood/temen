@@ -6,7 +6,9 @@
 //! The bytecode engine covers breakpoints, stepping, backtrace, scalar/aggregate inspection,
 //! **reverse debugging** (`seek`/`step_back`/`reverseContinue`, by deterministic replay — the debug
 //! run is pure compute, so seeking to an earlier op clock rebuilds a fresh `DebugRun` and replays to
-//! that many ops), and **data breakpoints** (`set_watchpoint` — a per-op check of the effective
+//! that many ops, restarting from the nearest **checkpoint** in a single-vCPU ladder so the replay is
+//! bounded by the checkpoint stride rather than O(t) from clock 0), and **data breakpoints**
+//! (`set_watchpoint` — a per-op check of the effective
 //! address, computed like the interpreter's `access_of`, against the watched ranges; the run stops
 //! *before* an op that touches one). For a spawn-free guest `supports_reverse`/`supports_watch` are
 //! both `true`.
@@ -23,7 +25,9 @@
 //! and `bytecode_debug_threads.rs` (engine level, vs the tree-walker oracle) and `dap_over_bytecode_*`
 //! (server level).
 
-use svm_interp::bytecode::{self, DebugRun, SchedBreak, SchedStop, ScheduledDebugRun};
+use svm_interp::bytecode::{
+    self, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
+};
 use svm_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
     StreamRole, Trap, Value, VarValue, WatchId, WatchKind,
@@ -299,7 +303,23 @@ pub struct BytecodeBackend {
     /// Cached stoppable-position timeline for `step_back` target search (see [`RevTrace`]). `None` until
     /// the first `step_back`; rebuilt when a forward step moves the position past its `high_water`.
     rev_trace: Option<RevTrace>,
+    /// Time-travel **checkpoint ladder** (DEBUGGING.md W1), single-vCPU only: snapshots of the run at
+    /// ascending op clocks (kept sorted) so a reverse `seek`/`step_back` restarts from the nearest one
+    /// (`clock <= t`) instead of clock 0, bounding the replay to [`CHECKPOINT_STRIDE`]. Populated lazily
+    /// as `seek` drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s
+    /// ladder.
+    checkpoints: Vec<DebugRunSnapshot>,
+    /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
+    /// boundary falls outside the [`DebugRun::snapshot`] subset (a fiber/coroutine/thread seam, a
+    /// non-pristine memory layout, or a host that grew unrestorable state), after which `seek` reverts
+    /// to replay-from-clock-0 for the rest of the session — mirroring `Inspector::maybe_checkpoint`.
+    checkpointing: bool,
 }
+
+/// The op-clock stride between time-travel checkpoints (DEBUGGING.md W1). Matches the tree-walker
+/// `Inspector`'s `SEEK_CHECKPOINT_STRIDE`, so a reverse `seek`/`step_back` replays at most this many
+/// ops past the nearest snapshot instead of O(t) from clock 0.
+const CHECKPOINT_STRIDE: u64 = 1024;
 
 impl BytecodeBackend {
     /// Open a bytecode debug session on `module`'s `func(args)`. A `thread.spawn` guest gets the
@@ -336,7 +356,17 @@ impl BytecodeBackend {
             stdin,
             tape,
             rev_trace: None,
+            checkpoints: Vec::new(),
+            checkpointing: true,
         })
+    }
+
+    /// Number of time-travel checkpoints currently in the ladder — test/introspection hook (mirrors
+    /// `Inspector::checkpoint_count`). `0` for a run not yet seeked far enough to lay one down, or one
+    /// outside the checkpointable subset (multithreaded, fibers, coroutines, stateful host), which
+    /// replays from clock 0.
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
     }
 
     /// Build a fresh single-vCPU [`DebugRun`] with this session's engine config — under the on-ramp I/O
@@ -351,6 +381,51 @@ impl BytecodeBackend {
             &self.stdin,
             &self.tape,
         )
+    }
+
+    /// Drive a freshly rebuilt (and possibly checkpoint-restored) single-vCPU `run` forward to op clock
+    /// `t`, laying down a checkpoint at each [`CHECKPOINT_STRIDE`] boundary along the way (so a later
+    /// reverse `seek`/`step_back` restarts nearby). With checkpointing off it is a straight tick-to-`t`.
+    /// The stride capture is transparent — ticking is the same raw replay quantum regardless — so the
+    /// state at `t` is identical to a single run from the restore point to `t`.
+    fn drive_single_to(&mut self, run: &mut DebugRun, t: u64, fuel: &mut u64) {
+        loop {
+            let clock = run.op_clock();
+            if clock >= t {
+                break;
+            }
+            // At a positive stride boundary short of `t`, snapshot before executing the op (so the
+            // checkpoint's clock is exactly the boundary). Deduped + subset-guarded by `maybe_checkpoint`.
+            if self.checkpointing && clock > 0 && clock.is_multiple_of(CHECKPOINT_STRIDE) {
+                self.maybe_checkpoint(run);
+            }
+            if !run.tick(fuel) {
+                break;
+            }
+        }
+    }
+
+    /// Snapshot `run` into the checkpoint ladder at its current clock, if checkpointing is still on and
+    /// the continuation is [`DebugRun::snapshot`]-able; otherwise disable checkpointing and drop the
+    /// ladder (the run left the snapshottable subset, so `seek` reverts to replay-from-0). A clock
+    /// already in the ladder is not duplicated. Mirrors `Inspector::maybe_checkpoint`.
+    fn maybe_checkpoint(&mut self, run: &DebugRun) {
+        if !self.checkpointing {
+            return;
+        }
+        let Some(snap) = run.snapshot() else {
+            self.checkpointing = false;
+            self.checkpoints.clear();
+            return;
+        };
+        let clock = snap.clock();
+        if self.checkpoints.iter().any(|c| c.clock() == clock) {
+            return;
+        }
+        // Keep the ladder sorted by clock (boundaries usually append in order, but a fresh replay-from-0
+        // can fill a gap below an existing entry).
+        let at = self.checkpoints.partition_point(|c| c.clock() < clock);
+        self.checkpoints.insert(at, snap);
     }
 
     /// Absorb the live single-vCPU run's recorded cap-input tape if it now reaches further than the one
@@ -570,8 +645,9 @@ impl Debuggee for BytecodeBackend {
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // (single-vCPU, no capabilities), so seeking to an earlier op clock = rebuild a fresh run and
-    // replay to that many ops. `step_back` = one op earlier. (A checkpoint ladder to bound the `seek`
-    // replay cost is a future optimization; the debugged programs here are small.)
+    // replay to that many ops. `step_back` = one op earlier. The `seek` replay is bounded by the
+    // single-vCPU **checkpoint ladder** (see `drive_single_to`/`maybe_checkpoint`): a restart from the
+    // nearest snapshot replays at most `CHECKPOINT_STRIDE` ops instead of O(t) from clock 0.
     fn step_back(&mut self) -> Stop {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
         // terminator slot, where there's nothing to inspect) strictly before now, then seek there. The
@@ -632,7 +708,14 @@ impl Debuggee for BytecodeBackend {
         let Some(mut run) = self.fresh_single() else {
             return Stop::Blocked;
         };
-        while run.op_clock() < t && run.tick(&mut fuel) {}
+        // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
+        // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
+        if self.checkpointing {
+            if let Some(cp) = self.checkpoints.iter().rev().find(|c| c.clock() <= t) {
+                run.restore(cp);
+            }
+        }
+        self.drive_single_to(&mut run, t, &mut fuel);
         self.engine = Engine::Single(Box::new(run));
         self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
                               // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
