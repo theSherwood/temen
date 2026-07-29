@@ -437,9 +437,18 @@ plumbing. Five workstreams, roughly independent:
   **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
   built-in containers). Non-zero global/data initializers land here too.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
-  module. Today `svm-leng` translates one module in isolation. W2 resolves cross-module symbols,
-  merges globals/data, and lays out one svm module from N Leng inputs — the analog of what the C
-  on-ramp gets from `clang`+`lld` for free.
+  module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
+  Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
+  (2026-07-29): `svm_leng::link_units` links real cross-module nimony code.** nimony references a
+  proc `P.` defined in module `stem` from elsewhere as `P.<stem>`; `link_units` translates each
+  module's procs, exports them under those global names, and resolves every unit's cross-module
+  calls (named imports) against the exports via `svm_ir::link` — one merged, re-verified, import-free
+  module. Proven on a genuine 2-module program (`moda` importing `pkg/modb`: `useit(5)` calls
+  `modb`'s compiled `helper` → 16) and a transitive A→B→C chain, both engines (`tests/link.rs`).
+  This is the same link mechanism the end-to-end shim used, now across *real translated modules* —
+  the shim's stand-in replaced by compiled Nim. **Remaining for full W2:** merging module
+  globals/`data` (cross-module data symbols + relocations) and translating the `ini`/`main`/`gvar`
+  scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
