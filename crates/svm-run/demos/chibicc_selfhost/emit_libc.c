@@ -26,15 +26,14 @@
 #include "../postgres/mem_shim.c"    /* memcpy/memset/memmove/memcmp/strcmp/strncmp/strlen */
 #include "../postgres/libc_shim.c"   /* __ctype_b_loc/strncpy/strstr/strdup/strtol/strtoul/atoi */
 #include "../strtod/strtod.c"        /* correctly-rounded strtod (float literal parse) */
+#include "os_emit.c"                 /* emit-object os bottom edge: extern write/read (caps) + fs stubs (2c) */
 #include "chibicc_extra.c"           /* stdio+memstream, strchr/memchr/strndup/…, time (no allocator) */
+#include "printf_emit.c"             /* __vm_fmt_*-free vfprintf/fprintf/printf/snprintf/vsnprintf */
 
-/* NOT YET INCLUDED — the two bottom-edge shims are on-ramp-only: `os_shim.c` and `printf_shim.c` call
- * svm-llvm intrinsics (`__vm_stream_write`/`__vm_host_call`/`__vm_cap_resolve`, `__vm_fmt_gen`/…) that
- * chibicc's own `--emit-object` codegen does *not* recognize as builtins (it knows `__vm_map`/`__vm_jit_`
- * /… — codegen_ir.c `scan_caps` — but not those). The emit-object regime instead invokes the host by
- * plain `call.sym "write"`/`"read"`/… that the powerbox binds. So this aggregator needs **emit-object**
- * variants of both — an os bottom edge (fd-dispatch over `write`/`read` [Stream cap] and an fs cap for
- * fd≥3) and a `__vm_fmt_*`-free `vfprintf` (the `%d/%s/%x/%ld/%02d/%.*s/%+ld` surface chibicc uses;
- * `%e`/`%.17g` float emission needs a guest dtoa, but is unexercised on integer inputs). Those land in
- * the next slice; here the reusable, intrinsic-free core (allocator from the bundled header, mem/str,
- * ctype, errno, strtod, and the fd/memory-stream stdio) compiles under emit-object on its own. */
+/* The two bottom-edge shims above are the **emit-object** replacements for the on-ramp's `os_shim.c`
+ * and `printf_shim.c`, which reach the host through svm-llvm intrinsics (`__vm_stream_write`/
+ * `__vm_host_call`/`__vm_cap_resolve`; `__vm_fmt_*`) that chibicc's own `--emit-object` codegen does not
+ * lower. `os_emit.c` invokes the powerbox by plain `extern` `write`/`read` (bound by name to the Stream
+ * cap) and stubs the fd≥3 fs path until the 2c fs cap; `printf_emit.c` supplies the float formatters in
+ * guest C. The undefined externs that survive into the linked program are then only default-powerbox-
+ * bindable caps (`write`/`read`/`exit`/`vm_map`/`vm_page_size`). */

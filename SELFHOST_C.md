@@ -435,20 +435,37 @@ compiler bug is a clean error, never an escape.
    `c_link.rs::emit_object_libc_core_compiles_and_is_intrinsic_free`, which also fails if the guard
    regresses. It defines the real `stdin`/`stdout`/`stderr` the 2a link stubbed.
 
-   **Remaining for 2b — the two bottom-edge shims.** `os_shim.c` and `printf_shim.c` are on-ramp-only:
-   they invoke the host through svm-llvm intrinsics — `__vm_stream_write`/`__vm_host_call`/
-   `__vm_cap_resolve` (os) and `__vm_fmt_gen`/`__vm_fmt_fix`/`__vm_fmt_sci` (float printf) — that
-   chibicc's own `--emit-object` codegen does not lower (its `scan_caps` knows `__vm_map`/`__vm_jit_`/…
-   but not those). The emit-object regime reaches the host by plain `call.sym "write"`/`"read"`/… bound
-   by the powerbox instead. So 2b needs (i) an **os bottom edge**: fd-dispatch over `write`/`read`
-   (Stream cap, fd 0/1/2) and an **fs cap for fd≥3** — note the reference `default_cap_resolver` binds
-   `write`/`read`/`exit`/`vm_*` but **not** `open`/`close`/`stat`, so the full cc1 (which `fopen`s its
-   input `.c`) needs a richer fs-powerbox resolver + memfs; and (ii) a **`__vm_fmt_*`-free `vfprintf`**
-   over the `%d`/`%s`/`%x`/`%ld`/`%02d`/`%.*s`/`%+ld`/`%*s` surface chibicc actually uses (`%e`/`%.17g`
-   float emission — 58 call sites, all in float-constant codegen — needs a guest dtoa but is unexercised
-   on integer inputs). Then link libc + the nine TUs (only host caps remain) and run a `.c → SVM IR`
-   compile through `_start` on interp==JIT under the fs-powerbox. Then (c) the **bootstrap-fixpoint**
-   differential (§5 E).
+   **→ Emit-object increment 2b DONE 2026-07-29 — the libc runs, and the whole cc1 links against it.**
+   The two bottom-edge shims that `os_shim.c`/`printf_shim.c` couldn't supply under emit-object (they
+   reach the host through svm-llvm intrinsics `__vm_stream_write`/`__vm_host_call`/`__vm_cap_resolve` and
+   `__vm_fmt_*` that chibicc's own `--emit-object` codegen doesn't lower — its `scan_caps` knows
+   `__vm_map`/`__vm_jit_`/… but not those) now exist:
+   - **`os_emit.c`** — the emit-object os edge. It reaches the powerbox by plain `extern` `write`/`read`
+     (bound by name to the Stream cap), not intrinsics; the fd≥3 filesystem path is stubbed (`open`
+     returns −1) until the 2c fs cap, because the reference `default_cap_resolver` binds
+     `write`/`read`/`exit`/`vm_*` but **not** `open`/`close`/`stat`, and a manifest module refuses to
+     start with an unbindable import — so a real fs name here would make the linked cc1 un-runnable.
+   - **`printf_emit.c`** — the `__vm_fmt_*`-free formatter. It reuses `printf_shim.c`'s pure-C engine
+     verbatim (the whole `%d`/`%s`/`%x`/`%ld`/`%02d`/`%.*s`/`%+ld`/`%*s` surface) and supplies the three
+     float helpers in guest C. The float path is **best-effort, not correctly-rounded** — a program with
+     float literals (chibicc emits them `%.17g`, 58 call sites, all in float-constant codegen) needs the
+     bignum dtoa ported to guest C, the float-input increment; on integer inputs it is never reached.
+
+   Proven two ways (`c_link.rs`): (1) `demo2.c` drives the printf engine — radices, width/precision,
+   flag combinations, `%*d`/`%.*s`, and the `FILE*`/`open_memstream` path — linked against the full
+   `emit_libc.c` and run through `_start` on **interp==JIT** with stdout asserted **byte-for-byte against
+   native glibc**; (2) the **whole cc1 (nine TUs + `emit_libc.c`) links and verifies with every remaining
+   import a default-powerbox cap** (`write`/`read`/`exit`/`vm_map`/`vm_page_size`) — the 2a link's
+   `fopen`/`vfprintf`/`strlen`/… manifest imports are all now supplied, and `stdin`/`stdout`/`stderr`
+   are real definitions, not the 2a stub. The `chibicc_extra.c` allocator stays `__SVM_STDLIB_H`-guarded
+   so the on-ramp `chibicc_libc.c` still builds under clang.
+
+   **Remaining for 2c (run the compiler).** The one thing between the linked cc1 and a running compiler
+   is input: `os_emit.c` stubs fd≥3, so `fopen`'ing the source `.c` returns NULL. 2c wires the
+   **fs-powerbox harness** — a memfs seeded with the input `.c` + `/include`, and a resolver that binds
+   the fs ops (`open`/`close`/`read`/`write`/`stat` for fd≥3) — then runs a real `.c → SVM IR` compile
+   through `_start` on interp==JIT and diffs it against the native `chibicc_ref`. Then the float-input
+   dtoa, and (c) the **bootstrap-fixpoint** differential (§5 E).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

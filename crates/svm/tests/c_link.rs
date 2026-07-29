@@ -901,3 +901,122 @@ fn emit_object_libc_core_compiles_and_is_intrinsic_free() {
         );
     }
 }
+
+/// **The emit-object libc runs** (task #20, increment 2b): `demo2.c` drives the `printf_emit.c` engine
+/// — integer/hex/octal radices, width/precision/flags, the `%*d`/`%.*s` star forms, and the `FILE*`
+/// path (`fprintf`, `open_memstream`) — linked against the full `emit_libc.c` and run through `_start`
+/// on **interp==JIT** under the powerbox. The stdout bytes are a fixed oracle **matching native glibc**
+/// (captured from a `cc`-built reference of the same directives), so this pins that the varargs printf
+/// the whole self-host stands on formats byte-for-byte correctly through emit-object → link → run.
+///
+/// This is the proof for the two 2b bottom-edge shims: `os_emit.c` (stdout via the powerbox `write`
+/// cap) and `printf_emit.c` (the `__vm_fmt_*`-free formatter). Float directives and fd≥3 file I/O are
+/// out of scope here (later increments). Linux-only (links the system-header libc).
+#[cfg(target_os = "linux")]
+#[test]
+fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
+    use svm_run::{instantiate, Outcome, RunConfig, Value};
+
+    // Entry unit first so `demo2`'s `_start` is merged function 0; the libc has no `main`.
+    let demo = object_unit_file("crates/svm/tests/fixtures/emit_libc/demo2.c");
+    let libc = object_unit_emit_libc();
+
+    let linked = svm_ir::link_with_manifest(&[demo, libc]).expect("link demo2 + emit-object libc");
+    // Every printf/stdio call resolved cross-TU; only powerbox-bindable caps survive as imports.
+    let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
+    for resolved in [
+        "printf",
+        "snprintf",
+        "fprintf",
+        "open_memstream",
+        "vfprintf",
+    ] {
+        assert!(
+            !imports.contains(&resolved),
+            "libc `{resolved}` resolved to a direct call, not left an import; imports: {imports:?}"
+        );
+    }
+    for cap in &imports {
+        assert!(
+            matches!(*cap, "write" | "read" | "exit" | "vm_map" | "vm_page_size"),
+            "only default-powerbox caps remain; unexpected import `{cap}` in {imports:?}"
+        );
+    }
+    svm_verify::verify_module(&linked).expect("verify linked emit-object libc program");
+
+    // Run `_start` on the tree-walk oracle and the JIT (§18); `run_diff` asserts they agree.
+    let inst = instantiate(linked).expect("instantiate");
+    let run = inst
+        .run_diff(&RunConfig::default())
+        .expect("run _start on interp+jit");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(5)]));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "-42 4000000000 ff FF 100\n\
+         -1234567890123 9876543210\n\
+         [   42][42   ][00042][+42][ 42]\n\
+         [     007][007     ][]\n\
+         [    99][tru]\n\
+         abc str % (null)\n\
+         snlen=11 buf=111-222\n\
+         stream=mem<7,x>! len=9\n\
+         fd=stdout\n",
+        "emit-object printf/stdio formats byte-for-byte like glibc"
+    );
+}
+
+/// **The whole cc1 links against the real emit-object libc** (task #20, increment 2b): the nine cc1
+/// TUs + `emit_libc.c`, linked and verified into one module whose *every* remaining import is a
+/// default-powerbox-bindable cap — so the linked compiler instantiates, not just verifies. This is the
+/// 2a link (which stood the libc's stdio globals in with a stub) now closed against the actual libc:
+/// `stdin`/`stdout`/`stderr`, the `str`/`mem`/ctype/stdio/printf surface, and `strtod` all resolve
+/// cross-unit, and what is left — `write`/`read`/`exit`/`vm_map`/`vm_page_size` — the powerbox binds.
+///
+/// The one thing still between here and a running compiler is the input: `os_emit.c` stubs fd≥3, so
+/// `fopen`'ing the source `.c` returns NULL until the 2c fs cap. Linux-only.
+#[cfg(target_os = "linux")]
+#[test]
+fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
+    let mut units = vec![object_unit_cc1_entry()];
+    for tu in [
+        "tokenize.c",
+        "preprocess.c",
+        "parse.c",
+        "type.c",
+        "codegen_ir.c",
+        "hashmap.c",
+        "unicode.c",
+        "strings.c",
+    ] {
+        units.push(object_unit_real(tu));
+    }
+    units.push(object_unit_emit_libc());
+
+    let linked = svm_ir::link_with_manifest(&units).expect("link whole cc1 + emit-object libc");
+    svm_verify::verify_module(&linked).expect("verify the whole linked cc1 + libc");
+
+    // `_start` at function 0 and the shared `ty_int` global both survived (as in 2a).
+    assert!(
+        linked
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0),
+        "cc1_main's _start is merged function 0"
+    );
+    // The decisive close: no libc symbol is left dangling — every import is a powerbox cap. (The 2a
+    // link still had `fopen`/`vfprintf`/`strlen`/… as manifest imports; the libc now supplies them.)
+    let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
+    for imp in &imports {
+        assert!(
+            matches!(*imp, "write" | "read" | "exit" | "vm_map" | "vm_page_size"),
+            "every remaining import is a default-powerbox cap; unexpected `{imp}` in {imports:?}"
+        );
+    }
+    // And the stdio streams are real definitions now, not the 2a stub.
+    for g in ["stdin", "stdout", "stderr"] {
+        assert!(
+            linked.data_exports.iter().any(|e| e.name == g),
+            "the linked cc1 carries a real `{g}` from the libc"
+        );
+    }
+}
