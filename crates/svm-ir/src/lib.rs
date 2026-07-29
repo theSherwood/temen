@@ -3715,16 +3715,28 @@ pub fn link_with_manifest(units: &[LinkUnit]) -> Result<Module, LinkError> {
 
 fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
-    // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
-    // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
-    let align16 = |x: u64| (x + 15) & !15;
+    // list, and its data occupies the window region `[dbase, dbase + data_span)`. `data_span` is the
+    // high-water mark of the unit's own (un-relocated) data.
+    //
+    // `dbase` is aligned to the **max host page** ([`POWERBOX_STACK_ALIGN`], 64 KiB), not merely 16
+    // bytes. The confinement runtime applies the D40 read-only-segment protection at *host-page*
+    // granularity — it rounds a read-only segment's end **up to the host page** and marks the page
+    // `PROT_READ`. A frontend lays each unit out so its own read-only and writable data never share a
+    // host page (rodata last, page-aligned), but stacking units 16-byte-tight reintroduces the hazard
+    // *across* units: one unit's read-only tail lands on the same host page as the next unit's writable
+    // head, and that writable data's first store faults. Page-aligning every unit's base keeps each
+    // unit on its own host pages (no cross-unit sharing) **and** preserves each unit's internal
+    // offset-mod-page coloring (the shift is a page multiple), so the intra-unit separation survives
+    // the relocation. The padding is a few reserved (`PROT_NONE`, lazily paged) KiB per unit — free in
+    // the sparse window (§1a), and load-bearing for confinement, not cosmetic.
+    let page_align = |x: u64| (x + (POWERBOX_STACK_ALIGN - 1)) & !(POWERBOX_STACK_ALIGN - 1);
     let mut fbases = Vec::with_capacity(units.len());
     let mut dbases = Vec::with_capacity(units.len());
     let (mut ftotal, mut dtotal): (u32, u64) = (0, 0);
     for u in units {
         fbases.push(ftotal);
         ftotal += u.module.funcs.len() as u32;
-        let dbase = align16(dtotal);
+        let dbase = page_align(dtotal);
         dbases.push(dbase);
         let span = u
             .module
@@ -4350,6 +4362,95 @@ mod import_tests {
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
         let r = resolve_imports_with(&m, |n| policy(n).map(Resolved::Cap)).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
+    }
+}
+
+#[cfg(test)]
+mod link_layout_tests {
+    use super::*;
+
+    /// A minimal link unit: one linear-memory window and a single data segment (no funcs/exports),
+    /// enough to exercise the linker's data-stacking layout.
+    fn data_unit(seg_offset: u64, len: usize, readonly: bool) -> LinkUnit {
+        LinkUnit {
+            module: Module {
+                data_ptrs: Vec::new(),
+                types: vec![],
+                funcs: vec![],
+                memory: Some(Memory { size_log2: 16 }),
+                data: vec![Data {
+                    offset: seg_offset,
+                    readonly,
+                    bytes: vec![0u8; len],
+                }],
+                imports: vec![],
+                exports: vec![],
+                data_exports: vec![],
+                impl_exports: vec![],
+                debug_info: None,
+            },
+            exports: vec![],
+            data_exports: vec![],
+        }
+    }
+
+    /// The confinement property the linker must preserve when it stacks units: the runtime applies the
+    /// read-only-segment protection at **host-page** granularity (it rounds a read-only segment up to
+    /// the host page and marks the whole page `PROT_READ`), so **no host page may hold bytes from both
+    /// a read-only and a writable segment** — otherwise the writable data's first store faults. A
+    /// frontend guarantees this within one unit; the linker must not break it *across* units by packing
+    /// one unit's writable head onto the same page as the previous unit's read-only tail. Regression
+    /// guard for the emit-object self-host libc, whose writable arena landed on the entry unit's
+    /// read-only symbol page under the old 16-byte-tight stacking (task #20).
+    #[test]
+    fn stacked_units_never_share_a_host_page_between_ro_and_rw() {
+        // Unit A ends in read-only data whose tail spills into a second 4 KiB page; unit B begins with
+        // writable data at a low in-unit offset. 16-byte-tight, B's store page would coincide with A's
+        // read-only page; page-aligned unit bases keep them apart.
+        let a = data_unit(0, 4096 + 32, true); // read-only
+        let b = data_unit(32, 64, false); // writable, low offset
+        let linked = link_with_manifest(&[a, b]).expect("link ro-provider + rw-consumer");
+
+        // No 64 KiB host page (the max host page, [`POWERBOX_STACK_ALIGN`]) mixes ro and rw bytes.
+        let page = POWERBOX_STACK_ALIGN;
+        let mut ro_pages = alloc::collections::BTreeSet::new();
+        let mut rw_pages = alloc::collections::BTreeSet::new();
+        for d in &linked.data {
+            if d.bytes.is_empty() {
+                continue;
+            }
+            let first = d.offset / page;
+            let last = (d.offset + d.bytes.len() as u64 - 1) / page;
+            for p in first..=last {
+                if d.readonly {
+                    ro_pages.insert(p);
+                } else {
+                    rw_pages.insert(p);
+                }
+            }
+        }
+        let shared: Vec<_> = ro_pages.intersection(&rw_pages).collect();
+        assert!(
+            shared.is_empty(),
+            "no host page may mix read-only and writable data; shared pages: {shared:?}"
+        );
+
+        // Concretely: unit B was relocated onto its own page-aligned base (the mechanism), so its
+        // writable segment keeps its in-unit offset (32) modulo the page and sits above unit A.
+        let rw = linked
+            .data
+            .iter()
+            .find(|d| !d.readonly)
+            .expect("writable segment present");
+        assert_eq!(
+            rw.offset % page,
+            32,
+            "unit base page-aligned; seg keeps in-unit offset 32"
+        );
+        assert!(
+            rw.offset >= page,
+            "unit B relocated to a fresh host page above unit A"
+        );
     }
 }
 

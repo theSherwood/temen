@@ -381,6 +381,91 @@ compiler bug is a clean error, never an escape.
    runtime needs `malloc`/`printf`/file I/O (the LLVM-on-ramp self-host build synthesizes these; the
    emit-object path does not yet); (c) the **bootstrap-fixpoint** differential (§5 E). The cross-TU
    function + data linking, the `data.top` stack base, headers, and heap it all stands on are done.
+
+   **→ Emit-object libc (b′) increment 1 DONE 2026-07-29 — the *mechanism* proven.** A from-scratch
+   libc **designed for chibicc's own frontend** (`crates/svm/tests/fixtures/emit_libc/mini_libc.c`),
+   not the clang-tuned aggregator: a bump `malloc`, the `mem`/`str` family, and a **varargs** `printf`
+   that writes through the powerbox `write` cap. `demo1.c` malloc's an array, copies a string, and
+   prints a deterministic line; the two units link (`link_with_manifest`, `write` a host-bound
+   manifest import) and run through `_start` on interp==JIT with a byte-exact stdout oracle
+   (`c_link.rs::links_and_runs_emit_libc_under_powerbox`). This pins that varargs printf + heap +
+   cross-TU linking + a powerbox cap compose end-to-end through emit-object.
+
+   *Increment 1 surfaced and fixed a real linker confinement bug.* The linker stacked units' data
+   16-byte-tight, so the entry unit's read-only tail (a symbol-name string at the args-region boundary)
+   shared a **host page** with the libc unit's writable arena; the D40 read-only protection (host-page
+   granular) marked the page `PROT_READ` and the arena's first store faulted (`MemoryFault`). Fix:
+   page-align each unit's data base to `POWERBOX_STACK_ALIGN` (64 KiB, the max host page), so units
+   never share a host page and each unit's internal ro/rw page separation survives relocation
+   (`svm-ir::link_impl`; regression `svm-ir::link_layout_tests`). Same class as the Doom read-only-page
+   fault, now for stacked link units.
+
+   **→ Emit-object increment 2a DONE 2026-07-29 — all ~9 cc1 TUs compile + link + verify.** The whole
+   `-cc1` slice (eight upstream TUs + the `cc1_main.c` entry) compiles under `--emit-object` and links
+   into one **verified** module (`c_link.rs::all_cc1_tus_compile_link_and_verify_under_emit_object`).
+   Two things unblocked it:
+   - **`selfhost_prelude.h`** (`-include`d) closes chibicc's own parser gap against modern glibc: when
+     the compiler doesn't define glibc's `__REDIRECT`, `<stdlib.h>` takes its ISO C23 branch that
+     declares `__isoc23_strtoul`/… behind attribute forms chibicc doesn't resolve and then
+     `#define strtoul __isoc23_strtoul`, so `strtoul`/`strtol`/`atoi`/`strtold`/… land *implicitly
+     declared* (fatal). The prelude force-includes plain prototypes. (The on-ramp never hit this —
+     clang defines `__REDIRECT`.) Also fixed the harness's `-I`: chibicc reads `-I<dir>` **joined**
+     (`argv+2`), so a spaced `-I dir` was a silent no-op masked by sibling resolution.
+   - **The only unresolved *data* symbols across the whole cc1 are `stdin`/`stdout`/`stderr`** — a
+     cross-TU data reference must resolve to a concrete address (it can't be a manifest import like a
+     function), so the linker fails closed on them until the libc's stdio globals exist; a stub unit
+     defining the three lets the whole cc1 link. Every `ty_*`/`opt_*`/`include_paths`/`base_file`
+     resolves cross-TU. All remaining unbound names are the libc **function** surface + host caps —
+     the exact increment-2b target: `fopen`/`fwrite`/`vfprintf`/`snprintf`/the `str`/`mem` family/
+     `open_memstream`/`__ctype_b_loc`/… as guest C over the powerbox syscall + memory caps
+     (`write`/`read`/`open`/`close`/`exit`/`stat`/`vm_map`). Note the **heap allocator is *not* on that
+     list**: chibicc's emit-object synthesizes `malloc`/`calloc`/`free` **inline** (a bump heap that
+     grows the window via the `vm_map`/`vm_page_size` builtins), so the libc need not provide them —
+     a real simplification vs the clang-tuned aggregator.
+
+   **→ Emit-object increment 2b (started) — the libc's intrinsic-free core compiles.** `emit_libc.c`
+   is the emit-object twin of `chibicc_libc.c`, aggregating the parts of the guest libc that carry **no**
+   on-ramp dependency: the allocator (from chibicc's *bundled* `<stdlib.h>` — `static`
+   `malloc`/`calloc`/`free`/`realloc` growing the window via `__vm_map`, so `malloc` is never a
+   cross-unit symbol), `mem_shim`/`libc_shim` (mem/str/ctype `__ctype_b_loc`/`strtoul`), `strtod`, and
+   `chibicc_extra.c`'s fd-backed + `open_memstream` stdio — the last with its `free`/`calloc` now
+   `#ifndef __SVM_STDLIB_H`-guarded (the bundled header already defines them under emit-object; the
+   on-ramp's clang, on system headers, still gets them — verified `chibicc_libc.c` still builds under
+   clang). This core compiles under `--emit-object` and is **intrinsic-free** — regression-guarded by
+   `c_link.rs::emit_object_libc_core_compiles_and_is_intrinsic_free`, which also fails if the guard
+   regresses. It defines the real `stdin`/`stdout`/`stderr` the 2a link stubbed.
+
+   **→ Emit-object increment 2b DONE 2026-07-29 — the libc runs, and the whole cc1 links against it.**
+   The two bottom-edge shims that `os_shim.c`/`printf_shim.c` couldn't supply under emit-object (they
+   reach the host through svm-llvm intrinsics `__vm_stream_write`/`__vm_host_call`/`__vm_cap_resolve` and
+   `__vm_fmt_*` that chibicc's own `--emit-object` codegen doesn't lower — its `scan_caps` knows
+   `__vm_map`/`__vm_jit_`/… but not those) now exist:
+   - **`os_emit.c`** — the emit-object os edge. It reaches the powerbox by plain `extern` `write`/`read`
+     (bound by name to the Stream cap), not intrinsics; the fd≥3 filesystem path is stubbed (`open`
+     returns −1) until the 2c fs cap, because the reference `default_cap_resolver` binds
+     `write`/`read`/`exit`/`vm_*` but **not** `open`/`close`/`stat`, and a manifest module refuses to
+     start with an unbindable import — so a real fs name here would make the linked cc1 un-runnable.
+   - **`printf_emit.c`** — the `__vm_fmt_*`-free formatter. It reuses `printf_shim.c`'s pure-C engine
+     verbatim (the whole `%d`/`%s`/`%x`/`%ld`/`%02d`/`%.*s`/`%+ld`/`%*s` surface) and supplies the three
+     float helpers in guest C. The float path is **best-effort, not correctly-rounded** — a program with
+     float literals (chibicc emits them `%.17g`, 58 call sites, all in float-constant codegen) needs the
+     bignum dtoa ported to guest C, the float-input increment; on integer inputs it is never reached.
+
+   Proven two ways (`c_link.rs`): (1) `demo2.c` drives the printf engine — radices, width/precision,
+   flag combinations, `%*d`/`%.*s`, and the `FILE*`/`open_memstream` path — linked against the full
+   `emit_libc.c` and run through `_start` on **interp==JIT** with stdout asserted **byte-for-byte against
+   native glibc**; (2) the **whole cc1 (nine TUs + `emit_libc.c`) links and verifies with every remaining
+   import a default-powerbox cap** (`write`/`read`/`exit`/`vm_map`/`vm_page_size`) — the 2a link's
+   `fopen`/`vfprintf`/`strlen`/… manifest imports are all now supplied, and `stdin`/`stdout`/`stderr`
+   are real definitions, not the 2a stub. The `chibicc_extra.c` allocator stays `__SVM_STDLIB_H`-guarded
+   so the on-ramp `chibicc_libc.c` still builds under clang.
+
+   **Remaining for 2c (run the compiler).** The one thing between the linked cc1 and a running compiler
+   is input: `os_emit.c` stubs fd≥3, so `fopen`'ing the source `.c` returns NULL. 2c wires the
+   **fs-powerbox harness** — a memfs seeded with the input `.c` + `/include`, and a resolver that binds
+   the fs ops (`open`/`close`/`read`/`write`/`stat` for fd≥3) — then runs a real `.c → SVM IR` compile
+   through `_start` on interp==JIT and diffs it against the native `chibicc_ref`. Then the float-input
+   dtoa, and (c) the **bootstrap-fixpoint** differential (§5 E).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
