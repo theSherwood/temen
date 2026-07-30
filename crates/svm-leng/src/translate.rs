@@ -1094,10 +1094,13 @@ impl Translator {
         if let Some(b) = body {
             collect_addr_taken(b, &mut addr_taken);
         }
+        // An address-taken **aggregate** param is already passed by-address — its slot value *is*
+        // the address, so `(addr p)` works with no spill. A scalar param has no address (it lives in
+        // an SSA slot); taking its address still fail-closes (scalar spill is a later refinement).
         for (pn, _) in &params {
-            if addr_taken.contains(pn) {
+            if addr_taken.contains(pn) && !matches!(local_desc.get(pn), Some(TyDesc::Agg(_))) {
                 return Err(LengError::Unsupported(format!(
-                    "address of parameter `{pn}` (param spill is a later refinement)"
+                    "address of scalar parameter `{pn}` (param spill is a later refinement)"
                 )));
             }
         }
@@ -2366,6 +2369,16 @@ impl<'a> FuncGen<'a> {
                         id,
                         ty: ValType::I64,
                     })
+                }
+                Some("sizeof") => {
+                    // `(sizeof T)` — a compile-time constant, the byte size of the type (nimony emits
+                    // it for `copyMem` lengths). Resolved from the layout registry.
+                    let a = e.args();
+                    let t = a
+                        .first()
+                        .ok_or_else(|| LengError::Malformed("sizeof needs a type".into()))?;
+                    let desc = self.t.tydesc(t)?;
+                    Ok(self.emit_const(ValType::I64, self.t.sizeof(&desc) as i64))
                 }
                 Some("suf") => {
                     // A **suffixed literal** — `255'i64`, `1.5'f32` — value then a `"type"` tag.

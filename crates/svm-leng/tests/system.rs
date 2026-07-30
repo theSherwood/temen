@@ -6,9 +6,9 @@
 //! (verbatim from `system/stringimpl.nim`, exportc `nimStrWasMoved`). A driver calls it across the
 //! module boundary; the linker binds the import to the real proc. Both engines, §9 parity.
 //!
-//! Most of the ARC set (`=destroy`/`=dup`/`=copy`) and the system `ini` chain need translator work
-//! still ahead — sub-word (`u8`) loads, `deref` of a computed address, parameter spill, exception
-//! globals — so the wider `system` link stays future work; this pins the first real binding.
+//! The string ARC set — `=wasMoved`, `=destroy`, `=copy` (verbatim from `system/stringimpl.nim`) —
+//! now translates and runs against `arcDec`/`dealloc`/`arcInc`/`copyMem` stubs. The system `ini`
+//! chain (exception globals) remains ahead.
 
 use svm_interp::Value;
 use svm_leng::LengModule;
@@ -163,4 +163,71 @@ fn real_system_destroy_short_string_is_noop() {
     // The blob's rc stays 0 — the short-string branch never called arcDec.
     let rc = u64::from_le_bytes(imem[b + 8..b + 16].try_into().unwrap());
     assert_eq!(rc, 0, "short string: no arcDec, no dealloc");
+}
+
+/// The real `=copy` (string copy-assign, verbatim from `system/stringimpl.nim`) — the most complex
+/// string ARC op: it reads both operands' SSO length bytes, may release the destination's old
+/// `LongString` (`=destroy`-style `arcDec`/`dealloc`), retains the source's when shared (`arcInc`),
+/// and `copyMem`s the 16-byte string header across. It links against the four ARC/mem imports and
+/// runs the short-string path here: `copyMem` writes a marker at the destination header so we can
+/// confirm the copy site was reached — proving the whole proc lowered and executed. Both engines.
+#[test]
+fn real_system_copy_runs_short_path() {
+    const SYSTEM: &str = include_str!("fixtures/real_system_arc.leng.nif");
+    // Stubs for everything `=copy` calls (empty stem — intra-`system` names). `copyMem(d, s, n)`
+    // writes a marker through its destination pointer; the rest are inert.
+    let stubs = "\
+(stmts
+ (proc :arcDec.0. (params (param :p.0 . (ptr (i +64)))) (bool) . (stmts . (ret (false))))
+ (proc :arcInc.0. (params (param :p.0 . (ptr (i +64)))) . . (stmts . (ret .)))
+ (proc :dealloc.1. (params (param :p.0 . (i +64))) . . (stmts . (ret .)))
+ (proc :copyMem.0. (params (param :d.0 . (ptr (i +64))) (param :s.0 . (i +64)) (param :n.0 . (i +64))) . .
+  (stmts . (asgn (deref d.0) 48879))))";
+    // `cp(dest, src)` calls the real `=copy` across the boundary; `dest` is a `ptr string`, `src` a
+    // `string` (by address).
+    let driver = "\
+(stmts
+ (proc :cp.0. (params (param :dest.0 . (i +64)) (param :src.0 . (i +64))) . .
+  (stmts . (call =copy.2.sysvq0asl dest.0 src.0))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "drv",
+            src: driver,
+            names: &["cp.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: SYSTEM,
+            names: &["=copy.2."],
+        },
+        LengModule {
+            stem: "",
+            src: stubs,
+            names: &["arcDec.0.", "arcInc.0.", "dealloc.1.", "copyMem.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link real =copy: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    // Two short strings (low byte of `bytes` ≤ 14 → short path, ≠ 255 → no dealloc): `dest` at D,
+    // `src` at S. `=copy` should reach `copyMem(&dest.bytes, …)`, marking dest.bytes.
+    let (d, s) = (256usize, 512usize);
+    let mut seed = vec![0u8; 4096];
+    seed[d] = 5; // dest SSO length
+    seed[s] = 5; // src SSO length
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(
+        &linked,
+        0,
+        &[Value::I64(d as i64), Value::I64(s as i64)],
+        &mut fuel,
+        &seed,
+    );
+    ir.expect("interp cp");
+    let (_j, jmem) =
+        svm_jit::compile_and_run_capture(&linked, 0, &[d as i64, s as i64], &seed).expect("jit");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+    let mark = u64::from_le_bytes(imem[d..d + 8].try_into().unwrap());
+    assert_eq!(mark, 48879, "=copy reached copyMem(&dest.bytes, …)");
 }
