@@ -39,7 +39,7 @@ use crate::{map_operands, map_term_operands};
 use svm_ir::{BinOp, Func, FuncType, Inst, IntTy, Module, ValIdx, ValType};
 
 /// The hook capability's event kinds — the `op` immediate of each inserted `cap.call`. An
-/// embedder's handler dispatches on these (the first argument of the `HostFn` ABI).
+/// embedder's handler dispatches on these (the first argument of the `HostProc` ABI).
 pub mod mem_hook_op {
     /// `[addr, width]` — plain and v128 loads (v128 is width 16).
     pub const LOAD: u32 = 0;
@@ -389,7 +389,7 @@ mod tests {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, Vec<i64>)>::new()));
         let sink = events.clone();
         let mut h = svm_interp::Host::new();
-        let handle = h.grant_host_fn(Box::new(move |op, args, _mem| {
+        let handle = h.grant_host_proc(Box::new(move |op, args, _mem| {
             sink.lock().unwrap().push((op, args.to_vec()));
             Ok(vec![])
         }));

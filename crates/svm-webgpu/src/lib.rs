@@ -2,7 +2,7 @@
 //!
 //! The host holds a real GPU device via [`wgpu`]; the guest drives it through the same generic
 //! host-defined-capability surface the `fs`/LMDB shims use — `__vm_cap_resolve("webgpu")` +
-//! `__vm_host_call(handle, op, …)` — so **no translator change** is needed (§7 `HostFn`). WebGPU is
+//! `__vm_host_call(handle, op, …)` — so **no translator change** is needed (§7 `HostProc`). WebGPU is
 //! the *right* GPU waist for a sandbox: no raw pointers, validated buffers/bind-groups, and WGSL
 //! shaders that are safe by construction — the guest never holds a GPU pointer, only *data* crosses
 //! the window boundary (a buffer's contents up, a compute buffer's results back). This is the §2a
@@ -237,7 +237,7 @@ impl WebGpuState {
 /// The `webgpu` capability: grant it under a name (e.g. `"webgpu"`) and the guest reaches it via
 /// `__vm_cap_resolve("webgpu")` + `__vm_host_call`. Each host builds a fresh GPU context on first use.
 pub fn webgpu_cap() -> HostCap {
-    HostCap::host_fn(0, || {
+    HostCap::host_proc(0, || {
         let mut st = WebGpuState::default();
         Box::new(
             move |op: u32,

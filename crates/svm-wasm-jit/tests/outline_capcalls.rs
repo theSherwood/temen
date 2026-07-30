@@ -16,8 +16,8 @@ use svm_interp::{bytecode, Host, Value};
 use svm_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry (`f0`) is otherwise-emittable integer compute, but makes one inline `cap.call` to a
-// host-fn capability (`cap_id::HOST_FN` = type_id 13, op 0) whose handle arrives as the arg: it computes
-// `host_fn(10, 20) + 5`. The host-fn adds its two args, so the result is `10 + 20 + 5 = 35`.
+// host-fn capability (`cap_id::HOST_PROC` = type_id 13, op 0) whose handle arrives as the arg: it computes
+// `host_proc(10, 20) + 5`. The host-fn adds its two args, so the result is `10 + 20 + 5 = 35`.
 const SRC: &str = r#"
 memory 16
 func (i32) -> (i64) {
@@ -43,7 +43,7 @@ fn parse(src: &str) -> svm_ir::Module {
 /// after) identically either way.
 fn run(m: &svm_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
-    let handle = host.grant_host_fn(Box::new(|op, args, _mem| {
+    let handle = host.grant_host_proc(Box::new(|op, args, _mem| {
         assert_eq!(op, 0, "the guest calls op 0");
         Ok(vec![args[0] + args[1]])
     }));
@@ -64,7 +64,7 @@ fn outlining_flips_emittability_and_preserves_semantics() {
         "an inline cap.call in the entry blocks emit",
     );
     let before = run(&m);
-    assert_eq!(before, vec![Value::I64(35)], "10 + 20 (host_fn) + 5");
+    assert_eq!(before, vec![Value::I64(35)], "10 + 20 (host_proc) + 5");
 
     // Outline the cap.call into a wrapper function.
     outline_cap_calls(&mut m);

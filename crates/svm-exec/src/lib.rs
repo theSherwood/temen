@@ -3,7 +3,7 @@
 //! This crate holds the wasm-safe half of the subprocess capability (EXEC.md): the op-code /
 //! argv / errno protocol every backend speaks, and the deterministic **scripted** backend
 //! (`scripted_exec`) — a `(argv-prefix → {stdout, stderr, exit})` table, no processes at all.
-//! It depends only on `svm-interp` (`HostFn`/`GuestMem`), so it builds for **wasm** — the
+//! It depends only on `svm-interp` (`HostProc`/`GuestMem`), so it builds for **wasm** — the
 //! browser cdylib grants a `scripted_exec` directly. `svm-run` keeps the real subprocess
 //! `host_exec(allowlist)` backend (`crates/svm-run/src/exec.rs`) and wraps these handlers in
 //! its `HostCap`; it re-exports this crate so `svm_run::exec::*` is one surface.
@@ -15,11 +15,11 @@
 //! The contract *reserves* streaming (a future backend may yield output before exit) — guests
 //! must not depend on output being complete before `status` returns 0-EOF reads.
 //!
-//! A handler builder returns a `make: impl Fn() -> HostFn` closure — `svm-run` passes it to
-//! `HostCap::host_fn`, and the browser cdylib grants the `HostFn` directly on its Host.
+//! A handler builder returns a `make: impl Fn() -> HostProc` closure — `svm-run` passes it to
+//! `HostCap::host_proc`, and the browser cdylib grants the `HostProc` directly on its Host.
 
 use std::sync::Arc;
-use svm_interp::{GuestMem, HostFn};
+use svm_interp::{GuestMem, HostProc};
 
 /// `run(argv_ptr, argv_len, stdin_ptr, stdin_len) -> job | -errno` — spawn with `argv`
 /// (NUL-separated bytes, `argv[0]` the program) and `stdin` fed to it; v1 runs the job to
@@ -166,7 +166,7 @@ pub struct ScriptedEntry {
 /// immutable, so re-runs are deterministic.
 pub fn scripted_exec_handler(
     table: Vec<ScriptedEntry>,
-) -> impl Fn() -> HostFn + Send + Sync + 'static {
+) -> impl Fn() -> HostProc + Send + Sync + 'static {
     let table = Arc::new(table);
     move || {
         let table = Arc::clone(&table);
@@ -175,7 +175,7 @@ pub fn scripted_exec_handler(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![scripted_dispatch(&table, &mut jobs, op, args, mem)])
             },
-        ) as HostFn
+        ) as HostProc
     }
 }
 

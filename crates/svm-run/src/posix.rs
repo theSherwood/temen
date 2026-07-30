@@ -5,8 +5,8 @@
 //!
 //! `svm-posix` normally grants itself on a `Host` by name binding ([`svm_posix::grant`], the chibicc
 //! path). The on-ramp instead resolves host capabilities by **name** and calls them by op number, exactly
-//! as `demos/postgres/os_shim.c` reaches the `fs` cap. [`posix_cap`] wraps the personality's [`HostFn`]
-//! factory ([`svm_posix::cap`]) in a [`HostCap`] at [`svm_interp::cap_id::HOST_FN`], so an embedder can
+//! as `demos/postgres/os_shim.c` reaches the `fs` cap. [`posix_cap`] wraps the personality's [`HostProc`]
+//! factory ([`svm_posix::cap`]) in a [`HostCap`] at [`svm_interp::cap_id::HOST_PROC`], so an embedder can
 //! grant it under a name (e.g. `"posix"`) via `Instance::run_with_caps`, and a guest calls
 //! `__vm_host_call(__vm_cap_resolve("posix"), OP_*, a, b, c, d)`.
 
@@ -25,5 +25,5 @@ use svm_posix::Posix;
 /// observes the same `Posix` — read it back after the run.
 pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Posix) {
     let (posix, make) = svm_posix::cap(heap_base, heap_end, stdin);
-    (HostCap::host_fn(0, make), posix)
+    (HostCap::host_proc(0, make), posix)
 }

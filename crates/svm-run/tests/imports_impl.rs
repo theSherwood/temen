@@ -1,6 +1,6 @@
 //! IMPORTS.md **§3.2** — provider-side interface offers wired into import slots, end to end:
 //! a provider module declares `export "adder" impl <funcidx>...`, the embedder binds a
-//! consumer's import slot to one op of that offer (`HostCap::impl_offer`), and the consumer's
+//! consumer's import slot to one op of that offer (`HostCap::offer_func`), and the consumer's
 //! `call.import` executes the offered guest function — identically on all three backends,
 //! through the one shared generic dispatch (v1 pure dispatch: the impl computes over its
 //! arguments alone — no window, no capabilities).
@@ -57,7 +57,7 @@ fn a_wired_offer_runs_identically_on_all_three_backends() {
     let registry = Imports::new()
         .provide(
             "add",
-            HostCap::impl_offer(&provider, "adder", 0).expect("offer resolves"),
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(consumer.clone(), registry).expect("instantiate");
@@ -97,7 +97,7 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
     let registry = Imports::new()
         .provide(
             "add",
-            HostCap::impl_offer(&provider, "adder", 0).expect("offer resolves"),
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let err = match instantiate_with_imports(consumer, registry) {
@@ -160,7 +160,7 @@ fn an_instanced_offer_keeps_state_across_calls_on_all_three_backends() {
     let registry = Imports::new()
         .provide(
             "bump",
-            HostCap::impl_service(&provider, "counter", 0).expect("offer resolves"),
+            HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
@@ -178,10 +178,10 @@ fn an_instanced_offer_keeps_state_across_calls_on_all_three_backends() {
 }
 
 #[test]
-fn impl_offer_fails_closed_on_unknown_offer_or_op() {
+fn offer_func_fails_closed_on_unknown_offer_or_op() {
     let provider = parse_module(PROVIDER).expect("provider parses");
-    assert!(HostCap::impl_offer(&provider, "nope", 0).is_none());
-    assert!(HostCap::impl_offer(&provider, "adder", 1).is_none());
+    assert!(HostCap::offer_func(&provider, "nope", 0).is_none());
+    assert!(HostCap::offer_func(&provider, "adder", 1).is_none());
 }
 
 // --- §3.5 grouped host-native providers (HostCap::iface) --------------------------------------

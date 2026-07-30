@@ -773,11 +773,13 @@ pub struct CapTape {
 /// Whether a capability is a **nondeterministic input** whose result a re-execution must replay
 /// (rather than re-derive). Deterministic / structural caps (window `Memory` ops, `SharedRegion`,
 /// `Stream` *write*) re-run faithfully on a fresh powerbox, so they are left live. Inputs: `Clock`
-/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`cap_id::HOST_FN`) — the
+/// (op 0 `now`), `Stream` op 0 (stdin `read`), and **any host-fn** (`cap_id::HOST_PROC`) — the
 /// embedder's escape hatch (RNG, a real clock, external I/O), whose closure is *gone* on the fresh
 /// replay powerbox, so only the tape can reproduce it.
 fn is_recorded_input(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::CLOCK || (type_id == cap_id::STREAM && op == 0) || type_id == cap_id::HOST_FN
+    type_id == cap_id::CLOCK
+        || (type_id == cap_id::STREAM && op == 0)
+        || type_id == cap_id::HOST_PROC
 }
 
 /// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
@@ -11790,13 +11792,13 @@ pub mod cap_id {
     /// ops (`cap.call` on it is an inert `CapFault`); it confers only the authority to be named in
     /// `Jit.invoke`/`release` on the domain handle that compiled it.
     pub const JIT_CODE: u32 = 12;
-    /// `HostFn` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
-    /// installs a handler closure with [`crate::Host::grant_host_fn`] and the guest reaches it like
-    /// any capability (`cap.call HOST_FN op …`). The interface's *semantics* live entirely in the
+    /// `HostProc` — an **embedder-registered** capability (§7 "host-defined capabilities"): the host
+    /// installs a handler closure with [`crate::Host::grant_host_proc`] and the guest reaches it like
+    /// any capability (`cap.call HOST_PROC op …`). The interface's *semantics* live entirely in the
     /// embedder's closure (e.g. an `svm-wasi` shim), **outside** this crate's TCB match — so a host
     /// can add capabilities without touching the VM. The handler reads/writes the guest window
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
-    pub const HOST_FN: u32 = 13;
+    pub const HOST_PROC: u32 = 13;
     /// §15 / PROCESS.md §5 `Budget` — a passable, **splittable** resource-quota vector (fuel / mem /
     /// spawn), §15's "every meterable resource is a capability with a quota" promoted to an object.
     /// op 0 `split(fuel, mem, spawn) -> sub_handle | -errno`: mint a child `Budget` holding those
@@ -11838,7 +11840,7 @@ pub mod cap_id {
 /// unrelated capability could share it by accident, so canonicalizing it would over-claim (and
 /// `(i64) -> (i64)` is exactly the shape an ordinary guest offer uses). Handle-typed built-ins,
 /// whose ops pass or return capabilities where the `cap`-vs-`i32` signature convention for
-/// built-ins is unsettled, and `HOST_FN`, whose semantics are per-registration with no canonical
+/// built-ins is unsettled, and `HOST_PROC`, whose semantics are per-registration with no canonical
 /// shape, are the deliberate exceptions — see IMPORTS.md §3.5.
 fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
     let rw = FuncType {
@@ -11867,7 +11869,7 @@ fn preseeded_iface_id(sigs: &[FuncType]) -> Option<u32> {
 /// The canonical op names + signatures of a pre-seeded built-in interface
 /// ([`preseeded_iface_shapes`]) — for an embedder offering a host-native handle as a **whole
 /// interface** (e.g. `svm-run`'s `IfaceShape::builtin`) without re-declaring its shape by hand.
-/// Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins, `HOST_FN`) or an
+/// Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins, `HOST_PROC`) or an
 /// unknown id.
 pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
     preseeded_iface_shapes()
@@ -12203,15 +12205,15 @@ enum Binding {
         unit: u32,
     },
     /// An **embedder-registered** host-function capability (iface 13): carries the index of its
-    /// handler closure in [`Host::host_fns`] (out-of-line so `Binding` stays `Copy`, like
+    /// handler closure in [`Host::host_procs`] (out-of-line so `Binding` stays `Copy`, like
     /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`.
-    HostFn(u32),
-    /// An mmap-capable host-function capability (§4b): like [`Binding::HostFn`] but its handler in
-    /// [`Host::host_fns_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
-    HostFnRegion(u32),
+    HostProc(u32),
+    /// An mmap-capable host-function capability (§4b): like [`Binding::HostProc`] but its handler in
+    /// [`Host::host_procs_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
+    HostProcRegion(u32),
     /// A **wired interface offer** (IMPORTS.md §3.2): a guest-implemented capability, carrying the
     /// index of its [`GuestImplEntry`] in [`Host::guest_impls`] (out-of-line so `Binding` stays
-    /// `Copy`, like [`Binding::HostFn`]). Op `i` dispatches to the offer's `ops[i]` function via
+    /// `Copy`, like [`Binding::HostProc`]). Op `i` dispatches to the offer's `ops[i]` function via
     /// the **generic dispatch** (one implementation, all three backends): a v1 **pure dispatch** —
     /// a fresh reference run over the offer's functions with no window and an empty powerbox, so
     /// the impl computes over its arguments alone. Exporter-domain state is the designed
@@ -12283,7 +12285,7 @@ impl Attestation {
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
 /// into a fresh `Host` reconstructs the exact authority. The non-value bindings
-/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostFn`) are
+/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostProc`) are
 /// **not** durable: a live one makes the domain non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
@@ -12343,7 +12345,7 @@ pub enum NonDurableKind {
     Blocking,
     JitDomain,
     JitCode,
-    HostFn,
+    HostProc,
     Budget,
     Pipe,
     /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
@@ -12597,15 +12599,15 @@ impl AsyncCounter for RegionCounter {
     }
 }
 
-/// An **embedder-registered host-capability handler** (iface [`cap_id::HOST_FN`]): given the `op`,
+/// An **embedder-registered host-capability handler** (iface [`cap_id::HOST_PROC`]): given the `op`,
 /// the slot-encoded `i64` args, and the guest window (`None` if the module has no memory), it runs
 /// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
 /// host adds a capability (e.g. an `svm-wasi` shim) **without** touching this crate: the semantics
 /// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
-pub type HostFn =
+pub type HostProc =
     Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
 
-/// The **one** extra authority an mmap-capable [`HostFnRegion`] handler gets over a plain [`HostFn`]:
+/// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
 /// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
 /// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
 /// exactly this one capability (MMAP_CAPABILITY.md §4b, "a small, existing-shaped new power for the
@@ -12616,12 +12618,12 @@ pub trait RegionMinter {
     fn grant_region(&mut self, backing: RegionBacking) -> i32;
 }
 
-/// Like [`HostFn`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
+/// Like [`HostProc`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
 /// zero-copy file-mmap bridge (§4b): an mmap-capable fs handler opens a file, mints a file-backed
 /// `SharedRegion` over it, and returns the handle so the guest aliases the real file into its window.
-/// Registered with [`Host::grant_host_fn_region`]; resolves under the same [`cap_id::HOST_FN`] as a
-/// plain `HostFn`, so a guest reaches it identically.
-pub type HostFnRegion = Box<
+/// Registered with [`Host::grant_host_proc_region`]; resolves under the same [`cap_id::HOST_PROC`] as a
+/// plain `HostProc`, so a guest reaches it identically.
+pub type HostProcRegion = Box<
     dyn FnMut(
             u32,
             &[i64],
@@ -12635,7 +12637,7 @@ pub type HostFnRegion = Box<
 /// [`Binding::GuestImpl`] carries: the offering module's functions, the offer's per-op funcidx
 /// list, the op signatures **derived** from those functions' declared types (never self-asserted),
 /// and the interned interface id ([`Host::intern_interface`]). Minted only by the wiring party
-/// ([`Host::wire_impl`]) — declaring an offer confers nothing; this entry existing in a domain's
+/// ([`Host::wire_offer_func`]) — declaring an offer confers nothing; this entry existing in a domain's
 /// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
 /// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
 /// A slot's retained §3.5 requirement set: the manifest's `(names, sigs)`, shared with the
@@ -12691,7 +12693,7 @@ pub struct GuestImplEntry {
     pub depth: u32,
     /// §3.2 v2 **provider instance** — the exporter's domain. `None` = a v1 *pure* offer
     /// (windowless, empty powerbox: arguments in, results out). `Some` = an **instanced** offer:
-    /// ops run over this persistent window + powerbox ([`Host::wire_impl_instance`]), so state
+    /// ops run over this persistent window + powerbox ([`Host::wire_offer_proc`]), so state
     /// survives across calls — the stateful wrap ("an `Fs` backed by the provider's own
     /// window"). Shared (`Arc`) across re-grants: a parent and its children handed the same
     /// offer drive one service instance, like a pipe's shared backing. The blocking lock is
@@ -12814,7 +12816,7 @@ fn translate_cap_slots(
     Ok(())
 }
 
-// The `Host` *is* the region minter — the narrow authority a `HostFnRegion` handler is handed. It
+// The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
     fn grant_region(&mut self, backing: RegionBacking) -> i32 {
@@ -12892,15 +12894,15 @@ pub struct Host {
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
-    /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostFn`]
-    /// carries ([`Host::grant_host_fn`]). A dispatch takes the closure out, runs it, and restores it.
-    host_fns: Vec<HostFn>,
-    /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostFnRegion`]
-    /// carries, [`Host::grant_host_fn_region`]) — a `HostFn` plus a [`RegionMinter`]. Same
-    /// take-out/run/restore dispatch as `host_fns`.
-    host_fns_region: Vec<HostFnRegion>,
+    /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostProc`]
+    /// carries ([`Host::grant_host_proc`]). A dispatch takes the closure out, runs it, and restores it.
+    host_procs: Vec<HostProc>,
+    /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostProcRegion`]
+    /// carries, [`Host::grant_host_proc_region`]) — a `HostProc` plus a [`RegionMinter`]. Same
+    /// take-out/run/restore dispatch as `host_procs`.
+    host_procs_region: Vec<HostProcRegion>,
     /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::GuestImpl`]
-    /// carries ([`Host::wire_impl`]).
+    /// carries ([`Host::wire_offer_func`]).
     guest_impls: Vec<GuestImplEntry>,
     /// The per-`Host` **structural interface intern** (D59 applied to capability interfaces):
     /// index `i` holds the op-signature list whose interface id is `GUEST_IMPL_BASE + i`, so
@@ -13246,8 +13248,8 @@ impl Host {
             modules: Vec::new(),
             region_factory: None,
             blockings: Vec::new(),
-            host_fns: Vec::new(),
-            host_fns_region: Vec::new(),
+            host_procs: Vec::new(),
+            host_procs_region: Vec::new(),
             guest_impls: Vec::new(),
             iface_intern: Vec::new(),
             import_remaps: Vec::new(),
@@ -13296,7 +13298,7 @@ impl Host {
     /// caller is always parked *inside* a call through such an offer, so it necessarily holds one.
     ///
     /// **Fails closed** (returns `None`) for any domain carrying capability state the core cannot yet
-    /// duplicate on its own: closure-based host caps (`host_fns` / `host_fns_region` / `guest_impls`,
+    /// duplicate on its own: closure-based host caps (`host_procs` / `host_procs_region` / `guest_impls`,
     /// not `Clone`), module grants, JIT / ring / async / offload / serve state, or in-flight freeze
     /// residue. Those a real `fork` (of a personality-wired domain such as bash) requires are **re-wired
     /// into the twin by the personality layer** (PR 3), not cloned here. So this only ever forks a
@@ -13306,8 +13308,8 @@ impl Host {
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
     fn fork_powerbox(&self) -> Option<Host> {
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
-        let simple = self.host_fns.is_empty()
-            && self.host_fns_region.is_empty()
+        let simple = self.host_procs.is_empty()
+            && self.host_procs_region.is_empty()
             && self.guest_impls.is_empty()
             && self.pending_live_impls.is_empty()
             && self.rings.is_empty()
@@ -13703,8 +13705,8 @@ impl Host {
         self.regions.is_empty()
             && self.blockings.is_empty()
             && self.rings.is_empty()
-            && self.host_fns.is_empty()
-            && self.host_fns_region.is_empty()
+            && self.host_procs.is_empty()
+            && self.host_procs_region.is_empty()
             && self.jit_domains.is_empty()
     }
 
@@ -14006,8 +14008,8 @@ impl Host {
                 Binding::JitCode { .. } => {
                     return Err(self.non_durable(slot, NonDurableKind::JitCode))
                 }
-                Binding::HostFn(_) | Binding::HostFnRegion(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::HostFn))
+                Binding::HostProc(_) | Binding::HostProcRegion(_) => {
+                    return Err(self.non_durable(slot, NonDurableKind::HostProc))
                 }
                 Binding::GuestImpl(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
@@ -14048,7 +14050,7 @@ impl Host {
     /// "drainable non-durable bindings" / Phase-4 handle hardening). Closes every live slot holding a
     /// binding [`Self::capture_durable_handles`] would refuse on — the ones carrying out-of-line host
     /// state or native pointers (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`JitDomain`/`JitCode`/
-    /// `HostFn`) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
+    /// `HostProc`) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
     /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
     /// `cap.call` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
     /// handles in ascending slot order (for the embedder to audit the relinquished authority). The exact
@@ -14060,7 +14062,7 @@ impl Host {
     /// across a restore (they aren't re-grantable), so dropping them is the only way to make the freeze
     /// proceed. Call at a freeze safepoint — the STW quiesce + §12.8 4A.7 guarantee no vCPU is mid-host
     /// call, and the embedder drains any async offload residue ([`Self::quiesce_pool`]) first, so closing
-    /// the slot orphans no in-flight work. The out-of-line backings (`rings`/`blockings`/`host_fns`/…)
+    /// the slot orphans no in-flight work. The out-of-line backings (`rings`/`blockings`/`host_procs`/…)
     /// are released when this per-run `Host` is dropped after the snapshot.
     pub fn drain_non_durable(&mut self) -> Vec<NonDurableHandle> {
         let mut drained = Vec::new();
@@ -14083,7 +14085,7 @@ impl Host {
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
-                Binding::HostFn(_) | Binding::HostFnRegion(_) => NonDurableKind::HostFn,
+                Binding::HostProc(_) | Binding::HostProcRegion(_) => NonDurableKind::HostProc,
                 Binding::GuestImpl(_) => NonDurableKind::GuestImpl,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
@@ -14318,26 +14320,26 @@ impl Host {
     }
 
     /// §7 Register an **embedder host-capability** handler and grant a handle to it (iface
-    /// [`cap_id::HOST_FN`]). The guest reaches it with `cap.call HOST_FN <op> <handle> (args)`; the
+    /// [`cap_id::HOST_PROC`]). The guest reaches it with `cap.call HOST_PROC <op> <handle> (args)`; the
     /// closure supplies the semantics, so a host adds a capability (e.g. an `svm-wasi` shim) without
     /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
-    pub fn grant_host_fn(&mut self, f: HostFn) -> i32 {
-        let idx = self.host_fns.len() as u32;
-        self.host_fns.push(f);
-        self.grant(cap_id::HOST_FN, Binding::HostFn(idx))
+    pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
+        let idx = self.host_procs.len() as u32;
+        self.host_procs.push(f);
+        self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
     }
 
     /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
-    /// (also iface [`cap_id::HOST_FN`], so a guest resolves it exactly like a plain [`grant_host_fn`]).
-    /// Identical to `grant_host_fn` except the handler is additionally handed a [`RegionMinter`] on
+    /// (also iface [`cap_id::HOST_PROC`], so a guest resolves it exactly like a plain [`grant_host_proc`]).
+    /// Identical to `grant_host_proc` except the handler is additionally handed a [`RegionMinter`] on
     /// each call, so it can mint a file-backed `SharedRegion` and return the handle — the delivery
     /// mechanism for the zero-copy file-mmap bridge. The extra authority is exactly region-minting
     /// (nothing else of the `Host` is reachable).
-    pub fn grant_host_fn_region(&mut self, f: HostFnRegion) -> i32 {
-        let idx = self.host_fns_region.len() as u32;
-        self.host_fns_region.push(f);
-        self.grant(cap_id::HOST_FN, Binding::HostFnRegion(idx))
+    pub fn grant_host_proc_region(&mut self, f: HostProcRegion) -> i32 {
+        let idx = self.host_procs_region.len() as u32;
+        self.host_procs_region.push(f);
+        self.grant(cap_id::HOST_PROC, Binding::HostProcRegion(idx))
     }
 
     /// Intern an interface's op-signature list and return its id (IMPORTS.md §3.2): structurally
@@ -14370,7 +14372,7 @@ impl Host {
     /// wiring party holding both ends calls this — declaring the offer conferred nothing.
     ///
     /// Returns `None` (nothing minted) for an empty op list or an out-of-range funcidx.
-    pub fn wire_impl(&mut self, funcs: &Arc<[Func]>, ops: &[u32]) -> Option<i32> {
+    pub fn wire_offer_func(&mut self, funcs: &Arc<[Func]>, ops: &[u32]) -> Option<i32> {
         if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
             return None;
         }
@@ -14396,13 +14398,13 @@ impl Host {
     }
 
     /// Wire an **instanced** offer (IMPORTS.md §3.2 v2 — exporter-domain state): like
-    /// [`Host::wire_impl`], but the offer gets a persistent **provider domain** — a window built
+    /// [`Host::wire_offer_func`], but the offer gets a persistent **provider domain** — a window built
     /// once from `m`'s memory declaration + data segments, and its own (initially empty)
     /// powerbox — that every op dispatch runs over, so state survives across calls. The wirer
     /// may re-grant capabilities into the provider with [`Host::grant_impl_cap`] (the
-    /// wrap-holding-its-real-cap story). Fail-closed like `wire_impl`; `m.funcs` must be
+    /// wrap-holding-its-real-cap story). Fail-closed like `wire_offer_func`; `m.funcs` must be
     /// verifier-passing (the host is trusted to wire only verified modules, as with every grant).
-    pub fn wire_impl_instance(&mut self, m: &Module, ops: &[u32]) -> Option<i32> {
+    pub fn wire_offer_proc(&mut self, m: &Module, ops: &[u32]) -> Option<i32> {
         let funcs: Arc<[Func]> = m.funcs.clone().into();
         if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
             return None;
@@ -15426,7 +15428,7 @@ impl Host {
     /// (`Instantiator.instantiate_granted`), so a §14 child is not born destitute. Only a
     /// **coordinate-free, self-contained** capability qualifies — one a fresh child `Host` can hold
     /// as-is: `Stream` (stdio), `Exit`, `Clock`. Refused (`CapFault`), deliberately:
-    /// - **index-carrying** caps (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`HostFn*`) whose index
+    /// - **index-carrying** caps (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`HostProc*`) whose index
     ///   names a slot in *this* Host's side tables — a child needs those installed by their own
     ///   deep-copy path (e.g. the SharedRegion grant), not a raw binding copy; and
     /// - **window-coordinate** caps (`AddressSpace`/`Instantiator`, `Memory`) whose `{base,size}` are
@@ -16027,29 +16029,29 @@ impl Host {
                 }
             }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
-            // out for the call so the closure can't alias `self.host_fns` (it doesn't need `Host`),
+            // out for the call so the closure can't alias `self.host_procs` (it doesn't need `Host`),
             // then restore it — a panic would only poison this one slot, never the host.
-            Binding::HostFn(idx) => {
-                let mut f = match self.host_fns.get_mut(idx as usize) {
+            Binding::HostProc(idx) => {
+                let mut f = match self.host_procs.get_mut(idx as usize) {
                     Some(slot) => std::mem::replace(slot, Box::new(|_, _, _| Err(Trap::CapFault))),
                     None => return Err(Trap::CapFault),
                 };
                 let r = f(op, args, mem);
-                self.host_fns[idx as usize] = f;
+                self.host_procs[idx as usize] = f;
                 r
             }
-            // §4b mmap-capable host-cap: same take-out/run/restore as `HostFn`, but also hand the
+            // §4b mmap-capable host-cap: same take-out/run/restore as `HostProc`, but also hand the
             // handler `self` as the `RegionMinter`. Taking the closure out first means `self` is no
-            // longer aliased by `host_fns_region[idx]`, so the `&mut dyn RegionMinter` borrow is sound.
-            Binding::HostFnRegion(idx) => {
-                let mut f = match self.host_fns_region.get_mut(idx as usize) {
+            // longer aliased by `host_procs_region[idx]`, so the `&mut dyn RegionMinter` borrow is sound.
+            Binding::HostProcRegion(idx) => {
+                let mut f = match self.host_procs_region.get_mut(idx as usize) {
                     Some(slot) => {
                         std::mem::replace(slot, Box::new(|_, _, _, _| Err(Trap::CapFault)))
                     }
                     None => return Err(Trap::CapFault),
                 };
                 let r = f(op, args, mem, self);
-                self.host_fns_region[idx as usize] = f;
+                self.host_procs_region[idx as usize] = f;
                 r
             }
             Binding::Exit => {
@@ -18855,17 +18857,17 @@ fn loclist_value(locs: &[SsaLoc], block: usize, inst: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod region_minter_tests {
-    //! The §4b `RegionMinter` ABI: an mmap-capable `HostFnRegion` handler is handed exactly one extra
+    //! The §4b `RegionMinter` ABI: an mmap-capable `HostProcRegion` handler is handed exactly one extra
     //! authority — minting a `SharedRegion` — and nothing else of the `Host`. These pin that the
     //! handler can mint a region and hand its handle back to the guest, and that the minted handle is
     //! a live `SharedRegion` (the delivery mechanism for the zero-copy file-mmap bridge).
     use super::*;
 
     #[test]
-    fn host_fn_region_handler_mints_a_region_and_returns_a_live_handle() {
+    fn host_proc_region_handler_mints_a_region_and_returns_a_live_handle() {
         let mut host = Host::new();
         // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
-        let h = host.grant_host_fn_region(Box::new(|op, _args, _mem, minter| {
+        let h = host.grant_host_proc_region(Box::new(|op, _args, _mem, minter| {
             if op == 0 {
                 let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
                 Ok(vec![minter.grant_region(backing) as i64])
@@ -18875,13 +18877,13 @@ mod region_minter_tests {
         }));
         assert!(
             h >= 0,
-            "grant_host_fn_region should yield a handle under iface HOST_FN"
+            "grant_host_proc_region should yield a handle under iface HOST_PROC"
         );
 
         // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
         let out = host
-            .cap_dispatch_slots(cap_id::HOST_FN, 0, h, &[], None)
-            .expect("host_fn_region dispatch");
+            .cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None)
+            .expect("host_proc_region dispatch");
         let region_h = out[0];
         assert!(
             region_h >= 0,
@@ -18899,10 +18901,10 @@ mod region_minter_tests {
     }
 
     #[test]
-    fn region_and_plain_host_fn_are_distinct_handles_under_the_same_iface() {
+    fn region_and_plain_host_proc_are_distinct_handles_under_the_same_iface() {
         let mut host = Host::new();
-        let plain = host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
-        let region = host.grant_host_fn_region(Box::new(|_, _, _, _| Ok(vec![0])));
+        let plain = host.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
+        let region = host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(plain >= 0 && region >= 0 && plain != region);
     }
 }
@@ -18977,10 +18979,10 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_refuses_a_domain_with_closure_caps() {
         let mut host = Host::new();
-        host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
+        host.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
         assert!(
             host.fork_powerbox().is_none(),
-            "a domain holding a closure-based host_fn fails closed — the personality re-wires it (PR 3)"
+            "a domain holding a closure-based host_proc fails closed — the personality re-wires it (PR 3)"
         );
     }
 }

@@ -822,12 +822,12 @@ block 0 (v0: i32) {
 "#;
 
 #[test]
-fn captape_replays_host_fn_inputs_for_faithful_seek() {
+fn captape_replays_host_proc_inputs_for_faithful_seek() {
     let m = parse_module(HOSTFN_SUM).expect("parse");
     let mut host = Host::new();
     // A nondeterministic host capability: each call returns an incrementing counter.
     let mut n = 100i64;
-    let hf = host.grant_host_fn(Box::new(move |_op, _args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem| {
         let v = n;
         n += 1;
         Ok(vec![v])

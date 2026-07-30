@@ -57,7 +57,7 @@ block 0 () {
 ";
 
 #[test]
-fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
+fn name_bound_host_proc_callbacks_run_through_the_c_abi() {
     unsafe {
         let ir = CString::new(NAMED).unwrap();
         let m = svm_module_parse_text(ir.as_ptr());
@@ -67,11 +67,11 @@ fn name_bound_host_fn_callbacks_run_through_the_c_abi() {
         let n_add = CString::new("add_seven").unwrap();
         let n_tri = CString::new("triple").unwrap();
         assert_eq!(
-            svm_imports_provide_host_fn(imports, n_add.as_ptr(), 0, add_seven, ptr::null_mut()),
+            svm_imports_provide_host_proc(imports, n_add.as_ptr(), 0, add_seven, ptr::null_mut()),
             SVM_OK
         );
         assert_eq!(
-            svm_imports_provide_host_fn(imports, n_tri.as_ptr(), 0, triple, ptr::null_mut()),
+            svm_imports_provide_host_proc(imports, n_tri.as_ptr(), 0, triple, ptr::null_mut()),
             SVM_OK
         );
 
@@ -474,7 +474,7 @@ block 0 () {
 ";
 
 #[test]
-fn host_fn_reads_and_writes_guest_memory_via_c_abi() {
+fn host_proc_reads_and_writes_guest_memory_via_c_abi() {
     unsafe {
         for backend in [SVM_BACKEND_TREEWALK, SVM_BACKEND_BYTECODE, SVM_BACKEND_JIT] {
             let ir = CString::new(UPCASE_IR).unwrap();
@@ -484,7 +484,7 @@ fn host_fn_reads_and_writes_guest_memory_via_c_abi() {
             let n_up = CString::new("upcase").unwrap();
             let n_write = CString::new("write").unwrap();
             assert_eq!(
-                svm_imports_provide_host_fn(imports, n_up.as_ptr(), 0, upcase, ptr::null_mut()),
+                svm_imports_provide_host_proc(imports, n_up.as_ptr(), 0, upcase, ptr::null_mut()),
                 SVM_OK
             );
             assert_eq!(

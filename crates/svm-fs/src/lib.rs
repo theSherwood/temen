@@ -3,18 +3,18 @@
 //! This crate holds the wasm-safe half of the filesystem capability (`crates/svm-run/src/fs.rs`
 //! §7): the op-code/`stat`-layout/path-vetting protocol both backends speak, and the deterministic
 //! **in-memory** backend (`mem_fs`) plus its shippable **data-image** format. It depends only on
-//! `svm-interp` (`HostFn`/`GuestMem`), so it builds for **wasm** — the browser cdylib mounts a
+//! `svm-interp` (`HostProc`/`GuestMem`), so it builds for **wasm** — the browser cdylib mounts a
 //! data-image `mem_fs` with no real filesystem. `svm-run` keeps the real-filesystem `host_fs`
 //! backend (which pulls in the unix-only JIT/mmap machinery) and wraps these handlers in its
 //! `HostCap`; it re-exports this crate's protocol + `mem_fs*` so `svm_run::fs::*` is unchanged.
 //!
-//! A handler builder returns a `make: impl Fn() -> HostFn` closure — `svm-run` passes it to
-//! `HostCap::host_fn`, and the browser cdylib grants the `HostFn` directly on its `svm-interp` Host.
+//! A handler builder returns a `make: impl Fn() -> HostProc` closure — `svm-run` passes it to
+//! `HostCap::host_proc`, and the browser cdylib grants the `HostProc` directly on its `svm-interp` Host.
 
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
-use svm_interp::{GuestMem, HostFn};
+use svm_interp::{GuestMem, HostProc};
 
 pub const FS_OPEN: u32 = 0;
 pub const FS_READ: u32 = 1;
@@ -741,8 +741,8 @@ pub fn arm_crash(ctl: Option<&mut CrashCtl>, n: i64) -> i64 {
 }
 
 /// A `make` builder for the in-memory backend (`svm-run` wraps it in a `HostCap`; the browser grants
-/// the `HostFn` directly). `crashy` enables the **test-only** crash-injection op ([`FS_CRASH_ARM`]).
-pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostFn + Send + Sync + 'static {
+/// the `HostProc` directly). `crashy` enables the **test-only** crash-injection op ([`FS_CRASH_ARM`]).
+pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostProc + Send + Sync + 'static {
     move || {
         let mut st = MemFsState {
             crash: crashy.then(CrashCtl::default),
@@ -752,7 +752,7 @@ pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostFn + Send + Sync + 'stat
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
-        ) as HostFn
+        ) as HostProc
     }
 }
 
@@ -762,7 +762,7 @@ pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostFn + Send + Sync + 'stat
 pub fn mem_fs_seeded_handler(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
-) -> impl Fn() -> HostFn + Send + Sync + 'static {
+) -> impl Fn() -> HostProc + Send + Sync + 'static {
     let files = Arc::new(files);
     let dirs = Arc::new(dirs);
     move || {
@@ -778,7 +778,7 @@ pub fn mem_fs_seeded_handler(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
-        ) as HostFn
+        ) as HostProc
     }
 }
 
@@ -805,16 +805,16 @@ impl MemFsHandle {
     }
 }
 
-/// Like [`mem_fs_seeded_handler`] but returns the `HostFn` **and** a [`MemFsHandle`] onto its state, so
+/// Like [`mem_fs_seeded_handler`] but returns the `HostProc` **and** a [`MemFsHandle`] onto its state, so
 /// the mount can be snapshotted back out later (the persistent-session persistence path). Unlike the
-/// `make: impl Fn() -> HostFn` builders — which re-seed a fresh store on every grant — this grants
+/// `make: impl Fn() -> HostProc` builders — which re-seed a fresh store on every grant — this grants
 /// **one** live store shared between the handler and the handle through an `Arc<Mutex<..>>`, locked per
 /// op (uncontended in the single-threaded browser). The deterministic, snapshot-free one-shot path keeps
 /// [`mem_fs_seeded_handler`].
 pub fn mem_fs_seeded_shared(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
-) -> (HostFn, MemFsHandle) {
+) -> (HostProc, MemFsHandle) {
     let mut st = MemFsState::default();
     for (p, data) in &files {
         st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
@@ -824,7 +824,7 @@ pub fn mem_fs_seeded_shared(
     }
     let shared = Arc::new(Mutex::new(st));
     let handle = MemFsHandle(shared.clone());
-    let hostfn: HostFn = Box::new(
+    let hostfn: HostProc = Box::new(
         move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
             Ok(vec![shared
                 .lock()
@@ -955,7 +955,7 @@ mod tests {
     }
 
     /// `mem_fs_seeded_shared` snapshots the **live** store — writes and removes made through the granted
-    /// `HostFn` after the mount show up in `MemFsHandle::image`, and the image round-trips through
+    /// `HostProc` after the mount show up in `MemFsHandle::image`, and the image round-trips through
     /// `decode_image` back to a mountable seed. This is the persistence hinge: a Postgres session's data
     /// dir, mutated by DDL/DML, must serialize back out exactly.
     #[test]
@@ -974,7 +974,7 @@ mod tests {
         let mut mem = VecMem(vec![0u8; 32]);
         mem.0[..6].copy_from_slice(b"base/2");
         mem.0[16..21].copy_from_slice(b"hello");
-        let call = |fs: &mut HostFn, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
+        let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
             fs(op, args, Some(mem)).expect("host fn")[0]
         };
 

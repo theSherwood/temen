@@ -4,7 +4,7 @@
 //! to *real WASI bytes*. svm-wasm transpiles a WASI module, declaring one manifest import
 //! `"wasi_snapshot_preview1.<name>"` per WASI function (IMPORTS.md phase 3 — call sites are
 //! `call.import <slot>`, the module is never rewritten); [`bind`] grants a single
-//! [`svm_interp::cap_id::HOST_FN`] capability and installs one [`BoundImport`] per manifest slot
+//! [`svm_interp::cap_id::HOST_PROC`] capability and installs one [`BoundImport`] per manifest slot
 //! ([`resolve`] maps each name to its op), and [`handler`] implements the WASI ops over the guest
 //! window. The WASI *semantics* (the iovec ABI, errno values, the fd table) live **here** — outside
 //! both svm-wasm and the interp TCB — exactly the boundary DESIGN.md §7 draws: the binding mechanism
@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{cap_id, BoundImport, GuestMem, Host, HostFn, Trap};
+use svm_interp::{cap_id, BoundImport, GuestMem, Host, HostProc, Trap};
 use svm_ir::ResolvedCap;
 
 /// Op numbers the [`handler`] dispatches on; [`resolve`] maps WASI names to these.
@@ -37,7 +37,7 @@ pub struct WasiOut {
 }
 
 /// The §7 import-name resolver for this WASI subset: maps the standard preview1 import names (as
-/// svm-wasm declares them, `"<module>.<name>"`) to the [`cap_id::HOST_FN`] capability + op. [`bind`]
+/// svm-wasm declares them, `"<module>.<name>"`) to the [`cap_id::HOST_PROC`] capability + op. [`bind`]
 /// uses it to build the per-slot bindings; compose with your own policy for other imports. Unknown
 /// names return `None`, so binding fails closed.
 pub fn resolve(name: &str) -> Option<ResolvedCap> {
@@ -47,7 +47,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         _ => return None,
     };
     Some(ResolvedCap {
-        type_id: cap_id::HOST_FN,
+        type_id: cap_id::HOST_PROC,
         op,
     })
 }
@@ -57,12 +57,12 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
 /// the call. Most embedders want [`bind`], which also installs the per-slot import bindings.
 pub fn grant(host: &mut Host) -> (i32, WasiOut) {
     let out = WasiOut::default();
-    let handle = host.grant_host_fn(handler(out.clone()));
+    let handle = host.grant_host_proc(handler(out.clone()));
     (handle, out)
 }
 
 /// Grant the WASI capability on `host` and install one [`BoundImport`] per manifest slot of `m`
-/// (IMPORTS.md phase 3): each import name resolves through [`resolve`] to `(HOST_FN, op)` over the
+/// (IMPORTS.md phase 3): each import name resolves through [`resolve`] to `(HOST_PROC, op)` over the
 /// single granted handle. Fails closed (`None`, nothing installed) on a non-WASI import name. The
 /// module is never rewritten and the entry takes only its wasm params.
 pub fn bind(m: &svm_ir::Module, host: &mut Host) -> Option<WasiOut> {
@@ -80,9 +80,9 @@ pub fn bind(m: &svm_ir::Module, host: &mut Host) -> Option<WasiOut> {
     Some(out)
 }
 
-/// Build the WASI [`HostFn`] handler over `out`. `fd_write` captures into `out`; `proc_exit`
+/// Build the WASI [`HostProc`] handler over `out`. `fd_write` captures into `out`; `proc_exit`
 /// terminates the domain with the given code (a non-error [`Trap::Exit`]).
-pub fn handler(out: WasiOut) -> HostFn {
+pub fn handler(out: WasiOut) -> HostProc {
     Box::new(move |op, args, mem| match op {
         OP_FD_WRITE => fd_write(&out, args, mem),
         OP_PROC_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
@@ -130,7 +130,7 @@ mod tests {
     /// A real WASI preview1 **"hello world"**: imports `wasi_snapshot_preview1.fd_write`, builds an
     /// `iovec` pointing at "hello\n", and writes it to fd 1 — the same shape clang/rustc emit for
     /// `wasm32-wasi` (minimal, hand-written so the test needs no wasi toolchain). svm-wasm transpiles
-    /// it (the WASI import → a `CallImport`), [`resolve`] binds the name to the WASI `HostFn`
+    /// it (the WASI import → a `CallImport`), [`resolve`] binds the name to the WASI `HostProc`
     /// capability, and the bytes the shim captures prove the whole path carries real WASI bytes.
     const HELLO_WAT: &str = r#"
       (module
@@ -175,7 +175,7 @@ mod tests {
         );
 
         // JIT parity: the same resolved module + WASI grant, driven through the production cap thunk.
-        // The HostFn capability dispatches through the same `cap_dispatch_slots` the thunk calls, so
+        // The HostProc capability dispatches through the same `cap_dispatch_slots` the thunk calls, so
         // the demo runs on the production backend unchanged.
         let mut hj = Host::new();
         let jout = bind(&t.module, &mut hj).expect("bind WASI imports");

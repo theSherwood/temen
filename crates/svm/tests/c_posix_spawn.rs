@@ -77,7 +77,7 @@ fn c_to_ir(src: &str) -> String {
 }
 
 /// Bind the shim's `__px_`-prefixed import slots to the granted personality `handle`
-/// ([`svm_posix::resolve`] → `(HOST_FN, op)`), phase-4 no-rewrite. Same helper as `c_posix.rs`.
+/// ([`svm_posix::resolve`] → `(HOST_PROC, op)`), phase-4 no-rewrite. Same helper as `c_posix.rs`.
 fn bind_shim(m: &svm_ir::Module, host: &mut Host, handle: i32) {
     let bindings = m
         .imports

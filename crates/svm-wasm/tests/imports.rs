@@ -217,14 +217,14 @@ fn imports_declare_manifest_entries() {
     let wasm = wat::parse_str(
         r#"(module
              (import "2" "0" (func (result i64)))
-             (import "env" "host_fn" (func (result i64)))
+             (import "env" "host_proc" (func (result i64)))
              (func (export "f") (result i64) (i64.add (call 0) (call 1))))"#,
     )
     .expect("assemble wat");
     let t = svm_wasm::transpile(&wasm).expect("transpile");
     assert_eq!(t.module.imports.len(), 2, "one manifest entry per import");
     assert_eq!(t.module.imports[0].name, "2.0", "numeric convention");
-    assert_eq!(t.module.imports[1].name, "env.host_fn", "§7 named");
+    assert_eq!(t.module.imports[1].name, "env.host_proc", "§7 named");
     assert!(t
         .module
         .imports

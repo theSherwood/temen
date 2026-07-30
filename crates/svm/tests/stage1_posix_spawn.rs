@@ -116,7 +116,7 @@ static int __capof(int want) {
   return -1;
 }
 static int __h_px = -1;
-static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_FN = 13 */
+static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_PROC = 13 */
 static int __h_inst = -1;
 static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
@@ -164,7 +164,7 @@ int main(void){
 
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
-/// through [`svm_posix::resolve`] to `(HOST_FN, op)`; `__spawn`/`__join` are the shell's own
+/// through [`svm_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
 /// `Instantiator` ops (13 / 1). No handle is baked at link: each lowered `cap.call` dispatches on
 /// the guest's own handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at`
 /// reflection (§3c protection at the boundary, IMPORTS.md §2.3 dynamic mode).
