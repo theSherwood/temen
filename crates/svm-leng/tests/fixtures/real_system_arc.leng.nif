@@ -1,0 +1,18 @@
+(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr (i +64)))))
+ (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc@,1g,nimony/lib/std/system/stringimpl.nim :=wasMoved.2.@5
+  (params@H
+   (param@1 :s.40 .
+    (ptr@3 string.0.@4))).
+  (pragmas@X
+   (exportc "nimStrWasMoved")
+   (inline 0 0)
+   (smry~X
+    (param 0 0 reads writes)))
+  (stmts@2,1
+   (asgn@8
+    (dot~7
+     (deref~1 s.40)bytes.0 0)
+    (conv@2
+     (u@B,c,nimony/lib/std/system/basic_types.nim 64)0)))))

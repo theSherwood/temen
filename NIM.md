@@ -506,8 +506,58 @@ plumbing. Five workstreams, roughly independent:
     fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
     against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
     `more` land in the sret slot identically on both engines (`tests/link.rs`).
-  - **Remaining for full W2:** long-string (`LongString`) data, and whole-module scaffolding
-    translation so the *entire* `system` module links (Path A), not hand-picked procs.
+  - **✅ Whole-module link objects — DONE 2026-07-30 (Path A shape).** `link_units` lifts a
+    *hand-picked subset* of a module's procs (the "go deep" mode); a real program instead links
+    *whole compiled modules* — every proc plus the scaffolding nimony emits (`ini`
+    module-initializer, C `main`, exportc gvars). `svm_leng::compile_whole_object`/`link_whole_units`
+    (over a `WholeModule{stem, src}`) do that: `Translator::module_with_names` translates every proc
+    and returns their local names, which become the object's in-band export table (each proc under
+    its global stem-suffixed name), so other modules' cross-module calls resolve. This is `lld` over
+    object files versus the selective lift. Proven on **two genuine `hexer` modules linked in full**
+    (`tests/whole.rs`): real `moda` (main module — `useit`, its `ini`, the C `main` + exportc gvars)
+    + real `modb` (`helper` + `ini`), their cross-module edges resolving against each other
+    (`useit`→`helper`, `moda.ini`→`modb.ini`) and their `sysvq0asl` system edges against a small
+    stand-in system object. The whole program links, verifies, and runs on both engines — including
+    moda's **real C `main` executing the whole init chain** end-to-end (guards, sub-inits, flush) and
+    returning 0. The stand-in system object is the last stub between here and the real compiled
+    `system` module.
+  - **✅ Long string literals (`LongString` data) — DONE 2026-07-30.** A string too long to pack
+    into the SSO `bytes` word: nimony emits it as a `const` `LongString` blob
+    `{fullLen, rc, capImpl, data: uarray char}` and a `string` value whose `more` field points at it
+    (`(addr strlit…)`). Lowering it took **constant-aggregate materialization**: a `const` whose
+    value is an `(oconstr T (kv field val)*)` now materializes its exact little-endian bytes into a
+    data segment (scalar-int fields at their offset; a **string-literal** field — the `uarray` /
+    `UncheckedArray` flexible tail — as raw bytes past the fixed size) and registers the const as an
+    addressable global, so `(addr strlit…)` resolves to it. `resolve_type` gained the `uarray`
+    flexible-array tail (size-0, the object's fixed size stops there). The `LongString` layout comes
+    across the link (cross-module type resolution). Tested: a self-contained `const` blob whose bytes
+    are read back from the window (both engines), and **real nimony
+    `greetLong(): string = "hello, this is a long string!"` running end-to-end** — linked against a
+    stand-in `system` unit (real `string`/`LongString` defs + no-op ARC stubs), the returned
+    `string`'s `more` points at the materialized blob (`fullLen` = 29, data = the literal),
+    identically on both engines (`tests/strings.rs`).
+  - **✅ `exportc` C-name exports — DONE 2026-07-30.** A whole-module object now exposes its
+    `exportc` symbols under their **C** names (the C `main`, and the `cmdCount`/`cmdLine`/`nimEnviron`
+    gvars), alongside the mangled Leng names — `Translator::exportc_exports` scans proc/gvar
+    `(pragmas (exportc "cname") …)` and adds a func/data export under `cname`. So the program's C-ABI
+    surface is findable: a host or `svm-run --link` can enter at `main`. Tested on real `moda`'s whole
+    object (`tests/object.rs`).
+  - **◑ Real `system` module — STARTED 2026-07-30.** The `sysvq0asl` edges now bind to code
+    translated from the **actual nimony `system` module**, not a hand-written stub — first real
+    stdlib code running on SVM (`tests/system.rs`): a driver's cross-module call binds to the real
+    `=wasMoved` (string's ARC "moved-from" reset, `s.bytes = 0` through a `ptr string`, verbatim
+    from `system/stringimpl.nim`), and it runs correctly on both engines. Getting there closed two
+    translator gaps the real module surfaces: **gvar symbol/proc-pointer initializers** (e.g.
+    `gExitFlush = nimNoopFlush` — the pointer value is opaque, an indirect call through it
+    fail-closes, so the slot is reserved zero-initialized and the runtime's `ini` writes it) and
+    **`suf` suffixed literals** (`255'i64`). With those, the *whole* system module's globals, 96
+    types, and 163 `strlit` (`LongString`) consts all collect, and `=wasMoved`,
+    `nimFlushStdStreams`, `nimNoopFlush`, `setExitFlush` translate.
+  - **Remaining for the full `system` link:** the rest of the ARC set (`=destroy`/`=dup`/`=copy`) and
+    the system `ini` chain need more totality — **sub-word (`u8`) loads**, **`deref` of a computed
+    address** (not just a symbol pointer), **parameter spill** (`addr` of a by-value param), and the
+    exception-global setup in system's `ini`. Each is a bounded translator slice; together they're
+    the last stretch to retiring the stub entirely.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

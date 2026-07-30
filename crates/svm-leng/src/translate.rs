@@ -55,6 +55,60 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
+/// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
+fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
+    let p = pragmas?;
+    if p.tag() != Some("pragmas") {
+        return None;
+    }
+    for prag in p.args() {
+        if prag.tag() == Some("exportc") {
+            if let Some(name) = prag.args().first().and_then(|n| n.as_atom()) {
+                return Some(name.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
+fn is_string_literal(node: &Node) -> bool {
+    matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
+}
+
+/// Decode a NIF string-literal atom (quotes included) to its raw bytes. NIF escapes a byte as `\HH`
+/// (two hex digits); a `\` before any other byte is that literal byte (`\\`, `\"`). Everything else
+/// is copied verbatim. (The tokenizer keeps the escapes intact in the atom text.)
+fn nif_str_bytes(atom: &str) -> Result<Vec<u8>, LengError> {
+    let s = atom
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| LengError::Malformed("expected a string literal".into()))?;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 2 < b.len()
+            && b[i + 1].is_ascii_hexdigit()
+            && b[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (b[i + 1] as char).to_digit(16).unwrap();
+            let lo = (b[i + 2] as char).to_digit(16).unwrap();
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else if b[i] == b'\\' && i + 1 < b.len() {
+            out.push(b[i + 1]);
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Escape a symbol for an svm-text string literal (e.g. an `import` name). Printable ASCII passes
 /// through; `\` and `"` are backslash-escaped; anything else is `\xHH`. Necessary because mangled
 /// Leng names carry NIF hex escapes — the `[]` operator is literally `\5B\5D…`, whose bare backslash
@@ -268,24 +322,31 @@ impl Translator {
                     let name = sym_def(&a[0])?;
                     let desc = self.tydesc(&a[2])?;
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
-                    // (the window is otherwise zero). Non-int / aggregate initializers fail-close.
+                    // (the window is otherwise zero).
                     if let Some(init) = a.get(3) {
-                        if !init.is_empty_marker() {
-                            match (int_literal(init), &desc) {
-                                (Some(0), _) => {}
-                                (Some(v), TyDesc::Scalar(t)) => {
-                                    let w = match t {
-                                        ValType::I32 | ValType::F32 => 4,
-                                        _ => 8,
-                                    };
-                                    self.data_inits
-                                        .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
-                                }
-                                _ => {
-                                    return Err(LengError::Unsupported(format!(
-                                        "non-scalar-int global initializer for `{name}`"
-                                    )))
-                                }
+                        if !init.is_empty_marker() && init.tag() != Some("nil") {
+                            if let Some(0) = int_literal(init) {
+                                // zero — the window is already zero-filled.
+                            } else if let (Some(v), TyDesc::Scalar(t)) = (int_literal(init), &desc)
+                            {
+                                let w = match t {
+                                    ValType::I32 | ValType::F32 => 4,
+                                    _ => 8,
+                                };
+                                self.data_inits
+                                    .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if init.as_atom().is_some() {
+                                // A **symbol** initializer — a proc pointer (`gExitFlush =
+                                // nimNoopFlush`) or another global's address. Its pointer value is
+                                // opaque in this model: we don't materialize usable proc addresses,
+                                // and an indirect call through it fail-closes. So reserve the scalar
+                                // slot zero-initialized; nimony's `ini`/setup writes the real pointer
+                                // before any use. (Relocating such an initializer to the referenced
+                                // symbol is a later refinement.)
+                            } else {
+                                return Err(LengError::Unsupported(format!(
+                                    "non-scalar-int global initializer for `{name}`"
+                                )));
                             }
                         }
                     }
@@ -299,14 +360,22 @@ impl Translator {
                         let name = sym_def(&a[0])?;
                         if let Some(v) = int_literal(&a[3]) {
                             self.consts.insert(name, v);
+                        } else if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                            // A constant aggregate with data (a `LongString` string-literal blob):
+                            // materialize its exact bytes into a data segment and register it as an
+                            // addressable global, so `(addr strlit…)` — the `string` value's `more`
+                            // pointer — resolves to it.
+                            let sz = bytes.len() as u64;
+                            self.data_inits.push((off, bytes));
+                            self.globals.insert(name, (off, desc));
+                            off += sz.max(8);
                         } else {
-                            // A non-scalar const — e.g. an `Rtti` vtable (`Type.vt`) or its RTTI
-                            // internals. Reserve an addressable, opaque placeholder global so
-                            // `(addr Type.vt)` yields a valid window address. Its bytes are never read
-                            // by translatable code (an object stores the vtable pointer, but only
-                            // *dynamic dispatch* reads through it, and that fail-closes), so a zeroed
-                            // fixed-size placeholder is sound — and we avoid resolving exotic RTTI
-                            // types (`flexarray`, external `Rtti`).
+                            // A non-scalar const we can't materialize — e.g. an `Rtti` vtable
+                            // (`Type.vt`) or its RTTI internals. Reserve an addressable, opaque
+                            // placeholder global so `(addr Type.vt)` yields a valid window address.
+                            // Its bytes are never read by translatable code (an object stores the
+                            // vtable pointer, but only *dynamic dispatch* reads through it, and that
+                            // fail-closes), so a zeroed fixed-size placeholder is sound.
                             const VT_PLACEHOLDER: u64 = 64;
                             self.globals
                                 .insert(name, (off, TyDesc::Scalar(ValType::I64)));
@@ -336,6 +405,109 @@ impl Translator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
         out
+    }
+
+    /// The module's **`exportc` symbols** as exports under their *C* names — the conventional entry
+    /// points a host or `svm-run` binds to (the C `main`, `cmdCount`, `cmdLine`, `nimEnviron`), in
+    /// addition to the mangled Leng names. A proc `(proc … (pragmas (exportc "cname") …) …)` exports
+    /// as a func under `cname`; a `gvar` with `(exportc "cname")` as a data symbol. Call after
+    /// translation (uses the populated proc/global tables). Path A: makes a whole-module object's
+    /// C-ABI surface findable (`svm-run --link` can enter at `main`).
+    pub fn exportc_exports(
+        &self,
+        root: &Node,
+    ) -> Result<(Vec<svm_ir::Export>, Vec<svm_ir::DataExport>), LengError> {
+        let mut procs = Vec::new();
+        let mut data = Vec::new();
+        for item in root.args() {
+            match item.tag() {
+                Some("proc") => {
+                    // `(proc :name params ret pragmas body)` — pragmas at index 3.
+                    if let Some(cname) = exportc_name(item.args().get(3)) {
+                        let local = sym_def(&item.args()[0])?;
+                        if let Some(sig) = self.procs.get(&local) {
+                            procs.push(svm_ir::Export {
+                                name: cname,
+                                func: sig.index,
+                            });
+                        }
+                    }
+                }
+                Some("gvar" | "tvar") => {
+                    // `(gvar :name pragmas type init)` — pragmas at index 1.
+                    if let Some(cname) = exportc_name(item.args().get(1)) {
+                        let local = sym_def(&item.args()[0])?;
+                        if let Some((off, _)) = self.globals.get(&local) {
+                            data.push(svm_ir::DataExport {
+                                name: cname,
+                                offset: *off,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((procs, data))
+    }
+
+    /// Materialize a **constant aggregate** value — `(oconstr AggType (kv field val)*)` — into its
+    /// little-endian window bytes, given the aggregate's (already resolved) layout. Scalar-int fields
+    /// write width-appropriate bytes at their offset; a **string literal** (a `LongString`'s `data`
+    /// flexible tail) writes its raw bytes there, growing the blob past the fixed size. Returns
+    /// `None` for anything outside that shape (a non-`oconstr`, an unresolved type, an unsupported
+    /// field value) so the caller falls back to an opaque placeholder. This is how a **long string
+    /// literal** lowers: nimony emits it as a `const` `LongString` blob that the `string` value's
+    /// `more` field points at (`(addr strlit…)`), NIM.md W2.
+    fn const_aggregate_bytes(&self, val: &Node) -> Result<Option<(Vec<u8>, TyDesc)>, LengError> {
+        if val.tag() != Some("oconstr") {
+            return Ok(None);
+        }
+        let a = val.args();
+        let tyname = match a.first().and_then(|n| n.as_atom()) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let (fields, base_size) = match self.types.get(tyname) {
+            Some(Layout::Object { fields, size }) => (fields.clone(), *size),
+            _ => return Ok(None),
+        };
+        let mut bytes = vec![0u8; base_size as usize];
+        for kv in &a[1..] {
+            if kv.tag() != Some("kv") {
+                continue;
+            }
+            let ka = kv.args();
+            if ka.len() < 2 {
+                continue;
+            }
+            let fname = ka[0]
+                .as_atom()
+                .ok_or_else(|| LengError::Malformed("const kv needs a field name".into()))?;
+            let (_, off, fdesc) = fields.iter().find(|(n, _, _)| n == fname).ok_or_else(|| {
+                LengError::Unsupported(format!("const field `{fname}` not in `{tyname}`"))
+            })?;
+            let off = *off as usize;
+            if let Some(v) = int_literal(&ka[1]) {
+                let w = match fdesc {
+                    TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
+                    _ => 8,
+                };
+                if bytes.len() < off + w {
+                    bytes.resize(off + w, 0);
+                }
+                bytes[off..off + w].copy_from_slice(&(v as u64).to_le_bytes()[..w]);
+            } else if is_string_literal(&ka[1]) {
+                let data = nif_str_bytes(ka[1].as_atom().unwrap())?;
+                if bytes.len() < off + data.len() {
+                    bytes.resize(off + data.len(), 0);
+                }
+                bytes[off..off + data.len()].copy_from_slice(&data);
+            } else {
+                return Ok(None); // an unsupported const field value — fall back to a placeholder
+            }
+        }
+        Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))))
     }
 
     /// Byte size of a type descriptor.
@@ -444,6 +616,15 @@ impl Translator {
                         return Err(LengError::Malformed("fld needs :name pragmas type".into()));
                     }
                     let fname = sym_def(&fa[0])?;
+                    // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
+                    // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
+                    // object's size stops here); a `const` materializes its bytes past the fixed
+                    // part. Record it at the current offset as an opaque pointer-width slot and stop
+                    // advancing.
+                    if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
+                        fields.push((fname, off, TyDesc::Scalar(ValType::I64)));
+                        continue;
+                    }
                     let fdesc = self.tydesc(&fa[2])?;
                     if let TyDesc::Agg(n) = &fdesc {
                         self.resolve_type(n, raw)?;
@@ -545,6 +726,15 @@ impl Translator {
 
     /// Translate a `(stmts TopLevelConstruct*)` module to SVM text (all procs).
     pub fn module(&mut self, root: &Node) -> Result<String, LengError> {
+        Ok(self.module_with_names(root)?.0)
+    }
+
+    /// Translate an **entire** module (every proc, in source order) to SVM text, also returning each
+    /// proc's **local name** in func-index order — the whole-module counterpart of [`some_procs`],
+    /// for compiling a real nimony module (all its scaffolding: `ini`, C `main`, the exportc gvars)
+    /// as a link object. The names feed the object's export table so *other* modules' cross-module
+    /// calls (`callee.<stem>`) resolve against it (NIM.md W2, Path A).
+    pub fn module_with_names(&mut self, root: &Node) -> Result<(String, Vec<String>), LengError> {
         if root.tag() != Some("stmts") {
             return Err(LengError::Malformed(format!(
                 "module root must be (stmts …), got {:?}",
@@ -554,6 +744,7 @@ impl Translator {
         self.collect_types(root)?;
         self.collect_globals(root)?;
         let mut proc_nodes = Vec::new();
+        let mut names = Vec::new();
         for item in root.args() {
             match item.tag() {
                 Some("proc") => {
@@ -563,7 +754,7 @@ impl Translator {
                     let index = proc_nodes.len() as u32;
                     let needs_frame = proc_needs_frame(item);
                     self.procs.insert(
-                        name,
+                        name.clone(),
                         Sig {
                             index,
                             params,
@@ -572,6 +763,7 @@ impl Translator {
                             sret,
                         },
                     );
+                    names.push(name);
                     proc_nodes.push(item);
                 }
                 Some("type" | "gvar" | "tvar" | "const") => {} // handled by collect_types/globals
@@ -592,7 +784,7 @@ impl Translator {
         for p in &proc_nodes {
             used_memory |= self.proc_body(p, &mut out)?;
         }
-        Ok(self.assemble(used_memory, out))
+        Ok((self.assemble(used_memory, out), names))
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -2037,6 +2229,29 @@ impl<'a> FuncGen<'a> {
                         ty: ValType::I64,
                     })
                 }
+                Some("suf") => {
+                    // A **suffixed literal** — `255'i64`, `1.5'f32` — value then a `"type"` tag.
+                    let a = e.args();
+                    if a.len() < 2 {
+                        return Err(LengError::Malformed(
+                            "suf needs a literal and a type".into(),
+                        ));
+                    }
+                    let ty = suf_val_ty(a[1].as_atom().unwrap_or(""));
+                    if is_float(ty) {
+                        let f = a[0]
+                            .as_atom()
+                            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
+                            .ok_or_else(|| {
+                                LengError::Unsupported("non-float suf literal".into())
+                            })?;
+                        Ok(self.emit_fconst(ty, f))
+                    } else {
+                        let n = int_literal(&a[0])
+                            .ok_or_else(|| LengError::Unsupported("non-int suf literal".into()))?;
+                        Ok(self.emit_const(ty, n))
+                    }
+                }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
                 Some("call") => self.call(e, true), // expression position: a value is wanted
@@ -2626,5 +2841,20 @@ fn parse_int(s: &str) -> Result<i64, ()> {
 
 /// The integer value of an atom literal node, if it is one.
 fn int_literal(node: &Node) -> Option<i64> {
+    if node.tag() == Some("suf") {
+        // A suffixed integer literal `N'iXX` in constant position — the value is the first son.
+        return node.args().first().and_then(int_literal);
+    }
     node.as_atom().and_then(|s| parse_int(s).ok())
+}
+
+/// The value type of a NIF literal **suffix** (`"i64"`, `"u8"`, `"f32"`, …): floats map to
+/// `f32`/`f64`; a `64`-wide integer to `i64`; everything else (narrower ints, `char`) to `i32`.
+fn suf_val_ty(s: &str) -> ValType {
+    match s.trim_matches('"') {
+        "f32" => ValType::F32,
+        "f64" => ValType::F64,
+        t if t.ends_with("64") => ValType::I64,
+        _ => ValType::I32,
+    }
 }
