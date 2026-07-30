@@ -165,7 +165,23 @@ pub(crate) enum TyDesc {
         bytes: u8,
         signed: bool,
     },
+    /// A **typed pointer** — value type `i64`, but carrying what it points at, so a `deref` of a
+    /// *computed* pointer (a pointer-valued field, `(deref (dot s more))`) recovers the pointee's
+    /// layout. nimony's ARC ops walk `string.more → LongString.rc` this way.
+    Ptr(Box<TyDesc>),
     Agg(String),
+}
+
+impl TyDesc {
+    /// The machine type of a value held in one SSA slot / scalar memory cell (a pointer is `i64`);
+    /// `None` for a `Narrow` char cell or an aggregate (handled on their own paths).
+    fn scalar_ty(&self) -> Option<ValType> {
+        match self {
+            TyDesc::Scalar(t) => Some(*t),
+            TyDesc::Ptr(_) => Some(ValType::I64),
+            _ => None,
+        }
+    }
 }
 
 /// The in-memory layout of a named aggregate type (`(type :Name … Body)`).
@@ -524,6 +540,7 @@ impl Translator {
         match d {
             TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
             TyDesc::Scalar(_) => 8,
+            TyDesc::Ptr(_) => 8,
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
@@ -536,7 +553,12 @@ impl Translator {
     /// scalar `i64` (the pointer itself); otherwise an integer scalar.
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
         match node.tag() {
-            Some("ptr") | Some("aptr") => Ok(TyDesc::Scalar(ValType::I64)),
+            // A **typed pointer**: value type `i64`, carrying the pointee for `deref`. A pointer to
+            // an opaque/void pointee (`(ptr (void))`, `(ptr)`) stays a bare `i64` scalar.
+            Some("ptr") | Some("aptr") => match node.args().first() {
+                Some(t) if t.tag() != Some("void") => Ok(TyDesc::Ptr(Box::new(self.tydesc(t)?))),
+                _ => Ok(TyDesc::Scalar(ValType::I64)),
+            },
             Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
             // A sub-word integer (`u8`/`i8`/`u16`/`i16`, `char`) is a `Narrow` scalar — loaded and
             // stored at its true width, not widened to a 4/8-byte access.
@@ -1094,9 +1116,9 @@ impl Translator {
                     mem.insert(vn.clone(), (frame_size, desc.clone()));
                     frame_size += sz;
                 }
-            } else if let TyDesc::Scalar(vt) = desc {
+            } else if let Some(vt) = desc.scalar_ty() {
                 if !ssa_vars.iter().any(|(n, _)| n == vn) {
-                    ssa_vars.push((vn.clone(), *vt));
+                    ssa_vars.push((vn.clone(), vt));
                 }
             }
         }
@@ -1389,22 +1411,29 @@ impl<'a> FuncGen<'a> {
     /// Read a scalar local by name: a frame scalar emits a `load` at `sp+off`; an SSA slot returns
     /// its current value. Aggregate frame locals return `None` (not a scalar rvalue).
     fn read_local(&mut self, name: &str) -> Option<Val> {
-        if let Some((off, TyDesc::Scalar(ty))) = self.mem.get(name).cloned() {
-            let sp = self.cur[0];
-            let id = self.fresh();
-            self.used_memory = true;
-            self.cur_buf.push_str(&format!(
-                "  v{id} = {}.load v{sp} offset={off}\n",
-                prefix(ty)
-            ));
-            return Some(Val { id, ty });
+        if let Some((off, desc)) = self.mem.get(name).cloned() {
+            if let Some(ty) = desc.scalar_ty() {
+                let sp = self.cur[0];
+                let id = self.fresh();
+                self.used_memory = true;
+                self.cur_buf.push_str(&format!(
+                    "  v{id} = {}.load v{sp} offset={off}\n",
+                    prefix(ty)
+                ));
+                return Some(Val { id, ty });
+            }
         }
         self.lookup(name)
     }
 
     /// Write a scalar local by name: a frame scalar emits a `store`; an SSA slot rebinds.
     fn write_local(&mut self, name: &str, v: Val) -> Result<(), LengError> {
-        if let Some((off, TyDesc::Scalar(ty))) = self.mem.get(name).cloned() {
+        if let Some((off, ty)) = self
+            .mem
+            .get(name)
+            .cloned()
+            .and_then(|(off, d)| d.scalar_ty().map(|t| (off, t)))
+        {
             let val = if v.ty != ty { self.convert(v, ty) } else { v };
             let sp = self.cur[0];
             self.used_memory = true;
@@ -1485,7 +1514,20 @@ impl<'a> FuncGen<'a> {
                             }
                         }
                     }
-                    Err(LengError::Unsupported("deref of non-symbol".into()))
+                    // A **pointer-valued lvalue**: `(deref (dot s more))` — a typed-pointer field.
+                    // Load the pointer value at the field's address; its pointee is the address of
+                    // the target aggregate. Walks `string.more → LongString` for the ARC ops.
+                    let (laddr, ldesc) = self.lvalue_addr(operand)?;
+                    if let TyDesc::Ptr(pointee) = ldesc {
+                        let pv = self.fresh();
+                        self.used_memory = true;
+                        self.cur_buf
+                            .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
+                        return Ok((pv, *pointee));
+                    }
+                    Err(LengError::Unsupported(
+                        "deref of non-pointer expression".into(),
+                    ))
                 }
                 Some("dot") => {
                     let a = node.args();
@@ -1536,6 +1578,16 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  v{id} = {}.load v{addr}\n", prefix(ty)));
                 Ok(Val { id, ty })
             }
+            TyDesc::Ptr(_) => {
+                let id = self.fresh();
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  v{id} = i64.load v{addr}\n"));
+                Ok(Val {
+                    id,
+                    ty: ValType::I64,
+                })
+            }
             TyDesc::Narrow { bytes, signed } => {
                 // A sub-word load, widened to `i32` (`i32.load8_u` / `load16_s` / …).
                 let id = self.fresh();
@@ -1567,6 +1619,7 @@ impl<'a> FuncGen<'a> {
         }
         let ty = match desc {
             TyDesc::Scalar(t) => t,
+            TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
             TyDesc::Agg(n) => {
                 return Err(LengError::Unsupported(format!(
@@ -1768,6 +1821,13 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  i32.store{} v{addr} v{}\n", bytes * 8, v.id));
                 Ok(())
             }
+            TyDesc::Ptr(_) => {
+                let v = self.expr_typed(expr, ValType::I64)?;
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  i64.store v{addr} v{}\n", v.id));
+                Ok(())
+            }
             TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
         }
     }
@@ -1855,7 +1915,7 @@ impl<'a> FuncGen<'a> {
                 }
                 let ty = val_ty(&a[2])?;
                 let v = match a.get(3) {
-                    Some(init) if !init.is_empty_marker() => self.expr(init)?,
+                    Some(init) if !init.is_empty_marker() => self.expr_typed(init, ty)?,
                     _ => self.emit_const(ty, 0),
                 };
                 self.write_local(&name, v)
@@ -1885,7 +1945,7 @@ impl<'a> FuncGen<'a> {
                 Ok(())
             }
             Some("call") => {
-                self.call(s, false)?; // statement position: result (if any) discarded
+                self.call(s, None)?; // statement position: result (if any) discarded
                 Ok(())
             }
             Some("if") => self.if_stmt(s),
@@ -2332,7 +2392,7 @@ impl<'a> FuncGen<'a> {
                 }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
-                Some("call") => self.call(e, true), // expression position: a value is wanted
+                Some("call") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
                     other.unwrap_or("<headless>")
@@ -2349,7 +2409,13 @@ impl<'a> FuncGen<'a> {
                 }
             }
         }
-        let v = self.expr(e)?;
+        // A call in typed position hands `want` down as the return hint, so a cross-module callee's
+        // import is declared returning exactly this type (not a guessed `i64`).
+        let v = if e.tag() == Some("call") {
+            self.call(e, Some(want))?
+        } else {
+            self.expr(e)?
+        };
         Ok(if v.ty != want {
             self.convert(v, want)
         } else {
@@ -2450,9 +2516,11 @@ impl<'a> FuncGen<'a> {
     }
 
     /// `(call Callee Expr*)` — a direct call to a module proc, or an SVM `import` for a cross-module
-    /// callee. `want_value` distinguishes expr position (a result) from stmt position (discarded /
-    /// void) so an external callee's import signature gets the right return arity.
-    fn call(&mut self, e: &Node, want_value: bool) -> Result<Val, LengError> {
+    /// callee. `ret_hint` is the type the result is wanted as (from the enclosing `expr_typed`), or
+    /// `None` in statement position (result discarded / void) — it fixes an **import**'s declared
+    /// return type, so a `bool`-returning cross-module callee (`arcDec`) is `(…) -> (i32)`, not a
+    /// mis-guessed `i64` the linker would reject against the real proc.
+    fn call(&mut self, e: &Node, ret_hint: Option<ValType>) -> Result<Val, LengError> {
         let a = e.args();
         if a.is_empty() {
             return Err(LengError::Malformed("call needs a callee".into()));
@@ -2462,7 +2530,7 @@ impl<'a> FuncGen<'a> {
         })?;
         // Cross-module callee (not defined in this module) → an SVM import.
         if !self.t.procs.contains_key(callee) {
-            return self.call_import(callee, &a[1..], want_value);
+            return self.call_import(callee, &a[1..], ret_hint);
         }
         // An aggregate-returning call must flow to an aggregate destination (`asgn`/`var`/`ret`),
         // which routes through `call_sret`. Reaching plain `call` means it was used as a scalar
@@ -2604,7 +2672,7 @@ impl<'a> FuncGen<'a> {
         &mut self,
         name: &str,
         args: &[Node],
-        want_value: bool,
+        ret: Option<ValType>,
     ) -> Result<Val, LengError> {
         let mut argvals = Vec::new();
         let mut argtys = Vec::new();
@@ -2620,7 +2688,6 @@ impl<'a> FuncGen<'a> {
                 argtys.push(v.ty);
             }
         }
-        let ret = if want_value { Some(ValType::I64) } else { None };
         let slot = self.t.register_import(name, &argtys, ret)?;
         let arglist = argvals
             .iter()

@@ -57,3 +57,110 @@ fn real_system_wasmoved_runs() {
     assert_eq!(bytes, 0, "real =wasMoved zeroed string.bytes");
     assert_eq!(more, 7, "=wasMoved touches only `bytes`, not `more`");
 }
+
+/// The real `=destroy` (string ARC destructor, verbatim from `system/stringimpl.nim`): if the low
+/// byte of `bytes` is the long-string tag `255`, it decrements the `LongString`'s refcount
+/// (`arcDec(&s.more.rc)`) and, if that hits zero, `dealloc(s.more)`. Exercising it end-to-end
+/// stresses everything this PR added — the `u8` tag load through a `(cast (ptr u8) …)`, and the
+/// **typed-pointer walk** `s.more → LongString.rc`. Linked against `arcDec`/`dealloc` stubs; both
+/// engines.
+#[test]
+fn real_system_destroy_walks_the_longstring() {
+    const SYSTEM: &str = include_str!("fixtures/real_system_arc.leng.nif");
+    // `arcDec(p)` writes a marker through its pointer (so we can prove it got `&s.more.rc`) and
+    // returns true → `dealloc` runs. `dealloc` is a no-op. Empty stem: these are intra-`system`
+    // names `=destroy` calls bare (`arcDec.0.`/`dealloc.1.`), so they must export unqualified.
+    let stubs = "\
+(stmts
+ (proc :arcDec.0. (params (param :p.0 . (ptr (i +64)))) (bool) .
+  (stmts . (asgn (deref p.0) 48879) (ret (true))))
+ (proc :dealloc.1. (params (param :p.0 . (i +64))) . . (stmts . (ret .))))";
+    let driver = "\
+(stmts
+ (proc :del.0. (params (param :p.0 . (i +64))) . .
+  (stmts . (call =destroy.2.sysvq0asl p.0))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "drv",
+            src: driver,
+            names: &["del.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: SYSTEM,
+            names: &["=destroy.2."],
+        },
+        LengModule {
+            stem: "",
+            src: stubs,
+            names: &["arcDec.0.", "dealloc.1."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link real =destroy: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    // A "long" string at `s`: low byte of `bytes` = 255 (the tag), `more` → a LongString blob at `b`.
+    let (s, b) = (256usize, 512usize);
+    let mut seed = vec![0u8; 4096];
+    seed[s] = 255; // bytes low byte = long-string tag
+    seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes()); // more → blob
+
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &[Value::I64(s as i64)], &mut fuel, &seed);
+    ir.expect("interp del");
+    let (_j, jmem) = svm_jit::compile_and_run_capture(&linked, 0, &[s as i64], &seed).expect("jit");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+
+    // arcDec wrote its marker at `&s.more.rc` = blob + 8 (rc@8) — proving the typed-pointer walk
+    // `s.more → LongString.rc` computed the right address.
+    let rc = u64::from_le_bytes(imem[b + 8..b + 16].try_into().unwrap());
+    assert_eq!(rc, 48879, "arcDec ran on &s.more.rc (blob+8)");
+}
+
+/// The same real `=destroy` on a **short** string (low byte ≠ the `255` tag) takes the other branch:
+/// it must do nothing — no refcount touch, no dealloc. Proves the `u8` tag comparison actually gates
+/// the ARC path.
+#[test]
+fn real_system_destroy_short_string_is_noop() {
+    const SYSTEM: &str = include_str!("fixtures/real_system_arc.leng.nif");
+    let stubs = "\
+(stmts
+ (proc :arcDec.0. (params (param :p.0 . (ptr (i +64)))) (bool) .
+  (stmts . (asgn (deref p.0) 48879) (ret (true))))
+ (proc :dealloc.1. (params (param :p.0 . (i +64))) . . (stmts . (ret .))))";
+    let driver = "\
+(stmts
+ (proc :del.0. (params (param :p.0 . (i +64))) . .
+  (stmts . (call =destroy.2.sysvq0asl p.0))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "drv",
+            src: driver,
+            names: &["del.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: SYSTEM,
+            names: &["=destroy.2."],
+        },
+        LengModule {
+            stem: "",
+            src: stubs,
+            names: &["arcDec.0.", "dealloc.1."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+
+    let (s, b) = (256usize, 512usize);
+    let mut seed = vec![0u8; 4096];
+    seed[s] = 0x68; // low byte of a packed SSO word ("h") — not the long tag
+    seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes());
+
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &[Value::I64(s as i64)], &mut fuel, &seed);
+    ir.expect("interp del");
+    // The blob's rc stays 0 — the short-string branch never called arcDec.
+    let rc = u64::from_le_bytes(imem[b + 8..b + 16].try_into().unwrap());
+    assert_eq!(rc, 0, "short string: no arcDec, no dealloc");
+}
