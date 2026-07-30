@@ -72,6 +72,38 @@ fn bitwise_and_shift_ops() {
 }
 
 #[test]
+fn narrow_int_local() {
+    // A sub-word (`i8`) local — like `system`'s `min`/`max` result — now gets its own (i32) SSA slot
+    // and can be assigned in both `if` branches, then widened on return. min(3,5)=3, min(200,5)=5.
+    let leng = "\
+(stmts
+ (proc :m.0 (params (param :x.0 . (i +64)) (param :y.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i 8) .)
+   (if (elif (le x.0 y.0) (stmts . (asgn r.0 x.0)))
+       (else (stmts . (asgn r.0 y.0))))
+   (ret (conv (i +64) r.0)))))";
+    assert_eq!(run_i64(leng, 0, &[3, 5]), 3);
+    assert_eq!(run_i64(leng, 0, &[100, 5]), 5);
+}
+
+#[test]
+fn bool_case_values() {
+    // `case` over a bool branches on `(true)`/`(false)` literals (system's `$` for bool).
+    let leng = "\
+(stmts
+ (proc :b.0 (params (param :e.0 . (bool))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (case e.0
+    (of (ranges (false)) (stmts . (asgn r.0 10)))
+    (of (ranges (true)) (stmts . (asgn r.0 20))))
+   (ret r.0))))";
+    assert_eq!(run_i64(leng, 0, &[0]), 10);
+    assert_eq!(run_i64(leng, 0, &[1]), 20);
+}
+
+#[test]
 fn char_literals() {
     // nimony emits char literals as `'c'` / `'\HH'`. `'0'` = 48, `'\0A'` = 10; 48 + 10 = 58.
     let leng = "\

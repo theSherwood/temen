@@ -1135,6 +1135,12 @@ impl Translator {
                 if !ssa_vars.iter().any(|(n, _)| n == vn) {
                     ssa_vars.push((vn.clone(), vt));
                 }
+            } else if matches!(desc, TyDesc::Narrow { .. }) {
+                // A sub-word (`i8`/`i16`) local not address-taken lives in an `i32` SSA slot — the
+                // narrow width only matters when it crosses memory.
+                if !ssa_vars.iter().any(|(n, _)| n == vn) {
+                    ssa_vars.push((vn.clone(), ValType::I32));
+                }
             }
         }
         let needs_frame = !mem.is_empty();
@@ -1427,8 +1433,21 @@ impl<'a> FuncGen<'a> {
     /// its current value. Aggregate frame locals return `None` (not a scalar rvalue).
     fn read_local(&mut self, name: &str) -> Option<Val> {
         if let Some((off, desc)) = self.mem.get(name).cloned() {
+            let sp = self.cur[0];
+            if let TyDesc::Narrow { bytes, signed } = desc {
+                let id = self.fresh();
+                self.used_memory = true;
+                let ext = if signed { 's' } else { 'u' };
+                self.cur_buf.push_str(&format!(
+                    "  v{id} = i32.load{}_{ext} v{sp} offset={off}\n",
+                    bytes * 8
+                ));
+                return Some(Val {
+                    id,
+                    ty: ValType::I32,
+                });
+            }
             if let Some(ty) = desc.scalar_ty() {
-                let sp = self.cur[0];
                 let id = self.fresh();
                 self.used_memory = true;
                 self.cur_buf.push_str(&format!(
@@ -1443,6 +1462,21 @@ impl<'a> FuncGen<'a> {
 
     /// Write a scalar local by name: a frame scalar emits a `store`; an SSA slot rebinds.
     fn write_local(&mut self, name: &str, v: Val) -> Result<(), LengError> {
+        if let Some((off, TyDesc::Narrow { bytes, .. })) = self.mem.get(name).cloned() {
+            let val = if v.ty != ValType::I32 {
+                self.convert(v, ValType::I32)
+            } else {
+                v
+            };
+            let sp = self.cur[0];
+            self.used_memory = true;
+            self.cur_buf.push_str(&format!(
+                "  i32.store{} v{sp} v{} offset={off}\n",
+                bytes * 8,
+                val.id
+            ));
+            return Ok(());
+        }
         if let Some((off, ty)) = self
             .mem
             .get(name)
@@ -3067,9 +3101,13 @@ fn parse_int(s: &str) -> Result<i64, ()> {
 
 /// The integer value of an atom literal node, if it is one.
 fn int_literal(node: &Node) -> Option<i64> {
-    if node.tag() == Some("suf") {
-        // A suffixed integer literal `N'iXX` in constant position — the value is the first son.
-        return node.args().first().and_then(int_literal);
+    match node.tag() {
+        // A suffixed integer literal `N'iXX` in constant position — value is the first son.
+        Some("suf") => return node.args().first().and_then(int_literal),
+        // Boolean literals are integer-valued (`case` over a bool branches on `(true)`/`(false)`).
+        Some("true") => return Some(1),
+        Some("false") => return Some(0),
+        _ => {}
     }
     node.as_atom()
         .and_then(|s| parse_int(s).ok().or_else(|| char_literal(s)))
