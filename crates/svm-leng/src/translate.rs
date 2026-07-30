@@ -219,6 +219,11 @@ pub(crate) struct Translator {
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
     /// type (`enum`, `distinct` int, `proctype`, opaque/external) is an integer scalar.
     agg_names: std::collections::HashSet<String>,
+    /// Named-type **pointer aliases** — a `(type :RootRef … (ptr T))` declares `RootRef` as an alias
+    /// for a typed pointer. Without this, a bare-symbol type not in `agg_names` falls back to a plain
+    /// `i64` scalar, so a param typed `RootRef` wouldn't `deref`. Records the resolved `TyDesc::Ptr`
+    /// (or any non-scalar alias) so `tydesc` recovers the pointee for `deref`/`dot`.
+    ty_aliases: HashMap<String, TyDesc>,
     /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
     /// starts zeroed); non-zero initializers are a later slice.
     globals: HashMap<String, (u64, TyDesc)>,
@@ -251,6 +256,7 @@ impl Translator {
             procs: HashMap::new(),
             types: HashMap::new(),
             agg_names: std::collections::HashSet::new(),
+            ty_aliases: HashMap::new(),
             data_inits: Vec::new(),
             data_ptrs: Vec::new(),
             globals_top: 16,
@@ -739,8 +745,13 @@ impl Translator {
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
                 // A bare-symbol type is an aggregate only if it's a declared object/array; any other
-                // named type (enum, distinct int, proctype, opaque external) is an integer scalar.
+                // named type (enum, distinct int, proctype, opaque external) is an integer scalar —
+                // unless it's a declared pointer alias (`(type :RootRef … (ptr T))`), which carries a
+                // typed pointee so `deref` works.
                 Some(name) if self.agg_names.contains(name) => Ok(TyDesc::Agg(name.to_string())),
+                Some(name) if self.ty_aliases.contains_key(name) => {
+                    Ok(self.ty_aliases[name].clone())
+                }
                 Some(_) => Ok(TyDesc::Scalar(ValType::I64)),
                 None => Err(LengError::Malformed("expected a type".into())),
             },
@@ -768,8 +779,35 @@ impl Translator {
                 .map(|(n, _)| n.clone()),
         );
         let names: Vec<String> = raw.keys().cloned().collect();
-        for name in names {
-            self.resolve_type(&name, &raw)?;
+        for name in &names {
+            self.resolve_type(name, &raw)?;
+        }
+        // Record named-type **pointer aliases** (`(type :RootRef … (ptr T))`) so a param/field typed
+        // by that name resolves to a typed pointer, not a bare `i64`. A fixpoint handles one alias
+        // naming another (`(type :A . B)` where `B` is itself a ptr alias); it converges once no new
+        // alias resolves. Object/array names are excluded — those are aggregates, handled above.
+        loop {
+            let mut progress = false;
+            for name in &names {
+                if self.agg_names.contains(name) || self.ty_aliases.contains_key(name) {
+                    continue;
+                }
+                let body = raw[name];
+                let desc = match body.tag() {
+                    Some("ptr") | Some("aptr") => self.tydesc(body)?,
+                    // A bare-symbol alias to a name we've already recognized as a pointer alias.
+                    None => match body.as_atom().and_then(|s| self.ty_aliases.get(s)) {
+                        Some(d) => d.clone(),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                self.ty_aliases.insert(name.clone(), desc);
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
         }
         Ok(())
     }
@@ -1227,11 +1265,11 @@ impl Translator {
     /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at. A `void`/opaque pointee has
     /// no typed target (a `deref` of it fail-closes), so it yields `None`.
     fn pointee_desc(&self, node: &Node) -> Result<Option<TyDesc>, LengError> {
-        match node.tag() {
-            Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) if t.tag() != Some("void") => Ok(Some(self.tydesc(t)?)),
-                _ => Ok(None),
-            },
+        // A typed pointer — whether written inline as `(ptr T)`/`(aptr T)` or named via a pointer
+        // alias (`(type :RootRef … (ptr T))`) — resolves through `tydesc` to `TyDesc::Ptr(pointee)`.
+        // An opaque `(ptr (void))` is a bare `i64` scalar (no pointee to track).
+        match self.tydesc(node)? {
+            TyDesc::Ptr(pointee) => Ok(Some(*pointee)),
             _ => Ok(None),
         }
     }

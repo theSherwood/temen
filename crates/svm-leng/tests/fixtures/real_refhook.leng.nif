@@ -1,0 +1,26 @@
+(stmts
+ (type :Rtti.0. . (object . (fld :dummy.0 . (i +64))))
+ (type :RootObj.0. . (object . (fld :vt.00 . (ptr Rtti.0.))))
+ (type :`t.0.IArefSX52ootX4fbj0sysvq0asl. . (object . (fld :r.00 . (i +64)) (fld :d.00 . RootObj.0.)))
+ (type :RootRef.0. . (ptr `t.0.IArefSX52ootX4fbj0sysvq0asl.))
+ (proc :arcInc.0. (params (param :p.0 . (ptr (i +64)))) . .
+  (stmts .
+   (asgn (deref p.0) (add (i +64) (deref p.0) 1))))
+ (proc :=dup_SX52ootX52ef0sysvq0asl.0.
+  (params (param :src.0 . RootRef.0.)) RootRef.0. .
+  (stmts .
+   (var :dest.0 . RootRef.0. .)
+   (if
+    (elif src.0
+     (stmts
+      (call arcInc.0.
+       (addr
+        (dot
+         (deref src.0)r.00 0))))))
+   (asgn dest.0 src.0)
+   (ret dest.0)))
+ (proc :dupDriver.0. (params (param :r.0 . RootRef.0.)) (i +64) .
+  (stmts .
+   (var :d.0 . RootRef.0.
+    (call =dup_SX52ootX52ef0sysvq0asl.0. r.0))
+   (ret (dot (deref d.0)r.00 0)))))

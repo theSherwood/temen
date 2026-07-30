@@ -296,3 +296,42 @@ fn real_long_string_end_to_end_against_real_arc() {
         "the literal, read back through real ARC + a relocated pointer"
     );
 }
+
+/// A **`ref`-type ARC hook** — nimony compiles a `ref object` destructor/`=dup` whose parameter is
+/// typed by a *named pointer alias* (`RootRef = (ptr t.0.IAref…)`), not an inline `(ptr …)`. Real
+/// bytes: the `=dup` hook (from `system/arcops.nim`) takes a bare `RootRef` `src`, and if non-nil
+/// does `arcInc(&src.r)` before returning it. Without pointer-alias resolution the bare-named param
+/// is a plain `i64` scalar and `(deref src)` fails "not a known pointer". This drives the real hook
+/// against an `arcInc` stub that bumps the refcount word, on both engines.
+#[test]
+fn real_ref_type_dup_hook_increments_refcount() {
+    const R: &str = include_str!("fixtures/real_refhook.leng.nif");
+    let m = svm_leng::translate(R).unwrap_or_else(|e| panic!("translate ref hook: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    // A ref target at offset 256 whose `r` (refcount) word is 5. dupDriver derefs the aliased
+    // pointer, `arcInc` bumps `r` (5 → 6), and reads it back through the returned (== src) pointer.
+    let r = 256usize;
+    let mut seed = vec![0u8; 4096];
+    seed[r..r + 8].copy_from_slice(&5u64.to_le_bytes());
+
+    // dupDriver is func 2 (arcInc = 0, =dup = 1): (refptr) -> incremented refcount.
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&m, 2, &[Value::I64(r as i64)], &mut fuel, &seed);
+    let ival = ir.expect("interp dupDriver");
+    let (jout, jmem) = svm_jit::compile_and_run_capture(&m, 2, &[r as i64], &seed).expect("jit");
+    let jval = match jout {
+        svm_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    let iword = match ival.as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("unexpected {o:?}"),
+    };
+    assert_eq!(vec![iword], jval, "§9 interp/JIT parity");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+    assert_eq!(iword, 6, "arcInc bumped the refcount through the aliased ref pointer");
+    let rc = u64::from_le_bytes(imem[r..r + 8].try_into().unwrap());
+    assert_eq!(rc, 6, "the refcount word was incremented in place");
+}

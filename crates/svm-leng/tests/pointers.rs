@@ -61,6 +61,45 @@ fn store_stmt_reversed_operands() {
 }
 
 #[test]
+fn named_pointer_alias_type_derefs() {
+    // A named type that aliases a pointer — `(type :NodeRef … (ptr Node))` — must be treated as a
+    // typed pointer, so a param/field declared with that bare name can `deref`. This is exactly the
+    // shape the real system module uses for `ref` types (`RootRef = (ptr t.0.IAref…)`), whose ARC
+    // hooks take a bare `RootRef`-typed param and `(deref)` it. Without alias resolution the param
+    // is a plain `i64` scalar and the deref fails "not a known pointer".
+    let leng = "\
+(stmts
+ (type :Node.0. . (object . (fld :val.0 . (i +64)) (fld :nxt.0 . NodeRef.0.)))
+ (type :NodeRef.0. . (ptr Node.0.))
+ (proc :nodeVal.0 (params (param :n.0 . NodeRef.0.)) (i +64) .
+  (stmts .
+   (ret (dot (deref n.0) val.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // Store val = 42 at window offset 128 (the Node's `val` field is at offset 0), then read it back
+    // through the aliased pointer. The window starts zeroed; write 42 via a helper store is awkward,
+    // so instead point `n` at an offset we pre-seed by round-tripping through a sibling proc is
+    // overkill — the zeroed window gives val == 0, and a distinct non-zero check follows.
+    assert_eq!(run(&m, 0, &[128]), 0);
+}
+
+#[test]
+fn named_pointer_alias_stores_through_field() {
+    // Round-trip through an aliased-pointer param: write then read the pointee's field. Proves the
+    // alias resolves to a *typed* pointer whose pointee object layout is recovered for `dot`.
+    let leng = "\
+(stmts
+ (type :Cell.0. . (object . (fld :v.0 . (i +64))))
+ (type :CellRef.0. . (ptr Cell.0.))
+ (proc :setget.0 (params (param :c.0 . CellRef.0.) (param :x.0 . (i +64))) (i +64) .
+  (stmts .
+   (asgn (dot (deref c.0) v.0 0) x.0)
+   (ret (dot (deref c.0) v.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[64, 42]), 42);
+    assert_eq!(run(&m, 0, &[256, -9]), -9);
+}
+
+#[test]
 fn no_memory_decl_without_pointers() {
     // A pure-integer proc must NOT declare a window (memory only appears when actually used).
     let leng = "(stmts (proc :id.0 (params (param :x.0 . (i +64))) (i +64) . (stmts . (ret x.0))))";
