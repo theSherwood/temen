@@ -4117,6 +4117,91 @@ impl Scheduler {
             false
         }
     }
+
+    /// FORK.md PR 1 increment 3b — the **targeted clone**. The caller parked on `(callee_id, ticket)`
+    /// is a whole parked vCPU (a root/child caller → [`Waiter::VCpu`]); build a live [`VCpu::fork_twin`]
+    /// of it over a **private** window ([`Mem::fork_private`]) and a **duplicated** powerbox
+    /// ([`Host::fork_powerbox`]), deliver `reply_orig` to the original and `reply_twin` to the twin
+    /// (each reloads it as the fork `cap.call`'s result and resumes **past** the call), enqueue both,
+    /// and return the twin's `TaskId` (the servicer's `child_handle`). This is `fork()`'s return-twice
+    /// in one live run.
+    ///
+    /// Returns `None` — the caller then falls back to a single reply (increment 2), so it never hangs —
+    /// when the fork cannot be done: no parked-vCPU caller (a [`Waiter::Fiber`] caller is a follow-up),
+    /// the live cap is hit, the domain isn't a simple forkable shape (`fork_powerbox`/`fork_private`
+    /// fail closed), or the caller isn't a bare root park (has children/fibers — not yet supported).
+    fn fork_parked_caller(
+        self: &Arc<Self>,
+        callee_id: usize,
+        ticket: u64,
+        reply_orig: i64,
+        reply_twin: i64,
+    ) -> Option<i64> {
+        let mut s = self.lock();
+        if s.live >= self.cap || s.shutdown {
+            return None;
+        }
+        // Only a whole parked vCPU is forkable this slice; anything else stays put.
+        let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
+            Some(Waiter::VCpu(v)) => v,
+            Some(other) => {
+                s.ticket_waiters.insert((callee_id, ticket), other);
+                return None;
+            }
+            None => return None,
+        };
+        // A bare root park with no children/fibers is the only shape `fork_twin` duplicates faithfully.
+        let bare = v.cur == ROOT_FIBER
+            && v.chain.as_slice() == [ROOT_FIBER]
+            && v.root_parked.is_none()
+            && v.threads.is_empty()
+            && v.coroutines.is_empty()
+            && v.nested_children.is_empty()
+            && v.child_hosts.is_empty()
+            && !v.registry.has_blocked_parks();
+        macro_rules! put_back_none {
+            () => {{
+                s.ticket_waiters
+                    .insert((callee_id, ticket), Waiter::VCpu(v));
+                return None;
+            }};
+        }
+        if !bare {
+            put_back_none!();
+        }
+        // Private window copy (fork does not share memory) — fails closed on a non-`snapshot_safe` window.
+        let twin_mem = match &v.mem {
+            Some(m) => match m.fork_private() {
+                Some(tm) => Some(tm),
+                None => put_back_none!(),
+            },
+            None => None,
+        };
+        // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
+        // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
+        let twin_host = {
+            let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+            match hg.fork_powerbox() {
+                Some(h) => Arc::new(Mutex::new(h)),
+                None => {
+                    drop(hg);
+                    put_back_none!();
+                }
+            }
+        };
+        let twin_id = s.next_task;
+        s.next_task += 1;
+        s.live += 1;
+        let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
+        twin.pending = Some(Pending::CapResult(reply_twin));
+        s.runnable.push_back(twin);
+        // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
+        v.pending = Some(Pending::CapResult(reply_orig));
+        s.runnable.push_back(v);
+        self.maybe_spawn_worker(&mut s);
+        self.work.notify_all();
+        Some(twin_id as i64)
+    }
 }
 
 /// Move any expired `wait` timers' vCPUs back to the run-queue with a timed-out status. (A waiter
@@ -6813,6 +6898,67 @@ impl VCpu {
         }
     }
 
+    /// FORK.md PR 1 increment 3b — build a live `fork()` **twin** of this parked caller vCPU. The twin
+    /// resumes the *same* continuation (`frames`) at the fork `cap.call`'s post-call resume point over a
+    /// **private** window (`twin_mem`) and a **duplicated** powerbox (`twin_host`), as its **own domain**
+    /// (fresh fiber registry, new `id`/`tls`). `pending` is left `None` — the caller sets
+    /// `CapResult(reply_twin)` so the reload delivers the twin's reply. Only ever called on a caller
+    /// parked at its root on a `cap.call` (`cur == ROOT_FIBER`, no children/fibers — checked by
+    /// [`Scheduler::fork_parked_caller`]), so the child/serve/fiber fields start empty.
+    fn fork_twin(
+        &self,
+        new_id: TaskId,
+        twin_mem: Option<Mem>,
+        twin_host: Arc<Mutex<Host>>,
+    ) -> Box<VCpu> {
+        Box::new(VCpu {
+            funcs: Arc::clone(&self.funcs),
+            registry: Arc::new(FiberRegistry::new()), // its own fiber table (a separate domain)
+            chain: vec![ROOT_FIBER],
+            cur: ROOT_FIBER,
+            frames: self.frames.clone(), // the continuation inside the pending fork `cap.call`
+            root_parked: None,
+            parked_frames: 0,
+            durable: self.durable,
+            root_shadow_sp: self.root_shadow_sp,
+            durable_sp_ctx: self.durable_sp_ctx,
+            frozen: Vec::new(),
+            spawn_residue: None,
+            vcpu_ctx: self.vcpu_ctx,
+            dstate: self.dstate,
+            mem: twin_mem,
+            host: twin_host,
+            freeze_sink: None,
+            fuel: self.fuel,
+            threads: Vec::new(),
+            nested_children: Vec::new(),
+            child_hosts: BTreeMap::new(),
+            nested_child: false,
+            nested_slot: 0,
+            coroutines: Vec::new(),
+            fault_yields: false,
+            depth: self.depth,
+            id: new_id,
+            parent_task: self.parent_task,
+            tls: new_id as i64,
+            setjmp_points: BTreeMap::new(),
+            pending: None, // the caller sets `CapResult(reply_twin)`
+            sched: self.sched.clone(),
+            memop: false,
+            acc: None,
+            quota: self.quota,
+            dt: Arc::clone(&self.dt),
+            units: Vec::new(),
+            invoked: None,
+            debug: None,
+            kill: None,
+            child_kill: BTreeMap::new(),
+            serve_run: None,
+            handler_parks: BTreeMap::new(),
+            serve_count: 0,
+        })
+    }
+
     /// A vCPU that runs a guest-compiled **`Jit` unit**'s entry (`unit[0]`) over the parent's
     /// world — same window/host/fuel — for the `Jit.invoke` op (DESIGN.md §22/B2). Module 0 is
     /// the `parent` program; `dt` is the **shared, live** domain table, so the unit's `call_indirect`
@@ -8886,17 +9032,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     *serve_count = 0;
                 }
-                // FORK.md PR 1 — `clone_caller(reply)` (self-namespace op 11): serviced here because it
-                // needs the eval-loop-local `serve_run` (the running handler's dispatch). Increment 2 —
-                // the **reply-injection nucleus**: from within a handler, deliver `reply` out-of-band to
-                // the caller parked on this dispatch's ticket, and mark the dispatch replied so the
-                // handler's own return does not clobber the injected value. This is fork's core insight —
-                // "return-twice is a reply value" (FORK.md §3): the servicer supplies the caller's reply
-                // rather than the handler's return. `0` on success; `-EINVAL` when not called from within
-                // a handler (no `serve_run`, or from the serve loop itself, where `*cur == serve_cur`).
-                // The twin (a second copy under a second ticket) is increment 3; PR 2's `fork` op replies
-                // `pid`/`0`. Race-safe: `cap_reply_or_stash` wakes the parked vCPU, or stashes for its
-                // park-time early-probe if the caller has not parked yet.
+                // FORK.md PR 1 — `clone_caller(reply_orig, reply_twin)` (self-namespace op 11): serviced
+                // here because it needs the eval-loop-local `serve_run` (the running handler's dispatch).
+                // Increment 3 — the **targeted clone**: from within a handler, duplicate the caller parked
+                // on this dispatch into a live **twin** (private window + duplicated powerbox, its own
+                // domain), deliver `reply_orig` to the original and `reply_twin` to the twin, and return
+                // the twin's `child_handle`. Both reload their injected reply and resume **past** the fork
+                // `cap.call` — `fork()`'s return-twice, one live run (FORK.md §3/§8.3). The dispatch is
+                // marked replied so the handler's own return does not clobber the original's value.
+                // `-EINVAL` when not called from within a handler (no `serve_run`, or from the serve loop
+                // itself, `*cur == serve_cur`). If the twin can't be built (a non-`Real` scheduler, a
+                // non-forkable domain — `fork_powerbox`/`fork_private` fail closed — or a caller with
+                // children/fibers), it **degrades to a single reply** (increment 2's nucleus): the
+                // original still resumes with `reply_orig`, `0` is returned, no twin. Never hangs.
                 Inst::CapCall {
                     type_id: svm_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
@@ -8904,15 +9052,35 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let reply = match args.first() {
+                    let reply_orig = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let reply_twin = match args.get(1) {
                         Some(a) => get(&frames[top].vals, *a)?.i64(),
                         None => 0,
                     };
                     let r = match serve_run.as_mut() {
                         Some(sr) if *cur != sr.serve_cur => {
-                            sched.cap_reply_or_stash(sr.ticket, reply, host);
+                            let ticket = sr.ticket;
                             sr.replied = true;
-                            0
+                            let callee_id =
+                                host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                            // Fork the parked caller into a twin (Real scheduler only); on any failure
+                            // fall back to a single reply so the original never hangs — no twin.
+                            let twin = if let SchedRef::Real(sr_sched) = sched {
+                                sr_sched
+                                    .fork_parked_caller(callee_id, ticket, reply_orig, reply_twin)
+                            } else {
+                                None
+                            };
+                            match twin {
+                                Some(h) => h,
+                                None => {
+                                    sched.cap_reply_or_stash(ticket, reply_orig, host);
+                                    0
+                                }
+                            }
                         }
                         _ => EINVAL,
                     };
@@ -12485,7 +12653,10 @@ pub const CAP_SELF_CLONE_CALLER: u32 = 11;
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
 /// **shape** (fetched from the callee's module at wire time) so a re-grant into another
-/// powerbox can intern it there without touching the callee's lock.
+/// powerbox can intern it there without touching the callee's lock. `Clone` so a `fork()` twin
+/// ([`Host::fork_powerbox`]) can **share** the offer (same callee `Arc`) — a forking caller is
+/// always parked *inside* a call through such an offer, so it necessarily holds one.
+#[derive(Clone)]
 struct LiveImplEntry {
     callee: Arc<Mutex<Host>>,
     export: u32,
@@ -13024,24 +13195,23 @@ impl Host {
     /// **new `domain_id`**. The twin's serve state, JIT context, and local stdout/stderr buffers start
     /// fresh (its own).
     ///
+    /// Live-callee **offers** (`live_impls`) ride along, sharing the same callee `Arc` — a forking
+    /// caller is always parked *inside* a call through such an offer, so it necessarily holds one.
+    ///
     /// **Fails closed** (returns `None`) for any domain carrying capability state the core cannot yet
     /// duplicate on its own: closure-based host caps (`host_fns` / `host_fns_region` / `guest_impls`,
-    /// not `Clone`), live-callee offers, JIT / ring / async / offload / serve state, or in-flight
-    /// freeze residue. Those a real `fork` (of a personality-wired domain such as bash) requires are
-    /// **re-wired into the twin by the personality layer** (PR 3), not cloned here. So this only ever
-    /// forks a *provably-simple* domain: a handle table over `Copy` bindings (Instantiator /
-    /// AddressSpace / Stream / Exit / Clock / Memory / SharedRegion / Module / Budget), a self-module,
-    /// an attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding
-    /// a `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
-    // Wired into `clone_caller`'s twin construction in the next slice (increment 3b); landed first as a
-    // fails-closed, unit-tested primitive (the S13 CoW-clone crux) per FORK.md's TDD-first plan.
-    #[allow(dead_code)]
+    /// not `Clone`), module grants, JIT / ring / async / offload / serve state, or in-flight freeze
+    /// residue. Those a real `fork` (of a personality-wired domain such as bash) requires are **re-wired
+    /// into the twin by the personality layer** (PR 3), not cloned here. So this only ever forks a
+    /// *provably-simple* domain: a handle table over `Copy` bindings (Instantiator / AddressSpace /
+    /// Stream / Exit / Clock / Memory / SharedRegion / Budget) plus live offers, a self-module, an
+    /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
+    /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
     fn fork_powerbox(&self) -> Option<Host> {
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
         let simple = self.host_fns.is_empty()
             && self.host_fns_region.is_empty()
             && self.guest_impls.is_empty()
-            && self.live_impls.is_empty()
             && self.pending_live_impls.is_empty()
             && self.rings.is_empty()
             && self.jit_domains.is_empty()
@@ -13071,6 +13241,9 @@ impl Host {
         twin.pipes = self.pipes.clone();
         twin.region_hook = self.region_hook.clone();
         twin.region_factory = self.region_factory;
+        // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
+        // forking caller is always parked inside a call through one, so it holds at least this.
+        twin.live_impls = self.live_impls.clone();
         // Shared stdout/stderr sinks — fork shares stdout/stderr.
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
@@ -16847,9 +17020,6 @@ impl Mem {
     /// the other (POSIX-fork semantics). Requires a [`snapshot_safe`](Mem::snapshot_safe) window (no §13
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
-    // Wired into `clone_caller`'s twin construction alongside `Host::fork_powerbox` (increment 3b);
-    // landed first as a fails-closed, unit-tested primitive.
-    #[allow(dead_code)]
     fn fork_private(&self) -> Option<Mem> {
         if !self.snapshot_safe() {
             return None;
