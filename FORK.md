@@ -161,3 +161,59 @@ into a window image and immediately restores it *in place* with an injected repl
 parked fiber's continuation serializes + resumes past its call with a supplied result. Harness: a server
 whose handler calls it, one caller calling in. Only then add step 3 (twin + second ticket). This isolates
 the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-first.
+
+### 8.1 Increment breakdown (the build order actually followed)
+
+- **Increment 1 — the handler→caller linkage. DONE (this branch).** New eval-loop arm for op 11:
+  returns `serve_run.ticket` when in a running handler (`*cur != serve_cur`), else `-EINVAL`; host-side
+  dispatch answers a probeable `-EINVAL` (like svc.poll/wait). `CAP_SELF_CLONE_CALLER = 11` pinned.
+  Tests: `crates/svm-interp/tests/clone_caller.rs`. Proves *only* that the servicer can name the parked
+  caller — no capture yet.
+- **Increment 2 — the targeted capture + restore-in-place with injected reply. NEXT (the hard core).**
+  See §8.2 for the derived mechanism. The load-bearing soundness change; a subtle error is
+  wrong-but-passing, so TDD-first over a **durable-transformed** harness, interp==JIT.
+- **Increment 3 — the twin + second ticket** (step 3 above). Copy the captured image into a fresh child
+  and re-seed a second `CapReply` park; return the twin `child_handle`.
+- **PR 2 — the `fork` personality op** replies `pid`/`0` to the two tickets (FORK.md §5).
+
+### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
+
+**Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**
+(`svm-durable/src/lib.rs:855`): "the host performs the op; the deepest frame reloads its result." A caller
+parked on a durable-transformed `cap.call` therefore has *exactly* the Leaf continuation shape, whose thaw
+reloads the call's result at the **post-call resume point**. **Fork's reply-injection is nothing more than
+supplying that reloaded Leaf result** (§3) — the freeze/flatten path already positions the spill there. So
+the caller's domain (and only it) must be durable-transformed; `clone_caller`'s capture reuses the
+`flatten_fiber_for_freeze` Leaf spill rather than inventing a new continuation format.
+
+**Finding B — the parked caller *is* a self-contained vCPU (the clean path).** A caller is registered in
+`ticket_waiters[(callee_id, ticket)]` in **two** forms (`svm-interp` `Step::Park(CapReply)` at `:4879` and
+the generic-arm fiber park at `:8929`):
+  - a **root** caller → `Waiter::VCpu(v)` — the *entire* parked vCPU, holding its **own** `v.mem` (window),
+    `v.frames` (the continuation sitting inside the pending `cap.call`), and durable state;
+  - a **non-root fiber** caller → `Waiter::Fiber { reg, slot }` — frames in a registry whose vCPU is still
+    live running other fibers (no bundled window).
+
+The `Waiter::VCpu(v)` form is **self-contained**: `v` carries its own window, so the Leaf flatten runs on
+`v` with no cross-vCPU window sharing — and the **increment-1 harness already produces exactly this** (the
+parent root parks on the child's offer → `Waiter::VCpu`). So increment 2's restore-in-place step is:
+
+  1. In `clone_caller` (child handler), read `serve_run.ticket` + child domain id; **take** the
+     `Waiter::VCpu(v)` out of `sched.ticket_waiters` (via the `sched` handle the eval loop already holds).
+  2. **Capture:** drive `v`'s root through `UNWINDING` from its `CapReply` park, delivering the **injected
+     reply** as the Leaf reload (`placeholder = Some(injected)`, *not* the O10 freeze placeholder — the
+     clone supplies the real reply, which is what dissolves O10, §3). `v`'s continuation spills into `v`'s
+     own window as a durable **image**; record its `FrozenFiber`/root-SP residue.
+  3. **Restore in place:** thaw `v` under `REWINDING` — it rebuilds from the image, the Leaf reload hands
+     back the injected reply, and `v` resumes **past** the `cap.call`. Push `v` to `sched.runnable`.
+
+For the pure no-op this is *visibly* identical to `v.pending = CapResult(injected); runnable.push(v)` — but
+it must genuinely round-trip through the **window image** (discard `v.frames`, rebuild from the flattened
+window), because that image is exactly what increment 3's **twin** copies into a fresh child. So the test
+must assert the image path ran (e.g. the caller's domain is `set_durable(true)` + a durable window, and the
+freeze/thaw residue is observable), not merely that the caller got the value.
+
+**Harness = increment-1's, made durable.** Parent calls the child's offer and parks (→ `Waiter::VCpu`), but
+now the **parent** is `transform_module_assume_confined` + `set_durable(true)` + `init_durable_window`, so
+its `cap.call` is the `SuspendKind::Leaf` shape the flatten needs. The child (servicer) stays as-is. The
+non-root-fiber (`Waiter::Fiber`) caller and the true cross-domain-window case are the follow-up before PR 2.

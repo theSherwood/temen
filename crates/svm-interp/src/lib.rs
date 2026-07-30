@@ -8874,6 +8874,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     *serve_count = 0;
                 }
+                // FORK.md PR 1 — `clone_caller` (self-namespace op 11): serviced here because it needs
+                // the eval-loop-local `serve_run` (the running handler's dispatch). Increment 1: prove
+                // the handler→ticket linkage — return the served ticket, or `-EINVAL` when not called
+                // from within a handler (no `serve_run`, or called from the serve loop itself, where
+                // `*cur == serve_cur`). Capture + twin + dual-reply are the next increments.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_CLONE_CALLER,
+                    sig,
+                    ..
+                } => {
+                    let r = match serve_run.as_ref() {
+                        Some(sr) if *cur != sr.serve_cur => sr.ticket as i64,
+                        _ => EINVAL,
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -12428,6 +12447,14 @@ pub const CAP_SELF_SVC_POLL: u32 = 9;
 /// Same encoding path and backend story as `svc.poll`.
 pub const CAP_SELF_SVC_WAIT: u32 = 10;
 
+/// FORK.md PR 1 — the reserved self-namespace op for `clone_caller`: from **within a serve handler**,
+/// act on the caller parked on the dispatch this handler is serving (identified by `serve_run.ticket`).
+/// The servicer-side primitive `fork()` is sugar over — the servicer clones its parked caller into a
+/// twin and replies differently to each (FORK.md §3/§6). Increment 1 (this slice) proves only the
+/// handler→ticket linkage: it returns the served ticket, or `-EINVAL` when not called from a handler.
+/// Eval-loop-only (needs `serve_run`); a host-side dispatch answers a probeable `-EINVAL`.
+pub const CAP_SELF_CLONE_CALLER: u32 = 11;
+
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
 /// **shape** (fetched from the callee's module at wire time) so a re-grant into another
@@ -15248,12 +15275,15 @@ impl Host {
                     Ok(vec![self.self_covers(h, idx)?])
                 }
                 8 => Ok(vec![self.reify_export(idx)? as i64]),
-                // §3.6 svc.poll/svc.wait reaching host-side dispatch = a backend tier without
-                // the eval-loop servicing arm (only the eval loop can run guest handler code):
-                // a probeable `-EINVAL`, never a trap — the guest's serve loop can fall back.
-                // (The tree-walk eval loop intercepts these before dispatch; the bytecode
-                // engine declines them at compile and falls back to the tree-walker.)
-                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT if op >> 8 == 0 => Ok(vec![EINVAL]),
+                // §3.6 svc.poll/svc.wait — and FORK.md's clone_caller (op 11) — reaching host-side
+                // dispatch = a backend tier without the eval-loop servicing arm (only the eval loop
+                // can run guest handler code / read `serve_run`): a probeable `-EINVAL`, never a
+                // trap — the guest's serve loop can fall back. (The tree-walk eval loop intercepts
+                // these before dispatch; the bytecode engine declines them at compile and falls back
+                // to the tree-walker.)
+                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT | CAP_SELF_CLONE_CALLER if op >> 8 == 0 => {
+                    Ok(vec![EINVAL])
+                }
                 _ => Err(Trap::CapFault),
             };
         }
