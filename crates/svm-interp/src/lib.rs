@@ -3451,6 +3451,35 @@ impl DomainTable {
         Some(slot as u32)
     }
 
+    /// **Auto-install a unit's own functions** (DESIGN.md §22 "unit-own funcref", the interpreter
+    /// mirror of the JIT's `define_extra` auto-install). Append `unit` as module `k` and fill the
+    /// first `unit.len()` free padding slots — **one per function** — with `(k, i)`, returning the
+    /// slots (indexed by unit-local function index) so a `ref.func i` in the unit can resolve to its
+    /// own function `i`. `None` if fewer than `unit.len()` padding slots are free (matches the JIT's
+    /// fail-closed). Deterministic: the first free slots in order, so both backends pick the same set
+    /// from an identical table state. Serialized under the `units` lock like [`Self::install`].
+    fn install_unit_funcs(&self, unit: Arc<[Func]>) -> Option<Vec<u32>> {
+        let n = unit.len();
+        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        let free: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)
+            .map(|(i, _)| i)
+            .take(n)
+            .collect();
+        if free.len() < n {
+            return None;
+        }
+        units.push(unit);
+        let module = units.len() as u32; // module k ≡ units[k-1]
+        for (func, &slot) in free.iter().enumerate() {
+            self.slots[slot].store(pack_slot(module, func as u32), Ordering::Release);
+        }
+        Some(free.iter().map(|&s| s as u32).collect())
+    }
+
     /// `Jit.uninstall` (Model B2 reclaim): clear an installed slot (`≥ n_real`, currently filled)
     /// back to trapping padding so the index is reusable and a stale `call_indirect` of it traps.
     /// `units` stays (append-only; the unit is just no longer reachable). Serialized like `install`.
@@ -3477,6 +3506,16 @@ impl DomainTable {
 
 /// Resolve module `m`'s functions for a running vCPU: module 0 is its primary program; `INVOKE_MODULE`
 /// is the transient unit a `Jit.invoke` is running (`invoked`); `k ≥ 1` is an installed unit in the
+/// Whether a unit takes any of its OWN functions' addresses (`ref.func`) — the trigger for the
+/// §22 unit-own-funcref auto-install (mirrors the JIT's `define_extra` detection).
+fn unit_uses_ref_func(funcs: &[Func]) -> bool {
+    funcs.iter().any(|f| {
+        f.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::RefFunc { .. })))
+    })
+}
+
 /// shared [`DomainTable`]. `local_units` is the vCPU's lock-free clone of the shared installed units
 /// (a prefix); a miss (a unit installed since the last sync) refreshes it. Returns `None` for an
 /// out-of-range module (a forged/stale slot) → the caller traps.
@@ -6791,6 +6830,14 @@ struct VCpu {
     /// resolved as module [`INVOKE_MODULE`] — kept out of the shared `dt.units` so it is never
     /// installed/`call_indirect`-reachable and never collides with a concurrent install.
     invoked: Option<Arc<[Func]>>,
+    /// **Unit-own funcref remap** (DESIGN.md §22 "unit-own funcref"), the interpreter mirror of the
+    /// JIT's `ref_slots`. `Some` only for an invoke child whose unit takes its OWN functions'
+    /// addresses (`ref.func`): the unit's functions are auto-installed into `dt` at these
+    /// `call_indirect` slots (indexed by unit-local function index), and while running the invoked
+    /// unit (module [`INVOKE_MODULE`]) a `ref.func N` yields `invoked_ref_slots[N]` — the real shared
+    /// slot — instead of `N`, so it resolves to the unit's own function like the JIT does. `None`
+    /// when the unit takes no funcref (then `ref.func` is never executed).
+    invoked_ref_slots: Option<Vec<u32>>,
     /// **Debug seam** (DEBUGGING.md W2/S4): `Some` only when an [`Inspector`] drives this vCPU.
     /// `None` is the production hot path — the per-op hook in [`run_inner`] is gated on it, so an
     /// undebugged run pays a single null check per op and is otherwise byte-identical (S7). Not
@@ -6900,6 +6947,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: None,
+            invoked_ref_slots: None,
             debug: None,
             kill: None,
             child_kill: BTreeMap::new(),
@@ -6961,6 +7009,7 @@ impl VCpu {
             dt: Arc::clone(&self.dt),
             units: Vec::new(),
             invoked: None,
+            invoked_ref_slots: None,
             debug: None,
             kill: None,
             child_kill: BTreeMap::new(),
@@ -6990,9 +7039,17 @@ impl VCpu {
         sched: SchedRef,
         quota: Quota,
     ) -> VCpu {
+        // Unit-own funcref (DESIGN.md §22): if the unit takes its OWN functions' addresses,
+        // auto-install them into `dt` (function-granular) so `ref.func i` resolves to the unit's own
+        // func i — the interpreter mirror of the JIT's `define_extra` auto-install. `None` (no
+        // `ref.func`, or too few reserved slots) leaves `ref.func` unremapped, exactly like the JIT.
+        let invoked_ref_slots = if unit_uses_ref_func(&unit) {
+            dt.install_unit_funcs(unit.clone())
+        } else {
+            None
+        };
         VCpu {
             funcs: parent,
-            // A unit cannot use `cont.*` (gated at compile), so its registry is never touched.
             registry: Arc::new(FiberRegistry::new()),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
@@ -7036,6 +7093,7 @@ impl VCpu {
             dt,
             units: Vec::new(),
             invoked: Some(unit),
+            invoked_ref_slots,
             debug: None,
             kill: None,
             child_kill: BTreeMap::new(),
@@ -7456,6 +7514,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         dt,
         units,
         invoked,
+        invoked_ref_slots,
         debug,
         kill,
         child_kill,
@@ -10097,7 +10156,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let r = cast(*op, get(&frames[top].vals, *a)?);
                     frames[top].vals.push(r);
                 }
-                Inst::RefFunc { func } => frames[top].vals.push(Reg::from_i32(*func as i32)),
+                Inst::RefFunc { func } => {
+                    // Unit-own funcref (DESIGN.md §22): while running an invoked unit that takes its
+                    // own functions' addresses, `ref.func N` yields the unit's auto-installed slot
+                    // (`invoked_ref_slots[N]`) — a real shared-table slot resolving to the unit's own
+                    // func N — instead of `N`, which would hit the parent's table. Module-0 (and
+                    // installed-unit) code has no remap: `ref.func N` is slot N verbatim, as the JIT.
+                    let idx = match invoked_ref_slots.as_deref() {
+                        Some(slots) if frames[top].module == INVOKE_MODULE => {
+                            *slots.get(*func as usize).unwrap_or(func)
+                        }
+                        _ => *func,
+                    };
+                    frames[top].vals.push(Reg::from_i32(idx as i32));
+                }
                 // Everything else: one value, or none for `Store`/`AtomicStore`.
                 // Fast-path the two common scalar memory ops out of the `eval_inst` call; the
                 // §14 fault-driven-yield handling is shared via `handle_mem`. The expensive part

@@ -2944,6 +2944,7 @@ impl CompiledModule {
                 epoch_addr,
                 fuel_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
                 fi as u32,
                 srcloc_map.as_ref(),
                 var_labels,
@@ -4002,6 +4003,38 @@ impl CompiledModule {
             })
             .collect::<Result<_, _>>()?;
 
+        // Auto-install for unit-own funcrefs (DESIGN.md §22 "unit-own funcref"): if the unit takes
+        // its OWN functions' addresses (`ref.func`), each such funcref must be a real shared-table
+        // slot or it would resolve against the *parent's* table. Reserve one padding slot per unit
+        // function up front, so `ref.func N` lowers to `ref_slots[N]` (below); the finalized code is
+        // published into these slots after the build. `None` when the unit takes no funcref — then
+        // `ref.func` never fires and no slots are consumed. Single `cap.call`, so the picked padding
+        // slots stay free until we `install_at` them (no concurrent install races within a compile).
+        let uses_ref_func = funcs.iter().any(|f| {
+            f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::RefFunc { .. })))
+        });
+        let ref_slots: Option<Vec<u32>> = if uses_ref_func {
+            let free: Vec<u32> = self
+                .fn_table
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.type_id() == PADDING_TYPE_ID)
+                .map(|(i, _)| i as u32)
+                .take(funcs.len())
+                .collect();
+            if free.len() < funcs.len() {
+                return Err(JitError::Unsupported(
+                    "not enough reserved call_indirect slots for a submitted unit's own funcrefs \
+                     (grant a larger Jit table)",
+                ));
+            }
+            Some(free)
+        } else {
+            None
+        };
+
         let mut ctx = self.module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
             build_clif(
@@ -4023,6 +4056,7 @@ impl CompiledModule {
                 self.epoch_addr,
                 self.fuel_addr, // same counted-fuel cell as the parent module's functions
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
                 0,
                 None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
                 None, // …nor value-label points (Stage 3a)
@@ -4060,6 +4094,27 @@ impl CompiledModule {
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+        // Publish the unit's now-finalized functions into the slots reserved above, so a `ref.func`
+        // funcref (remapped to `ref_slots[N]`) resolves to the unit's own function through the
+        // ordinary masked dispatch (DESIGN.md §22 "unit-own funcref"). Slots were picked from the
+        // padding pool and are still free (single `cap.call`), so each `install_at` succeeds.
+        if let Some(slots) = &ref_slots {
+            for ((f, id), &slot) in funcs.iter().zip(&ids).zip(slots) {
+                let code = self.module.get_finalized_function(*id);
+                let type_id = type_id_of(
+                    &self.distinct,
+                    &FuncType {
+                        params: f.params.clone(),
+                        results: f.results.clone(),
+                    },
+                );
+                if !self.install_at(slot, code, type_id) {
+                    return Err(JitError::Backend(format!(
+                        "auto-install of a unit funcref into slot {slot} failed"
+                    )));
+                }
+            }
+        }
         // Per function: the buffer-ABI trampoline (for `invoke` over a window) **and** the
         // natural-ABI entry + interned `type_id` (for B2 `install` into the function table —
         // `call_indirect` calls the natural ABI, not the trampoline).
@@ -4745,6 +4800,7 @@ fn compile_child(
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
             None, // …nor value-label points (Stage 3a)
@@ -5362,6 +5418,15 @@ struct Lower<'a> {
     frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
+    /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
+    /// compile this is `None` and `ref.func N` lowers to the bare index `N` (module-0 slot N). For a
+    /// guest-submitted unit that takes its own functions' addresses, `define_extra` auto-installs the
+    /// unit's functions into reserved `call_indirect` slots and passes the map here (indexed by the
+    /// unit-local function index), so `ref.func N` lowers to `iconst(ref_slots[N])` — the real shared
+    /// table slot — instead of `N`, which would resolve against the *parent's* table. This is what
+    /// lets a unit `cont.new`/`thread.spawn`/`call_indirect` over its OWN function; it changes only
+    /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
+    ref_slots: Option<&'a [u32]>,
     /// The host `cap.call` thunk + ctx (constant addresses).
     cap: CapEnv,
     /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
@@ -5470,6 +5535,7 @@ fn build_clif(
     epoch_addr: i64,
     fuel_addr: i64,
     fn_table_mask: u64,
+    ref_slots: Option<&[u32]>,
     func_idx: u32,
     srclocs: Option<&SrcLocMap>,
     var_labels: Option<&VarLabelMap>,
@@ -5557,6 +5623,7 @@ fn build_clif(
         guard_offset,
         frontend_config: module.target_config(),
         fn_table_mask,
+        ref_slots,
         cap,
         fiber,
         thread,
@@ -7203,7 +7270,17 @@ fn lower_block(
             }
             // A funcref is just the function index as plain i32 data (§3c) — the same
             // value the interpreter materializes; `call_indirect` masks it into the table.
-            Inst::RefFunc { func } => b.ins().iconst(I32, *func as i64),
+            Inst::RefFunc { func } => {
+                // A submitted unit's own-function address must be a real shared-table slot (the unit
+                // is auto-installed there — DESIGN.md §22 "unit-own funcref"), so it resolves to the
+                // unit's function through the ordinary masked dispatch instead of the parent's table.
+                // Top-level compiles have no remap: `ref.func N` is module-0 slot N verbatim.
+                let idx = match lower.ref_slots {
+                    Some(slots) => *slots.get(*func as usize).unwrap_or(func),
+                    None => *func,
+                };
+                b.ins().iconst(I32, idx as i64)
+            }
             // §12 standalone fence. Cranelift emits a full (seq-cst) barrier regardless of the
             // requested `order` — the same sound strengthening the atomics use.
             Inst::AtomicFence { .. } => {

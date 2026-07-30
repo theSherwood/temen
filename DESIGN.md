@@ -2589,9 +2589,20 @@ which builds the table/runtime/`cont.*` thunk env post-compile so a submitted un
 `CURRENT_RT`); the shared `jit_resolve_and_validate` admits `cont.*` and rejects only threads/futex on both
 backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
-`fn_table`. Threads-in-a-submitted-unit and fibers over *installed*-unit entries (module ≥ 1) remain
-deferred. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
+`fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
 `submitted_unit_threads_still_rejected_with_fiber_hosting`.
+
+**Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
+(module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
+*parent* `fn_table`; so a unit whose own body is a fiber entry (jacl's scheduler running an interpreted
+program as the root job) could not name it. Now, when a submitted unit takes its own functions' addresses,
+it is **auto-installed**: `define_extra` (JIT) / `install_unit_funcs` (interp) reserves one padding slot per
+unit function and `ref.func N` lowers to `iconst(slot[N])` — a real shared slot that resolves to the unit's
+own function through the ordinary masked dispatch. No escape-TCB change (invariant I2): only *which constant*
+`ref.func` emits, plus the existing Model-B2 `install_at` primitive; fails closed on too few reserved slots.
+The same mechanism serves `thread.spawn` entries. Pinned by
+`jit_cap::submitted_unit_fibers_over_its_own_func_agrees` (differential). Threads-in-a-submitted-unit
+remain deferred.
 
 ### Code reclaim — whole-module compaction
 
