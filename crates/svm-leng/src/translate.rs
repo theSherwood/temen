@@ -55,6 +55,13 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
+/// translatable body (calls to it become SVM imports the host binds at link).
+fn is_importc_proc(proc_node: &Node) -> bool {
+    matches!(proc_node.args().get(3), Some(p)
+        if p.tag() == Some("pragmas") && p.args().iter().any(|x| x.tag() == Some("importc")))
+}
+
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
 /// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
 fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
@@ -169,6 +176,10 @@ pub(crate) enum TyDesc {
     /// *computed* pointer (a pointer-valued field, `(deref (dot s more))`) recovers the pointee's
     /// layout. nimony's ARC ops walk `string.more → LongString.rc` this way.
     Ptr(Box<TyDesc>),
+    /// An **inline flexible array** (`uarray`/`UncheckedArray` — `LongString.data`): a size-0 tail
+    /// whose *own address* is the array base. `at`/`pat` index it by the element (boxed) type; you
+    /// never load the whole thing.
+    FlexArray(Box<TyDesc>),
     Agg(String),
 }
 
@@ -411,7 +422,47 @@ impl Translator {
                 _ => {}
             }
         }
+        // **Local** consts inside proc bodies that are *aggregates* (a local `const` string/table)
+        // are materialized module-wide too (their mangled names are unique), so `(addr name)`
+        // resolves. Scalar local consts stay inlined per-function (see the `const` statement).
+        for item in root.args() {
+            if item.tag() == Some("proc") {
+                if let Some(body) = item.args().get(4) {
+                    self.collect_local_aggregate_consts(body, &mut off)?;
+                }
+            }
+        }
         self.globals_top = off;
+        Ok(())
+    }
+
+    /// Recurse a proc body, materializing each **aggregate** local `const` (a `const` whose value is
+    /// an `oconstr`/`aconstr`) into a module data segment + addressable global — the same treatment
+    /// top-level aggregate consts get.
+    fn collect_local_aggregate_consts(
+        &mut self,
+        node: &Node,
+        off: &mut u64,
+    ) -> Result<(), LengError> {
+        if node.tag() == Some("const") {
+            let a = node.args();
+            if a.len() >= 4 {
+                let name = sym_def(&a[0])?;
+                if !self.globals.contains_key(&name) && int_literal(&a[3]).is_none() {
+                    if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                        let sz = bytes.len() as u64;
+                        self.data_inits.push((*off, bytes));
+                        self.globals.insert(name, (*off, desc));
+                        *off += sz.max(8);
+                    }
+                }
+            }
+        }
+        if let Node::List(items) = node {
+            for c in items {
+                self.collect_local_aggregate_consts(c, off)?;
+            }
+        }
         Ok(())
     }
 
@@ -485,6 +536,41 @@ impl Translator {
     /// literal** lowers: nimony emits it as a `const` `LongString` blob that the `string` value's
     /// `more` field points at (`(addr strlit…)`), NIM.md W2.
     fn const_aggregate_bytes(&self, val: &Node) -> Result<Option<(Vec<u8>, TyDesc)>, LengError> {
+        // An **array constructor** `(aconstr ArrayType elem0 elem1 …)` — a `const` table (e.g.
+        // `fsLookupTable`, 256 `i8`s). Each scalar-int element writes at `i * elem_size`.
+        if val.tag() == Some("aconstr") {
+            let a = val.args();
+            let tyname = match a.first().and_then(|n| n.as_atom()) {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+            let (elem_size, total) = match self.types.get(tyname) {
+                Some(Layout::Array {
+                    elem_size, size, ..
+                }) => (*elem_size as usize, *size as usize),
+                _ => return Ok(None),
+            };
+            let w = elem_size.min(8);
+            let mut bytes = vec![0u8; total];
+            for (i, v) in a[1..].iter().enumerate() {
+                let off = i * elem_size;
+                if let Some(n) = int_literal(v) {
+                    if off + w <= bytes.len() {
+                        bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
+                    }
+                } else if let Some((ebytes, _)) = self.const_aggregate_bytes(v)? {
+                    // An **aggregate** element (an array of `string`s — each an SSO `oconstr`):
+                    // materialize it recursively and place its bytes.
+                    let end = (off + ebytes.len()).min(bytes.len());
+                    if off < end {
+                        bytes[off..end].copy_from_slice(&ebytes[..end - off]);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))));
+        }
         if val.tag() != Some("oconstr") {
             return Ok(None);
         }
@@ -528,6 +614,17 @@ impl Translator {
                     bytes.resize(off + data.len(), 0);
                 }
                 bytes[off..off + data.len()].copy_from_slice(&data);
+            } else if ka[1].tag() == Some("addr") {
+                // A pointer to another const/global (`more = (addr strlit…)`). In runnable mode the
+                // target is at a fixed window offset, so bake its address in. In **link** mode this
+                // needs a real data relocation the static const bytes can't carry — fail-closed.
+                let target = ka[1].args().first().and_then(|n| n.as_atom());
+                match target.and_then(|t| self.globals.get(t)) {
+                    Some((goff, _)) if !self.link_mode => {
+                        bytes[off..off + 8].copy_from_slice(&goff.to_le_bytes());
+                    }
+                    _ => return Ok(None),
+                }
             } else {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
@@ -541,12 +638,38 @@ impl Translator {
             TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
             TyDesc::Scalar(_) => 8,
             TyDesc::Ptr(_) => 8,
+            TyDesc::FlexArray(_) => 0, // a size-0 inline tail
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
                 None => 8,
             },
         }
+    }
+
+    /// The frame bytes needed for aggregate-rvalue temps in a body: each aggregate `(oconstr T …)` /
+    /// `(aconstr T …)` in **call-argument** position (the only spot emission builds a temp — an
+    /// aggregate arg passes by-address). Matching emission exactly matters: an aggregate constructor
+    /// in *return*/assign position builds in place, not a temp, and must NOT reserve space (else the
+    /// proc becomes spuriously frame-needing and its ABI changes). See [`FuncGen::agg_rvalue_temp`].
+    fn agg_temp_bytes(&self, node: &Node) -> u64 {
+        let mut total = 0;
+        if node.tag() == Some("call") {
+            for arg in node.args().iter().skip(1) {
+                if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
+                    if let Some(Ok(d @ TyDesc::Agg(_))) = arg.args().first().map(|t| self.tydesc(t))
+                    {
+                        total += self.sizeof(&d);
+                    }
+                }
+            }
+        }
+        if let Node::List(items) = node {
+            for c in items {
+                total += self.agg_temp_bytes(c);
+            }
+        }
+        total
     }
 
     /// The type descriptor of a Leng type node: a named symbol is an aggregate; `ptr`/`aptr` are
@@ -673,11 +796,19 @@ impl Translator {
                     let fname = sym_def(&fa[0])?;
                     // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
                     // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
-                    // object's size stops here); a `const` materializes its bytes past the fixed
-                    // part. Record it at the current offset as an opaque pointer-width slot and stop
-                    // advancing.
+                    // object's size stops here); its own address is the array base, indexed by
+                    // `at`/`pat`. Record it as a `FlexArray` at the current offset and stop advancing.
                     if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
-                        fields.push((fname, off, TyDesc::Scalar(ValType::I64)));
+                        let elem = fa[2]
+                            .args()
+                            .first()
+                            .map(|e| self.tydesc(e))
+                            .transpose()?
+                            .unwrap_or(TyDesc::Narrow {
+                                bytes: 1,
+                                signed: false,
+                            });
+                        fields.push((fname, off, TyDesc::FlexArray(Box::new(elem))));
                         continue;
                     }
                     let fdesc = self.tydesc(&fa[2])?;
@@ -802,12 +933,16 @@ impl Translator {
         let mut names = Vec::new();
         for item in root.args() {
             match item.tag() {
+                // An `importc` proc is an **extern** (a C bottom-edge function — `memcpy`, `mmap`):
+                // it has no body to translate. Skip it, so a call to it lowers to an SVM import the
+                // host/runtime binds at link (the same seam the ~15 C funcs already use).
+                Some("proc") if is_importc_proc(item) => {}
                 Some("proc") => {
                     let (name, params, ret0) = self.proc_sig(item)?;
                     let sret = self.ret_sret(&item.args()[2])?;
                     let ret = if sret.is_some() { None } else { ret0 };
                     let index = proc_nodes.len() as u32;
-                    let needs_frame = proc_needs_frame(item);
+                    let needs_frame = self.proc_needs_frame(item);
                     self.procs.insert(
                         name.clone(),
                         Sig {
@@ -834,12 +969,74 @@ impl Translator {
                 }
             }
         }
+        self.propagate_frames(&proc_nodes)?;
         let mut out = String::new();
         let mut used_memory = false;
         for p in &proc_nodes {
             used_memory |= self.proc_body(p, &mut out)?;
         }
         Ok((self.assemble(used_memory, out), names))
+    }
+
+    /// **Transitive frame propagation.** A proc that calls a frame-needing proc must itself own an
+    /// `$sp` (to hand a fresh sub-frame down), so it is frame-needing too. Iterate the call graph to
+    /// a fixpoint over the registered proc sigs. (Externals/imports don't take `$sp`, so a call to
+    /// one never forces a frame.)
+    fn propagate_frames(&mut self, nodes: &[&Node]) -> Result<(), LengError> {
+        loop {
+            let mut to_frame = Vec::new();
+            for node in nodes {
+                let name = sym_def(&node.args()[0])?;
+                if self.procs.get(&name).is_none_or(|s| s.needs_frame) {
+                    continue;
+                }
+                if let Some(b) = node.args().get(4) {
+                    if body_calls_framed(b, &self.procs) {
+                        to_frame.push(name);
+                    }
+                }
+            }
+            if to_frame.is_empty() {
+                return Ok(());
+            }
+            for name in to_frame {
+                if let Some(s) = self.procs.get_mut(&name) {
+                    s.needs_frame = true;
+                }
+            }
+        }
+    }
+
+    /// A proc's **own** frame need — computed exactly as `proc_body` decides `frame_size > 0`, so the
+    /// two never disagree: a `(var …)` is frame-resident iff it is a true aggregate (`object`/`array`,
+    /// via `tydesc` — a scalar enum/distinct named type is not) *or* its address is taken; plus any
+    /// aggregate-rvalue argument temp. An address-taken **global/param** does not frame the proc
+    /// (globals live in the data segment, aggregate params are already by-address).
+    fn proc_needs_frame(&self, p: &Node) -> bool {
+        let body = match p.args().get(4) {
+            Some(b) => b,
+            None => return false,
+        };
+        let mut addr = std::collections::HashSet::new();
+        collect_addr_taken(body, &mut addr);
+        let mut var_descs = Vec::new();
+        let mut pointee = HashMap::new();
+        if self
+            .collect_var_descs(body, &mut var_descs, &mut pointee)
+            .is_err()
+        {
+            return true; // be conservative if the body doesn't scan cleanly
+        }
+        let framed_var = var_descs
+            .iter()
+            .any(|(vn, d)| matches!(d, TyDesc::Agg(_)) || addr.contains(vn));
+        // An address-taken **scalar** param is spilled to a frame slot (an aggregate param is not).
+        let spilled_param = self.param_types(&p.args()[1]).is_ok_and(|pts| {
+            pts.iter().any(|(pn, tnode)| {
+                addr.contains(pn) && !matches!(self.tydesc(tnode), Ok(TyDesc::Agg(_)))
+            })
+        });
+        framed_var || spilled_param || self.agg_temp_bytes(body) > 0
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -866,7 +1063,7 @@ impl Translator {
             let (n, params, ret0) = self.proc_sig(item)?;
             let sret = self.ret_sret(&item.args()[2])?;
             let ret = if sret.is_some() { None } else { ret0 };
-            let needs_frame = proc_needs_frame(item);
+            let needs_frame = self.proc_needs_frame(item);
             self.procs.insert(
                 n,
                 Sig {
@@ -920,12 +1117,13 @@ impl Translator {
                     index: index as u32,
                     params,
                     ret,
-                    needs_frame: proc_needs_frame(node),
+                    needs_frame: self.proc_needs_frame(node),
                     sret,
                 },
             );
             selected.push(node);
         }
+        self.propagate_frames(&selected)?;
         let mut out = String::new();
         let mut used_memory = false;
         for node in &selected {
@@ -996,12 +1194,13 @@ impl Translator {
         Ok(out)
     }
 
-    /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at.
+    /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at. A `void`/opaque pointee has
+    /// no typed target (a `deref` of it fail-closes), so it yields `None`.
     fn pointee_desc(&self, node: &Node) -> Result<Option<TyDesc>, LengError> {
         match node.tag() {
             Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) => Ok(Some(self.tydesc(t)?)),
-                None => Ok(None),
+                Some(t) if t.tag() != Some("void") => Ok(Some(self.tydesc(t)?)),
+                _ => Ok(None),
             },
             _ => Ok(None),
         }
@@ -1095,15 +1294,16 @@ impl Translator {
             collect_addr_taken(b, &mut addr_taken);
         }
         // An address-taken **aggregate** param is already passed by-address — its slot value *is*
-        // the address, so `(addr p)` works with no spill. A scalar param has no address (it lives in
-        // an SSA slot); taking its address still fail-closes (scalar spill is a later refinement).
-        for (pn, _) in &params {
-            if addr_taken.contains(pn) && !matches!(local_desc.get(pn), Some(TyDesc::Agg(_))) {
-                return Err(LengError::Unsupported(format!(
-                    "address of scalar parameter `{pn}` (param spill is a later refinement)"
-                )));
-            }
-        }
+        // the address, so `(addr p)` works with no spill. An address-taken **scalar** param is
+        // *spilled*: it gets a frame slot, its incoming value is stored there at entry, and all
+        // reads/writes/`(addr p)` go through the frame.
+        let spill_params: Vec<(String, ValType)> = params
+            .iter()
+            .filter(|(pn, _)| {
+                addr_taken.contains(pn) && !matches!(local_desc.get(pn), Some(TyDesc::Agg(_)))
+            })
+            .cloned()
+            .collect();
 
         // A var is frame-resident if it is an aggregate (indexed by `at`/`dot`) or address-taken;
         // the rest are SSA slots. Frame locals get natural-size byte offsets.
@@ -1123,9 +1323,39 @@ impl Translator {
                 if !ssa_vars.iter().any(|(n, _)| n == vn) {
                     ssa_vars.push((vn.clone(), vt));
                 }
+            } else if matches!(desc, TyDesc::Narrow { .. }) {
+                // A sub-word (`i8`/`i16`) local not address-taken lives in an `i32` SSA slot — the
+                // narrow width only matters when it crosses memory.
+                if !ssa_vars.iter().any(|(n, _)| n == vn) {
+                    ssa_vars.push((vn.clone(), ValType::I32));
+                }
             }
         }
-        let needs_frame = !mem.is_empty();
+        // Spilled scalar params get a frame slot too (their incoming value is stored there at entry).
+        for (pn, _) in &spill_params {
+            if !mem.contains_key(pn) {
+                let desc = local_desc
+                    .get(pn)
+                    .cloned()
+                    .unwrap_or(TyDesc::Scalar(ValType::I64));
+                let sz = self.sizeof(&desc);
+                mem.insert(pn.clone(), (frame_size, desc));
+                frame_size += sz.max(8);
+            }
+        }
+        // Reserve scratch frame space above the named locals for **aggregate rvalue temps** (an
+        // `(oconstr T …)` passed as a call argument is constructed here and passed by-address).
+        let temp_base = frame_size;
+        if let Some(b) = body {
+            frame_size += self.agg_temp_bytes(b);
+        }
+        // A proc is frame-needing if it holds a frame/temp *or* its (propagated) sig says so — i.e.
+        // it calls a frame-needing proc and must own an `$sp` to hand down (`propagate_frames`).
+        let sig_framed = self
+            .procs
+            .get(&sym_def(&a[0])?)
+            .is_some_and(|s| s.needs_frame);
+        let needs_frame = frame_size > 0 || sig_framed;
         let has_sret = sret_desc.is_some();
 
         // SSA slots (block-parameter set): [$sp] ++ [$sret] ++ params ++ non-framed scalar vars.
@@ -1166,6 +1396,8 @@ impl Translator {
             needs_frame,
             mem,
             frame_size,
+            temp_base,
+            spill_params,
             sret,
         );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
@@ -1213,6 +1445,12 @@ struct FuncGen<'a> {
     mem: HashMap<String, (u64, TyDesc)>,
     /// Total frame bytes; a call to a frame-needing proc passes `sp + frame_size` as its frame.
     frame_size: u64,
+    /// Bump pointer into the aggregate-rvalue temp region (`[temp_base, frame_size)`) — the next
+    /// scratch offset an `(oconstr …)` argument is constructed at.
+    temp_next: u64,
+    /// Address-taken scalar params to **spill** at entry: their incoming SSA value is stored into a
+    /// frame slot (they're also in `mem`), so `(addr p)` and later reads/writes go through the frame.
+    spill_params: Vec<(String, ValType)>,
     /// `Some((slot, desc))` when this proc returns an aggregate by sret: `cur[slot]` is the caller's
     /// destination pointer, into which `ret` copies/constructs the aggregate before a void return.
     sret: Option<(usize, TyDesc)>,
@@ -1224,6 +1462,8 @@ struct FuncGen<'a> {
     /// the innermost exit and `(continue)` to the innermost header (nimony's `for` lowers to
     /// `while (true) { … else break }`).
     loop_stack: Vec<(u32, u32)>,
+    /// Scalar-int **local `const`s** declared in the body (`(const :name T value)`), inlined at use.
+    local_consts: HashMap<String, i64>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -1249,6 +1489,8 @@ impl<'a> FuncGen<'a> {
         has_sp: bool,
         mem: HashMap<String, (u64, TyDesc)>,
         frame_size: u64,
+        temp_base: u64,
+        spill_params: Vec<(String, ValType)>,
         sret: Option<(usize, TyDesc)>,
     ) -> Self {
         let slot_of = slots
@@ -1266,10 +1508,13 @@ impl<'a> FuncGen<'a> {
             local_desc,
             has_sp,
             mem,
+            temp_next: temp_base,
+            spill_params,
             frame_size,
             sret,
             label_block: HashMap::new(),
             loop_stack: Vec::new(),
+            local_consts: HashMap::new(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -1316,6 +1561,30 @@ impl<'a> FuncGen<'a> {
             let ty = self.slots[i].1;
             let v = self.emit_const(ty, 0);
             self.cur.push(v.id);
+        }
+        // Spill each address-taken scalar param: store its incoming SSA value into its frame slot.
+        // (Only reachable when there are spills, hence a frame with `$sp` at slot 0.)
+        if self.spill_params.is_empty() {
+            return;
+        }
+        let sp = self.cur[0];
+        for (name, _) in self.spill_params.clone() {
+            let (off, desc) = self.mem[&name].clone();
+            let val = self.cur[self.slot_of[&name]];
+            self.used_memory = true;
+            match desc {
+                TyDesc::Narrow { bytes, .. } => self.cur_buf.push_str(&format!(
+                    "  i32.store{} v{sp} v{val} offset={off}\n",
+                    bytes * 8
+                )),
+                _ => {
+                    let ty = desc.scalar_ty().unwrap_or(ValType::I64);
+                    self.cur_buf.push_str(&format!(
+                        "  {}.store v{sp} v{val} offset={off}\n",
+                        prefix(ty)
+                    ));
+                }
+            }
         }
     }
 
@@ -1415,8 +1684,21 @@ impl<'a> FuncGen<'a> {
     /// its current value. Aggregate frame locals return `None` (not a scalar rvalue).
     fn read_local(&mut self, name: &str) -> Option<Val> {
         if let Some((off, desc)) = self.mem.get(name).cloned() {
+            let sp = self.cur[0];
+            if let TyDesc::Narrow { bytes, signed } = desc {
+                let id = self.fresh();
+                self.used_memory = true;
+                let ext = if signed { 's' } else { 'u' };
+                self.cur_buf.push_str(&format!(
+                    "  v{id} = i32.load{}_{ext} v{sp} offset={off}\n",
+                    bytes * 8
+                ));
+                return Some(Val {
+                    id,
+                    ty: ValType::I32,
+                });
+            }
             if let Some(ty) = desc.scalar_ty() {
-                let sp = self.cur[0];
                 let id = self.fresh();
                 self.used_memory = true;
                 self.cur_buf.push_str(&format!(
@@ -1431,6 +1713,21 @@ impl<'a> FuncGen<'a> {
 
     /// Write a scalar local by name: a frame scalar emits a `store`; an SSA slot rebinds.
     fn write_local(&mut self, name: &str, v: Val) -> Result<(), LengError> {
+        if let Some((off, TyDesc::Narrow { bytes, .. })) = self.mem.get(name).cloned() {
+            let val = if v.ty != ValType::I32 {
+                self.convert(v, ValType::I32)
+            } else {
+                v
+            };
+            let sp = self.cur[0];
+            self.used_memory = true;
+            self.cur_buf.push_str(&format!(
+                "  i32.store{} v{sp} v{} offset={off}\n",
+                bytes * 8,
+                val.id
+            ));
+            return Ok(());
+        }
         if let Some((off, ty)) = self
             .mem
             .get(name)
@@ -1493,44 +1790,7 @@ impl<'a> FuncGen<'a> {
                         .args()
                         .first()
                         .ok_or_else(|| LengError::Malformed("deref needs an operand".into()))?;
-                    // A **symbol pointer**: a local whose pointee type we tracked.
-                    if let Some(pname) = operand.as_atom() {
-                        let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                            LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-                        })?;
-                        let pv = self.lookup(pname).ok_or_else(|| {
-                            LengError::Unsupported(format!("unknown pointer `{pname}`"))
-                        })?;
-                        return Ok((pv.id, desc));
-                    }
-                    // A **computed pointer** with an explicit pointee type: `(deref (cast (ptr T)
-                    // e))` — evaluate `e` as the address, take the pointee `T` from the cast. nimony
-                    // emits this to read through a re-typed address (`=destroy` reads a string's low
-                    // length byte via `(ptr (u 8))`).
-                    if operand.tag() == Some("cast") {
-                        let ca = operand.args();
-                        if ca.len() >= 2 {
-                            if let Some(pointee) = ptr_pointee(&ca[0]) {
-                                let desc = self.t.tydesc(pointee)?;
-                                let addr = self.expr_typed(&ca[1], ValType::I64)?;
-                                return Ok((addr.id, desc));
-                            }
-                        }
-                    }
-                    // A **pointer-valued lvalue**: `(deref (dot s more))` — a typed-pointer field.
-                    // Load the pointer value at the field's address; its pointee is the address of
-                    // the target aggregate. Walks `string.more → LongString` for the ARC ops.
-                    let (laddr, ldesc) = self.lvalue_addr(operand)?;
-                    if let TyDesc::Ptr(pointee) = ldesc {
-                        let pv = self.fresh();
-                        self.used_memory = true;
-                        self.cur_buf
-                            .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
-                        return Ok((pv, *pointee));
-                    }
-                    Err(LengError::Unsupported(
-                        "deref of non-pointer expression".into(),
-                    ))
+                    self.pointer_operand(operand)
                 }
                 Some("dot") => {
                     let a = node.args();
@@ -1550,17 +1810,20 @@ impl<'a> FuncGen<'a> {
                     Ok((self.add_scaled(baddr, idx.id, esize), edesc))
                 }
                 Some("pat") => {
+                    // `(pat ptr idx)` — pointer-indexed lvalue: `*(ptr + idx)`. An **inline flexible
+                    // array** (`LongString.data`) indexes off the field's *own address* (no load);
+                    // otherwise the pointer is a symbol or computed pointer (as `deref`).
                     let a = node.args();
-                    let pname = a.first().and_then(|n| n.as_atom()).ok_or_else(|| {
-                        LengError::Unsupported("pat on non-symbol pointer".into())
-                    })?;
-                    let pdesc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                        LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-                    })?;
-                    let p = self.expr(&a[0])?;
+                    if let Some(bd @ TyDesc::FlexArray(_)) = self.lvalue_type(&a[0]) {
+                        let (base, _) = self.lvalue_addr(&a[0])?;
+                        let (esize, edesc) = self.array_of(&bd)?;
+                        let idx = self.expr_typed(&a[1], ValType::I64)?;
+                        return Ok((self.add_scaled(base, idx.id, esize), edesc));
+                    }
+                    let (pv, pdesc) = self.pointer_operand(&a[0])?;
                     let esize = self.t.sizeof(&pdesc);
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
-                    Ok((self.add_scaled(p.id, idx.id, esize), pdesc))
+                    Ok((self.add_scaled(pv, idx.id, esize), pdesc))
                 }
                 other => Err(LengError::Unsupported(format!(
                     "lvalue `{}`",
@@ -1568,6 +1831,44 @@ impl<'a> FuncGen<'a> {
                 ))),
             },
         }
+    }
+
+    /// Resolve a **pointer expression** to `(value id, pointee descriptor)` — shared by `deref`/`pat`.
+    /// A pointer is a **symbol** local (its tracked pointee), a `(cast (ptr T) e)` **computed
+    /// pointer** (evaluate `e`, pointee `T`), or a **pointer-valued lvalue** (`(dot s more)` — load
+    /// the pointer, pointee from the `Ptr` field type). Anything else fail-closes.
+    fn pointer_operand(&mut self, operand: &Node) -> Result<(u32, TyDesc), LengError> {
+        if let Some(pname) = operand.as_atom() {
+            let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
+                LengError::Unsupported(format!("`{pname}` is not a known pointer"))
+            })?;
+            let pv = self
+                .lookup(pname)
+                .ok_or_else(|| LengError::Unsupported(format!("unknown pointer `{pname}`")))?;
+            return Ok((pv.id, desc));
+        }
+        if operand.tag() == Some("cast") {
+            let ca = operand.args();
+            if ca.len() >= 2 {
+                if let Some(pointee) = ptr_pointee(&ca[0]) {
+                    let desc = self.t.tydesc(pointee)?;
+                    let addr = self.expr_typed(&ca[1], ValType::I64)?;
+                    return Ok((addr.id, desc));
+                }
+            }
+        }
+        let (laddr, ldesc) = self.lvalue_addr(operand)?;
+        if let TyDesc::Ptr(pointee) = ldesc {
+            let pv = self.fresh();
+            self.used_memory = true;
+            self.cur_buf
+                .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
+            return Ok((pv, *pointee));
+        }
+        Err(LengError::Unsupported(format!(
+            "not a pointer expression (`{}`)",
+            operand.tag().unwrap_or("<atom>")
+        )))
     }
 
     /// Load the scalar value of an lvalue.
@@ -1603,6 +1904,9 @@ impl<'a> FuncGen<'a> {
                     ty: ValType::I32,
                 })
             }
+            TyDesc::FlexArray(_) => Err(LengError::Unsupported(
+                "reading a flexible array as a value (index it with `at`/`pat`)".into(),
+            )),
             TyDesc::Agg(n) => Err(LengError::Unsupported(format!(
                 "reading aggregate `{n}` as a value (whole-aggregate ops are a later slice)"
             ))),
@@ -1624,6 +1928,11 @@ impl<'a> FuncGen<'a> {
             TyDesc::Scalar(t) => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
+            TyDesc::FlexArray(_) => {
+                return Err(LengError::Unsupported(
+                    "assigning to a flexible array (index it with `at`/`pat`)".into(),
+                ))
+            }
             TyDesc::Agg(n) => {
                 return Err(LengError::Unsupported(format!(
                     "assigning to aggregate lvalue `{n}`"
@@ -1680,15 +1989,20 @@ impl<'a> FuncGen<'a> {
 
     /// Element `(size, type)` of an array descriptor.
     fn array_of(&self, bdesc: &TyDesc) -> Result<(u64, TyDesc), LengError> {
-        if let TyDesc::Agg(n) = bdesc {
-            if let Some(Layout::Array {
-                elem, elem_size, ..
-            }) = self.t.types.get(n)
-            {
-                return Ok((*elem_size, elem.clone()));
+        match bdesc {
+            TyDesc::Agg(n) => {
+                if let Some(Layout::Array {
+                    elem, elem_size, ..
+                }) = self.t.types.get(n)
+                {
+                    return Ok((*elem_size, elem.clone()));
+                }
+                Err(LengError::Unsupported("`at` on a non-array".into()))
             }
+            // An inline flexible array (`LongString.data`): element size from the element type.
+            TyDesc::FlexArray(elem) => Ok((self.t.sizeof(elem).max(1), (**elem).clone())),
+            _ => Err(LengError::Unsupported("`at` on a non-array".into())),
         }
-        Err(LengError::Unsupported("`at` on a non-array".into()))
     }
 
     /// The type descriptor of an lvalue, computed **without emitting** (for dispatching aggregate
@@ -1705,11 +2019,27 @@ impl<'a> FuncGen<'a> {
                 self.local_desc.get(name).cloned()
             }
             Node::List(_) => match node.tag() {
-                Some("deref" | "pat") => node
-                    .args()
-                    .first()
-                    .and_then(|n| n.as_atom())
-                    .and_then(|p| self.pointee.get(p).cloned()),
+                Some("deref") => {
+                    // A symbol pointer's tracked pointee, or a **computed** pointer (`(deref (dot s
+                    // more))`) whose lvalue type is a `Ptr` → its pointee.
+                    let op = node.args().first()?;
+                    if let Some(p) = op.as_atom() {
+                        return self.pointee.get(p).cloned();
+                    }
+                    match self.lvalue_type(op)? {
+                        TyDesc::Ptr(pointee) => Some(*pointee),
+                        _ => None,
+                    }
+                }
+                Some("pat") => {
+                    // Indexing an **inline flexible array** yields its element; indexing a symbol
+                    // pointer yields its pointee.
+                    let op = node.args().first()?;
+                    if let Some(TyDesc::FlexArray(e)) = self.lvalue_type(op) {
+                        return Some(*e);
+                    }
+                    op.as_atom().and_then(|p| self.pointee.get(p).cloned())
+                }
                 Some("dot") => {
                     let a = node.args();
                     let bd = self.lvalue_type(a.first()?)?;
@@ -1831,6 +2161,9 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  i64.store v{addr} v{}\n", v.id));
                 Ok(())
             }
+            TyDesc::FlexArray(_) => Err(LengError::Unsupported(
+                "storing to a flexible array member (index it with `at`/`pat`)".into(),
+            )),
             TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
         }
     }
@@ -1923,6 +2256,26 @@ impl<'a> FuncGen<'a> {
                 };
                 self.write_local(&name, v)
             }
+            Some("const") => {
+                // A **local `const`** `(const :name pragmas type value)`: a scalar int/char/bool is
+                // inlined at use; an aggregate was already materialized as a module global by
+                // `collect_local_aggregate_consts` (so nothing to do here).
+                let a = s.args();
+                if a.len() >= 4 {
+                    let name = sym_def(&a[0])?;
+                    if let Some(v) = int_literal(&a[3]) {
+                        self.local_consts.insert(name, v);
+                        return Ok(());
+                    }
+                    if self.t.globals.contains_key(&name) {
+                        return Ok(()); // pre-materialized aggregate const
+                    }
+                    return Err(LengError::Unsupported(format!(
+                        "non-scalar local const `{name}`"
+                    )));
+                }
+                Ok(())
+            }
             Some("asgn") => {
                 // `(asgn Lvalue Expr)`.
                 let a = s.args();
@@ -1936,6 +2289,18 @@ impl<'a> FuncGen<'a> {
                 let a = s.args();
                 if a.len() != 2 {
                     return Err(LengError::Malformed("store needs value and lvalue".into()));
+                }
+                self.assign(&a[1], &a[0])
+            }
+            Some("keepovf") => {
+                // `(keepovf Expr Dest)` — overflow-*keeping* (wrapping) arithmetic into `Dest`.
+                // Overflow checks are off (svm integer arithmetic wraps), so it's a plain store of
+                // the wrapping result — `Dest = Expr`.
+                let a = s.args();
+                if a.len() != 2 {
+                    return Err(LengError::Malformed(
+                        "keepovf needs an expr and a dest".into(),
+                    ));
                 }
                 self.assign(&a[1], &a[0])
             }
@@ -2302,6 +2667,9 @@ impl<'a> FuncGen<'a> {
                 if let Some(v) = self.read_local(a) {
                     return Ok(v);
                 }
+                if let Some(&c) = self.local_consts.get(a) {
+                    return Ok(self.emit_const(ValType::I64, c));
+                }
                 if let Some(&c) = self.t.consts.get(a) {
                     return Ok(self.emit_const(ValType::I64, c));
                 }
@@ -2314,6 +2682,9 @@ impl<'a> FuncGen<'a> {
                 if let Ok(f) = a.parse::<f64>() {
                     return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
                 }
+                if let Some(c) = char_literal(a) {
+                    return Ok(self.emit_const(ValType::I32, c)); // char literal `'0'` / `'\0A'`
+                }
                 // A link unit: a leftover atom is a cross-module data symbol — load through `data.sym`.
                 if self.t.link_mode {
                     return self.load_lvalue(e);
@@ -2322,7 +2693,39 @@ impl<'a> FuncGen<'a> {
             }
             Node::List(_) => match e.tag() {
                 Some(op @ ("add" | "sub" | "mul" | "div" | "mod")) => self.arith(op, e),
+                Some(op @ ("bitand" | "bitor" | "bitxor" | "shl" | "shr" | "ashr")) => {
+                    self.bitwise(op, e)
+                }
                 Some(op @ ("eq" | "neq" | "lt" | "le")) => self.compare(op, e),
+                Some("bitnot") => {
+                    // Bitwise complement `(bitnot T x)` — `x xor -1` at the type's width.
+                    let a = e.args();
+                    if a.len() != 2 {
+                        return Err(LengError::Malformed(
+                            "bitnot needs Type and one operand".into(),
+                        ));
+                    }
+                    let (ty, _) = int_ty_signed(&a[0])?;
+                    let x = self.expr_typed(&a[1], ty)?;
+                    let ones = self.emit_const(ty, -1);
+                    Ok(self.emit_bin("xor", ty, x, ones))
+                }
+                Some("not") => {
+                    // Logical `not` on a bool (i32 0/1): `x == 0`, an i32 0/1.
+                    let x = self.expr(&e.args()[0])?;
+                    let zero = self.emit_const(x.ty, 0);
+                    let id = self.fresh();
+                    self.cur_buf.push_str(&format!(
+                        "  v{id} = {}.eq v{} v{}\n",
+                        prefix(x.ty),
+                        x.id,
+                        zero.id
+                    ));
+                    Ok(Val {
+                        id,
+                        ty: ValType::I32,
+                    })
+                }
                 Some("neg") => {
                     let a = e.args();
                     let ty = val_ty(&a[0])?;
@@ -2358,6 +2761,9 @@ impl<'a> FuncGen<'a> {
                 Some("true") => Ok(self.emit_const(ValType::I32, 1)),
                 Some("false") => Ok(self.emit_const(ValType::I32, 0)),
                 Some("nil") => Ok(self.emit_const(ValType::I64, 0)),
+                // The overflow flag (`(ovf)`) — always false: svm integer arithmetic wraps and we
+                // don't track overflow (checks are off), so the `if (ovf)` guard never fires.
+                Some("ovf") => Ok(self.emit_const(ValType::I32, 0)),
                 // Float specials.
                 Some("inf") => Ok(self.emit_fconst(ValType::F64, f64::INFINITY)),
                 Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
@@ -2483,6 +2889,32 @@ impl<'a> FuncGen<'a> {
                     "rem_u"
                 }
             }
+            _ => unreachable!(),
+        };
+        Ok(self.emit_bin(name, ty, l, r))
+    }
+
+    /// `(bitand|bitor|bitxor|shl|shr|ashr Type Expr Expr)` — bitwise/shift, same `(Type a b)` shape
+    /// as [`arith`]. `shr` is logical for unsigned types, arithmetic for signed; `ashr` is always
+    /// arithmetic.
+    fn bitwise(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
+        let a = e.args();
+        if a.len() != 3 {
+            return Err(LengError::Malformed(format!(
+                "`{op}` needs Type and two operands"
+            )));
+        }
+        let (ty, signed) = int_ty_signed(&a[0])?;
+        let l = self.expr_typed(&a[1], ty)?;
+        let r = self.expr_typed(&a[2], ty)?;
+        let name = match op {
+            "bitand" => "and",
+            "bitor" => "or",
+            "bitxor" => "xor",
+            "shl" => "shl",
+            "shr" if signed => "shr_s",
+            "shr" => "shr_u",
+            "ashr" => "shr_s",
             _ => unreachable!(),
         };
         Ok(self.emit_bin(name, ty, l, r))
@@ -2668,9 +3100,42 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
-    /// One call argument → its SVM value id. An **aggregate** argument is passed by address (the
-    /// callee's param is a by-address pointer); a scalar is evaluated and coerced to the param type.
+    /// Allocate `size` bytes of aggregate-rvalue scratch (`sp + temp_next`) and bump the pointer.
+    fn alloc_temp(&mut self, size: u64) -> u32 {
+        let off = self.temp_next;
+        self.temp_next += size;
+        let sp = self.cur[0];
+        self.add_const_off(sp, off)
+    }
+
+    /// If `node` is an **aggregate rvalue** — `(oconstr T …)`/`(aconstr T …)` with an aggregate `T` —
+    /// construct it into a fresh temp slot and return `(temp address, desc)`; else `None`. This is how
+    /// an aggregate literal reaches *argument* position (aggregates are passed by-address), e.g.
+    /// `(call &.0. s (oconstr string …))`.
+    fn agg_rvalue_temp(&mut self, node: &Node) -> Result<Option<(u32, TyDesc)>, LengError> {
+        if !matches!(node.tag(), Some("oconstr") | Some("aconstr")) {
+            return Ok(None);
+        }
+        let tnode = node
+            .args()
+            .first()
+            .ok_or_else(|| LengError::Malformed("constructor needs a type".into()))?;
+        let desc = self.t.tydesc(tnode)?;
+        if !matches!(desc, TyDesc::Agg(_)) {
+            return Ok(None);
+        }
+        let addr = self.alloc_temp(self.t.sizeof(&desc));
+        self.assign_aggregate(addr, &desc, node)?;
+        Ok(Some((addr, desc)))
+    }
+
+    /// One call argument → its SVM value id. An **aggregate** argument is passed by address: an
+    /// aggregate *lvalue* by its own address, an aggregate *rvalue* (`(oconstr …)`) via a temp; a
+    /// scalar is evaluated and coerced to the param type.
     fn call_arg(&mut self, arg: &Node, want: ValType) -> Result<u32, LengError> {
+        if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+            return Ok(addr);
+        }
         if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
             let (addr, _) = self.lvalue_addr(arg)?;
             return Ok(addr);
@@ -2691,7 +3156,10 @@ impl<'a> FuncGen<'a> {
         let mut argtys = Vec::new();
         for arg in args {
             // Aggregate args pass by address (matching by-address params); scalars by value.
-            if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+                argvals.push(addr);
+                argtys.push(ValType::I64);
+            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
                 let (addr, _) = self.lvalue_addr(arg)?;
                 argvals.push(addr);
                 argtys.push(ValType::I64);
@@ -2879,32 +3347,20 @@ fn is_float(t: ValType) -> bool {
     matches!(t, ValType::F32 | ValType::F64)
 }
 
-/// A proc needs a frame iff it takes the address of a local, or declares an aggregate-typed local
-/// (indexed by `at`/`dot`, hence frame-resident). Kept in sync with `proc_body`'s frame decision.
-fn proc_needs_frame(p: &Node) -> bool {
-    let body = match p.args().get(4) {
-        Some(b) => b,
-        None => return false,
-    };
-    let mut addr = std::collections::HashSet::new();
-    collect_addr_taken(body, &mut addr);
-    !addr.is_empty() || has_aggregate_var(body)
-}
-
-/// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
-fn has_aggregate_var(node: &Node) -> bool {
-    if let Node::List(_) = node {
-        if node.tag() == Some("var") {
-            let a = node.args();
-            if a.len() >= 3 && matches!(&a[2], Node::Atom(s) if s != ".") {
+/// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
+/// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
+fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>) -> bool {
+    if node.tag() == Some("call") {
+        if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
+            if procs.get(callee).is_some_and(|s| s.needs_frame) {
                 return true;
             }
         }
-        return node.args().iter().any(has_aggregate_var);
     }
-    false
+    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs)))
 }
 
+/// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
 /// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
 fn collect_labels(node: &Node, out: &mut Vec<String>) {
     if let Node::List(_) = node {
@@ -2999,11 +3455,32 @@ fn parse_int(s: &str) -> Result<i64, ()> {
 
 /// The integer value of an atom literal node, if it is one.
 fn int_literal(node: &Node) -> Option<i64> {
-    if node.tag() == Some("suf") {
-        // A suffixed integer literal `N'iXX` in constant position — the value is the first son.
-        return node.args().first().and_then(int_literal);
+    match node.tag() {
+        // A suffixed integer literal `N'iXX` in constant position — value is the first son.
+        Some("suf") => return node.args().first().and_then(int_literal),
+        // Boolean literals are integer-valued (`case` over a bool branches on `(true)`/`(false)`).
+        Some("true") => return Some(1),
+        Some("false") => return Some(0),
+        Some("nil") => return Some(0), // a null pointer literal (a `string`'s `more` in an SSO const)
+        _ => {}
     }
-    node.as_atom().and_then(|s| parse_int(s).ok())
+    node.as_atom()
+        .and_then(|s| parse_int(s).ok().or_else(|| char_literal(s)))
+}
+
+/// A NIF **character literal** — `'0'` (the byte 48), `'\0A'` (a `\HH` hex escape) — to its byte
+/// value. `None` if `s` isn't a `'…'`-delimited char.
+fn char_literal(s: &str) -> Option<i64> {
+    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    if let Some(hex) = inner.strip_prefix('\\') {
+        // `\HH` — the same hex-byte escape NIF strings use.
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    let mut chars = inner.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c as i64),
+        _ => None,
+    }
 }
 
 /// The pointee type node of a `(ptr T)` / `(aptr T)` type, if `node` is one (else `None` — e.g. a

@@ -154,6 +154,106 @@ fn real_long_string_runs_end_to_end() {
 }
 
 #[test]
+fn computed_deref_flexarray_chain() {
+    // The real string-internal walk: `s.more.data[i]` where `s: ptr string`, so the flex array is
+    // reached through a **computed** deref — `(pat (dot (deref (dot (deref s) more)) data) i)`.
+    // This needs `lvalue_type` to see through the computed `(deref (dot …))` to the `LongString`,
+    // then to its `data` flex array. nth(s, i) reads `s.more.data[i]`.
+    let leng = "\
+(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LS.0.))))
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc :nth.0. (params (param :s.0 . (ptr string.0.)) (param :i.0 . (i +64))) (i +64) .
+  (stmts . (ret (conv (i +64) (pat (dot (deref (dot (deref s.0) more.0 0)) data.0 0) i.0))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let (s, b) = (256usize, 512usize);
+    let mut seed = vec![0u8; 4096];
+    seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes()); // string.more → blob
+    seed[b + 24..b + 24 + 3].copy_from_slice(b"hey"); // blob.data@24
+    let read = |i: i64| -> i64 {
+        let mut fuel = u64::MAX;
+        let (ir, _) = svm_interp::run_capture(
+            &m,
+            0,
+            &[Value::I64(s as i64), Value::I64(i)],
+            &mut fuel,
+            &seed,
+        );
+        match ir.expect("interp").as_slice() {
+            [Value::I64(n)] => *n,
+            o => panic!("{o:?}"),
+        }
+    };
+    assert_eq!(read(0), b'h' as i64, "s.more.data[0]");
+    assert_eq!(read(2), b'y' as i64, "s.more.data[2]");
+}
+
+#[test]
+fn const_array_table_indexes() {
+    // A `const` array table `(aconstr T e0 e1 …)` — like `system`'s `fsLookupTable` (256 i8s) —
+    // materializes into a data segment; `(at table idx)` reads an element. Here a small i8 table
+    // [-1, 5, 100, -3]; `nth(i)` returns the signed element.
+    let leng = "\
+(stmts
+ (type :Tbl.0. . (array (i 8) 4))
+ (const :tbl.0. . Tbl.0. (aconstr Tbl.0. (suf -1 \"i8\") (suf 5 \"i8\") (suf 100 \"i8\") (suf -3 \"i8\")))
+ (proc :nth.0. (params (param :i.0 . (i +64))) (i +64) .
+  (stmts . (ret (conv (i +64) (at tbl.0. i.0))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    assert_eq!(run(&m, 0, &[0]), -1, "tbl[0]");
+    assert_eq!(run(&m, 0, &[1]), 5, "tbl[1]");
+    assert_eq!(run(&m, 0, &[2]), 100, "tbl[2]");
+    assert_eq!(run(&m, 0, &[3]), -3, "tbl[3] sign-extended");
+}
+
+#[test]
+fn flexarray_data_indexing() {
+    // `LongString.data` is an inline `uarray char` — a flexible array whose own address is the base.
+    // `nth(p, i) = (deref p).data[i]`, read as a byte. Indexes off `p + 24` (data@24), no pointer
+    // load, widened per char. Reads "hello" seeded at the blob.
+    let leng = "\
+(stmts
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc :nth.0. (params (param :p.0 . (ptr LS.0.)) (param :i.0 . (i +64))) (i +64) .
+  (stmts . (ret (conv (i +64) (at (dot (deref p.0) data.0 0) i.0))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let b = 256usize;
+    let mut seed = vec![0u8; 4096];
+    seed[b + 24..b + 24 + 5].copy_from_slice(b"hello"); // data@24
+    let read = |i: i64| -> i64 {
+        let mut fuel = u64::MAX;
+        let (ir, _) = svm_interp::run_capture(
+            &m,
+            0,
+            &[Value::I64(b as i64), Value::I64(i)],
+            &mut fuel,
+            &seed,
+        );
+        let n = match ir.expect("interp").as_slice() {
+            [Value::I64(n)] => *n,
+            o => panic!("{o:?}"),
+        };
+        let jit = match svm_jit::compile_and_run_capture(&m, 0, &[b as i64, i], &seed)
+            .expect("jit")
+            .0
+        {
+            svm_jit::JitOutcome::Returned(v) => v,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(jit, vec![n], "§9 parity");
+        n
+    };
+    assert_eq!(read(0), b'h' as i64, "data[0]");
+    assert_eq!(read(1), b'e' as i64, "data[1]");
+    assert_eq!(read(4), b'o' as i64, "data[4]");
+}
+
+#[test]
 fn unsigned_literal_over_i64_max() {
     // An SSO word can exceed i64::MAX; the `u` literal keeps the bit pattern.
     let leng = "\

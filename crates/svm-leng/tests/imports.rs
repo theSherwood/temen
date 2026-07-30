@@ -30,6 +30,29 @@ fn cross_module_call_becomes_import() {
 }
 
 #[test]
+fn importc_proc_becomes_an_import() {
+    // An `importc` proc is a C extern (the bottom edge: `memcpy`, `getpid`, `mmap`) with no
+    // translatable body. It is *not* emitted as a func; a call to it lowers to an import the host
+    // binds at link — so a non-void extern no longer trips "falls off the end without ret".
+    let leng = "\
+(stmts
+ (proc :c_getpid.0. . (i +32) (pragmas (importc \"getpid\")) (stmts .))
+ (proc :pid.0. . (i +32) . (stmts . (ret (call c_getpid.0.)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).expect("verify");
+    assert_eq!(
+        m.funcs.len(),
+        1,
+        "only `pid` is a func; the extern is skipped"
+    );
+    assert!(
+        m.imports.iter().any(|i| i.name == "c_getpid.0."),
+        "the extern is an import: {:?}",
+        m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn import_runs_when_bound() {
     let m = svm_leng::translate(MOD).unwrap();
     // Bind import slot 0 to a host fn `ext_double(x) = x * 2`, then use_ext(x) = x*2 + 1.
