@@ -1974,6 +1974,20 @@ impl<'a> FuncGen<'a> {
                         .ok_or_else(|| LengError::Malformed("deref needs an operand".into()))?;
                     self.pointer_operand(operand)
                 }
+                Some("baseobj") => {
+                    // `(baseobj BaseType Levels ObjExpr)` — the base sub-object of `ObjExpr`. Single
+                    // inheritance inlines the base at offset 0 (see `resolve_type`), so the base's
+                    // address is the object's own address, retyped to the base aggregate.
+                    let a = node.args();
+                    let obj = a.get(2).ok_or_else(|| {
+                        LengError::Malformed("baseobj needs BaseType Levels Obj".into())
+                    })?;
+                    let (addr, _) = self.lvalue_addr(obj)?;
+                    let base = a[0]
+                        .as_atom()
+                        .ok_or_else(|| LengError::Malformed("baseobj needs a base type".into()))?;
+                    Ok((addr, TyDesc::Agg(base.to_string())))
+                }
                 Some("dot") => {
                     let a = node.args();
                     let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
@@ -2227,6 +2241,14 @@ impl<'a> FuncGen<'a> {
                     if let Some(p) = op.as_atom() {
                         return self.pointee.get(p).cloned();
                     }
+                    // A cast to a typed pointer (`(deref (cast (ptr T) …))`) yields the pointee `T` —
+                    // the same rule `pointer_operand` uses at runtime. Without it the static-type
+                    // chain breaks on RTTI walks (`(cast (ptr RootObj) …)` → `.vt` → `.mt`).
+                    if op.tag() == Some("cast") {
+                        if let Some(pointee) = op.args().first().and_then(ptr_pointee) {
+                            return self.t.tydesc(pointee).ok();
+                        }
+                    }
                     match self.lvalue_type(op)? {
                         TyDesc::Ptr(pointee) => Some(*pointee),
                         _ => None,
@@ -2251,6 +2273,12 @@ impl<'a> FuncGen<'a> {
                     let bd = self.lvalue_type(node.args().first()?)?;
                     self.array_of(&bd).ok().map(|(_, d)| d)
                 }
+                // `(baseobj BaseType Levels Obj)` — a base sub-object, typed as the base aggregate.
+                Some("baseobj") => node
+                    .args()
+                    .first()
+                    .and_then(|n| n.as_atom())
+                    .map(|b| TyDesc::Agg(b.to_string())),
                 _ => None,
             },
         }
@@ -2422,6 +2450,12 @@ impl<'a> FuncGen<'a> {
     }
 
     fn stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        // A `.` Empty marker or an empty `()` placeholder carries no statement — nimony emits these
+        // in module scaffolding (`ini`/C-`main`). Inert: skip.
+        if s.is_empty_marker() || (s.tag().is_none() && s.as_atom().is_none() && s.args().is_empty())
+        {
+            return Ok(());
+        }
         match s.tag() {
             // Nested block / scope: recurse (hexer emits `(stmts (stmts …))` and `(scope (stmts …))`).
             Some("stmts") => self.stmt_list(s),
@@ -3359,10 +3393,16 @@ impl<'a> FuncGen<'a> {
     fn indirect_callee(&mut self, a0: &Node) -> Result<Option<(u32, FnPtrSig)>, LengError> {
         if a0.tag() == Some("cast") {
             let ca = a0.args();
-            if ca.len() >= 2 && self.t.is_proctype(&ca[0]) {
-                let sig = self.t.proctype_sig(&ca[0])?;
-                let v = self.expr_typed(&ca[1], ValType::I32)?;
-                return Ok(Some((v.id, sig)));
+            // A cast whose target is a funcref — an inline `(proctype …)`, a named proctype, or a
+            // `(ptr proctype)` alias (nimony's RTTI method-slot cast). The source is the funcref
+            // value: a `proctype` field/slot is already an `i32` index; an opaque `(ptr void)` method
+            // slot is an `i64` that narrows to the `i32` table index.
+            if ca.len() >= 2 {
+                if let Ok(TyDesc::FnPtr(sig)) = self.t.tydesc(&ca[0]) {
+                    let v = self.expr(&ca[1])?;
+                    let idx = self.convert(v, ValType::I32);
+                    return Ok(Some((idx.id, *sig)));
+                }
             }
         }
         let sig = match self.lvalue_type(a0) {

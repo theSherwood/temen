@@ -570,9 +570,22 @@ plumbing. Five workstreams, roughly independent:
     (`data.ptr <at> self <off>`, svm_ir D-LINK): a pointer stored *inside* one const's bytes to
     another const (a `string` literal's `more = (addr strlit)`) — placeholder bytes the linker
     overwrites (`tests/system.rs`, `tests/strings.rs`).
-  - **Remaining for the full `system` link:** the `[]=` call-arity tail bug (an `openArray` op), the
-    system `ini` exception-global setup, and function-pointer/indirect-dispatch (out of subset). The
-    ARC-heavy string path — what a real string program needs at the boundary — now links and runs.
+  - **✅ Whole `system` module compiles — MET 2026-07-30 (Path A capstone).** `compile_whole_object`
+    lowers the **entire** real `system` module to a 129 KB `.svmo` link object — **297 functions**
+    plus exactly the **25 bottom-edge C imports** (`mmap`, `c_memcpy`/`memset`/`memcmp`, the atomics,
+    `bswap64`/`ctz64`/`clz64`, `cWriteErr`, `cExitSys`, `dlopen`/`dlsym`/`dlclose`). Getting the last
+    procs to lower closed a run of translator gaps, each with a synthetic both-engines test
+    (`tests/indirect.rs`): the **char-literal lexer** (a space char `' '` no longer splits, fixing
+    the phantom `[]=` arity), **named pointer-alias types** (`ref` types like `RootRef = (ptr …)`),
+    **indirect calls through function pointers** (`ref.func` + `call_indirect`, scalar and sret —
+    coroutine scheduling: `trivialTick`/`advance`/`setScheduler`), **RTTI virtual dispatch** (the
+    `o.vt.mt[i]` method-table walk, via cast-deref static typing + `i64` slot → `i32` funcref), and
+    `baseobj` base-subobject upcasts. Linking the whole object end-to-end now needs only the 25
+    imports bound (W3, below); the object itself is produced and structurally sound.
+  - **Remaining for the full `system` *link+run*:** bind the 25 W3 bottom-edge imports to a runtime
+    shim (`mmap`→bump allocator, `c_memcpy`→`mem.copy`, atomics→plain ops in the single-threaded
+    model, `cWriteErr`→host write), then link + verify + run a real heap program. The ARC-heavy
+    string path — what a real string program needs at the boundary — already links and runs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

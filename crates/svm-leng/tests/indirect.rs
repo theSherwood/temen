@@ -87,3 +87,85 @@ fn call_through_funcref_param() {
     // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49.
     assert_eq!(run(&m, 1, &[0, 7]), 49);
 }
+
+#[test]
+fn virtual_dispatch_through_a_vtable() {
+    // The RTTI shape nimony emits for method calls: an object's `vt` points at a vtable whose `mt`
+    // flexarray holds method funcrefs (as opaque `(ptr void)` slots). A virtual call loads
+    // `o.vt.mt[0]`, casts it to the method's `(ptr proctype)`, and dispatches. This exercises the
+    // whole chain the real `finalizeCoroutine`/exception-destroy hooks use: the cast-deref static
+    // type walk, flexarray funcref indexing, and the `i64` method-slot → `i32` funcref narrowing.
+    let leng = "\
+(stmts
+ (type :Getter.0. . (proctype . (params (param :self.0 . (ptr Obj.0.))) (i +64) (pragmas (nimcall))))
+ (type :GetterP.0. . (ptr Getter.0.))
+ (type :Vtbl.0. . (object . (fld :mt.0 . (flexarray (ptr (void))))))
+ (type :Obj.0. . (object . (fld :vt.0 . (ptr Vtbl.0.)) (fld :x.0 . (i +64))))
+ (proc :getX.0 (params (param :self.0 . (ptr Obj.0.))) (i +64) .
+  (stmts . (ret (dot (deref self.0) x.0 0))))
+ (proc :dispatch.0 (params (param :o.0 . (ptr Obj.0.))) (i +64) .
+  (stmts .
+   (ret (call
+     (cast GetterP.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
+     o.0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let text = svm_leng::translate_to_text(leng).unwrap();
+    assert!(text.contains("call_indirect"), "dispatch is indirect:\n{text}");
+
+    // getX = func 0, dispatch = func 1. Lay out a vtable and object in the window:
+    //   Vtbl @ 256: mt[0] @256 = 0 (getX's function index).
+    //   Obj  @ 320: vt @320 = 256, x @328 = 42.
+    let (vt, obj) = (256usize, 320usize);
+    let mut seed = vec![0u8; 4096];
+    seed[vt..vt + 8].copy_from_slice(&0u64.to_le_bytes()); // mt[0] = getX (func 0)
+    seed[obj..obj + 8].copy_from_slice(&(vt as u64).to_le_bytes()); // o.vt = &Vtbl
+    seed[obj + 8..obj + 16].copy_from_slice(&42u64.to_le_bytes()); // o.x = 42
+
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(&m, 1, &[Value::I64(obj as i64)], &mut fuel, &seed);
+    let iword = match ir.expect("interp").as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("unexpected {o:?}"),
+    };
+    let (jout, _) = svm_jit::compile_and_run_capture(&m, 1, &[obj as i64], &seed).expect("jit");
+    let jword = match jout {
+        svm_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(vec![iword], jword, "§9 interp/JIT parity");
+    assert_eq!(iword, 42, "virtual dispatch resolved o.vt.mt[0](o) = getX(o) = o.x");
+}
+
+#[test]
+fn baseobj_upcasts_to_the_base_subobject() {
+    // `(baseobj Base N obj)` upcasts to the inlined base sub-object (offset 0, single inheritance).
+    // `Derived` inlines `Base{tag}` at offset 0, then its own `extra`. Reading the base's `tag`
+    // through `baseobj` must see the same field the derived object stores at offset 0.
+    let leng = "\
+(stmts
+ (type :Base.0. . (object . (fld :tag.0 . (i +64))))
+ (type :Derived.0. . (object Base.0. (fld :extra.0 . (i +64))))
+ (proc :baseTag.0 (params (param :d.0 . (ptr Derived.0.))) (i +64) .
+  (stmts .
+   (ret (dot (baseobj Base.0. 1 (deref d.0)) tag.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // Derived @ 128: tag (base, offset 0) = 7.
+    let d = 128usize;
+    let mut seed = vec![0u8; 4096];
+    seed[d..d + 8].copy_from_slice(&7u64.to_le_bytes());
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(&m, 0, &[Value::I64(d as i64)], &mut fuel, &seed);
+    let iword = match ir.expect("interp").as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("unexpected {o:?}"),
+    };
+    let (jout, _) = svm_jit::compile_and_run_capture(&m, 0, &[d as i64], &seed).expect("jit");
+    let jword = match jout {
+        svm_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(vec![iword], jword, "§9 interp/JIT parity");
+    assert_eq!(iword, 7, "baseobj read the base sub-object's tag at offset 0");
+}
