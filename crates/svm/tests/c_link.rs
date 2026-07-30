@@ -75,8 +75,16 @@ fn selfhost_dir() -> PathBuf {
 /// spaced `-I dir` is a no-op — a real cc1 TU that isn't a sibling of `chibicc.h` needs this).
 #[cfg(target_os = "linux")]
 fn emit_object_real(cfile: &Path, include_dirs: &[PathBuf], tag: &str) -> LinkUnit {
+    // Unique per call: the test binary runs tests in parallel threads (one process ⇒ one pid), and
+    // several compile the same `tag` (e.g. `emit_libc.c` from three different tests). A pid+tag-only
+    // name would let those concurrent compiles clobber each other's IR file mid-write — a real race
+    // that surfaced as a libc unit with missing exports. The atomic id makes every output distinct,
+    // matching what `object_unit` already does for the string-sourced units.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
     let irfile = std::env::temp_dir().join(format!(
-        "svm_clink_real_{}_{}.svm",
+        "svm_clink_real_{}_{}_{id}.svm",
         tag.replace(['.', '/'], "_"),
         std::process::id()
     ));
@@ -999,6 +1007,48 @@ fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
          stream=mem<7,x>! len=9\n\
          fd=stdout\n",
         "emit-object printf/stdio formats byte-for-byte like glibc"
+    );
+}
+
+/// The **correctly-rounded float path** (task #22): `demo_float.c` prints a battery of `%.17g`/`%g`/
+/// `%e`/`%f` conversions through the emit-object libc's Steele & White scaled-bignum dtoa
+/// (`printf_emit.c`), run on interp==JIT under the powerbox. The headline is `%.17g` — the format
+/// chibicc itself emits for float literals — round-tripping the values that a lossy formatter gets
+/// wrong (0.1, 2/3, 1e-7). The oracle is glibc's own output for the identical calls (verified
+/// natively): a `double` printed with `%.17g` must read back bit-identical. Linux-only (mirrors the
+/// sibling printf gate — `object_unit_emit_libc`/`cc1_imports` compile the system-header libc).
+#[cfg(target_os = "linux")]
+#[test]
+fn emit_object_libc_float_runs_byte_exact_under_powerbox() {
+    use svm_run::{instantiate_with_imports, Outcome, RunConfig, Value};
+
+    // Entry unit first so `demo_float`'s `_start` is merged function 0; the libc has no `main`.
+    let demo = object_unit_file("crates/svm/tests/fixtures/emit_libc/demo_float.c");
+    let libc = object_unit_emit_libc();
+
+    let linked =
+        svm_ir::link_with_manifest(&[demo, libc]).expect("link demo_float + emit-object libc");
+    svm_verify::verify_module(&linked).expect("verify linked emit-object float program");
+
+    let inst = instantiate_with_imports(linked, cc1_imports(vec![], vec![])).expect("instantiate");
+    let run = inst
+        .run_diff(&RunConfig::default())
+        .expect("run _start on interp+jit");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "0.10000000000000001\n\
+         1\n\
+         3.14159265358979\n\
+         0.66666666666666663\n\
+         1e+20\n\
+         -9.9999999999999995e-08\n\
+         123456789 6.0220000000000003e+23\n\
+         [0.5][100][0.0001][1e-05]\n\
+         [1.234568e+04][4.200000E-04]\n\
+         [3.14][2][0.007]\n\
+         [+4.0][-5.0e+01][-0]\n",
+        "emit-object %.17g (and %g/%e/%f) is correctly rounded — byte-for-byte like glibc"
     );
 }
 
