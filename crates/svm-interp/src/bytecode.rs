@@ -722,6 +722,21 @@ impl ModuleSource {
         mods.push(std::sync::Arc::new(unit));
         mods.len() - 1
     }
+
+    /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
+    /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
+    /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
+    fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
+        self.mods.lock().unwrap_or_else(|e| e.into_inner())[1..].to_vec()
+    }
+
+    /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
+    fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
+        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        mods.truncate(1);
+        mods.extend(units.iter().cloned());
+    }
 }
 
 /// Build a §14 child / coroutine's natural dispatch table over its `module` in the shared source.
@@ -3634,6 +3649,7 @@ pub fn ir_value_trace(
 /// lives directly on the [`DebugRun`]/[`ScheduledDebugRun`]; a §14 **separate-module** child carries its
 /// own here (built from the granted `Module` at spawn, keyed by its pushed source index) so
 /// `read_var`/`var_addr`/`value_in_frame` resolve inside the child's body, not just module 0's.
+#[derive(Clone)]
 struct ModuleDebug {
     /// The child's index in the shared [`ModuleSource`] (`>= 1`) — matched against a frame's module so a
     /// frame outside this child (e.g. an installed §22 unit) isn't misread against these tables.
@@ -3693,10 +3709,14 @@ pub struct DebugRunSnapshot {
     chain: Vec<(usize, Vm, u32)>,
     /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
     fibers: Vec<FiberState>,
-    /// The §14 same-module coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
+    /// The §14 coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
     coroutines: Vec<Option<CoroSnapshot>>,
     /// While stepping inside a coroutine body: `(handle, parent resume-result slot, parent depth)`.
     active_coro: Option<(usize, u32, usize)>,
+    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** coroutine's pushed program), so
+    /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
+    /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
+    extra_units: Vec<std::sync::Arc<Compiled>>,
     /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
     /// a memoryless run. Fibers and same-module coroutines share this one window (coroutines via a
     /// `nested_view` over the same backing), so their bytes ride here too.
@@ -3705,13 +3725,15 @@ pub struct DebugRunSnapshot {
     host: super::HostReplaySubstate,
 }
 
-/// A §14 **same-module** coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a
-/// `nested_view` sub-view sharing the parent's backing region, so its bytes are already in the parent
-/// `mem` snapshot; only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds
-/// the view over the restored parent. The host is a fresh Yielder-only powerbox on restore, so only its
-/// replay substate is carried. Demand/mapping coroutines (non-pristine layout) and separate-module ones
-/// (a pushed source module) are outside the checkpointable subset, so `fault_yields`/`mod_debug` are
-/// always the defaults here and need not be stored.
+/// A §14 coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a `nested_view`
+/// sub-view sharing the parent's backing region, so its bytes are already in the parent `mem` snapshot;
+/// only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds the view over the
+/// restored parent. The host is a fresh Yielder-only powerbox on restore, so only its replay substate is
+/// carried. The coroutine's `module` rides in `vm.module` (`0` = same-module; `>= 1` = a **separate**
+/// module, whose pushed source unit is captured in the run snapshot's `extra_units`); its own §6
+/// metadata (`mod_debug`) is carried so a step-into resolves the separate module's source variables after
+/// restore. Demand/mapping coroutines (non-pristine layout) stay outside the subset, so `fault_yields`
+/// is always `false` here and need not be stored.
 struct CoroSnapshot {
     vm: Vm,
     win_base: u64,
@@ -3719,6 +3741,9 @@ struct CoroSnapshot {
     host: super::HostReplaySubstate,
     awaiting: Option<u32>,
     faulted_page: Option<u64>,
+    /// A separate-module coroutine's own §6 debug metadata (`None` for a same-module coroutine), cloned
+    /// so `read_var`/`var_addr` resolve inside its body after restore.
+    mod_debug: Option<ModuleDebug>,
 }
 
 impl DebugRunSnapshot {
@@ -3743,14 +3768,19 @@ fn coro_snapshot(c: &Coro) -> CoroSnapshot {
         host: c.host.replay_substate(),
         awaiting: c.awaiting,
         faulted_page: c.faulted_page,
+        mod_debug: c.mod_debug.clone(),
     }
 }
 
 /// Rebuild a live [`Coro`] from a [`CoroSnapshot`] on restore — the inverse of [`coro_snapshot`]:
 /// recreate its `nested_view` over the (already reseeded) `parent_mem` window so its bytes (shared via
 /// the backing region) are correct, a fresh Yielder-only host carrying the captured replay substate, and
-/// its natural same-module dispatch table. Shared by the single-vCPU and scheduled `restore` paths.
-fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, progs_len: usize) -> Coro {
+/// its natural dispatch table over its own `module` (`0` = primary; a separate module resolves against
+/// the just-restored `source`, whose `extra_units` were re-pushed first). Shared by the single-vCPU and
+/// scheduled `restore` paths.
+fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, source: &ModuleSource) -> Coro {
+    let module = cs.vm.module;
+    let progs_len = source.get(module).map_or(0, |u| u.progs.len());
     let mem = parent_mem.map(|m| m.nested_view(cs.win_base, cs.size_log2));
     let mut host = Host::new();
     host.grant_yielder();
@@ -3759,24 +3789,25 @@ fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, progs_len: usize) -
         vm: cs.vm.clone(),
         mem,
         host,
-        table: build_table(progs_len, 0),
+        table: build_table_for(progs_len, 0, module as u32),
         awaiting: cs.awaiting,
         fault_yields: false, // demand coroutines are outside the subset
         faulted_page: cs.faulted_page,
-        mod_debug: None, // same-module: frames read against the session's own metadata
+        mod_debug: cs.mod_debug.clone(),
     }
 }
 
 /// Capture a live **same-module** `instantiate`-child [`DbgEnv`] into an [`EnvSnapshot`]: its window
 /// geometry (`nested_view` base + size) + host replay substate + fuel. Its bytes ride in the shared
 /// window snapshot (the view shares the root backing region).
-fn env_snapshot(e: &DbgEnv) -> EnvSnapshot {
+fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
     EnvSnapshot {
         win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
         size_log2: e
             .mem
             .as_ref()
             .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
+        module,
         host: e.host.replay_substate(),
         fuel: e.fuel,
     }
@@ -3786,9 +3817,10 @@ fn env_snapshot(e: &DbgEnv) -> EnvSnapshot {
 /// [`env_snapshot`]: recreate its `nested_view` over the (reseeded) `shared_mem` window, its attenuated
 /// `Instantiator` + `AddressSpace` powerbox over `[0, child_size)` (deterministic in `child_size`), the
 /// captured host replay substate, its natural module-0 table, and its fuel quota.
-fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, progs_len: usize) -> DbgEnv {
+fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource) -> DbgEnv {
     let child_size = 1u64 << es.size_log2;
     let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2));
+    let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
     let mut host = Host::new();
     host.grant_instantiator(0, child_size);
     host.grant_address_space(0, child_size);
@@ -3796,7 +3828,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, progs_len: usize) -> 
     DbgEnv {
         mem,
         host,
-        table: build_table(progs_len, 0),
+        table: build_table_for(progs_len, 0, es.module as u32),
         fuel: es.fuel,
     }
 }
@@ -4505,17 +4537,19 @@ impl DebugRun {
                 .fibers
                 .iter()
                 .any(|f| matches!(f, FiberState::WaitParked { .. }))
-            && self.vt.coroutines.iter().flatten().all(|c| {
-                c.vm.module == 0
-                    && !c.fault_yields
-                    && c.mem.as_ref().is_none_or(|m| m.snapshot_safe())
-            })
+            && self
+                .vt
+                .coroutines
+                .iter()
+                .flatten()
+                .all(|c| !c.fault_yields && c.mem.as_ref().is_none_or(|m| m.snapshot_safe()))
     }
 
     /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
     /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
-    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, same-module
-    /// coroutine children) + the shared window bytes + the host's replay substate.
+    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, coroutine
+    /// children) + the shared window bytes + the host's replay substate + any separate-module coroutine's
+    /// pushed source units.
     pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
         if !self.checkpointable() {
             return None;
@@ -4533,6 +4567,7 @@ impl DebugRun {
                 .map(|c| c.as_ref().map(coro_snapshot))
                 .collect(),
             active_coro: self.vt.active_coro,
+            extra_units: self.source.extra_units(),
             mem: self.mem.as_ref().map(|m| m.window_snapshot()),
             host: self.host.replay_substate(),
         })
@@ -4543,25 +4578,29 @@ impl DebugRun {
     /// snapshot's logical time rather than clock 0. Rebuilds the whole `VTask` (active `Vm`, resume
     /// chain, fiber registry, and each same-module coroutine — its `nested_view` recreated over the
     /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
-    /// host replay substate, and sets the clock. The shared structure (`source`/`table`/`funcs`) already
-    /// matches — a checkpoint is only taken for a run whose coroutines are same-module.
+    /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
+    /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
     pub fn restore(&mut self, snap: &DebugRunSnapshot) {
         self.vt.active = snap.active.clone();
         self.vt.active_id = snap.active_id;
         self.vt.chain = snap.chain.clone();
         self.vt.active_coro = snap.active_coro;
         self.fibers = snap.fibers.clone();
+        // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
+        // indices resolve against the source).
+        self.source.reset_extra(&snap.extra_units);
         if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
             m.seed(bytes);
         }
-        // Rebuild each same-module coroutine: a fresh `nested_view` over the just-reseeded parent window
-        // (so its bytes — shared via the backing region — are already correct) + a fresh Yielder host.
-        let progs_len = self.source.primary().progs.len();
+        // Rebuild each coroutine: a fresh `nested_view` over the just-reseeded parent window (so its
+        // bytes — shared via the backing region — are already correct) + a fresh Yielder host + a table
+        // over its own module.
         let parent_mem = self.mem.as_ref();
+        let source = &*self.source;
         self.vt.coroutines = snap
             .coroutines
             .iter()
-            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, progs_len)))
+            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, source)))
             .collect();
         self.host.restore_replay_substate(&snap.host);
         self.op_clock = snap.clock;
@@ -5003,24 +5042,33 @@ pub struct ScheduledSnapshot {
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
     /// D57), reconstructed verbatim on restore. The parked fiber `Vm`s share the run's window.
     fibers: Vec<FiberState>,
-    /// The §14 **same-module** `instantiate`-child environments (handle = index; a task's
-    /// [`DbgTask::env`] indexes this). See [`EnvSnapshot`].
+    /// The §14 `instantiate`-child environments (handle = index; a task's [`DbgTask::env`] indexes this).
+    /// See [`EnvSnapshot`].
     extra_envs: Vec<EnvSnapshot>,
+    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** `instantiate_module` child's or
+    /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
+    /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
+    extra_units: Vec<std::sync::Arc<Compiled>>,
     mem: Option<Vec<u8>>,
     host: super::HostReplaySubstate,
 }
 
-/// A §14 **same-module** `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`].
-/// Like a coroutine child, its window is a `nested_view` sharing the root backing region — so its bytes
-/// ride in the snapshot's window bytes and only the view geometry (`win_base`/`size_log2`) is stored;
-/// `restore` rebuilds the view over the reseeded shared window. Its attenuated powerbox (an
-/// `Instantiator` + `AddressSpace`, each over `[0, child_size)`) is deterministic in `child_size =
-/// 1 << size_log2`, so only the host replay substate is carried; the natural module-0 dispatch table
-/// and the sub-allocated `fuel` complete it. Separate-module children (a pushed source unit) are outside
-/// the checkpointable subset, as are children that map their own pages (non-pristine window layout).
+/// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`]. Like a coroutine
+/// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
+/// snapshot's window bytes and only the view geometry (`win_base`/`size_log2`) is stored; `restore`
+/// rebuilds the view over the reseeded shared window. Its attenuated powerbox (an `Instantiator` +
+/// `AddressSpace`, each over `[0, child_size)`) is deterministic in `child_size = 1 << size_log2`, so
+/// only the host replay substate is carried; a natural dispatch table over the child's [`module`] (a
+/// **separate-module** `instantiate_module` child's pushed unit rides in `extra_units`) and the
+/// sub-allocated `fuel` complete it. Children that map their own pages (non-pristine window layout) stay
+/// outside the checkpointable subset.
 struct EnvSnapshot {
     win_base: u64,
     size_log2: u8,
+    /// The child's module in the shared source (`0` = same-module `instantiate`; `>= 1` = a
+    /// **separate-module** `instantiate_module` child, whose pushed unit is captured in the run
+    /// snapshot's `extra_units`). Its natural dispatch table is rebuilt over this index.
+    module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
 }
@@ -6020,15 +6068,14 @@ impl ScheduledDebugRun {
     /// **checkpoint** (W1) snapshots. Mirrors [`DebugRun::checkpointable`], extended over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 same-module coroutines** are admitted (`vm.module == 0`, not demand,
-    /// pristine `nested_view`); and **§14 same-module `instantiate` children** are admitted (each
-    /// [`DbgEnv`] a `nested_view` over the shared backing + a deterministic `Instantiator`/`AddressSpace`
-    /// powerbox, rebuilt on restore) provided their window layout is pristine — this is what admits
-    /// scheduled coroutines, which only ever arise alongside an `instantiate` sibling (the bytecode
-    /// engine rejects `coroutine + thread`). Still excluded (→ fall back to replay-from-turn-0):
-    /// **separate-module** coroutines / children (a pushed source unit — implicitly excluded, since a
-    /// live `module != 0` continuation would already have disabled checkpointing) and children that
-    /// **map their own pages** (non-pristine `nested_view` layout).
+    /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
+    /// same-module *or* separate-module (a separate module's pushed unit rides in `extra_units`); and
+    /// **§14 `instantiate` / `instantiate_module` children** are admitted (each [`DbgEnv`] a `nested_view`
+    /// over the shared backing + a deterministic `Instantiator`/`AddressSpace` powerbox + a natural table
+    /// over the child's module, rebuilt on restore) provided their window layout is pristine — this is
+    /// what admits scheduled coroutines, which only ever arise alongside an `instantiate` sibling (the
+    /// bytecode engine rejects `coroutine + thread`). Still excluded (→ fall back to replay-from-turn-0):
+    /// **demand** coroutines / children that **map their own pages** (non-pristine `nested_view` layout).
     fn checkpointable(&self) -> bool {
         self.host.checkpoint_safe()
             && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
@@ -6037,15 +6084,12 @@ impl ScheduledDebugRun {
                 .iter()
                 .any(|f| matches!(f, FiberState::WaitParked { .. }))
             && self.tasks.iter().all(|t| {
-                // Same-module: no live `module != 0` continuation (a separate-module coroutine/child
-                // pushed a source unit a fresh restore lacks).
-                t.vt.active.module == 0
-                    && t.vt.chain.iter().all(|(_, vm, _)| vm.module == 0)
-                    && t.vt.coroutines.iter().flatten().all(|c| {
-                        c.vm.module == 0
-                            && !c.fault_yields
-                            && c.mem.as_ref().is_none_or(|m| m.snapshot_safe())
-                    })
+                // A separate-module coroutine (`vm.module >= 1`) is admitted — its pushed unit rides in
+                // `extra_units` — but a **demand** coroutine (non-pristine window) is not.
+                t.vt.coroutines
+                    .iter()
+                    .flatten()
+                    .all(|c| !c.fault_yields && c.mem.as_ref().is_none_or(|m| m.snapshot_safe()))
             })
             && self.extra_envs.iter().all(|e| {
                 e.host.checkpoint_safe() && e.mem.as_ref().is_none_or(|m| m.snapshot_safe())
@@ -6086,7 +6130,22 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             fibers: self.fibers.clone(),
-            extra_envs: self.extra_envs.iter().map(env_snapshot).collect(),
+            // Each child env's module = the module its owning task runs (`0` = same-module `instantiate`;
+            // `>= 1` = a separate-module `instantiate_module` child), so its table rebuilds correctly.
+            extra_envs: self
+                .extra_envs
+                .iter()
+                .enumerate()
+                .map(|(k, e)| {
+                    let module = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.env == Some(k))
+                        .map_or(0, |t| t.vt.active.module);
+                    env_snapshot(e, module)
+                })
+                .collect(),
+            extra_units: self.source.extra_units(),
             mem: self.mem.as_ref().map(|m| m.window_snapshot()),
             host: self.host.replay_substate(),
         })
@@ -6097,21 +6156,25 @@ impl ScheduledDebugRun {
     /// resumes exactly at the snapshot's global turn rather than turn 0. Rebuilds the task set (each a
     /// root-only `VTask` around the captured active `Vm`), reseeds the shared window bytes, restores the
     /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
-    /// it). The captured subset had no §14 children / §12 fibers, so `extra_envs`/`fibers` reset empty.
+    /// it). A separate-module coroutine/child's pushed source units are re-pushed first (so its `module`
+    /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
     pub fn restore(&mut self, snap: &ScheduledSnapshot) {
         self.fibers = snap.fibers.clone();
+        // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
+        // resolve against the source).
+        self.source.reset_extra(&snap.extra_units);
         if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
             m.seed(bytes);
         }
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
         // windows are `nested_view`s over the just-reseeded shared window (their bytes — shared via the
-        // backing region — are already correct).
-        let progs_len = self.source.primary().progs.len();
+        // backing region — are already correct); each table is rebuilt over the child's own module.
         let shared_mem = self.mem.as_ref();
+        let source = &*self.source;
         self.extra_envs = snap
             .extra_envs
             .iter()
-            .map(|es| rebuild_env(es, shared_mem, progs_len))
+            .map(|es| rebuild_env(es, shared_mem, source))
             .collect();
         self.tasks = snap
             .tasks
@@ -6120,7 +6183,7 @@ impl ScheduledDebugRun {
                 let coroutines = ts
                     .coroutines
                     .iter()
-                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, progs_len)))
+                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, source)))
                     .collect();
                 DbgTask {
                     vt: VTask {

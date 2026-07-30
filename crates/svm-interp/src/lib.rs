@@ -13336,13 +13336,21 @@ impl Host {
     /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
     /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
     /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
-    /// guest minting a §13 region / §14 module / §12 blocking / async ring / §22 JIT domain, or the
-    /// embedder granting a host-fn, populates one. While they stay empty a checkpoint restored to an
-    /// earlier logical time reproduces the host faithfully (W1); otherwise the `Inspector` stops
-    /// checkpointing and falls back to replay-from-clock-0.
+    /// guest minting a §13 region / §12 blocking / async ring / §22 JIT domain, or the embedder granting
+    /// a host-fn, populates one. While they stay empty a checkpoint restored to an earlier logical time
+    /// reproduces the host faithfully (W1); otherwise the `Inspector` stops checkpointing and falls back
+    /// to replay-from-clock-0.
+    ///
+    /// **Module grants are exempt.** [`modules`](Host::modules) is populated *only* by the embedder
+    /// ([`grant_module`](Host::grant_module) / [`grant_module_durable`](Host::grant_module_durable) —
+    /// there is no guest op that mints one), and each grant is an immutable `Arc<Module>`. Like the
+    /// `Instantiator`/`Yielder`/`AddressSpace` grants already ignored here, a grant is reproducible
+    /// powerbox state a faithful run rebuild re-grants, not dropped residue — so a §14 **separate-module**
+    /// coroutine/child (which needs a module grant to spawn) stays checkpointable, its pushed source units
+    /// captured in the run snapshot. (The DAP backend grants no modules, so this only affects a direct
+    /// embedder driving `snapshot`/`restore` itself, which rebuilds its own powerbox.)
     fn checkpoint_safe(&self) -> bool {
         self.regions.is_empty()
-            && self.modules.is_empty()
             && self.blockings.is_empty()
             && self.rings.is_empty()
             && self.host_fns.is_empty()

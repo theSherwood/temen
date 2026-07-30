@@ -234,15 +234,34 @@ different things depending on which pair you compare:
   a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
   the reseeded shared window. Admitting `instantiate` children is what unlocks **scheduled coroutines**:
   the bytecode engine rejects `coroutine + thread`, so a scheduled coroutine only ever arises alongside
-  an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): a live `module != 0`
-  continuation (**separate-module** coroutine/child — a pushed source unit; implicitly excluded, since it
-  would already have disabled checkpointing) and any child that **maps its own pages** (non-pristine
-  `nested_view` layout), plus event-parked (`memory.wait`) fibers. Oracles:
+  an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
+  **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
+  (`memory.wait`) fibers. Oracles:
   `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
   worker vCPUs each driving a fiber body) and
   `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
   (`ScheduledDebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every*
   checkpointable turn, including inside the coroutine body, with a live `instantiate` child env).
+
+  **Subset extended to §14 separate-module coroutines + `instantiate_module` children (slice 5-perf, both
+  engines).** A **separate-module** coroutine/child pushes its compiled program into the shared
+  `ModuleSource` and dispatches by that index, so a fresh restore's source lacked it. The run snapshots
+  (`DebugRunSnapshot` + `ScheduledSnapshot`) now capture the non-primary units (`ModuleSource::extra_units`
+  — cheap `Arc<Compiled>` clones, immutable) and `restore` re-pushes them (`reset_extra`) before rebuilding
+  coroutines/envs, so a `module >= 1` frame resolves; `rebuild_coro`/`rebuild_env` build the dispatch table
+  over the continuation's own module (`build_table_for`), and `CoroSnapshot`/`EnvSnapshot` carry the module
+  index + a separate-module coroutine's own §6 `ModuleDebug` (now `Clone`) so `read_var` keeps resolving
+  its source variables after restore. This required relaxing `Host::checkpoint_safe`, which vetoed any run
+  holding a **module grant**: `Host::modules` is populated *only* by the embedder (`grant_module` — no
+  guest op mints one) and each grant is an immutable `Arc<Module>`, so like the `Instantiator`/`Yielder`
+  grants it already tolerates, a grant is reproducible powerbox state a faithful rebuild re-grants, not
+  dropped residue (the DAP backend grants no modules, so this only affects a direct embedder driving
+  `snapshot`/`restore`). Oracles:
+  `bytecode_debug_coroutine_module.rs::separate_module_coroutine_checkpoint_snapshot_restore_round_trips`
+  (+ `…_restore_reconstructs_source_metadata`, proving `mod_debug` round-trips) and
+  `bytecode_debug_instantiate_module.rs::scheduled_instantiate_module_checkpoint_snapshot_restore_round_trips`
+  (a separate-module child vCPU stepped inside its pushed module). Only **demand** coroutines / page-mapping
+  children remain excluded.
 
   **Subset extended to §12 fibers + §14 same-module coroutines (slice 4-perf, single-vCPU).** The
   single-vCPU `DebugRun` checkpointable subset no longer excludes fibers/coroutines. **Fibers**: the
@@ -490,12 +509,11 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
   (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
   engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
-  is bounded too), and its checkpointable subset now covers **§12 fibers + §14 same-module coroutines**
-  on **both** engines, plus **same-module `instantiate` children** on the scheduled engine (which is what
-  admits scheduled coroutines). Follow-ups: the §3.6 serve/live-call machinery inside a confined child,
-  env teardown / D37 revocation, and — if a use case demands it — extending the checkpointable subset
-  further to **separate-module** coroutines / `instantiate` children (they push a unit into the shared
-  source a fresh restore lacks) and to **demand** coroutines / page-mapping children (non-pristine
+  is bounded too), and its checkpointable subset now covers **§12 fibers + §14 coroutines** (same-module
+  *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
+  on the scheduled engine (which is what admits scheduled coroutines). Follow-ups: the §3.6 serve/live-call
+  machinery inside a confined child, env teardown / D37 revocation, and — if a use case demands it —
+  extending the checkpointable subset further to **demand** coroutines / page-mapping children (non-pristine
   window layout) — today those fall back to replay-from-0, which stays correct, just unbounded.
 
 ---
