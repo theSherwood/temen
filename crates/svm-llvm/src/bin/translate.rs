@@ -14,7 +14,10 @@
 //! once, link many programs against it.
 //!
 //! Output format: text (`svm_text::print_module`) by default, binary (`svm_encode::encode_module`)
-//! when `-o` ends in `.svmb` or `--binary` is given.
+//! when `-o` ends in `.svmb` or `--binary` is given, or a binary **object** / link unit
+//! (`svm_encode::encode_unit`, the v9 object dialect) when `-o` ends in `.svmo`. A `.svmo`
+//! carries its export tables in-band, so it links directly (`svm-run --link`) with no `.syms`
+//! sidecar; `--emit-syms` remains for older sidecar-driven flows.
 
 use std::path::Path;
 use std::{env, fs, process};
@@ -32,7 +35,8 @@ fn try_main() -> Result<(), String> {
         eprintln!(
             "usage: svm-llvm-translate <input.ll|input.bc> -o <out> [--emit-syms <file>] [--binary] [--host-page <bytes>] [--stub-externs]\n\
              \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an SVM-IR module written to <out>:\n\
-             \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary.\n\
+             \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary,\n\
+             \n    or a binary object/link unit (.svmo, v9 object dialect; exports ride in-band).\n\
              \n  --emit-syms <file> writes the export map (one `name idx` line per exported\n\
              \n  function) so a program can link against the module via svm_ir::link.\n\
              \n  --host-page <bytes> sets the powerbox RO/writable page-isolation granularity\n\
@@ -83,7 +87,11 @@ fn try_main() -> Result<(), String> {
     }
     let input = input.ok_or("no input file")?;
     let out = out.ok_or("no output file (-o <out>)")?;
-    // Binary if asked explicitly or the output names a `.svmb` file; text otherwise.
+    // Binary if asked explicitly or the output names a `.svmb` file; text otherwise. A `.svmo`
+    // output writes the v9 **object dialect** (`encode_unit`): a self-contained binary link unit
+    // whose first-class export tables are its link symbols — superseding the `.syms` sidecar
+    // (still emitted on request for older drivers).
+    let object = Path::new(&out).extension().is_some_and(|e| e == "svmo");
     let binary = binary || Path::new(&out).extension().is_some_and(|e| e == "svmb");
 
     // Translate the input. A `.ll` extension takes the in-house **textual** reader (no `llvm-dis`,
@@ -101,7 +109,9 @@ fn try_main() -> Result<(), String> {
     }
     .map_err(|e| format!("translate `{input}`: {e:?}"))?;
 
-    let module_bytes = if binary {
+    let module_bytes = if object {
+        svm_encode::encode_unit(&translated.module)
+    } else if binary {
         svm_encode::encode_module(&translated.module)
     } else {
         svm_text::print_module(&translated.module).into_bytes()

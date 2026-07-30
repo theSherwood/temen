@@ -85,7 +85,8 @@ static void emit_header(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 8);  // format v8 (single-string import names; call.sym link form)
+  eb(buf, 9);  // format v9 (v8 + the header flags byte)
+  eb(buf, 0);  // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
   eb(buf, 1);  // memory present
   eb(buf, 16); // size_log2 = 16 (must match this module's 64 KiB window)
   eb(buf, 0);  // no data segments

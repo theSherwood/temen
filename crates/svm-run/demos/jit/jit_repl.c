@@ -94,7 +94,8 @@ static long emit_unit(char *buf) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 8); // format v8 (single-string import names; call.sym link form)
+  eb(buf, 9); // format v9 (v8 + the header flags byte)
+  eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
   // Memory descriptor: present, size_log2 16 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(buf, 1);
