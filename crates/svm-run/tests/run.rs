@@ -243,7 +243,7 @@ fn run_demo_failfast(rel: &str) -> std::process::Output {
 
 #[test]
 fn runs_shipped_demo() {
-    let src = std::fs::read_to_string(demo("hello.svm")).expect("read hello.svm");
+    let src = std::fs::read_to_string(demo("hello.svmt")).expect("read hello.svmt");
     let m = load(&src);
     let run = run_powerbox(&m, b"").expect("run");
     assert_eq!(run.stdout, b"hello, sandbox!\n");
@@ -255,7 +255,7 @@ fn runs_shipped_demo() {
 #[test]
 fn cli_runs_svm_file() {
     let out = Command::new(env!("CARGO_BIN_EXE_svm-run"))
-        .arg(demo("hello.svm"))
+        .arg(demo("hello.svmt"))
         .output()
         .expect("spawn svm-run");
     assert!(

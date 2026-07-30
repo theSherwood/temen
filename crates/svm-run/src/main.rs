@@ -4,8 +4,8 @@
 //! svm-run <file> [--stdin FILE] [-- <guest args>]
 //! ```
 //!
-//! `<file>` is `.svm` (text IR), `.svmb` (binary), or `.c` (C source — compiled through the
-//! chibicc frontend, located via `$SVM_CHIBICC` or the in-repo build). The module is verified,
+//! `<file>` is `.svmt` (text IR; `.svm` deprecated), `.svmb` (binary), or `.c` (C source —
+//! compiled through the chibicc frontend, located via `$SVM_CHIBICC` or the in-repo build). The module is verified,
 //! then run on the Cranelift JIT under the MVP powerbox (§3e): bytes it writes to `stdout`/
 //! `stderr` go to the real streams, and it terminates with the guest's exit code (`Exit(code)`
 //! or `main`'s return value). A bare kernel (a non-powerbox entry) is run with zero args and its
@@ -44,7 +44,7 @@ fn try_main() -> Result<(), String> {
         return Err("no input file".into());
     }
     let mut file: Option<String> = None;
-    // `--link` (D-LINK): statically link several units (`.svm`/`.svmo`/`.svmb`) into one module.
+    // `--link` (D-LINK): statically link several units (`.svmt`/`.svmo`/`.svmb`) into one module.
     let mut link = false;
     // `--assemble`: text unit → binary object (`.svmo`), the tiny assembler for frontends that
     // emit text (chibicc `--emit-object`), so anything that links can move binary objects around.
@@ -118,8 +118,15 @@ fn try_main() -> Result<(), String> {
             return Err("--assemble and --link are mutually exclusive".into());
         }
         let [unit] = link_files.as_slice() else {
-            return Err("--assemble takes exactly one text unit (.svm)".into());
+            return Err("--assemble takes exactly one text unit (.svmt)".into());
         };
+        is_text_ext(
+            Path::new(unit)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(""),
+            Path::new(unit),
+        ); // deprecation note only — the input is parsed as text regardless
         let out = out_path.ok_or("--assemble needs -o OUT.svmo")?;
         let text = fs::read_to_string(unit).map_err(|e| format!("read `{unit}`: {e}"))?;
         let m = svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"))?;
@@ -128,7 +135,7 @@ fn try_main() -> Result<(), String> {
     }
     if link {
         if link_files.is_empty() {
-            return Err("--link needs at least one unit (.svm/.svmo/.svmb)".into());
+            return Err("--link needs at least one unit (.svmt/.svmo/.svmb)".into());
         }
         return run_link(&link_files, out_path, emit_text);
     }
@@ -334,7 +341,7 @@ fn parse_arg(s: &str) -> Result<SpecArg, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: svm-run <file.svm|.svmb|.c> [--stdin FILE] [-- <guest args>]\n\
+        "usage: svm-run <file.svmt|.svmb|.c> [--stdin FILE] [-- <guest args>]\n\
          \n  Verify a module, then run it sandboxed on the JIT under the MVP powerbox\n\
          \n  (stdout/stderr → real streams, exit code = the guest's). `.c` is compiled via\n\
          \n  the chibicc frontend ($SVM_CHIBICC or the in-repo build). Arguments after `--`\n\
@@ -343,11 +350,12 @@ fn print_usage() {
          \n       SVM_MAX_FIBERS / SVM_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb).\n\
          \n\
          \nlink (D-LINK): statically link units into one runnable module.\n\
-         \n  svm-run --link <unit.svm|.svmo|.svmb>... [-o OUT.svmb | --emit-text]\n\
-         \n  Units are text IR or binary objects (`.svmo`, the v9 object dialect); each unit's\n\
-         \n  export tables are its link symbols. The linked module is re-verified, then written\n\
-         \n  (-o, text or binary by extension) or printed (--emit-text).\n\
-         \n  svm-run --assemble <unit.svm> -o OUT.svmo\n\
+         \n  svm-run --link <unit.svmt|.svmo|.svmb>... [-o OUT.svmb | --emit-text]\n\
+         \n  Units are text IR (.svmt; .svm deprecated) or binary objects (`.svmo`, the v9\n\
+         \n  object dialect); each unit's export tables are its link symbols. The linked module\n\
+         \n  is re-verified, then written (-o, text or binary by extension) or printed\n\
+         \n  (--emit-text).\n\
+         \n  svm-run --assemble <unit.svmt> -o OUT.svmo\n\
          \n  assembles one text unit to a binary object (for text-emitting frontends, e.g.\n\
          \n  chibicc --emit-object).\n\
          \n\
@@ -410,7 +418,11 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
         .map_err(|e| format!("verification of linked module failed (fail-closed): {e:?}"))?;
     match out_path {
         Some(p) => {
-            if p.ends_with(".svm") || p.ends_with(".ir") || p.ends_with(".txt") {
+            if p.ends_with(".svmt")
+                || p.ends_with(".svm")
+                || p.ends_with(".ir")
+                || p.ends_with(".txt")
+            {
                 fs::write(&p, svm_text::print_module(&linked))
                     .map_err(|e| format!("write `{p}`: {e}"))?;
             } else {
@@ -428,35 +440,52 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
     }
 }
 
-/// Load a **link unit** by extension: `.svm`/`.ir`/`.txt` text (which may carry the link forms),
-/// or `.svmo`/`.svmb`/`.bin` binary via `decode_unit` (the object dialect; an already-resolved
-/// runnable module is a degenerate unit and links fine).
-fn load_unit(path: &Path) -> Result<Module, String> {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+/// Is this extension the text-IR form, and warn once per file on the deprecated spelling.
+/// `.svmt` is canonical (the text member of the `.svmt`/`.svmb`/`.svmo` triple); `.svm` and the
+/// older `.ir`/`.txt` still load but steer users to `.svmt`.
+fn is_text_ext(ext: &str, path: &Path) -> bool {
+    match ext {
+        "svmt" => true,
         "svm" | "ir" | "txt" => {
-            let text =
-                fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"))
+            eprintln!(
+                "svm-run: note: `.{ext}` is deprecated for text IR — rename {} to `.svmt`",
+                path.display()
+            );
+            true
         }
+        _ => false,
+    }
+}
+
+/// Load a **link unit** by extension: `.svmt` text (which may carry the link forms; `.svm`
+/// deprecated), or `.svmo`/`.svmb`/`.bin` binary via `decode_unit` (the object dialect; an
+/// already-resolved runnable module is a degenerate unit and links fine).
+fn load_unit(path: &Path) -> Result<Module, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if is_text_ext(ext, path) {
+        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        return svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"));
+    }
+    match ext {
         "svmo" | "svmb" | "bin" => {
             let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
             svm_encode::decode_unit(&bytes).map_err(|e| format!("decode unit: {e:?}"))
         }
         other => Err(format!(
-            "unknown unit extension `.{other}` — expected .svm, .svmo, or .svmb"
+            "unknown unit extension `.{other}` — expected .svmt, .svmo, or .svmb"
         )),
     }
 }
 
-/// Load a module by file extension: `.svm`/`.ir` text IR, `.svmb`/`.bin` binary, or `.c` C
-/// source (compiled through the frontend).
+/// Load a module by file extension: `.svmt` text IR (`.svm` deprecated), `.svmb`/`.bin` binary,
+/// or `.c` C source (compiled through the frontend).
 fn load_module(path: &Path) -> Result<Module, String> {
-    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-        "svm" | "ir" | "txt" => {
-            let text =
-                fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"))
-        }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if is_text_ext(ext, path) {
+        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        return svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"));
+    }
+    match ext {
         "svmo" => Err("`.svmo` is an object (a pre-link unit) — link it first: \
              svm-run --link <units...> -o out.svmb"
             .into()),

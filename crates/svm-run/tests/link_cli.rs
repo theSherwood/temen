@@ -132,13 +132,15 @@ fn link_svmo_units_into_runnable_svmb() {
 
 /// `--assemble`: the tiny text→binary-object step for text-emitting frontends. A text unit
 /// carrying link forms assembles to a `.svmo` that decodes as the identical module and links.
+/// `.svmt` is the canonical text extension (no note); the deprecated `.svm` still works but
+/// steers the user to `.svmt` on stderr.
 #[test]
 fn assemble_text_unit_to_svmo() {
     let bin = env!("CARGO_BIN_EXE_svm-run");
     let dir = std::env::temp_dir().join(format!("svm_asm_cli_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let unit = unit_b();
-    let text_path = dir.join("b.svm");
+    let text_path = dir.join("b.svmt");
     std::fs::write(&text_path, svm_text::print_module(&unit)).unwrap();
     let obj_path = dir.join("b.svmo");
 
@@ -154,8 +156,34 @@ fn assemble_text_unit_to_svmo() {
         "assemble failed: {}",
         String::from_utf8_lossy(&asm.stderr)
     );
+    assert!(
+        !String::from_utf8_lossy(&asm.stderr).contains("deprecated"),
+        "canonical .svmt must not warn"
+    );
     let decoded = svm_encode::decode_unit(&std::fs::read(&obj_path).unwrap()).expect("decode");
     assert_eq!(decoded, unit, "assembled object differs from the text unit");
+
+    // Deprecated spelling: `.svm` still assembles identically but notes the rename.
+    let old_path = dir.join("b.svm");
+    std::fs::write(&old_path, svm_text::print_module(&unit)).unwrap();
+    let obj2 = dir.join("b2.svmo");
+    let asm2 = Command::new(bin)
+        .args(["--assemble"])
+        .arg(&old_path)
+        .args(["-o"])
+        .arg(&obj2)
+        .output()
+        .unwrap();
+    assert!(asm2.status.success());
+    assert!(
+        String::from_utf8_lossy(&asm2.stderr).contains("deprecated"),
+        "deprecated .svm should note the rename to .svmt"
+    );
+    assert_eq!(
+        std::fs::read(&obj_path).unwrap(),
+        std::fs::read(&obj2).unwrap(),
+        ".svm and .svmt inputs assemble to identical objects"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

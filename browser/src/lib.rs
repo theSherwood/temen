@@ -1766,7 +1766,7 @@ const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clo
 
 /// Run `m`'s function 0 under the **browser powerbox**, seeding `stdin` and capturing the streams.
 ///
-/// Capabilities are granted by the entry's **arity** (so `hello.svm`'s 3-handle `(out, in, exit)`
+/// Capabilities are granted by the entry's **arity** (so `hello.svmt`'s 3-handle `(out, in, exit)`
 /// shape works unchanged), in this order — the browser embedder's ABI:
 ///
 /// | param # | capability        | `cap.call` type_id |

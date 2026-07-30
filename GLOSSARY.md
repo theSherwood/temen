@@ -28,8 +28,9 @@ The system is four ideas wearing many names:
 
 ## Core runtime
 
-- **`.svm` / `.svmb` / `.svmo`** — the three module file forms. `.svm` is the text IR
-  (dev/debug interface; can carry everything, including link scaffolding). `.svmb` is
+- **`.svmt` / `.svmb` / `.svmo`** — the three module file forms. `.svmt` is the text IR
+  (dev/debug interface; can carry everything, including link scaffolding; the older
+  `.svm` spelling is deprecated — tools accept it with a rename note). `.svmb` is
   the **runnable** binary (wire v9 flag 0): the untrusted-input path, decoded by the
   escape-TCB `decode_module`, never contains link scaffolding. `.svmo` is the binary
   **object / link unit** (v9 flag bit 0, `decode_unit`): a pre-link unit that may carry
