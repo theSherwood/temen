@@ -90,6 +90,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
     timeout-minutes: 45
+    # CI-speed + I3: drop test-binary debug info. Generating it (PDBs on Windows especially) is a
+    # large fraction of the cross-OS `cargo test` compile+link — this is the run's critical path
+    # (~20 min on windows-latest) — and the debug info is unused here (backtraces keep symbol names).
+    # The `check` gate already runs with this (I30); mirroring it also lowers the Windows link-memory
+    # peak that I3 aborts on. Behavior is unchanged.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     # Gating (no continue-on-error): windows/macOS build+test parity blocks the merge.
     strategy:
       fail-fast: false

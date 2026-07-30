@@ -16,6 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **ci.yml** (2026-07-29): `cross-os` (windows/macOS `build · test`) gains
+  `env: CARGO_PROFILE_TEST_DEBUG: "0"`, mirroring the `check` gate. Windows `build · test` is CI's
+  wall-clock critical path (~20 min, vs ~18 for miri and ≤12 for everything else); dropping unused
+  test-binary debug info (PDB generation on Windows especially) cuts a large slice of its
+  compile+link, and also lowers the Windows link-memory peak I3 aborts on. Behavior unchanged
+  (backtraces keep symbol names). CI-speed pass — see ISSUES/PR.
+
 - **ci.yml** (2026-07-28): the real-Chromium browser step runs `node bench_chibicc_jit.mjs` (after
   `browser-play-editor-test.mjs`) — chibicc compile-time on V8, bytecode vs wasm-JIT: prints the
   speedup and asserts the two tiers emit byte-identical IR (a second guard alongside `chibicc_jit.rs`).
