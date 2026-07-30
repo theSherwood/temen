@@ -1,18 +1,16 @@
-//! FORK.md PR 1 — `clone_caller(reply)` (self-namespace op 11), fork's servicer-side primitive.
+//! FORK.md PR 1 — `clone_caller(reply_orig, reply_twin)` (self-namespace op 11), fork's servicer-side
+//! primitive, built across increments:
 //!
-//! Increment 1 proved the **handler→caller linkage** (the handler can name the caller parked on the
-//! dispatch it is serving). Increment 2 — this file — proves the **reply-injection nucleus**: from
-//! within a serve handler, `clone_caller(reply)` delivers `reply` to that parked caller *out-of-band*
-//! and suppresses the handler's own auto-reply, so the caller reloads the **injected** value, not the
-//! handler's return. That is fork's core insight (FORK.md §3): "return-twice is a reply value" — the
-//! servicer supplies the caller's reply. The twin (a second copy under a second ticket) is increment 3.
-//!
-//! Harness (the `svc_serve_loop` shape): the root spawns a server child, mints an offer over its `svc`
-//! export, and calls it — parking on `CapReply`. The server's handler (func 2) calls `clone_caller` and
-//! then returns a *different* value; the injected value is what the root observes.
+//! - **1 — handler→caller linkage:** the handler can name the caller parked on the dispatch it serves.
+//! - **2 — reply-injection nucleus:** from within the handler, deliver a reply to that parked caller
+//!   *out-of-band* and suppress the handler's own auto-reply, so the caller reloads the **injected**
+//!   value, not the handler's return — fork's core insight, "return-twice is a reply value" (FORK.md §3).
+//! - **3 — the twin:** duplicate the parked caller into a second live domain (private window +
+//!   duplicated powerbox), deliver `reply_orig` to the original and `reply_twin` to the twin. Both
+//!   resume past the same fork `cap.call` — return-twice, one live run.
 
 use std::sync::Arc;
-use svm_interp::{run_with_host, Host, Value};
+use svm_interp::{run_with_host, Host, StreamRole, Value};
 
 fn module(text: &str) -> Arc<svm_ir::Module> {
     let m = svm_text::parse_module(text).expect("parse");
@@ -130,5 +128,139 @@ fn clone_caller_injects_the_callers_reply_out_of_band() {
         r,
         vec![Value::I64(999)],
         "the caller reloads the injected reply (999), not the handler's return (5)",
+    );
+}
+
+/// Increment 3 — the **twin**: `clone_caller(reply_orig, reply_twin)` from within the handler
+/// duplicates the parked caller into a second live domain. Both copies resume **past** the fork
+/// `cap.call` from the same call site — the original with `reply_orig`, the twin with `reply_twin` —
+/// each over its own private window + duplicated powerbox, and each writes its reply to the **shared**
+/// stdout sink (fork shares stdout) before returning.
+///
+/// The **correct fork topology**: the *caller* is a spawned child with no children of its own (the
+/// only shape the targeted clone duplicates faithfully). func 0 (root) spawns server `S` (func 1),
+/// mints an offer over its `svc` export, then spawns caller `C` (func 3) re-granting that offer (as
+/// `"svc"`) and stdout (as `"o"`) into it; root joins `C` and returns its result. `C` resolves both
+/// caps by name, calls the fork offer, writes its reply to stdout, and returns it. func 2 (S's
+/// handler): `clone_caller(100, 200)`. Root returns `C`'s `reply_orig` (100); the shared stdout
+/// carries BOTH 100 and 200 — the twin ran `C`'s continuation with `reply_twin`.
+const SRC_TWIN: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "svc" 1 { op: 2 }
+data 300 "svc"
+data 310 "o"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32) {
+  ve1 = i64.const 1
+  voffs = i64.const 131072
+  vlog = i64.const 12
+  vq = i64.const 0
+  vs = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve1, voffs, vlog, vq)
+  vz0 = i64.const 0
+  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 256
+  vnp = i32.const 300
+  i32.store va0 vnp
+  va1 = i64.const 260
+  vnl = i32.const 3
+  i32.store va1 vnl
+  va2 = i64.const 264
+  i32.store va2 vcap
+  va3 = i64.const 272
+  vnp2 = i32.const 310
+  i32.store va3 vnp2
+  va4 = i64.const 276
+  vnl2 = i32.const 1
+  i32.store va4 vnl2
+  va5 = i64.const 280
+  i32.store va5 vout
+  vgp = i64.const 256
+  vgn = i64.const 2
+  ve3 = i64.const 3
+  voffc = i64.const 135168
+  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve3, voffc, vlog, vq)
+  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vro = i64.const 100
+  vrt = i64.const 200
+  vt = cap.call 4294967295 11 (i64, i64) -> (i64) vz (vro, vrt)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsvc = i64.const 6518387
+  vzero = i64.const 0
+  i64.store vzero vsvc
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = cap.self.resolve vp0 vl3
+  voname = i64.const 111
+  va8 = i64.const 8
+  i64.store va8 voname
+  vp8 = i64.const 8
+  vl1 = i64.const 1
+  vho = cap.self.resolve vp8 vl1
+  varg = i64.const 7
+  vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  vp16 = i64.const 16
+  i64.store vp16 vr
+  vlen = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
+    let m = module(SRC_TWIN);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
+    let out_h = host.grant_stream(StreamRole::Out);
+    let mut fuel = 40_000_000u64;
+    let r = run_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(out_h)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    // The run's result is the ORIGINAL caller's reply (reply_orig = 100), joined back through C.
+    assert_eq!(
+        r,
+        vec![Value::I64(100)],
+        "the original caller resumes past the fork call with reply_orig (100)"
+    );
+    // The shared stdout carries BOTH replies — the twin resumed the same continuation with reply_twin
+    // (200) over its own private window and duplicated powerbox. Order is scheduler-dependent.
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(bytes.len(), 16, "two i64 writes reached the shared sink");
+    let mut vals: Vec<i64> = bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    vals.sort();
+    assert_eq!(
+        vals,
+        vec![100, 200],
+        "both the original (100) and the twin (200) wrote their reply — return-twice, one live run"
     );
 }
