@@ -745,7 +745,9 @@ impl Translator {
             // an opaque/void pointee (`(ptr (void))`, `(ptr)`) stays a bare `i64` scalar. A pointer
             // to a `proctype` (inline or named) is a funcref, not a data pointer.
             Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) if self.is_proctype(t) => Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(t)?))),
+                Some(t) if self.is_proctype(t) => {
+                    Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(t)?)))
+                }
                 Some(t) if t.tag() != Some("void") => Ok(TyDesc::Ptr(Box::new(self.tydesc(t)?))),
                 _ => Ok(TyDesc::Scalar(ValType::I64)),
             },
@@ -794,9 +796,7 @@ impl Translator {
 
     /// True if `t` denotes a `proctype` — written inline as `(proctype …)` or as a named proctype.
     fn is_proctype(&self, t: &Node) -> bool {
-        t.tag() == Some("proctype")
-            || t.as_atom()
-                .is_some_and(|n| self.proctypes.contains_key(n))
+        t.tag() == Some("proctype") || t.as_atom().is_some_and(|n| self.proctypes.contains_key(n))
     }
 
     /// The `call_indirect` signature of a `proctype` — a named one (looked up) or an inline
@@ -2135,7 +2135,8 @@ impl<'a> FuncGen<'a> {
             // Store the `i32` funcref (a proc name → `ref.func`, else a funcref value) into the slot.
             let v = self.funcref_value(rhs)?;
             self.used_memory = true;
-            self.cur_buf.push_str(&format!("  i32.store v{addr} v{v}\n"));
+            self.cur_buf
+                .push_str(&format!("  i32.store v{addr} v{v}\n"));
             return Ok(());
         }
         let ty = match desc {
@@ -2419,7 +2420,8 @@ impl<'a> FuncGen<'a> {
                 }
                 let idx = sig.index;
                 let id = self.fresh();
-                self.cur_buf.push_str(&format!("  v{id} = ref.func {idx}\n"));
+                self.cur_buf
+                    .push_str(&format!("  v{id} = ref.func {idx}\n"));
                 return Ok(id);
             }
         }
@@ -2452,7 +2454,8 @@ impl<'a> FuncGen<'a> {
     fn stmt(&mut self, s: &Node) -> Result<(), LengError> {
         // A `.` Empty marker or an empty `()` placeholder carries no statement — nimony emits these
         // in module scaffolding (`ini`/C-`main`). Inert: skip.
-        if s.is_empty_marker() || (s.tag().is_none() && s.as_atom().is_none() && s.args().is_empty())
+        if s.is_empty_marker()
+            || (s.tag().is_none() && s.as_atom().is_none() && s.args().is_empty())
         {
             return Ok(());
         }

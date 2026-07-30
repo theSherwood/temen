@@ -331,7 +331,10 @@ fn real_ref_type_dup_hook_increments_refcount() {
     assert_eq!(vec![iword], jval, "§9 interp/JIT parity");
     let n = imem.len().min(jmem.len());
     assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
-    assert_eq!(iword, 6, "arcInc bumped the refcount through the aliased ref pointer");
+    assert_eq!(
+        iword, 6,
+        "arcInc bumped the refcount through the aliased ref pointer"
+    );
     let rc = u64::from_le_bytes(imem[r..r + 8].try_into().unwrap());
     assert_eq!(rc, 6, "the refcount word was incremented in place");
 }

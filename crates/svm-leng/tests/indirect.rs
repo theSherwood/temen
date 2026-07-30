@@ -39,8 +39,14 @@ fn store_funcref_then_call_through_field() {
    (ret (call (dot (deref b.0) fn.0 0) (dot (deref b.0) v.0 0))))))";
     let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = svm_leng::translate_to_text(leng).unwrap();
-    assert!(text.contains("ref.func 0"), "run stores ref.func dbl:\n{text}");
-    assert!(text.contains("call_indirect"), "run dispatches indirectly:\n{text}");
+    assert!(
+        text.contains("ref.func 0"),
+        "run stores ref.func dbl:\n{text}"
+    );
+    assert!(
+        text.contains("call_indirect"),
+        "run dispatches indirectly:\n{text}"
+    );
     // dbl = func 0, run = func 1. Box at offset 128: fn@0 (overwritten by the store), v@8 = 21.
     // run(128) stores ref.func dbl into b.fn, then b.fn(b.v) = dbl(21) = 21*21 = 441.
     let b = 128usize;
@@ -83,7 +89,10 @@ fn call_through_funcref_param() {
   (stmts . (ret (call f.0 x.0)))))";
     let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = svm_leng::translate_to_text(leng).unwrap();
-    assert!(text.contains("call_indirect"), "apply dispatches indirectly:\n{text}");
+    assert!(
+        text.contains("call_indirect"),
+        "apply dispatches indirectly:\n{text}"
+    );
     // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49.
     assert_eq!(run(&m, 1, &[0, 7]), 49);
 }
@@ -111,7 +120,10 @@ fn virtual_dispatch_through_a_vtable() {
     let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let text = svm_leng::translate_to_text(leng).unwrap();
-    assert!(text.contains("call_indirect"), "dispatch is indirect:\n{text}");
+    assert!(
+        text.contains("call_indirect"),
+        "dispatch is indirect:\n{text}"
+    );
 
     // getX = func 0, dispatch = func 1. Lay out a vtable and object in the window:
     //   Vtbl @ 256: mt[0] @256 = 0 (getX's function index).
@@ -134,7 +146,10 @@ fn virtual_dispatch_through_a_vtable() {
         o => panic!("jit: {o:?}"),
     };
     assert_eq!(vec![iword], jword, "§9 interp/JIT parity");
-    assert_eq!(iword, 42, "virtual dispatch resolved o.vt.mt[0](o) = getX(o) = o.x");
+    assert_eq!(
+        iword, 42,
+        "virtual dispatch resolved o.vt.mt[0](o) = getX(o) = o.x"
+    );
 }
 
 #[test]
@@ -167,5 +182,8 @@ fn baseobj_upcasts_to_the_base_subobject() {
         o => panic!("jit: {o:?}"),
     };
     assert_eq!(vec![iword], jword, "§9 interp/JIT parity");
-    assert_eq!(iword, 7, "baseobj read the base sub-object's tag at offset 0");
+    assert_eq!(
+        iword, 7,
+        "baseobj read the base sub-object's tag at offset 0"
+    );
 }
