@@ -227,6 +227,23 @@ different things depending on which pair you compare:
   a checkpoint-restored `seek` reproduces the global turn, live-thread count, stopped thread, shared
   counter, and **every** thread's stack (`select_task` each) — forward and on a full backward sweep.
 
+  **Subset extended to §12 fibers + §14 same-module coroutines (slice 4-perf, single-vCPU).** The
+  single-vCPU `DebugRun` checkpointable subset no longer excludes fibers/coroutines. **Fibers**: the
+  snapshot now carries the whole `VTask` continuation — `active_id`, the resume `chain` (each parked
+  resumer `Vm`), and the `fibers` registry (`FiberState` derives `Clone`) — all of which share the one
+  window (snapshotted once), so a checkpoint taken while a fiber is the active continuation (root parked
+  on the chain) restores faithfully; an event-parked (`memory.wait`) fiber stays excluded (non-deterministic
+  wall-clock deadline). **Same-module coroutines**: each `Coro` is captured as a `CoroSnapshot` (its `Vm`,
+  the `nested_view` geometry `win_base`/`size_log2`, and its Yielder host substate); because the view
+  shares the parent's backing region, the coroutine's bytes already ride in the parent window snapshot,
+  and `restore` rebuilds the view over the reseeded parent + a fresh Yielder host. Excluded (→ fall back
+  to replay-from-0): **demand** coroutines (`fault_yields` / non-pristine `nested_view` layout, caught by
+  the coroutine's own `snapshot_safe`) and **separate-module** coroutines (`vm.module != 0` — they push a
+  unit into the shared source, which a fresh restore lacks). Oracles: `dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber`
+  (backend ladder, fiber active across the strides) and `bytecode_debug_coroutines.rs::coroutine_checkpoint_snapshot_restore_round_trips`
+  (`DebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every* checkpointable clock,
+  including inside the coroutine body, replays forward identically to the from-0 run).
+
   **Watchpoints landed on the bytecode engine (slice 5).** `DebugRun` gained a `set_watchpoints`
   replace-API + a per-op check (`watch_hit_before`) that computes the op-about-to-run's effective
   address via the interpreter's `access_of` and stops *before* an op that touches a watched range —
@@ -456,10 +473,12 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
   (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
   engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
-  is bounded too, for the fiber/coroutine/§14-child-free threaded subset). Follow-ups: the §3.6
-  serve/live-call machinery inside a confined child, env teardown / D37 revocation, and — if a use case
-  demands it — extending the checkpointable subset to snapshot §12 fibers / §14 coroutines / `instantiate`
-  children (today those fall back to replay-from-0, which stays correct, just unbounded).
+  is bounded too), and its single-vCPU checkpointable subset now covers **§12 fibers + §14 same-module
+  coroutines**. Follow-ups: the §3.6 serve/live-call machinery inside a confined child, env teardown /
+  D37 revocation, and — if a use case demands it — extending the checkpointable subset further to
+  **separate-module** coroutines / §14 `instantiate` children (they push a unit into the shared source /
+  build an env table a fresh restore lacks) and to **fibers/coroutines on the scheduled engine** (today
+  those fall back to replay-from-0, which stays correct, just unbounded).
 
 ---
 

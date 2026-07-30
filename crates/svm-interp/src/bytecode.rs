@@ -3686,17 +3686,63 @@ pub struct DebugRunSnapshot {
     clock: u64,
     /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
     active: Vm,
+    /// The active continuation id — `ROOT_FIBER` or the handle of the fiber currently running.
+    active_id: usize,
+    /// Parked resumers on the §12 fiber resume chain: `(fiber id, its `Vm`, resume-result slot)`. Each
+    /// `Vm` shares the one window (snapshotted in `mem`), so cloning is a faithful deep copy.
+    chain: Vec<(usize, Vm, u32)>,
+    /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
+    fibers: Vec<FiberState>,
+    /// The §14 same-module coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
+    coroutines: Vec<Option<CoroSnapshot>>,
+    /// While stepping inside a coroutine body: `(handle, parent resume-result slot, parent depth)`.
+    active_coro: Option<(usize, u32, usize)>,
     /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
-    /// a memoryless run.
+    /// a memoryless run. Fibers and same-module coroutines share this one window (coroutines via a
+    /// `nested_view` over the same backing), so their bytes ride here too.
     mem: Option<Vec<u8>>,
     /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
     host: super::HostReplaySubstate,
+}
+
+/// A §14 **same-module** coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a
+/// `nested_view` sub-view sharing the parent's backing region, so its bytes are already in the parent
+/// `mem` snapshot; only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds
+/// the view over the restored parent. The host is a fresh Yielder-only powerbox on restore, so only its
+/// replay substate is carried. Demand/mapping coroutines (non-pristine layout) and separate-module ones
+/// (a pushed source module) are outside the checkpointable subset, so `fault_yields`/`mod_debug` are
+/// always the defaults here and need not be stored.
+struct CoroSnapshot {
+    vm: Vm,
+    win_base: u64,
+    size_log2: u8,
+    host: super::HostReplaySubstate,
+    awaiting: Option<u32>,
+    faulted_page: Option<u64>,
 }
 
 impl DebugRunSnapshot {
     /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
     pub fn clock(&self) -> u64 {
         self.clock
+    }
+}
+
+/// Capture a live **same-module** coroutine into a [`CoroSnapshot`]: its `Vm`, its window geometry (the
+/// `nested_view`'s absolute base + size, so `restore` can recreate the view), and its host replay
+/// substate. The coroutine's bytes are *not* copied here — they live in the parent's backing region
+/// (shared via `nested_view`) and ride in the parent window snapshot.
+fn coro_snapshot(c: &Coro) -> CoroSnapshot {
+    CoroSnapshot {
+        vm: c.vm.clone(),
+        win_base: c.mem.as_ref().map_or(0, |m| m.window.base()),
+        size_log2: c
+            .mem
+            .as_ref()
+            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
+        host: c.host.replay_substate(),
+        awaiting: c.awaiting,
+        faulted_page: c.faulted_page,
     }
 }
 
@@ -4386,30 +4432,35 @@ impl DebugRun {
         self.at_bp = true;
     }
 
-    /// Whether this run's state is fully captured by its active `Vm` + the window bytes + the host's
-    /// replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
-    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector) on the tree-walker: the
-    /// **root** continuation is running (no §12 fiber resume-chain or step-into coroutine), there are
-    /// no `cont.new` fibers or §14 coroutine children (whose frames/windows live outside the capture),
-    /// the host has grown no state a checkpoint can't restore (`checkpoint_safe`), and memory has a
-    /// pristine layout (`snapshot_safe`, so `window_snapshot`/`seed` of the mapped prefix round-trips).
-    /// Outside this subset the DAP backend stops checkpointing and falls back to replay-from-clock-0.
+    /// Whether this run's state is fully captured by its `VTask` continuation + the window bytes + the
+    /// host's replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
+    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector). The host has grown no state a
+    /// checkpoint can't restore (`checkpoint_safe`) and the shared window has a pristine layout
+    /// (`snapshot_safe`). **§12 fibers** are admitted (their `Vm`s share the one window), except an
+    /// event-parked (`memory.wait`) fiber whose wall-clock deadline is non-deterministic. **§14
+    /// coroutines** are admitted only when **same-module** (`vm.module == 0`, no pushed source), **not
+    /// demand** (`fault_yields`), and **pristine** (their own `nested_view` layout is `snapshot_safe`);
+    /// separate-module coroutines and §14 `instantiate` children stay outside (they need the source /
+    /// env table rebuilt). Outside this subset the DAP backend falls back to replay-from-clock-0.
     fn checkpointable(&self) -> bool {
         self.done.is_none()
-            && self.vt.active_id == ROOT_FIBER
-            && self.vt.chain.is_empty()
-            && self.vt.active_coro.is_none()
-            && self.vt.coroutines.iter().all(|c| c.is_none())
-            && self.fibers.is_empty()
             && self.host.checkpoint_safe()
             && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+            && !self
+                .fibers
+                .iter()
+                .any(|f| matches!(f, FiberState::WaitParked { .. }))
+            && self.vt.coroutines.iter().flatten().all(|c| {
+                c.vm.module == 0
+                    && !c.fault_yields
+                    && c.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+            })
     }
 
     /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
     /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
-    /// subset. Reused by the DAP backend to restart a reverse `seek`/`step_back` from the nearest
-    /// snapshot instead of clock 0. Cheap deep copy: the active `Vm` (plain data), the window bytes, and
-    /// the host's run-mutable replay substate.
+    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, same-module
+    /// coroutine children) + the shared window bytes + the host's replay substate.
     pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
         if !self.checkpointable() {
             return None;
@@ -4417,6 +4468,16 @@ impl DebugRun {
         Some(DebugRunSnapshot {
             clock: self.op_clock,
             active: self.vt.active.clone(),
+            active_id: self.vt.active_id,
+            chain: self.vt.chain.clone(),
+            fibers: self.fibers.clone(),
+            coroutines: self
+                .vt
+                .coroutines
+                .iter()
+                .map(|c| c.as_ref().map(coro_snapshot))
+                .collect(),
+            active_coro: self.vt.active_coro,
             mem: self.mem.as_ref().map(|m| m.window_snapshot()),
             host: self.host.replay_substate(),
         })
@@ -4424,18 +4485,46 @@ impl DebugRun {
 
     /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
     /// re-created + tape re-armed by the backend), so a subsequent replay resumes exactly at the
-    /// snapshot's logical time rather than clock 0. Replaces the active `Vm`, reseeds the window bytes,
-    /// restores the host replay substate (cap cursor, captured stdout, clock), and sets the clock. The
-    /// shared structure (`source`/`table`/`funcs`) already matches — a checkpoint is only taken for the
-    /// root-only run this rebuilds. A checkpointable snapshot had an empty fiber/coroutine set, so the
-    /// fresh run's already-empty `chain`/`coroutines`/`fibers` need no reset.
+    /// snapshot's logical time rather than clock 0. Rebuilds the whole `VTask` (active `Vm`, resume
+    /// chain, fiber registry, and each same-module coroutine — its `nested_view` recreated over the
+    /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
+    /// host replay substate, and sets the clock. The shared structure (`source`/`table`/`funcs`) already
+    /// matches — a checkpoint is only taken for a run whose coroutines are same-module.
     pub fn restore(&mut self, snap: &DebugRunSnapshot) {
         self.vt.active = snap.active.clone();
-        self.vt.active_id = ROOT_FIBER;
-        self.vt.active_coro = None;
+        self.vt.active_id = snap.active_id;
+        self.vt.chain = snap.chain.clone();
+        self.vt.active_coro = snap.active_coro;
+        self.fibers = snap.fibers.clone();
         if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
             m.seed(bytes);
         }
+        // Rebuild each same-module coroutine: a fresh `nested_view` over the just-reseeded parent window
+        // (so its bytes — shared via the backing region — are already correct) + a fresh Yielder host.
+        let progs_len = self.source.primary().progs.len();
+        let parent_mem = self.mem.as_ref();
+        self.vt.coroutines = snap
+            .coroutines
+            .iter()
+            .map(|c| {
+                c.as_ref().map(|cs| {
+                    let mem = parent_mem.map(|m| m.nested_view(cs.win_base, cs.size_log2));
+                    let mut host = Host::new();
+                    host.grant_yielder();
+                    host.restore_replay_substate(&cs.host);
+                    Coro {
+                        vm: cs.vm.clone(),
+                        mem,
+                        host,
+                        table: build_table(progs_len, 0),
+                        awaiting: cs.awaiting,
+                        fault_yields: false, // demand coroutines are outside the subset
+                        faulted_page: cs.faulted_page,
+                        mod_debug: None, // same-module: frames read against the session's own metadata
+                    }
+                })
+            })
+            .collect();
         self.host.restore_replay_substate(&snap.host);
         self.op_clock = snap.clock;
         self.done = None;
@@ -6277,7 +6366,10 @@ enum Outcome {
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
 /// per-context shadow-SP swap ([`shadow_switch`]) and, on freeze, flattens each `Parked` fiber into its
-/// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`.
+/// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`. `Clone` for
+/// time-travel checkpointing (W1): a fiber-carrying `DebugRun` snapshots its whole registry — each
+/// fiber `Vm` shares the one window (snapshotted separately), so a clone is a faithful deep copy.
+#[derive(Clone)]
 enum FiberState {
     /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`.
     Pending { funcref: i32, sp: i64 },

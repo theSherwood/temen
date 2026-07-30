@@ -343,3 +343,93 @@ fn coroutine_body_tick_replays_deterministically() {
         "replay reproduced the coroutine-body position"
     );
 }
+
+/// A per-op observation of a coroutine `DebugRun`: the logical clock, the full call stack (each frame's
+/// IR pc — inside the coroutine body when stepped in), and the coroutine's confined-window bytes (its
+/// carve starts at 64 KiB). A faithful checkpoint restore reproduces all three.
+fn coro_obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
+    let mut stack = Vec::new();
+    for d in 0..run.depth() {
+        if let Some(pc) = run.frame_pc(d) {
+            stack.push(format!(
+                "{}:{}:{}:{}",
+                pc.module, pc.func, pc.block, pc.inst
+            ));
+        }
+    }
+    let win = run.read_window(65536, 16).unwrap_or_default();
+    (run.op_clock(), stack.join("|"), win)
+}
+
+/// Warm≡cold oracle for **§14 same-module coroutine** checkpointing (DEBUGGING.md W1): at every op
+/// clock where a checkpoint could be taken — including while stepped *inside* the coroutine body — a
+/// `DebugRun::restore`d run replays forward **identically** to the trusted single from-0 run. This
+/// exercises the coroutine snapshot/restore directly (the DAP powerbox grants no Instantiator, so the
+/// backend-level oracle can't reach coroutines): the child `Vm`, its `nested_view` window (rebuilt over
+/// the reseeded parent), and its Yielder host must all round-trip.
+#[test]
+fn coroutine_checkpoint_snapshot_restore_round_trips() {
+    const FUEL: u64 = 5_000_000;
+
+    // Reference: one observation per op clock from a single from-0 run.
+    let mut refr = coro_session();
+    let mut f = FUEL;
+    let mut ref_obs = vec![coro_obs(&refr)];
+    while refr.tick(&mut f) {
+        ref_obs.push(coro_obs(&refr));
+    }
+    let total = ref_obs.len() - 1;
+    assert_eq!(
+        refr.result().unwrap().as_ref().unwrap(),
+        &[Value::I64(WANT)]
+    );
+    // The run genuinely steps inside the coroutine body (func 1), so the round-trip below covers a live
+    // coroutine, not only the parent.
+    assert!(
+        ref_obs
+            .iter()
+            .any(|(_, s, _)| s.split('|').any(|fr| fr.starts_with("0:1:"))),
+        "the run steps inside the coroutine body (func 1)"
+    );
+
+    // For every clock C where `snapshot` succeeds, restore into a fresh run and replay forward, checking
+    // it matches the reference from C onward. Track that at least one such C was inside the coroutine.
+    let mut checkpointed_in_coro = false;
+    for c in 0..=total {
+        let mut at_c = coro_session();
+        let mut f = FUEL;
+        while at_c.op_clock() < c as u64 && at_c.tick(&mut f) {}
+        let Some(snap) = at_c.snapshot() else {
+            continue; // C is outside the checkpointable subset
+        };
+        if ref_obs[c].1.split('|').any(|fr| fr.starts_with("0:1:")) {
+            checkpointed_in_coro = true;
+        }
+        let mut warm = coro_session();
+        warm.restore(&snap);
+        let mut i = c;
+        assert_eq!(
+            coro_obs(&warm),
+            ref_obs[i],
+            "restore at C={c} lands at the reference state"
+        );
+        let mut f = FUEL;
+        while warm.tick(&mut f) {
+            i += 1;
+            assert_eq!(
+                coro_obs(&warm),
+                ref_obs[i],
+                "forward replay after restore at C={c}"
+            );
+        }
+        assert_eq!(i, total, "warm run from C={c} reached the same end");
+        assert_eq!(
+            warm.result().unwrap().as_ref().unwrap(),
+            &[Value::I64(WANT)]
+        );
+    }
+    assert!(
+        checkpointed_in_coro,
+        "a checkpoint was taken (and restored) while stepped inside the coroutine body"
+    );
+}
