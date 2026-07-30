@@ -55,6 +55,13 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
+/// translatable body (calls to it become SVM imports the host binds at link).
+fn is_importc_proc(proc_node: &Node) -> bool {
+    matches!(proc_node.args().get(3), Some(p)
+        if p.tag() == Some("pragmas") && p.args().iter().any(|x| x.tag() == Some("importc")))
+}
+
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
 /// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
 fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
@@ -802,6 +809,10 @@ impl Translator {
         let mut names = Vec::new();
         for item in root.args() {
             match item.tag() {
+                // An `importc` proc is an **extern** (a C bottom-edge function — `memcpy`, `mmap`):
+                // it has no body to translate. Skip it, so a call to it lowers to an SVM import the
+                // host/runtime binds at link (the same seam the ~15 C funcs already use).
+                Some("proc") if is_importc_proc(item) => {}
                 Some("proc") => {
                     let (name, params, ret0) = self.proc_sig(item)?;
                     let sret = self.ret_sret(&item.args()[2])?;
