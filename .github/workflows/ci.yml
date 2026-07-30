@@ -73,11 +73,69 @@ jobs:
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
+  # Guard against the I26/I42/I49 class: a play.js demo card referencing an asset that isn't shipped
+  # (neither committed under browser/web/assets/ nor declared deploy-built) → the card 404s. Cheap,
+  # no toolchain (Node is preinstalled) — the required set is derived from web/play.js, so new cards
+  # are covered automatically. The complementary "is every required asset actually assembled into the
+  # published site" check runs at deploy time in pages.yml (--site mode).
+  playground-assets:
+    name: playground assets accounted for
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: node browser/check-play-assets.mjs
+
+  # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
+  # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
+  # (`cp .github/workflows_src/*.yml .github/workflows/`). This guard reds the run when the two drift —
+  # a staged change hasn't been applied, or one dir was edited without the other — so pending workflow
+  # changes can't be silently forgotten. (This job lives in the copied-over `.github/workflows/ci.yml`,
+  # so it can only start catching drift once the two are first brought into sync.)
+  workflows-in-sync:
+    name: workflows_src == workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: .github/workflows_src/*.yml must match .github/workflows/*.yml
+        run: |
+          set -u
+          fail=0
+          shopt -s nullglob
+          # Every staged .yml must exist in workflows/ and be byte-identical.
+          for src in .github/workflows_src/*.yml; do
+            base=$(basename "$src")
+            dst=".github/workflows/$base"
+            if [ ! -f "$dst" ]; then
+              echo "::error file=$src::$base is in workflows_src/ but not workflows/ — copy it over"
+              fail=1
+            elif ! diff -u "$dst" "$src"; then
+              echo "::error file=$src::$base differs from workflows/$base — run: cp .github/workflows_src/*.yml .github/workflows/ (see .github/workflows_src/README.md)"
+              fail=1
+            fi
+          done
+          # And nothing may live only in workflows/ (a .yml deleted from the source but left running).
+          for dst in .github/workflows/*.yml; do
+            base=$(basename "$dst")
+            if [ ! -f ".github/workflows_src/$base" ]; then
+              echo "::error file=$dst::$base is in workflows/ but not workflows_src/ — add it to the source (or delete it)"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then echo "workflows_src/ and workflows/ are in sync."; fi
+          exit "$fail"
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Same I7 backstop as `check` (windows/macOS runners are slower, so a wider bound).
     timeout-minutes: 45
+    # CI-speed + I3: drop test-binary debug info. Generating it (PDBs on Windows especially) is a
+    # large fraction of the cross-OS `cargo test` compile+link — this is the run's critical path
+    # (~20 min on windows-latest) — and the debug info is unused here (backtraces keep symbol names).
+    # The `check` gate already runs with this (I30); mirroring it also lowers the Windows link-memory
+    # peak that I3 aborts on. Behavior is unchanged.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     # Gating (no continue-on-error): windows/macOS build+test parity blocks the merge.
     strategy:
       fail-fast: false
@@ -217,6 +275,13 @@ jobs:
     # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
     # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
     # (which models the protocol atomics) and TSan.
+    #
+    # Nightly + manual only (CI speed): Miri interprets svm-mem and takes ~18 min — second only to the
+    # windows `build · test` on the run's critical path. The unsafe substrate it guards changes rarely,
+    # so it rides the daily `schedule` cron like the other deep UB checks (asan/tsan/asan-jit-setjmp)
+    # rather than gating every PR. NOTE: if `miri` is a *required* status check in branch protection,
+    # drop it from that list (a skipped required check blocks merges).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: miri (svm-mem unsafe substrate)
     runs-on: ubuntu-latest
     steps:
@@ -407,6 +472,17 @@ jobs:
         env:
           SVM_PG_CACHE: /tmp/svm_pg_cache
         run: node build-pg-assets.mjs
+      # Stage chibicc.svmb for the playground C-compiler card so browser-play-editor-test.mjs runs its
+      # compile-and-run assertion (rather than SKIPping). Uses the same LLVM-18/clang installed above;
+      # fail-soft so a build hiccup degrades to a SKIP, never a red build (the test guards on the asset).
+      - name: build + stage chibicc asset
+        working-directory: browser
+        # Block scalar: the inline JS contains a colon-space ("skipped: "+e.message) which is invalid
+        # as a YAML plain scalar (GHA rejects the whole file). This pending step was never valid to
+        # copy over as-is; `|` makes the body literal. Fixed here so the workflows-in-sync guard's
+        # copy-over can't break CI parsing.
+        run: |
+          node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
       # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
       # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
       - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
@@ -425,7 +501,17 @@ jobs:
           # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
           node browser-jit-reactor-test.mjs
           node browser-play-editor-test.mjs
+          # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
+          # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
+          # staged chibicc.svmb; SKIPs if it's absent. Timing is informational — it only FAILs on IR
+          # divergence. See SELFHOST_C.md §7 (wasm-JIT tier) / PR #483.
+          node bench_chibicc_jit.mjs
           node pg-reload-test.mjs
+          # The svm-posix shell card (STAGE1.md): stage the committed shell fixture into web/assets,
+          # then drive `svm_run_shell` in real Chromium and assert the script's stdout. The test
+          # skips cleanly if the asset is absent, so the copy is what makes it actually run.
+          cp tests/fixtures/shell.svmb web/assets/shell.svmb
+          node browser-shell-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
