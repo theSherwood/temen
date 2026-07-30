@@ -86,7 +86,8 @@ fn seeded_host(m: &Arc<svm_ir::Module>) -> Host {
 fn session() -> DebugRun {
     let m = module();
     let host = seeded_host(&m);
-    DebugRun::new_with_host(&m, 0, &[], host).expect("bytecode debug engine drives the native serve loop")
+    DebugRun::new_with_host(&m, 0, &[], host)
+        .expect("bytecode debug engine drives the native serve loop")
 }
 
 /// The expected result, pinned against the tree-walker oracle over the *same* seeded queue:
@@ -236,7 +237,11 @@ fn scheduled_serve_loop_checkpoint_snapshot_restore_round_trips() {
         let mut warm = sched_session();
         warm.restore(&snap);
         let mut i = c;
-        assert_eq!(sched_obs(&warm), ref_obs[i], "scheduled restore at C={c} lands");
+        assert_eq!(
+            sched_obs(&warm),
+            ref_obs[i],
+            "scheduled restore at C={c} lands"
+        );
         let mut f = FUEL;
         while warm.tick(&mut f) {
             i += 1;
@@ -246,7 +251,10 @@ fn scheduled_serve_loop_checkpoint_snapshot_restore_round_trips() {
                 "scheduled forward serve replay diverged after restore at C={c}"
             );
         }
-        assert_eq!(i, total, "scheduled warm serve run from C={c} reached the same end");
+        assert_eq!(
+            i, total,
+            "scheduled warm serve run from C={c} reached the same end"
+        );
         assert_eq!(warm.result(), Some(&Ok(want.clone())));
     }
     assert_eq!(
