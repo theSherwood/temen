@@ -617,6 +617,17 @@ struct HostReplaySubstate {
     clock_ns: i64,
     cap_cursor: usize,
     cap_record: Vec<CapRecord>,
+    /// §3.6 serve state — the domain's inbound dispatch queue, its settled completion cells, and its
+    /// next ticket ([`Host::svc_state`]). A checkpoint taken while a `svc.poll` drain is in flight — a
+    /// handler activation on the vCPU stack (`serve_ticket = Some`, captured in the `Vm` clone), or the
+    /// queue only partly drained — must carry the queued-but-unserved dispatches and the already-settled
+    /// cells, or a restored replay would silently drop them and diverge. This is **plain data**
+    /// (DURABILITY.md §13.4 "serialize as-is", the sibling freeze/thaw path's identical treatment), not a
+    /// waiter/scheduler record: the single-domain debug engine parks no cross-domain caller, so nothing
+    /// here is captured scheduler state (INVARIANTS.md #7).
+    svc_queue: Vec<SvcDispatch>,
+    svc_results: Vec<(u64, i64)>,
+    svc_next_ticket: u64,
 }
 
 /// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
@@ -13612,11 +13623,14 @@ impl Host {
 
     /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
     /// replay from logical time `c` sees the host exactly as it was then: the I/O streams the run has
-    /// produced/consumed, the deterministic clock, and the cap-replay cursor (which record the next
-    /// `Clock`/stdin input is served from). Everything else on a fresh seek-host is immutable for the
-    /// run (the replay tape, the empty cap table) or absent (no granted powerbox), so this small set is
-    /// the whole mutable frontier. Cheap clones (`stdout`/`stderr` are typically tiny in a debug run).
+    /// produced/consumed, the deterministic clock, the cap-replay cursor (which record the next
+    /// `Clock`/stdin input is served from), and the §3.6 serve state (the inbound dispatch queue +
+    /// settled completion cells + next ticket — the mutable frontier a mid-`svc.poll` checkpoint needs).
+    /// Everything else on a fresh seek-host is immutable for the run (the replay tape, the empty cap
+    /// table) or absent (no granted powerbox), so this small set is the whole mutable frontier. Cheap
+    /// clones (`stdout`/`stderr` and the debug-run serve queue are typically tiny).
     fn replay_substate(&self) -> HostReplaySubstate {
+        let (svc_queue, svc_results, svc_next_ticket) = self.svc_state();
         HostReplaySubstate {
             stdin_pos: self.stdin_pos,
             stdout: self.stdout.clone(),
@@ -13624,6 +13638,9 @@ impl Host {
             clock_ns: self.clock_ns,
             cap_cursor: self.cap_replay.as_ref().map(|(_, c)| *c).unwrap_or(0),
             cap_record: self.cap_record.clone().unwrap_or_default(),
+            svc_queue,
+            svc_results,
+            svc_next_ticket,
         }
     }
 
@@ -13640,6 +13657,14 @@ impl Host {
             slot.1 = s.cap_cursor;
         }
         self.cap_record = Some(s.cap_record.clone());
+        // Reinstate the §3.6 serve state (replaces whatever the reused caller-built host was seeded with
+        // at construction) so a replay resumed from the checkpoint drains the exact remaining queue and
+        // observes the same settled cells — the inverse of [`Host::svc_state`] captured above.
+        self.set_svc_state(
+            s.svc_queue.clone(),
+            s.svc_results.clone(),
+            s.svc_next_ticket,
+        );
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
