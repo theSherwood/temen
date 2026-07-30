@@ -207,7 +207,11 @@ fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
         "warm (checkpoint-restored) scheduled seek ≡ cold (replay-from-turn-0) at every forward probe",
     );
 
-    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs_sched(&mut warm, t)).collect();
+    let warm_back: Vec<_> = probes
+        .iter()
+        .rev()
+        .map(|&t| obs_sched(&mut warm, t))
+        .collect();
     let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
     assert_eq!(
         warm_back, cold_back,

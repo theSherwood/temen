@@ -867,7 +867,10 @@ fn dap_over_bytecode_step_back_after_forward_progress_matches_the_tree_walker() 
 
     let bytecode = script(Some("bytecode"));
     assert_eq!(bytecode.0, "1,5", "furthest-forward hit is i=1, acc=5");
-    assert_eq!(bytecode.1, "step", "the rebuild-then-seek stepBack is a step stop");
+    assert_eq!(
+        bytecode.1, "step",
+        "the rebuild-then-seek stepBack is a step stop"
+    );
     assert_eq!(
         bytecode,
         script(None),
