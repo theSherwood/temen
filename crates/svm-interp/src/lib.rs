@@ -6735,6 +6735,11 @@ struct ServeRun {
     handle: i64,
     ticket: u64,
     serve_cur: usize,
+    /// FORK.md PR 1 increment 2 — set when `clone_caller` already delivered this dispatch's reply
+    /// out-of-band (the reply-injection nucleus). The handler's eventual `FIBER_RETURNED` then
+    /// **skips** its auto-reply, so the servicer's injected value is the one the caller reloads —
+    /// not the handler's return clobbering it. (`fork()` replies `pid`/`0` this way in PR 2.)
+    replied: bool,
 }
 
 impl VCpu {
@@ -8716,8 +8721,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             FIBER_RETURNED => {
                                 // Reply-wake the parked caller, or stash in the completion
                                 // cell — atomically, so a caller parking mid-settle can't
-                                // strand ([`Scheduler::cap_reply_or_stash`]).
-                                sched.cap_reply_or_stash(run.ticket, value, host);
+                                // strand ([`Scheduler::cap_reply_or_stash`]). FORK.md PR 1
+                                // increment 2: unless `clone_caller` already injected this
+                                // dispatch's reply out-of-band (`run.replied`), in which case the
+                                // handler's return must **not** clobber the injected value — the
+                                // dispatch still counts as served.
+                                if !run.replied {
+                                    sched.cap_reply_or_stash(run.ticket, value, host);
+                                }
                                 *serve_count += 1;
                             }
                             FIBER_PARKED => {
@@ -8753,6 +8764,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 handle: $handle,
                                 ticket: $ticket,
                                 serve_cur: *cur,
+                                replied: false,
                             });
                             frames[top].inst -= 1;
                             let parked = std::mem::take(frames);
@@ -8874,19 +8886,34 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     *serve_count = 0;
                 }
-                // FORK.md PR 1 — `clone_caller` (self-namespace op 11): serviced here because it needs
-                // the eval-loop-local `serve_run` (the running handler's dispatch). Increment 1: prove
-                // the handler→ticket linkage — return the served ticket, or `-EINVAL` when not called
-                // from within a handler (no `serve_run`, or called from the serve loop itself, where
-                // `*cur == serve_cur`). Capture + twin + dual-reply are the next increments.
+                // FORK.md PR 1 — `clone_caller(reply)` (self-namespace op 11): serviced here because it
+                // needs the eval-loop-local `serve_run` (the running handler's dispatch). Increment 2 —
+                // the **reply-injection nucleus**: from within a handler, deliver `reply` out-of-band to
+                // the caller parked on this dispatch's ticket, and mark the dispatch replied so the
+                // handler's own return does not clobber the injected value. This is fork's core insight —
+                // "return-twice is a reply value" (FORK.md §3): the servicer supplies the caller's reply
+                // rather than the handler's return. `0` on success; `-EINVAL` when not called from within
+                // a handler (no `serve_run`, or from the serve loop itself, where `*cur == serve_cur`).
+                // The twin (a second copy under a second ticket) is increment 3; PR 2's `fork` op replies
+                // `pid`/`0`. Race-safe: `cap_reply_or_stash` wakes the parked vCPU, or stashes for its
+                // park-time early-probe if the caller has not parked yet.
                 Inst::CapCall {
                     type_id: svm_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
                     sig,
+                    args,
                     ..
                 } => {
-                    let r = match serve_run.as_ref() {
-                        Some(sr) if *cur != sr.serve_cur => sr.ticket as i64,
+                    let reply = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let r = match serve_run.as_mut() {
+                        Some(sr) if *cur != sr.serve_cur => {
+                            sched.cap_reply_or_stash(sr.ticket, reply, host);
+                            sr.replied = true;
+                            0
+                        }
                         _ => EINVAL,
                     };
                     if !sig.results.is_empty() {

@@ -1,12 +1,15 @@
-//! FORK.md PR 1, increment 1 — the **handler→caller linkage**. `clone_caller` (self-namespace op 11)
-//! is fork's servicer-side primitive: from within a serve handler it acts on the caller parked on the
-//! dispatch this handler is serving. This first increment proves only the linkage — the handler can read
-//! its own dispatch ticket via `serve_run` — before the capture / twin / dual-reply increments.
+//! FORK.md PR 1 — `clone_caller(reply)` (self-namespace op 11), fork's servicer-side primitive.
+//!
+//! Increment 1 proved the **handler→caller linkage** (the handler can name the caller parked on the
+//! dispatch it is serving). Increment 2 — this file — proves the **reply-injection nucleus**: from
+//! within a serve handler, `clone_caller(reply)` delivers `reply` to that parked caller *out-of-band*
+//! and suppresses the handler's own auto-reply, so the caller reloads the **injected** value, not the
+//! handler's return. That is fork's core insight (FORK.md §3): "return-twice is a reply value" — the
+//! servicer supplies the caller's reply. The twin (a second copy under a second ticket) is increment 3.
 //!
 //! Harness (the `svc_serve_loop` shape): the root spawns a server child, mints an offer over its `svc`
 //! export, and calls it — parking on `CapReply`. The server's handler (func 2) calls `clone_caller` and
-//! returns its result; the reply threads back to the root. A result `>= 0` (the served ticket) proves the
-//! handler was correctly identified as serving a dispatch; `-EINVAL` would mean the linkage is broken.
+//! then returns a *different* value; the injected value is what the root observes.
 
 use std::sync::Arc;
 use svm_interp::{run_with_host, Host, Value};
@@ -19,8 +22,9 @@ fn module(text: &str) -> Arc<svm_ir::Module> {
 
 /// func 0 (root/caller): spawn a server running func 1, mint an offer over export 0 (`svc` → func 2),
 /// call it with `7`, return the reply. func 1 (server entry): serve one dispatch via `svc.wait`
-/// (op 10). func 2 (the handler, bound to the offer): `clone_caller()` (op 11) and return it. The
-/// child-entry signature is `(i64) -> (i64)` — the spawn ABI hands the entry an `(i64)` starter arg.
+/// (op 10). func 2 (the handler, bound to the offer): `clone_caller(999)` — inject `999` into the
+/// caller — then return a *different* value `5`, which must NOT reach the caller. The child-entry
+/// signature is `(i64) -> (i64)` — the spawn ABI hands the entry an `(i64)` starter arg.
 const SRC: &str = r#"
 memory 17
 type 0 func (i64) -> (i64)
@@ -50,21 +54,24 @@ block 0 (v0: i64) {
 func (i64) -> (i64) {
 block 0 (vx: i64) {
   vz = i32.const 0
-  vt = cap.call 4294967295 11 () -> (i64) vz ()
-  return vt
+  v999 = i64.const 999
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (v999)
+  v5 = i64.const 5
+  return v5
   }
 }
 "#;
 
 /// The negative half of the linkage: `clone_caller` called from **outside** a handler (the root's
-/// own `main`, no `serve_run`) is a probeable `-EINVAL`, never a trap and never a bogus ticket — the
-/// op only acts when a handler is genuinely serving a parked caller.
+/// own `main`, no `serve_run`) is a probeable `-EINVAL` (it injects nothing), never a trap — the op
+/// only acts when a handler is genuinely serving a parked caller.
 const SRC_NO_HANDLER: &str = r#"
 memory 17
 func () -> (i64) {
 block 0 () {
   vz = i32.const 0
-  vt = cap.call 4294967295 11 () -> (i64) vz ()
+  varg = i64.const 999
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (varg)
   return vt
   }
 }
@@ -88,7 +95,7 @@ fn a_non_serving_tier_refuses_clone_caller_probeably() {
             svm_ir::CAP_SELF_TYPE_ID,
             svm_interp::CAP_SELF_CLONE_CALLER,
             0,
-            &[],
+            &[0],
             None,
         )
         .expect("refusal, not a trap");
@@ -105,23 +112,23 @@ fn clone_caller_outside_a_handler_is_probeable_einval() {
     assert_eq!(
         r,
         vec![Value::I64(-22)],
-        "clone_caller from main (no serve_run) refuses with -EINVAL, not a trap or a bogus ticket",
+        "clone_caller from main (no serve_run) refuses with -EINVAL, not a trap",
     );
 }
 
 #[test]
-fn clone_caller_reads_its_dispatch_ticket_from_within_a_handler() {
+fn clone_caller_injects_the_callers_reply_out_of_band() {
     let m = module(SRC);
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let mut fuel = 20_000_000u64;
     let r = run_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &mut host).expect("run");
-    // The handler returned `clone_caller()`'s result, threaded back as the offer call's reply. The first
-    // dispatch's ticket is 0 (per-callee tickets start at 0); a broken linkage would be -EINVAL (-22).
+    // The root observes the value `clone_caller` INJECTED (999), not the handler's own return (5) —
+    // proving the servicer supplied the caller's reply out-of-band and the auto-reply was suppressed.
     assert_eq!(
         r,
-        vec![Value::I64(0)],
-        "clone_caller from within a handler returns the served ticket (0), not -EINVAL",
+        vec![Value::I64(999)],
+        "the caller reloads the injected reply (999), not the handler's return (5)",
     );
 }
