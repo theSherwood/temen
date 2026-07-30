@@ -357,8 +357,11 @@ libc, or a standard DAP verb.
   record debugger writes on the same input tape as W4's provided stdin (the `CapTape` shape) so a
   later `seek` replays them and time-travel stays truthful.
 - **X6 is guest C.** `sem_*` / `pthread_barrier_*` as guest-libc headers over the existing
-  futex/wait-notify ops — the postgres demo's `ipc_shim.c` already proves the pattern. Zero engine
-  surface; lands next to the playground's seeded libc.
+  futex/wait-notify ops. The proven pattern is `frontend/chibicc/include/pthread.h`: mutex +
+  condvar built on the `__vm_wait32` / `__vm_notify` intrinsics (lowered to `memory.wait`/
+  `memory.notify` by `codegen_ir.c`) — sem/barrier are the same construction, currently declared
+  out of scope in that header. (An earlier draft cited the postgres demo's `ipc_shim.c`; corrected
+  — that shim is a single-process no-op counter, not a futex user.) Zero engine surface.
 - **Batching:** `svm_dap_request` is one-request-per-pump today; accept a **JSON array of requests
   per pump** (replies already come back as an array). One FFI crossing per step for a step + N
   state reads, embedder-neutral, no new ABI entries.
@@ -405,16 +408,27 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    tape. Acceptance: the W4 block above (two round-trips; `seek(0)` replays both
 >    byte-identically, no re-park).
 > 2. **DAP array-pump.** `svm_dap_request` accepts a JSON **array** of requests per pump (replies
->    already come back as an array); singletons unchanged. Acceptance: a step + N state reads in
->    one FFI crossing; existing DAP tests pass untouched.
+>    already come back as an array); singletons unchanged. Integration (verified): a pure
+>    `browser/src/lib.rs` change at the `server.handle` call — `svm_dap::parse` already returns
+>    `Json::Arr` for a top-level array (today it falls through to a clean single failure), so the
+>    pump matches `Arr` and flat-maps `handle` per element; `web/dap.js` already parses the reply
+>    as an array and filters by `type`, so the JS client needs no change. Acceptance: a step + N
+>    state reads in one FFI crossing; existing DAP tests pass untouched.
 > 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize the per-op
 >    access decode behind `watch_hit_before` into an optional sink on
 >    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
 >    module rewrite, op-clock unchanged. Scope note (2026-07-30, verified): the shared decode is
 >    `access_of` (`lib.rs`), and it is **single-range only — `mem.copy`/`mem.move`/`mem.fill`
->    fall through to `MemAccess::None`**. So the sink needs a multi-range event vocabulary
->    (mirror `svm-run`'s `MemEvent`, whose `Copy`/`Fill` carry spans), not just a plumbed-through
->    `MemAccess`. The same fall-through means **watchpoints likely never fire on bulk-op writes**
+>    fall through to `MemAccess::None`**. So the sink needs a multi-range event vocabulary — not
+>    a plumbed-through `MemAccess`; **decided (owner, 2026-07-30): the sink vocabulary is
+>    `MemEvent`** (`svm-run`, whose `Copy`/`Fill` carry spans), shared verbatim with the hook
+>    pass so the differential compares like with like. Threading (verified): the sink rides the
+>    same path as the existing `watch_specs` — a field on `BytecodeBackend` re-installed after
+>    every `seek` rebuild (`fresh_single`), a slot on `DebugRun`/`ScheduledDebugRun` next to
+>    `watchpoints`, fired at the same pre-op sites (`run_to` / `drive`'s check block); the
+>    snapshot structs exclude it exactly as they exclude watchpoints (backend re-applies after
+>    restore); a launch-arg flag parses in `on_launch` next to `engine`/`stdin`. The same
+>    fall-through means **watchpoints likely never fire on bulk-op writes**
 >    (a `memcpy` over a watched byte won't stop) on *either* engine — parity hides it because both
 >    share the decode shape; pin it with a test and fix it in this slice (the sink-vs-hook
 >    differential would have exposed it regardless). Acceptance: sink stream **≡ the W3 hook-pass
@@ -425,32 +439,75 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
 >    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
 >    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
->    includes the **W3 browser export**. Model state snapshots at the checkpoint-ladder stride.
->    Acceptance: strided-vs-sequential miss ordering; browser counters ≡ native on the same
->    stream; `seek(t)` model state ≡ a from-0 run to `t`.
+>    includes the **W3 browser export**. Integration (verified): the browser crate depends on
+>    **neither `svm-run` nor `svm-opt`** (it runs the engine directly via
+>    `compile_and_run_with_host`), so the W3 export is *not* re-exporting
+>    `Instance::with_mem_hooks` — it adds the wasm-clean `svm-opt` dep (deps: `svm-ir` +
+>    `svm-verify` only) and reproduces the rewrite + handle bake-in locally in the cdylib,
+>    re-honoring the manifest exclusion (`svm-run`'s hooks refuse a manifest-carrying instance);
+>    natural entries are `svm_run`/`svm_run0` (via `run_at`) and the powerbox twins. Model
+>    snapshotting: there is **no checkpoint callback** — the ladder is private to the DAP backend
+>    and self-disables silently when a run leaves the checkpointable subset — so the model
+>    snapshots by watching `Debuggee::clock()`/`turn()` at its own stride; expose
+>    `checkpoint_clocks()` (one-liner — the snapshot types' `clock()`/`turn()` are already `pub`)
+>    if the model should align with the engine's ladder, and surface the self-disable so the
+>    model can drop to rebuild-from-0 with the engine. Acceptance: strided-vs-sequential miss
+>    ordering; browser counters ≡ native on the same stream; `seek(t)` model state ≡ a from-0 run
+>    to `t`, including after checkpointing self-disables.
 > 5. **X4's real-state half + W6 memory-map.** The window memory-map JSON (data segments, heap
 >    extent, data-stack region, cap-mapped regions) and a **Memory-capability growth cap** so
->    guest `malloc` over `vm_map` returns NULL at the limit. Acceptance: JSON matches module +
->    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows.
+>    guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
+>    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
+>    mapped/reserved) + the `svm-ir` powerbox layout constants (args/stack), with the **heap
+>    cursor read from guest memory** — `POWERBOX_HEAP_BRK`/`_TOP` are window words at offsets
+>    32/40, a `read_window`, not host state (`Mem::layout_snapshot` is the serialization
+>    precedent). The growth cap is greenfield: **nothing accounts `vm_map` growth today** — the
+>    only bound is the geometric `reserved` check in `prot_pages`; `MAX_MINTED_REGION` caps §14
+>    region mints only, and `Quota`/`Limits` have no memory field (aggregate metering is
+>    explicitly deferred to §15/D48). The cap is a payload on `Binding::Memory` (a unit variant
+>    today) checked in `Mem::map` beside the reserved bound — and it must round-trip the durable
+>    codec (`DurableBinding::Memory`, both directions). Acceptance: JSON matches module +
+>    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows;
+>    durable freeze/thaw preserves the cap.
 > 6. **X1 — scheduler trace seam + shared-state consumer.** An optional, zero-cost-when-off event
 >    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
 >    edge) with batch readback; the shared-state consumer (last-writer / contested per range) over
->    the attributed sink. Acceptance: the tape is bit-identical across a replay of the same run;
+>    the attributed sink. Integration (verified): every decision point sits in
+>    `ScheduledDebugRun::drive` — the pick (`dbg_pinned_coro` → stepping thread → lowest-index
+>    `dbg_pick_runnable`), join parks (`dbg_join` → `BlockedJoin`), futex parks (`dbg_wait` →
+>    `BlockedWait`, with timed wakeups fired inside the *picker*), and notify (`dbg_notify`).
+>    Join wake edges already carry both identities (`dbg_complete` enumerates); the futex wake
+>    edge needs the wakee's index materialized — the `dbg_notify` scan becomes `.enumerate()`,
+>    a one-token change. Acceptance: the tape is bit-identical across a replay of the same run;
 >    wake edges match wait/notify semantics on a fixture; contested flags match a hand-computed
 >    oracle.
-> 7. **X3 — scheduler policy + forced switch.** Seed + quantum bounds as debug-launch config
->    through the DAP/browser surface (quantum = 1 is the chaos case; the native deterministic
->    explorer already runs memop-granularity quantum = 1), plus a forced-switch session verb that
->    ends the turn at the next safe point. Acceptance: same policy → identical slice-6 tape;
->    a forced switch lands at a deterministic clock and survives replay.
-> 8. **X5 — DAP `setVariable` / `writeMemory`.** The standard verbs on the existing backend;
->    debugger writes are recorded on the session input tape (the `CapTape` shape) so replay
->    re-applies them. Acceptance: write → `seek` back → `seek` forward re-observes the write;
->    parity with the tree-walker where both back the same request.
-> 9. **X6 — guest-libc sem/barrier.** `sem_*` / `pthread_barrier_*` headers over the existing
->    futex wait/notify ops (the postgres demo `ipc_shim.c` pattern), landed next to the
->    playground's seeded libc. Acceptance: producer/consumer and barrier-phase fixtures run on
->    interp + JIT with identical output.
+> 7. **X3 — scheduler policy + forced switch.** Reframed by verification: the bytecode debug
+>    scheduler is **hardwired** — lowest-index pick, one op per turn, no seed or quantum anywhere
+>    (`on_launch` documents "seed/schedule ignored" for the bytecode engine; seeding exists only
+>    on the tree-walker's `attach_scheduled_seeded`, seed `u64`, no quantum there either). Since
+>    the turn quantum is already 1 op, **chaos-granularity interleaving is the default** — what's
+>    missing is *variation*: a seed-parameterized deterministic pick (the tree-walker's
+>    xorshift-with-fixpoint-guard is the precedent, and its `sched_tape()` shows how to recover
+>    the realized plan), plus a forced-switch session verb. Both must preserve the load-bearing
+>    replay property ("replaying `t` ticks from a fresh session reproduces the state at turn
+>    `t`") that `drive_scheduled_to` + `ScheduledSnapshot` depend on — so the seed is session
+>    state and forced switches are **recorded** (tape-shaped, like CapTape) and re-applied at the
+>    same turns on replay. Acceptance: same seed → identical slice-6 tape; a forced switch lands
+>    at a deterministic turn and survives `seek`.
+> 8. **X5 — DAP `setVariable` / `writeMemory`.** Greenfield at all three layers (verified): the
+>    `Inspector` has no write methods, the `Debuggee` trait has no write operation, and
+>    `DapServer` handles neither request (nor `readMemory`) — so this is a new trait method +
+>    engine implementations + new `handle` arms. Debugger writes are recorded on the session
+>    input tape (the `CapTape` shape) so replay re-applies them. Acceptance: write → `seek` back
+>    → `seek` forward re-observes the write; parity with the tree-walker where both back the
+>    same request.
+> 9. **X6 — guest-libc sem/barrier.** Extend `frontend/chibicc/include/pthread.h` — which already
+>    builds mutex + condvar on the `__vm_wait32`/`__vm_notify` futex intrinsics and declares
+>    sem/barrier out of scope — with `sem_*` (counter + futex) and `pthread_barrier_*`
+>    (generation counter + futex) by the same construction; add the headers to the browser
+>    playground's seeded set (which today ships **no** threading headers at all). Zero engine
+>    surface. Acceptance: producer/consumer and barrier-phase fixtures run on interp + JIT with
+>    identical output.
 > 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
 >    (finite register file) stays demand-driven.
 >
