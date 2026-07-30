@@ -394,19 +394,33 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > the checkpoint ladder and `CapTape` replay have landed. Each slice lands with CI-gating tests,
 > differential wherever two observers see the same program, per `AGENTS.md`.
 >
-> 1. **W4 finish — `provideStdin` on the debug session.** Park the debug vCPU on exhausted stdin
->    (`VcpuEvent::StdinPark` exists engine-side), surface a distinct DAP stop reason, add a custom
->    `provideStdin` request that appends to the session's `CapTape` and resumes. Acceptance: the
->    W4 block above (two round-trips; `seek(0)` replays both byte-identically, no re-park).
+> 1. **W4 finish — `provideStdin` on the debug session.** Integration note (2026-07-30, verified):
+>    in a debug run stdin is served by the **Host's stdin cap** (`grant_io_powerbox`, `host.stdin`
+>    — `svm-dap/src/backend.rs`), not the Vcpu event loop, so `VcpuEvent::StdinPark` is *not* the
+>    seam here. The work: a **would-block outcome** on the stdin cap when the buffer is exhausted
+>    (instead of serving EOF), surfaced as a new stop variant threaded `DebugRun`/
+>    `ScheduledDebugRun` stop enums → the `Debuggee` trait → the DAP `stopped` event; a custom
+>    `provideStdin` request appends to `host.stdin` and resumes (re-executing the read). Replay is
+>    free: `record_caps`/`replay_cap_tape` already tape stdin inputs, so provided bytes join the
+>    tape. Acceptance: the W4 block above (two round-trips; `seek(0)` replays both
+>    byte-identically, no re-park).
 > 2. **DAP array-pump.** `svm_dap_request` accepts a JSON **array** of requests per pump (replies
 >    already come back as an array); singletons unchanged. Acceptance: a step + N state reads in
 >    one FFI crossing; existing DAP tests pass untouched.
-> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize
->    `watch_hit_before`'s per-op access decode into an optional sink on
+> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize the per-op
+>    access decode behind `watch_hit_before` into an optional sink on
 >    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
->    module rewrite, op-clock unchanged. Acceptance: sink stream **≡ the W3 hook-pass stream** on
->    the same program (uninstrumented vs. instrumented) across the full `MemEvent` vocabulary; all
->    debug parity tests pass with a sink installed.
+>    module rewrite, op-clock unchanged. Scope note (2026-07-30, verified): the shared decode is
+>    `access_of` (`lib.rs`), and it is **single-range only — `mem.copy`/`mem.move`/`mem.fill`
+>    fall through to `MemAccess::None`**. So the sink needs a multi-range event vocabulary
+>    (mirror `svm-run`'s `MemEvent`, whose `Copy`/`Fill` carry spans), not just a plumbed-through
+>    `MemAccess`. The same fall-through means **watchpoints likely never fire on bulk-op writes**
+>    (a `memcpy` over a watched byte won't stop) on *either* engine — parity hides it because both
+>    share the decode shape; pin it with a test and fix it in this slice (the sink-vs-hook
+>    differential would have exposed it regardless). Acceptance: sink stream **≡ the W3 hook-pass
+>    stream** on the same program (uninstrumented vs. instrumented) across the full `MemEvent`
+>    vocabulary; a bulk-op watchpoint fires at the same clock on both engines; all debug parity
+>    tests pass with a sink installed.
 > 4. **X2 + X4's fault counter — cache/coherence + paging models, host-side in the cdylib.** A
 >    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
 >    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
