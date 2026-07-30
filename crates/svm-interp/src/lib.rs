@@ -16649,6 +16649,21 @@ pub fn host_region_granularity() -> u64 {
 /// primitive behind aliasing / the magic-ring-buffer trick. Crucially the access path
 /// ([`Mem::byte`]/[`Mem::set_byte`]) just redirects where a page's bytes live; loads/stores stay
 /// ordinary masked accesses (zero overhead), exactly as §13 specifies.
+/// A time-travel checkpoint of a window's full guest-visible memory state — the committed byte range
+/// plus the page-protection map — for restoring a **page-mapping** root window (one that has `map`/
+/// `unmap`/`protect`ed or grown its layout). Captured by [`Mem::layout_snapshot`], reinstalled by
+/// [`Mem::restore_layout`]. Carries no `Backed` entries: §13 region aliasing is excluded from the
+/// checkpointable subset (see [`Mem::layout_snapshot_safe`]).
+#[derive(Clone)]
+struct MemLayout {
+    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
+    /// uncommitted pages read zero).
+    bytes: Vec<u8>,
+    /// The guest-visible page-protection entries (window-relative page index ⇒ state) — every
+    /// `Rw`/`Ro`/`Unmapped` deviation from the region default, reinstalled verbatim.
+    prot: Vec<(u64, PageProt)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PageProt {
     /// Explicitly `map`ped read-write — committed even in the reserved tail (where *absent* would
@@ -17747,10 +17762,12 @@ impl Mem {
     /// checkpointing the window (W1). True when nothing has changed *how* `[0, mapped)` is read back or
     /// extended it: no §13 region aliasing, and every explicit page-protection entry is a benign
     /// in-prefix `Rw` commit (the only kind demand-paging inserts). A `protect`ed (`Ro`), `unmap`ped,
-    /// region-`Backed`, or **grown** (tail `Rw`) page is *not* reproduced by reseeding a fresh window,
-    /// so it makes the run un-checkpointable (it falls back to replay-from-clock-0). Plain in-prefix
-    /// writes are fine — they leave the prefix `Rw` (absent from the map) and snapshot/seed round-trips
-    /// their bytes.
+    /// region-`Backed`, or **grown** (tail `Rw`) page is *not* reproduced by reseeding a fresh window, so
+    /// it fails this stricter check — but the root window instead uses the weaker
+    /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (bytes **plus** protection map), which admits
+    /// those; this bytes-only predicate still gates nested children, whose protection maps are not yet
+    /// captured. Plain in-prefix writes are fine — they leave the prefix `Rw` (absent from the map) and
+    /// snapshot/seed round-trips their bytes.
     fn snapshot_safe(&self) -> bool {
         if self.has_regions.load(Ordering::Relaxed) {
             return false;
@@ -17770,6 +17787,84 @@ impl Mem {
     /// The full mapped window, for a time-travel checkpoint (restored with [`seed`](Mem::seed)).
     fn window_snapshot(&self) -> Vec<u8> {
         self.snapshot(self.window.mapped())
+    }
+
+    /// Whether the live memory state round-trips through a [`layout_snapshot`](Mem::layout_snapshot) /
+    /// [`restore_layout`](Mem::restore_layout) pair — the precondition for time-travel checkpointing a
+    /// **page-mapping** window (W1). Weaker than [`snapshot_safe`](Mem::snapshot_safe): because the
+    /// page-protection map is captured *alongside* the bytes, this admits `protect`ed (`Ro`), `unmap`ped,
+    /// and grown reserved-tail (`Rw`) pages — a window that manages its own layout via `map`/`unmap`/
+    /// `protect`. The one disqualifier is §13 region aliasing: a `Backed` page's bytes live in a shared
+    /// cross-domain `SharedRegion`, not this window's own backing, so a bytes-plus-protmap capture cannot
+    /// reproduce it (and reinstating a cross-domain alias on restore is out of scope). `has_regions` is
+    /// the monotonic "ever aliased a region" flag, set at the same choke as the `Backed` insert, so its
+    /// clear state proves no `Backed` page exists.
+    fn layout_snapshot_safe(&self) -> bool {
+        !self.has_regions.load(Ordering::Relaxed)
+    }
+
+    /// Capture the window's full guest-visible memory state — the committed byte range plus the
+    /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
+    /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)
+    /// (no §13 regions). The byte range runs to the high-water mark — the mapped prefix, extended to
+    /// cover any grown reserved-tail page present in the map — so a `map`-grown heap is captured;
+    /// uncommitted/unmapped pages inside it read zero (the demand-zeroed backing, and `map`/`unmap`
+    /// zero on commit), matching a fresh window. Only for the **root** window (`base == 0`); nested
+    /// children ride in the root capture.
+    fn layout_snapshot(&self) -> MemLayout {
+        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let mut high = self.window.mapped();
+        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
+            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
+        }
+        high = high.min(self.window.reserved());
+        MemLayout {
+            bytes: (0..high).map(|i| self.byte(i)).collect(),
+            prot: space.prot.iter().map(|(&pg, &p)| (pg, p)).collect(),
+        }
+    }
+
+    /// Reinstate a [`layout_snapshot`](Mem::layout_snapshot) into this freshly built window: reseed the
+    /// captured bytes (committing any grown-tail page), then install the page-protection map verbatim.
+    /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
+    /// window has no regions, so this reproduces the guest-visible state exactly.
+    fn restore_layout(&mut self, layout: &MemLayout) {
+        for (i, &b) in layout.bytes.iter().enumerate() {
+            self.set_byte(i as u64, b);
+        }
+        if !layout.prot.is_empty() {
+            let mut space = self.space_write(); // marks prot_dirty, matching the captured window
+            space.prot = layout.prot.iter().copied().collect();
+        }
+    }
+
+    /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a
+    /// §14 **child** window — a coroutine or `instantiate` child, whose *bytes* live in the parent backing
+    /// (shared via [`nested_view`](Mem::nested_view)) and ride in the parent's [`layout_snapshot`], but
+    /// whose page map is its own (a fresh `AddrSpace`, not the parent's). Precondition:
+    /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (no §13 regions). Reinstated with
+    /// [`install_prot`](Mem::install_prot).
+    fn prot_snapshot(&self) -> Vec<(u64, PageProt)> {
+        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        space.prot.iter().map(|(&pg, &p)| (pg, p)).collect()
+    }
+
+    /// Install a [`prot_snapshot`](Mem::prot_snapshot) into this freshly built child window — the page-map
+    /// half of a child restore (the byte half is the parent reseed the child's `nested_view` shares). No
+    /// reseed: the child's bytes are already correct in the shared backing.
+    fn install_prot(&self, prot: &[(u64, PageProt)]) {
+        if !prot.is_empty() {
+            self.space_write().prot = prot.iter().copied().collect();
+        }
+    }
+
+    /// Whether this child window's full extent `[base, base + reserved)` lies within `parent`'s mapped
+    /// prefix `[0, mapped)` — i.e. the child's bytes are wholly covered by the parent's
+    /// [`layout_snapshot`] (which reaches at least `parent.mapped`), so a child checkpoint need only carry
+    /// the child's page map. A child carved into the parent's uncommitted reserved tail is *not* covered
+    /// and stays outside the checkpointable subset.
+    fn nested_within_prefix(&self, parent: &Mem) -> bool {
+        self.window.base().saturating_add(self.window.reserved()) <= parent.window.mapped()
     }
 
     /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
