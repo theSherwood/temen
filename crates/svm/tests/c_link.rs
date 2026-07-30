@@ -1281,13 +1281,16 @@ fn native_cc1(extra_args: &[&str], stdin: &[u8]) -> Vec<u8> {
 /// (only the TU's own `__FILE__`), so the two sides stay byte-comparable despite the `/usr` vs `usr`
 /// `-I` difference. Linux-only (real glibc header tree). Returns `None` if `chibicc -M` can't run.
 #[cfg(target_os = "linux")]
-fn chibicc_tu_closure(tu_rel: &str) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+fn chibicc_tu_closure(tu_rel: &str, m_incs: &[&str]) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let root = repo_root();
     // Run `-M` on the **relative** TU path (cwd = repo root) so repo-local deps come back relative
     // (`frontend/chibicc/hashmap.c`, `frontend/chibicc/chibicc.h`) — matching the guest's base_file and
     // `-I` keys. An absolute input would emit absolute deps and the memfs keys wouldn't line up.
+    // `m_incs` are extra `-I` dirs the `#include` search needs (e.g. `-Ifrontend/chibicc` for cc1_main.c,
+    // whose `#include "chibicc.h"` isn't a sibling) — IR/closure-neutral for the frontend TUs.
     let out = Command::new(chibicc())
         .args(["-M", "-c", tu_rel])
+        .args(m_incs)
         .current_dir(&root)
         .output()
         .expect("run chibicc -M");
@@ -1362,24 +1365,31 @@ fn native_cc1_file(args: &[&str]) -> Vec<u8> {
 /// TU is a memfs file (not stdin) so its quoted `#include "chibicc.h"` resolves against its own dir.
 /// Native reads the real header tree (absolute `-I`); header paths never reach the IR, so the only
 /// variables are the substrate (guest libc + SVM vs system libc + native CPU).
+/// The self-host prelude, force-included on every guest/native emit-object compile of a chibicc TU (as
+/// `emit_object_real` does when building the guest): chibicc's parser can't ingest modern glibc's
+/// ISO-C23 `strtoul`/`atoi`/… redirects, so the prelude supplies clean prototypes. Declarations-only ⇒
+/// emits no IR ⇒ byte-match holds; TUs that don't call those functions are unaffected.
 #[cfg(target_os = "linux")]
-fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
-    let (mut files, mut dirs) = chibicc_tu_closure(tu);
+const SELFHOST_PRELUDE: &str = "crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h";
+
+/// Guest-compile one chibicc TU to emitted-object IR bytes: seed its `-M` header closure + the prelude
+/// into the memfs, then run the linked guest cc1 on it (interp==JIT, via [`cc1_compile`]). The `-I`s
+/// are relative (the fs cap refuses absolute paths); `-Ifrontend/chibicc` lets cc1_main.c's quoted
+/// `#include "chibicc.h"` (not a sibling) resolve and is IR-neutral for the frontend TUs. Shared by the
+/// per-TU differential and the relink test.
+#[cfg(target_os = "linux")]
+fn guest_emit_object(linked: &svm_ir::Module, tu: &str) -> Vec<u8> {
+    let (mut files, mut dirs) = chibicc_tu_closure(tu, &["-Ifrontend/chibicc"]);
     assert!(
         files.len() > 20,
         "{tu}: the closure should pull chibicc.h's system headers, got {} files",
         files.len()
     );
-    // Force-include the self-host prelude on BOTH sides (as `emit_object_real` does when building the
-    // guest): chibicc's parser can't ingest modern glibc's ISO-C23 `strtoul`/`atoi`/… redirects, so
-    // the prelude supplies clean prototypes. It is declarations-only ⇒ emits no IR ⇒ byte-match holds;
-    // the TUs that don't call those functions are unaffected. Seed it into the memfs at its repo key.
-    let prelude = "crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h";
     files.push((
-        prelude.to_string(),
-        std::fs::read(repo_root().join(prelude)).expect("read selfhost prelude"),
+        SELFHOST_PRELUDE.to_string(),
+        std::fs::read(repo_root().join(SELFHOST_PRELUDE)).expect("read selfhost prelude"),
     ));
-    let mut anc = Path::new(prelude).parent();
+    let mut anc = Path::new(SELFHOST_PRELUDE).parent();
     while let Some(d) = anc {
         if d.as_os_str().is_empty() {
             break;
@@ -1389,13 +1399,14 @@ fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
     }
     dirs.sort();
     dirs.dedup();
-    let guest = cc1_compile(
+    cc1_compile(
         linked,
         &[
             b"chibicc",
             b"--emit-object",
             b"-include",
-            prelude.as_bytes(),
+            SELFHOST_PRELUDE.as_bytes(),
+            b"-Ifrontend/chibicc",
             b"-Ifrontend/chibicc/include",
             b"-Iusr/include/x86_64-linux-gnu",
             b"-Iusr/include",
@@ -1404,11 +1415,20 @@ fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
         b"",
         files,
         dirs,
-    );
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
+    let guest = guest_emit_object(linked, tu);
+    // Native reads the real header tree (absolute `-I`); header paths never reach the IR, so the only
+    // variables are the substrate (guest libc + SVM vs system libc + native CPU). `-Ifrontend/chibicc`
+    // mirrors the guest side (IR-neutral; both stay symmetric so the diff is only substrate).
     let native = native_cc1_file(&[
         "--emit-object",
         "-include",
-        prelude,
+        SELFHOST_PRELUDE,
+        "-Ifrontend/chibicc",
         "-Ifrontend/chibicc/include",
         "-I/usr/include/x86_64-linux-gnu",
         "-I/usr/include",
@@ -1419,6 +1439,38 @@ fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
         String::from_utf8_lossy(&native),
         "guest-compiled IR for {tu} is byte-identical to native chibicc_ref"
     );
+}
+
+/// Guest-compile a chibicc TU into a **linkable unit** — the guest's *own* emitted object, parsed and
+/// wire-round-tripped like [`object_unit_real`]'s native ones. The building block of `chibicc2`.
+#[cfg(target_os = "linux")]
+fn guest_cc1_unit(linked: &svm_ir::Module, tu: &str, tag: &str) -> LinkUnit {
+    let ir = guest_emit_object(linked, tu);
+    let m = svm_text::parse_module(&String::from_utf8(ir).expect("guest IR is UTF-8"))
+        .unwrap_or_else(|e| panic!("parse guest object {tag}: {e:?}"));
+    unit_via_svmo(m, tag)
+}
+
+/// The **native** counterpart of [`guest_cc1_unit`]: compile the same TU with `chibicc_ref` using the
+/// *identical relative* flags/paths the guest uses (repo-relative `-I`s and TU path), so the two units
+/// differ **only** by substrate (system libc + native CPU vs guest libc + SVM). This is what makes the
+/// relink comparison apples-to-apples — unlike `link_whole_cc1`, whose units embed *absolute* `__FILE__`
+/// paths (`emit_object_real` passes an absolute cfile), which the memfs-relative guest can't reproduce.
+#[cfg(target_os = "linux")]
+fn native_cc1_unit(tu: &str, tag: &str) -> LinkUnit {
+    let ir = native_cc1_file(&[
+        "--emit-object",
+        "-include",
+        SELFHOST_PRELUDE,
+        "-Ifrontend/chibicc",
+        "-Ifrontend/chibicc/include",
+        "-I/usr/include/x86_64-linux-gnu",
+        "-I/usr/include",
+        tu,
+    ]);
+    let m = svm_text::parse_module(&String::from_utf8(ir).expect("native IR is UTF-8"))
+        .unwrap_or_else(|e| panic!("parse native object {tag}: {e:?}"));
+    unit_via_svmo(m, tag)
 }
 
 /// **Bootstrap-fixpoint slice #1 (SELFHOST_C.md §5 E, task #7): the guest compiles chibicc's *own*
@@ -1472,6 +1524,72 @@ fn whole_cc1_compiles_giant_tus_matching_native() {
     ] {
         assert_guest_tu_matches_native(&linked, tu);
     }
+}
+
+/// **Bootstrap fixpoint, mechanized (SELFHOST_C.md §5 E, task #7): `chibicc2 == chibicc1`.** Where the
+/// per-TU differential proves the guest emits byte-identical *object IR* to native for each cc1 TU,
+/// this closes the loop at the **module** level: relink a whole cc1 from the guest's *own* emitted
+/// objects and assert it is byte-identical to `link_whole_cc1` (the native-built guest). Each of the
+/// nine cc1 TUs (the `cc1_main` entry + eight upstream) is compiled by the running guest cc1 into a
+/// unit; linked with the same native `emit_libc` (the libc is substrate, not the compiler under test)
+/// the result is `chibicc2`. Byte-equality with `chibicc1` means the guest-built compiler *is* the
+/// native-built one, so running it reproduces its own output (`chibicc2 == chibicc3`). ∎ Very heavy
+/// (guest-compiles all nine, incl. the giants); opt-in via `SVM_SELFHOST_GIANTS=1`, on the nightly lane.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "very heavy (~10 min): relink the whole cc1 from the guest's own objects; opt-in via SVM_SELFHOST_GIANTS=1"]
+fn whole_cc1_relinks_from_guest_objects_equals_native() {
+    if std::env::var_os("SVM_SELFHOST_GIANTS").is_none() {
+        eprintln!("skipping guest-object relink; set SVM_SELFHOST_GIANTS=1 to run (~10 min)");
+        return;
+    }
+    let entry = "crates/svm-run/demos/chibicc_selfhost/cc1_main.c";
+    let upstream = [
+        "tokenize.c",
+        "preprocess.c",
+        "parse.c",
+        "type.c",
+        "codegen_ir.c",
+        "hashmap.c",
+        "unicode.c",
+        "strings.c",
+    ];
+    // The running native-built guest that *does* the compiling. How it was itself built doesn't affect
+    // the IR it emits — only the input's base_file does.
+    let running = link_whole_cc1();
+
+    // chibicc1 — the native reference, built from `chibicc_ref` units compiled with the **same relative**
+    // flags/paths as the guest, so `__FILE__` and every other byte match and the only variable is the
+    // substrate. (Not `link_whole_cc1` itself: its units embed *absolute* `__FILE__` paths —
+    // `emit_object_real` passes an absolute cfile — which the memfs-relative guest can't reproduce.)
+    let mut native_units = vec![native_cc1_unit(entry, "cc1_main.c")];
+    for tu in upstream {
+        native_units.push(native_cc1_unit(&format!("frontend/chibicc/{tu}"), tu));
+    }
+    native_units.push(object_unit_emit_libc());
+    let chibicc1 =
+        svm_ir::link_with_manifest(&native_units).expect("link native chibicc1 (relative paths)");
+
+    // chibicc2 — the same units, but each cc1 TU compiled by the **running guest** into its own object;
+    // same native emit_libc (the libc is substrate, not the compiler under test), same order.
+    let mut guest_units = vec![guest_cc1_unit(&running, entry, "cc1_main.c")];
+    for tu in upstream {
+        guest_units.push(guest_cc1_unit(
+            &running,
+            &format!("frontend/chibicc/{tu}"),
+            tu,
+        ));
+    }
+    guest_units.push(object_unit_emit_libc());
+    let chibicc2 = svm_ir::link_with_manifest(&guest_units)
+        .expect("link chibicc2 from the guest's own objects");
+    svm_verify::verify_module(&chibicc2).expect("verify chibicc2");
+
+    assert_eq!(
+        svm_text::print_module(&chibicc2),
+        svm_text::print_module(&chibicc1),
+        "chibicc2 (relinked from the guest's own emitted objects) is byte-identical to chibicc1 (native-built, same flags)"
+    );
 }
 
 /// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The

@@ -557,10 +557,17 @@ compiler bug is a clean error, never an escape.
    reproduces the native-built guest (`chibicc2 == chibicc1`), and a byte-identical compiler on the same
    source reproduces its own output (`chibicc2 == chibicc3`). ∎
 
-   **Remaining (optional hardening):** an explicit end-to-end test that *links* the guest-emitted objects
-   into a `chibicc2` module and asserts it equals `link_whole_cc1` (mechanizing the `== chibicc1` step),
-   and/or instantiating `chibicc2` to re-emit `chibicc3` directly — belt-and-suspenders over the
-   byte-identity proof, not new coverage.
+   **→ Mechanized 2026-07-30 — `chibicc2 == chibicc1` in code.** The `== chibicc1` step is no longer
+   just an argument: `whole_cc1_relinks_from_guest_objects_equals_native` relinks a whole cc1 from the
+   **guest's own emitted objects** — each of the nine cc1 TUs compiled by the running guest into a unit,
+   linked with the same native `emit_libc` — and asserts the result **verifies** and is byte-identical
+   to a native reference built with the *same relative flags* (the only variable is the substrate). One
+   subtlety it flushed out: `link_whole_cc1`'s units embed *absolute* `__FILE__` paths (`emit_object_real`
+   passes an absolute cfile), so the reference is rebuilt from `native_cc1_unit` (relative paths) to match
+   the memfs-relative guest — otherwise the sole diff is `internal error at %s`'s source path. Rides the
+   same opt-in `SVM_SELFHOST_GIANTS=1` nightly lane (it guest-compiles all nine, incl. the giants). With
+   this, the fixpoint is closed both ways — per-TU byte-identity **and** the linked-module equality it
+   implies.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
