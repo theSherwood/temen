@@ -21,6 +21,23 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I53 — `clone_caller::clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #539
+
+**Symptom.** On PR #539 (a **docs + `#[ignore]`d-test + `workflows_src` only** change — zero lines in
+`crates/svm-interp`) the `build · test · fmt · clippy` job failed with
+`crates/svm-interp/tests/clone_caller.rs:255` — `assertion left == right failed: two i64 writes
+reached the shared sink, left: 8, right: 16`. The expected single reply-write (8) was doubled (16),
+i.e. the cloned twin's reply landed twice / a dedup lost a race. **Unrelated to the diff** (the PR
+touches nothing in the svc/fiber/clone path) and **flaky, not deterministic**: the same test passed
+**6/6** locally back-to-back on the same commit.
+
+**Family.** Same crate and failure shape as I52 (`svc_serve_chain`) — the fork/serve scheduler path's
+nondeterminism under CI load. Likely the same lost-wakeup/ordering class I52 root-caused; the
+`clone_caller` twin-reply ordering wants the same fail-fast + wakeup-ordering scrutiny. Fix sketch:
+audit `clone_caller`'s out-of-band reply injection for a reply that can be delivered to both the
+original and the twin (or observed twice at the shared sink) when the two resume in the losing order.
+Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
