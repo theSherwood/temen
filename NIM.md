@@ -458,9 +458,56 @@ plumbing. Five workstreams, roughly independent:
     This was load-bearing: an absolute-offset unit *silently aliased* under linking — two modules'
     globals both at offset 16, one clobbering the other — a fail-closed violation the `data.self`
     lowering fixes (regression test: two modules each read their *own* global, `tests/link.rs`).
-  - **Remaining for full W2:** cross-module *data* symbols (a `gvar` shared between modules →
-    `data.sym`/`data_exports`), string-literal data, and translating the `ini`/`main`/`gvar`
-    scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
+  - **✅ Through the `.svmo` narrow waist — DONE 2026-07-30.** `svm-leng` now emits real binary link
+    **objects**: `svm_leng::compile_object(unit)` → a `.svmo` with the unit's procs exported *in-band*
+    (`Module::exports`, stem-suffixed) — the counterpart of `svm-llvm-translate -o out.svmo`.
+    `link_units` routes through the format: compile each module to `.svmo`, `decode_unit` it back
+    through the hardened firewall (a frontend is untrusted), pair a `LinkUnit` from its in-band export
+    tables (the same conversion `svm-run --link` does), then `svm_ir::link`. The linker stays shared;
+    the format is the only added seam. Proven cross-producer (`tests/object.rs`): a nimony `.svmo`
+    (`sumSeq`) links against a **separately produced runtime `.svmo`** — both binary objects, joined
+    only through the format — and runs (Σ = 60, both engines). That composition is the point: the
+    runtime object is the stand-in the real compiled `system` module (or a C-runtime `.svmo`) will
+    replace, and now they meet at a versioned, spec-pinned, fuzzed boundary rather than in-process.
+  - **✅ Cross-module data symbols — DONE 2026-07-30.** A `gvar` referenced across the module
+    boundary — hexer emits it as `counter.0.<defining-stem>`, in lvalue/rvalue position — now links.
+    The *defining* unit exports each of its globals as a `data_export` (stem-suffixed name → data
+    offset, via `Translator::global_exports`); the *referencing* unit, finding an atom that's not a
+    local/own-global/const/literal, emits a relocatable `data.sym "<name>"` the linker binds to that
+    export (an unresolved name is a fail-closed link error, never a wrong address). External data
+    symbols are assumed `i64` scalars — the common `int`/pointer global. Tested: a hand-written
+    writer/reader pair sharing a global defined in a third data-only unit, real nimony
+    `bump`/`store` (`bump()` increments `store.counter` across the boundary → 1), and two
+    fail-closed cases (`tests/link.rs`).
+  - **✅ Short string literals (SSO) — DONE 2026-07-30.** nimony's `string` is a small-string
+    object `{bytes: u64@0, more: ptr@8}` (confirmed from the system module's `basic_types.nim`): a
+    *short* literal packs its chars into the inline `bytes` word with a nil `more`, so it's an
+    ordinary `(oconstr string (kv bytes.0 <packed-u64>) (kv more.0 (nil)))` — no data segment.
+    Lowering it took two things: unsigned literals (`122511465736197u`) now parse (bit-pattern
+    preserved, `u64`-wide), and the external `string` type's layout must be available. That layout
+    normally comes from the `system` module across the link (cross-module *type* resolution — the
+    third symbol kind after funcs and data; Path A); until that's automatic, `translate_proc_with_types`
+    supplies it as a type prelude. Tested: a hand-written SSO construct-and-read (*runs*), an
+    over-`i64::MAX` unsigned literal, and **real nimony `greet(): string = "hello"`** (genuine SSO
+    `oconstr` by sret — translates + verifies given the real `string` def; running needs the ARC
+    `=wasMoved`/`=destroy` imports, W3).
+  - **✅ Automatic cross-module type resolution — DONE 2026-07-30.** The third symbol kind after
+    funcs and data. Proc/data symbols resolve at *link* time, but an aggregate **type**'s layout is
+    needed at *translate* time (field offsets are baked into loads/stores) — so `link_units` first
+    pools every unit's `(type …)` defs under their stem-suffixed global names
+    (`Translator::export_types`, rewriting nested same-module field types to their suffixed forms
+    too) and pre-registers the pool in each unit's translator (`import_types`) before translating
+    any. A module constructing a `string.0.sysvq0asl` now gets the system module's layout
+    automatically; `translate_proc_with_types` remains as the manual escape hatch for
+    single-module entry points. A *standalone* `compile_object` of a unit with an external value
+    type still fail-closes (the layout only exists across the link) — if that ever needs to work
+    without siblings, types would ride in-band in `.svmo`, a format question for later. Tested:
+    hand-written flat + *nested* external value types (both run, both engines), the standalone
+    fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
+    against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
+    `more` land in the sret slot identically on both engines (`tests/link.rs`).
+  - **Remaining for full W2:** long-string (`LongString`) data, and whole-module scaffolding
+    translation so the *entire* `system` module links (Path A), not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

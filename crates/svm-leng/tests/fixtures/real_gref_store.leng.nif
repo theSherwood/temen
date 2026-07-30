@@ -1,0 +1,22 @@
+(.nif27)
+(.indexat 332              )
+(stmts@,1,pkg/store.nim
+ (gvar@B :counter.0.~7 .~7
+  (i@3 64)0@9)
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl))))(.index@,1,pkg/store.nim
+ (h counter.0. 61)
+ (h `iniGuard.0. 42)
+ (x `ini.0. 34))
