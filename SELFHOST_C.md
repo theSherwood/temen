@@ -531,8 +531,24 @@ compiler bug is a clean error, never an escape.
    absolute paths — `read_path`); the guest searches `frontend/chibicc/include` + `usr/include[...]` in
    the memfs while native reads the real `/usr/include`, and only the TU's own `__FILE__` reaches the IR
    (no header paths), so the two stay byte-comparable. `cc1_main.c` gained multi-`-I` support for the
-   multi-root search. **Remaining for the fixpoint:** widen to all nine TUs, then the true
-   instantiate-and-rerun `chibicc2 == chibicc3` (run a guest-compiled `chibicc2` to reproduce `chibicc3`).
+   multi-root search.
+
+   **→ Widened 2026-07-30 — five real chibicc TUs, and `cc1_main` gained `-include`.** The differential
+   now covers `strings.c`/`hashmap.c`/`unicode.c`/`type.c`/`tokenize.c` — the **tractable** upstream TUs
+   (≤ ~800 lines; the guest runs on the tree-walk interpreter, so runtime scales with TU size, and the
+   giants `preprocess.c`/`codegen_ir.c`/`parse.c` at 1.2k–3.4k lines are left to a future slow lane).
+   `tokenize.c` surfaced the real next gap: it calls `strtoul`, whose modern-glibc ISO-C23
+   `__isoc23_*` redirect chibicc's parser can't ingest — the exact reason `emit_object_real`
+   force-includes `selfhost_prelude.h` when building the guest. `cc1_main.c` didn't support `-include`,
+   so the guest couldn't take the prelude; added it (mirroring `main.c`'s cc1() token-prepend). The
+   prelude is declarations-only ⇒ no IR of its own, and force-including it on **both** sides makes each
+   TU emit the shared-`extern` allocator form (`__SVM_LIBC_EXTERN`) the real linked build uses — still
+   byte-identical guest-vs-native. The heavy `cc1-self-compile` CI job's filter was broadened from
+   `self_compiles` to run every `--ignored` c_link gate, so this test gates too.
+
+   **Remaining for the fixpoint:** the three giant TUs (a slow lane, or interpreter-perf work), then the
+   true instantiate-and-rerun `chibicc2 == chibicc3` (run a guest-compiled `chibicc2` to reproduce
+   `chibicc3`).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

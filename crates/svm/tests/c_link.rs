@@ -1356,39 +1356,46 @@ fn native_cc1_file(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// **Bootstrap-fixpoint slice #1 (SELFHOST_C.md §5 E, task #7): the guest compiles chibicc's *own*
-/// source.** The linked whole cc1 ([`link_whole_cc1`]) compiles a real upstream chibicc TU
-/// (`hashmap.c`) — pulling chibicc.h's full system-header closure (~95 files) from the seeded memfs —
-/// and the emitted IR must byte-match native `chibicc_ref` on the identical source. This is the
-/// stage-2 conformance check: the SVM-executed compiler is faithful to native not just on crafted
-/// programs but on the compiler's own code, the hardest input on the path to `chibicc2 == chibicc3`.
-///
-/// The header closure is discovered with `chibicc -M` and seeded at relative keys (the fs cap refuses
-/// absolute paths); the guest searches `usr/include[...]` in the memfs while native reads the real
-/// `/usr/include` — identical bytes, and only the TU's own `__FILE__` reaches the IR, so byte-exact.
-/// Heavy (`#[ignore]`d): builds/links the whole cc1, runs it on two engines over glibc-scale headers.
+/// Compile one real chibicc TU through the linked guest cc1 and assert the emitted IR byte-matches
+/// native `chibicc_ref` on the identical source. Guest `-I`s are relative (memfs, no absolute paths)
+/// in native's default search order — chibicc's bundled `include/` first, then the system roots; the
+/// TU is a memfs file (not stdin) so its quoted `#include "chibicc.h"` resolves against its own dir.
+/// Native reads the real header tree (absolute `-I`); header paths never reach the IR, so the only
+/// variables are the substrate (guest libc + SVM vs system libc + native CPU).
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "heavy: the guest compiles a real chibicc TU (full glibc header closure) on two engines"]
-fn whole_cc1_compiles_its_own_tu_matching_native() {
-    let linked = link_whole_cc1();
-
-    let tu = "frontend/chibicc/hashmap.c";
-    let (files, dirs) = chibicc_tu_closure(tu);
+fn assert_guest_tu_matches_native(linked: &svm_ir::Module, tu: &str) {
+    let (mut files, mut dirs) = chibicc_tu_closure(tu);
     assert!(
         files.len() > 20,
-        "the closure should pull chibicc.h's system headers, got {} files",
+        "{tu}: the closure should pull chibicc.h's system headers, got {} files",
         files.len()
     );
-
-    // Guest `-I`s are relative (memfs, no absolute paths), in native's default search order: chibicc's
-    // bundled `include/` first, then the system roots. The TU is a memfs file (not stdin) so its quoted
-    // `#include "chibicc.h"` resolves against its own dir.
+    // Force-include the self-host prelude on BOTH sides (as `emit_object_real` does when building the
+    // guest): chibicc's parser can't ingest modern glibc's ISO-C23 `strtoul`/`atoi`/… redirects, so
+    // the prelude supplies clean prototypes. It is declarations-only ⇒ emits no IR ⇒ byte-match holds;
+    // the TUs that don't call those functions are unaffected. Seed it into the memfs at its repo key.
+    let prelude = "crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h";
+    files.push((
+        prelude.to_string(),
+        std::fs::read(repo_root().join(prelude)).expect("read selfhost prelude"),
+    ));
+    let mut anc = Path::new(prelude).parent();
+    while let Some(d) = anc {
+        if d.as_os_str().is_empty() {
+            break;
+        }
+        dirs.push(d.to_string_lossy().into_owned());
+        anc = d.parent();
+    }
+    dirs.sort();
+    dirs.dedup();
     let guest = cc1_compile(
-        &linked,
+        linked,
         &[
             b"chibicc",
             b"--emit-object",
+            b"-include",
+            prelude.as_bytes(),
             b"-Ifrontend/chibicc/include",
             b"-Iusr/include/x86_64-linux-gnu",
             b"-Iusr/include",
@@ -1398,11 +1405,10 @@ fn whole_cc1_compiles_its_own_tu_matching_native() {
         files,
         dirs,
     );
-
-    // Native reads the real header tree (absolute `-I`); header paths never reach the IR, so the only
-    // variables are the substrate (guest libc + SVM vs system libc + native CPU).
     let native = native_cc1_file(&[
         "--emit-object",
+        "-include",
+        prelude,
         "-Ifrontend/chibicc/include",
         "-I/usr/include/x86_64-linux-gnu",
         "-I/usr/include",
@@ -1413,6 +1419,34 @@ fn whole_cc1_compiles_its_own_tu_matching_native() {
         String::from_utf8_lossy(&native),
         "guest-compiled IR for {tu} is byte-identical to native chibicc_ref"
     );
+}
+
+/// **Bootstrap-fixpoint slice #1 (SELFHOST_C.md §5 E, task #7): the guest compiles chibicc's *own*
+/// source.** The linked whole cc1 ([`link_whole_cc1`]) compiles real upstream chibicc TUs — each
+/// pulling chibicc.h's full system-header closure (~95 files) from the seeded memfs — and the emitted
+/// IR must byte-match native `chibicc_ref` on the identical source. This is the stage-2 conformance
+/// check: the SVM-executed compiler is faithful to native not just on crafted programs but on the
+/// compiler's own code, the hardest input on the path to `chibicc2 == chibicc3`.
+///
+/// Covers the **tractable** TUs (≤ ~800 lines): the guest runs under the tree-walk interpreter, so
+/// runtime scales with TU size. The three giants (`preprocess.c`, `codegen_ir.c`, `parse.c` —
+/// 1.2k–3.4k lines) are left to a future slow lane; they exercise no new *frontend* surface, only more
+/// of the same. Heavy (`#[ignore]`d): builds/links the whole cc1, runs each TU on two engines over
+/// glibc-scale headers; the fixed link cost is shared across the corpus.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "heavy: the guest compiles real chibicc TUs (full glibc header closure) on two engines"]
+fn whole_cc1_compiles_its_own_tu_matching_native() {
+    let linked = link_whole_cc1();
+    for tu in [
+        "frontend/chibicc/strings.c",
+        "frontend/chibicc/hashmap.c",
+        "frontend/chibicc/unicode.c",
+        "frontend/chibicc/type.c",
+        "frontend/chibicc/tokenize.c",
+    ] {
+        assert_guest_tu_matches_native(&linked, tu);
+    }
 }
 
 /// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The

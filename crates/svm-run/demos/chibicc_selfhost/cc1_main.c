@@ -47,6 +47,7 @@ int align_to(int n, int align) {
 // against the default). The playground passes `-g` only when the user opts into source-level debugging.
 int main(int argc, char **argv) {
   int n_inc = 0;
+  StringArray opt_include = {0}; // `-include FILE`: force-included before the main file (see below)
   int ai = 1;
   while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
     if (argv[ai][1] == 'I') {
@@ -58,6 +59,13 @@ int main(int argc, char **argv) {
       strarray_push(&include_paths, argv[ai] + 2);
       n_inc++;
       ai++;
+    } else if (!strcmp(argv[ai], "-include") && ai + 1 < argc) {
+      // `-include FILE` — tokenized and prepended to the main file (below), like `main.c`'s cc1().
+      // Needed to compile chibicc's own TUs: they call `strtoul`/`atoi`/… whose modern-glibc
+      // `<stdlib.h>` declarations chibicc's parser can't ingest, so the self-host prelude
+      // (`selfhost_prelude.h`) supplies clean ones — exactly as `emit_object_real` builds the guest.
+      strarray_push(&opt_include, argv[ai + 1]);
+      ai += 2;
     } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
       opt_data_page = atoi(argv[ai + 1]);
       ai += 2;
@@ -88,10 +96,44 @@ int main(int argc, char **argv) {
   // `__DATE__`/`__TIME__`/`__TIMESTAMP__` — are stubbed in chibicc_extra.c (fixed 1970 epoch).
   init_macros();
 
-  Token *tok = tokenize_file(base_file);
-  if (!tok) {
+  // Force-include each `-include FILE` ahead of the main file, then tokenize the main file and append
+  // it — one token stream preprocessed as a whole, matching `main.c`'s cc1(). The prelude is
+  // declarations only, so it emits no IR; the main file still starts at its own line 1, keeping
+  // `__FILE__`/`__LINE__` (and thus the emitted IR) identical to a native `cc1_main` build.
+  Token *tok = NULL;
+  for (int i = 0; i < opt_include.len; i++) {
+    char *incl = opt_include.data[i];
+    char *path = file_exists(incl) ? incl : search_include_paths(incl);
+    if (!path) {
+      fprintf(stderr, "-include: %s: cannot open file\n", incl);
+      return 1;
+    }
+    Token *ti = tokenize_file(path);
+    if (!ti) {
+      fprintf(stderr, "%s: tokenize failed\n", path);
+      return 1;
+    }
+    if (!tok || tok->kind == TK_EOF) {
+      tok = ti;
+    } else {
+      Token *e = tok;
+      while (e->next->kind != TK_EOF)
+        e = e->next;
+      e->next = ti;
+    }
+  }
+  Token *tmain = tokenize_file(base_file);
+  if (!tmain) {
     fprintf(stderr, "%s: tokenize failed\n", base_file);
     return 1;
+  }
+  if (!tok || tok->kind == TK_EOF) {
+    tok = tmain;
+  } else {
+    Token *e = tok;
+    while (e->next->kind != TK_EOF)
+      e = e->next;
+    e->next = tmain;
   }
   tok = preprocess(tok);
   Obj *prog = parse(tok);

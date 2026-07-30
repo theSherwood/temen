@@ -22,15 +22,12 @@ identical until the next agent edit.
 > (`cp .github/workflows_src/*.yml .github/workflows/`) and this section is drained. The guard only
 > starts enforcing once it is itself copied into `.github/workflows/ci.yml` for the first time.
 
-- **`cc1-self-compile` job** — a new dedicated Linux job running the heavy, `#[ignore]`d cc1
-  self-compile differential (`cargo test -p svm --test c_link -- --ignored self_compiles`). It
-  `make`s chibicc, links + verifies the whole cc1, runs it on the tree-walk interpreter and the JIT,
-  and diffs the guest-emitted IR against a native `clang`-built reference — for a base program, an
-  `#include`-from-memfs program, and a feature-diverse corpus. Until now nothing in CI ran the
-  `--ignored` heavy tests, so this differential never gated merges (SELFHOST_C.md §5 E's "wire the
-  differential into CI"). The job installs `clang` (the reference compiler), drops test debug info
-  and caps `-j 2` for the I30 OOM guard, and runs parallel to the other jobs so it gates without
-  serializing into the `check` critical path.
+- **`cc1-self-compile` job filter** — the dedicated Linux job's run line broadened from
+  `-- --ignored self_compiles` to `-- --ignored` (no name filter), so it runs **every** heavy
+  `#[ignore]`d c_link gate — both `whole_cc1_self_compiles…` and the stage-2
+  `whole_cc1_compiles_its_own_tu…` (the guest compiling chibicc's *own* TUs). The narrower filter
+  silently skipped the latter. (The job itself — installing `clang`, `-j 2` + no-debug I30 OOM guard,
+  parallel to `check` — landed in a prior copy-over; only the run line changed here.)
 
 *(Previously drained 2026-07-30, when the whole backlog was copied over: the `workflows-in-sync`
 guard, nightly-only `miri`, `cross-os` `CARGO_PROFILE_TEST_DEBUG: "0"`, the `playground-assets` job +
