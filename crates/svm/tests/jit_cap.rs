@@ -221,9 +221,11 @@ fn submitted_unit_threads_still_rejected_with_fiber_hosting() {
 /// `define_extra` auto-installs the unit's functions into reserved `call_indirect` slots and remaps
 /// `ref.func N` to those slots, so `cont.new(ref.func 1)` resolves to the unit's own func 1 through
 /// the ordinary masked dispatch. The unit's entry resumes it twice (suspend 10, then return 107).
-/// JIT-only for now — the interpreter mirror lands with the differential; here we pin the JIT result.
+/// Both backends auto-install the unit's functions into reserved slots and resolve `ref.func N` there
+/// (JIT: `define_extra` remaps the `iconst`; interp: `install_unit_funcs` + the `run_inner` remap).
+/// Differential.
 #[test]
-fn submitted_unit_fibers_over_its_own_func_jit() {
+fn submitted_unit_fibers_over_its_own_func_agrees() {
     let b = blob(
         "memory 16\n\
 func () -> (i64) {\nblock 0 () {\n  v0 = ref.func 1\n  v1 = i64.const 32768\n  v2 = cont.new v0 v1\n  v3 = i64.const 10\n  v4, v5 = cont.resume v2 v3\n  v6 = i64.const 7\n  v7, v8 = cont.resume v2 v6\n  return v8\n  }\n}\n\
@@ -237,22 +239,52 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
     verify_module(&m).expect("verify");
     let mut init = vec![0u8; BLOB_OFF + b.len()];
     init[BLOB_OFF..].copy_from_slice(&b);
-    let mut host = Host::new();
-    let h = grant_jit_fibers(&mut host, &m, 3);
-    let (out, _) = jit_cap_run(
+
+    // Interpreter (the oracle): a fiber-hosting Jit domain with a reserved table (log2=3).
+    let mut host_i = Host::new();
+    let h_i = grant_jit_fibers(&mut host_i, &m, 3);
+    let mut fuel = 50_000_000u64;
+    let (ires, imem) = run_capture_reserved_with_host(
         &m,
         0,
-        &[h as i64],
+        &[Value::I32(h_i)],
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    );
+
+    // JIT: same setup, same table reservation.
+    let mut host_j = Host::new();
+    let h_j = grant_jit_fibers(&mut host_j, &m, 3);
+    assert_eq!(h_i, h_j, "identical powerbox setup mints identical handles");
+    let (jout, jmem) = jit_cap_run(
+        &m,
+        0,
+        &[h_j as i64],
         &init,
         DEFAULT_RESERVED_LOG2,
         3,
-        &mut host,
+        &mut host_j,
     )
     .expect("jit run");
-    assert!(
-        matches!(out, JitOutcome::Returned(ref s) if s == &[107]),
-        "unit should fiber over its own func to 107, got {out:?}"
-    );
+
+    match (&ires, &jout) {
+        (Ok(vals), JitOutcome::Returned(slots)) => {
+            let want: Vec<i64> = vals
+                .iter()
+                .map(|v| match v {
+                    Value::I32(x) => *x as i64,
+                    Value::I64(x) => *x,
+                    other => panic!("scalar expected, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(&want, slots, "interp {ires:?} != jit {jout:?}");
+            assert_eq!(slots, &[107], "unit should fiber over its own func to 107");
+        }
+        other => panic!("backends disagree: {other:?}"),
+    }
+    assert_eq!(imem, jmem, "final memory must be byte-identical");
 }
 
 fn with_len(src: &str, len: usize) -> String {
