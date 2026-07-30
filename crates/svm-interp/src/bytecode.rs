@@ -7236,9 +7236,14 @@ fn step_vcpu(
                             FiberState::Pending { funcref, sp } => (funcref, sp),
                             _ => unreachable!(),
                         };
-                        // Resolve the fiber entry through module 0's natural table + `fiber_sig`,
-                        // exactly as `table_lookup` does — a forged/mistyped funcref is a
-                        // `FiberFault`. Fibers are module-0 only (a unit cannot use `cont.*`).
+                        // Resolve the fiber entry through module 0's natural table + `fiber_sig` —
+                        // a forged/mistyped funcref is a `FiberFault`. A *submitted unit* may now
+                        // create fibers (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30); it
+                        // names the entry by a raw slot (`cont.new <slot>`), and an entry that is an
+                        // original (module-0) function resolves here exactly as the JIT's shared
+                        // `fn_table` and the tree-walker's `dispatch_indirect` do. (A fiber over an
+                        // *installed* unit function — a module ≥ 1 entry — is the deferred case; it
+                        // would need the module-aware `DomainTable` here, as those two backends use.)
                         let m0 = dom.source.primary();
                         let f = (funcref as u32 as usize) & m0.table_mask;
                         let ok = m0

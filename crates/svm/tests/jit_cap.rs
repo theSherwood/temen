@@ -15,7 +15,7 @@ use svm_encode::encode_module;
 use svm_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::DEFAULT_RESERVED_LOG2;
 use svm_jit::{JitOutcome, TrapKind};
-use svm_run::{grant_jit, jit_cap_run};
+use svm_run::{grant_jit, grant_jit_fibers, jit_cap_run};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -114,6 +114,107 @@ fn diff_run_t(
 /// A guest that compiles the blob then invokes it with `(a, b)`, returning the result:
 /// `(jit_handle, a, b) -> invoke(compile(blob), a, b)`.
 const COMPILE_INVOKE: &str = "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  v3 = i64.const 4096\n  v4 = i64.const BLOBLEN\n  v5 = cap.call 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  v6 = cap.call 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
+
+/// A guest that compiles the blob then invokes its **0-argument** `() -> i64` entry, returning the
+/// result — and carries the **fiber body at func 1** (table slot 1) so a submitted unit can create a
+/// fiber over it by slot (new→old for fibers: a unit `ref.func`s only its own indices, so it names a
+/// parent function by a raw `i32.const <slot>`, exactly like new→old `call_indirect`). Slot 1's body
+/// `(i64,i64)->(i64)` suspends its arg, then on the next resume adds 100 and returns.
+const COMPILE_INVOKE_0ARG: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n";
+
+/// Like [`diff_run`], but grant the `Jit` domain **fiber-hosting** (`grant_jit_fibers`, DESIGN.md §22
+/// "Concurrency"): a submitted unit may run §12 fibers (`cont.*`). Same differential assertions
+/// (result equivalence, the same fiber/cap trap kinds, byte-identical final memory).
+fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (JitOutcome, Vec<u8>) {
+    let m = parse_module(guest_src).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
+    init[BLOB_OFF..].copy_from_slice(blob_bytes);
+
+    let mut host_i = Host::new();
+    let h_i = grant_jit_fibers(&mut host_i, &m, 0);
+    let mut iargs = vec![Value::I32(h_i)];
+    iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
+    let mut fuel = 50_000_000u64;
+    let (ires, imem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &iargs,
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    );
+
+    let mut host_j = Host::new();
+    let h_j = grant_jit_fibers(&mut host_j, &m, 0);
+    assert_eq!(
+        h_i, h_j,
+        "identical powerbox setup must mint identical handles"
+    );
+    let mut jargs = vec![h_j as i64];
+    jargs.extend_from_slice(user_args);
+    let (jout, jmem) =
+        jit_cap_run(&m, 0, &jargs, &init, DEFAULT_RESERVED_LOG2, 0, &mut host_j).expect("jit run");
+
+    match (&ires, &jout) {
+        (Ok(vals), JitOutcome::Returned(slots)) => {
+            assert_eq!(vals.len(), slots.len(), "result arity");
+            for (v, s) in vals.iter().zip(slots) {
+                let iv = match v {
+                    Value::I32(x) => *x as i64,
+                    Value::I64(x) => *x,
+                    other => panic!("scalar result expected, got {other:?}"),
+                };
+                assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
+            }
+        }
+        (Err(Trap::FiberFault), JitOutcome::Trapped(TrapKind::FiberFault))
+        | (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
+        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
+        other => panic!("backends disagree: {other:?}"),
+    }
+    assert_eq!(imem, jmem, "final memory must be byte-identical");
+    (jout, jmem)
+}
+
+/// **Fibers in a submitted unit** (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): with the
+/// domain granted fiber-hosting, a submitted unit runs its OWN §12 fiber — the entry `cont.new`s a
+/// unit-local body and resumes it twice (it `suspend`s 10, then on resume(7) returns 107), computing
+/// the result in-guest via `invoke`. The JIT (parent fiber runtime stood up by `enable_fiber_hosting`,
+/// `cont.*` reached through `invoke_extra`) must match the reference interpreter exactly.
+#[test]
+fn submitted_unit_hosts_a_fiber_agrees() {
+    // The unit's entry `() -> i64` creates a fiber over parent slot 1 (the fiber body, via a raw
+    // `i32.const 1` funcref — new→old), resumes it with 10 (it suspends 10), then with 7 (it returns
+    // 7 + 100 = 107), and returns 107. All the fiber switching happens inside the `invoke` — the
+    // parent stays suspended in its `cap.call` throughout.
+    let b = blob(
+        "memory 16\n\
+func () -> (i64) {\nblock 0 () {\n  v0 = i32.const 1\n  v1 = i64.const 32768\n  v2 = cont.new v0 v1\n  v3 = i64.const 10\n  v4, v5 = cont.resume v2 v3\n  v6 = i64.const 7\n  v7, v8 = cont.resume v2 v6\n  return v8\n  }\n}\n",
+    );
+    let guest = with_len(COMPILE_INVOKE_0ARG, b.len());
+    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[107]),
+        "{out:?}"
+    );
+}
+
+/// **Threads stay rejected** in a submitted unit even with fiber-hosting granted (only fibers were
+/// lifted): a blob using `thread.spawn` fails the shared validator `-EINVAL` on both backends.
+#[test]
+fn submitted_unit_threads_still_rejected_with_fiber_hosting() {
+    // A unit whose entry spawns a real vCPU (func 1) — `uses_threads()` → rejected by
+    // `jit_resolve_and_validate` before any compilation, identically on both backends.
+    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
+    let guest = with_len(COMPILE_ONLY, b.len());
+    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[-22]),
+        "threads in a submitted unit must be rejected -EINVAL, got {out:?}"
+    );
+}
 
 fn with_len(src: &str, len: usize) -> String {
     src.replace("BLOBLEN", &len.to_string())

@@ -955,7 +955,14 @@ pub fn jit_resolve_and_validate(
     if !m.data.is_empty() {
         return Err(EINVAL);
     }
-    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
+    // A submitted unit MAY host §12 **fibers** (`cont.*`) — they switch stacks within the domain on
+    // the caller's thread, so a unit running its own scheduler to completion never parks across the
+    // synchronous `cap.call` it runs inside; the parent domain stands up the fiber runtime (see
+    // `CompiledModule::enable_fiber_hosting`, and the interpreter's `INVOKE_MODULE` fiber support).
+    // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) stay rejected: a
+    // spawned vCPU would outlive this `cap.call` and collide with the serialized `Mutex<Host>`
+    // model. (Renegotiated 2026-07-30 — DESIGN.md §22 "Concurrency"; was: all §12 rejected.)
+    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
         return Err(EINVAL);
     }
     // A submitted unit's `call_indirect` (the new→old path) is now allowed: on the JIT it
@@ -977,6 +984,17 @@ pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
+/// Like [`grant_jit`], but the granted domain may host §12 **fibers** (`cont.*`) in submitted units
+/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] stands up the parent's
+/// fiber runtime (`CompiledModule::enable_fiber_hosting`) so a unit's `cont.*` resolve, and the
+/// interpreter runs them in its eval loop — so the backends stay in differential lockstep.
+/// **Threads/futex** in a submitted unit stay rejected (they would outlive the `cap.call`). Same
+/// handle value + memory-match precondition as [`grant_jit`].
+pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    host.set_jit_hosts_fibers(true);
+    grant_jit(host, m, table_log2)
+}
+
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
 /// ([`CompiledModule`]), with the module pointer registered in `host` so [`cap_thunk`]'s
 /// native `Jit` ops can re-enter it mid-run (`define_extra` / `invoke_extra` while the guest
@@ -993,6 +1011,9 @@ pub fn jit_cap_run(
     table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
+    // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
+    // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
+    let hosts_fibers = host.jit_hosts_fibers();
     // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
@@ -1015,6 +1036,9 @@ pub fn jit_cap_run(
             svm_jit::Quota::default(),
             table_reserve_log2,
         )?;
+        if hosts_fibers {
+            cm.enable_fiber_hosting(svm_jit::Quota::default())?;
+        }
         host_mutex
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1044,6 +1068,9 @@ pub fn jit_cap_run(
         svm_jit::Quota::default(),
         table_reserve_log2,
     )?;
+    if hosts_fibers {
+        cm.enable_fiber_hosting(svm_jit::Quota::default())?;
+    }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
     // §3.6 / I36 slice 3: register for the native serve arm too (see `powerbox_compile_run`).

@@ -2640,9 +2640,10 @@ impl Func {
     /// Whether this function uses any §12 fiber/thread/futex op (`cont.*`, `thread.*`,
     /// `atomic.wait`/`notify`). The single source of truth for backends that must agree on
     /// rejecting concurrency in a context that cannot host it — e.g. a §14 JIT child (no
-    /// per-child runtimes) or a guest-submitted `Jit`-capability unit (the single-threaded
-    /// MVP restriction; DESIGN.md §22 "Concurrency") — so the reference interpreter and the JIT
-    /// fail-close on exactly the same set.
+    /// per-child runtimes). A guest-submitted `Jit`-capability unit is now a *finer* gate — it
+    /// admits fibers and rejects only threads/futex ([`uses_threads`](Func::uses_threads) `||`
+    /// [`uses_futex`](Func::uses_futex)), DESIGN.md §22 "Concurrency" (renegotiated 2026-07-30) —
+    /// so this whole-set predicate is no longer what that path uses.
     pub fn uses_concurrency(&self) -> bool {
         self.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
@@ -2657,6 +2658,35 @@ impl Func {
                         | Inst::MemoryNotify { .. }
                 )
             })
+        })
+    }
+
+    /// Whether this function contains a **fiber** op (`cont.new`/`cont.resume`/`suspend`) — the
+    /// scheduling primitives a guest-submitted `Jit` unit **may** host: they switch stacks *within*
+    /// the domain, on the caller's thread, so a unit that runs its own scheduler to completion never
+    /// parks across the synchronous `cap.call` it runs inside (DESIGN.md §22 "Concurrency"). Split
+    /// out of [`uses_concurrency`](Func::uses_concurrency) so the submitted-unit gate can admit
+    /// fibers while still rejecting threads/futex.
+    pub fn uses_fibers(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                )
+            })
+        })
+    }
+
+    /// Whether this function contains a **vCPU/thread** op (`thread.spawn`/`thread.join`) — real OS
+    /// threads (§12 vCPUs), which a submitted `Jit` unit may **not** host yet: a spawned thread would
+    /// outlive the synchronous `cap.call` the unit runs inside and collide with the serialized
+    /// `Mutex<Host>` model (DESIGN.md §22). Split out for the submitted-unit gate.
+    pub fn uses_threads(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
         })
     }
 
