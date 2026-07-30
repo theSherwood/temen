@@ -1395,16 +1395,18 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
     }
     println!(
         "\nlinked cc1: {nfuncs} funcs, {ninsns} IR insns.  \
-         pure svm_jit::compile (no execution, best-of-3): {jit_compile_ms} ms — the fixed \
-         'compile-the-compiler' cost.\n\
-         The powerbox JIT fuses compile+run with no module cache, so `jit-run` pays this on \
-         *every* call.\n\
-         Read it as  jit-run ≈ compile-the-compiler + execution;  execution = jit-run − ~{jit_compile_ms}ms \
-         (a few hundred ms, single-digit × native).\n\
-         A compile-once/run-many deployment amortizes the fixed cost to ~0 and the JIT lands near native; \
-         `jit-run` here does not.\n\
-         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`. native has no \
-         separate instantiate.)\n"
+         pure svm_jit::compile (Cranelift, opt_level=speed, no execution, best-of-3): {jit_compile_ms} ms.\n\
+         `jit-run` is a GENUINE, honest cost: the powerbox entry is run-once (`_start`), so it \
+         Cranelift-compiles the whole {nfuncs}-fn guest AND executes it, every call — that ~10s IS \
+         what a `compile one file, exit` invocation pays. Count it.\n\
+         The compile so dominates that this benchmark CANNOT cleanly isolate execution (compile ≈ run, \
+         and re-running `_start` on a dirtied window isn't valid) — the per-file execution is below the \
+         run-to-run variance of the fixed compile. To bound it, compare the (trivial) floor to the giant \
+         TUs: ~flat, so execution is small vs compile — but this bench does not measure it precisely.\n\
+         When the fixed compile amortizes (long-lived process compiling many files via a persistent \
+         CompiledModule / JitSession) it drops out and per-file cost approaches execution alone; a \
+         run-once self-host does not get that.\n\
+         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`.)\n"
     );
 }
 
