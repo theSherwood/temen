@@ -169,12 +169,17 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   dispatch answers a probeable `-EINVAL` (like svc.poll/wait). `CAP_SELF_CLONE_CALLER = 11` pinned.
   Tests: `crates/svm-interp/tests/clone_caller.rs`. Proves *only* that the servicer can name the parked
   caller — no capture yet.
-- **Increment 2 — the targeted capture + restore-in-place with injected reply. NEXT (the hard core).**
-  See §8.2 for the derived mechanism. The load-bearing soundness change; a subtle error is
-  wrong-but-passing, so TDD-first over a **durable-transformed** harness, interp==JIT.
-- **Increment 3 — the twin + second ticket** (step 3 above). Copy the captured image into a fresh child
-  and re-seed a second `CapReply` park; return the twin `child_handle`.
-- **PR 2 — the `fork` personality op** replies `pid`/`0` to the two tickets (FORK.md §5).
+- **Increment 2 — the reply-injection nucleus. DONE (PR #528).** `clone_caller(reply)` delivers `reply`
+  to the parked caller *out-of-band* (`cap_reply_or_stash(ticket, reply)`) and sets `ServeRun.replied`, so
+  the handler's `FIBER_RETURNED` skips its auto-reply and the caller reloads the **injected** value, not the
+  handler's return. This *is* "return-twice is a reply value" (§3), the heart of fork. **Key simplification
+  vs the original §8.2 plan:** because both copies resume in the **same live run**, no durable window-image
+  serialization is needed — the reply crosses via the existing race-safe `cap_reply_or_stash` path. The
+  durable freeze/flatten (§8.2) is only relevant to *snapshot/migration*, which is off fork's live path.
+- **Increment 3 — the twin + second ticket. NEXT (the deep core; see §8.3).** Duplicate the parked caller
+  vCPU (its live window + continuation) into a fresh domain parked under a second ticket; the servicer
+  replies to both. The powerbox duplication is the crux (the S13 CoW-clone heart).
+- **PR 3 — the `fork` personality op** replies `pid`/`0` to the two tickets (FORK.md §5).
 
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
@@ -213,7 +218,44 @@ window), because that image is exactly what increment 3's **twin** copies into a
 must assert the image path ran (e.g. the caller's domain is `set_durable(true)` + a durable window, and the
 freeze/thaw residue is observable), not merely that the caller got the value.
 
-**Harness = increment-1's, made durable.** Parent calls the child's offer and parks (→ `Waiter::VCpu`), but
-now the **parent** is `transform_module_assume_confined` + `set_durable(true)` + `init_durable_window`, so
-its `cap.call` is the `SuspendKind::Leaf` shape the flatten needs. The child (servicer) stays as-is. The
-non-root-fiber (`Waiter::Fiber`) caller and the true cross-domain-window case are the follow-up before PR 2.
+> **Superseded (2026-07-30):** increment 2 shipped **without** the durable window-image round-trip. Because
+> both copies of a `fork()` resume in the **same live run**, the reply is injected through the existing
+> `cap_reply_or_stash` path — no freeze/flatten needed on the live path. §8.2 is retained as the design for
+> *snapshot/migration* re-issue (a separate concern, §3), not fork. Increment 3 (§8.3) likewise clones the
+> **live** parked vCPU directly rather than via a durable image.
+
+### 8.3 Increment 3 — the twin (the deep core, NEXT)
+
+**Topology correction.** The real fork topology is **parent spawns child (bash); child calls the parent's
+servicer offer and parks; the parent's handler clones the child** — so the servicer *owns* the twin (it
+holds the child's `child_handle`, FORK.md §4). Increment 2's harness is *inverted* (root calls the child's
+offer), which is fine for reply-injection (topology-agnostic) but **not** for the twin: the cloner must own
+what it clones. Increment 3's harness must put the **caller as a spawned child** and the **servicer as its
+parent**, so the parked caller is the child's own vCPU (`Waiter::VCpu(child)`) and the parent can register
+the twin as a sibling child it holds.
+
+**The twin, on the live parked vCPU `v` (= `Waiter::VCpu`).** No durable serialization — copy the live
+structure:
+  1. **Window:** `twin_mem` = a fresh `Mem` seeded from `v.mem`'s bytes (`snapshot`/`seed`, or a
+     `fork_for_thread`-style deep copy). A private window — fork does **not** share memory.
+  2. **Continuation:** `twin.frames = v.frames.clone()`, positioned at the same post-`cap.call` resume
+     point, `pending = CapResult(reply_for_twin)`.
+  3. **Powerbox — the crux (S13 CoW-clone heart).** `twin_host` = a fresh `Host` that **copies `v.host`'s
+     handle table** (`table: Vec<Slot>`) so the twin has its own handle namespace, but **shares** the
+     `Arc`-backed capability backings that POSIX fork shares (pipes/`PipeBacking`, regions/`RegionBacking`,
+     module grants — already `Arc`, so cloning the `Slot` clones the `Arc`) and gives the twin a **new
+     `domain_id`**. Deciding copy-vs-share per `Slot` kind is the sensitive part; get it wrong and either
+     the twin aliases the parent's private state (a confinement-adjacent correctness bug) or loses a shared
+     fd. Start with a **minimal powerbox** caller (just an instantiator handle, no pipes/regions) to prove
+     the table-copy + new-domain path, then extend to shared backings.
+  4. **Register + park:** enqueue `twin` as a new task/domain in the scheduler (a sibling child of the
+     servicer, recorded in its `nested_children`/`child_hosts` so it holds the `child_handle`), parked under
+     a **second** `(callee, ticket')` — or, since the twin's reply is known at clone time, just set its
+     `pending` and push it `runnable`.
+  5. **Return** the twin's `child_handle` to the servicer; the `fork` op (PR 3) then replies `pid` to the
+     original ticket (increment 2's path) and `0` to the twin.
+
+**Success criterion:** one servicer handler, one caller child that calls it; `clone_caller` inside the
+handler → the original returns `A` and the twin returns `B` from the **same** call site, both resuming in
+one live run, interp==JIT. **Load-bearing risk:** the powerbox copy-vs-share decision — TDD-first, and a
+`Slot`-kind audit before wiring shared backings.
