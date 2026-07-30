@@ -8,7 +8,7 @@
 use svm_encode::{decode_unit, encode_unit};
 use svm_interp::Value;
 use svm_ir::{Export, LinkUnit, Module};
-use svm_leng::LengModule;
+use svm_leng::{LengModule, WholeModule};
 
 /// Build a `LinkUnit` from a decoded object's in-band export tables — the exact conversion
 /// `svm-run --link` does.
@@ -60,6 +60,40 @@ fn nimony_object_round_trips_and_runs() {
     let mut fuel = u64::MAX;
     let r = svm_interp::run(&linked, 0, &[Value::I64(5)], &mut fuel).unwrap();
     assert_eq!(r.as_slice(), &[Value::I64(16)]);
+}
+
+/// A whole-module object exposes its **`exportc`** symbols under their C names — the conventional
+/// entry points a host / `svm-run --link` binds to. Real `moda` (main module) marks its C `main`
+/// `(exportc "main")` and its `cmdCount`/`cmdLine`/`nimEnviron` gvars `(exportc "…")`; the compiled
+/// object carries all of them in-band, alongside the mangled Leng names, so the program's C-ABI
+/// surface is findable (NIM.md W2, Path A).
+#[test]
+fn whole_object_exposes_exportc_c_names() {
+    const MODA: &str = include_str!("fixtures/real_moda.leng.nif");
+    let obj = svm_leng::compile_whole_object(&WholeModule {
+        stem: "modywjwgs",
+        src: MODA,
+    })
+    .expect("compile whole moda object");
+    let m = decode_unit(&obj).expect("decode moda.svmo");
+    // The C `main` is exported under its exportc name (and still under the mangled `main.0.<stem>`).
+    assert!(
+        m.exports.iter().any(|e| e.name == "main"),
+        "exportc C `main` present: {:?}",
+        m.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    assert!(
+        m.exports.iter().any(|e| e.name == "`main.0.modywjwgs"),
+        "mangled main still present too"
+    );
+    // The exportc gvars are exposed as C-named data symbols.
+    for g in ["cmdCount", "cmdLine", "nimEnviron"] {
+        assert!(
+            m.data_exports.iter().any(|e| e.name == g),
+            "exportc gvar `{g}` present as a data export: {:?}",
+            m.data_exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// A separately-produced **runtime object** (not from nimony): the four pure seq/openArray ops real

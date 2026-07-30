@@ -536,6 +536,12 @@ plumbing. Five workstreams, roughly independent:
     stand-in `system` unit (real `string`/`LongString` defs + no-op ARC stubs), the returned
     `string`'s `more` points at the materialized blob (`fullLen` = 29, data = the literal),
     identically on both engines (`tests/strings.rs`).
+  - **✅ `exportc` C-name exports — DONE 2026-07-30.** A whole-module object now exposes its
+    `exportc` symbols under their **C** names (the C `main`, and the `cmdCount`/`cmdLine`/`nimEnviron`
+    gvars), alongside the mangled Leng names — `Translator::exportc_exports` scans proc/gvar
+    `(pragmas (exportc "cname") …)` and adds a func/data export under `cname`. So the program's C-ABI
+    surface is findable: a host or `svm-run --link` can enter at `main`. Tested on real `moda`'s whole
+    object (`tests/object.rs`).
   - **Remaining for full W2:** translating (or linking a real compiled) `system` module so the
     `sysvq0asl` edges bind to real ARC/IO rather than the stub — the last stub in the chain.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →

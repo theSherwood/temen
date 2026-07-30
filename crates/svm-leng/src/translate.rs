@@ -55,6 +55,23 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
+/// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
+fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
+    let p = pragmas?;
+    if p.tag() != Some("pragmas") {
+        return None;
+    }
+    for prag in p.args() {
+        if prag.tag() == Some("exportc") {
+            if let Some(name) = prag.args().first().and_then(|n| n.as_atom()) {
+                return Some(name.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
 /// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
 fn is_string_literal(node: &Node) -> bool {
     matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
@@ -381,6 +398,50 @@ impl Translator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
         out
+    }
+
+    /// The module's **`exportc` symbols** as exports under their *C* names — the conventional entry
+    /// points a host or `svm-run` binds to (the C `main`, `cmdCount`, `cmdLine`, `nimEnviron`), in
+    /// addition to the mangled Leng names. A proc `(proc … (pragmas (exportc "cname") …) …)` exports
+    /// as a func under `cname`; a `gvar` with `(exportc "cname")` as a data symbol. Call after
+    /// translation (uses the populated proc/global tables). Path A: makes a whole-module object's
+    /// C-ABI surface findable (`svm-run --link` can enter at `main`).
+    pub fn exportc_exports(
+        &self,
+        root: &Node,
+    ) -> Result<(Vec<svm_ir::Export>, Vec<svm_ir::DataExport>), LengError> {
+        let mut procs = Vec::new();
+        let mut data = Vec::new();
+        for item in root.args() {
+            match item.tag() {
+                Some("proc") => {
+                    // `(proc :name params ret pragmas body)` — pragmas at index 3.
+                    if let Some(cname) = exportc_name(item.args().get(3)) {
+                        let local = sym_def(&item.args()[0])?;
+                        if let Some(sig) = self.procs.get(&local) {
+                            procs.push(svm_ir::Export {
+                                name: cname,
+                                func: sig.index,
+                            });
+                        }
+                    }
+                }
+                Some("gvar" | "tvar") => {
+                    // `(gvar :name pragmas type init)` — pragmas at index 1.
+                    if let Some(cname) = exportc_name(item.args().get(1)) {
+                        let local = sym_def(&item.args()[0])?;
+                        if let Some((off, _)) = self.globals.get(&local) {
+                            data.push(svm_ir::DataExport {
+                                name: cname,
+                                offset: *off,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((procs, data))
     }
 
     /// Materialize a **constant aggregate** value — `(oconstr AggType (kv field val)*)` — into its

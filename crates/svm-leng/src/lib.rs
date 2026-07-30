@@ -221,6 +221,11 @@ fn translate_object_module(
         })
         .collect();
     module.data_exports = t.global_exports(stem);
+    // Also expose `exportc` symbols under their C names (the conventional entry points — the C
+    // `main`, `cmdCount`, …), so a host / `svm-run --link` can bind to them by name (Path A).
+    let (ec_procs, ec_data) = t.exportc_exports(&root)?;
+    module.exports.extend(ec_procs);
+    module.data_exports.extend(ec_data);
     Ok(module)
 }
 
