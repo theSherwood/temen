@@ -722,6 +722,21 @@ impl ModuleSource {
         mods.push(std::sync::Arc::new(unit));
         mods.len() - 1
     }
+
+    /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
+    /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
+    /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
+    fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
+        self.mods.lock().unwrap_or_else(|e| e.into_inner())[1..].to_vec()
+    }
+
+    /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
+    fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
+        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        mods.truncate(1);
+        mods.extend(units.iter().cloned());
+    }
 }
 
 /// Build a §14 child / coroutine's natural dispatch table over its `module` in the shared source.
@@ -3634,6 +3649,7 @@ pub fn ir_value_trace(
 /// lives directly on the [`DebugRun`]/[`ScheduledDebugRun`]; a §14 **separate-module** child carries its
 /// own here (built from the granted `Module` at spawn, keyed by its pushed source index) so
 /// `read_var`/`var_addr`/`value_in_frame` resolve inside the child's body, not just module 0's.
+#[derive(Clone)]
 struct ModuleDebug {
     /// The child's index in the shared [`ModuleSource`] (`>= 1`) — matched against a frame's module so a
     /// frame outside this child (e.g. an installed §22 unit) isn't misread against these tables.
@@ -3693,10 +3709,14 @@ pub struct DebugRunSnapshot {
     chain: Vec<(usize, Vm, u32)>,
     /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
     fibers: Vec<FiberState>,
-    /// The §14 same-module coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
+    /// The §14 coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
     coroutines: Vec<Option<CoroSnapshot>>,
     /// While stepping inside a coroutine body: `(handle, parent resume-result slot, parent depth)`.
     active_coro: Option<(usize, u32, usize)>,
+    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** coroutine's pushed program), so
+    /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
+    /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
+    extra_units: Vec<std::sync::Arc<Compiled>>,
     /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
     /// a memoryless run. Fibers and same-module coroutines share this one window (coroutines via a
     /// `nested_view` over the same backing), so their bytes ride here too.
@@ -3705,13 +3725,15 @@ pub struct DebugRunSnapshot {
     host: super::HostReplaySubstate,
 }
 
-/// A §14 **same-module** coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a
-/// `nested_view` sub-view sharing the parent's backing region, so its bytes are already in the parent
-/// `mem` snapshot; only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds
-/// the view over the restored parent. The host is a fresh Yielder-only powerbox on restore, so only its
-/// replay substate is carried. Demand/mapping coroutines (non-pristine layout) and separate-module ones
-/// (a pushed source module) are outside the checkpointable subset, so `fault_yields`/`mod_debug` are
-/// always the defaults here and need not be stored.
+/// A §14 coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a `nested_view`
+/// sub-view sharing the parent's backing region, so its bytes are already in the parent `mem` snapshot;
+/// only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds the view over the
+/// restored parent. The host is a fresh Yielder-only powerbox on restore, so only its replay substate is
+/// carried. The coroutine's `module` rides in `vm.module` (`0` = same-module; `>= 1` = a **separate**
+/// module, whose pushed source unit is captured in the run snapshot's `extra_units`); its own §6
+/// metadata (`mod_debug`) is carried so a step-into resolves the separate module's source variables after
+/// restore. Demand/mapping coroutines (non-pristine layout) stay outside the subset, so `fault_yields`
+/// is always `false` here and need not be stored.
 struct CoroSnapshot {
     vm: Vm,
     win_base: u64,
@@ -3719,6 +3741,9 @@ struct CoroSnapshot {
     host: super::HostReplaySubstate,
     awaiting: Option<u32>,
     faulted_page: Option<u64>,
+    /// A separate-module coroutine's own §6 debug metadata (`None` for a same-module coroutine), cloned
+    /// so `read_var`/`var_addr` resolve inside its body after restore.
+    mod_debug: Option<ModuleDebug>,
 }
 
 impl DebugRunSnapshot {
@@ -3743,14 +3768,19 @@ fn coro_snapshot(c: &Coro) -> CoroSnapshot {
         host: c.host.replay_substate(),
         awaiting: c.awaiting,
         faulted_page: c.faulted_page,
+        mod_debug: c.mod_debug.clone(),
     }
 }
 
 /// Rebuild a live [`Coro`] from a [`CoroSnapshot`] on restore — the inverse of [`coro_snapshot`]:
 /// recreate its `nested_view` over the (already reseeded) `parent_mem` window so its bytes (shared via
 /// the backing region) are correct, a fresh Yielder-only host carrying the captured replay substate, and
-/// its natural same-module dispatch table. Shared by the single-vCPU and scheduled `restore` paths.
-fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, progs_len: usize) -> Coro {
+/// its natural dispatch table over its own `module` (`0` = primary; a separate module resolves against
+/// the just-restored `source`, whose `extra_units` were re-pushed first). Shared by the single-vCPU and
+/// scheduled `restore` paths.
+fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, source: &ModuleSource) -> Coro {
+    let module = cs.vm.module;
+    let progs_len = source.get(module).map_or(0, |u| u.progs.len());
     let mem = parent_mem.map(|m| m.nested_view(cs.win_base, cs.size_log2));
     let mut host = Host::new();
     host.grant_yielder();
@@ -3759,11 +3789,11 @@ fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, progs_len: usize) -
         vm: cs.vm.clone(),
         mem,
         host,
-        table: build_table(progs_len, 0),
+        table: build_table_for(progs_len, 0, module as u32),
         awaiting: cs.awaiting,
         fault_yields: false, // demand coroutines are outside the subset
         faulted_page: cs.faulted_page,
-        mod_debug: None, // same-module: frames read against the session's own metadata
+        mod_debug: cs.mod_debug.clone(),
     }
 }
 
@@ -4505,17 +4535,19 @@ impl DebugRun {
                 .fibers
                 .iter()
                 .any(|f| matches!(f, FiberState::WaitParked { .. }))
-            && self.vt.coroutines.iter().flatten().all(|c| {
-                c.vm.module == 0
-                    && !c.fault_yields
-                    && c.mem.as_ref().is_none_or(|m| m.snapshot_safe())
-            })
+            && self
+                .vt
+                .coroutines
+                .iter()
+                .flatten()
+                .all(|c| !c.fault_yields && c.mem.as_ref().is_none_or(|m| m.snapshot_safe()))
     }
 
     /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
     /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
-    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, same-module
-    /// coroutine children) + the shared window bytes + the host's replay substate.
+    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, coroutine
+    /// children) + the shared window bytes + the host's replay substate + any separate-module coroutine's
+    /// pushed source units.
     pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
         if !self.checkpointable() {
             return None;
@@ -4533,6 +4565,7 @@ impl DebugRun {
                 .map(|c| c.as_ref().map(coro_snapshot))
                 .collect(),
             active_coro: self.vt.active_coro,
+            extra_units: self.source.extra_units(),
             mem: self.mem.as_ref().map(|m| m.window_snapshot()),
             host: self.host.replay_substate(),
         })
@@ -4543,25 +4576,29 @@ impl DebugRun {
     /// snapshot's logical time rather than clock 0. Rebuilds the whole `VTask` (active `Vm`, resume
     /// chain, fiber registry, and each same-module coroutine — its `nested_view` recreated over the
     /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
-    /// host replay substate, and sets the clock. The shared structure (`source`/`table`/`funcs`) already
-    /// matches — a checkpoint is only taken for a run whose coroutines are same-module.
+    /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
+    /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
     pub fn restore(&mut self, snap: &DebugRunSnapshot) {
         self.vt.active = snap.active.clone();
         self.vt.active_id = snap.active_id;
         self.vt.chain = snap.chain.clone();
         self.vt.active_coro = snap.active_coro;
         self.fibers = snap.fibers.clone();
+        // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
+        // indices resolve against the source).
+        self.source.reset_extra(&snap.extra_units);
         if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
             m.seed(bytes);
         }
-        // Rebuild each same-module coroutine: a fresh `nested_view` over the just-reseeded parent window
-        // (so its bytes — shared via the backing region — are already correct) + a fresh Yielder host.
-        let progs_len = self.source.primary().progs.len();
+        // Rebuild each coroutine: a fresh `nested_view` over the just-reseeded parent window (so its
+        // bytes — shared via the backing region — are already correct) + a fresh Yielder host + a table
+        // over its own module.
         let parent_mem = self.mem.as_ref();
+        let source = &*self.source;
         self.vt.coroutines = snap
             .coroutines
             .iter()
-            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, progs_len)))
+            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, source)))
             .collect();
         self.host.restore_replay_substate(&snap.host);
         self.op_clock = snap.clock;
@@ -6108,6 +6145,7 @@ impl ScheduledDebugRun {
         // backing region — are already correct).
         let progs_len = self.source.primary().progs.len();
         let shared_mem = self.mem.as_ref();
+        let source = &*self.source;
         self.extra_envs = snap
             .extra_envs
             .iter()
@@ -6120,7 +6158,7 @@ impl ScheduledDebugRun {
                 let coroutines = ts
                     .coroutines
                     .iter()
-                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, progs_len)))
+                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, source)))
                     .collect();
                 DbgTask {
                     vt: VTask {

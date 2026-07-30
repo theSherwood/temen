@@ -308,3 +308,125 @@ fn separate_module_source_variable_tick_replays_deterministically() {
         "replay reproduced the child's source-variable value"
     );
 }
+
+/// A per-op observation of the coroutine-module run: the logical clock, the full call stack (frames as
+/// `module:func:block:inst`, so a frame in the pushed child module reads `1:...`), and the child carve's
+/// bytes (its window starts at 64 KiB). A faithful checkpoint restore reproduces all three.
+fn mod_coro_obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
+    let mut stack = Vec::new();
+    for d in 0..run.depth() {
+        if let Some(pc) = run.frame_pc(d) {
+            stack.push(format!(
+                "{}:{}:{}:{}",
+                pc.module, pc.func, pc.block, pc.inst
+            ));
+        }
+    }
+    let win = run.read_window(65536, 8).unwrap_or_default();
+    (run.op_clock(), stack.join("|"), win)
+}
+
+/// Warm≡cold oracle for **§14 separate-module coroutine** checkpointing (DEBUGGING.md W1): at every op
+/// clock where a checkpoint could be taken — including while stepped *inside the pushed module's body* —
+/// a `DebugRun::restore`d run replays forward **identically** to the trusted single from-0 run. This
+/// exercises the separate-module reconstruction directly: the pushed source unit is re-pushed (so a
+/// `module 1` frame resolves), and the coroutine `Vm` + its `nested_view` window + its table over the
+/// child module + its Yielder host all round-trip.
+#[test]
+fn separate_module_coroutine_checkpoint_snapshot_restore_round_trips() {
+    const FUEL: u64 = 5_000_000;
+
+    let mut refr = module_session();
+    let mut f = FUEL;
+    let mut ref_obs = vec![mod_coro_obs(&refr)];
+    while refr.tick(&mut f) {
+        ref_obs.push(mod_coro_obs(&refr));
+    }
+    let total = ref_obs.len() - 1;
+    assert_eq!(
+        refr.result().unwrap().as_ref().unwrap(),
+        &[Value::I64(WANT)]
+    );
+    // The run genuinely steps inside the pushed child module (module 1), so the round-trip below covers a
+    // live separate-module coroutine, not only module 0.
+    assert!(
+        ref_obs
+            .iter()
+            .any(|(_, s, _)| s.split('|').any(|fr| fr.starts_with("1:"))),
+        "the run steps inside the pushed child module (module 1)"
+    );
+
+    let mut checkpointed_in_child = false;
+    for c in 0..=total {
+        let mut at_c = module_session();
+        let mut f = FUEL;
+        while at_c.op_clock() < c as u64 && at_c.tick(&mut f) {}
+        let Some(snap) = at_c.snapshot() else {
+            continue; // C is outside the checkpointable subset
+        };
+        if ref_obs[c].1.split('|').any(|fr| fr.starts_with("1:")) {
+            checkpointed_in_child = true;
+        }
+        let mut warm = module_session();
+        warm.restore(&snap);
+        let mut i = c;
+        assert_eq!(
+            mod_coro_obs(&warm),
+            ref_obs[i],
+            "restore at C={c} lands at reference"
+        );
+        let mut f = FUEL;
+        while warm.tick(&mut f) {
+            i += 1;
+            assert_eq!(
+                mod_coro_obs(&warm),
+                ref_obs[i],
+                "forward replay after restore at C={c}"
+            );
+        }
+        assert_eq!(i, total, "warm run from C={c} reached the same end");
+        assert_eq!(
+            warm.result().unwrap().as_ref().unwrap(),
+            &[Value::I64(WANT)]
+        );
+    }
+    assert!(
+        checkpointed_in_child,
+        "a checkpoint was taken (and restored) while stepped inside the pushed child module"
+    );
+}
+
+/// The restored separate-module coroutine stays **source-inspectable**: a checkpoint taken while stepped
+/// inside the pushed module's body, restored into a fresh run, still resolves the child's own named SSA
+/// variable `b` — proving the coroutine's per-module §6 metadata (`mod_debug`) round-trips through the
+/// snapshot, not just its position and window bytes.
+#[test]
+fn separate_module_coroutine_restore_reconstructs_source_metadata() {
+    let mut a = module_session_dbg();
+    let mut fuel = 5_000_000u64;
+    assert_eq!(
+        a.run_to(&[child_module_load()], &mut fuel),
+        Some(child_module_load()),
+        "stopped inside the granted module's body"
+    );
+    let live = a.read_var(0, "b", 4);
+    assert_eq!(live, Some(VarValue::Value(Value::I32(WANT as i32))));
+    let snap = a
+        .snapshot()
+        .expect("a non-demand separate-module coroutine is checkpointable");
+
+    let mut b = module_session_dbg();
+    b.restore(&snap);
+    assert_eq!(b.op_clock(), a.op_clock(), "restored to the same clock");
+    assert_eq!(
+        b.frame_pc(0),
+        Some(child_module_load()),
+        "restore landed at the child body"
+    );
+    assert_eq!(
+        b.read_var(0, "b", 4),
+        live,
+        "restore reconstructed the child module's debug metadata (source var `b` still resolves)"
+    );
+    assert_eq!(drive(&mut b, &[], &mut fuel), Ok(vec![Value::I64(WANT)]));
+}
