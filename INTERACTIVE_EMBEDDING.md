@@ -21,7 +21,7 @@ prospective interactive embedder (c_interpret) that the W1–W6 scope does not y
 | **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`svm_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
 | **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `svm-dap`, `DEBUGGING.md` |
 | **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `svm-opt` instrumentation pass, C ABI `svm_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
-| **W4** blocking-input suspend/resume | **Partial** — the `VcpuEvent::StdinPark` suspend/resume seam **shipped in the browser** (`bytecode.rs`, `svm_pg_*` console path), and the **`CapTape` replay half landed** (2026-07-30 check: `svm-dap` records nondeterministic cap inputs and `replay_cap_tape`s them on rebuild — reverse debugging rewinds stdout byte-identically, `browser/tests/chibicc_debug.rs`); remaining: the **interactive mid-session provide verb** on the debug session (the DAP session takes *preloaded* stdin only) | `bytecode.rs`, `svm-dap/src/backend.rs`, this doc |
+| **W4** blocking-input suspend/resume | **Built 2026-07-30** — the engine seam (`VcpuEvent::StdinPark`, `svm_pg_*` console path), `CapTape` replay, **and the debug-session verb**: a `blockStdin` launch flag parks an exhausted `read` as a `stopped` event (reason `"stdin"`, no clock advance), the custom `provideStdin` request appends bytes and a resume re-issues the read, and a reverse `seek` replays provided inputs from the tape with **no re-park**. Fail-closed launch gate (bytecode + powerbox + single-vCPU only); parked placeholder reads never tape. Gated by `browser/tests/chibicc_debug.rs` (round-trip + replay + inertness pin) and `dap_bytecode.rs` (gate) | `bytecode.rs` `DebugRun`, `svm-dap`, this doc |
 | **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.svmb` asset + `svm_run_onramp_fs` + `svm_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
 | **W6** small host/tooling items | **Mostly remaining** — only the *native* seeded scheduler (`attach_scheduled_seeded`) exists; the four browser/tooling items (seed-via-ABI, `display` frame-query, memory-map JSON, compile metrics) are unbuilt | mixed |
 | **—** consumer-surfaced needs not yet scoped | **Not scoped** — telemetry stream, cache-coherence view, adversarial+replayable scheduling, paging counters, state writes, sem/barrier libc | new section below |
@@ -190,10 +190,19 @@ ordering, and browser counters match the native run of the same hook stream.
 > session**. **Update 2026-07-30:** the `CapTape`/`seek`-replay half **landed** — the `svm-dap`
 > backend records nondeterministic cap inputs (clock / stdin `read` / host-fn) and replays the tape
 > on every rebuild, so reverse debugging reproduces earlier stdout byte-identically
-> (`svm-dap/src/backend.rs` `replay_cap_tape`; `browser/tests/chibicc_debug.rs`). The one remaining
-> piece is the **interactive provide verb on the debug session itself**: today the DAP session takes
-> *preloaded* stdin at launch; a park-on-exhausted-stdin + provide-and-resume request (appending to
-> the same tape) closes W4. The text below is the original sketch.
+> (`svm-dap/src/backend.rs` `replay_cap_tape`; `browser/tests/chibicc_debug.rs`).
+> **CLOSED 2026-07-30 (same day, the plan's slice 1):** the debug-session verb landed. A
+> `blockStdin: true` launch flag arms `Host::set_stdin_blocking` on the session powerbox; an
+> exhausted `read` yields `Outcome::StdinPark` (op not executed, `op_clock` held), surfaced as
+> `StopReason::StdinPark` → a `stopped` event with reason `"stdin"`; the custom `provideStdin`
+> request appends bytes (`Host::push_stdin`) and a resume re-issues the read. Parked placeholder
+> reads are excluded from the `CapTape`, so a reverse `seek` replays the *completed* provided reads
+> byte-identically with no re-park; a read past the replay frontier parks again (the launch stdin
+> buffer is empty in this mode, so frontier semantics are exact). Fail-closed: the launch gate
+> rejects `blockStdin` off the bytecode engine, without the powerbox, or on a threaded module.
+> Acceptance met per the block below (`blocking_stdin_round_trips_and_replays`,
+> `without_block_stdin_exhausted_reads_stay_eof` — the invariant-9b inertness pin — and the
+> `dap_bytecode.rs` gate tests). The text below is the original sketch.
 
 **Need.** Interactive guests read input that does not exist yet (a REPL prompt, a stdin-driven
 program). The embedder needs the run to **suspend** when input is exhausted, surface that to
@@ -397,7 +406,9 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > the checkpoint ladder and `CapTape` replay have landed. Each slice lands with CI-gating tests,
 > differential wherever two observers see the same program, per `AGENTS.md`.
 >
-> 1. **W4 finish — `provideStdin` on the debug session.** Integration note (2026-07-30, verified):
+> 1. ~~**W4 finish — `provideStdin` on the debug session.**~~ **DONE 2026-07-30** — as specced
+>    below (the `StdinPark` route corrected to the Host-cap seam). See the W4 status block above.
+>    Original integration note (2026-07-30, verified):
 >    in a debug run stdin is served by the **Host's stdin cap** (`grant_io_powerbox`, `host.stdin`
 >    — `svm-dap/src/backend.rs`), not the Vcpu event loop, so `VcpuEvent::StdinPark` is *not* the
 >    seam here. The work: a **would-block outcome** on the stdin cap when the buffer is exhausted
@@ -407,7 +418,10 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    free: `record_caps`/`replay_cap_tape` already tape stdin inputs, so provided bytes join the
 >    tape. Acceptance: the W4 block above (two round-trips; `seek(0)` replays both
 >    byte-identically, no re-park).
-> 2. **DAP array-pump.** `svm_dap_request` accepts a JSON **array** of requests per pump (replies
+> 2. ~~**DAP array-pump.**~~ **DONE 2026-07-30** — as specced (`browser/src/lib.rs` pump matches
+>    `Json::Arr` and flat-maps `handle`; gated by `browser/tests/dap_batch.rs`: four responses in
+>    order + the stopped event in one crossing; singleton unchanged). Original:
+>    `svm_dap_request` accepts a JSON **array** of requests per pump (replies
 >    already come back as an array); singletons unchanged. Integration (verified): a pure
 >    `browser/src/lib.rs` change at the `server.handle` call — `svm_dap::parse` already returns
 >    `Json::Arr` for a top-level array (today it falls through to a clean single failure), so the

@@ -5084,9 +5084,23 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
         }
         slot.as_mut().unwrap()
     };
-    let reply = svm_dap::Json::Arr(server.handle(&req))
-        .to_string()
-        .into_bytes();
+    // A top-level JSON **array** batches requests (INTERACTIVE_EMBEDDING.md, the step+reads
+    // bundle): each element is handled in order and the reply messages concatenate into the one
+    // reply array — a step + N state reads in a single FFI crossing. A single object stays the
+    // one-request pump; the reply shape is identical either way (`web/dap.js` already consumes an
+    // array and filters by `type`).
+    let reply = match &req {
+        svm_dap::Json::Arr(reqs) => {
+            let mut msgs = Vec::new();
+            for r in reqs {
+                msgs.extend(server.handle(r));
+            }
+            svm_dap::Json::Arr(msgs)
+        }
+        _ => svm_dap::Json::Arr(server.handle(&req)),
+    }
+    .to_string()
+    .into_bytes();
     put(reply);
     0
 }

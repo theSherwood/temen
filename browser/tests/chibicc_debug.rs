@@ -780,9 +780,17 @@ fn vars_of(s: &mut DapServer, seq: i64, vref: i64) -> Vec<(String, String, i64)>
         .iter()
         .map(|v| {
             (
-                v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                v.get("value").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-                v.get("variablesReference").and_then(|r| r.as_i64()).unwrap_or(0),
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("value")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("variablesReference")
+                    .and_then(|r| r.as_i64())
+                    .unwrap_or(0),
             )
         })
         .collect()
@@ -984,5 +992,174 @@ fn breakpoint_on_bare_return_line_is_unverified() {
     assert!(
         event(&out, "terminated") && !event(&out, "stopped"),
         "with only the bare-return breakpoint, the program runs to completion"
+    );
+}
+
+// ---- W4 blocking stdin: park on exhausted stdin, provideStdin resumes, replay is faithful ---------
+// The INTERACTIVE_EMBEDDING.md W4 acceptance: a prompt-loop C guest round-trips two provided inputs;
+// rewinding and re-running replays both byte-identically from the CapTape with no new suspensions.
+
+const ECHO_SRC: &str = r#"int read(int fd, char *buf, long n);
+int write(int fd, char *buf, long n);
+int main(void) {
+  char buf[16];
+  int n = read(0, buf, 16);
+  write(1, buf, n);
+  n = read(0, buf, 16);
+  write(1, buf, n);
+  return 0;
+}
+"#;
+
+/// The reason of the batch's `stopped` event, if any.
+fn stopped_reason(msgs: &[Json]) -> Option<String> {
+    msgs.iter()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("stopped"))
+        .and_then(|m| m.get("body"))
+        .and_then(|b| b.get("reason"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
+fn launch_echo(s: &mut DapServer, ir: &str, block_stdin: bool) {
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let mut launch = vec![
+        ("programText", Json::s(ir)),
+        ("function", Json::i(0)),
+        ("args", Json::Arr(vec![])),
+        ("engine", Json::s("bytecode")),
+        ("powerbox", Json::s("onramp")),
+    ];
+    if block_stdin {
+        launch.push(("blockStdin", Json::Bool(true)));
+    }
+    let out = s.handle(&req(2, "launch", Json::obj(launch)));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "echo launch ok"
+    );
+}
+
+/// **A blocking-stdin session parks at each exhausted `read`, resumes on `provideStdin`, and its
+/// reverse replay reproduces the provided inputs with no new suspensions** — the W4 acceptance.
+#[test]
+fn blocking_stdin_round_trips_and_replays() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, ECHO_SRC);
+
+    let mut s = DapServer::new();
+    launch_echo(&mut s, &ir, true);
+
+    // No breakpoints: the run parks at the first read (reason "stdin") instead of EOF-completing.
+    let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    assert_eq!(
+        stopped_reason(&out).as_deref(),
+        Some("stdin"),
+        "parked awaiting input at the first read (not terminated: {out:?})"
+    );
+
+    // Provide the first input and resume: it echoes, then parks at the second read.
+    let out = s.handle(&req(
+        4,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("A\n"))]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "provideStdin accepted"
+    );
+    let out = s.handle(&req(
+        5,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    assert_eq!(
+        stopped_reason(&out).as_deref(),
+        Some("stdin"),
+        "parked at the second read"
+    );
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\n"),
+        "the first provided input was echoed"
+    );
+
+    // Provide the second input and resume to completion.
+    s.handle(&req(
+        6,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("B!"))]),
+    ));
+    let out = s.handle(&req(
+        7,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    assert!(event(&out, "terminated"), "ran to completion");
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\nB!"),
+        "both provided inputs were echoed"
+    );
+
+    // Rewind to the start: the captured output rewinds with the program.
+    let out = s.handle(&req(
+        8,
+        "reverseContinue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    assert!(event(&out, "stopped"), "rewound to the start");
+    assert_eq!(
+        output_text(&out).as_deref().unwrap_or(""),
+        "",
+        "output rewound to empty at the start"
+    );
+
+    // Forward again: the CapTape replays both provided reads byte-identically — the run completes
+    // with the same output and **no new stdin suspension** (the W4 replay acceptance).
+    let out = s.handle(&req(
+        9,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    assert!(
+        stopped_reason(&out).is_none(),
+        "replay served the provided inputs from the tape — no re-park"
+    );
+    assert!(event(&out, "terminated"), "replay ran to completion");
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\nB!"),
+        "replay reproduced the provided inputs byte-identically"
+    );
+}
+
+/// **Inertness pin** (invariant 9b): without `blockStdin`, the same guest keeps plain EOF semantics —
+/// exhausted reads return 0 and the run completes with no stop. The mode is armed, never ambient.
+#[test]
+fn without_block_stdin_exhausted_reads_stay_eof() {
+    let Some(bytes) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let chibicc = svm_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, ECHO_SRC);
+
+    let mut s = DapServer::new();
+    launch_echo(&mut s, &ir, false);
+    let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    assert!(
+        stopped_reason(&out).is_none(),
+        "no stdin stop without the mode"
+    );
+    assert!(
+        event(&out, "terminated"),
+        "EOF reads (0 bytes) let the guest run to completion unchanged"
     );
 }
