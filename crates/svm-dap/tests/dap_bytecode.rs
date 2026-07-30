@@ -1452,3 +1452,103 @@ fn dap_over_bytecode_fiber_on_a_spawned_thread() {
         "the fiber-on-threads guest finished"
     );
 }
+
+// ---- W4 blocking stdin: the launch gate is fail-closed --------------------------------------------
+// `blockStdin: true` parks a `read` on exhausted stdin instead of returning EOF — a session mode only
+// the single-vCPU bytecode powerbox path supports. Every unsupported combination must *fail the
+// launch* rather than silently keep EOF semantics (invariant 9: decline, never diverge).
+
+/// Launch `text` with the given extra args; returns the launch response's `success`.
+fn launch_succeeds(text: &str, extra: Vec<(&str, Json)>) -> bool {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let mut args = vec![
+        ("programText", Json::s(text)),
+        ("function", Json::i(0)),
+        ("args", Json::Arr(vec![Json::i(3)])),
+    ];
+    args.extend(extra);
+    let out = s.handle(&req(2, "launch", Json::obj(args)));
+    response(&out).get("success") == Some(&Json::Bool(true))
+}
+
+#[test]
+fn block_stdin_launch_gate_is_fail_closed() {
+    // The tree-walker has no blocking-stdin mode: fail the launch, don't silently EOF.
+    assert!(
+        !launch_succeeds(
+            LOOP_SUM_DBG,
+            vec![
+                ("powerbox", Json::s("onramp")),
+                ("blockStdin", Json::Bool(true)),
+            ],
+        ),
+        "treewalk + blockStdin must fail the launch"
+    );
+    // A deny-all (no powerbox) session has no stdin capability to block on.
+    assert!(
+        !launch_succeeds(
+            LOOP_SUM_DBG,
+            vec![
+                ("engine", Json::s("bytecode")),
+                ("blockStdin", Json::Bool(true)),
+            ],
+        ),
+        "bytecode without the powerbox + blockStdin must fail the launch"
+    );
+    // The multithreaded scheduled engine is out of scope this slice: declined at construction.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            ("blockStdin", Json::Bool(true)),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(false)),
+        "a thread.spawn module + blockStdin must fail the launch"
+    );
+    // And the same launches *without* blockStdin still succeed — the gate rejects only the mode.
+    assert!(
+        launch_succeeds(LOOP_SUM_DBG, vec![("powerbox", Json::s("onramp"))]),
+        "treewalk without blockStdin launches"
+    );
+    assert!(
+        launch_succeeds(LOOP_SUM_DBG, vec![("engine", Json::s("bytecode"))]),
+        "bytecode deny-all without blockStdin launches"
+    );
+}
+
+#[test]
+fn provide_stdin_fails_cleanly_on_a_non_blocking_session() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    let out = s.handle(&req(
+        3,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("hello\n"))]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(false)),
+        "provideStdin on a non-blocking session fails cleanly"
+    );
+}

@@ -191,6 +191,7 @@ impl DapServer {
             "stepBack" => self.on_step_back(),
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
+            "provideStdin" => self.on_provide_stdin(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -316,8 +317,21 @@ impl DapServer {
             .and_then(|v| v.as_str())
             .map(|s| s.as_bytes().to_vec())
             .unwrap_or_default();
+        // `blockStdin: true` (INTERACTIVE_EMBEDDING.md W4): a `read` on an exhausted stdin buffer
+        // parks the session (a `stopped` event, reason `"stdin"`) instead of returning EOF; the
+        // custom `provideStdin` request appends bytes and a resume re-issues the read. Bytecode
+        // engine, single-vCPU, powerbox sessions only — anything else fails the launch (fail-closed)
+        // rather than silently keeping EOF semantics.
+        let block_stdin = args
+            .get("blockStdin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if block_stdin && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
-            match BytecodeBackend::new(module, func, &call_args, fuel, powerbox, stdin) {
+            match BytecodeBackend::new(module, func, &call_args, fuel, powerbox, stdin, block_stdin)
+            {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
                 Some(b) => {
@@ -859,6 +873,21 @@ impl DapServer {
         PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 
+    /// The custom `provideStdin` request (W4 blocking stdin): append `arguments.data` to the parked
+    /// session's stdin. The client then resumes (`continue`/`next`) and the parked read re-issues
+    /// against the new bytes. Fails cleanly when there is no session, no `data`, or the session is
+    /// not a blocking-stdin one (`Debuggee::provide_stdin` returns `false`).
+    fn on_provide_stdin(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let Some(data) = args.and_then(|a| a.get("data")).and_then(|d| d.as_str()) else {
+            return (false, Json::Null, vec![]);
+        };
+        let ok = session.inspector.provide_stdin(data.as_bytes());
+        (ok, Json::Null, vec![])
+    }
+
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
         if self.session.is_none() {
             return (false, Json::Null, vec![]);
@@ -1214,6 +1243,9 @@ fn dap_reason(r: StopReason) -> &'static str {
         StopReason::Step => "step",
         StopReason::Watchpoint { .. } => "data breakpoint",
         StopReason::CapCall { .. } => "pause",
+        // W4 blocking stdin: parked at a `read` awaiting input — the client shows an input prompt
+        // and resumes after `provideStdin`.
+        StopReason::StdinPark => "stdin",
     }
 }
 

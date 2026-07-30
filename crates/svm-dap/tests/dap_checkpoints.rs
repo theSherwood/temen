@@ -200,7 +200,7 @@ fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     let m = parse_module(LOOP_WITH_MEM).expect("parses");
     let args = [Value::I32(800)]; // several thousand ops ⇒ several stride boundaries
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
             .expect("the bytecode engine accepts the single-vCPU loop")
     };
 
@@ -255,7 +255,7 @@ fn bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber() {
     let m = parse_module(FIBER_LOOP).expect("parses");
     let args = [Value::I64(900)]; // fiber loops 900× before its first suspend ⇒ several strides deep
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
             .expect("the single-vCPU engine accepts the fiber generator")
     };
 
@@ -322,7 +322,7 @@ fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     let m = parse_module(LOOP_THREADS).expect("parses");
     let args = [Value::I64(400)]; // two workers × 400 iters ⇒ several thousand turns, many strides
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
             .expect("the scheduled bytecode engine accepts the thread.spawn loop")
     };
 
@@ -376,7 +376,7 @@ fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
     let m = parse_module(THREADS_WITH_FIBERS).expect("parses");
     let args = [Value::I64(400)]; // two fibers × 400 iters ⇒ several thousand turns, many strides
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
             .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
     };
 
@@ -430,7 +430,8 @@ fn bytecode_checkpoint_reverse_sweep_is_bounded() {
     use std::time::Instant;
     let m = parse_module(LOOP_WITH_MEM).expect("parses");
     let args = [Value::I32(8_000)]; // ~64k ops — many strides deep
-    let mk = || BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new()).unwrap();
+    let mk =
+        || BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false).unwrap();
     let deep = 60_000u64;
     let steps = 60u64;
 

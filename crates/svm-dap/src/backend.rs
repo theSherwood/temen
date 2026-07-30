@@ -108,6 +108,7 @@ fn build_single_run(
     args: &[Value],
     powerbox: bool,
     stdin: &[u8],
+    block_stdin: bool,
     tape: &CapTape,
 ) -> Option<DebugRun> {
     if !powerbox {
@@ -115,6 +116,12 @@ fn build_single_run(
     }
     let mut host = Host::new();
     grant_io_powerbox(&mut host, module, stdin);
+    // W4 blocking stdin: a `read` on an exhausted buffer parks the run (`StopReason::StdinPark`)
+    // instead of returning EOF; `provideStdin` appends bytes and a resume re-issues the read.
+    // Re-armed on every `seek` rebuild so a read past the replay frontier parks again.
+    if block_stdin {
+        host.set_stdin_blocking(true);
+    }
     host.record_caps(); // tape this run's cap inputs so a later reverse seek can replay them
     if !tape.records.is_empty() {
         host.replay_cap_tape(tape.clone()); // serve the furthest-forward inputs on a rebuild
@@ -166,6 +173,14 @@ pub trait Debuggee {
     /// Data breakpoints (`setDataBreakpoints` watchpoints). Default `true` (the tree-walker).
     fn supports_watch(&self) -> bool {
         true
+    }
+
+    // --- blocking stdin (W4) ---------------------------------------------------------------------
+    /// Append stdin bytes for a session parked at a blocking `read` (`StopReason::StdinPark`) —
+    /// the next resume re-issues the read against them. `false` when this backend/session has no
+    /// blocking stdin (the `provideStdin` request fails cleanly). Default: unsupported.
+    fn provide_stdin(&mut self, _bytes: &[u8]) -> bool {
+        false
     }
 
     // --- powerbox output -------------------------------------------------------------------------
@@ -295,6 +310,10 @@ pub struct BytecodeBackend {
     powerbox: bool,
     /// Preloaded stdin for the powerbox (`read(0, …)`); empty for a pure-output program.
     stdin: Vec<u8>,
+    /// W4 blocking stdin: a `read` on an exhausted buffer parks the session
+    /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Single-vCPU
+    /// powerbox sessions only — `new` declines a threaded module with this set (fail-closed).
+    block_stdin: bool,
     /// The recorded [`CapTape`] of nondeterministic cap **inputs** (clock / stdin `read` / host-fn) from
     /// the furthest-forward execution — replayed on a reverse `seek` rebuild so re-execution sees
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
@@ -339,13 +358,25 @@ impl BytecodeBackend {
         fuel: u64,
         powerbox: bool,
         stdin: Vec<u8>,
+        block_stdin: bool,
     ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let engine = if bytecode::module_spawns_threads(&module) {
+            // Blocking stdin is single-vCPU only this slice — decline a threaded module rather
+            // than silently keeping EOF semantics (fail-closed, like the seed on this engine).
+            if block_stdin {
+                return None;
+            }
             Engine::Threaded(Box::new(ScheduledDebugRun::new(&module, func, args)?))
         } else {
             Engine::Single(Box::new(build_single_run(
-                &module, func, args, powerbox, &stdin, &tape,
+                &module,
+                func,
+                args,
+                powerbox,
+                &stdin,
+                block_stdin,
+                &tape,
             )?))
         };
         Some(BytecodeBackend {
@@ -359,6 +390,7 @@ impl BytecodeBackend {
             fuel,
             powerbox,
             stdin,
+            block_stdin,
             tape,
             rev_trace: None,
             checkpoints: Vec::new(),
@@ -385,6 +417,7 @@ impl BytecodeBackend {
             &self.args,
             self.powerbox,
             &self.stdin,
+            self.block_stdin,
             &self.tape,
         )
     }
@@ -569,9 +602,21 @@ impl BytecodeBackend {
         true
     }
 
-    /// Map an engine completion (a resume/step returned no pc) to a `Stop`: the finished result (or
-    /// trap) if the root is done, else `Blocked` (a concurrency seam that engine can't follow).
+    /// Map an engine completion (a resume/step returned no pc) to a `Stop`: a blocking-stdin park
+    /// first (the run is live, paused at the read, resumable once `provideStdin` supplies bytes),
+    /// then the finished result (or trap) if the root is done, else `Blocked` (a concurrency seam
+    /// that engine can't follow).
     fn finish_stop(&self) -> Stop {
+        if let Engine::Single(run) = &self.engine {
+            if run.stdin_parked() {
+                if let Some(pc) = run.frame_pc(0) {
+                    return Stop::Break {
+                        reason: StopReason::StdinPark,
+                        pc,
+                    };
+                }
+            }
+        }
         let result = match &self.engine {
             Engine::Single(run) => run.result().cloned(),
             Engine::Threaded(run) => run.result().cloned(),
@@ -896,6 +941,21 @@ impl Debuggee for BytecodeBackend {
     }
     fn supports_watch(&self) -> bool {
         true
+    }
+    /// W4 blocking stdin: append the provided bytes to the parked single-vCPU run's stdin — the
+    /// next resume re-issues the parked read against them (and the completed read joins the
+    /// session's cap tape, so a later reverse `seek` replays it faithfully).
+    fn provide_stdin(&mut self, bytes: &[u8]) -> bool {
+        if !self.block_stdin {
+            return false;
+        }
+        match &mut self.engine {
+            Engine::Single(run) => {
+                run.provide_stdin(bytes);
+                true
+            }
+            Engine::Threaded(_) => false, // declined at construction; unreachable in practice
+        }
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the

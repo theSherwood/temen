@@ -3905,6 +3905,11 @@ pub struct DebugRun {
     /// the per-op `access_of` computation is skipped entirely. Ids are owned by the caller (the DAP
     /// backend), which re-applies the set after a `seek` rebuild.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// Set when the last advance parked at a **blocking-stdin** `read` ([`Outcome::StdinPark`],
+    /// INTERACTIVE_EMBEDDING.md W4): the read did not execute and `op_clock` did not advance.
+    /// Cleared at each advance entry — the parked read re-executes on resume, so the state
+    /// re-derives (re-parks or proceeds) rather than being carried (invariant 7).
+    stdin_parked: bool,
     /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
     /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -4519,6 +4524,7 @@ impl DebugRun {
             op_clock: 0,
             funcs: std::sync::Arc::from(m.funcs.clone()),
             watchpoints: Vec::new(),
+            stdin_parked: false,
             last_watch: None,
         })
     }
@@ -4540,6 +4546,20 @@ impl DebugRun {
     /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
     pub fn op_clock(&self) -> u64 {
         self.op_clock
+    }
+
+    /// Whether the last advance parked at a **blocking-stdin** `read` (W4): the run is live and
+    /// resumable, paused at the read, and the clock did not advance. Arm the mode via
+    /// [`Host::set_stdin_blocking`](super::Host::set_stdin_blocking) on the run's host.
+    pub fn stdin_parked(&self) -> bool {
+        self.stdin_parked
+    }
+
+    /// Append stdin bytes for a parked blocking `read` ([`Host::push_stdin`](super::Host::push_stdin))
+    /// — the next advance re-issues the read against them, and the completed read joins the recorded
+    /// cap tape so a later `seek` replays it faithfully.
+    pub fn provide_stdin(&mut self, bytes: &[u8]) {
+        self.host.push_stdin(bytes);
     }
 
     /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
@@ -4638,6 +4658,7 @@ impl DebugRun {
         self.op_clock = snap.clock;
         self.done = None;
         self.at_bp = false;
+        self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
     }
 
     /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
@@ -4648,6 +4669,7 @@ impl DebugRun {
             return false;
         }
         self.at_bp = false;
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4657,6 +4679,7 @@ impl DebugRun {
             fibers,
             done,
             op_clock,
+            stdin_parked,
             ..
         } = self;
         match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
@@ -4673,6 +4696,12 @@ impl DebugRun {
                 *done = Some(Err(t));
                 false
             }
+            // Parked at a blocking-stdin read (W4): the read did not run and the clock holds —
+            // the run stays live; the driver pushes bytes and re-ticks to re-issue it.
+            FiberStep::Other(Outcome::StdinPark) => {
+                *stdin_parked = true;
+                false
+            }
             // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
             FiberStep::Other(_) => {
                 *done = Some(Err(Trap::Malformed));
@@ -4687,6 +4716,7 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4700,6 +4730,7 @@ impl DebugRun {
             fn_block_base,
             funcs,
             watchpoints,
+            stdin_parked,
             last_watch,
             ..
         } = self;
@@ -4715,6 +4746,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -4769,6 +4805,11 @@ impl DebugRun {
                     *done = Some(Err(t));
                     return None;
                 }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
+                    return None;
+                }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
                 FiberStep::Other(_) => {
                     *done = Some(Err(Trap::Malformed));
@@ -4785,6 +4826,7 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4795,6 +4837,7 @@ impl DebugRun {
             at_bp,
             done,
             op_clock,
+            stdin_parked,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
@@ -4808,6 +4851,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.

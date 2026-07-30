@@ -288,6 +288,11 @@ pub enum StopReason {
     /// [`Inspector::read_ir_value`]); `step` once to perform the call and see its results. This is
     /// the boundary W1 record/replay will hook (DEBUGGING.md S5).
     CapCall { type_id: u32, op: u32 },
+    /// Parked at a **blocking-stdin** `read` on an exhausted buffer
+    /// ([`Host::set_stdin_blocking`], INTERACTIVE_EMBEDDING.md W4). The read did **not** execute
+    /// and the clock did not advance; push bytes (the DAP `provideStdin` request) and resume —
+    /// the parked read re-issues against them.
+    StdinPark,
 }
 
 /// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
@@ -15747,14 +15752,19 @@ impl Host {
                 ),
             };
             if let Some(rec) = &mut self.cap_record {
-                rec.push(CapRecord {
-                    type_id,
-                    op,
-                    handle,
-                    args: args.to_vec(),
-                    result: result.clone(),
-                    mem_writes,
-                });
+                // A parked blocking-stdin read (W4) is a placeholder the driver discards and
+                // re-issues — taping it would replay as a phantom EOF. Only the re-issued
+                // (completed) read joins the tape.
+                if !self.stdin_parked {
+                    rec.push(CapRecord {
+                        type_id,
+                        op,
+                        handle,
+                        args: args.to_vec(),
+                        result: result.clone(),
+                        mem_writes,
+                    });
+                }
             }
             return result;
         }
