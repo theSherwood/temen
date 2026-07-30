@@ -22,11 +22,20 @@ identical until the next agent edit.
 > (`cp .github/workflows_src/*.yml .github/workflows/`) and this section is drained. The guard only
 > starts enforcing once it is itself copied into `.github/workflows/ci.yml` for the first time.
 
-*(none — the two directories are in sync as of 2026-07-30, when the whole backlog below was
-copied over: the `workflows-in-sync` guard, nightly-only `miri`, `cross-os`
-`CARGO_PROFILE_TEST_DEBUG: "0"`, the `playground-assets` job + the `pages.yml` reachability step,
-the `bench_chibicc_jit.mjs` / `browser-shell-test.mjs` / chibicc-asset browser steps, the hardened
-`embench` fetch, and the full-`fuzz_targets` matrix.)*
+- **`cc1-self-compile` job** — a new dedicated Linux job running the heavy, `#[ignore]`d cc1
+  self-compile differential (`cargo test -p svm --test c_link -- --ignored self_compiles`). It
+  `make`s chibicc, links + verifies the whole cc1, runs it on the tree-walk interpreter and the JIT,
+  and diffs the guest-emitted IR against a native `clang`-built reference — for a base program, an
+  `#include`-from-memfs program, and a feature-diverse corpus. Until now nothing in CI ran the
+  `--ignored` heavy tests, so this differential never gated merges (SELFHOST_C.md §5 E's "wire the
+  differential into CI"). The job installs `clang` (the reference compiler), drops test debug info
+  and caps `-j 2` for the I30 OOM guard, and runs parallel to the other jobs so it gates without
+  serializing into the `check` critical path.
+
+*(Previously drained 2026-07-30, when the whole backlog was copied over: the `workflows-in-sync`
+guard, nightly-only `miri`, `cross-os` `CARGO_PROFILE_TEST_DEBUG: "0"`, the `playground-assets` job +
+the `pages.yml` reachability step, the `bench_chibicc_jit.mjs` / `browser-shell-test.mjs` /
+chibicc-asset browser steps, the hardened `embench` fetch, and the full-`fuzz_targets` matrix.)*
 
 > **Reminder for whoever drains this next:** `miri` no longer runs on PRs. If it is still listed as
 > a *required* status check in branch protection, remove it there — a skipped required check blocks
