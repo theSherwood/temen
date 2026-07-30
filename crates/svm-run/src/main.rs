@@ -46,6 +46,9 @@ fn try_main() -> Result<(), String> {
     let mut file: Option<String> = None;
     // `--link` (D-LINK): statically link several units (`.svm`/`.svmo`/`.svmb`) into one module.
     let mut link = false;
+    // `--assemble`: text unit → binary object (`.svmo`), the tiny assembler for frontends that
+    // emit text (chibicc `--emit-object`), so anything that links can move binary objects around.
+    let mut assemble = false;
     let mut link_files: Vec<String> = Vec::new();
     let mut stdin_path: Option<String> = None;
     // Everything after a `--` is the guest's own argument vector (the §3e args buffer): it becomes
@@ -77,6 +80,7 @@ fn try_main() -> Result<(), String> {
                 stdin_path = Some(it.next().ok_or("--stdin needs a file argument")?.clone())
             }
             "--link" => link = true,
+            "--assemble" => assemble = true,
             "--specialize" => specialize = true,
             "--func" => func = parse_u64v(it.next().ok_or("--func needs an index")?)? as u32,
             "--arg" => spec_args.push(parse_arg(it.next().ok_or("--arg needs a binding")?)?),
@@ -108,6 +112,19 @@ fn try_main() -> Result<(), String> {
                 }
             }
         }
+    }
+    if assemble {
+        if link {
+            return Err("--assemble and --link are mutually exclusive".into());
+        }
+        let [unit] = link_files.as_slice() else {
+            return Err("--assemble takes exactly one text unit (.svm)".into());
+        };
+        let out = out_path.ok_or("--assemble needs -o OUT.svmo")?;
+        let text = fs::read_to_string(unit).map_err(|e| format!("read `{unit}`: {e}"))?;
+        let m = svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"))?;
+        fs::write(&out, svm_encode::encode_unit(&m)).map_err(|e| format!("write `{out}`: {e}"))?;
+        return Ok(());
     }
     if link {
         if link_files.is_empty() {
@@ -330,6 +347,9 @@ fn print_usage() {
          \n  Units are text IR or binary objects (`.svmo`, the v9 object dialect); each unit's\n\
          \n  export tables are its link symbols. The linked module is re-verified, then written\n\
          \n  (-o, text or binary by extension) or printed (--emit-text).\n\
+         \n  svm-run --assemble <unit.svm> -o OUT.svmo\n\
+         \n  assembles one text unit to a binary object (for text-emitting frontends, e.g.\n\
+         \n  chibicc --emit-object).\n\
          \n\
          \nspecialize (§20c first Futamura projection): turn an interpreter + a fixed program into\n\
          \nthe compiled residual.\n\

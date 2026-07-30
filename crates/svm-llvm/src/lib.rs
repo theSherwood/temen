@@ -1152,7 +1152,7 @@ fn translate_impl(
             imports,
             // First-class function exports: each defined function's name → its final `module.funcs`
             // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
-            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source). When a
+            // Mirrors the in-memory `Translated::exports`. When a
             // powerbox `_start` was synthesized, export it at funcidx 0 too — the named-entry marker
             // the runtime keys off (S15 (c): a paramless `_start` is tagged by its export, not params).
             exports: {

@@ -4122,12 +4122,13 @@ pub extern "C" fn svm_run_shell(
 }
 
 /// **In-browser link + run of a frontend-emitted program** (docs/SVM_BROWSER_PLAN.md option (b)):
-/// the live-editing path, language-agnostic. Given a **program** module as SVM-IR **text**, a
-/// **library** module as SVM-IR text (its exports inline — e.g. a language runtime blob), and the
-/// name of the export to run, this parses both, links them (`link_with_manifest`), wraps the named
-/// entry in a powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same
-/// on-ramp powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native
-/// link/encode step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
+/// the live-editing path, language-agnostic. Given a **program** unit and a **library** unit —
+/// each either SVM-IR **text** or a **binary object** (`.svmo` bytes, the v9 object dialect;
+/// told apart by the `SVM\0` magic, so the two params mix freely) — and the name of the export
+/// to run, this loads both, links them (`link_with_manifest`), wraps the named entry in a
+/// powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same on-ramp
+/// powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native link/encode
+/// step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
 /// `svm_status`, `svm_exit_code`).
 ///
 /// This is the generic browser counterpart to the native link path: **nothing here is specific to
@@ -4159,20 +4160,6 @@ pub extern "C" fn svm_link_run(
             unsafe { core::slice::from_raw_parts(p, n) }
         }
     };
-    let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
-        Ok(s) => s,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
-    };
-    let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
-        Ok(s) => s,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
-    };
     let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
         Ok(s) => s,
         Err(_) => {
@@ -4182,16 +4169,26 @@ pub extern "C" fn svm_link_run(
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
-    let program = match svm_text::parse_module(prog_text) {
-        Ok(m) => m,
-        Err(_) => {
+    // A unit is binary iff it opens with the container magic (`SVM\0`) — text IR can't start
+    // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
+    // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
+    let load_unit = |bytes: &[u8]| -> Option<svm_ir::Module> {
+        if bytes.starts_with(b"SVM\0") {
+            svm_encode::decode_unit(bytes).ok()
+        } else {
+            svm_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+        }
+    };
+    let program = match load_unit(slice(prog_ptr, prog_len)) {
+        Some(m) => m,
+        None => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    let lib = match svm_text::parse_module(lib_text) {
-        Ok(m) => m,
-        Err(_) => {
+    let lib = match load_unit(slice(lib_ptr, lib_len)) {
+        Some(m) => m,
+        None => {
             set(STATUS_DECODE_ERR);
             return 0;
         }

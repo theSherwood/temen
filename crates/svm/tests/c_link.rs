@@ -39,6 +39,34 @@ use std::sync::OnceLock;
 use svm_interp::Value;
 use svm_ir::{link, LinkUnit};
 
+/// Turn an emit-object module into the `LinkUnit` the linker consumes — **via the binary object
+/// wire** (`.svmo`, the v9 object dialect): encode with `encode_unit`, re-decode with
+/// `decode_unit` (asserting round-trip identity on the real compiler output), and build the
+/// export maps from the re-decoded module's in-band tables. Every chibicc-emitted unit in these
+/// tests therefore travels the same bytes an on-disk object would — a unit the object dialect
+/// can't carry fails here, not in a downstream consumer.
+fn unit_via_svmo(m: svm_ir::Module, tag: &str) -> LinkUnit {
+    let bytes = svm_encode::encode_unit(&m);
+    let re =
+        svm_encode::decode_unit(&bytes).unwrap_or_else(|e| panic!("decode {tag} object: {e:?}"));
+    assert_eq!(m, re, "object wire changed the {tag} unit");
+    let exports = re
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    let data_exports = re
+        .data_exports
+        .iter()
+        .map(|e| (e.name.clone(), e.offset))
+        .collect();
+    LinkUnit {
+        module: re,
+        exports,
+        data_exports,
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -112,17 +140,7 @@ fn emit_object_real(cfile: &Path, include_dirs: &[PathBuf], tag: &str) -> LinkUn
     assert!(status.success(), "chibicc --emit-object failed on {tag}");
     let ir = std::fs::read_to_string(&irfile).unwrap();
     let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse {tag}: {e:?}"));
-    let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
-    let data_exports = m
-        .data_exports
-        .iter()
-        .map(|e| (e.name.clone(), e.offset))
-        .collect();
-    LinkUnit {
-        module: m,
-        exports,
-        data_exports,
-    }
+    unit_via_svmo(m, tag)
 }
 
 /// Compile one of chibicc's **own** upstream source files (`frontend/chibicc/<name>`) to a linkable
@@ -193,20 +211,9 @@ fn object_unit(tag: &str, src: &str) -> LinkUnit {
 
     let ir = std::fs::read_to_string(&irfile).unwrap();
     let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse {tag} unit: {e:?}\n{ir}"));
-    let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
-    // Cross-TU *data* symbols: a non-`static` global defined here (`export … data`) that another
-    // unit reads via `data.sym`/`data.ptr … sym`. The linker places this unit's data at its window
-    // base and records each symbol's absolute address for the consumers.
-    let data_exports = m
-        .data_exports
-        .iter()
-        .map(|e| (e.name.clone(), e.offset))
-        .collect();
-    LinkUnit {
-        module: m,
-        exports,
-        data_exports,
-    }
+    // Cross-TU *data* symbols (`export … data` → `data.sym`/`data.ptr … sym`) ride the unit's
+    // in-band tables through the object wire like everything else.
+    unit_via_svmo(m, tag)
 }
 
 /// Compile a crafted fixture `.c` file (repo-relative path) to a linkable unit via `--emit-object`.
