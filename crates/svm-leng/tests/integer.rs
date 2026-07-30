@@ -53,6 +53,56 @@ fn suffixed_literals() {
 }
 
 #[test]
+fn bitwise_and_shift_ops() {
+    // nimony's arithmetics: bitand/bitor/bitxor/shl/shr/bitnot, same (Type a b) shape as arith.
+    // ((0xF0 & 0x3C) | 0x01) = 0x30 | 1 = 0x31; (0x31 ^ 0x0F) = 0x3E; (0x3E << 2) = 0xF8;
+    // (0xF8 >> 3) = 0x1F = 31.
+    let leng = "\
+(stmts
+ (proc :main.0 . (i +64) .
+  (stmts .
+   (ret (shr (u +64)
+     (shl (i +64)
+       (bitxor (i +64)
+         (bitor (i +64) (bitand (i +64) 240 60) 1)
+         15)
+       2)
+     3)))))";
+    assert_eq!(run_i64(leng, 0, &[]), 31);
+}
+
+#[test]
+fn bitnot_and_logical_not() {
+    // bitnot: ~0 = -1. not: logical negation of a bool (0/1).
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (bitnot (i +64) 0)))))",
+            0,
+            &[]
+        ),
+        -1
+    );
+    // not(3 == 4) = not(false) = true = 1.
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (not (eq 3 4))))))",
+            0,
+            &[]
+        ),
+        1
+    );
+    // not(2 == 2) = not(true) = false = 0.
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (not (eq 2 2))))))",
+            0,
+            &[]
+        ),
+        0
+    );
+}
+
+#[test]
 fn params_and_locals() {
     // addup(a, b): int = (var t = b*2; a + t)
     let leng = "\

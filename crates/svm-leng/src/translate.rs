@@ -996,12 +996,13 @@ impl Translator {
         Ok(out)
     }
 
-    /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at.
+    /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at. A `void`/opaque pointee has
+    /// no typed target (a `deref` of it fail-closes), so it yields `None`.
     fn pointee_desc(&self, node: &Node) -> Result<Option<TyDesc>, LengError> {
         match node.tag() {
             Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) => Ok(Some(self.tydesc(t)?)),
-                None => Ok(None),
+                Some(t) if t.tag() != Some("void") => Ok(Some(self.tydesc(t)?)),
+                _ => Ok(None),
             },
             _ => Ok(None),
         }
@@ -2322,7 +2323,39 @@ impl<'a> FuncGen<'a> {
             }
             Node::List(_) => match e.tag() {
                 Some(op @ ("add" | "sub" | "mul" | "div" | "mod")) => self.arith(op, e),
+                Some(op @ ("bitand" | "bitor" | "bitxor" | "shl" | "shr" | "ashr")) => {
+                    self.bitwise(op, e)
+                }
                 Some(op @ ("eq" | "neq" | "lt" | "le")) => self.compare(op, e),
+                Some("bitnot") => {
+                    // Bitwise complement `(bitnot T x)` — `x xor -1` at the type's width.
+                    let a = e.args();
+                    if a.len() != 2 {
+                        return Err(LengError::Malformed(
+                            "bitnot needs Type and one operand".into(),
+                        ));
+                    }
+                    let (ty, _) = int_ty_signed(&a[0])?;
+                    let x = self.expr_typed(&a[1], ty)?;
+                    let ones = self.emit_const(ty, -1);
+                    Ok(self.emit_bin("xor", ty, x, ones))
+                }
+                Some("not") => {
+                    // Logical `not` on a bool (i32 0/1): `x == 0`, an i32 0/1.
+                    let x = self.expr(&e.args()[0])?;
+                    let zero = self.emit_const(x.ty, 0);
+                    let id = self.fresh();
+                    self.cur_buf.push_str(&format!(
+                        "  v{id} = {}.eq v{} v{}\n",
+                        prefix(x.ty),
+                        x.id,
+                        zero.id
+                    ));
+                    Ok(Val {
+                        id,
+                        ty: ValType::I32,
+                    })
+                }
                 Some("neg") => {
                     let a = e.args();
                     let ty = val_ty(&a[0])?;
@@ -2483,6 +2516,32 @@ impl<'a> FuncGen<'a> {
                     "rem_u"
                 }
             }
+            _ => unreachable!(),
+        };
+        Ok(self.emit_bin(name, ty, l, r))
+    }
+
+    /// `(bitand|bitor|bitxor|shl|shr|ashr Type Expr Expr)` — bitwise/shift, same `(Type a b)` shape
+    /// as [`arith`]. `shr` is logical for unsigned types, arithmetic for signed; `ashr` is always
+    /// arithmetic.
+    fn bitwise(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
+        let a = e.args();
+        if a.len() != 3 {
+            return Err(LengError::Malformed(format!(
+                "`{op}` needs Type and two operands"
+            )));
+        }
+        let (ty, signed) = int_ty_signed(&a[0])?;
+        let l = self.expr_typed(&a[1], ty)?;
+        let r = self.expr_typed(&a[2], ty)?;
+        let name = match op {
+            "bitand" => "and",
+            "bitor" => "or",
+            "bitxor" => "xor",
+            "shl" => "shl",
+            "shr" if signed => "shr_s",
+            "shr" => "shr_u",
+            "ashr" => "shr_s",
             _ => unreachable!(),
         };
         Ok(self.emit_bin(name, ty, l, r))
