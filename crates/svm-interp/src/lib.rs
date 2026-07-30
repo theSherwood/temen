@@ -3850,6 +3850,18 @@ struct Sched {
     /// calls another server) does exactly that, and keying by the bare ticket would let the second
     /// park clobber the first's waiter (I49).
     ticket_waiters: BTreeMap<(usize, u64), Waiter>,
+    /// I40 — `(callee domain id, dispatch ticket)` whose **caller died before it could claim the
+    /// reply**. A dispatch outlives its caller when the caller is reaped (its domain torn down)
+    /// with a call still in flight: the callee later serves it and replies, but nobody will ever
+    /// claim the value, so `cap_reply_or_stash` would stash an entry into the callee's
+    /// `svc_results` that nothing removes — an unbounded leak on a long-lived server as child
+    /// callers come and go. Recorded wherever a caller with an outstanding dispatch is reaped
+    /// (the `CapReply` park gate and [`teardown_domain`]'s caller sweep) and consumed — dropped
+    /// instead of stashed — at the reply site. Tickets are unique per run (monotone
+    /// `svc_next_ticket`), so a recorded key can never match a live dispatch. Swept for a callee
+    /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
+    /// call volume.
+    orphan_tickets: BTreeSet<(usize, u64)>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -4049,6 +4061,11 @@ impl Scheduler {
                 }
             }
             None => {
+                // I40: the caller was reaped with this call in flight — drop the reply instead of
+                // stashing an entry into `svc_results` that nothing will ever claim.
+                if s.orphan_tickets.remove(&(callee_id, ticket)) {
+                    return;
+                }
                 callee
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -4239,6 +4256,9 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
         return; // already down (a second member's trap raced the sweep)
     }
     s.dead.insert(key, reason.clone());
+    // I40: any orphaned reply destined *for* this domain (as a callee) will never arrive now —
+    // its handler is being torn down — so its recorded orphan entry can never be consumed. Drop it.
+    s.orphan_tickets.retain(|(callee, _)| *callee != key);
     let mut victims: Vec<Box<VCpu>> = Vec::new();
     let runnable = std::mem::take(&mut s.runnable);
     for v in runnable {
@@ -4290,8 +4310,9 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
         }
     }
     s.cap_waiters.retain(|_, q| !q.is_empty());
-    // Members parked as *callers* through some other domain die too (their tickets there go
-    // unclaimed — the callee's eventual reply finds no waiter and stashes, harmlessly).
+    // Members parked as *callers* through some other domain die too. The callee's eventual reply
+    // will find no waiter here — I40: record the ticket as an orphan so the reply is dropped at its
+    // stash site instead of leaking an unclaimable `svc_results` entry on the (surviving) callee.
     let tw = std::mem::take(&mut s.ticket_waiters);
     for (k, w) in tw {
         let member = match &w {
@@ -4302,6 +4323,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             if let Waiter::VCpu(v) = w {
                 victims.push(v);
             }
+            s.orphan_tickets.insert(k);
         } else {
             s.ticket_waiters.insert(k, w);
         }
@@ -4861,6 +4883,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             let mut s = sched.lock();
             // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
             let Some(mut v) = park_gate(&mut s, v) else {
+                // I40: the caller's domain was torn down in the enqueue→park window, so it never
+                // registered a waiter — but its dispatch is queued on the (live) callee and will be
+                // served. Record the ticket as an orphan so the reply is dropped, not leaked. (A
+                // dead callee never replies; its queue was already drained, so skip it.)
+                let callee_id =
+                    callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                if !s.dead.contains_key(&callee_id) {
+                    s.orphan_tickets.insert((callee_id, ticket));
+                }
                 sched.work.notify_all();
                 return;
             };
@@ -18307,6 +18338,91 @@ mod region_minter_tests {
         let plain = host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
         let region = host.grant_host_fn_region(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(plain >= 0 && region >= 0 && plain != region);
+    }
+}
+
+#[cfg(test)]
+mod orphan_reply_tests {
+    //! I40 — a completed dispatch whose caller died before claiming must have its reply **dropped**,
+    //! not stashed into the callee's `svc_results` where nothing would ever remove it. These pin the
+    //! consume side of the fix directly on [`Scheduler::cap_reply_or_stash`]: a live reply is stashed
+    //! for its caller; a reply for a ticket recorded in `orphan_tickets` (the caller was reaped with
+    //! the call in flight) is dropped and the record consumed. The invariant that matters is *never
+    //! drop a live caller's reply* — tickets are unique per run, so only a genuinely-dead caller's
+    //! ticket is ever recorded.
+    use super::*;
+
+    #[test]
+    fn a_dead_callers_reply_is_dropped_but_a_live_ones_is_stashed() {
+        let sched = Scheduler::new(16, 1);
+        let callee = Arc::new(Mutex::new(Host::new()));
+        let cid = callee.lock().unwrap().domain_id() as usize;
+
+        // Live caller (no orphan record): the reply is stashed in the completion cell to claim.
+        sched.cap_reply_or_stash(1, 99, &callee);
+        assert_eq!(
+            callee.lock().unwrap().svc_result(1),
+            Some(99),
+            "a live caller's reply must be stashed for it to claim"
+        );
+
+        // Dead caller (ticket 2 recorded as an orphan when it was reaped): the reply is dropped, so
+        // nothing accumulates in `svc_results`, and the one-shot orphan record is consumed.
+        sched.lock().orphan_tickets.insert((cid, 2));
+        sched.cap_reply_or_stash(2, 42, &callee);
+        assert_eq!(
+            callee.lock().unwrap().svc_result(2),
+            None,
+            "a dead caller's reply must be dropped, not leaked into svc_results"
+        );
+        assert!(
+            sched.lock().orphan_tickets.is_empty(),
+            "the orphan record must be consumed by the drop"
+        );
+
+        // An orphan record for a *different* callee must not affect this one (the key includes the
+        // callee domain — two callees can share a ticket number).
+        sched.lock().orphan_tickets.insert((cid + 1, 3));
+        sched.cap_reply_or_stash(3, 7, &callee);
+        assert_eq!(
+            callee.lock().unwrap().svc_result(3),
+            Some(7),
+            "an orphan keyed on a different callee must not drop this callee's live reply"
+        );
+    }
+
+    #[test]
+    fn tearing_down_a_caller_domain_records_its_outstanding_ticket_and_sweeps_its_own() {
+        let sched = Scheduler::new(16, 1);
+        let dying = Arc::new(Mutex::new(Host::new()));
+        let dying_key = dying.lock().unwrap().domain_id() as usize;
+        // The dying domain is parked as a caller awaiting a *surviving* callee's reply, and also owns
+        // an orphan recorded against *itself* as a callee (a stale record whose reply can't come once
+        // it dies). A `Waiter::Fiber` stands in for a parked caller (cheap; no full vCPU needed).
+        let surviving_callee = dying_key + 1;
+        {
+            let mut s = sched.lock();
+            s.ticket_waiters.insert(
+                (surviving_callee, 5),
+                Waiter::Fiber {
+                    reg: Arc::new(FiberRegistry::new()),
+                    slot: 0,
+                    svc: dying_key, // this parked caller belongs to the dying domain
+                },
+            );
+            s.orphan_tickets.insert((dying_key, 9)); // an orphan *for* the dying domain as callee
+
+            teardown_domain(&mut s, dying_key, &Trap::ThreadFault, &dying);
+
+            assert!(
+                s.orphan_tickets.contains(&(surviving_callee, 5)),
+                "the dead caller's in-flight ticket must be recorded so the callee drops its reply"
+            );
+            assert!(
+                !s.orphan_tickets.contains(&(dying_key, 9)),
+                "an orphan awaiting the now-dead domain as callee must be swept (its reply can't come)"
+            );
+        }
     }
 }
 
