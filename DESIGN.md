@@ -2604,6 +2604,15 @@ The same mechanism serves `thread.spawn` entries. Pinned by
 `jit_cap::submitted_unit_fibers_over_its_own_func_agrees` (differential). Threads-in-a-submitted-unit
 remain deferred.
 
+**Powerbox hosts fibers (2026-07-30).** The CLI powerbox (`grant_powerbox_prefix`) is the maximal grant,
+so its `Jit` cap now opts into fiber hosting (`set_jit_hosts_fibers(true)`), and `powerbox_compile_run`
+calls `enable_fiber_hosting` on the top-level module after compile (idempotent when the top-level already
+uses `cont.*`). A submitted unit can therefore run its own cooperative scheduler *even when the top-level
+program uses no fibers of its own* — the concrete consumer is jacl's in-guest `[interpret …]` of concurrent
+source (spawn/await): the bridge codegens a scheduler-entry unit (arity-2, body run on a `cont.*` root fiber)
+whose funcref is a unit-own install (above), and the powerbox stands up the fiber runtime it resolves against.
+Threads/futex in the unit stay rejected; the grant only adds in-domain stack switches, no escape-TCB surface.
+
 ### Code reclaim — whole-module compaction
 
 `cranelift-jit`'s `JITModule` has **no per-function free**: every incremental `define_extra` consumes the
