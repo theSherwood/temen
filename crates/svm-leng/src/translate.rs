@@ -891,7 +891,7 @@ impl Translator {
                     let sret = self.ret_sret(&item.args()[2])?;
                     let ret = if sret.is_some() { None } else { ret0 };
                     let index = proc_nodes.len() as u32;
-                    let needs_frame = proc_needs_frame(item);
+                    let needs_frame = self.proc_needs_frame(item);
                     self.procs.insert(
                         name.clone(),
                         Sig {
@@ -918,12 +918,68 @@ impl Translator {
                 }
             }
         }
+        self.propagate_frames(&proc_nodes)?;
         let mut out = String::new();
         let mut used_memory = false;
         for p in &proc_nodes {
             used_memory |= self.proc_body(p, &mut out)?;
         }
         Ok((self.assemble(used_memory, out), names))
+    }
+
+    /// **Transitive frame propagation.** A proc that calls a frame-needing proc must itself own an
+    /// `$sp` (to hand a fresh sub-frame down), so it is frame-needing too. Iterate the call graph to
+    /// a fixpoint over the registered proc sigs. (Externals/imports don't take `$sp`, so a call to
+    /// one never forces a frame.)
+    fn propagate_frames(&mut self, nodes: &[&Node]) -> Result<(), LengError> {
+        loop {
+            let mut to_frame = Vec::new();
+            for node in nodes {
+                let name = sym_def(&node.args()[0])?;
+                if self.procs.get(&name).map_or(true, |s| s.needs_frame) {
+                    continue;
+                }
+                if let Some(b) = node.args().get(4) {
+                    if body_calls_framed(b, &self.procs) {
+                        to_frame.push(name);
+                    }
+                }
+            }
+            if to_frame.is_empty() {
+                return Ok(());
+            }
+            for name in to_frame {
+                if let Some(s) = self.procs.get_mut(&name) {
+                    s.needs_frame = true;
+                }
+            }
+        }
+    }
+
+    /// A proc's **own** frame need — computed exactly as `proc_body` decides `frame_size > 0`, so the
+    /// two never disagree: a `(var …)` is frame-resident iff it is a true aggregate (`object`/`array`,
+    /// via `tydesc` — a scalar enum/distinct named type is not) *or* its address is taken; plus any
+    /// aggregate-rvalue argument temp. An address-taken **global/param** does not frame the proc
+    /// (globals live in the data segment, aggregate params are already by-address).
+    fn proc_needs_frame(&self, p: &Node) -> bool {
+        let body = match p.args().get(4) {
+            Some(b) => b,
+            None => return false,
+        };
+        let mut addr = std::collections::HashSet::new();
+        collect_addr_taken(body, &mut addr);
+        let mut var_descs = Vec::new();
+        let mut pointee = HashMap::new();
+        if self
+            .collect_var_descs(body, &mut var_descs, &mut pointee)
+            .is_err()
+        {
+            return true; // be conservative if the body doesn't scan cleanly
+        }
+        let framed_var = var_descs
+            .iter()
+            .any(|(vn, d)| matches!(d, TyDesc::Agg(_)) || addr.contains(vn));
+        framed_var || self.agg_temp_bytes(body) > 0
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -950,7 +1006,7 @@ impl Translator {
             let (n, params, ret0) = self.proc_sig(item)?;
             let sret = self.ret_sret(&item.args()[2])?;
             let ret = if sret.is_some() { None } else { ret0 };
-            let needs_frame = proc_needs_frame(item);
+            let needs_frame = self.proc_needs_frame(item);
             self.procs.insert(
                 n,
                 Sig {
@@ -1004,12 +1060,13 @@ impl Translator {
                     index: index as u32,
                     params,
                     ret,
-                    needs_frame: proc_needs_frame(node),
+                    needs_frame: self.proc_needs_frame(node),
                     sret,
                 },
             );
             selected.push(node);
         }
+        self.propagate_frames(&selected)?;
         let mut out = String::new();
         let mut used_memory = false;
         for node in &selected {
@@ -1222,7 +1279,13 @@ impl Translator {
         if let Some(b) = body {
             frame_size += self.agg_temp_bytes(b);
         }
-        let needs_frame = frame_size > 0;
+        // A proc is frame-needing if it holds a frame/temp *or* its (propagated) sig says so — i.e.
+        // it calls a frame-needing proc and must own an `$sp` to hand down (`propagate_frames`).
+        let sig_framed = self
+            .procs
+            .get(&sym_def(&a[0])?)
+            .is_some_and(|s| s.needs_frame);
+        let needs_frame = frame_size > 0 || sig_framed;
         let has_sret = sret_desc.is_some();
 
         // SSA slots (block-parameter set): [$sp] ++ [$sret] ++ params ++ non-framed scalar vars.
@@ -3146,32 +3209,20 @@ fn is_float(t: ValType) -> bool {
     matches!(t, ValType::F32 | ValType::F64)
 }
 
-/// A proc needs a frame iff it takes the address of a local, or declares an aggregate-typed local
-/// (indexed by `at`/`dot`, hence frame-resident). Kept in sync with `proc_body`'s frame decision.
-fn proc_needs_frame(p: &Node) -> bool {
-    let body = match p.args().get(4) {
-        Some(b) => b,
-        None => return false,
-    };
-    let mut addr = std::collections::HashSet::new();
-    collect_addr_taken(body, &mut addr);
-    !addr.is_empty() || has_aggregate_var(body)
-}
-
-/// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
-fn has_aggregate_var(node: &Node) -> bool {
-    if let Node::List(_) = node {
-        if node.tag() == Some("var") {
-            let a = node.args();
-            if a.len() >= 3 && matches!(&a[2], Node::Atom(s) if s != ".") {
+/// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
+/// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
+fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>) -> bool {
+    if node.tag() == Some("call") {
+        if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
+            if procs.get(callee).is_some_and(|s| s.needs_frame) {
                 return true;
             }
         }
-        return node.args().iter().any(has_aggregate_var);
     }
-    false
+    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs)))
 }
 
+/// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
 /// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
 fn collect_labels(node: &Node, out: &mut Vec<String>) {
     if let Node::List(_) = node {

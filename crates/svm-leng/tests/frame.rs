@@ -91,3 +91,28 @@ fn addr_of_non_frame_is_fail_closed_via_pure_proc() {
         "pure proc keeps its plain signature:\n{text}"
     );
 }
+
+#[test]
+fn frameless_caller_of_framed_callee_gets_a_frame() {
+    // `callee` holds an aggregate local, so it needs a frame ($sp). `caller` has no frame of its
+    // own, but calling `callee` means it must own an $sp to hand a fresh sub-frame down — transitive
+    // frame propagation makes `caller` frame-needing too. Without it, this fails to translate.
+    let leng = "\
+(stmts
+ (type :P.0. . (object . (fld :a.0 . (i +64))))
+ (proc :callee.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :p.0 . P.0. .)
+   (asgn (dot p.0 a.0 0) n.0)
+   (ret (dot p.0 a.0 0))))
+ (proc :caller.0 (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (call callee.0 x.0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // Both are frame-needing now: caller ($sp, x) -> i64.
+    assert_eq!(
+        run(&m, 1, &[8192, 5]),
+        5,
+        "caller threads a sub-frame to callee"
+    );
+    assert_eq!(run(&m, 1, &[8192, 42]), 42);
+}
