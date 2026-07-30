@@ -496,6 +496,34 @@ impl Translator {
     /// literal** lowers: nimony emits it as a `const` `LongString` blob that the `string` value's
     /// `more` field points at (`(addr strlit…)`), NIM.md W2.
     fn const_aggregate_bytes(&self, val: &Node) -> Result<Option<(Vec<u8>, TyDesc)>, LengError> {
+        // An **array constructor** `(aconstr ArrayType elem0 elem1 …)` — a `const` table (e.g.
+        // `fsLookupTable`, 256 `i8`s). Each scalar-int element writes at `i * elem_size`.
+        if val.tag() == Some("aconstr") {
+            let a = val.args();
+            let tyname = match a.first().and_then(|n| n.as_atom()) {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+            let (elem_size, total) = match self.types.get(tyname) {
+                Some(Layout::Array {
+                    elem_size, size, ..
+                }) => (*elem_size as usize, *size as usize),
+                _ => return Ok(None),
+            };
+            let w = elem_size.min(8);
+            let mut bytes = vec![0u8; total];
+            for (i, v) in a[1..].iter().enumerate() {
+                let n = match int_literal(v) {
+                    Some(n) => n,
+                    None => return Ok(None),
+                };
+                let off = i * elem_size;
+                if off + w <= bytes.len() {
+                    bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
+                }
+            }
+            return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))));
+        }
         if val.tag() != Some("oconstr") {
             return Ok(None);
         }

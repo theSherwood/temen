@@ -154,6 +154,25 @@ fn real_long_string_runs_end_to_end() {
 }
 
 #[test]
+fn const_array_table_indexes() {
+    // A `const` array table `(aconstr T e0 e1 …)` — like `system`'s `fsLookupTable` (256 i8s) —
+    // materializes into a data segment; `(at table idx)` reads an element. Here a small i8 table
+    // [-1, 5, 100, -3]; `nth(i)` returns the signed element.
+    let leng = "\
+(stmts
+ (type :Tbl.0. . (array (i 8) 4))
+ (const :tbl.0. . Tbl.0. (aconstr Tbl.0. (suf -1 \"i8\") (suf 5 \"i8\") (suf 100 \"i8\") (suf -3 \"i8\")))
+ (proc :nth.0. (params (param :i.0 . (i +64))) (i +64) .
+  (stmts . (ret (conv (i +64) (at tbl.0. i.0))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    assert_eq!(run(&m, 0, &[0]), -1, "tbl[0]");
+    assert_eq!(run(&m, 0, &[1]), 5, "tbl[1]");
+    assert_eq!(run(&m, 0, &[2]), 100, "tbl[2]");
+    assert_eq!(run(&m, 0, &[3]), -3, "tbl[3] sign-extended");
+}
+
+#[test]
 fn flexarray_data_indexing() {
     // `LongString.data` is an inline `uarray char` — a flexible array whose own address is the base.
     // `nth(p, i) = (deref p).data[i]`, read as a byte. Indexes off `p + 24` (data@24), no pointer
