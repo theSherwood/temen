@@ -186,25 +186,34 @@ supplying that reloaded Leaf result** (§3) — the freeze/flatten path already 
 the caller's domain (and only it) must be durable-transformed; `clone_caller`'s capture reuses the
 `flatten_fiber_for_freeze` Leaf spill rather than inventing a new continuation format.
 
-**Finding B — the capture is cross-vCPU.** The servicer (child) runs `clone_caller` in *its* eval loop,
-but the parked caller is a *different domain*'s vCPU (the parent/forking guest — bash). `ticket_waiters`
-hands the servicer `Waiter::Fiber { reg, slot }` = an `Arc<FiberRegistry>` + slot into the **caller's**
-registry, but *not* the caller vCPU's `mem`/window/`durable_sp_ctx` — which the Leaf flatten needs (it
-spills into the caller's shadow region and requires the caller's window in `UNWINDING`). `freeze_drive`
-is single-vCPU (`self`), so increment 2's new primitive is a **targeted single-fiber flatten that reaches
-the caller vCPU's window**, not `self`'s. Options to get there (decide at build time, simplest that holds):
-  1. Route the capture through the scheduler, which owns every vCPU: the servicer asks the scheduler to
-     run a one-fiber flatten on the *caller's* parked vCPU (its `mem` + registry), transiently under
-     `UNWINDING`, then hand back the window image + `FrozenFiber` residue.
-  2. Or: single-vCPU harness first — construct the parked caller as a **fiber in the servicer's own
-     vCPU** (a `cont` that called an offer and parked on `CapReply` in the same domain), so `self.mem`
-     *is* the caller's window and `flatten_fiber_for_freeze(slot, frames, injected_reply)` applies almost
-     directly (save/restore `self.frames/cur/chain/parked_frames/durable_sp_ctx` around the sub-run,
-     since the live servicer's own state must not be clobbered). This proves the flatten+reload+inject
-     round-trip with no cross-vCPU plumbing; the cross-vCPU reach (option 1) is a follow-up before the
-     real personality wiring. **Start here** — it is the honest smallest step for the *soundness* change.
+**Finding B — the parked caller *is* a self-contained vCPU (the clean path).** A caller is registered in
+`ticket_waiters[(callee_id, ticket)]` in **two** forms (`svm-interp` `Step::Park(CapReply)` at `:4879` and
+the generic-arm fiber park at `:8929`):
+  - a **root** caller → `Waiter::VCpu(v)` — the *entire* parked vCPU, holding its **own** `v.mem` (window),
+    `v.frames` (the continuation sitting inside the pending `cap.call`), and durable state;
+  - a **non-root fiber** caller → `Waiter::Fiber { reg, slot }` — frames in a registry whose vCPU is still
+    live running other fibers (no bundled window).
 
-The restore-in-place no-op still resumes the caller past its `cap.call` with the injected value (identical
-*visible* result to a plain `cap_reply`), but it must genuinely **discard the live `Vec<Frame>` and rebuild
-from the flattened window image** — otherwise the test passes without exercising the serialization the twin
-will depend on. The reply value is delivered as the reloaded Leaf result, `placeholder = Some(injected)`.
+The `Waiter::VCpu(v)` form is **self-contained**: `v` carries its own window, so the Leaf flatten runs on
+`v` with no cross-vCPU window sharing — and the **increment-1 harness already produces exactly this** (the
+parent root parks on the child's offer → `Waiter::VCpu`). So increment 2's restore-in-place step is:
+
+  1. In `clone_caller` (child handler), read `serve_run.ticket` + child domain id; **take** the
+     `Waiter::VCpu(v)` out of `sched.ticket_waiters` (via the `sched` handle the eval loop already holds).
+  2. **Capture:** drive `v`'s root through `UNWINDING` from its `CapReply` park, delivering the **injected
+     reply** as the Leaf reload (`placeholder = Some(injected)`, *not* the O10 freeze placeholder — the
+     clone supplies the real reply, which is what dissolves O10, §3). `v`'s continuation spills into `v`'s
+     own window as a durable **image**; record its `FrozenFiber`/root-SP residue.
+  3. **Restore in place:** thaw `v` under `REWINDING` — it rebuilds from the image, the Leaf reload hands
+     back the injected reply, and `v` resumes **past** the `cap.call`. Push `v` to `sched.runnable`.
+
+For the pure no-op this is *visibly* identical to `v.pending = CapResult(injected); runnable.push(v)` — but
+it must genuinely round-trip through the **window image** (discard `v.frames`, rebuild from the flattened
+window), because that image is exactly what increment 3's **twin** copies into a fresh child. So the test
+must assert the image path ran (e.g. the caller's domain is `set_durable(true)` + a durable window, and the
+freeze/thaw residue is observable), not merely that the caller got the value.
+
+**Harness = increment-1's, made durable.** Parent calls the child's offer and parks (→ `Waiter::VCpu`), but
+now the **parent** is `transform_module_assume_confined` + `set_durable(true)` + `init_durable_window`, so
+its `cap.call` is the `SuspendKind::Leaf` shape the flatten needs. The child (servicer) stays as-is. The
+non-root-fiber (`Waiter::Fiber`) caller and the true cross-domain-window case are the follow-up before PR 2.
