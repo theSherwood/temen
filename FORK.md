@@ -161,3 +161,50 @@ into a window image and immediately restores it *in place* with an injected repl
 parked fiber's continuation serializes + resumes past its call with a supplied result. Harness: a server
 whose handler calls it, one caller calling in. Only then add step 3 (twin + second ticket). This isolates
 the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-first.
+
+### 8.1 Increment breakdown (the build order actually followed)
+
+- **Increment 1 — the handler→caller linkage. DONE (this branch).** New eval-loop arm for op 11:
+  returns `serve_run.ticket` when in a running handler (`*cur != serve_cur`), else `-EINVAL`; host-side
+  dispatch answers a probeable `-EINVAL` (like svc.poll/wait). `CAP_SELF_CLONE_CALLER = 11` pinned.
+  Tests: `crates/svm-interp/tests/clone_caller.rs`. Proves *only* that the servicer can name the parked
+  caller — no capture yet.
+- **Increment 2 — the targeted capture + restore-in-place with injected reply. NEXT (the hard core).**
+  See §8.2 for the derived mechanism. The load-bearing soundness change; a subtle error is
+  wrong-but-passing, so TDD-first over a **durable-transformed** harness, interp==JIT.
+- **Increment 3 — the twin + second ticket** (step 3 above). Copy the captured image into a fresh child
+  and re-seed a second `CapReply` park; return the twin `child_handle`.
+- **PR 2 — the `fork` personality op** replies `pid`/`0` to the two tickets (FORK.md §5).
+
+### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
+
+**Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**
+(`svm-durable/src/lib.rs:855`): "the host performs the op; the deepest frame reloads its result." A caller
+parked on a durable-transformed `cap.call` therefore has *exactly* the Leaf continuation shape, whose thaw
+reloads the call's result at the **post-call resume point**. **Fork's reply-injection is nothing more than
+supplying that reloaded Leaf result** (§3) — the freeze/flatten path already positions the spill there. So
+the caller's domain (and only it) must be durable-transformed; `clone_caller`'s capture reuses the
+`flatten_fiber_for_freeze` Leaf spill rather than inventing a new continuation format.
+
+**Finding B — the capture is cross-vCPU.** The servicer (child) runs `clone_caller` in *its* eval loop,
+but the parked caller is a *different domain*'s vCPU (the parent/forking guest — bash). `ticket_waiters`
+hands the servicer `Waiter::Fiber { reg, slot }` = an `Arc<FiberRegistry>` + slot into the **caller's**
+registry, but *not* the caller vCPU's `mem`/window/`durable_sp_ctx` — which the Leaf flatten needs (it
+spills into the caller's shadow region and requires the caller's window in `UNWINDING`). `freeze_drive`
+is single-vCPU (`self`), so increment 2's new primitive is a **targeted single-fiber flatten that reaches
+the caller vCPU's window**, not `self`'s. Options to get there (decide at build time, simplest that holds):
+  1. Route the capture through the scheduler, which owns every vCPU: the servicer asks the scheduler to
+     run a one-fiber flatten on the *caller's* parked vCPU (its `mem` + registry), transiently under
+     `UNWINDING`, then hand back the window image + `FrozenFiber` residue.
+  2. Or: single-vCPU harness first — construct the parked caller as a **fiber in the servicer's own
+     vCPU** (a `cont` that called an offer and parked on `CapReply` in the same domain), so `self.mem`
+     *is* the caller's window and `flatten_fiber_for_freeze(slot, frames, injected_reply)` applies almost
+     directly (save/restore `self.frames/cur/chain/parked_frames/durable_sp_ctx` around the sub-run,
+     since the live servicer's own state must not be clobbered). This proves the flatten+reload+inject
+     round-trip with no cross-vCPU plumbing; the cross-vCPU reach (option 1) is a follow-up before the
+     real personality wiring. **Start here** — it is the honest smallest step for the *soundness* change.
+
+The restore-in-place no-op still resumes the caller past its `cap.call` with the injected value (identical
+*visible* result to a plain `cap_reply`), but it must genuinely **discard the live `Vec<Frame>` and rebuild
+from the flattened window image** — otherwise the test passes without exercising the serialization the twin
+will depend on. The reply value is delivered as the reloaded Leaf result, `placeholder = Some(injected)`.
