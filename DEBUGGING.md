@@ -215,17 +215,34 @@ different things depending on which pair you compare:
   **Extended to the multi-vCPU `ScheduledDebugRun` (slice 4-perf, threaded).** The scheduled `seek`
   (keyed on the global `turn`) got the same ladder, so threaded reverse debugging is bounded too.
   `ScheduledDebugRun` gained `checkpointable`/`snapshot`/`restore` (`ScheduledSnapshot` = every task's
-  active `Vm` + join table + run state, the shared window bytes, the host substate, and both scheduler
-  clocks; `DbgTaskState` derives `Clone`, `VTask::from_active` rebuilds a root-only task on restore).
-  The transient `stopped`/`focus`/`last_watch` are **not** captured — `locate` rederives them from the
-  task states after the replay. The checkpointable subset is slice-1's extended over all tasks: no §14
-  `instantiate` children (`extra_envs` empty), no §12 fibers, every task root-only (no active
-  fiber/chain/coroutine) — otherwise fall back to replay-from-turn-0. `BytecodeBackend` carries a second
-  turn-keyed ladder (`sched_checkpoints`); the threaded `seek` restarts from the nearest snapshot and
+  reduced state + the shared window bytes + the host substate + both scheduler clocks; `DbgTaskState`
+  derives `Clone`). The transient `stopped`/`focus`/`last_watch` are **not** captured — `locate`
+  rederives them from the task states after the replay. `BytecodeBackend` carries a second turn-keyed
+  ladder (`sched_checkpoints`); the threaded `seek` restarts from the nearest snapshot and
   `drive_scheduled_to`/`maybe_sched_checkpoint` mirror the single-vCPU pair. Gated by a threaded
   warm≡cold oracle (`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero`):
   a checkpoint-restored `seek` reproduces the global turn, live-thread count, stopped thread, shared
   counter, and **every** thread's stack (`select_task` each) — forward and on a full backward sweep.
+
+  **Subset extended to §12 fibers + §14 same-module coroutines + `instantiate` children (slice 4-perf,
+  threaded).** The scheduled subset now mirrors the single-vCPU one, applied per task. `DbgTaskSnapshot`
+  carries each task's **full** `VTask` (active `Vm`, `active_id`, resume `chain`, same-module coroutine
+  children, `active_coro`, `root_shadow_sp`) instead of only the root `Vm`, and `ScheduledSnapshot` adds
+  the **run-shared** `fibers` registry (a fiber migrates across vCPUs — D57) and the §14 same-module
+  `instantiate`-child environments (`extra_envs`, as `EnvSnapshot`). On restore each coroutine window
+  (`rebuild_coro`, shared with the single-vCPU path) and each child env (`rebuild_env`: `nested_view` +
+  a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
+  the reseeded shared window. Admitting `instantiate` children is what unlocks **scheduled coroutines**:
+  the bytecode engine rejects `coroutine + thread`, so a scheduled coroutine only ever arises alongside
+  an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): a live `module != 0`
+  continuation (**separate-module** coroutine/child — a pushed source unit; implicitly excluded, since it
+  would already have disabled checkpointing) and any child that **maps its own pages** (non-pristine
+  `nested_view` layout), plus event-parked (`memory.wait`) fibers. Oracles:
+  `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
+  worker vCPUs each driving a fiber body) and
+  `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
+  (`ScheduledDebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every*
+  checkpointable turn, including inside the coroutine body, with a live `instantiate` child env).
 
   **Subset extended to §12 fibers + §14 same-module coroutines (slice 4-perf, single-vCPU).** The
   single-vCPU `DebugRun` checkpointable subset no longer excludes fibers/coroutines. **Fibers**: the
@@ -473,12 +490,13 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
   (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
   engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
-  is bounded too), and its single-vCPU checkpointable subset now covers **§12 fibers + §14 same-module
-  coroutines**. Follow-ups: the §3.6 serve/live-call machinery inside a confined child, env teardown /
-  D37 revocation, and — if a use case demands it — extending the checkpointable subset further to
-  **separate-module** coroutines / §14 `instantiate` children (they push a unit into the shared source /
-  build an env table a fresh restore lacks) and to **fibers/coroutines on the scheduled engine** (today
-  those fall back to replay-from-0, which stays correct, just unbounded).
+  is bounded too), and its checkpointable subset now covers **§12 fibers + §14 same-module coroutines**
+  on **both** engines, plus **same-module `instantiate` children** on the scheduled engine (which is what
+  admits scheduled coroutines). Follow-ups: the §3.6 serve/live-call machinery inside a confined child,
+  env teardown / D37 revocation, and — if a use case demands it — extending the checkpointable subset
+  further to **separate-module** coroutines / `instantiate` children (they push a unit into the shared
+  source a fresh restore lacks) and to **demand** coroutines / page-mapping children (non-pristine
+  window layout) — today those fall back to replay-from-0, which stays correct, just unbounded.
 
 ---
 
