@@ -3677,6 +3677,29 @@ impl ModuleDebug {
     }
 }
 
+/// A single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
+/// [`DebugRun`]'s root continuation at logical time [`clock`](DebugRunSnapshot::clock), so a reverse
+/// `seek`/`step_back` on the DAP backend can restart a replay here instead of from clock 0 — bounding
+/// the replay to the checkpoint stride. The bytecode counterpart of the tree-walker's `SeekCheckpoint`.
+/// Opaque to the backend, which only stores it in a ladder and hands it back to [`DebugRun::restore`].
+pub struct DebugRunSnapshot {
+    clock: u64,
+    /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
+    active: Vm,
+    /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
+    /// a memoryless run.
+    mem: Option<Vec<u8>>,
+    /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
+    host: super::HostReplaySubstate,
+}
+
+impl DebugRunSnapshot {
+    /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
+    pub fn clock(&self) -> u64 {
+        self.clock
+    }
+}
+
 /// A minimal **resumable bytecode debug session** (DEBUGGING.md §1b G3) — the engine-level primitive a
 /// DAP-over-bytecode backend would wire into, the first prerequisite for that second backend. Holds the
 /// running [`Vm`] across stops: [`DebugRun::run_to`] steps until the current op's [`crate::IrPc`] is a
@@ -4363,6 +4386,62 @@ impl DebugRun {
         self.at_bp = true;
     }
 
+    /// Whether this run's state is fully captured by its active `Vm` + the window bytes + the host's
+    /// replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
+    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector) on the tree-walker: the
+    /// **root** continuation is running (no §12 fiber resume-chain or step-into coroutine), there are
+    /// no `cont.new` fibers or §14 coroutine children (whose frames/windows live outside the capture),
+    /// the host has grown no state a checkpoint can't restore (`checkpoint_safe`), and memory has a
+    /// pristine layout (`snapshot_safe`, so `window_snapshot`/`seed` of the mapped prefix round-trips).
+    /// Outside this subset the DAP backend stops checkpointing and falls back to replay-from-clock-0.
+    fn checkpointable(&self) -> bool {
+        self.done.is_none()
+            && self.vt.active_id == ROOT_FIBER
+            && self.vt.chain.is_empty()
+            && self.vt.active_coro.is_none()
+            && self.vt.coroutines.iter().all(|c| c.is_none())
+            && self.fibers.is_empty()
+            && self.host.checkpoint_safe()
+            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+    }
+
+    /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
+    /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
+    /// subset. Reused by the DAP backend to restart a reverse `seek`/`step_back` from the nearest
+    /// snapshot instead of clock 0. Cheap deep copy: the active `Vm` (plain data), the window bytes, and
+    /// the host's run-mutable replay substate.
+    pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
+        if !self.checkpointable() {
+            return None;
+        }
+        Some(DebugRunSnapshot {
+            clock: self.op_clock,
+            active: self.vt.active.clone(),
+            mem: self.mem.as_ref().map(|m| m.window_snapshot()),
+            host: self.host.replay_substate(),
+        })
+    }
+
+    /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
+    /// re-created + tape re-armed by the backend), so a subsequent replay resumes exactly at the
+    /// snapshot's logical time rather than clock 0. Replaces the active `Vm`, reseeds the window bytes,
+    /// restores the host replay substate (cap cursor, captured stdout, clock), and sets the clock. The
+    /// shared structure (`source`/`table`/`funcs`) already matches — a checkpoint is only taken for the
+    /// root-only run this rebuilds. A checkpointable snapshot had an empty fiber/coroutine set, so the
+    /// fresh run's already-empty `chain`/`coroutines`/`fibers` need no reset.
+    pub fn restore(&mut self, snap: &DebugRunSnapshot) {
+        self.vt.active = snap.active.clone();
+        self.vt.active_id = ROOT_FIBER;
+        self.vt.active_coro = None;
+        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.seed(bytes);
+        }
+        self.host.restore_replay_substate(&snap.host);
+        self.op_clock = snap.clock;
+        self.done = None;
+        self.at_bp = false;
+    }
+
     /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
     /// the run has finished (its result is then available via [`result`](DebugRun::result)). Unlike the
     /// stepping verbs it does not skip unmapped ops or honor breakpoints — it is the raw time quantum.
@@ -4707,7 +4786,10 @@ pub enum SchedBreak {
     Step,
 }
 
-/// One scheduled vCPU under the multi-vCPU debugger.
+/// One scheduled vCPU under the multi-vCPU debugger. `Clone` for time-travel checkpointing (W1): a
+/// scheduled checkpoint captures each task's state so a reverse `seek` restarts from the nearest
+/// snapshot instead of turn 0.
+#[derive(Clone)]
 enum DbgTaskState {
     Runnable,
     /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake.
@@ -4758,6 +4840,42 @@ struct DbgEnv {
     host: Host,
     table: SharedSlots,
     fuel: u64,
+}
+
+/// One scheduled vCPU's captured state inside a [`ScheduledSnapshot`] — the reduced representation the
+/// checkpointable subset needs: the active root `Vm` (deep copy), the join-handle table, the env index
+/// (always `None` in the subset — no §14 children), the run state, and the breakpoint-skip flag. Fibers
+/// and coroutines are empty in the subset, so only the active `Vm` is carried; [`VTask::from_active`]
+/// rebuilds the full `VTask` on restore.
+struct DbgTaskSnapshot {
+    active: Vm,
+    threads: Vec<Option<usize>>,
+    env: Option<usize>,
+    state: DbgTaskState,
+    at_bp: bool,
+}
+
+/// A multi-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
+/// [`ScheduledDebugRun`] at global [`turn`](ScheduledSnapshot::turn), so a reverse `seek`/`step_back`
+/// restarts a replay here instead of from turn 0. Captured only for the simple threaded subset (see
+/// [`ScheduledDebugRun::checkpointable`]: no §12 fibers, no §14 coroutines/`instantiate` children, a
+/// pristine shared window, a restorable host) — where the per-task active `Vm`s + the shared window
+/// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
+/// counterpart of [`DebugRunSnapshot`]. Opaque to the DAP backend, which stores it in a ladder and hands
+/// it back to [`ScheduledDebugRun::restore`].
+pub struct ScheduledSnapshot {
+    turn: u64,
+    clock: u64,
+    tasks: Vec<DbgTaskSnapshot>,
+    mem: Option<Vec<u8>>,
+    host: super::HostReplaySubstate,
+}
+
+impl ScheduledSnapshot {
+    /// The global turn this checkpoint was taken at — the ladder key the backend searches.
+    pub fn turn(&self) -> u64 {
+        self.turn
+    }
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -5743,6 +5861,84 @@ impl ScheduledDebugRun {
         }
     }
 
+    /// Whether the scheduled continuation is fully captured by the per-task active `Vm`s + the shared
+    /// window bytes + the host substate + the scheduler clocks — the subset a multi-vCPU time-travel
+    /// **checkpoint** (W1) snapshots. Mirrors [`DebugRun::checkpointable`], extended over every task:
+    /// no §14 `instantiate` children (`extra_envs` empty, so every task steps the shared domain), no
+    /// §12 fibers, and every task's `VTask` is root-only (no active fiber / resume chain / coroutine).
+    /// Outside this subset the DAP backend stops checkpointing and falls back to replay-from-turn-0.
+    fn checkpointable(&self) -> bool {
+        self.extra_envs.is_empty()
+            && self.fibers.is_empty()
+            && self.host.checkpoint_safe()
+            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+            && self.tasks.iter().all(|t| {
+                t.vt.active_id == ROOT_FIBER
+                    && t.vt.chain.is_empty()
+                    && t.vt.active_coro.is_none()
+                    && t.vt.coroutines.iter().all(|c| c.is_none())
+            })
+    }
+
+    /// Snapshot the scheduled continuation at the current [`turn`](ScheduledDebugRun::op_turn) for the
+    /// backend's checkpoint ladder — `None` outside the [`checkpointable`](ScheduledDebugRun::checkpointable)
+    /// subset. Captures each task's active `Vm` + join table + state, the shared window bytes, the host
+    /// replay substate, and both scheduler clocks; the transient `stopped`/`focus`/`last_watch` are
+    /// *not* captured — [`locate`](ScheduledDebugRun::locate) rederives them from the task states.
+    pub fn snapshot(&self) -> Option<ScheduledSnapshot> {
+        if !self.checkpointable() {
+            return None;
+        }
+        Some(ScheduledSnapshot {
+            turn: self.turn,
+            clock: self.clock,
+            tasks: self
+                .tasks
+                .iter()
+                .map(|t| DbgTaskSnapshot {
+                    active: t.vt.active.clone(),
+                    threads: t.threads.clone(),
+                    env: t.env,
+                    state: t.state.clone(),
+                    at_bp: t.at_bp,
+                })
+                .collect(),
+            mem: self.mem.as_ref().map(|m| m.window_snapshot()),
+            host: self.host.replay_substate(),
+        })
+    }
+
+    /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
+    /// breakpoints/watchpoints re-armed by the backend before this call), so a subsequent `tick`-replay
+    /// resumes exactly at the snapshot's global turn rather than turn 0. Rebuilds the task set (each a
+    /// root-only `VTask` around the captured active `Vm`), reseeds the shared window bytes, restores the
+    /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
+    /// it). The captured subset had no §14 children / §12 fibers, so `extra_envs`/`fibers` reset empty.
+    pub fn restore(&mut self, snap: &ScheduledSnapshot) {
+        self.tasks = snap
+            .tasks
+            .iter()
+            .map(|ts| DbgTask {
+                vt: VTask::from_active(ts.active.clone()),
+                threads: ts.threads.clone(),
+                env: ts.env,
+                state: ts.state.clone(),
+                at_bp: ts.at_bp,
+            })
+            .collect();
+        self.extra_envs.clear();
+        self.fibers.clear();
+        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.seed(bytes);
+        }
+        self.host.restore_replay_substate(&snap.host);
+        self.turn = snap.turn;
+        self.clock = snap.clock;
+        self.stopped = None;
+        self.focus = 0;
+        self.last_watch = None;
+    }
+
     /// The run's result once the root has finished (`None` while still running).
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         match &self.tasks[0].state {
@@ -6171,6 +6367,22 @@ impl VTask {
             coro_step_into: true,
             active_coro: None,
         })
+    }
+
+    /// Rebuild a **root-only** `VTask` (no active fiber, empty resume chain / coroutine set) around an
+    /// already-materialized active `Vm` — for restoring a time-travel checkpoint whose captured subset
+    /// had no fibers/coroutines (see [`DebugRun::checkpointable`] / `ScheduledDebugRun::checkpointable`).
+    /// Uses the same field defaults as [`VTask::new`], so it stays correct if those defaults change.
+    fn from_active(active: Vm) -> VTask {
+        VTask {
+            active,
+            active_id: ROOT_FIBER,
+            chain: Vec::new(),
+            coroutines: Vec::new(),
+            root_shadow_sp: super::SHADOW_BASE,
+            coro_step_into: true,
+            active_coro: None,
+        }
     }
 
     /// The continuation the single-vCPU debugger is currently stepping: the active §14 coroutine child
@@ -9289,6 +9501,12 @@ struct ByteSetJmp {
     dst: u32,
 }
 
+// `Clone` for time-travel checkpointing (DEBUGGING.md W1): a single-vCPU `DebugRun` snapshots its
+// active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
+// (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
+// guest page store is **not** here (it lives in `DebugRun::mem`, snapshotted separately via
+// `Mem::window_snapshot`), so cloning a `Vm` never aliases another run's memory.
+#[derive(Clone)]
 struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
