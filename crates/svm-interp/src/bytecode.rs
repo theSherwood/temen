@@ -3910,6 +3910,11 @@ pub struct DebugRun {
     /// Cleared at each advance entry — the parked read re-executes on resume, so the state
     /// re-derives (re-parks or proceeds) rather than being carried (invariant 7).
     stdin_parked: bool,
+    /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
+    /// op with the op's [`MemEvent`](super::MemEvent), the run's `op_clock`, and task 0. `None`
+    /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
+    /// `seek` rebuild (the `watch_specs` pattern) and leaves its rev-trace probes silent.
+    access_sink: Option<AccessSinkFn>,
     /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
     /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -3938,15 +3943,70 @@ fn watch_hit_before(
         .get(inst)?;
     let base_off = *fn_block_base.get(func as usize)?.get(block)? as usize;
     let vals = vm.regs.get(vm.base + base_off..)?;
-    let super::MemAccess::Range { base, width, write } = super::access_of(ir_inst, vals, mem)
-    else {
-        return None;
+    // `watch_accesses` (not `access_of`): bulk `mem.copy`/`mem.move`/`mem.fill` and v128 ops
+    // check both their spans, so a memcpy over a watched byte stops here like a plain store.
+    super::watch_accesses(ir_inst, vals, mem)
+        .into_iter()
+        .find_map(|acc| {
+            let super::MemAccess::Range { base, width, write } = acc else {
+                return None;
+            };
+            let end = base.saturating_add(width as u64);
+            watchpoints.iter().find_map(|(addr, len, kind)| {
+                let w_end = addr.saturating_add(*len);
+                (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
+            })
+        })
+}
+
+/// A debug-session **access sink** (INTERACTIVE_EMBEDDING.md slice 3): observes every module-0
+/// memory op the session is about to execute — `(clock-or-turn, task, event)`, with **raw
+/// pre-confinement addresses** (the W3 hook-pass vocabulary, [`super::MemEvent`]) — with **no
+/// module rewrite**, so the machine view, SSA slots, and the op-clock are identical with a sink
+/// installed or absent (invariant 9b: observation never perturbs semantics). Zero cost when
+/// absent (callers gate on `Some`). Fed to host-side models (cache/paging/shared-state) by the
+/// DAP backend.
+pub type AccessSinkFn = Box<dyn FnMut(u64, usize, super::MemEvent) + Send>;
+
+/// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
+/// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
+/// scope). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
+/// and address semantics are the instrumentation pass's, pinned by the `access_sink_diff`
+/// differential.
+fn emit_access(
+    vm: &Vm,
+    source: &ModuleSource,
+    funcs: &[Func],
+    fn_block_base: &[Vec<u32>],
+    clock: u64,
+    task: usize,
+    sink: &mut AccessSinkFn,
+) {
+    let Some(pc) = vm.cur_ir_pc(source) else {
+        return;
     };
-    let end = base.saturating_add(width as u64);
-    watchpoints.iter().find_map(|(addr, len, kind)| {
-        let w_end = addr.saturating_add(*len);
-        (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
-    })
+    if pc.module != 0 {
+        return;
+    }
+    let Some(ir_inst) = funcs
+        .get(pc.func as usize)
+        .and_then(|f| f.blocks.get(pc.block))
+        .and_then(|b| b.insts.get(pc.inst))
+    else {
+        return;
+    };
+    let Some(base_off) = fn_block_base
+        .get(pc.func as usize)
+        .and_then(|v| v.get(pc.block))
+    else {
+        return;
+    };
+    let Some(vals) = vm.regs.get(vm.base + *base_off as usize..) else {
+        return;
+    };
+    if let Some(ev) = super::mem_event_of(ir_inst, vals) {
+        sink(clock, task, ev);
+    }
 }
 
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
@@ -4525,6 +4585,7 @@ impl DebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             watchpoints: Vec::new(),
             stdin_parked: false,
+            access_sink: None,
             last_watch: None,
         })
     }
@@ -4560,6 +4621,12 @@ impl DebugRun {
     /// cap tape so a later `seek` replays it faithfully.
     pub fn provide_stdin(&mut self, bytes: &[u8]) {
         self.host.push_stdin(bytes);
+    }
+
+    /// Install the session's per-op **access sink** ([`AccessSinkFn`]) — observation only, zero
+    /// cost when never installed. Replaces any prior sink.
+    pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
+        self.access_sink = Some(sink);
     }
 
     /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
@@ -4680,8 +4747,15 @@ impl DebugRun {
             done,
             op_clock,
             stdin_parked,
+            funcs,
+            fn_block_base,
+            access_sink,
             ..
         } = self;
+        if let Some(sink) = access_sink.as_mut() {
+            let (cur_vm, _) = vt.debug_active();
+            emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+        }
         match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
             FiberStep::Stepped => {
                 *op_clock += 1;
@@ -4731,12 +4805,17 @@ impl DebugRun {
             funcs,
             watchpoints,
             stdin_parked,
+            access_sink,
             last_watch,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => *op_clock += 1,
                 FiberStep::Finished(vals) => {
@@ -4791,6 +4870,10 @@ impl DebugRun {
                 *at_bp = true;
                 return Some(pc);
             }
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => {
                     *op_clock += 1;
@@ -4838,10 +4921,17 @@ impl DebugRun {
             done,
             op_clock,
             stdin_parked,
+            funcs,
+            fn_block_base,
+            access_sink,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => *op_clock += 1,
                 FiberStep::Finished(vals) => {
@@ -5208,6 +5298,11 @@ pub struct ScheduledDebugRun {
     /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
     /// common case, so the per-op `access_of` computation is skipped entirely.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
+    /// op with the global `turn` and the **executing task index** (the vCPU attribution host-side
+    /// models key on). `None` (the default) is zero-cost; the DAP backend re-installs it on every
+    /// `seek` rebuild, like watchpoints.
+    access_sink: Option<AccessSinkFn>,
     /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
     /// taken by the backend to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -5739,6 +5834,7 @@ impl ScheduledDebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
+            access_sink: None,
             last_watch: None,
             stopped: None,
             focus: 0,
@@ -5757,6 +5853,12 @@ impl ScheduledDebugRun {
     /// with a matching read/write kind.
     pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
         self.watchpoints = ranges;
+    }
+
+    /// Install the run-shared per-op **access sink** ([`AccessSinkFn`]) — fired with the global
+    /// `turn` and the executing task index. Observation only; zero cost when never installed.
+    pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
+        self.access_sink = Some(sink);
     }
 
     /// Take the `(addr, write)` of the watchpoint the last stop fired on (cleared by the read), so the
@@ -5791,6 +5893,7 @@ impl ScheduledDebugRun {
             funcs,
             breakpoints,
             watchpoints,
+            access_sink,
             last_watch,
             fn_block_base,
             stopped,
@@ -5863,6 +5966,10 @@ impl ScheduledDebugRun {
                     *focus = ti;
                     return SchedStop::Break { pc, reason };
                 }
+            }
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = tasks[ti].vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
             let step_res = dbg_advance_task(
                 tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
@@ -6042,6 +6149,9 @@ impl ScheduledDebugRun {
             fibers,
             turn,
             clock,
+            funcs,
+            fn_block_base,
+            access_sink,
             ..
         } = self;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
@@ -6049,6 +6159,10 @@ impl ScheduledDebugRun {
         let Some(ti) = dbg_pinned_coro(tasks).or_else(|| dbg_pick_runnable(tasks, clock)) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
+        if let Some(sink) = access_sink.as_mut() {
+            let (cur_vm, _) = tasks[ti].vt.debug_active();
+            emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
+        }
         let step_res = dbg_advance_task(
             tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
         );

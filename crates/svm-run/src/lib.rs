@@ -3881,22 +3881,10 @@ pub struct Instance {
     hooks: Option<MemHooks>,
 }
 
-/// One guest memory access, reported to a [`Instance::with_mem_hooks`] handler **before** the
-/// access executes (pre-confinement-check, so a faulting run's final event is the *attempted*
-/// faulting access). `addr` is the effective guest address (base + immediate offset). Bulk ops are
-/// one event carrying their span operands — `Copy` covers both `mem.copy` and `mem.move`;
-/// consumers expand spans themselves. v128 accesses are `Load`/`Store` with `width` 16.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MemEvent {
-    Load { addr: u64, width: u32 },
-    Store { addr: u64, width: u32 },
-    AtomicLoad { addr: u64, width: u32 },
-    AtomicStore { addr: u64, width: u32 },
-    AtomicRmw { addr: u64, width: u32 },
-    AtomicCmpxchg { addr: u64, width: u32 },
-    Copy { dst: u64, src: u64, len: u64 },
-    Fill { dst: u64, len: u64 },
-}
+// The access vocabulary (`MemEvent`) lives in `svm-interp` — it is shared with the debug-session
+// access sink (`bytecode::AccessSinkFn`), and a differential pins the two streams equal — and is
+// re-exported here unchanged as the [`Instance::with_mem_hooks`] handler's event type.
+pub use svm_interp::MemEvent;
 
 /// A per-host memory-hook handler: observe each [`MemEvent`]; return `Err(Trap)` to veto — the run
 /// aborts with that trap, with ordinary backend-identical cap-trap semantics.

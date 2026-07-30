@@ -428,7 +428,15 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    pump matches `Arr` and flat-maps `handle` per element; `web/dap.js` already parses the reply
 >    as an array and filters by `type`, so the JS client needs no change. Acceptance: a step + N
 >    state reads in one FFI crossing; existing DAP tests pass untouched.
-> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize the per-op
+> 3. ~~**Debug-session access sink**~~ **DONE 2026-07-30** — as specced: `MemEvent` moved to
+>    `svm-interp` (re-exported by `svm-run`), `mem_event_of` raw-address decode, sinks on both
+>    debug engines fired from every advance path (seek replay included), backend `SharedSink`
+>    re-installed on rebuilds (rev-trace probes silent), and the **bulk-op watchpoint blind spot
+>    fixed on both engines** via the shared `watch_accesses` decode (v128 included; `access_of` /
+>    DPOR untouched). Gated by `crates/svm/tests/access_sink_diff.rs`: sink stream ≡ the
+>    `mem_hooks_diff.rs` hook stream, dst-write + src-read `mem.copy` watchpoints stop both
+>    engines identically, and the sink is inert (result + op-clock bit-identical). Original spec:
+>    the hinge for X2/X4/X1-shared-state. Generalize the per-op
 >    access decode behind `watch_hit_before` into an optional sink on
 >    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
 >    module rewrite, op-clock unchanged. Scope note (2026-07-30, verified): the shared decode is

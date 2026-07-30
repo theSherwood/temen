@@ -26,8 +26,10 @@
 //! (server level).
 
 use svm_interp::bytecode::{
-    self, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledSnapshot,
+    self, AccessSinkFn, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
+    ScheduledSnapshot,
 };
+use svm_interp::MemEvent;
 use svm_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
     StreamRole, Trap, Value, VarValue, WatchId, WatchKind,
@@ -338,6 +340,25 @@ pub struct BytecodeBackend {
     /// state), after which `seek` reverts to replay-from-0 for the rest of the session — mirroring
     /// `Inspector::maybe_checkpoint`.
     checkpointing: bool,
+    /// The session's shared access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3), re-installed
+    /// into the live engine on every `seek` rebuild (the `watch_specs` pattern) — so a model fed by
+    /// it observes the replay too and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
+    /// The rev-trace probes stay silent (they build raw runs, no sink). `None` = no consumer.
+    access_sink: Option<SharedSink>,
+}
+
+/// A shared, re-installable access-sink consumer: `(clock-or-turn, task, event)`. `Arc<Mutex<…>>`
+/// so the backend can hand a fresh boxed wrapper to every rebuilt run while one consumer (a
+/// host-side model) accumulates.
+pub type SharedSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(u64, usize, MemEvent) + Send>>;
+
+/// Wrap the shared consumer as the engine's boxed sink ([`AccessSinkFn`]).
+fn wrap_sink(sink: &SharedSink) -> AccessSinkFn {
+    let s = std::sync::Arc::clone(sink);
+    Box::new(move |clock, task, ev| {
+        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+        (*g)(clock, task, ev)
+    })
 }
 
 /// The op-clock stride between time-travel checkpoints (DEBUGGING.md W1). Matches the tree-walker
@@ -396,7 +417,20 @@ impl BytecodeBackend {
             checkpoints: Vec::new(),
             sched_checkpoints: Vec::new(),
             checkpointing: true,
+            access_sink: None,
         })
+    }
+
+    /// Install the session's **access-sink consumer** (INTERACTIVE_EMBEDDING.md slice 3): every
+    /// module-0 memory op the session executes — including `seek`-replay re-execution — reaches
+    /// `sink` as `(clock-or-turn, task, MemEvent)`. Re-installed transparently across `seek`
+    /// rebuilds; the rev-trace probes never fire it.
+    pub fn set_access_sink(&mut self, sink: SharedSink) {
+        match &mut self.engine {
+            Engine::Single(run) => run.set_access_sink(wrap_sink(&sink)),
+            Engine::Threaded(run) => run.set_access_sink(wrap_sink(&sink)),
+        }
+        self.access_sink = Some(sink);
     }
 
     /// Number of time-travel checkpoints currently in the ladder (single-vCPU or scheduled — only one
@@ -786,6 +820,11 @@ impl Debuggee for BytecodeBackend {
                     .map(|(_, a, l, k)| (*a, *l, *k))
                     .collect(),
             );
+            // Re-install the access sink *before* the replay drive, so a model consumer observes
+            // the re-execution and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
+            if let Some(sink) = &self.access_sink {
+                run.set_access_sink(wrap_sink(sink));
+            }
             // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
             // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
             if self.checkpointing {
@@ -806,6 +845,10 @@ impl Debuggee for BytecodeBackend {
         let Some(mut run) = self.fresh_single() else {
             return Stop::Blocked;
         };
+        // Re-install the access sink *before* the replay drive (see the threaded path above).
+        if let Some(sink) = &self.access_sink {
+            run.set_access_sink(wrap_sink(sink));
+        }
         // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
         // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
         if self.checkpointing {

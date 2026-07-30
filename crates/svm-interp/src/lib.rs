@@ -497,16 +497,18 @@ impl DebugCtx {
         !self.shared().watchpoints.is_empty()
     }
 
-    /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
-    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
-    /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
-    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
-    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
+    /// Decide whether to pause *before* the op at `pc`. `accesses` are the op's memory effects
+    /// ([`watch_accesses`] — two entries so a bulk copy's dst-write and src-read both check; only
+    /// computed by the caller when watchpoints are armed, `[MemAccess::None; 2]` otherwise);
+    /// `inst` is the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op
+    /// has not run, `clock` unchanged, so the continuation re-enters here); `None` charges one
+    /// tick of logical time and lets the op run. The `resume_clock` guard makes resume step off
+    /// the current op.
     fn before_op(
         &mut self,
         pc: IrPc,
         inst: &Inst,
-        access: MemAccess,
+        accesses: [MemAccess; 2],
         depth: usize,
     ) -> Option<StopReason> {
         // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
@@ -528,7 +530,7 @@ impl DebugCtx {
                 None // scheduled-seek fast-forward: run past stops (clock still ticks below)
             } else if sh.breakpoints.contains(&pc) {
                 Some(StopReason::Breakpoint)
-            } else if let Some((addr, write)) = sh.watch_hit(access) {
+            } else if let Some((addr, write)) = accesses.iter().find_map(|a| sh.watch_hit(*a)) {
                 Some(StopReason::Watchpoint { addr, write })
             } else if let Some(r) = sh.cap_stop(inst) {
                 Some(r)
@@ -2817,6 +2819,136 @@ fn access_of(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> MemAccess {
         Inst::MemoryWait { ty, addr, .. } => range(*addr, 0, atomic_width(*ty), false),
         Inst::MemoryNotify { addr, .. } => range(*addr, 0, 4, true),
         _ => MemAccess::None, // ThreadSpawn / ThreadJoin: ordering via the enabled set, not a race
+    }
+}
+
+/// One guest memory access, reported **before** it executes (pre-confinement, so a faulting run's
+/// final event is the *attempted* faulting access). `addr` is the effective guest address (base +
+/// immediate offset), unmasked. Bulk ops are one event carrying their span operands — `Copy`
+/// covers both `mem.copy` and `mem.move`; consumers expand spans themselves. v128 accesses are
+/// `Load`/`Store` with `width` 16.
+///
+/// The shared access vocabulary of SVM's two observation seams (INTERACTIVE_EMBEDDING.md): the W3
+/// instrumentation pass (`svm-opt`; `svm-run` re-exports this type for its hook API) and the
+/// debug-session **access sink** ([`bytecode::AccessSinkFn`]) — a differential pins the two
+/// streams equal on the same program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemEvent {
+    Load { addr: u64, width: u32 },
+    Store { addr: u64, width: u32 },
+    AtomicLoad { addr: u64, width: u32 },
+    AtomicStore { addr: u64, width: u32 },
+    AtomicRmw { addr: u64, width: u32 },
+    AtomicCmpxchg { addr: u64, width: u32 },
+    Copy { dst: u64, src: u64, len: u64 },
+    Fill { dst: u64, len: u64 },
+}
+
+/// The [`MemEvent`] the op at hand would report, from the live SSA values — the sink-side
+/// counterpart of the W3 pass's per-op events: **raw pre-confinement addresses**, identical
+/// vocabulary (the `access_sink_diff` differential pins the streams equal). `None` for a
+/// non-memory op or an unreadable operand.
+pub(crate) fn mem_event_of(inst: &Inst, vals: &[Reg]) -> Option<MemEvent> {
+    let v = |i: ValIdx| get(vals, i).map(|s| s.i64() as u64).ok();
+    Some(match inst {
+        Inst::Load {
+            op, addr, offset, ..
+        } => MemEvent::Load {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: op.info().2,
+        },
+        Inst::Store {
+            op, addr, offset, ..
+        } => MemEvent::Store {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: op.info().2,
+        },
+        Inst::V128Load { addr, offset, .. } => MemEvent::Load {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: 16,
+        },
+        Inst::V128Store { addr, offset, .. } => MemEvent::Store {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: 16,
+        },
+        Inst::AtomicLoad {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicLoad {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicStore {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicStore {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicRmw {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicRmw {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicCmpxchg {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicCmpxchg {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => MemEvent::Copy {
+            dst: v(*dst)?,
+            src: v(*src)?,
+            len: v(*len)?,
+        },
+        Inst::MemFill { dst, len, .. } => MemEvent::Fill {
+            dst: v(*dst)?,
+            len: v(*len)?,
+        },
+        _ => return None,
+    })
+}
+
+/// The watched-range analysis of one op, **bulk and v128 ops included** — up to two confined
+/// range accesses: `[dst-write, src-read]` for `mem.copy`/`mem.move`, `[dst-write, None]` for
+/// `mem.fill`, a 16-byte range for v128, and `[access_of(..), None]` otherwise. Bulk spans clamp
+/// their width to `u32::MAX` (a > 4 GiB span's tail is out of watch range — accepted corner).
+/// Shared by both debug engines' watchpoint checks, so a `memcpy`/`memset` over a watched byte
+/// stops on either — the fix for the bulk-op watchpoint blind spot (`access_of` itself is left
+/// untouched: it is DPOR's conflict primitive, a separate concern).
+pub(crate) fn watch_accesses(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> [MemAccess; 2] {
+    let none = [MemAccess::None; 2];
+    let Some(m) = mem.as_ref() else {
+        return none;
+    };
+    let val = |i: ValIdx| get(vals, i).map(|s| s.i64() as u64).ok();
+    let span = |addr: Option<u64>, len: Option<u64>, write: bool| -> MemAccess {
+        let (Some(a), Some(l)) = (addr, len) else {
+            return MemAccess::None;
+        };
+        let width = l.min(u32::MAX as u64) as u32;
+        if width == 0 {
+            return MemAccess::None;
+        }
+        match m.confine_checked(a, 0, width) {
+            Ok(base) => MemAccess::Range { base, width, write },
+            Err(_) => MemAccess::None,
+        }
+    };
+    match inst {
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => [
+            span(val(*dst), val(*len), true),
+            span(val(*src), val(*len), false),
+        ],
+        Inst::MemFill { dst, len, .. } => [span(val(*dst), val(*len), true), MemAccess::None],
+        Inst::V128Load { addr, offset, .. } => [
+            span(val(*addr).map(|a| a.wrapping_add(*offset)), Some(16), false),
+            MemAccess::None,
+        ],
+        Inst::V128Store { addr, offset, .. } => [
+            span(val(*addr).map(|a| a.wrapping_add(*offset)), Some(16), true),
+            MemAccess::None,
+        ],
+        _ => [access_of(inst, vals, mem), MemAccess::None],
     }
 }
 
@@ -7605,16 +7737,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     block: frames[top].block,
                     inst: frames[top].inst,
                 };
-                // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
-                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints,
-                // stepping, and the cap.call stop need no memory analysis.
+                // Watchpoints reuse the confined-range analysis (`watch_accesses` — bulk and v128
+                // ops included, so a `memcpy` over a watched byte stops), but only when armed (it
+                // confines, so it isn't free). Breakpoints, stepping, and the cap.call stop need
+                // no memory analysis.
                 let inst = &block.insts[frames[top].inst];
-                let access = if dbg.watches_armed() {
-                    access_of(inst, &frames[top].vals, &*mem)
+                let accesses = if dbg.watches_armed() {
+                    watch_accesses(inst, &frames[top].vals, &*mem)
                 } else {
-                    MemAccess::None
+                    [MemAccess::None; 2]
                 };
-                if let Some(reason) = dbg.before_op(pc, inst, access, frames.len()) {
+                if let Some(reason) = dbg.before_op(pc, inst, accesses, frames.len()) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
