@@ -1263,6 +1263,23 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
         return;
     }
     let linked = link_whole_cc1();
+    // The linked cc1 module is IDENTICAL for every TU below — only the *input file* (fed via the fs
+    // cap) changes. So the JIT recompiles the exact same module on every run, and its compile cost is
+    // a genuine constant. Measure it in isolation (pure `svm_jit::compile`, no execution) so the table
+    // can be read as `jit-run ≈ compile-the-compiler + execution`, with execution the only variable.
+    let nfuncs = linked.funcs.len();
+    let ninsns: usize = linked
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .map(|b| b.insts.len())
+        .sum();
+    let mut jit_compile_ms = u128::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let _ = svm_jit::compile(&linked, 0).expect("compile whole cc1");
+        jit_compile_ms = jit_compile_ms.min(t.elapsed().as_millis());
+    }
     let tus = [
         "hashmap.c",
         "type.c",
@@ -1376,7 +1393,19 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
             ji + jr
         );
     }
-    println!("(bc-inst = IR→bytecode compile; jit-inst = compile the whole cc1 to native — one-time, amortized.\n run = the actual per-TU compilation. native has no separate instantiate.)\n");
+    println!(
+        "\nlinked cc1: {nfuncs} funcs, {ninsns} IR insns.  \
+         pure svm_jit::compile (no execution, best-of-3): {jit_compile_ms} ms — the fixed \
+         'compile-the-compiler' cost.\n\
+         The powerbox JIT fuses compile+run with no module cache, so `jit-run` pays this on \
+         *every* call.\n\
+         Read it as  jit-run ≈ compile-the-compiler + execution;  execution = jit-run − ~{jit_compile_ms}ms \
+         (a few hundred ms, single-digit × native).\n\
+         A compile-once/run-many deployment amortizes the fixed cost to ~0 and the JIT lands near native; \
+         `jit-run` here does not.\n\
+         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`. native has no \
+         separate instantiate.)\n"
+    );
 }
 
 /// The native oracle: `chibicc_ref` (same `cc1_main` entry, system clang + libc) fed `stdin` for
