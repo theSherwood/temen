@@ -1242,6 +1242,8 @@ struct FuncGen<'a> {
     /// the innermost exit and `(continue)` to the innermost header (nimony's `for` lowers to
     /// `while (true) { … else break }`).
     loop_stack: Vec<(u32, u32)>,
+    /// Scalar-int **local `const`s** declared in the body (`(const :name T value)`), inlined at use.
+    local_consts: HashMap<String, i64>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -1288,6 +1290,7 @@ impl<'a> FuncGen<'a> {
             sret,
             label_block: HashMap::new(),
             loop_stack: Vec::new(),
+            local_consts: HashMap::new(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -1964,6 +1967,22 @@ impl<'a> FuncGen<'a> {
                 };
                 self.write_local(&name, v)
             }
+            Some("const") => {
+                // A **local `const`** `(const :name pragmas type value)` — a scalar int/char/bool
+                // constant, inlined at use. (Aggregate/table consts stay unsupported for now.)
+                let a = s.args();
+                if a.len() >= 4 {
+                    let name = sym_def(&a[0])?;
+                    if let Some(v) = int_literal(&a[3]) {
+                        self.local_consts.insert(name, v);
+                        return Ok(());
+                    }
+                    return Err(LengError::Unsupported(format!(
+                        "non-scalar local const `{name}`"
+                    )));
+                }
+                Ok(())
+            }
             Some("asgn") => {
                 // `(asgn Lvalue Expr)`.
                 let a = s.args();
@@ -2342,6 +2361,9 @@ impl<'a> FuncGen<'a> {
             Node::Atom(a) => {
                 if let Some(v) = self.read_local(a) {
                     return Ok(v);
+                }
+                if let Some(&c) = self.local_consts.get(a) {
+                    return Ok(self.emit_const(ValType::I64, c));
                 }
                 if let Some(&c) = self.t.consts.get(a) {
                     return Ok(self.emit_const(ValType::I64, c));
