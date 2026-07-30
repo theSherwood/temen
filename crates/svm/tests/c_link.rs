@@ -1283,9 +1283,11 @@ fn native_cc1(extra_args: &[&str], stdin: &[u8]) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn chibicc_tu_closure(tu_rel: &str) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let root = repo_root();
+    // Run `-M` on the **relative** TU path (cwd = repo root) so repo-local deps come back relative
+    // (`frontend/chibicc/hashmap.c`, `frontend/chibicc/chibicc.h`) — matching the guest's base_file and
+    // `-I` keys. An absolute input would emit absolute deps and the memfs keys wouldn't line up.
     let out = Command::new(chibicc())
-        .args(["-M", "-c"])
-        .arg(root.join(tu_rel))
+        .args(["-M", "-c", tu_rel])
         .current_dir(&root)
         .output()
         .expect("run chibicc -M");
@@ -1304,16 +1306,23 @@ fn chibicc_tu_closure(tu_rel: &str) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
         if tok == "\\" {
             continue; // line-continuation marker
         }
-        // Real host path: absolute (`/usr/...`) or repo-relative (`./frontend/...`, `frontend/...`).
-        let rel = tok.trim_start_matches("./").trim_start_matches('/');
+        // Real host path: absolute (`/usr/...`, or `/<repo>/frontend/...` when chibicc is invoked by
+        // absolute argv0) or repo-relative (`./frontend/...`, `frontend/...`).
         let real = if tok.starts_with('/') {
             PathBuf::from(tok)
         } else {
-            root.join(rel)
+            root.join(tok.trim_start_matches("./"))
         };
-        if !seen.insert(rel.to_string()) {
+        // Memfs key: repo-relative for repo files (so it matches the guest's relative `-I` and
+        // base_file), else the system path with its leading '/' stripped (`/usr/... → usr/...`).
+        let rel = match real.strip_prefix(&root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => real.to_string_lossy().trim_start_matches('/').to_string(),
+        };
+        if !seen.insert(rel.clone()) {
             continue;
         }
+        let rel = rel.as_str();
         let bytes =
             std::fs::read(&real).unwrap_or_else(|e| panic!("read closure file {real:?}: {e}"));
         let mut anc = Path::new(rel).parent();
