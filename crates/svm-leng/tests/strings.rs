@@ -10,6 +10,7 @@
 //! *real* `string` def.
 
 use svm_interp::Value;
+use svm_leng::LengModule;
 
 fn run(module: &svm_ir::Module, idx: u32, args: &[i64]) -> i64 {
     svm_verify::verify_module(module).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -45,6 +46,110 @@ fn sso_string_construct_and_read() {
         run(&m, 0, &[sp]),
         478560413032,
         "packed \"hello\" bytes read back"
+    );
+}
+
+#[test]
+fn long_string_const_materializes() {
+    // A **long** string literal can't pack into the SSO `bytes` word: nimony emits it as a `const`
+    // `LongString` blob `{fullLen, rc, capImpl, data:"…"}` that the `string` value's `more` field
+    // points at (`(addr strlit…)`). This exercises the blob's materialization: the const's exact
+    // bytes land in a data segment, and `(addr blob)` resolves to them. `getptr` returns the blob's
+    // address; the window there must hold `[fullLen=5 | rc=0 | capImpl=0 | "hello"]`.
+    let leng = "\
+(stmts
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (const :blob.0. . LS.0. (oconstr LS.0. (kv fullLen.0 5) (kv rc.0 0) (kv capImpl.0 0) (kv data.0 \"hello\")))
+ (proc :getptr.0. . (i +64) . (stmts . (ret (addr blob.0.)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let mut want = vec![0u8; 24];
+    want[0] = 5; // fullLen@0
+    want.extend_from_slice(b"hello"); // data@24
+
+    let seed = vec![0u8; 4096];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&m, 0, &[], &mut fuel, &seed);
+    let addr = match ir.expect("interp").as_slice() {
+        [Value::I64(a)] => *a as usize,
+        o => panic!("expected an address, got {o:?}"),
+    };
+    assert_eq!(
+        &imem[addr..addr + want.len()],
+        &want[..],
+        "LongString blob (interp)"
+    );
+
+    let (jout, jmem) = svm_jit::compile_and_run_capture(&m, 0, &[], &seed).expect("jit");
+    let jaddr = match jout {
+        svm_jit::JitOutcome::Returned(v) => v[0] as usize,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(jaddr, addr, "§9 interp/JIT parity on the blob address");
+    assert_eq!(
+        &jmem[jaddr..jaddr + want.len()],
+        &want[..],
+        "LongString blob (jit)"
+    );
+}
+
+/// Real nimony `greetLong(): string = "hello, this is a long string!"` (29 chars — too long to
+/// pack into the SSO word). hexer emits it as a `const` `LongString` blob plus a `string` whose
+/// `more` points at it (`(addr strlit…)`). Linked against a stand-in `system` unit carrying the
+/// real `string`/`LongString` type defs (so the const's layout resolves cross-module) and no-op ARC
+/// stubs (`=wasMoved`/`=destroy`), it runs end-to-end: the returned `string`'s `more` points at the
+/// materialized blob, whose `fullLen` is 29 and whose data is the literal — identically on both
+/// engines.
+#[test]
+fn real_long_string_runs_end_to_end() {
+    const REAL: &str = include_str!("fixtures/real_longstring.leng.nif");
+    let system = "\
+(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr (i +64)))))
+ (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc :=wasMoved.2. (params (param :p.0 . (ptr (i +64)))) . . (stmts . (ret .)))
+ (proc :=destroy.2. (params (param :s.0 . (ptr (i +64)))) . . (stmts . (ret .))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "lonelga0b",
+            src: REAL,
+            names: &["greetLong.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: system,
+            names: &["=wasMoved.2.", "=destroy.2."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    // greetLong (func 0) is frame-needing + aggregate-returning: ($sp, $sret) -> ().
+    let (sp, sret) = (2048i64, 512usize);
+    let seed = vec![0u8; 8192];
+    let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &ivals, &mut fuel, &seed);
+    ir.expect("interp greetLong");
+    let (_j, jmem) =
+        svm_jit::compile_and_run_capture(&linked, 0, &[sp, sret as i64], &seed).expect("jit");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+
+    let bytes = u64::from_le_bytes(imem[sret..sret + 8].try_into().unwrap());
+    let more = u64::from_le_bytes(imem[sret + 8..sret + 16].try_into().unwrap()) as usize;
+    assert_eq!(
+        bytes, 2318350419654699262,
+        "the SSO `bytes` word nimony emitted"
+    );
+    assert_ne!(more, 0, "long string: `more` points at the LongString blob");
+    let full_len = u64::from_le_bytes(imem[more..more + 8].try_into().unwrap());
+    assert_eq!(full_len, 29, "blob fullLen@0");
+    assert_eq!(
+        &imem[more + 24..more + 24 + 29],
+        b"hello, this is a long string!",
+        "blob data@24"
     );
 }
 

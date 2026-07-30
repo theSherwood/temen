@@ -521,8 +521,23 @@ plumbing. Five workstreams, roughly independent:
     moda's **real C `main` executing the whole init chain** end-to-end (guards, sub-inits, flush) and
     returning 0. The stand-in system object is the last stub between here and the real compiled
     `system` module.
-  - **Remaining for full W2:** long-string (`LongString`) data, and translating (or linking a real
-    compiled) `system` module so the `sysvq0asl` edges bind to real ARC/IO rather than the stub.
+  - **✅ Long string literals (`LongString` data) — DONE 2026-07-30.** A string too long to pack
+    into the SSO `bytes` word: nimony emits it as a `const` `LongString` blob
+    `{fullLen, rc, capImpl, data: uarray char}` and a `string` value whose `more` field points at it
+    (`(addr strlit…)`). Lowering it took **constant-aggregate materialization**: a `const` whose
+    value is an `(oconstr T (kv field val)*)` now materializes its exact little-endian bytes into a
+    data segment (scalar-int fields at their offset; a **string-literal** field — the `uarray` /
+    `UncheckedArray` flexible tail — as raw bytes past the fixed size) and registers the const as an
+    addressable global, so `(addr strlit…)` resolves to it. `resolve_type` gained the `uarray`
+    flexible-array tail (size-0, the object's fixed size stops there). The `LongString` layout comes
+    across the link (cross-module type resolution). Tested: a self-contained `const` blob whose bytes
+    are read back from the window (both engines), and **real nimony
+    `greetLong(): string = "hello, this is a long string!"` running end-to-end** — linked against a
+    stand-in `system` unit (real `string`/`LongString` defs + no-op ARC stubs), the returned
+    `string`'s `more` points at the materialized blob (`fullLen` = 29, data = the literal),
+    identically on both engines (`tests/strings.rs`).
+  - **Remaining for full W2:** translating (or linking a real compiled) `system` module so the
+    `sysvq0asl` edges bind to real ARC/IO rather than the stub — the last stub in the chain.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

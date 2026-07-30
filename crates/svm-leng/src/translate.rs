@@ -55,6 +55,43 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
+fn is_string_literal(node: &Node) -> bool {
+    matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
+}
+
+/// Decode a NIF string-literal atom (quotes included) to its raw bytes. NIF escapes a byte as `\HH`
+/// (two hex digits); a `\` before any other byte is that literal byte (`\\`, `\"`). Everything else
+/// is copied verbatim. (The tokenizer keeps the escapes intact in the atom text.)
+fn nif_str_bytes(atom: &str) -> Result<Vec<u8>, LengError> {
+    let s = atom
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(|| LengError::Malformed("expected a string literal".into()))?;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 2 < b.len()
+            && b[i + 1].is_ascii_hexdigit()
+            && b[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (b[i + 1] as char).to_digit(16).unwrap();
+            let lo = (b[i + 2] as char).to_digit(16).unwrap();
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else if b[i] == b'\\' && i + 1 < b.len() {
+            out.push(b[i + 1]);
+            i += 2;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Escape a symbol for an svm-text string literal (e.g. an `import` name). Printable ASCII passes
 /// through; `\` and `"` are backslash-escaped; anything else is `\xHH`. Necessary because mangled
 /// Leng names carry NIF hex escapes — the `[]` operator is literally `\5B\5D…`, whose bare backslash
@@ -299,14 +336,22 @@ impl Translator {
                         let name = sym_def(&a[0])?;
                         if let Some(v) = int_literal(&a[3]) {
                             self.consts.insert(name, v);
+                        } else if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                            // A constant aggregate with data (a `LongString` string-literal blob):
+                            // materialize its exact bytes into a data segment and register it as an
+                            // addressable global, so `(addr strlit…)` — the `string` value's `more`
+                            // pointer — resolves to it.
+                            let sz = bytes.len() as u64;
+                            self.data_inits.push((off, bytes));
+                            self.globals.insert(name, (off, desc));
+                            off += sz.max(8);
                         } else {
-                            // A non-scalar const — e.g. an `Rtti` vtable (`Type.vt`) or its RTTI
-                            // internals. Reserve an addressable, opaque placeholder global so
-                            // `(addr Type.vt)` yields a valid window address. Its bytes are never read
-                            // by translatable code (an object stores the vtable pointer, but only
-                            // *dynamic dispatch* reads through it, and that fail-closes), so a zeroed
-                            // fixed-size placeholder is sound — and we avoid resolving exotic RTTI
-                            // types (`flexarray`, external `Rtti`).
+                            // A non-scalar const we can't materialize — e.g. an `Rtti` vtable
+                            // (`Type.vt`) or its RTTI internals. Reserve an addressable, opaque
+                            // placeholder global so `(addr Type.vt)` yields a valid window address.
+                            // Its bytes are never read by translatable code (an object stores the
+                            // vtable pointer, but only *dynamic dispatch* reads through it, and that
+                            // fail-closes), so a zeroed fixed-size placeholder is sound.
                             const VT_PLACEHOLDER: u64 = 64;
                             self.globals
                                 .insert(name, (off, TyDesc::Scalar(ValType::I64)));
@@ -336,6 +381,65 @@ impl Translator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
         out
+    }
+
+    /// Materialize a **constant aggregate** value — `(oconstr AggType (kv field val)*)` — into its
+    /// little-endian window bytes, given the aggregate's (already resolved) layout. Scalar-int fields
+    /// write width-appropriate bytes at their offset; a **string literal** (a `LongString`'s `data`
+    /// flexible tail) writes its raw bytes there, growing the blob past the fixed size. Returns
+    /// `None` for anything outside that shape (a non-`oconstr`, an unresolved type, an unsupported
+    /// field value) so the caller falls back to an opaque placeholder. This is how a **long string
+    /// literal** lowers: nimony emits it as a `const` `LongString` blob that the `string` value's
+    /// `more` field points at (`(addr strlit…)`), NIM.md W2.
+    fn const_aggregate_bytes(&self, val: &Node) -> Result<Option<(Vec<u8>, TyDesc)>, LengError> {
+        if val.tag() != Some("oconstr") {
+            return Ok(None);
+        }
+        let a = val.args();
+        let tyname = match a.first().and_then(|n| n.as_atom()) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let (fields, base_size) = match self.types.get(tyname) {
+            Some(Layout::Object { fields, size }) => (fields.clone(), *size),
+            _ => return Ok(None),
+        };
+        let mut bytes = vec![0u8; base_size as usize];
+        for kv in &a[1..] {
+            if kv.tag() != Some("kv") {
+                continue;
+            }
+            let ka = kv.args();
+            if ka.len() < 2 {
+                continue;
+            }
+            let fname = ka[0]
+                .as_atom()
+                .ok_or_else(|| LengError::Malformed("const kv needs a field name".into()))?;
+            let (_, off, fdesc) = fields.iter().find(|(n, _, _)| n == fname).ok_or_else(|| {
+                LengError::Unsupported(format!("const field `{fname}` not in `{tyname}`"))
+            })?;
+            let off = *off as usize;
+            if let Some(v) = int_literal(&ka[1]) {
+                let w = match fdesc {
+                    TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
+                    _ => 8,
+                };
+                if bytes.len() < off + w {
+                    bytes.resize(off + w, 0);
+                }
+                bytes[off..off + w].copy_from_slice(&(v as u64).to_le_bytes()[..w]);
+            } else if is_string_literal(&ka[1]) {
+                let data = nif_str_bytes(ka[1].as_atom().unwrap())?;
+                if bytes.len() < off + data.len() {
+                    bytes.resize(off + data.len(), 0);
+                }
+                bytes[off..off + data.len()].copy_from_slice(&data);
+            } else {
+                return Ok(None); // an unsupported const field value — fall back to a placeholder
+            }
+        }
+        Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))))
     }
 
     /// Byte size of a type descriptor.
@@ -444,6 +548,15 @@ impl Translator {
                         return Err(LengError::Malformed("fld needs :name pragmas type".into()));
                     }
                     let fname = sym_def(&fa[0])?;
+                    // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
+                    // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
+                    // object's size stops here); a `const` materializes its bytes past the fixed
+                    // part. Record it at the current offset as an opaque pointer-width slot and stop
+                    // advancing.
+                    if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
+                        fields.push((fname, off, TyDesc::Scalar(ValType::I64)));
+                        continue;
+                    }
                     let fdesc = self.tydesc(&fa[2])?;
                     if let TyDesc::Agg(n) = &fdesc {
                         self.resolve_type(n, raw)?;
