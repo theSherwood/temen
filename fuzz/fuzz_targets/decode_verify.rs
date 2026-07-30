@@ -11,11 +11,22 @@
 use libfuzzer_sys::fuzz_target;
 
 use svm::default_args;
-use svm_encode::decode_module;
+use svm_encode::{decode_module, decode_unit, DecodeError};
 use svm_interp::run;
 use svm_verify::verify_module;
 
 fuzz_target!(|data: &[u8]| {
+    // The object dialect (v9) is tooling-facing but shares this decoder: `decode_unit` must
+    // fail-closed on arbitrary bytes exactly like `decode_module`. And the header firewall —
+    // any input the unit path decodes that the runnable path rejects must be rejected
+    // *as an object* (flag bit 0), never for any other reason: link scaffolding stays
+    // unreachable from the runtime load path.
+    if decode_unit(data).is_ok() {
+        match decode_module(data) {
+            Ok(_) | Err(DecodeError::ObjectInput) => {}
+            Err(e) => panic!("dialect divergence beyond the object flag: {e:?}"),
+        }
+    }
     if let Ok(m) = decode_module(data) {
         if verify_module(&m).is_ok() {
             for (fi, f) in m.funcs.iter().enumerate() {

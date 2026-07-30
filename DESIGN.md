@@ -478,6 +478,20 @@ In Phase 1 (§18) chibicc emits text, a tiny assembler produces binary; the text
 is the human/agent debugging interface throughout. Disproportionately valuable for
 an agent-driven build.
 
+**Two binary dialects, one container (wire v9; owner-approved 2026-07-30, unblocking
+an external consumer on format standardization).** A header flags byte after the
+version splits the container: the **runnable module** (`.svmb`, flag 0 — the
+untrusted-input TCB path, `decode_module`) and the **object / link unit** (`.svmo`,
+flag bit 0 — `decode_unit`, the linker's binary input). Only the object dialect
+carries the D-LINK scaffolding: the `data.ptr` relocation section, the data-export
+section, and the link-form `data.self`/`data.sym`/`data.top` opcodes.
+`decode_module` rejects the object flag **at the header**, so link scaffolding stays
+unreachable from the runtime load path — the fused decode+verify pass is unchanged;
+reserved flag bits fail closed. Both dialects are one linear pass with no fixups
+(the link forms ride inline as instructions, position-independent — the retired
+`(func,block,inst)` reloc-table shape stays retired). An object with in-band export
+tables supersedes the `.syms` sidecar; `svm-run --link` is the CLI driver.
+
 ---
 
 ## 3b. IR specification (Phase 1)  [SETTLED]
