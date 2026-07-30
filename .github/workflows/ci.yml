@@ -270,6 +270,38 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+  cc1-self-compile:
+    name: cc1 self-compile differential (Linux-only)
+    runs-on: ubuntu-latest
+    # The guest compiler runs under the tree-walk interpreter — slow but finite. Bound a wedged run
+    # rather than sit at GitHub's 6 h default; generous vs. a cold-cache build + the ~2 min run.
+    timeout-minutes: 25
+    # ISSUES.md I30: the svm test-binary LINK phase (Cranelift + Wasmtime rlibs) is the memory peak;
+    # drop test debug info (symbols/backtraces survive, only line tables go) as the `check` job does.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: install clang (native reference compiler)
+        # The differential clang-builds a *native* chibicc reference (chibicc_ref) and `make`s the
+        # chibicc fork with the system cc. `make`/`cc` are preinstalled on the runner; clang may not
+        # be — the test prefers `clang-18` and falls back to `clang`, so plain `clang` suffices.
+        # ISSUES.md I34: bound the fetch so a wedged mirror fails fast into a re-run.
+        timeout-minutes: 15
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # The heavy self-compile gate is #[ignore]d — too slow (~2 min) for the inner
+      # `cargo test --workspace` loop: it `make`s chibicc, compiles ~10 TUs `--emit-object`, links +
+      # verifies a ~300-function module, runs it on the tree-walk interpreter AND the JIT, and
+      # clang-builds the native reference — for a base program, an `#include`-from-memfs program, and
+      # the feature-diverse corpus. Running it here makes the guest-vs-native IR differential actually
+      # gate merges (SELFHOST_C.md §5 E), instead of only when someone runs it by hand. `-j 2` bounds
+      # the concurrent heavy links (I30 OOM guard), matching the `check` job.
+      - run: cargo test -p svm --test c_link -j 2 -- --ignored self_compiles
+
   miri:
     # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
     # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
