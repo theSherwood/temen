@@ -506,8 +506,23 @@ plumbing. Five workstreams, roughly independent:
     fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
     against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
     `more` land in the sret slot identically on both engines (`tests/link.rs`).
-  - **Remaining for full W2:** long-string (`LongString`) data, and whole-module scaffolding
-    translation so the *entire* `system` module links (Path A), not hand-picked procs.
+  - **✅ Whole-module link objects — DONE 2026-07-30 (Path A shape).** `link_units` lifts a
+    *hand-picked subset* of a module's procs (the "go deep" mode); a real program instead links
+    *whole compiled modules* — every proc plus the scaffolding nimony emits (`ini`
+    module-initializer, C `main`, exportc gvars). `svm_leng::compile_whole_object`/`link_whole_units`
+    (over a `WholeModule{stem, src}`) do that: `Translator::module_with_names` translates every proc
+    and returns their local names, which become the object's in-band export table (each proc under
+    its global stem-suffixed name), so other modules' cross-module calls resolve. This is `lld` over
+    object files versus the selective lift. Proven on **two genuine `hexer` modules linked in full**
+    (`tests/whole.rs`): real `moda` (main module — `useit`, its `ini`, the C `main` + exportc gvars)
+    + real `modb` (`helper` + `ini`), their cross-module edges resolving against each other
+    (`useit`→`helper`, `moda.ini`→`modb.ini`) and their `sysvq0asl` system edges against a small
+    stand-in system object. The whole program links, verifies, and runs on both engines — including
+    moda's **real C `main` executing the whole init chain** end-to-end (guards, sub-inits, flush) and
+    returning 0. The stand-in system object is the last stub between here and the real compiled
+    `system` module.
+  - **Remaining for full W2:** long-string (`LongString`) data, and translating (or linking a real
+    compiled) `system` module so the `sysvq0asl` edges bind to real ARC/IO rather than the stub.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

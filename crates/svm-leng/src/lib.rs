@@ -154,27 +154,57 @@ pub fn translate_procs(src: &str, names: &[&str]) -> Result<Module, LengError> {
 /// One nimony module in a multi-module link (NIM.md W2 — the linker). `src` is the module's `hexer`
 /// Leng; `stem` is the file id that qualifies its symbols globally — a proc `P.` defined here is
 /// referenced from *other* modules as `P.<stem>` (nimony's cross-module mangling); `names` are the
-/// local proc names to translate out of it.
+/// local proc names to translate out of it. This is the **selective** ("go deep") shape: it lifts a
+/// caller→callee pair out of a module whose *other* top-levels the skeleton can't lower yet. To
+/// compile a module in full — every proc, its `ini`/C-`main` scaffolding and all — use
+/// [`WholeModule`]/[`link_whole_units`] (NIM.md W2, Path A).
 pub struct LengModule<'a> {
     pub stem: &'a str,
     pub src: &'a str,
     pub names: &'a [&'a str],
 }
 
+/// One nimony module linked **in full** (NIM.md W2, Path A) — every proc it defines, together with
+/// the module scaffolding nimony emits (`ini` module-initializer, C `main`, exportc gvars). This is
+/// what a real compiled module (e.g. the `system` module) is: it contributes *all* its procs, and
+/// each is exported under its global (stem-suffixed) name so other modules' cross-module calls
+/// resolve. The whole-module counterpart of [`LengModule`], with no proc selection to make.
+pub struct WholeModule<'a> {
+    pub stem: &'a str,
+    pub src: &'a str,
+}
+
+/// How much of a module to translate into its link object: a named subset, or the whole thing.
+#[derive(Clone, Copy)]
+enum Select<'a> {
+    Names(&'a [&'a str]),
+    Whole,
+}
+
 /// Translate one nimony module as a **relocatable link unit** and stamp its in-band export table.
 /// Link-unit mode: globals via `data.self` (so `link` relocates each unit's data into a disjoint
 /// window region — an absolute-offset unit would silently alias), and each proc exported under its
 /// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
-/// `ext_types` are external aggregate layouts (sibling units' pooled type defs, under their
-/// stem-suffixed names) available while translating — see [`link_units`].
+/// `sel` is the named subset or the whole module; `ext_types` are external aggregate layouts
+/// (sibling units' pooled type defs) available while translating — see [`link_units`].
 fn translate_object_module(
-    unit: &LengModule,
+    stem: &str,
+    src: &str,
+    sel: Select,
     ext_types: &[(String, translate::Layout)],
 ) -> Result<Module, LengError> {
-    let root = nif::parse(unit.src).map_err(LengError::Parse)?;
+    let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
-    let text = t.some_procs(&root, unit.names)?;
+    // Whole module → translate every proc, exporting the exact local names the translator emitted
+    // in func order; a named subset → exactly those, in list order.
+    let (text, export_names) = match sel {
+        Select::Whole => t.module_with_names(&root)?,
+        Select::Names(names) => {
+            let text = t.some_procs(&root, names)?;
+            (text, names.iter().map(|s| s.to_string()).collect())
+        }
+    };
     let mut module = svm_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
@@ -182,16 +212,15 @@ fn translate_object_module(
     })?;
     // Procs export in-band under their global (stem-suffixed) names; this unit's `gvar`s export as
     // cross-module data symbols so another unit's `data.sym` can bind to them.
-    module.exports = unit
-        .names
+    module.exports = export_names
         .iter()
         .enumerate()
         .map(|(i, local)| Export {
-            name: format!("{local}{}", unit.stem),
+            name: format!("{local}{stem}"),
             func: i as u32,
         })
         .collect();
-    module.data_exports = t.global_exports(unit.stem);
+    module.data_exports = t.global_exports(stem);
     Ok(module)
 }
 
@@ -207,18 +236,32 @@ fn translate_object_module(
 /// at translate time. [`link_units`] pools the linked units' type defs so those resolve.
 pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
     Ok(svm_encode::encode_unit(&translate_object_module(
-        unit,
+        unit.stem,
+        unit.src,
+        Select::Names(unit.names),
         &[],
     )?))
 }
 
-/// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), *through the `.svmo`
-/// narrow waist*: each module is compiled to a binary object ([`compile_object`]), decoded back
-/// through the hardened `decode_unit` firewall, paired into a [`svm_ir::LinkUnit`] from its in-band
-/// export tables (the same conversion `svm-run --link` does), and statically linked. So a nimony
-/// object is a first-class citizen the shared linker — and other frontends' objects — compose with.
-/// Units keep the given order, so the first module's first proc is func 0 (a natural entry). Not
-/// verified here (untrusted frontend — the caller runs `svm_verify::verify_module` on the result).
+/// Compile a nimony module **in full** to a binary `.svmo` link object (NIM.md W2, Path A) — every
+/// proc plus its scaffolding, each exported under its global name. The whole-module counterpart of
+/// [`compile_object`]; the same untrusted-producer discipline (the bytes re-enter through the
+/// hardened `decode_unit` firewall, and the linked result is re-verified).
+pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
+    Ok(svm_encode::encode_unit(&translate_object_module(
+        unit.stem,
+        unit.src,
+        Select::Whole,
+        &[],
+    )?))
+}
+
+/// The shared link engine (NIM.md W2), *through the `.svmo` narrow waist*: each `(stem, src, sel)` is
+/// compiled to a binary object, decoded back through the hardened `decode_unit` firewall, paired into
+/// a [`svm_ir::LinkUnit`] from its in-band export tables (the same conversion `svm-run --link` does),
+/// and statically linked into one svm-ir [`Module`]. Units keep the given order, so the first
+/// module's first proc is func 0 (a natural entry). Not verified here (untrusted frontend — the
+/// caller runs `svm_verify::verify_module` on the result).
 ///
 /// **Cross-module type resolution**: proc and data symbols resolve at *link* time, but an aggregate
 /// **type**'s layout is needed at *translate* time (field offsets are baked into loads/stores). So
@@ -226,17 +269,17 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
 /// global names ([`translate::Translator::export_types`]) and made available to all — a module
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
-pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
+fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
-    for unit in units {
-        let root = nif::parse(unit.src).map_err(LengError::Parse)?;
-        pooled.extend(translate::Translator::export_types(&root, unit.stem)?);
+    for (stem, src, _) in units {
+        let root = nif::parse(src).map_err(LengError::Parse)?;
+        pooled.extend(translate::Translator::export_types(&root, stem)?);
     }
     let objects: Vec<Vec<u8>> = units
         .iter()
-        .map(|u| {
+        .map(|(stem, src, sel)| {
             Ok(svm_encode::encode_unit(&translate_object_module(
-                u, &pooled,
+                stem, src, *sel, &pooled,
             )?))
         })
         .collect::<Result<_, LengError>>()?;
@@ -261,6 +304,29 @@ pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
         });
     }
     svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
+}
+
+/// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), each contributing a
+/// selected subset of its procs ([`LengModule`]). See [`link_selected`] for the mechanism. Use
+/// [`link_whole_units`] to link modules *in full* (Path A).
+pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Names(u.names)))
+        .collect();
+    link_selected(&sel)
+}
+
+/// **Link several nimony modules in full** into one svm-ir [`Module`] (NIM.md W2, Path A): every
+/// module contributes *all* its procs and scaffolding ([`WholeModule`]) — the shape a real program
+/// links, where each `.svmo` is a whole compiled module (the analog of `lld` over object files).
+/// See [`link_selected`] for the mechanism.
+pub fn link_whole_units(units: &[WholeModule]) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Whole))
+        .collect();
+    link_selected(&sel)
 }
 
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.

@@ -545,6 +545,15 @@ impl Translator {
 
     /// Translate a `(stmts TopLevelConstruct*)` module to SVM text (all procs).
     pub fn module(&mut self, root: &Node) -> Result<String, LengError> {
+        Ok(self.module_with_names(root)?.0)
+    }
+
+    /// Translate an **entire** module (every proc, in source order) to SVM text, also returning each
+    /// proc's **local name** in func-index order — the whole-module counterpart of [`some_procs`],
+    /// for compiling a real nimony module (all its scaffolding: `ini`, C `main`, the exportc gvars)
+    /// as a link object. The names feed the object's export table so *other* modules' cross-module
+    /// calls (`callee.<stem>`) resolve against it (NIM.md W2, Path A).
+    pub fn module_with_names(&mut self, root: &Node) -> Result<(String, Vec<String>), LengError> {
         if root.tag() != Some("stmts") {
             return Err(LengError::Malformed(format!(
                 "module root must be (stmts …), got {:?}",
@@ -554,6 +563,7 @@ impl Translator {
         self.collect_types(root)?;
         self.collect_globals(root)?;
         let mut proc_nodes = Vec::new();
+        let mut names = Vec::new();
         for item in root.args() {
             match item.tag() {
                 Some("proc") => {
@@ -563,7 +573,7 @@ impl Translator {
                     let index = proc_nodes.len() as u32;
                     let needs_frame = proc_needs_frame(item);
                     self.procs.insert(
-                        name,
+                        name.clone(),
                         Sig {
                             index,
                             params,
@@ -572,6 +582,7 @@ impl Translator {
                             sret,
                         },
                     );
+                    names.push(name);
                     proc_nodes.push(item);
                 }
                 Some("type" | "gvar" | "tvar" | "const") => {} // handled by collect_types/globals
@@ -592,7 +603,7 @@ impl Translator {
         for p in &proc_nodes {
             used_memory |= self.proc_body(p, &mut out)?;
         }
-        Ok(self.assemble(used_memory, out))
+        Ok((self.assemble(used_memory, out), names))
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
