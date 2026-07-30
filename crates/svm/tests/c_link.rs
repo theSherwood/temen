@@ -28,9 +28,12 @@
 //! headers (`<glob.h>`, …) are POSIX; Windows lacks the toolchain, so the whole suite is Unix-only.
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 use svm_interp::Value;
@@ -1074,7 +1077,7 @@ fn chibicc_ref() -> &'static Path {
         let clang = if Command::new("clang-18")
             .arg("--version")
             .status()
-            .map_or(false, |s| s.success())
+            .is_ok_and(|s| s.success())
         {
             "clang-18"
         } else {
@@ -1196,4 +1199,3 @@ fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
         "guest-emitted IR is byte-identical to the native reference (same frontend, different substrate)"
     );
 }
-
