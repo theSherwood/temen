@@ -133,3 +133,31 @@ the capture step first, TDD-first.
   unclassified park still `FiberFault`s.
 - **interp == JIT** across every new shape (the §18 oracle), as for all durable work.
 - **Single-vCPU first** (freeze_drive slice 3.1); nested/multi-vCPU is PR 2 / O11.
+
+## 8. Implementation plan for PR 1 — the handler→caller→capture linkage
+
+The servicer-triggered path has a **natural harness** (a serve handler that captures its own caller),
+which sidesteps the whole-run-freeze dead-end. The linkage is already in the code:
+
+- A running handler carries `serve_run: Some(ServeRun { ticket, .. })` (`svm-interp:6729`) — the dispatch
+  ticket its return would answer. (A `svc.*` op *under* a handler is refused `-EINVAL`, so the serve loop
+  is the domain's outermost dispatcher — the clone op rides the same serve-frame position.)
+- Its caller is parked as `Sched::ticket_waiters[(callee_domain_id, ticket)] = Waiter::Fiber { reg, slot,
+  svc }` (`:3796`) — a direct handle (`Arc<FiberRegistry>` + slot) to the caller's parked fiber.
+
+So the op — `clone_caller() -> twin_child_handle | -errno`, self-namespace, servicer-side — is:
+
+1. In the handler, read `serve_run.ticket` + the callee domain id; look up the caller's
+   `Waiter::Fiber { reg, slot }` in `ticket_waiters`. `-EINVAL` if not called from a handler / no waiter.
+2. **Capture** that specific fiber's continuation: `flatten_fiber_for_freeze`-style spill of `(reg, slot)`
+   at the caller's `cap.call` **post-call resume point** with a **reply slot** — the targeted,
+   single-fiber freeze (the load-bearing new primitive; the whole-run `freeze_drive` is not involved).
+3. **Twin**: copy the caller's carve into a fresh child (`spawn_named_child` path), re-grant pass-through
+   handles, re-seed a `CapReply` park for the twin under a second `(callee, ticket')`.
+4. Return the twin's `child_handle`; the servicer then `cap_reply`s each ticket (`pid`/`0`).
+
+**Smallest first code step (de-risk the capture, no twin):** `clone_caller()` that captures the caller
+into a window image and immediately restores it *in place* with an injected reply — proving a specific
+parked fiber's continuation serializes + resumes past its call with a supplied result. Harness: a server
+whose handler calls it, one caller calling in. Only then add step 3 (twin + second ticket). This isolates
+the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-first.
