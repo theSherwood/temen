@@ -308,15 +308,30 @@ How each X-item closes without new engine surface, without consumer coupling, an
 out of the TCB. Everything below is either an observer seam, host-side tooling in the cdylib, guest
 libc, or a standard DAP verb.
 
-- **X2 + X4's fault counter ride W3.** Both are **host-side consumers of the mem-hook stream** in
-  the cdylib (the `HOOKS.md` cache/page-fault use case, made concrete): a configurable cache/
-  coherence model and a first-touch shadow-set fault counter. Design notes that pass verified
-  against the as-built hook (`MemEvent`, `svm-run/src/lib.rs`):
+- **X2 + X4's fault counter are access-stream consumers — with two feeds.** The models (a
+  configurable cache/coherence model, a first-touch shadow-set fault counter) live **host-side in
+  the cdylib** either way; what differs is where the access stream comes from:
+  - **Under a debug session: the debugger's own access decode, *not* the hook pass.** The W3 pass
+    *rewrites the module* (inserted hook `cap.call`s — `mem_hook_stats` reports `inserted_insts`),
+    so instrumenting a debugged guest would surface synthetic ops in the machine view, shift SSA
+    slots, and skew the op-clock that `seek` indexes — turning a profiling panel on must not
+    change what the debugger shows. The debug tier already observes accesses without any rewrite:
+    `watch_hit_before` (`bytecode.rs`) decodes the next op's accessed range from live block-local
+    values — it is how watchpoints landed uninstrumented. Generalize that decode into an optional
+    per-op **access sink** on the debug session: no module rewrite, op-clock unchanged, zero cost
+    when no sink is installed, full `MemEvent` vocabulary (loads/stores/atomics/`Copy`/`Fill`).
+  - **Outside a debug session (run-mode profiling): the W3 hook pass**, as designed — the rewrite
+    is invisible when nothing inspects the machine.
+  - **The two feeds are each other's oracle**: the same program's sink stream (uninstrumented) and
+    hook stream (instrumented) must be identical — a house-style differential that also pins the
+    sink's op coverage.
+
+  Design notes verified against the as-built hook (`MemEvent`, `svm-run/src/lib.rs`):
   - `MemEvent` carries **no vCPU identity**, and coherence state is meaningless without it. Add
-    attribution **at hook dispatch, host-side** — on the cooperative tier the dispatcher knows the
-    executing vCPU — so the event type, the instrumentation pass, and the engine are untouched.
-    This pins coherence modeling to the **interpreter tier**; acceptable and worth stating (it is
-    the same tier boundary the debugger already has), not discovered later.
+    attribution **at dispatch, host-side** (sink or hook) — on the cooperative tier the dispatcher
+    knows the executing vCPU — so the event type, the instrumentation pass, and the engine are
+    untouched. This pins coherence modeling to the **interpreter tier**; acceptable and worth
+    stating (it is the same tier boundary the debugger already has), not discovered later.
   - `Copy`/`Fill` arrive as **span events**; consumers expand spans to lines/pages themselves.
   - **Capability-written bytes** (stdin fill, `fs`/`display` I/O) never appear as guest accesses.
     A model that should count them needs a host-side tap where caps write into the window —
@@ -373,11 +388,61 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 
 ## Suggested slice order
 
-> **2026-07-28:** W1 (+ time-travel/watchpoints), W2 v1, and **W5** are done; **W4**'s suspend/resume
-> seam shipped in the browser (its generic-debug-session + replay form remains). The live remaining
-> order is **W4 (generic form) → W3-in-browser → the W6 browser/tooling items → W2 v2**, plus the
-> **consumer-surfaced needs** section below as those are demanded. The 07-24 order (**W4 → W5 → W3 →
-> W2 v2**) is superseded.
+> **2026-07-30 — implementation plan for the remaining work** (supersedes the 07-28 and 07-24
+> orders; the original numbered list below stays as the record). Status at this date: W1
+> (+ time-travel/watchpoints), W2 v1, and W5 are done; W4 lacks only the interactive provide verb;
+> the checkpoint ladder and `CapTape` replay have landed. Each slice lands with CI-gating tests,
+> differential wherever two observers see the same program, per `AGENTS.md`.
+>
+> 1. **W4 finish — `provideStdin` on the debug session.** Park the debug vCPU on exhausted stdin
+>    (`VcpuEvent::StdinPark` exists engine-side), surface a distinct DAP stop reason, add a custom
+>    `provideStdin` request that appends to the session's `CapTape` and resumes. Acceptance: the
+>    W4 block above (two round-trips; `seek(0)` replays both byte-identically, no re-park).
+> 2. **DAP array-pump.** `svm_dap_request` accepts a JSON **array** of requests per pump (replies
+>    already come back as an array); singletons unchanged. Acceptance: a step + N state reads in
+>    one FFI crossing; existing DAP tests pass untouched.
+> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize
+>    `watch_hit_before`'s per-op access decode into an optional sink on
+>    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
+>    module rewrite, op-clock unchanged. Acceptance: sink stream **≡ the W3 hook-pass stream** on
+>    the same program (uninstrumented vs. instrumented) across the full `MemEvent` vocabulary; all
+>    debug parity tests pass with a sink installed.
+> 4. **X2 + X4's fault counter — cache/coherence + paging models, host-side in the cdylib.** A
+>    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
+>    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
+>    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
+>    includes the **W3 browser export**. Model state snapshots at the checkpoint-ladder stride.
+>    Acceptance: strided-vs-sequential miss ordering; browser counters ≡ native on the same
+>    stream; `seek(t)` model state ≡ a from-0 run to `t`.
+> 5. **X4's real-state half + W6 memory-map.** The window memory-map JSON (data segments, heap
+>    extent, data-stack region, cap-mapped regions) and a **Memory-capability growth cap** so
+>    guest `malloc` over `vm_map` returns NULL at the limit. Acceptance: JSON matches module +
+>    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows.
+> 6. **X1 — scheduler trace seam + shared-state consumer.** An optional, zero-cost-when-off event
+>    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
+>    edge) with batch readback; the shared-state consumer (last-writer / contested per range) over
+>    the attributed sink. Acceptance: the tape is bit-identical across a replay of the same run;
+>    wake edges match wait/notify semantics on a fixture; contested flags match a hand-computed
+>    oracle.
+> 7. **X3 — scheduler policy + forced switch.** Seed + quantum bounds as debug-launch config
+>    through the DAP/browser surface (quantum = 1 is the chaos case; the native deterministic
+>    explorer already runs memop-granularity quantum = 1), plus a forced-switch session verb that
+>    ends the turn at the next safe point. Acceptance: same policy → identical slice-6 tape;
+>    a forced switch lands at a deterministic clock and survives replay.
+> 8. **X5 — DAP `setVariable` / `writeMemory`.** The standard verbs on the existing backend;
+>    debugger writes are recorded on the session input tape (the `CapTape` shape) so replay
+>    re-applies them. Acceptance: write → `seek` back → `seek` forward re-observes the write;
+>    parity with the tree-walker where both back the same request.
+> 9. **X6 — guest-libc sem/barrier.** `sem_*` / `pthread_barrier_*` headers over the existing
+>    futex wait/notify ops (the postgres demo `ipc_shim.c` pattern), landed next to the
+>    playground's seeded libc. Acceptance: producer/consumer and barrier-phase fixtures run on
+>    interp + JIT with identical output.
+> 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
+>    (finite register file) stays demand-driven.
+>
+> Order rationale: 1–2 are small and unblock any embedder spike (interactivity + step latency);
+> 3 is the hinge the model slices stand on; 4–5 close the perf/memory panels; 6–7 close the
+> threading story; 8–10 are an independent tail, land any time.
 
 1. **W1 spike** — single-vCPU interactive step + source breakpoint exported from the cdylib,
    driven by a throwaway page, parity-checked against the native `Inspector`. De-risks
