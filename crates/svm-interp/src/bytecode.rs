@@ -3717,10 +3717,12 @@ pub struct DebugRunSnapshot {
     /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
     /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    /// Mapped window bytes ([`Mem::window_snapshot`]), reseeded via [`Mem::seed`] on restore; `None` for
-    /// a memoryless run. Fibers and same-module coroutines share this one window (coroutines via a
-    /// `nested_view` over the same backing), so their bytes ride here too.
-    mem: Option<Vec<u8>>,
+    /// The root window's full memory state — committed bytes **and** page-protection map
+    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore; `None` for a
+    /// memoryless run. Capturing the protection map (not just the prefix bytes) is what admits a
+    /// **page-mapping** root (`map`/`unmap`/`protect`/grow). Fibers and same-module coroutines share this
+    /// one window (coroutines via a `nested_view` over the same backing), so their bytes ride here too.
+    mem: Option<super::MemLayout>,
     /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
     host: super::HostReplaySubstate,
 }
@@ -4532,7 +4534,7 @@ impl DebugRun {
     fn checkpointable(&self) -> bool {
         self.done.is_none()
             && self.host.checkpoint_safe()
-            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
             && !self
                 .fibers
                 .iter()
@@ -4568,7 +4570,7 @@ impl DebugRun {
                 .collect(),
             active_coro: self.vt.active_coro,
             extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.window_snapshot()),
+            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
             host: self.host.replay_substate(),
         })
     }
@@ -4589,8 +4591,8 @@ impl DebugRun {
         // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
         // indices resolve against the source).
         self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
-            m.seed(bytes);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.restore_layout(layout);
         }
         // Rebuild each coroutine: a fresh `nested_view` over the just-reseeded parent window (so its
         // bytes — shared via the backing region — are already correct) + a fresh Yielder host + a table
@@ -5049,7 +5051,10 @@ pub struct ScheduledSnapshot {
     /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
     /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    mem: Option<Vec<u8>>,
+    /// The run window's full memory state — committed bytes **and** page-protection map
+    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore. All tasks share this
+    /// one window; capturing its protection map admits a **page-mapping** run (`map`/`unmap`/`protect`/grow).
+    mem: Option<super::MemLayout>,
     host: super::HostReplaySubstate,
 }
 
@@ -6078,7 +6083,7 @@ impl ScheduledDebugRun {
     /// **demand** coroutines / children that **map their own pages** (non-pristine `nested_view` layout).
     fn checkpointable(&self) -> bool {
         self.host.checkpoint_safe()
-            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
             && !self
                 .fibers
                 .iter()
@@ -6146,7 +6151,7 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.window_snapshot()),
+            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
             host: self.host.replay_substate(),
         })
     }
@@ -6163,8 +6168,8 @@ impl ScheduledDebugRun {
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
         self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), snap.mem.as_ref()) {
-            m.seed(bytes);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.restore_layout(layout);
         }
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
         // windows are `nested_view`s over the just-reseeded shared window (their bytes — shared via the
