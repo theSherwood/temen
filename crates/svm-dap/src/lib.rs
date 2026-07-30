@@ -200,6 +200,7 @@ impl DapServer {
             "provideStdin" => self.on_provide_stdin(args),
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
+            "schedTrace" => self.on_sched_trace(),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -432,6 +433,13 @@ impl DapServer {
                 Some(model)
             }
         };
+        // `schedTrace: true` (slice 6): arm the scheduler trace tape — a threaded bytecode
+        // session only; fail-closed elsewhere (a single vCPU has no schedule to trace).
+        if args.get("schedTrace").and_then(|v| v.as_bool()) == Some(true)
+            && !inspector.set_sched_trace(true)
+        {
+            return (false, Json::Null, vec![]);
+        }
         self.session = Some(Session {
             inspector,
             mem_model,
@@ -963,6 +971,19 @@ impl DapServer {
         };
         let ok = session.inspector.provide_stdin(data.as_bytes());
         (ok, Json::Null, vec![])
+    }
+
+    /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
+    /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
+    fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(tape) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inspector.sched_trace_json())
+        else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, tape, vec![])
     }
 
     /// The custom `memoryMap` request (slice 5): the window's memory-map introspection — geometry,

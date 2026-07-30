@@ -509,7 +509,17 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    codec (`DurableBinding::Memory`, both directions). Acceptance: JSON matches module +
 >    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows;
 >    durable freeze/thaw preserves the cap.
-> 6. **X1 — scheduler trace seam + shared-state consumer.** An optional, zero-cost-when-off event
+> 6. ~~**X1 — scheduler trace seam + shared-state consumer.**~~ **DONE 2026-07-30** —
+>    `SchedTraceEvent` tape on `ScheduledDebugRun` (turns, `parkJoin`/`parkWait`,
+>    `wakeNotify`/`wakeJoin` with **both identities**, `wakeTimeout`, `spawn`), derived by
+>    **state-diffing at the two driver sites** — zero helper churn, armed-only cost, the host
+>    records and never chooses differently (invariant 4). `schedTrace` launch arg + request
+>    (threaded bytecode only, fail-closed elsewhere), re-armed on seek rebuilds (the replay
+>    refills the tape deterministically — pinned bit-identical). The shared-state consumer rides
+>    `MemModel` (per-word last-writer + contested over the attributed sink, in `memModelStats`).
+>    Gated by `crates/svm-dap/tests/sched_trace.rs` — including the honest negative: a fixture
+>    whose wait falls through `WAIT_NOT_EQUAL` shows *no* park edge. Original spec: an optional,
+>    zero-cost-when-off event
 >    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
 >    edge) with batch readback; the shared-state consumer (last-writer / contested per range) over
 >    the attributed sink. Integration (verified): every decision point sits in

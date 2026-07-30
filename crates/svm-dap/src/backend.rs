@@ -199,6 +199,19 @@ pub trait Debuggee {
         None
     }
 
+    // --- scheduler trace (slice 6) ---------------------------------------------------------------
+    /// Arm the scheduler trace tape ([`bytecode::SchedTraceEvent`]) — turns, parks, wakes with
+    /// both identities, spawns. `false` when this backend/session has no schedule to trace (the
+    /// tree-walker, a single-vCPU session): a `schedTrace` launch fails cleanly. Default:
+    /// unsupported.
+    fn set_sched_trace(&mut self, _on: bool) -> bool {
+        false
+    }
+    /// The trace tape so far as a JSON array (`None` when unarmed/unsupported).
+    fn sched_trace_json(&self) -> Option<Json> {
+        None
+    }
+
     // --- access sink / models --------------------------------------------------------------------
     /// Install the session's access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3): every
     /// module-0 memory op reaches it, `seek` replays included. `false` when this backend has no
@@ -342,6 +355,9 @@ pub struct BytecodeBackend {
     /// Slice 5: the session's Memory-capability growth cap ([`Host::set_mem_map_limit`]) — set on
     /// the powerbox at build and on every seek rebuild. `None` = unbounded.
     mem_limit: Option<u64>,
+    /// Slice 6: whether the scheduler trace tape is armed (threaded engine only) — re-armed on
+    /// every seek rebuild so the replay refills the tape deterministically.
+    sched_trace: bool,
     /// The recorded [`CapTape`] of nondeterministic cap **inputs** (clock / stdin `read` / host-fn) from
     /// the furthest-forward execution — replayed on a reverse `seek` rebuild so re-execution sees
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
@@ -449,6 +465,7 @@ impl BytecodeBackend {
             sched_checkpoints: Vec::new(),
             checkpointing: true,
             access_sink: None,
+            sched_trace: false,
         })
     }
 
@@ -857,6 +874,10 @@ impl Debuggee for BytecodeBackend {
             if let Some(sink) = &self.access_sink {
                 run.set_access_sink(wrap_sink(sink));
             }
+            // Re-arm the trace tape: the replay refills it deterministically from the restore point.
+            if self.sched_trace {
+                run.set_sched_trace(true);
+            }
             // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
             // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
             if self.checkpointing {
@@ -1097,6 +1118,70 @@ impl Debuggee for BytecodeBackend {
             }
         }
         Some(Json::obj(fields))
+    }
+    /// The trace tape is a threaded-engine feature (a single vCPU has no schedule).
+    fn set_sched_trace(&mut self, on: bool) -> bool {
+        match &mut self.engine {
+            Engine::Threaded(run) => {
+                run.set_sched_trace(on);
+                self.sched_trace = on;
+                true
+            }
+            Engine::Single(_) => false,
+        }
+    }
+    fn sched_trace_json(&self) -> Option<Json> {
+        let Engine::Threaded(run) = &self.engine else {
+            return None;
+        };
+        let tape = run.sched_trace()?;
+        use bytecode::SchedTraceEvent as E;
+        Some(Json::Arr(
+            tape.iter()
+                .map(|e| match e {
+                    E::Turn { turn, task } => Json::obj(vec![
+                        ("kind", Json::s("turn")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                    E::ParkJoin { turn, task, child } => Json::obj(vec![
+                        ("kind", Json::s("parkJoin")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                        ("child", Json::i(*child as i64)),
+                    ]),
+                    E::ParkWait { turn, task, key } => Json::obj(vec![
+                        ("kind", Json::s("parkWait")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                        ("key", Json::i(*key as i64)),
+                    ]),
+                    E::WakeNotify { turn, waker, wakee } => Json::obj(vec![
+                        ("kind", Json::s("wakeNotify")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("waker", Json::i(*waker as i64)),
+                        ("wakee", Json::i(*wakee as i64)),
+                    ]),
+                    E::WakeJoin { turn, waker, wakee } => Json::obj(vec![
+                        ("kind", Json::s("wakeJoin")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("waker", Json::i(*waker as i64)),
+                        ("wakee", Json::i(*wakee as i64)),
+                    ]),
+                    E::WakeTimeout { turn, task } => Json::obj(vec![
+                        ("kind", Json::s("wakeTimeout")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                    E::Spawn { turn, parent, task } => Json::obj(vec![
+                        ("kind", Json::s("spawn")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("parent", Json::i(*parent as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                })
+                .collect(),
+        ))
     }
     /// The engine-level sink installer (both bytecode engines support it).
     fn set_access_sink(&mut self, sink: SharedSink) -> bool {

@@ -147,6 +147,10 @@ struct State {
     l2_misses: u64,
     /// First-touch page set (page index = `addr / page_size`); `len()` = the fault count.
     pages: std::collections::BTreeSet<u64>,
+    /// The **shared-state consumer** (slice 6, the X1 contested tracker): per 8-byte word, the
+    /// last task to write it and whether it is *contested* — written by one task and then touched
+    /// (read or written) by another. `(last_writer, contested)`; a never-written word is absent.
+    words: std::collections::BTreeMap<u64, (usize, bool)>,
     /// LRU tick, monotonically increasing per line touch.
     tick: u64,
 }
@@ -181,6 +185,7 @@ impl MemModel {
                 l2_hits: 0,
                 l2_misses: 0,
                 pages: std::collections::BTreeSet::new(),
+                words: std::collections::BTreeMap::new(),
                 tick: 0,
             },
             snaps: Vec::new(),
@@ -271,6 +276,26 @@ impl MemModel {
         let (pf, pl) = (addr / page, addr.saturating_add(len - 1) / page);
         for pi in pf..=pl {
             self.state.pages.insert(pi);
+        }
+        // The shared-state tracker (8-byte words): a write records the writer; any touch by a
+        // task other than the last writer marks the word contested.
+        let (wf, wl) = (addr / 8, addr.saturating_add(len - 1) / 8);
+        let wcount = (wl - wf + 1).min(self.max_lines_per_event);
+        for wi in wf..wf + wcount {
+            match self.state.words.get_mut(&wi) {
+                Some((writer, contested)) => {
+                    if *writer != task {
+                        *contested = true;
+                    }
+                    if write {
+                        *writer = task;
+                    }
+                }
+                None if write => {
+                    self.state.words.insert(wi, (task, false));
+                }
+                None => {}
+            }
         }
     }
 
@@ -370,6 +395,27 @@ impl MemModel {
                 ]),
             ),
             ("pageFaults", Json::i(st.pages.len() as i64)),
+            (
+                "sharedState",
+                Json::obj(vec![
+                    (
+                        "contested",
+                        Json::Arr(
+                            st.words
+                                .iter()
+                                .filter(|(_, (_, c))| *c)
+                                .map(|(w, (writer, _))| {
+                                    Json::obj(vec![
+                                        ("addr", Json::i((w * 8) as i64)),
+                                        ("lastWriter", Json::i(*writer as i64)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("trackedWords", Json::i(st.words.len() as i64)),
+                ]),
+            ),
             (
                 "l1Grids",
                 Json::Arr(st.l1s.iter().map(&grid).collect::<Vec<_>>()),
