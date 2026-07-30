@@ -360,3 +360,103 @@ fn scheduled_separate_module_source_variable_tick_replays_deterministically() {
         "replay reproduced the child's source-variable value"
     );
 }
+
+/// A per-turn observation of the scheduled coroutine run: the global turn, every live task's call stack
+/// (frames as `m{module}f{func}b{block}i{inst}` — unambiguous for the func/block sanity checks below),
+/// and the shared-window bytes spanning the instantiate child's carve (64 KiB) and the coroutine's
+/// (96 KiB). A faithful checkpoint restore reproduces all of it.
+fn sched_full_obs(run: &mut ScheduledDebugRun) -> (u64, String, Vec<u8>) {
+    let turn = run.op_turn();
+    let mut stacks = Vec::new();
+    for tid in run.threads() {
+        run.select_task(tid);
+        let mut frames = Vec::new();
+        for d in 0..run.depth() {
+            if let Some(pc) = run.frame_pc(d) {
+                frames.push(format!(
+                    "m{}f{}b{}i{}",
+                    pc.module, pc.func, pc.block, pc.inst
+                ));
+            }
+        }
+        stacks.push(format!("{tid}=[{}]", frames.join(",")));
+    }
+    let win = run.read_window(65536, 8).unwrap_or_default();
+    (turn, stacks.join(";"), win)
+}
+
+/// Warm≡cold oracle for **§14 coroutine + `instantiate`-child checkpointing on the multi-vCPU engine**
+/// (DEBUGGING.md W1). A scheduled coroutine only ever arises alongside an `instantiate` sibling (the
+/// bytecode engine rejects `coroutine + thread`), so this exercises both at once: at every turn where a
+/// checkpoint could be taken — including while stepped *inside* the coroutine body — a
+/// `ScheduledDebugRun::restore`d run replays forward **identically** to the trusted single from-0 run.
+/// The coroutine child `Vm` + its `nested_view`, the `instantiate` child's `DbgEnv` (window +
+/// `Instantiator`/`AddressSpace` powerbox), and the whole task set must all round-trip.
+#[test]
+fn scheduled_coroutine_checkpoint_snapshot_restore_round_trips() {
+    const FUEL: u64 = 5_000_000;
+
+    // Reference: one observation per turn from a single from-0 run.
+    let mut refr = sched_session();
+    let mut f = FUEL;
+    let mut ref_obs = vec![sched_full_obs(&mut refr)];
+    while refr.tick(&mut f) {
+        ref_obs.push(sched_full_obs(&mut refr));
+    }
+    let total = ref_obs.len() - 1;
+    assert_eq!(
+        refr.result().unwrap().as_ref().unwrap(),
+        &[Value::I64(WANT)]
+    );
+    // The run genuinely steps inside the coroutine body (func 1) and runs the instantiate child (func 2),
+    // so the round-trip below covers a live coroutine *and* a live child env.
+    assert!(
+        ref_obs.iter().any(|(_, s, _)| s.contains("f1b")),
+        "the run steps inside the coroutine body (func 1)"
+    );
+    assert!(
+        ref_obs.iter().any(|(_, s, _)| s.contains("f2b")),
+        "the instantiate child runs (func 2)"
+    );
+
+    // For every turn C where `snapshot` succeeds, restore into a fresh run and replay forward, checking
+    // it matches the reference from C onward. Track that at least one such C was inside the coroutine.
+    let mut checkpointed_in_coro = false;
+    for c in 0..=total {
+        let mut at_c = sched_session();
+        let mut f = FUEL;
+        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
+        let Some(snap) = at_c.snapshot() else {
+            continue; // C is outside the checkpointable subset
+        };
+        if ref_obs[c].1.contains("f1b") {
+            checkpointed_in_coro = true;
+        }
+        let mut warm = sched_session();
+        warm.restore(&snap);
+        let mut i = c;
+        assert_eq!(
+            sched_full_obs(&mut warm),
+            ref_obs[i],
+            "restore at C={c} lands at reference"
+        );
+        let mut f = FUEL;
+        while warm.tick(&mut f) {
+            i += 1;
+            assert_eq!(
+                sched_full_obs(&mut warm),
+                ref_obs[i],
+                "forward replay after restore at C={c}"
+            );
+        }
+        assert_eq!(i, total, "warm run from C={c} reached the same end");
+        assert_eq!(
+            warm.result().unwrap().as_ref().unwrap(),
+            &[Value::I64(WANT)]
+        );
+    }
+    assert!(
+        checkpointed_in_coro,
+        "a checkpoint was taken (and restored) while stepped inside the coroutine body"
+    );
+}
