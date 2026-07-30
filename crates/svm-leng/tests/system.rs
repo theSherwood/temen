@@ -231,3 +231,68 @@ fn real_system_copy_runs_short_path() {
     let mark = u64::from_le_bytes(imem[d..d + 8].try_into().unwrap());
     assert_eq!(mark, 48879, "=copy reached copyMem(&dest.bytes, …)");
 }
+
+/// **The end-to-end milestone (NIM.md §3b / Path A):** a *real* nimony program running against
+/// *real* compiled `system` ARC code. `greetLong(): string = "hello, this is a long string!"` — the
+/// genuine `hexer` output — is linked against the **real** `=wasMoved` and `=destroy` (verbatim from
+/// `system/stringimpl.nim`), not the no-op stubs the earlier long-string test used. On entry the
+/// default `result` is zeroed by the real `=wasMoved` and left untouched by the real `=destroy` (its
+/// SSO tag byte ≠ 255 → the short-string branch, no `arcDec`/`dealloc`); then `result` becomes the
+/// long-string value whose `more` points at the `LongString` blob. The blob is a `const` in
+/// greetLong's own data, and the linker **relocates** `result.more` to its placed address — so the
+/// returned string reads back as the literal, identically on both engines. `arcDec`/`dealloc` are
+/// linked (never reached on this path).
+#[test]
+fn real_long_string_end_to_end_against_real_arc() {
+    const GREET: &str = include_str!("fixtures/real_longstring.leng.nif");
+    const SYSTEM: &str = include_str!("fixtures/real_system_arc.leng.nif");
+    let stubs = "\
+(stmts
+ (proc :arcDec.0. (params (param :p.0 . (ptr (i +64)))) (bool) . (stmts . (ret (false))))
+ (proc :dealloc.1. (params (param :p.0 . (i +64))) . . (stmts . (ret .))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "lonelga0b",
+            src: GREET,
+            names: &["greetLong.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: SYSTEM,
+            names: &["=wasMoved.2.", "=destroy.2."],
+        },
+        LengModule {
+            stem: "",
+            src: stubs,
+            names: &["arcDec.0.", "dealloc.1."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link greetLong against real system ARC: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    // greetLong (func 0) is frame-needing + aggregate-returning: ($sp, $sret) -> ().
+    let (sp, sret) = (2048i64, 512usize);
+    let seed = vec![0u8; 8192];
+    let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &ivals, &mut fuel, &seed);
+    ir.expect("interp greetLong");
+    let (_j, jmem) =
+        svm_jit::compile_and_run_capture(&linked, 0, &[sp, sret as i64], &seed).expect("jit");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+
+    // The returned `string`: `bytes` is the SSO word nimony packed; `more` was *relocated* by the
+    // linker to point at the const `LongString` blob (fullLen 29, data = the literal).
+    let bytes = u64::from_le_bytes(imem[sret..sret + 8].try_into().unwrap());
+    let more = u64::from_le_bytes(imem[sret + 8..sret + 16].try_into().unwrap()) as usize;
+    assert_eq!(bytes, 2318350419654699262, "packed SSO `bytes` word");
+    assert_ne!(more, 0, "`more` relocated to the LongString blob");
+    let full_len = u64::from_le_bytes(imem[more..more + 8].try_into().unwrap());
+    assert_eq!(full_len, 29, "blob fullLen");
+    assert_eq!(
+        &imem[more + 24..more + 24 + 29],
+        b"hello, this is a long string!",
+        "the literal, read back through real ARC + a relocated pointer"
+    );
+}

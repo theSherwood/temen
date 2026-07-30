@@ -227,6 +227,11 @@ pub(crate) struct Translator {
     /// Non-zero scalar global initializers → `(unit-local offset, little-endian bytes)`, folded into
     /// the globals `data` segment. Zero-init globals stay zero (the segment is zero-filled).
     data_inits: Vec<(u64, Vec<u8>)>,
+    /// **Data-image pointer relocations** (link mode): a pointer stored *inside* a const's bytes to
+    /// another const — a `string` literal's `more = (addr strlit)`. Each `(at, target_off)` emits a
+    /// `data.ptr <at> self <target_off>` the linker fixes up (svm_ir D-LINK). Runnable mode bakes the
+    /// absolute offset directly instead, so this stays empty there.
+    data_ptrs: Vec<(u64, u64)>,
     /// End of the globals region (unit-local). The globals occupy `[16, globals_top)`.
     globals_top: u64,
     /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.svmo`
@@ -247,6 +252,7 @@ impl Translator {
             types: HashMap::new(),
             agg_names: std::collections::HashSet::new(),
             data_inits: Vec::new(),
+            data_ptrs: Vec::new(),
             globals_top: 16,
             link_mode: false,
             globals: HashMap::new(),
@@ -329,7 +335,13 @@ impl Translator {
                 let o = *off as usize;
                 image[o..o + bytes.len()].copy_from_slice(bytes);
             }
-            out.push_str(&format!("data 16 \"{}\"\n\n", escape_bytes(&image[16..])));
+            out.push_str(&format!("data 16 \"{}\"\n", escape_bytes(&image[16..])));
+            // Pointers stored inside const data (a `string`'s `more = (addr strlit)`) are relocated
+            // by the linker; the placeholder bytes above are overwritten with the resolved address.
+            for (at, target_off) in &self.data_ptrs {
+                out.push_str(&format!("data.ptr {at} self {target_off}\n"));
+            }
+            out.push('\n');
         } else {
             // Runnable module: globals are fixed absolute offsets in the zeroed window, so only
             // non-zero initializers need a `data` segment.
@@ -396,13 +408,19 @@ impl Translator {
                         let name = sym_def(&a[0])?;
                         if let Some(v) = int_literal(&a[3]) {
                             self.consts.insert(name, v);
-                        } else if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                        } else if let Some((bytes, desc, relocs)) =
+                            self.const_aggregate_bytes(&a[3])?
+                        {
                             // A constant aggregate with data (a `LongString` string-literal blob):
                             // materialize its exact bytes into a data segment and register it as an
                             // addressable global, so `(addr strlit…)` — the `string` value's `more`
-                            // pointer — resolves to it.
+                            // pointer — resolves to it. Any const-to-const pointer inside it becomes
+                            // a `data.ptr` relocation at its absolute offset.
                             let sz = bytes.len() as u64;
                             self.data_inits.push((off, bytes));
+                            for (rel_at, target) in relocs {
+                                self.data_ptrs.push((off + rel_at, target));
+                            }
                             self.globals.insert(name, (off, desc));
                             off += sz.max(8);
                         } else {
@@ -449,9 +467,12 @@ impl Translator {
             if a.len() >= 4 {
                 let name = sym_def(&a[0])?;
                 if !self.globals.contains_key(&name) && int_literal(&a[3]).is_none() {
-                    if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                    if let Some((bytes, desc, relocs)) = self.const_aggregate_bytes(&a[3])? {
                         let sz = bytes.len() as u64;
                         self.data_inits.push((*off, bytes));
+                        for (rel_at, target) in relocs {
+                            self.data_ptrs.push((*off + rel_at, target));
+                        }
                         self.globals.insert(name, (*off, desc));
                         *off += sz.max(8);
                     }
@@ -535,7 +556,14 @@ impl Translator {
     /// field value) so the caller falls back to an opaque placeholder. This is how a **long string
     /// literal** lowers: nimony emits it as a `const` `LongString` blob that the `string` value's
     /// `more` field points at (`(addr strlit…)`), NIM.md W2.
-    fn const_aggregate_bytes(&self, val: &Node) -> Result<Option<(Vec<u8>, TyDesc)>, LengError> {
+    #[allow(clippy::type_complexity)]
+    fn const_aggregate_bytes(
+        &self,
+        val: &Node,
+    ) -> Result<Option<(Vec<u8>, TyDesc, Vec<(u64, u64)>)>, LengError> {
+        // Relocations `(rel_at, target_off)`: a pointer at `rel_at` (relative to these bytes) to the
+        // window offset `target_off` — a const-to-const pointer (a `string`'s `more = (addr strlit)`).
+        let mut relocs: Vec<(u64, u64)> = Vec::new();
         // An **array constructor** `(aconstr ArrayType elem0 elem1 …)` — a `const` table (e.g.
         // `fsLookupTable`, 256 `i8`s). Each scalar-int element writes at `i * elem_size`.
         if val.tag() == Some("aconstr") {
@@ -558,18 +586,19 @@ impl Translator {
                     if off + w <= bytes.len() {
                         bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
                     }
-                } else if let Some((ebytes, _)) = self.const_aggregate_bytes(v)? {
+                } else if let Some((ebytes, _, erelocs)) = self.const_aggregate_bytes(v)? {
                     // An **aggregate** element (an array of `string`s — each an SSO `oconstr`):
-                    // materialize it recursively and place its bytes.
+                    // materialize it recursively and place its bytes; shift its relocs by `off`.
                     let end = (off + ebytes.len()).min(bytes.len());
                     if off < end {
                         bytes[off..end].copy_from_slice(&ebytes[..end - off]);
                     }
+                    relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
                 } else {
                     return Ok(None);
                 }
             }
-            return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))));
+            return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()), relocs)));
         }
         if val.tag() != Some("oconstr") {
             return Ok(None);
@@ -615,21 +644,22 @@ impl Translator {
                 }
                 bytes[off..off + data.len()].copy_from_slice(&data);
             } else if ka[1].tag() == Some("addr") {
-                // A pointer to another const/global (`more = (addr strlit…)`). In runnable mode the
-                // target is at a fixed window offset, so bake its address in. In **link** mode this
-                // needs a real data relocation the static const bytes can't carry — fail-closed.
+                // A pointer to another const/global (`more = (addr strlit…)`). Runnable mode bakes
+                // the target's fixed window offset in; **link** mode emits a `data.ptr` relocation
+                // (placeholder bytes here, the linker overwrites with the resolved address).
                 let target = ka[1].args().first().and_then(|n| n.as_atom());
                 match target.and_then(|t| self.globals.get(t)) {
-                    Some((goff, _)) if !self.link_mode => {
+                    Some((goff, _)) if self.link_mode => relocs.push((off as u64, *goff)),
+                    Some((goff, _)) => {
                         bytes[off..off + 8].copy_from_slice(&goff.to_le_bytes());
                     }
-                    _ => return Ok(None),
+                    None => return Ok(None),
                 }
             } else {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
         }
-        Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))))
+        Ok(Some((bytes, TyDesc::Agg(tyname.to_string()), relocs)))
     }
 
     /// Byte size of a type descriptor.
