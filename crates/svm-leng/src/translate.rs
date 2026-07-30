@@ -176,6 +176,10 @@ pub(crate) enum TyDesc {
     /// *computed* pointer (a pointer-valued field, `(deref (dot s more))`) recovers the pointee's
     /// layout. nimony's ARC ops walk `string.more → LongString.rc` this way.
     Ptr(Box<TyDesc>),
+    /// An **inline flexible array** (`uarray`/`UncheckedArray` — `LongString.data`): a size-0 tail
+    /// whose *own address* is the array base. `at`/`pat` index it by the element (boxed) type; you
+    /// never load the whole thing.
+    FlexArray(Box<TyDesc>),
     Agg(String),
 }
 
@@ -548,6 +552,7 @@ impl Translator {
             TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
             TyDesc::Scalar(_) => 8,
             TyDesc::Ptr(_) => 8,
+            TyDesc::FlexArray(_) => 0, // a size-0 inline tail
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
@@ -680,11 +685,19 @@ impl Translator {
                     let fname = sym_def(&fa[0])?;
                     // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
                     // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
-                    // object's size stops here); a `const` materializes its bytes past the fixed
-                    // part. Record it at the current offset as an opaque pointer-width slot and stop
-                    // advancing.
+                    // object's size stops here); its own address is the array base, indexed by
+                    // `at`/`pat`. Record it as a `FlexArray` at the current offset and stop advancing.
                     if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
-                        fields.push((fname, off, TyDesc::Scalar(ValType::I64)));
+                        let elem = fa[2]
+                            .args()
+                            .first()
+                            .map(|e| self.tydesc(e))
+                            .transpose()?
+                            .unwrap_or(TyDesc::Narrow {
+                                bytes: 1,
+                                signed: false,
+                            });
+                        fields.push((fname, off, TyDesc::FlexArray(Box::new(elem))));
                         continue;
                     }
                     let fdesc = self.tydesc(&fa[2])?;
@@ -1562,10 +1575,16 @@ impl<'a> FuncGen<'a> {
                     Ok((self.add_scaled(baddr, idx.id, esize), edesc))
                 }
                 Some("pat") => {
-                    // `(pat ptr idx)` — pointer-indexed lvalue: `*(ptr + idx)`. The pointer may be a
-                    // symbol or a computed pointer (same resolution as `deref`); the element size is
-                    // the pointee's.
+                    // `(pat ptr idx)` — pointer-indexed lvalue: `*(ptr + idx)`. An **inline flexible
+                    // array** (`LongString.data`) indexes off the field's *own address* (no load);
+                    // otherwise the pointer is a symbol or computed pointer (as `deref`).
                     let a = node.args();
+                    if let Some(bd @ TyDesc::FlexArray(_)) = self.lvalue_type(&a[0]) {
+                        let (base, _) = self.lvalue_addr(&a[0])?;
+                        let (esize, edesc) = self.array_of(&bd)?;
+                        let idx = self.expr_typed(&a[1], ValType::I64)?;
+                        return Ok((self.add_scaled(base, idx.id, esize), edesc));
+                    }
                     let (pv, pdesc) = self.pointer_operand(&a[0])?;
                     let esize = self.t.sizeof(&pdesc);
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
@@ -1647,6 +1666,9 @@ impl<'a> FuncGen<'a> {
                     ty: ValType::I32,
                 })
             }
+            TyDesc::FlexArray(_) => Err(LengError::Unsupported(
+                "reading a flexible array as a value (index it with `at`/`pat`)".into(),
+            )),
             TyDesc::Agg(n) => Err(LengError::Unsupported(format!(
                 "reading aggregate `{n}` as a value (whole-aggregate ops are a later slice)"
             ))),
@@ -1668,6 +1690,11 @@ impl<'a> FuncGen<'a> {
             TyDesc::Scalar(t) => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
+            TyDesc::FlexArray(_) => {
+                return Err(LengError::Unsupported(
+                    "assigning to a flexible array (index it with `at`/`pat`)".into(),
+                ))
+            }
             TyDesc::Agg(n) => {
                 return Err(LengError::Unsupported(format!(
                     "assigning to aggregate lvalue `{n}`"
@@ -1724,15 +1751,20 @@ impl<'a> FuncGen<'a> {
 
     /// Element `(size, type)` of an array descriptor.
     fn array_of(&self, bdesc: &TyDesc) -> Result<(u64, TyDesc), LengError> {
-        if let TyDesc::Agg(n) = bdesc {
-            if let Some(Layout::Array {
-                elem, elem_size, ..
-            }) = self.t.types.get(n)
-            {
-                return Ok((*elem_size, elem.clone()));
+        match bdesc {
+            TyDesc::Agg(n) => {
+                if let Some(Layout::Array {
+                    elem, elem_size, ..
+                }) = self.t.types.get(n)
+                {
+                    return Ok((*elem_size, elem.clone()));
+                }
+                Err(LengError::Unsupported("`at` on a non-array".into()))
             }
+            // An inline flexible array (`LongString.data`): element size from the element type.
+            TyDesc::FlexArray(elem) => Ok((self.t.sizeof(elem).max(1), (**elem).clone())),
+            _ => Err(LengError::Unsupported("`at` on a non-array".into())),
         }
-        Err(LengError::Unsupported("`at` on a non-array".into()))
     }
 
     /// The type descriptor of an lvalue, computed **without emitting** (for dispatching aggregate
@@ -1875,6 +1907,9 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  i64.store v{addr} v{}\n", v.id));
                 Ok(())
             }
+            TyDesc::FlexArray(_) => Err(LengError::Unsupported(
+                "storing to a flexible array member (index it with `at`/`pat`)".into(),
+            )),
             TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
         }
     }
