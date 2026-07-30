@@ -128,6 +128,60 @@ fn per_module_globals_relocate_without_aliasing() {
 }
 
 #[test]
+fn cross_module_global_read_write() {
+    // Module `w`'s proc reads and writes a `gvar` `g` *defined in module `s`*. The reference is a
+    // `data.sym` the linker binds to `s`'s exported global — write-then-read-back through that
+    // symbol must reach `s`'s storage, so `rw(v) = v`.
+    let mod_s = "\
+(stmts
+ (gvar :g.0. . (i +64) 0))";
+    let mod_w = "\
+(stmts
+ (proc :rw.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (asgn g.0.mods v.0)
+   (ret g.0.mods))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["rw.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &[], // data-only unit: it just defines (and exports) `g`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(run(&linked, 0, &[42]), 42, "write then read the external g");
+    assert_eq!(run(&linked, 0, &[-5]), -5);
+}
+
+/// Real nimony: `moda`'s `bump` reads and writes `store.counter` across the module boundary — hexer
+/// emits the reference as `counter.0.<store-stem>`. `store` defines `counter.0.` and exports it as a
+/// data symbol; the linker binds `moda`'s `data.sym` to it. `bump()` increments 0 → 1.
+#[test]
+fn real_cross_module_global() {
+    const MODA: &str = include_str!("fixtures/real_gref_moda.leng.nif");
+    const STORE: &str = include_str!("fixtures/real_gref_store.leng.nif");
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modywjwgs",
+            src: MODA,
+            names: &["bump.0."],
+        },
+        LengModule {
+            stem: "sto0vp1px",
+            src: STORE,
+            names: &[],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(run(&linked, 0, &[]), 1, "bump(): counter 0 -> 1");
+}
+
+#[test]
 fn unresolved_cross_module_call_is_fail_closed() {
     // `top` calls `missing.0.modx`, which no linked unit exports → a clean link error.
     let mod_a = "\
@@ -137,6 +191,22 @@ fn unresolved_cross_module_call_is_fail_closed() {
         stem: "moda",
         src: mod_a,
         names: &["top.0."],
+    }]) {
+        Err(svm_leng::LengError::Malformed(_)) => {}
+        other => panic!("expected a fail-closed link error, got {other:?}"),
+    }
+}
+
+#[test]
+fn unresolved_cross_module_global_is_fail_closed() {
+    // A `data.sym` for a global no unit exports → a clean link error, never a wrong address.
+    let mod_w = "\
+(stmts
+ (proc :rd.0. . (i +64) . (stmts . (ret missing.0.nowhere))))";
+    match svm_leng::link_units(&[LengModule {
+        stem: "modw",
+        src: mod_w,
+        names: &["rd.0."],
     }]) {
         Err(svm_leng::LengError::Malformed(_)) => {}
         other => panic!("expected a fail-closed link error, got {other:?}"),

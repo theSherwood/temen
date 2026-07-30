@@ -136,12 +136,15 @@ pub struct LengModule<'a> {
 /// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
 fn translate_object_module(unit: &LengModule) -> Result<Module, LengError> {
     let root = nif::parse(unit.src).map_err(LengError::Parse)?;
-    let text = translate::Translator::new_for_link().some_procs(&root, unit.names)?;
+    let mut t = translate::Translator::new_for_link();
+    let text = t.some_procs(&root, unit.names)?;
     let mut module = svm_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
         ))
     })?;
+    // Procs export in-band under their global (stem-suffixed) names; this unit's `gvar`s export as
+    // cross-module data symbols so another unit's `data.sym` can bind to them.
     module.exports = unit
         .names
         .iter()
@@ -151,6 +154,7 @@ fn translate_object_module(unit: &LengModule) -> Result<Module, LengError> {
             func: i as u32,
         })
         .collect();
+    module.data_exports = t.global_exports(unit.stem);
     Ok(module)
 }
 

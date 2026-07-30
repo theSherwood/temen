@@ -321,6 +321,23 @@ impl Translator {
         Ok(())
     }
 
+    /// This unit's globals as **cross-module data exports** (NIM.md W2): each `gvar`'s global
+    /// (stem-suffixed) name → its unit-local data offset, the counterpart of a proc export. Another
+    /// unit's `data.sym "<name>"` binds here. A local `gvar` name ends in `.`, so `name + stem`
+    /// yields the same `<name>.<stem>` a referencing module emits.
+    pub fn global_exports(&self, stem: &str) -> Vec<svm_ir::DataExport> {
+        let mut out: Vec<svm_ir::DataExport> = self
+            .globals
+            .iter()
+            .map(|(name, (off, _))| svm_ir::DataExport {
+                name: format!("{name}{stem}"),
+                offset: *off,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
+        out
+    }
+
     /// Byte size of a type descriptor.
     fn sizeof(&self, d: &TyDesc) -> u64 {
         match d {
@@ -1140,6 +1157,14 @@ impl<'a> FuncGen<'a> {
                         return Ok((v.id, desc));
                     }
                 }
+                // In a link unit, an atom resolved by none of the above is a **cross-module data
+                // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
+                // scalar; the linker binds it, and an unresolved name is a fail-closed link error.
+                // (A runnable module has nothing to bind to, so it stays the error below.)
+                if self.t.link_mode {
+                    let addr = self.emit_data_sym(name, 0);
+                    return Ok((addr, TyDesc::Scalar(ValType::I64)));
+                }
                 Err(LengError::Unsupported(format!(
                     "`{name}` is not an addressable lvalue"
                 )))
@@ -1333,8 +1358,9 @@ impl<'a> FuncGen<'a> {
         let name = lhs.as_atom().ok_or_else(|| {
             LengError::Unsupported(format!("assignment to lvalue `{:?}`", lhs.tag()))
         })?;
-        // A global is stored through its fixed window address; a local rebinds/stores its slot.
-        if self.t.globals.contains_key(name) {
+        // A global is stored through its window address; a cross-module data symbol (link unit,
+        // not a local) stores through its `data.sym` address; a local rebinds/stores its slot.
+        if self.t.globals.contains_key(name) || (self.t.link_mode && !self.is_local(name)) {
             return self.store_lvalue(lhs, rhs);
         }
         let v = self.expr(rhs)?;
@@ -1894,6 +1920,10 @@ impl<'a> FuncGen<'a> {
                 if let Ok(f) = a.parse::<f64>() {
                     return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
                 }
+                // A link unit: a leftover atom is a cross-module data symbol — load through `data.sym`.
+                if self.t.link_mode {
+                    return self.load_lvalue(e);
+                }
                 Err(LengError::Unsupported(format!("atom expression `{a}`")))
             }
             Node::List(_) => match e.tag() {
@@ -2309,6 +2339,25 @@ impl<'a> FuncGen<'a> {
         self.cur_buf
             .push_str(&format!("  v{id} = data.self {off}\n"));
         id
+    }
+
+    /// A relocatable address of a **cross-module data symbol** (`data.sym`) — a `gvar` defined and
+    /// exported by another unit. `link` binds it to that unit's `data_export`; an unresolved name is
+    /// a fail-closed link error.
+    fn emit_data_sym(&mut self, name: &str, addend: i64) -> u32 {
+        let id = self.fresh();
+        self.used_memory = true;
+        self.cur_buf.push_str(&format!(
+            "  v{id} = data.sym \"{}\" {addend}\n",
+            escape_str(name)
+        ));
+        id
+    }
+
+    /// Whether `name` is a function-local (an SSA slot or a frame slot) — as opposed to a module
+    /// global, a const, or a cross-module data symbol.
+    fn is_local(&self, name: &str) -> bool {
+        self.slot_of.contains_key(name) || self.mem.contains_key(name)
     }
 
     /// A float constant (`{:?}` round-trips through svm-text's `parse_float`).

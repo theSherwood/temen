@@ -469,9 +469,19 @@ plumbing. Five workstreams, roughly independent:
     only through the format — and runs (Σ = 60, both engines). That composition is the point: the
     runtime object is the stand-in the real compiled `system` module (or a C-runtime `.svmo`) will
     replace, and now they meet at a versioned, spec-pinned, fuzzed boundary rather than in-process.
-  - **Remaining for full W2:** cross-module *data* symbols (a `gvar` shared between modules →
-    `data.sym`/`data_exports`), string-literal data, and translating the `ini`/`main`/`gvar`
-    scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
+  - **✅ Cross-module data symbols — DONE 2026-07-30.** A `gvar` referenced across the module
+    boundary — hexer emits it as `counter.0.<defining-stem>`, in lvalue/rvalue position — now links.
+    The *defining* unit exports each of its globals as a `data_export` (stem-suffixed name → data
+    offset, via `Translator::global_exports`); the *referencing* unit, finding an atom that's not a
+    local/own-global/const/literal, emits a relocatable `data.sym "<name>"` the linker binds to that
+    export (an unresolved name is a fail-closed link error, never a wrong address). External data
+    symbols are assumed `i64` scalars — the common `int`/pointer global. Tested: a hand-written
+    writer/reader pair sharing a global defined in a third data-only unit, real nimony
+    `bump`/`store` (`bump()` increments `store.counter` across the boundary → 1), and two
+    fail-closed cases (`tests/link.rs`).
+  - **Remaining for full W2:** string-literal data (`LongString` payloads) and translating the
+    `ini`/`main`/`gvar` scaffolding whole-module, so the *entire* `system` module links (Path A),
+    not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
