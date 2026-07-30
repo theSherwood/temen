@@ -154,6 +154,43 @@ fn real_long_string_runs_end_to_end() {
 }
 
 #[test]
+fn computed_deref_flexarray_chain() {
+    // The real string-internal walk: `s.more.data[i]` where `s: ptr string`, so the flex array is
+    // reached through a **computed** deref — `(pat (dot (deref (dot (deref s) more)) data) i)`.
+    // This needs `lvalue_type` to see through the computed `(deref (dot …))` to the `LongString`,
+    // then to its `data` flex array. nth(s, i) reads `s.more.data[i]`.
+    let leng = "\
+(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LS.0.))))
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc :nth.0. (params (param :s.0 . (ptr string.0.)) (param :i.0 . (i +64))) (i +64) .
+  (stmts . (ret (conv (i +64) (pat (dot (deref (dot (deref s.0) more.0 0)) data.0 0) i.0))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let (s, b) = (256usize, 512usize);
+    let mut seed = vec![0u8; 4096];
+    seed[s + 8..s + 16].copy_from_slice(&(b as u64).to_le_bytes()); // string.more → blob
+    seed[b + 24..b + 24 + 3].copy_from_slice(b"hey"); // blob.data@24
+    let read = |i: i64| -> i64 {
+        let mut fuel = u64::MAX;
+        let (ir, _) = svm_interp::run_capture(
+            &m,
+            0,
+            &[Value::I64(s as i64), Value::I64(i)],
+            &mut fuel,
+            &seed,
+        );
+        match ir.expect("interp").as_slice() {
+            [Value::I64(n)] => *n,
+            o => panic!("{o:?}"),
+        }
+    };
+    assert_eq!(read(0), b'h' as i64, "s.more.data[0]");
+    assert_eq!(read(2), b'y' as i64, "s.more.data[2]");
+}
+
+#[test]
 fn const_array_table_indexes() {
     // A `const` array table `(aconstr T e0 e1 …)` — like `system`'s `fsLookupTable` (256 i8s) —
     // materializes into a data segment; `(at table idx)` reads an element. Here a small i8 table

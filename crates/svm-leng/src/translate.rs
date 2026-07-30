@@ -1765,7 +1765,10 @@ impl<'a> FuncGen<'a> {
                 .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
             return Ok((pv, *pointee));
         }
-        Err(LengError::Unsupported("not a pointer expression".into()))
+        Err(LengError::Unsupported(format!(
+            "not a pointer expression (`{}`)",
+            operand.tag().unwrap_or("<atom>")
+        )))
     }
 
     /// Load the scalar value of an lvalue.
@@ -1916,11 +1919,27 @@ impl<'a> FuncGen<'a> {
                 self.local_desc.get(name).cloned()
             }
             Node::List(_) => match node.tag() {
-                Some("deref" | "pat") => node
-                    .args()
-                    .first()
-                    .and_then(|n| n.as_atom())
-                    .and_then(|p| self.pointee.get(p).cloned()),
+                Some("deref") => {
+                    // A symbol pointer's tracked pointee, or a **computed** pointer (`(deref (dot s
+                    // more))`) whose lvalue type is a `Ptr` → its pointee.
+                    let op = node.args().first()?;
+                    if let Some(p) = op.as_atom() {
+                        return self.pointee.get(p).cloned();
+                    }
+                    match self.lvalue_type(op)? {
+                        TyDesc::Ptr(pointee) => Some(*pointee),
+                        _ => None,
+                    }
+                }
+                Some("pat") => {
+                    // Indexing an **inline flexible array** yields its element; indexing a symbol
+                    // pointer yields its pointee.
+                    let op = node.args().first()?;
+                    if let Some(TyDesc::FlexArray(e)) = self.lvalue_type(op) {
+                        return Some(*e);
+                    }
+                    op.as_atom().and_then(|p| self.pointee.get(p).cloned())
+                }
                 Some("dot") => {
                     let a = node.args();
                     let bd = self.lvalue_type(a.first()?)?;
