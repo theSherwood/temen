@@ -322,24 +322,31 @@ impl Translator {
                     let name = sym_def(&a[0])?;
                     let desc = self.tydesc(&a[2])?;
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
-                    // (the window is otherwise zero). Non-int / aggregate initializers fail-close.
+                    // (the window is otherwise zero).
                     if let Some(init) = a.get(3) {
-                        if !init.is_empty_marker() {
-                            match (int_literal(init), &desc) {
-                                (Some(0), _) => {}
-                                (Some(v), TyDesc::Scalar(t)) => {
-                                    let w = match t {
-                                        ValType::I32 | ValType::F32 => 4,
-                                        _ => 8,
-                                    };
-                                    self.data_inits
-                                        .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
-                                }
-                                _ => {
-                                    return Err(LengError::Unsupported(format!(
-                                        "non-scalar-int global initializer for `{name}`"
-                                    )))
-                                }
+                        if !init.is_empty_marker() && init.tag() != Some("nil") {
+                            if let Some(0) = int_literal(init) {
+                                // zero — the window is already zero-filled.
+                            } else if let (Some(v), TyDesc::Scalar(t)) = (int_literal(init), &desc)
+                            {
+                                let w = match t {
+                                    ValType::I32 | ValType::F32 => 4,
+                                    _ => 8,
+                                };
+                                self.data_inits
+                                    .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if init.as_atom().is_some() {
+                                // A **symbol** initializer — a proc pointer (`gExitFlush =
+                                // nimNoopFlush`) or another global's address. Its pointer value is
+                                // opaque in this model: we don't materialize usable proc addresses,
+                                // and an indirect call through it fail-closes. So reserve the scalar
+                                // slot zero-initialized; nimony's `ini`/setup writes the real pointer
+                                // before any use. (Relocating such an initializer to the referenced
+                                // symbol is a later refinement.)
+                            } else {
+                                return Err(LengError::Unsupported(format!(
+                                    "non-scalar-int global initializer for `{name}`"
+                                )));
                             }
                         }
                     }
@@ -2222,6 +2229,29 @@ impl<'a> FuncGen<'a> {
                         ty: ValType::I64,
                     })
                 }
+                Some("suf") => {
+                    // A **suffixed literal** — `255'i64`, `1.5'f32` — value then a `"type"` tag.
+                    let a = e.args();
+                    if a.len() < 2 {
+                        return Err(LengError::Malformed(
+                            "suf needs a literal and a type".into(),
+                        ));
+                    }
+                    let ty = suf_val_ty(a[1].as_atom().unwrap_or(""));
+                    if is_float(ty) {
+                        let f = a[0]
+                            .as_atom()
+                            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
+                            .ok_or_else(|| {
+                                LengError::Unsupported("non-float suf literal".into())
+                            })?;
+                        Ok(self.emit_fconst(ty, f))
+                    } else {
+                        let n = int_literal(&a[0])
+                            .ok_or_else(|| LengError::Unsupported("non-int suf literal".into()))?;
+                        Ok(self.emit_const(ty, n))
+                    }
+                }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
                 Some("call") => self.call(e, true), // expression position: a value is wanted
@@ -2811,5 +2841,20 @@ fn parse_int(s: &str) -> Result<i64, ()> {
 
 /// The integer value of an atom literal node, if it is one.
 fn int_literal(node: &Node) -> Option<i64> {
+    if node.tag() == Some("suf") {
+        // A suffixed integer literal `N'iXX` in constant position — the value is the first son.
+        return node.args().first().and_then(int_literal);
+    }
     node.as_atom().and_then(|s| parse_int(s).ok())
+}
+
+/// The value type of a NIF literal **suffix** (`"i64"`, `"u8"`, `"f32"`, …): floats map to
+/// `f32`/`f64`; a `64`-wide integer to `i64`; everything else (narrower ints, `char`) to `i32`.
+fn suf_val_ty(s: &str) -> ValType {
+    match s.trim_matches('"') {
+        "f32" => ValType::F32,
+        "f64" => ValType::F64,
+        t if t.ends_with("64") => ValType::I64,
+        _ => ValType::I32,
+    }
 }

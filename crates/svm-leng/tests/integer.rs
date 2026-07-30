@@ -42,6 +42,17 @@ fn constant_arithmetic() {
 }
 
 #[test]
+fn suffixed_literals() {
+    // nimony emits typed literals as `(suf <value> "<type>")` — e.g. `255'i64`. They evaluate to the
+    // value at the suffix's width. `(add (i +64) (suf 200 "i64") (suf 55 "u8")) = 255`.
+    let leng = "\
+(stmts
+ (proc :main.0 . (i +64) .
+  (stmts . (ret (add (i +64) (suf 200 \"i64\") (suf 55 \"u8\"))))))";
+    assert_eq!(run_i64(leng, 0, &[]), 255);
+}
+
+#[test]
 fn params_and_locals() {
     // addup(a, b): int = (var t = b*2; a + t)
     let leng = "\

@@ -542,8 +542,22 @@ plumbing. Five workstreams, roughly independent:
     `(pragmas (exportc "cname") …)` and adds a func/data export under `cname`. So the program's C-ABI
     surface is findable: a host or `svm-run --link` can enter at `main`. Tested on real `moda`'s whole
     object (`tests/object.rs`).
-  - **Remaining for full W2:** translating (or linking a real compiled) `system` module so the
-    `sysvq0asl` edges bind to real ARC/IO rather than the stub — the last stub in the chain.
+  - **◑ Real `system` module — STARTED 2026-07-30.** The `sysvq0asl` edges now bind to code
+    translated from the **actual nimony `system` module**, not a hand-written stub — first real
+    stdlib code running on SVM (`tests/system.rs`): a driver's cross-module call binds to the real
+    `=wasMoved` (string's ARC "moved-from" reset, `s.bytes = 0` through a `ptr string`, verbatim
+    from `system/stringimpl.nim`), and it runs correctly on both engines. Getting there closed two
+    translator gaps the real module surfaces: **gvar symbol/proc-pointer initializers** (e.g.
+    `gExitFlush = nimNoopFlush` — the pointer value is opaque, an indirect call through it
+    fail-closes, so the slot is reserved zero-initialized and the runtime's `ini` writes it) and
+    **`suf` suffixed literals** (`255'i64`). With those, the *whole* system module's globals, 96
+    types, and 163 `strlit` (`LongString`) consts all collect, and `=wasMoved`,
+    `nimFlushStdStreams`, `nimNoopFlush`, `setExitFlush` translate.
+  - **Remaining for the full `system` link:** the rest of the ARC set (`=destroy`/`=dup`/`=copy`) and
+    the system `ini` chain need more totality — **sub-word (`u8`) loads**, **`deref` of a computed
+    address** (not just a symbol pointer), **parameter spill** (`addr` of a by-value param), and the
+    exception-global setup in system's `ini`. Each is a bounded translator slice; together they're
+    the last stretch to retiring the stub entirely.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
