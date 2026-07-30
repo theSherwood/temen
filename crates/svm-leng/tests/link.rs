@@ -94,6 +94,40 @@ fn transitive_three_module_chain() {
 }
 
 #[test]
+fn per_module_globals_relocate_without_aliasing() {
+    // Each module has its own non-zero global; linking must place them in disjoint window regions so
+    // each proc reads its *own*. In link-unit mode globals are addressed via `data.self`, which the
+    // linker relocates — an absolute-offset unit would silently alias (both at offset 16 → one wins).
+    let mod_a = "\
+(stmts
+ (gvar :g.0. . (i +64) 5)
+ (proc :readG.0. . (i +64) . (stmts . (ret g.0.))))";
+    let mod_b = "\
+(stmts
+ (gvar :h.0. . (i +64) 7)
+ (proc :readH.0. . (i +64) . (stmts . (ret h.0.))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &["readG.0."],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &["readH.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(run(&linked, 0, &[]), 5, "module A reads its own g");
+    assert_eq!(
+        run(&linked, 1, &[]),
+        7,
+        "module B reads its own h (not A's g)"
+    );
+}
+
+#[test]
 fn unresolved_cross_module_call_is_fail_closed() {
     // `top` calls `missing.0.modx`, which no linked unit exports → a clean link error.
     let mod_a = "\

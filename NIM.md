@@ -446,9 +446,21 @@ plumbing. Five workstreams, roughly independent:
   module. Proven on a genuine 2-module program (`moda` importing `pkg/modb`: `useit(5)` calls
   `modb`'s compiled `helper` → 16) and a transitive A→B→C chain, both engines (`tests/link.rs`).
   This is the same link mechanism the end-to-end shim used, now across *real translated modules* —
-  the shim's stand-in replaced by compiled Nim. **Remaining for full W2:** merging module
-  globals/`data` (cross-module data symbols + relocations) and translating the `ini`/`main`/`gvar`
-  scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
+  the shim's stand-in replaced by compiled Nim.
+  - **✅ Relocatable globals — DONE 2026-07-30 (aligned to the new `.svmo` object dialect).** The
+    tree landed a binary link-unit format (`.svmo`) + `svm-run --link`, with first-class export
+    tables and inline data-relocation instructions — `data.self <off>` (this unit's data),
+    `data.sym "<name>" <addend>` (a cross-unit data symbol), `data.top` (top-of-data / heap start) —
+    that `link` resolves to concrete addresses. This filled the data-symbol gap. `svm-leng` is now
+    **dual-mode**: `translate`/`translate_procs` emit a directly *runnable* module (globals at fixed
+    absolute offsets, `.svmb` shape), while `link_units` emits a *link unit* (globals addressed via
+    `data.self`, `.svmo` shape) so `link` relocates each unit's data into disjoint window regions.
+    This was load-bearing: an absolute-offset unit *silently aliased* under linking — two modules'
+    globals both at offset 16, one clobbering the other — a fail-closed violation the `data.self`
+    lowering fixes (regression test: two modules each read their *own* global, `tests/link.rs`).
+  - **Remaining for full W2:** cross-module *data* symbols (a `gvar` shared between modules →
+    `data.sym`/`data_exports`), string-literal data, and translating the `ini`/`main`/`gvar`
+    scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
