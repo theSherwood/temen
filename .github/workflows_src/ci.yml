@@ -299,8 +299,11 @@ jobs:
       # clang-builds the native reference — for a base program, an `#include`-from-memfs program, and
       # the feature-diverse corpus. Running it here makes the guest-vs-native IR differential actually
       # gate merges (SELFHOST_C.md §5 E), instead of only when someone runs it by hand. `-j 2` bounds
-      # the concurrent heavy links (I30 OOM guard), matching the `check` job.
-      - run: cargo test -p svm --test c_link -j 2 -- --ignored self_compiles
+      # the concurrent heavy links (I30 OOM guard), matching the `check` job. `--ignored` (no name
+      # filter) runs *every* heavy c_link gate — both `whole_cc1_self_compiles…` and the stage-2
+      # `whole_cc1_compiles_its_own_tu…` (the guest compiling chibicc's own TUs) — so a new heavy test
+      # gates automatically rather than silently going unrun.
+      - run: cargo test -p svm --test c_link -j 2 -- --ignored
 
   miri:
     # Run the unsafe memory substrate under Miri's UB/provenance + data-race checkers. svm-mem is
