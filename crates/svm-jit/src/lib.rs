@@ -2944,7 +2944,7 @@ impl CompiledModule {
                 epoch_addr,
                 fuel_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
-                None, // top-level: `ref.func N` = module-0 slot N (no remap)
+                None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
                 fi as u32,
                 srcloc_map.as_ref(),
                 var_labels,
@@ -4800,7 +4800,7 @@ fn compile_child(
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
-            None, // §14 child: own window/table, `ref.func N` = slot N (no remap)
+            None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
             None, // …nor value-label points (Stage 3a)

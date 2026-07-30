@@ -239,8 +239,16 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
     init[BLOB_OFF..].copy_from_slice(&b);
     let mut host = Host::new();
     let h = grant_jit_fibers(&mut host, &m, 3);
-    let (out, _) = jit_cap_run(&m, 0, &[h as i64], &init, DEFAULT_RESERVED_LOG2, 3, &mut host)
-        .expect("jit run");
+    let (out, _) = jit_cap_run(
+        &m,
+        0,
+        &[h as i64],
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        3,
+        &mut host,
+    )
+    .expect("jit run");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[107]),
         "unit should fiber over its own func to 107, got {out:?}"
