@@ -2836,12 +2836,12 @@ mod object_tests {
         m.data_exports.clear();
         let mut bytes = encode_unit(&m);
         bytes[5] &= !FLAG_OBJECT; // flip the dialect to runnable, leaving the body bytes
-        match decode_module(&bytes) {
-            // The stream now desyncs at the object-only sections/opcodes; any Err is correct,
-            // but it must not decode successfully.
-            Ok(_) => panic!("link-form opcodes decoded outside the object dialect"),
-            Err(_) => {}
-        }
+        // The stream now desyncs at the object-only sections/opcodes; any Err is correct,
+        // but it must not decode successfully.
+        assert!(
+            decode_module(&bytes).is_err(),
+            "link-form opcodes decoded outside the object dialect"
+        );
     }
 
     #[test]

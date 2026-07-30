@@ -437,11 +437,9 @@ fn load_module(path: &Path) -> Result<Module, String> {
                 fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
             svm_text::parse_module(&text).map_err(|e| format!("parse text IR: {e:?}"))
         }
-        "svmo" => Err(
-            "`.svmo` is an object (a pre-link unit) — link it first: \
+        "svmo" => Err("`.svmo` is an object (a pre-link unit) — link it first: \
              svm-run --link <units...> -o out.svmb"
-                .into(),
-        ),
+            .into()),
         "svmb" | "bin" => {
             let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
             svm_encode::decode_module(&bytes).map_err(|e| match e {

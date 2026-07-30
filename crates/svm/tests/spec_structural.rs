@@ -23,8 +23,20 @@ fn structural_rows_verify_roundtrip_and_pin_encoding() {
                 row.module.funcs[0].blocks[0].insts[0],
                 Inst::DataSelf { .. } | Inst::DataSym { .. } | Inst::DataTop
             );
-        let enc = |m: &Module| if object { encode_unit(m) } else { encode_module(m) };
-        let dec = |b: &[u8]| if object { decode_unit(b) } else { decode_module(b) };
+        let enc = |m: &Module| {
+            if object {
+                encode_unit(m)
+            } else {
+                encode_module(m)
+            }
+        };
+        let dec = |b: &[u8]| {
+            if object {
+                decode_unit(b)
+            } else {
+                decode_module(b)
+            }
+        };
         // (1) Typing witness: accepted by both verifiers (skip the un-verifiable
         // pre-resolution import form).
         if row.verifies {
