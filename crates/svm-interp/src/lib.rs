@@ -16839,6 +16839,34 @@ impl Mem {
         }
     }
 
+    /// FORK.md PR 1 increment 3b — a **private** window copy for a live `fork()` twin: a fresh `Mem`
+    /// with its **own** backing (a new `Region`) holding a byte-for-byte copy of this window's mapped
+    /// prefix, and its own empty address space. Unlike [`fork_for_thread`](Mem::fork_for_thread) (shares
+    /// the `Arc<Region>` bytes) and [`nested_view`](Mem::nested_view) (shares bytes, confines), the twin
+    /// does **not** alias the parent's memory — a write by either copy after the fork is invisible to
+    /// the other (POSIX-fork semantics). Requires a [`snapshot_safe`](Mem::snapshot_safe) window (no §13
+    /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
+    /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
+    // Wired into `clone_caller`'s twin construction alongside `Host::fork_powerbox` (increment 3b);
+    // landed first as a fails-closed, unit-tested primitive.
+    #[allow(dead_code)]
+    fn fork_private(&self) -> Option<Mem> {
+        if !self.snapshot_safe() {
+            return None;
+        }
+        let reserved = self.window.reserved();
+        let mapped = self.window.mapped();
+        if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
+            return None;
+        }
+        let mut twin = Mem::with_reservation(
+            reserved.trailing_zeros() as u8,
+            mapped.trailing_zeros() as u8,
+        );
+        twin.seed(&self.window_snapshot());
+        Some(twin)
+    }
+
     /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
     /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
     /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
@@ -18559,6 +18587,40 @@ mod fork_powerbox_tests {
         assert!(
             host.fork_powerbox().is_none(),
             "a domain holding a closure-based host_fn fails closed — the personality re-wires it (PR 3)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mem_fork_tests {
+    //! FORK.md PR 1 increment 3b — `Mem::fork_private`, the twin's **private** window copy. It copies
+    //! the parent's mapped bytes into a fresh backing that does **not** alias the parent (POSIX-fork
+    //! memory semantics), distinct from `fork_for_thread`/`nested_view`, which share the backing bytes.
+    use super::*;
+
+    #[test]
+    fn fork_private_copies_bytes_but_does_not_alias() {
+        let m = Mem::with_reservation(16, 16); // a fully-mapped 64 KiB window
+        m.set_byte(0, 0xAB);
+        m.set_byte(100, 0x7F);
+        let twin = m.fork_private().expect("a simple window forks");
+        // The twin starts as a byte-for-byte copy of the parent.
+        assert_eq!(twin.byte(0), 0xAB);
+        assert_eq!(twin.byte(100), 0x7F);
+        // A write by the twin does not touch the parent — the copy is private, not shared.
+        twin.set_byte(0, 0x01);
+        assert_eq!(
+            m.byte(0),
+            0xAB,
+            "parent byte unchanged by a twin write (private copy, not aliased)"
+        );
+        assert_eq!(twin.byte(0), 0x01);
+        // And a parent write does not touch the twin.
+        m.set_byte(100, 0x02);
+        assert_eq!(
+            twin.byte(100),
+            0x7F,
+            "twin byte unchanged by a parent write"
         );
     }
 }
