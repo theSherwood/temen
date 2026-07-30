@@ -68,63 +68,68 @@ The servicer names the *specific parked child* to clone by the handle it already
 regardless of depth, so "clone the child I hold a handle to" works at any nesting level. **A nested bash
 must be forkable — no design step may force the forking guest to be top-level.**
 
+> **Finding (2026-07-29, from the PR-1 harness attempt): PR 1 and PR 2 are inseparable.** A caller
+> *persistently* parked on `CapReply` at a **whole-run** freeze is essentially unconstructable with normal
+> guest code: `live_impl_of` requires a *serving* callee (a non-serving one `CapFault`s the call), a
+> serving callee *replies* (no persistent park), and a mid-handler callee hits the `handler_parks` gate,
+> not the `CapReply` gate. The only durable test that freezes across an offer (`serve.rs`
+> `SRC_NESTED_HOLDER`) freezes with everyone idle in `svc.wait` — the offer calls run on *thaw*. So the
+> reply-injection state arises **only** when a servicer deliberately withholds the reply and freezes the
+> caller — which *is* fork's targeted-clone action. There is no independently-testable whole-run
+> reply-injection nucleus; **the first buildable slice is the targeted clone itself.**
+
 ## 5. The PR arc
 
-- **PR 1 — the reply-injection nucleus (O10, at the durable layer).** Make a `CapReply`-parked
-  continuation **freezable** by spilling it at the **post-call resume point** with a **reply slot**, and
-  let restore **inject** the reply the copy reloads. Proven with the existing whole-run
-  snapshot/`begin_thaw` machinery, no new substrate and no twin: freeze a run whose caller is parked on a
-  served `cap.call`, then thaw the **same snapshot twice** injecting reply `A` vs `B` → **two different
-  returns**. That is return-twice at the durable layer — the exact reply-injection atom, isolated. (§6.)
-- **PR 2 — the targeted clone verb (nested, slice 3.2).** `clone(child_handle) -> twin` — capture a
-  *specific* parked child's continuation (not the whole run), instantiate a **twin** over a copied carve
-  in a *live* run, and register a second `(callee, ticket)` in `ticket_waiters` so the servicer delivers
-  a reply to each. This lifts PR 1's durable-layer injection into a live, nested clone — the nested-bash
-  requirement, and the hardest substrate work.
-- **PR 3 — the `fork` personality op + endpoint.** Add `"fork"` to `svm-posix resolve` as sugar over
-  PR 2's clone, the servicer replying `pid`/`0`. The clone-servicer lives with the domain's
+- **PR 1 — the targeted clone `clone(child_handle)` (was two PRs).** From within a serve handler (the
+  servicer), capture the calling fiber's continuation (identified by its reply ticket), spill it at the
+  caller's **post-call resume point** with a **reply slot**, copy the carve into a **twin** domain, and
+  register a second `(callee, ticket)` in `ticket_waiters`. The servicer then replies to each copy — each
+  reloads its injected reply and resumes **past** the call. Return-twice, in one live run. This folds the
+  old "durable-layer nucleus" and "targeted clone" together because (per the finding above) the injection
+  state only exists under a servicer-triggered freeze. *The hardest substrate work; single-vCPU first.*
+- **PR 2 — the `fork` personality op + endpoint.** Add `"fork"` to `svm-posix resolve` as sugar over
+  PR 1's `clone`, the servicer replying `pid`/`0`. The clone-servicer lives with the domain's
   personality-provider / parent (which holds the `child_handle`), so it composes with nesting.
-- **PR 4 (later) — multi-vCPU `forkall`** (O11); CoW clone (deferred, S13).
+- **PR 3 (later) — multi-vCPU `forkall`** (O11); CoW clone (deferred, S13).
 
-## 6. PR 1 spec — the reply-injection nucleus
+## 6. PR 1 spec — the targeted clone `clone(child_handle)`
 
-**Success criterion (`svm-durable/tests/pending.rs`):** freeze a run whose caller is parked on a served
-`cap.call` (today `FiberFault` at `freeze_drive:6986`); the snapshot captures the parked continuation at
-its post-call resume point with a reply slot. Then, the `roundtrip.rs` pattern — `snapshot.clone()`
-**twice**, `begin_thaw` each, **inject** reply `A` into one and `B` into the other → the caller **reloads
-past the call** and returns `A` vs `B`. Two divergent returns from one frozen snapshot = return-twice.
-Interp==JIT.
+A servicer, **mid-handling** a call from a parked caller, clones the caller instead of replying. The
+handler knows the caller by its dispatch **ticket** (the `(callee, ticket)` reply token). The op — call
+it `clone_caller() -> twin_child_handle` (self-namespace, servicer-side) or `clone(child_handle)` — does:
 
-Harness: a *second* guest exists only as the **callee** the caller parks on (it need never reply — the
-reply is injected at restore). Only the caller is captured; it may be top-level here (nested/targeted
-capture is PR 2). *(Note: constructing a persistent `CapReply` park is itself finicky — a live callee
-replies, a dead/non-serving one `CapFault`s, a mid-handler park hits the `handler_parks` gate — so the
-harness must hold the caller parked without the callee replying or being mid-handler.)*
+1. **Capture the caller's continuation.** The caller is parked on `Blocked::CapReply { ticket, callee }`
+   with its live frame *inside* the pending `cap.call`. Spill that fiber's live set into its window,
+   positioned at the `cap.call`'s **post-call resume point** (the ordinary `Leaf`-style reload) with a
+   **reply slot** — the reply-injection capture, not a placeholder and not a re-issue arm.
+2. **Twin it.** Copy the caller's carve (window slice) into a fresh child domain (via the
+   `spawn_named_child` path), re-grant its pass-through handles, and re-seed a `CapReply` park for the
+   twin with a second `(callee, ticket')` in `ticket_waiters`.
+3. **Reply to each.** The servicer delivers `A` to the caller's ticket and `B` to the twin's — each
+   fiber reloads its injected reply and resumes **past** the call.
 
-**The edits (reply-injection, not re-issue):**
-1. `svm-interp` `flatten_fiber_for_freeze` (`:6997`): a `CapReply`-parked fiber spills its live set and is
-   positioned at the `cap.call`'s **post-call resume point** (the `Leaf`-style reload), with a **reply
-   slot** in the spill — *not* the placeholder `Leaf` spill (`:6999`), and *not* a re-issue arm.
-2. `svm-interp` `freeze_drive` (`:6984`): lift the `CapReply`-park refusal **only** when the park is
-   captured this way (reply-slot reload); every other unclassified park still fails closed.
-3. Restore: `begin_thaw` (or a small sibling) writes the **injected reply** into the reply slot so the
-   thawed fiber reloads it and resumes past the call. Two thaws, two injected replies.
-4. Tests: `pending.rs` + a JIT-differential entry (mirroring `indirect.rs`).
+**Success criterion:** one servicer handler, one caller that calls it, `clone` inside the handler → the
+caller returns `A` and the twin returns `B` from the *same* call site. Return-twice, one live run,
+interp==JIT. (This is why it cannot be a pure-durable unit — the capture state only exists under the
+servicer's action; see the §5 finding.)
 
-No new `SuspendKind` re-execute arm is needed — the resume point is the ordinary post-call `Leaf` reload;
-the only new thing is *entering* it from a park with an injected (rather than call-produced) result.
+**Smallest first step (de-risk the capture).** Before the twin/second-ticket machinery: prove a servicer
+can **capture a parked caller's continuation at the reply-slot resume point and re-inject its own reply**
+(a no-op clone that just resumes the original with an injected value through the freeze/restore path).
+That isolates the O10 lift (`flatten_fiber_for_freeze` + `freeze_drive`, `:6984`/`:6997`) — the load-
+bearing soundness change — from the twin-instantiation. Only then add the copy + second ticket.
 
 **Load-bearing risk.** A parked `cap.call`'s live set lives in the interp's native frame Vec, not the
-window — lost across snapshot→thaw unless `flatten` spills it, positioned at the post-call point with the
-reply slot, interp==JIT byte-identical. A subtle error yields a *wrong-but-passing* test — hence PR 1
-alone, TDD-first (characterization test pinning the current `FiberFault` before any soundness change).
+window — lost unless capture spills it, positioned at the post-call point with the reply slot,
+interp==JIT byte-identical. A subtle error yields a *wrong-but-passing* result — the reason to isolate
+the capture step first, TDD-first.
 
 ## 7. Invariants this must not break
 
 - **Confinement is untouched.** Fork is durable-transform + freeze-driver + Instantiator authority; it
   adds no new memory-access path. A transform/clone bug is a **correctness** bug, never an escape
   (DESIGN.md §3 / DURABILITY.md §3).
-- **Fail-closed stays the default.** Only a `CapReply` park *classified* re-issue may freeze; every
+- **Fail-closed stays the default.** Only a `CapReply` park captured by the clone path may freeze; every
   unclassified park still `FiberFault`s.
 - **interp == JIT** across every new shape (the §18 oracle), as for all durable work.
 - **Single-vCPU first** (freeze_drive slice 3.1); nested/multi-vCPU is PR 2 / O11.
