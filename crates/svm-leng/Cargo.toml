@@ -18,6 +18,7 @@ publish = false
 [dependencies]
 svm-ir = { path = "../svm-ir" }
 svm-text = { path = "../svm-text" }
+svm-encode = { path = "../svm-encode" }
 
 [dev-dependencies]
 svm-verify = { path = "../svm-verify" }

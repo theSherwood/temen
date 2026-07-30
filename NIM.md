@@ -458,6 +458,17 @@ plumbing. Five workstreams, roughly independent:
     This was load-bearing: an absolute-offset unit *silently aliased* under linking — two modules'
     globals both at offset 16, one clobbering the other — a fail-closed violation the `data.self`
     lowering fixes (regression test: two modules each read their *own* global, `tests/link.rs`).
+  - **✅ Through the `.svmo` narrow waist — DONE 2026-07-30.** `svm-leng` now emits real binary link
+    **objects**: `svm_leng::compile_object(unit)` → a `.svmo` with the unit's procs exported *in-band*
+    (`Module::exports`, stem-suffixed) — the counterpart of `svm-llvm-translate -o out.svmo`.
+    `link_units` routes through the format: compile each module to `.svmo`, `decode_unit` it back
+    through the hardened firewall (a frontend is untrusted), pair a `LinkUnit` from its in-band export
+    tables (the same conversion `svm-run --link` does), then `svm_ir::link`. The linker stays shared;
+    the format is the only added seam. Proven cross-producer (`tests/object.rs`): a nimony `.svmo`
+    (`sumSeq`) links against a **separately produced runtime `.svmo`** — both binary objects, joined
+    only through the format — and runs (Σ = 60, both engines). That composition is the point: the
+    runtime object is the stand-in the real compiled `system` module (or a C-runtime `.svmo`) will
+    replace, and now they meet at a versioned, spec-pinned, fuzzed boundary rather than in-process.
   - **Remaining for full W2:** cross-module *data* symbols (a `gvar` shared between modules →
     `data.sym`/`data_exports`), string-literal data, and translating the `ini`/`main`/`gvar`
     scaffolding whole-module, so the *entire* `system` module links (Path A), not hand-picked procs.

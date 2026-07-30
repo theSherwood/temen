@@ -16,9 +16,10 @@
 //! result)` tuple by sret; `try`/`except` is an error-code check plus a `jmp` to a handler label).
 //! `seq`/`string` are `{len, data*}` objects: their value layout and element access lower here, and
 //! their stdlib operations (`add`/`[]`/`len`/`toOpenArray`) lower to **imports** — valid IR that runs
-//! once those imports are bound to a real seq runtime (the W3 runtime edge). Multiple modules **link**
-//! into one ([`link_units`], NIM.md W2): nimony's cross-module calls resolve against the defining
-//! module's exports. `object of RootObj` **inheritance** lowers too: a derived object inlines its
+//! once those imports are bound to a real seq runtime (the W3 runtime edge). A module compiles to a
+//! binary **`.svmo` link object** ([`compile_object`], exports in-band) that composes with other
+//! producers' objects through the shared `svm_ir::link` — [`link_units`] does exactly that across
+//! several nimony modules (NIM.md W2). `object of RootObj` **inheritance** lowers too: a derived object inlines its
 //! base's layout after a leading vtable header, and the vtable pointer is stored but opaque (dynamic
 //! dispatch fail-closes). What remains
 //! outside the subset — `union`, `emit`, dynamic method dispatch, value-object exception payloads
@@ -36,7 +37,7 @@
 //! assert_eq!(m.funcs.len(), 1);
 //! ```
 
-use svm_ir::{Module, ValType};
+use svm_ir::{Export, Module, ValType};
 
 mod nif;
 mod translate;
@@ -129,38 +130,67 @@ pub struct LengModule<'a> {
     pub names: &'a [&'a str],
 }
 
-/// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2). Each module's `names` are
-/// translated and exported under their **global** (stem-suffixed) names; every unit's cross-module
-/// calls — which nimony emits as named imports `callee.<defining-stem>` — resolve against those
-/// exports via [`svm_ir::link`]. Units keep the given order, so the first module's first proc is
-/// func 0 (a natural entry). The linked module is **not** verified here (untrusted frontend — the
-/// caller runs `svm_verify::verify_module`, which re-checks the whole linked result).
-///
-/// This is the same mechanism the end-to-end runtime shim uses, generalized: a real dependency
-/// module takes the place the hand-written shim held, so `helper` in module B resolves a `call`
-/// from module A to *compiled Nim*, not a stand-in.
+/// Translate one nimony module as a **relocatable link unit** and stamp its in-band export table.
+/// Link-unit mode: globals via `data.self` (so `link` relocates each unit's data into a disjoint
+/// window region — an absolute-offset unit would silently alias), and each proc exported under its
+/// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
+fn translate_object_module(unit: &LengModule) -> Result<Module, LengError> {
+    let root = nif::parse(unit.src).map_err(LengError::Parse)?;
+    let text = translate::Translator::new_for_link().some_procs(&root, unit.names)?;
+    let mut module = svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })?;
+    module.exports = unit
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, local)| Export {
+            name: format!("{local}{}", unit.stem),
+            func: i as u32,
+        })
+        .collect();
+    Ok(module)
+}
+
+/// Compile one nimony module to a binary **`.svmo` link object** (NIM.md W2, the object dialect) —
+/// the narrow-waist artifact any linker consumer (`svm-run --link`, another frontend's build, a
+/// cache) can take, the counterpart of `svm-llvm-translate -o out.svmo`. It's a relocatable link
+/// unit: globals via `data.self`, cross-module callees as named imports, and its procs exported
+/// **in-band** under their global names. Untrusted like any frontend output — the bytes pass the
+/// hardened `decode_unit` firewall on the way back in, and the linked result is re-verified.
+pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
+    Ok(svm_encode::encode_unit(&translate_object_module(unit)?))
+}
+
+/// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), *through the `.svmo`
+/// narrow waist*: each module is compiled to a binary object ([`compile_object`]), decoded back
+/// through the hardened `decode_unit` firewall, paired into a [`svm_ir::LinkUnit`] from its in-band
+/// export tables (the same conversion `svm-run --link` does), and statically linked. So a nimony
+/// object is a first-class citizen the shared linker — and other frontends' objects — compose with.
+/// Units keep the given order, so the first module's first proc is func 0 (a natural entry). Not
+/// verified here (untrusted frontend — the caller runs `svm_verify::verify_module` on the result).
 pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
-    let mut link_units = Vec::with_capacity(units.len());
-    for u in units {
-        // Translate in **link-unit mode** — globals via `data.self`, so `link` relocates each unit's
-        // data into one shared window (an absolute-offset unit would silently alias).
-        let root = nif::parse(u.src).map_err(LengError::Parse)?;
-        let text = translate::Translator::new_for_link().some_procs(&root, u.names)?;
-        let module = svm_text::parse_module(&text).map_err(|e| {
-            LengError::Malformed(format!(
-                "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-            ))
-        })?;
-        let exports = u
-            .names
+    let objects: Vec<Vec<u8>> = units.iter().map(compile_object).collect::<Result<_, _>>()?;
+    let mut link_units = Vec::with_capacity(objects.len());
+    for bytes in &objects {
+        let module = svm_encode::decode_unit(bytes)
+            .map_err(|e| LengError::Malformed(format!("decode `.svmo` object: {e:?}")))?;
+        let exports = module
+            .exports
             .iter()
-            .enumerate()
-            .map(|(i, local)| (format!("{local}{}", u.stem), i as u32))
+            .map(|e| (e.name.clone(), e.func))
+            .collect();
+        let data_exports = module
+            .data_exports
+            .iter()
+            .map(|e| (e.name.clone(), e.offset))
             .collect();
         link_units.push(svm_ir::LinkUnit {
             module,
             exports,
-            ..Default::default()
+            data_exports,
         });
     }
     svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))

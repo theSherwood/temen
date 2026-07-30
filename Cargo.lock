@@ -731,6 +731,7 @@ dependencies = [
 name = "svm-leng"
 version = "0.0.0"
 dependencies = [
+ "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-jit",
