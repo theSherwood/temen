@@ -227,3 +227,20 @@ fn unsupported_is_fail_closed() {
         other => panic!("expected a fail-closed error, got {other:?}"),
     }
 }
+
+#[test]
+fn overflow_keeping_arithmetic() {
+    // nimony's overflow-checked add lowers to `(keepovf (add …) dest)` + an `(if (ovf) …)` guard.
+    // With checks off, svm arithmetic wraps and `(ovf)` is always false, so it's a plain wrapping
+    // store and the guard never fires. f(a,b) = a+b.
+    let leng = "\
+(stmts
+ (proc :f.0 (params (param :a.0 . (i +64)) (param :b.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (keepovf (add (i +64) a.0 b.0) r.0)
+   (if (elif (ovf) (stmts . (ret 0))))
+   (ret r.0))))";
+    assert_eq!(run_i64(leng, 0, &[3, 4]), 7);
+    assert_eq!(run_i64(leng, 0, &[100, 23]), 123);
+}

@@ -2169,6 +2169,18 @@ impl<'a> FuncGen<'a> {
                 }
                 self.assign(&a[1], &a[0])
             }
+            Some("keepovf") => {
+                // `(keepovf Expr Dest)` — overflow-*keeping* (wrapping) arithmetic into `Dest`.
+                // Overflow checks are off (svm integer arithmetic wraps), so it's a plain store of
+                // the wrapping result — `Dest = Expr`.
+                let a = s.args();
+                if a.len() != 2 {
+                    return Err(LengError::Malformed(
+                        "keepovf needs an expr and a dest".into(),
+                    ));
+                }
+                self.assign(&a[1], &a[0])
+            }
             Some("discard") => {
                 if let Some(e) = s.args().first() {
                     if !e.is_empty_marker() {
@@ -2626,6 +2638,9 @@ impl<'a> FuncGen<'a> {
                 Some("true") => Ok(self.emit_const(ValType::I32, 1)),
                 Some("false") => Ok(self.emit_const(ValType::I32, 0)),
                 Some("nil") => Ok(self.emit_const(ValType::I64, 0)),
+                // The overflow flag (`(ovf)`) — always false: svm integer arithmetic wraps and we
+                // don't track overflow (checks are off), so the `if (ovf)` guard never fires.
+                Some("ovf") => Ok(self.emit_const(ValType::I32, 0)),
                 // Float specials.
                 Some("inf") => Ok(self.emit_fconst(ValType::F64, f64::INFINITY)),
                 Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
