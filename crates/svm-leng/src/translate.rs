@@ -134,9 +134,18 @@ pub(crate) struct Translator {
     globals: HashMap<String, (u64, TyDesc)>,
     /// Scalar integer `const`s, inlined at use.
     consts: HashMap<String, i64>,
-    /// Non-zero scalar global initializers → `(window offset, little-endian bytes)`, emitted as
-    /// module `data` segments (the window is otherwise zero at start).
+    /// Non-zero scalar global initializers → `(unit-local offset, little-endian bytes)`, folded into
+    /// the globals `data` segment. Zero-init globals stay zero (the segment is zero-filled).
     data_inits: Vec<(u64, Vec<u8>)>,
+    /// End of the globals region (unit-local). The globals occupy `[16, globals_top)`.
+    globals_top: u64,
+    /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.svmo`
+    /// shape): a global's address is a `data.self <off>` the linker rewrites, and one zero-filled
+    /// `data` segment covers `[16, globals_top)` so the linker reserves and relocates the whole
+    /// region. When false (the default, runnable `.svmb` shape), globals sit at fixed absolute
+    /// window offsets (`i64.const`) and only non-zero initializers emit `data` — so the module runs
+    /// directly, without a link step.
+    link_mode: bool,
     /// Cross-module callees lowered to SVM imports (discovered during emission).
     imports: RefCell<ImportTable>,
 }
@@ -148,9 +157,20 @@ impl Translator {
             types: HashMap::new(),
             agg_names: std::collections::HashSet::new(),
             data_inits: Vec::new(),
+            globals_top: 16,
+            link_mode: false,
             globals: HashMap::new(),
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
+        }
+    }
+
+    /// A translator that emits a **relocatable link unit** (`.svmo` shape) instead of a directly
+    /// runnable module — globals via `data.self`, so several units link into one (NIM.md W2).
+    pub fn new_for_link() -> Self {
+        Translator {
+            link_mode: true,
+            ..Translator::new()
         }
     }
 
@@ -182,12 +202,15 @@ impl Translator {
         Ok(slot)
     }
 
-    /// Assemble the final module text: `memory` (if used) + `import` declarations + `data` segments
-    /// (non-zero global initializers) + funcs.
+    /// Assemble the final module text: `memory` (if used) + `import` declarations + the globals
+    /// `data` segment (relocatable; addressed via `data.self`) + funcs. The emitted module is a
+    /// **link unit** whenever it has globals — its `data.self`/imports resolve at `link` time (a
+    /// single-unit link makes a globals-only module runnable).
     fn assemble(&self, used_memory: bool, funcs: String) -> String {
+        let has_globals = self.globals_top > 16;
         let mut out = String::new();
-        // Any data segment writes into the window, so the module must declare `memory`.
-        if used_memory || !self.data_inits.is_empty() {
+        // Data segments (globals) and loads/stores write the window, so declare `memory`.
+        if used_memory || has_globals {
             out.push_str("memory 16\n\n");
         }
         let t = self.imports.borrow();
@@ -207,11 +230,25 @@ impl Translator {
         if !t.decls.is_empty() {
             out.push('\n');
         }
-        for (off, bytes) in &self.data_inits {
-            out.push_str(&format!("data {off} \"{}\"\n", escape_bytes(bytes)));
-        }
-        if !self.data_inits.is_empty() {
-            out.push('\n');
+        if self.link_mode && has_globals {
+            // Link unit: one `data` segment over the whole globals region `[16, globals_top)` —
+            // zero-filled, non-zero initializers patched in — referenced by `data.self`, so the
+            // linker relocates every global when it places this unit's data.
+            let mut image = vec![0u8; self.globals_top as usize];
+            for (off, bytes) in &self.data_inits {
+                let o = *off as usize;
+                image[o..o + bytes.len()].copy_from_slice(bytes);
+            }
+            out.push_str(&format!("data 16 \"{}\"\n\n", escape_bytes(&image[16..])));
+        } else {
+            // Runnable module: globals are fixed absolute offsets in the zeroed window, so only
+            // non-zero initializers need a `data` segment.
+            for (off, bytes) in &self.data_inits {
+                out.push_str(&format!("data {off} \"{}\"\n", escape_bytes(bytes)));
+            }
+            if !self.data_inits.is_empty() {
+                out.push('\n');
+            }
         }
         out.push_str(&funcs);
         out
@@ -280,6 +317,7 @@ impl Translator {
                 _ => {}
             }
         }
+        self.globals_top = off;
         Ok(())
     }
 
@@ -1086,10 +1124,15 @@ impl<'a> FuncGen<'a> {
                     let sp = self.cur[0];
                     return Ok((self.add_const_off(sp, off), desc));
                 }
-                // A module global lives at a fixed window offset (its address is a constant).
+                // A module global's address: a fixed absolute offset in a runnable module, or a
+                // relocatable `data.self <off>` in a link unit (the linker rewrites it on placement).
                 if let Some((off, desc)) = self.t.globals.get(name).cloned() {
-                    let base = self.emit_const(ValType::I64, off as i64);
-                    return Ok((base.id, desc));
+                    let base = if self.t.link_mode {
+                        self.emit_data_self(off)
+                    } else {
+                        self.emit_const(ValType::I64, off as i64).id
+                    };
+                    return Ok((base, desc));
                 }
                 // An aggregate passed by address: its slot value *is* the address.
                 if let Some(desc @ TyDesc::Agg(_)) = self.local_desc.get(name).cloned() {
@@ -2256,6 +2299,16 @@ impl<'a> FuncGen<'a> {
         self.cur_buf
             .push_str(&format!("  v{id} = {}.const {n}\n", prefix(ty)));
         Val { id, ty }
+    }
+
+    /// A relocatable address of this unit's own data at `off` (`data.self`). Resolved to a concrete
+    /// window address by `link`; touching the window, so it forces the `memory` declaration.
+    fn emit_data_self(&mut self, off: u64) -> u32 {
+        let id = self.fresh();
+        self.used_memory = true;
+        self.cur_buf
+            .push_str(&format!("  v{id} = data.self {off}\n"));
+        id
     }
 
     /// A float constant (`{:?}` round-trips through svm-text's `parse_float`).

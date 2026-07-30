@@ -142,7 +142,15 @@ pub struct LengModule<'a> {
 pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
     let mut link_units = Vec::with_capacity(units.len());
     for u in units {
-        let module = translate_procs(u.src, u.names)?;
+        // Translate in **link-unit mode** — globals via `data.self`, so `link` relocates each unit's
+        // data into one shared window (an absolute-offset unit would silently alias).
+        let root = nif::parse(u.src).map_err(LengError::Parse)?;
+        let text = translate::Translator::new_for_link().some_procs(&root, u.names)?;
+        let module = svm_text::parse_module(&text).map_err(|e| {
+            LengError::Malformed(format!(
+                "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+            ))
+        })?;
         let exports = u
             .names
             .iter()
