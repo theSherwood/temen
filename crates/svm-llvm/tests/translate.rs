@@ -7062,13 +7062,15 @@ long inc(long x) { return x + 1; }
     assert_links_and_runs(t.module, t.exports);
 }
 
-/// **Ask 2 — the `svm-llvm-translate` CLI.** Translate a library `.bc` to a `.svm` module plus a
-/// `.syms` export sidecar, then re-read both, rebuild the export map from the sidecar, and link a
-/// caller against the module — the scriptable, separate-artifact analogue of `exports_feed_a_link_unit`.
-/// Also smoke-tests the binary (`.svmb`) output path (it must `decode_module`).
+/// **Ask 2 — the `svm-llvm-translate` CLI.** Translate a library `.bc` to a binary object
+/// (`-o *.svmo`, the v9 object dialect), re-read it with `decode_unit`, rebuild the export map
+/// from the module's **in-band** export table, and link a caller against it — the scriptable,
+/// separate-artifact analogue of `exports_feed_a_link_unit` (formerly driven by the retired
+/// `.syms` sidecar). Also smoke-tests the runnable-binary (`.svmb`) output path (it must
+/// `decode_module`).
 #[test]
 #[cfg(unix)]
-fn translate_cli_emits_module_and_syms() {
+fn translate_cli_emits_linkable_object() {
     let src = r#"
 long twice(long x) { return x + x; }
 "#;
@@ -7077,16 +7079,13 @@ long twice(long x) { return x + x; }
     };
     let dir = std::env::temp_dir();
     let pid = std::process::id();
-    let out = dir.join(format!("svm_llvm_cli_{pid}.svm"));
-    let syms = dir.join(format!("svm_llvm_cli_{pid}.syms"));
+    let out = dir.join(format!("svm_llvm_cli_{pid}.svmo"));
     let outb = dir.join(format!("svm_llvm_cli_{pid}.svmb"));
 
     let status = Command::new(env!("CARGO_BIN_EXE_svm-llvm-translate"))
         .arg(&bc)
         .arg("-o")
         .arg(&out)
-        .arg("--emit-syms")
-        .arg(&syms)
         .status()
         .expect("run svm-llvm-translate");
     assert!(status.success(), "CLI exited non-zero");
@@ -7102,29 +7101,22 @@ long twice(long x) { return x + x; }
     svm_encode::decode_module(&std::fs::read(&outb).expect("read .svmb"))
         .expect("decode binary module");
 
-    // Re-read the text module + parse the `name idx` sidecar into an export map.
-    let module = svm_text::parse_module(&std::fs::read_to_string(&out).expect("read .svm"))
-        .expect("parse emitted module");
-    let syms_txt = std::fs::read_to_string(&syms).expect("read .syms");
-    let exports: Vec<(String, u32)> = syms_txt
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let mut it = l.split_whitespace();
-            let name = it.next().expect("sidecar name").to_string();
-            let idx = it
-                .next()
-                .expect("sidecar idx")
-                .parse()
-                .expect("sidecar idx int");
-            (name, idx)
-        })
+    // Re-read the object; its export table rides in-band (no sidecar to pair).
+    let module = svm_encode::decode_unit(&std::fs::read(&out).expect("read .svmo"))
+        .expect("decode emitted object");
+    let exports: Vec<(String, u32)> = module
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
         .collect();
+    assert!(
+        exports.iter().any(|(n, _)| n == "twice"),
+        "in-band export table names `twice`: {exports:?}"
+    );
 
     assert_links_and_runs(module, exports);
 
     let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&syms);
     let _ = std::fs::remove_file(&outb);
 }
 

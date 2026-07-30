@@ -489,8 +489,9 @@ section, and the link-form `data.self`/`data.sym`/`data.top` opcodes.
 unreachable from the runtime load path — the fused decode+verify pass is unchanged;
 reserved flag bits fail closed. Both dialects are one linear pass with no fixups
 (the link forms ride inline as instructions, position-independent — the retired
-`(func,block,inst)` reloc-table shape stays retired). An object with in-band export
-tables supersedes the `.syms` sidecar; `svm-run --link` is the CLI driver.
+`(func,block,inst)` reloc-table shape stays retired). An object's in-band export
+tables replaced the `.syms` sidecar (retired and removed — exports ride in the
+artifact in every form); `svm-run --link` is the CLI driver.
 
 ---
 

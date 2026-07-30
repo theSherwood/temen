@@ -129,3 +129,33 @@ fn link_svmo_units_into_runnable_svmb() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `--assemble`: the tiny text→binary-object step for text-emitting frontends. A text unit
+/// carrying link forms assembles to a `.svmo` that decodes as the identical module and links.
+#[test]
+fn assemble_text_unit_to_svmo() {
+    let bin = env!("CARGO_BIN_EXE_svm-run");
+    let dir = std::env::temp_dir().join(format!("svm_asm_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let unit = unit_b();
+    let text_path = dir.join("b.svm");
+    std::fs::write(&text_path, svm_text::print_module(&unit)).unwrap();
+    let obj_path = dir.join("b.svmo");
+
+    let asm = Command::new(bin)
+        .args(["--assemble"])
+        .arg(&text_path)
+        .args(["-o"])
+        .arg(&obj_path)
+        .output()
+        .unwrap();
+    assert!(
+        asm.status.success(),
+        "assemble failed: {}",
+        String::from_utf8_lossy(&asm.stderr)
+    );
+    let decoded = svm_encode::decode_unit(&std::fs::read(&obj_path).unwrap()).expect("decode");
+    assert_eq!(decoded, unit, "assembled object differs from the text unit");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

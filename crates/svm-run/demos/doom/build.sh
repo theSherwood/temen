@@ -43,7 +43,8 @@ clang $FL "$LUA/lua_fmt_snprintf.c"          -o "$OUT/_fmt.bc"
 clang $FL "$LUA/lua_files_stdio.c"           -o "$OUT/_files.bc"
 
 llvm-link "$OUT"/*.bc -o "$OUT/doom.bc"
-# 64 KiB host page (the wasm/browser page); emit the export map so a driver can resolve `tick`/`main`.
-"$TR" "$OUT/doom.bc" -o "$OUT/doom.svmb" --host-page 65536 --emit-syms "$OUT/doom.syms"
-echo "built $OUT/doom.svmb ($(wc -c < "$OUT/doom.svmb") bytes); exports:"
-grep -E '^(main|tick) ' "$OUT/doom.syms"
+# 64 KiB host page (the wasm/browser page). Exports (`tick`/`main`) ride in-band in the module's
+# first-class export table — a driver resolves them by name from the artifact itself (the old
+# `.syms` sidecar is retired).
+"$TR" "$OUT/doom.bc" -o "$OUT/doom.svmb" --host-page 65536
+echo "built $OUT/doom.svmb ($(wc -c < "$OUT/doom.svmb") bytes)"
