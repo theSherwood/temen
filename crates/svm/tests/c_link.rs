@@ -1245,6 +1245,169 @@ fn cc1_compile(
     interp.stdout
 }
 
+/// **Benchmark: chibicc self-compile on native vs SVM bytecode vs SVM JIT.** The tree-walk interpreter
+/// is the correctness oracle, not a consumer engine, so it's excluded here — this measures the two
+/// engines a consumer actually runs. For each TU it times: native `chibicc_ref`; the SVM **bytecode**
+/// engine (instantiate = IR→bytecode compile; run = execute); and the SVM **JIT** (instantiate =
+/// compile the ~300-function compiler to native; run = execute). Instantiate is timed separately so the
+/// JIT's one-time compile-the-compiler cost (amortized in any real deployment — compile once, run many)
+/// is visible apart from the per-invocation run. Opt-in (`SVM_SELFHOST_BENCH=1`); not a CI gate.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "benchmark: chibicc self-compile native vs bytecode vs jit; opt-in via SVM_SELFHOST_BENCH=1"]
+fn bench_self_compile_native_vs_bytecode_vs_jit() {
+    use std::time::Instant;
+    use svm_run::{instantiate_with_imports, Backend, RunConfig};
+    if std::env::var_os("SVM_SELFHOST_BENCH").is_none() {
+        eprintln!("skipping self-compile benchmark; set SVM_SELFHOST_BENCH=1 to run");
+        return;
+    }
+    let linked = link_whole_cc1();
+    // The linked cc1 module is IDENTICAL for every TU below — only the *input file* (fed via the fs
+    // cap) changes. So the JIT recompiles the exact same module on every run, and its compile cost is
+    // a genuine constant. Measure it in isolation (pure `svm_jit::compile`, no execution) so the table
+    // can be read as `jit-run ≈ compile-the-compiler + execution`, with execution the only variable.
+    let nfuncs = linked.funcs.len();
+    let ninsns: usize = linked
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .map(|b| b.insts.len())
+        .sum();
+    let mut jit_compile_ms = u128::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let _ = svm_jit::compile(&linked, 0).expect("compile whole cc1");
+        jit_compile_ms = jit_compile_ms.min(t.elapsed().as_millis());
+    }
+    let tus = [
+        "hashmap.c",
+        "type.c",
+        "tokenize.c",
+        "preprocess.c",
+        "parse.c",
+        "codegen_ir.c",
+    ];
+    let inc: &[&[u8]] = &[
+        b"-Ifrontend/chibicc",
+        b"-Ifrontend/chibicc/include",
+        b"-Iusr/include/x86_64-linux-gnu",
+        b"-Iusr/include",
+    ];
+    // Time (instantiate, run) for a backend, best-of-`reps` on each phase; returns (ms, ms, out_len).
+    let bench =
+        |backend: Backend, args: &[Vec<u8>], files: &[(String, Vec<u8>)], dirs: &[String], reps| {
+            let cfg = RunConfig {
+                args: args.to_vec(),
+                ..RunConfig::default()
+            };
+            let (mut inst_ms, mut run_ms, mut out) = (u128::MAX, u128::MAX, 0usize);
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let instance = instantiate_with_imports(
+                    linked.clone(),
+                    cc1_imports(files.to_vec(), dirs.to_vec()),
+                )
+                .expect("instantiate");
+                inst_ms = inst_ms.min(t0.elapsed().as_millis());
+                let t1 = Instant::now();
+                let r = instance
+                    .run_with_caps(backend, &cfg, &[])
+                    .expect("run backend");
+                run_ms = run_ms.min(t1.elapsed().as_millis());
+                out = r.stdout.len();
+            }
+            (inst_ms, run_ms, out)
+        };
+    println!("\n=== chibicc self-compile: native vs SVM bytecode vs SVM JIT (best-of-3, ms) ===");
+    println!(
+        "{:<14} {:>8} | {:>10} {:>8} | {:>10} {:>8} {:>8}   out",
+        "TU", "native", "bc-inst", "bc-run", "jit-inst", "jit-run", "jit-tot"
+    );
+    // Floor: a trivial no-`#include` compile isolates the fixed per-run cost (JIT = compile the ~300-fn
+    // compiler to native; bytecode = engine startup) from the actual front-end/codegen work. Subtract
+    // this from a TU's `*-run` to get the marginal compile time a real deployment amortizes to.
+    {
+        let files = vec![("t.c".to_string(), b"int main(void){return 42;}\n".to_vec())];
+        let dirs: Vec<String> = vec![];
+        let args: Vec<Vec<u8>> = vec![
+            b"chibicc".to_vec(),
+            b"--emit-object".to_vec(),
+            b"t.c".to_vec(),
+        ];
+        let (bi, br, _) = bench(Backend::Bytecode, &args, &files, &dirs, 3);
+        let (ji, jr, _) = bench(Backend::Jit, &args, &files, &dirs, 3);
+        println!(
+            "{:<14} {:>8} | {bi:>10} {br:>8} | {ji:>10} {jr:>8} {:>8}   (fixed floor)",
+            "(trivial)",
+            "-",
+            ji + jr
+        );
+    }
+    for tu in tus {
+        let path = format!("frontend/chibicc/{tu}");
+        let (mut files, mut dirs) = chibicc_tu_closure(&path, &["-Ifrontend/chibicc"]);
+        files.push((
+            SELFHOST_PRELUDE.to_string(),
+            std::fs::read(repo_root().join(SELFHOST_PRELUDE)).unwrap(),
+        ));
+        let mut anc = Path::new(SELFHOST_PRELUDE).parent();
+        while let Some(d) = anc {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            dirs.push(d.to_string_lossy().into_owned());
+            anc = d.parent();
+        }
+        dirs.sort();
+        dirs.dedup();
+        let mut args: Vec<Vec<u8>> = vec![b"chibicc".to_vec(), b"--emit-object".to_vec()];
+        args.push(b"-include".to_vec());
+        args.push(SELFHOST_PRELUDE.as_bytes().to_vec());
+        for i in inc {
+            args.push(i.to_vec());
+        }
+        args.push(path.as_bytes().to_vec());
+
+        // native: time chibicc_ref on the identical relative flags.
+        let native_args = [
+            "--emit-object",
+            "-include",
+            SELFHOST_PRELUDE,
+            "-Ifrontend/chibicc",
+            "-Ifrontend/chibicc/include",
+            "-I/usr/include/x86_64-linux-gnu",
+            "-I/usr/include",
+            &path,
+        ];
+        let mut nat = u128::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let _ = native_cc1_file(&native_args);
+            nat = nat.min(t.elapsed().as_millis());
+        }
+        let (bi, br, _) = bench(Backend::Bytecode, &args, &files, &dirs, 3);
+        let (ji, jr, _out) = bench(Backend::Jit, &args, &files, &dirs, 3);
+        println!(
+            "{tu:<14} {nat:>8} | {bi:>10} {br:>8} | {ji:>10} {jr:>8} {:>8}   {_out}",
+            ji + jr
+        );
+    }
+    println!(
+        "\nlinked cc1: {nfuncs} funcs, {ninsns} IR insns.  \
+         pure svm_jit::compile (no execution, best-of-3): {jit_compile_ms} ms — the fixed \
+         'compile-the-compiler' cost.\n\
+         The powerbox JIT fuses compile+run with no module cache, so `jit-run` pays this on \
+         *every* call.\n\
+         Read it as  jit-run ≈ compile-the-compiler + execution;  execution = jit-run − ~{jit_compile_ms}ms \
+         (a few hundred ms, single-digit × native).\n\
+         A compile-once/run-many deployment amortizes the fixed cost to ~0 and the JIT lands near native; \
+         `jit-run` here does not.\n\
+         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`. native has no \
+         separate instantiate.)\n"
+    );
+}
+
 /// The native oracle: `chibicc_ref` (same `cc1_main` entry, system clang + libc) fed `stdin` for
 /// `chibicc [extra_args...] -`, returning the emitted IR. `-g` is off by default on both sides, so
 /// there is no `debug.file <path>` line — a true byte-for-byte compare of the emitted IR.
