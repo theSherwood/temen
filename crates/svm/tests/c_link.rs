@@ -1002,6 +1002,46 @@ fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
     );
 }
 
+/// The **correctly-rounded float path** (task #22): `demo_float.c` prints a battery of `%.17g`/`%g`/
+/// `%e`/`%f` conversions through the emit-object libc's Steele & White scaled-bignum dtoa
+/// (`printf_emit.c`), run on interp==JIT under the powerbox. The headline is `%.17g` — the format
+/// chibicc itself emits for float literals — round-tripping the values that a lossy formatter gets
+/// wrong (0.1, 2/3, 1e-7). The oracle is glibc's own output for the identical calls (verified
+/// natively): a `double` printed with `%.17g` must read back bit-identical.
+#[test]
+fn emit_object_libc_float_runs_byte_exact_under_powerbox() {
+    use svm_run::{instantiate_with_imports, Outcome, RunConfig, Value};
+
+    // Entry unit first so `demo_float`'s `_start` is merged function 0; the libc has no `main`.
+    let demo = object_unit_file("crates/svm/tests/fixtures/emit_libc/demo_float.c");
+    let libc = object_unit_emit_libc();
+
+    let linked =
+        svm_ir::link_with_manifest(&[demo, libc]).expect("link demo_float + emit-object libc");
+    svm_verify::verify_module(&linked).expect("verify linked emit-object float program");
+
+    let inst = instantiate_with_imports(linked, cc1_imports(vec![], vec![])).expect("instantiate");
+    let run = inst
+        .run_diff(&RunConfig::default())
+        .expect("run _start on interp+jit");
+    assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(0)]));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "0.10000000000000001\n\
+         1\n\
+         3.14159265358979\n\
+         0.66666666666666663\n\
+         1e+20\n\
+         -9.9999999999999995e-08\n\
+         123456789 6.0220000000000003e+23\n\
+         [0.5][100][0.0001][1e-05]\n\
+         [1.234568e+04][4.200000E-04]\n\
+         [3.14][2][0.007]\n\
+         [+4.0][-5.0e+01][-0]\n",
+        "emit-object %.17g (and %g/%e/%f) is correctly rounded — byte-for-byte like glibc"
+    );
+}
+
 /// Link the whole `-cc1` slice — the eight upstream chibicc TUs, the `cc1_main.c` entry, and the
 /// emit-object guest libc (`emit_libc.c`) — into one verified module. The shared machinery behind
 /// both the "links with only powerbox caps" gate and the 2c self-compile run below. Linux-only.

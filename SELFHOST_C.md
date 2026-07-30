@@ -505,9 +505,24 @@ compiler bug is a clean error, never an escape.
    interp==JIT and byte-identical to native `chibicc_ref` (which reads the same header from a real `-I`
    dir). The stdout/stdin edge stays on the `Stream` cap, so the fs cap is only files (fd≥3).
 
-   **Remaining for 2c.** (b) The float-input dtoa (`printf_emit.c`'s `%.17g` is best-effort, so a
-   float-literal source won't diff byte-exact yet). (c) The **bootstrap-fixpoint** differential (§5 E) —
-   now unblocked: the running compiler can read its own multi-file source from a seeded memfs.
+   **→ Emit-object 2c increment 3 DONE 2026-07-30 — the float-input dtoa: `%.17g` is correctly
+   rounded.** `printf_emit.c`'s float path was best-effort double arithmetic; a float-literal source
+   couldn't diff byte-exact because `%.17g` didn't guarantee the 17-significant-digit round-trip. Closed
+   by porting svm-llvm's `synth_dtoa_*` IR reference (`crates/svm-llvm/src/lib.rs`) to guest C: a Steele
+   & White scaled-**bignum** generator (fixed-width 32-bit-limb integers `fbig`/`fbig_*`, namespaced off
+   `strtod.c`'s own `bn`) that emits the nearest half-to-even P-significant-digit decimal with *exact*
+   integer arithmetic — no float ops in the digit loop, so the result is deterministic across
+   interp/JIT/native and `%.17g` re-parses a `double` bit-identically. `__vm_fmt_{gen,sci,fix}` are
+   rewritten around it: `%g` (strip trailing zeros, e-vs-f at exponent −4/P), `%e` (fixed fractional
+   width), `%f` (significant digits down to 10^−fp, incl. the sub-precision rounding corner). Validated
+   two ways: a native fuzz harness diffs the engine against glibc over edge cases + 200k random doubles
+   (both signs, %g/%e/%f at many precisions) — **0 mismatches / 3.2M checks** — and a new guest gate,
+   `emit_object_libc_float_runs_byte_exact_under_powerbox`, runs `demo_float.c`'s `%.17g`/`%g`/`%e`/`%f`
+   battery through the real emit-object compile on interp==JIT, byte-for-byte against glibc's own output.
+
+   **Remaining for 2c.** The **bootstrap-fixpoint** differential (§5 E) — now unblocked on both edges:
+   the running compiler can read its own multi-file source from a seeded memfs *and* emit float constants
+   losslessly.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
