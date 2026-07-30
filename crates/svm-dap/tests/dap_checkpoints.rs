@@ -82,6 +82,48 @@ block 3 (vi2: i64) {
   }
 }";
 
+/// A §12 **fiber** generator whose fiber body runs a long internal loop before it first suspends, so
+/// the *bulk* of the run's ops execute with the fiber as the active continuation and the root parked on
+/// the resume chain — the state a checkpoint must capture (active fiber `Vm` + chain + registry). The
+/// root creates the fiber, resumes it (it loops `arg` times summing a counter, then suspends the sum),
+/// resumes again (it returns sum+5), and adds the two.
+const FIBER_LOOP: &str = "\
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  vc = cont.new v0 v1
+  vs0, vy = cont.resume vc vn
+  v6 = i64.const 0
+  vs1, vr = cont.resume vc v6
+  v9 = i64.add vy vr
+  return v9
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vacc0 = i64.const 0
+  br 1(varg, vacc0)
+}
+block 1 (vi: i64, vacc: i64) {
+  vz = i64.eqz vi
+  br_if vz 2(vacc) 3(vi, vacc)
+}
+block 2 (vsum: i64) {
+  vres = suspend vsum
+  v5 = i64.const 5
+  vfin = i64.add vsum v5
+  return vfin
+}
+block 3 (vi2: i64, vacc2: i64) {
+  v1 = i64.const 1
+  vnext = i64.add vacc2 v1
+  vm1 = i64.const -1
+  vid = i64.add vi2 vm1
+  br 1(vid, vnext)
+  }
+}";
+
 /// A stable per-`seek` observation: the logical clock, the call stack (each frame's IR pc), and the
 /// running-sum window bytes. Identical between a from-0 replay and a checkpoint-restored replay iff
 /// restore is faithful.
@@ -147,6 +189,52 @@ fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     assert!(
         warm.checkpoint_count() > 0,
         "checkpointing stays on for a pure single-vCPU memory loop",
+    );
+}
+
+#[test]
+fn bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber() {
+    // The bulk of this run executes *inside* the fiber (root parked on the resume chain), so nearly
+    // every checkpoint captures a live §12 fiber continuation. A checkpoint-restored `seek` must
+    // reproduce the fiber's stack and the final result exactly as a from-0 replay.
+    let m = parse_module(FIBER_LOOP).expect("parses");
+    let args = [Value::I64(900)]; // fiber loops 900× before its first suspend ⇒ several strides deep
+    let mk = || {
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+            .expect("the single-vCPU engine accepts the fiber generator")
+    };
+
+    let probes: Vec<u64> = (0..=5000).step_by(131).collect();
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs(&mut b, t)
+        })
+        .collect();
+    // Sanity: the run genuinely executes inside the fiber (func 1), so the checkpoints below capture a
+    // live fiber continuation rather than only the root.
+    assert!(
+        cold.iter().any(|(_, stack, _)| stack.contains("0:1:")),
+        "the run spends time inside the fiber body (func 1)",
+    );
+
+    let mut warm = mk();
+    warm.seek(5000);
+    assert!(
+        warm.checkpoint_count() > 0,
+        "a deep seek through the fiber body lays down checkpoints with a live fiber",
+    );
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm (checkpoint-restored) seek ≡ cold at every forward probe with a live fiber",
+    );
+    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(
+        warm_back, cold_back,
+        "warm backward sweep ≡ cold with a live fiber (fiber chain + registry restore is faithful)",
     );
 }
 
