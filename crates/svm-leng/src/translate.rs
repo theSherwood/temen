@@ -155,7 +155,16 @@ struct Sig {
 /// aggregate (whose fields/elements are reached by further `dot`/`at`).
 #[derive(Clone, Debug)]
 pub(crate) enum TyDesc {
+    /// A full-width scalar: `i32`/`i64`/`f32`/`f64`, loaded/stored with the plain `iN.load`/`store`.
     Scalar(ValType),
+    /// A **sub-word integer** — 1 or 2 bytes (`u8`/`i8`/`u16`/`i16`, e.g. `char`) — loaded and
+    /// stored with `iN.load8/16`/`store8/16`. Its SSA value type is `i32` (the load zero-/sign-
+    /// extends per `signed`). nimony reads these through pointer casts (`=destroy` checks a string's
+    /// low length byte via `(deref (cast (ptr (u 8)) …))`).
+    Narrow {
+        bytes: u8,
+        signed: bool,
+    },
     Agg(String),
 }
 
@@ -515,6 +524,7 @@ impl Translator {
         match d {
             TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
             TyDesc::Scalar(_) => 8,
+            TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
                 None => 8,
@@ -528,6 +538,29 @@ impl Translator {
         match node.tag() {
             Some("ptr") | Some("aptr") => Ok(TyDesc::Scalar(ValType::I64)),
             Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
+            // A sub-word integer (`u8`/`i8`/`u16`/`i16`, `char`) is a `Narrow` scalar — loaded and
+            // stored at its true width, not widened to a 4/8-byte access.
+            Some("i" | "u" | "c") => {
+                let (vt, signed) = int_ty_signed(node)?;
+                match vt {
+                    ValType::I32 => {
+                        let bytes = int_bits(
+                            node.args()
+                                .first()
+                                .and_then(|n| n.as_atom())
+                                .unwrap_or("+32"),
+                        )?;
+                        if bytes <= 8 {
+                            Ok(TyDesc::Narrow { bytes: 1, signed })
+                        } else if bytes <= 16 {
+                            Ok(TyDesc::Narrow { bytes: 2, signed })
+                        } else {
+                            Ok(TyDesc::Scalar(ValType::I32))
+                        }
+                    }
+                    _ => Ok(TyDesc::Scalar(vt)),
+                }
+            }
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
                 // A bare-symbol type is an aggregate only if it's a declared object/array; any other
@@ -1424,18 +1457,35 @@ impl<'a> FuncGen<'a> {
             }
             Node::List(_) => match node.tag() {
                 Some("deref") => {
-                    let pname = node
+                    let operand = node
                         .args()
                         .first()
-                        .and_then(|n| n.as_atom())
-                        .ok_or_else(|| LengError::Unsupported("deref of non-symbol".into()))?;
-                    let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                        LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-                    })?;
-                    let pv = self.lookup(pname).ok_or_else(|| {
-                        LengError::Unsupported(format!("unknown pointer `{pname}`"))
-                    })?;
-                    Ok((pv.id, desc))
+                        .ok_or_else(|| LengError::Malformed("deref needs an operand".into()))?;
+                    // A **symbol pointer**: a local whose pointee type we tracked.
+                    if let Some(pname) = operand.as_atom() {
+                        let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
+                            LengError::Unsupported(format!("`{pname}` is not a known pointer"))
+                        })?;
+                        let pv = self.lookup(pname).ok_or_else(|| {
+                            LengError::Unsupported(format!("unknown pointer `{pname}`"))
+                        })?;
+                        return Ok((pv.id, desc));
+                    }
+                    // A **computed pointer** with an explicit pointee type: `(deref (cast (ptr T)
+                    // e))` — evaluate `e` as the address, take the pointee `T` from the cast. nimony
+                    // emits this to read through a re-typed address (`=destroy` reads a string's low
+                    // length byte via `(ptr (u 8))`).
+                    if operand.tag() == Some("cast") {
+                        let ca = operand.args();
+                        if ca.len() >= 2 {
+                            if let Some(pointee) = ptr_pointee(&ca[0]) {
+                                let desc = self.t.tydesc(pointee)?;
+                                let addr = self.expr_typed(&ca[1], ValType::I64)?;
+                                return Ok((addr.id, desc));
+                            }
+                        }
+                    }
+                    Err(LengError::Unsupported("deref of non-symbol".into()))
                 }
                 Some("dot") => {
                     let a = node.args();
@@ -1486,6 +1536,18 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  v{id} = {}.load v{addr}\n", prefix(ty)));
                 Ok(Val { id, ty })
             }
+            TyDesc::Narrow { bytes, signed } => {
+                // A sub-word load, widened to `i32` (`i32.load8_u` / `load16_s` / …).
+                let id = self.fresh();
+                self.used_memory = true;
+                let ext = if signed { 's' } else { 'u' };
+                self.cur_buf
+                    .push_str(&format!("  v{id} = i32.load{}_{ext} v{addr}\n", bytes * 8));
+                Ok(Val {
+                    id,
+                    ty: ValType::I32,
+                })
+            }
             TyDesc::Agg(n) => Err(LengError::Unsupported(format!(
                 "reading aggregate `{n}` as a value (whole-aggregate ops are a later slice)"
             ))),
@@ -1495,8 +1557,17 @@ impl<'a> FuncGen<'a> {
     /// Store `rhs` through an lvalue.
     fn store_lvalue(&mut self, lhs: &Node, rhs: &Node) -> Result<(), LengError> {
         let (addr, desc) = self.lvalue_addr(lhs)?;
+        if let TyDesc::Narrow { bytes, .. } = desc {
+            // A sub-word store (`i32.store8` / `store16`), truncating the `i32` value.
+            let v = self.expr_typed(rhs, ValType::I32)?;
+            self.used_memory = true;
+            self.cur_buf
+                .push_str(&format!("  i32.store{} v{addr} v{}\n", bytes * 8, v.id));
+            return Ok(());
+        }
         let ty = match desc {
             TyDesc::Scalar(t) => t,
+            TyDesc::Narrow { .. } => unreachable!("handled above"),
             TyDesc::Agg(n) => {
                 return Err(LengError::Unsupported(format!(
                     "assigning to aggregate lvalue `{n}`"
@@ -1688,6 +1759,13 @@ impl<'a> FuncGen<'a> {
                 self.used_memory = true;
                 self.cur_buf
                     .push_str(&format!("  {}.store v{addr} v{}\n", prefix(*ty), v.id));
+                Ok(())
+            }
+            TyDesc::Narrow { bytes, .. } => {
+                let v = self.expr_typed(expr, ValType::I32)?;
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  i32.store{} v{addr} v{}\n", bytes * 8, v.id));
                 Ok(())
             }
             TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
@@ -2846,6 +2924,15 @@ fn int_literal(node: &Node) -> Option<i64> {
         return node.args().first().and_then(int_literal);
     }
     node.as_atom().and_then(|s| parse_int(s).ok())
+}
+
+/// The pointee type node of a `(ptr T)` / `(aptr T)` type, if `node` is one (else `None` — e.g. a
+/// non-pointer cast target). Used to type a `(deref (cast (ptr T) …))`.
+fn ptr_pointee(node: &Node) -> Option<&Node> {
+    match node.tag() {
+        Some("ptr") | Some("aptr") => node.args().first(),
+        _ => None,
+    }
 }
 
 /// The value type of a NIF literal **suffix** (`"i64"`, `"u8"`, `"f32"`, …): floats map to
