@@ -936,7 +936,7 @@ impl Translator {
             let mut to_frame = Vec::new();
             for node in nodes {
                 let name = sym_def(&node.args()[0])?;
-                if self.procs.get(&name).map_or(true, |s| s.needs_frame) {
+                if self.procs.get(&name).is_none_or(|s| s.needs_frame) {
                     continue;
                 }
                 if let Some(b) = node.args().get(4) {
