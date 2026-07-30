@@ -553,11 +553,26 @@ plumbing. Five workstreams, roughly independent:
     **`suf` suffixed literals** (`255'i64`). With those, the *whole* system module's globals, 96
     types, and 163 `strlit` (`LongString`) consts all collect, and `=wasMoved`,
     `nimFlushStdStreams`, `nimNoopFlush`, `setExitFlush` translate.
-  - **Remaining for the full `system` link:** the rest of the ARC set (`=destroy`/`=dup`/`=copy`) and
-    the system `ini` chain need more totality — **sub-word (`u8`) loads**, **`deref` of a computed
-    address** (not just a symbol pointer), **parameter spill** (`addr` of a by-value param), and the
-    exception-global setup in system's `ini`. Each is a bounded translator slice; together they're
-    the last stretch to retiring the stub entirely.
+  - **✅ Coverage grind — 290/324 system procs translate (2026-07-30).** The ARC set
+    (`=wasMoved`/`=destroy`/`=copy`) plus ~180 more procs now lower, after a run of bounded translator
+    slices: bitwise/shift/`not`/`bitnot`, char literals, computed-pointer `deref`/`pat`, `importc`
+    externs → imports, bool `case` values, sub-word (`i8`/`i16`) locals, local scalar+aggregate
+    consts, inline flexible arrays (`LongString.data`), const array tables, aggregate rvalues in
+    argument position, `keepovf`/`ovf`, computed `deref`/`pat` in `lvalue_type` (the `s.more.data[i]`
+    walk), transitive frame propagation, and scalar parameter spill. Whole-module translation of the
+    entire `system` module now runs to a single tail (`[]=`'s call arity).
+  - **✅ End-to-end against real `system` ARC — MET 2026-07-30 (Path A payoff).** A *real* nimony
+    program runs against *real* compiled `system` code, no stub: `greetLong(): string = "hello, this
+    is a long string!"` links against the **real** `=wasMoved`/`=destroy` (verbatim from
+    `system/stringimpl.nim`) and runs end-to-end on both engines, returning the literal. The long
+    string's `LongString` blob is a `const` in greetLong's data; the linker **relocates** the string's
+    `more` pointer to its placed address. This needed **const-to-const data relocations**
+    (`data.ptr <at> self <off>`, svm_ir D-LINK): a pointer stored *inside* one const's bytes to
+    another const (a `string` literal's `more = (addr strlit)`) — placeholder bytes the linker
+    overwrites (`tests/system.rs`, `tests/strings.rs`).
+  - **Remaining for the full `system` link:** the `[]=` call-arity tail bug (an `openArray` op), the
+    system `ini` exception-global setup, and function-pointer/indirect-dispatch (out of subset). The
+    ARC-heavy string path — what a real string program needs at the boundary — now links and runs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

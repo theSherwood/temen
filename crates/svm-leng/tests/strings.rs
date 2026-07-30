@@ -191,6 +191,41 @@ fn computed_deref_flexarray_chain() {
 }
 
 #[test]
+fn const_to_const_pointer_relocates() {
+    // A `const` `string` whose `more` field points at *another* `const` (a `LongString` blob) — like
+    // a local string literal `prefix = "…"` in the system module. In link mode this is a `data.ptr`
+    // relocation: `s.more` holds placeholder bytes the linker overwrites with the blob's placed
+    // address. `getmore()` returns `s.more`; following it must land on the blob (fullLen 3, "abc").
+    let leng = "\
+(stmts
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LS.0.))))
+ (const :strlit.0. . LS.0. (oconstr LS.0. (kv fullLen.0 3) (kv rc.0 0) (kv capImpl.0 0) (kv data.0 \"abc\")))
+ (const :s.0. . string.0. (oconstr string.0. (kv bytes.0 42) (kv more.0 (addr strlit.0.))))
+ (proc :getmore.0. . (i +64) . (stmts . (ret (dot s.0. more.0 0)))))";
+    // Link the single unit (compile → decode → link) so the `data.ptr` self-relocation resolves.
+    let linked = svm_leng::link_units(&[LengModule {
+        stem: "m",
+        src: leng,
+        names: &["getmore.0."],
+    }])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let seed = vec![0u8; 4096];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &[], &mut fuel, &seed);
+    let more = match ir.expect("interp").as_slice() {
+        [Value::I64(a)] => *a as usize,
+        o => panic!("{o:?}"),
+    };
+    assert_ne!(more, 0, "`more` relocated to the blob");
+    let full_len = u64::from_le_bytes(imem[more..more + 8].try_into().unwrap());
+    assert_eq!(full_len, 3, "blob fullLen — followed the relocated pointer");
+    assert_eq!(&imem[more + 24..more + 27], b"abc", "blob data");
+}
+
+#[test]
 fn const_array_table_indexes() {
     // A `const` array table `(aconstr T e0 e1 …)` — like `system`'s `fsLookupTable` (256 i8s) —
     // materializes into a data segment; `(at table idx)` reads an element. Here a small i8 table
