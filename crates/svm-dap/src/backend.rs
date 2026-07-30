@@ -30,6 +30,8 @@ use svm_interp::bytecode::{
     ScheduledSnapshot,
 };
 use svm_interp::MemEvent;
+
+use crate::json::Json;
 use svm_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
     StreamRole, Trap, Value, VarValue, WatchId, WatchKind,
@@ -111,6 +113,7 @@ fn build_single_run(
     powerbox: bool,
     stdin: &[u8],
     block_stdin: bool,
+    mem_limit: Option<u64>,
     tape: &CapTape,
 ) -> Option<DebugRun> {
     if !powerbox {
@@ -118,6 +121,9 @@ fn build_single_run(
     }
     let mut host = Host::new();
     grant_io_powerbox(&mut host, module, stdin);
+    // Slice 5: the Memory-capability growth cap — a `vm_map` past the limit returns -ENOMEM, so a
+    // guest malloc observes NULL (the OOM-teaching knob). Re-armed on every seek rebuild.
+    host.set_mem_map_limit(mem_limit);
     // W4 blocking stdin: a `read` on an exhausted buffer parks the run (`StopReason::StdinPark`)
     // instead of returning EOF; `provideStdin` appends bytes and a resume re-issues the read.
     // Re-armed on every `seek` rebuild so a read past the replay frontier parks again.
@@ -183,6 +189,14 @@ pub trait Debuggee {
     /// blocking stdin (the `provideStdin` request fails cleanly). Default: unsupported.
     fn provide_stdin(&mut self, _bytes: &[u8]) -> bool {
         false
+    }
+
+    // --- memory map (slice 5) --------------------------------------------------------------------
+    /// The window's memory-map introspection as JSON (geometry, data segments, explicit-state
+    /// pages, powerbox stack/heap regions). `None` when this backend doesn't expose it (the
+    /// tree-walker) or the module has no memory — the `memoryMap` request fails cleanly.
+    fn memory_map(&self) -> Option<Json> {
+        None
     }
 
     // --- access sink / models --------------------------------------------------------------------
@@ -325,6 +339,9 @@ pub struct BytecodeBackend {
     /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Single-vCPU
     /// powerbox sessions only — `new` declines a threaded module with this set (fail-closed).
     block_stdin: bool,
+    /// Slice 5: the session's Memory-capability growth cap ([`Host::set_mem_map_limit`]) — set on
+    /// the powerbox at build and on every seek rebuild. `None` = unbounded.
+    mem_limit: Option<u64>,
     /// The recorded [`CapTape`] of nondeterministic cap **inputs** (clock / stdin `read` / host-fn) from
     /// the furthest-forward execution — replayed on a reverse `seek` rebuild so re-execution sees
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
@@ -391,6 +408,7 @@ impl BytecodeBackend {
         powerbox: bool,
         stdin: Vec<u8>,
         block_stdin: bool,
+        mem_limit: Option<u64>,
     ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let engine = if bytecode::module_spawns_threads(&module) {
@@ -408,6 +426,7 @@ impl BytecodeBackend {
                 powerbox,
                 &stdin,
                 block_stdin,
+                mem_limit,
                 &tape,
             )?))
         };
@@ -423,6 +442,7 @@ impl BytecodeBackend {
             powerbox,
             stdin,
             block_stdin,
+            mem_limit,
             tape,
             rev_trace: None,
             checkpoints: Vec::new(),
@@ -463,6 +483,7 @@ impl BytecodeBackend {
             self.powerbox,
             &self.stdin,
             self.block_stdin,
+            self.mem_limit,
             &self.tape,
         )
     }
@@ -995,6 +1016,87 @@ impl Debuggee for BytecodeBackend {
     }
     fn supports_watch(&self) -> bool {
         true
+    }
+    /// The memory-map JSON: window geometry + explicit-state pages from the engine
+    /// ([`Mem::map_info`]), data-segment placements from the module, the powerbox stack layout
+    /// constants, and — under the powerbox — the guest heap cursor (window words at
+    /// `POWERBOX_HEAP_BRK`/`_TOP`; the heap base is the mapped end, §1a growth into the tail).
+    fn memory_map(&self) -> Option<Json> {
+        let (page, mapped, reserved, pages) = match &self.engine {
+            Engine::Single(run) => run.mem_map_info(),
+            Engine::Threaded(run) => run.mem_map_info(),
+        }?;
+        let kinds = ["ro", "rw", "unmapped", "region"];
+        let mut fields = vec![
+            ("pageSize", Json::i(page as i64)),
+            ("mapped", Json::i(mapped as i64)),
+            ("reserved", Json::i(reserved as i64)),
+            (
+                "segments",
+                Json::Arr(
+                    self.module
+                        .data
+                        .iter()
+                        .map(|d| {
+                            Json::obj(vec![
+                                ("offset", Json::i(d.offset as i64)),
+                                ("len", Json::i(d.bytes.len() as i64)),
+                                ("readonly", Json::Bool(d.readonly)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "pages",
+                Json::Arr(
+                    pages
+                        .iter()
+                        .map(|(base, k)| {
+                            Json::obj(vec![
+                                ("base", Json::i(*base as i64)),
+                                (
+                                    "kind",
+                                    Json::s(kinds.get(*k as usize).copied().unwrap_or("?")),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "stack",
+                Json::obj(vec![
+                    ("argsBase", Json::i(svm_ir::POWERBOX_ARGS_BASE as i64)),
+                    ("argsEnd", Json::i(svm_ir::POWERBOX_ARGS_END as i64)),
+                    ("stackPage", Json::i(svm_ir::POWERBOX_STACK_PAGE as i64)),
+                    (
+                        "stackReserve",
+                        Json::i(svm_ir::POWERBOX_STACK_RESERVE as i64),
+                    ),
+                ]),
+            ),
+        ];
+        if self.powerbox {
+            let word = |off: u64| -> Option<i64> {
+                let b = self.read_window(off, 8).ok()?;
+                Some(i64::from_le_bytes(b.try_into().ok()?))
+            };
+            if let (Some(brk), Some(top)) = (
+                word(svm_ir::POWERBOX_HEAP_BRK),
+                word(svm_ir::POWERBOX_HEAP_TOP),
+            ) {
+                fields.push((
+                    "heap",
+                    Json::obj(vec![
+                        ("base", Json::i(mapped as i64)),
+                        ("brk", Json::i(brk)),
+                        ("top", Json::i(top)),
+                    ]),
+                ));
+            }
+        }
+        Some(Json::obj(fields))
     }
     /// The engine-level sink installer (both bytecode engines support it).
     fn set_access_sink(&mut self, sink: SharedSink) -> bool {

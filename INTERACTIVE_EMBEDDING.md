@@ -487,9 +487,16 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    model can drop to rebuild-from-0 with the engine. Acceptance: strided-vs-sequential miss
 >    ordering; browser counters ≡ native on the same stream; `seek(t)` model state ≡ a from-0 run
 >    to `t`, including after checkpointing self-disables.
-> 5. **X4's real-state half + W6 memory-map.** The window memory-map JSON (data segments, heap
->    extent, data-stack region, cap-mapped regions) and a **Memory-capability growth cap** so
->    guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
+> 5. ~~**X4's real-state half + W6 memory-map.**~~ **DONE 2026-07-30** — `Mem::map_info` (one
+>    read-only accessor: page size, mapped/reserved, explicit-state pages) → the `memoryMap` DAP
+>    request (geometry + segments + grown-tail pages + powerbox stack/heap regions; tree-walker
+>    fails closed), and the growth cap as **Host policy at the Memory-cap dispatch**
+>    (`set_mem_map_limit` / `memoryLimit` launch arg): a `vm_map` past the limit returns
+>    `-ENOMEM` probeably (invariant 5 — guest `malloc` observes NULL), `vm_unmap` returns bytes
+>    to the budget, and the accounting rides `HostReplaySubstate` so checkpoint restores keep it.
+>    Gated by `crates/svm-dap/tests/memory_map.rs`. Original spec: the window memory-map JSON
+>    (data segments, heap extent, data-stack region, cap-mapped regions) and a
+>    **Memory-capability growth cap** so guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
 >    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
 >    mapped/reserved) + the `svm-ir` powerbox layout constants (args/stack), with the **heap
 >    cursor read from guest memory** — `POWERBOX_HEAP_BRK`/`_TOP` are window words at offsets

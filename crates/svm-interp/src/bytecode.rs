@@ -4629,6 +4629,12 @@ impl DebugRun {
         self.access_sink = Some(sink);
     }
 
+    /// The run's window memory-map introspection ([`Mem::map_info`](super::Host)): `(page_size,
+    /// mapped, reserved, explicit-state pages)`. `None` for a memory-less module.
+    pub fn mem_map_info(&self) -> Option<(u64, u64, u64, Vec<(u64, u8)>)> {
+        self.mem.as_ref().map(|m| m.map_info())
+    }
+
     /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
     /// current op before scanning — used after a `seek`/replay lands exactly on a breakpoint, so a
     /// forward resume makes progress instead of re-reporting the same stop.
@@ -5859,6 +5865,11 @@ impl ScheduledDebugRun {
     /// `turn` and the executing task index. Observation only; zero cost when never installed.
     pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
         self.access_sink = Some(sink);
+    }
+
+    /// The shared window's memory-map introspection — see `DebugRun::mem_map_info`.
+    pub fn mem_map_info(&self) -> Option<(u64, u64, u64, Vec<(u64, u8)>)> {
+        self.mem.as_ref().map(|m| m.map_info())
     }
 
     /// Take the `(addr, write)` of the watchpoint the last stop fired on (cleared by the read), so the

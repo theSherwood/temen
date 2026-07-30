@@ -199,6 +199,7 @@ impl DapServer {
             "evaluate" => self.on_evaluate(args),
             "provideStdin" => self.on_provide_stdin(args),
             "memModelStats" => self.on_mem_model_stats(),
+            "memoryMap" => self.on_memory_map(),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -336,9 +337,27 @@ impl DapServer {
         if block_stdin && (engine != "bytecode" || !powerbox) {
             return (false, Json::Null, vec![]);
         }
+        // `memoryLimit: N` (slice 5): cap the Memory capability's total committed bytes — a
+        // `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching
+        // knob). Needs the powerbox's Memory grant on the bytecode engine; fail-closed elsewhere.
+        let mem_limit = args
+            .get("memoryLimit")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as u64);
+        if mem_limit.is_some() && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
-            match BytecodeBackend::new(module, func, &call_args, fuel, powerbox, stdin, block_stdin)
-            {
+            match BytecodeBackend::new(
+                module,
+                func,
+                &call_args,
+                fuel,
+                powerbox,
+                stdin,
+                block_stdin,
+                mem_limit,
+            ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
                 Some(b) => {
@@ -944,6 +963,16 @@ impl DapServer {
         };
         let ok = session.inspector.provide_stdin(data.as_bytes());
         (ok, Json::Null, vec![])
+    }
+
+    /// The custom `memoryMap` request (slice 5): the window's memory-map introspection — geometry,
+    /// data segments, explicit-state pages, the powerbox stack/heap regions — as JSON. Fails
+    /// cleanly when the backend doesn't expose it (tree-walker) or there is no session.
+    fn on_memory_map(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(map) = self.session.as_ref().and_then(|s| s.inspector.memory_map()) else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, map, vec![])
     }
 
     /// The custom `memModelStats` request (slice 4): the armed memory model's counters + line-state

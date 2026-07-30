@@ -200,8 +200,17 @@ fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     let m = parse_module(LOOP_WITH_MEM).expect("parses");
     let args = [Value::I32(800)]; // several thousand ops ⇒ several stride boundaries
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
-            .expect("the bytecode engine accepts the single-vCPU loop")
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("the bytecode engine accepts the single-vCPU loop")
     };
 
     // Probe times spread across the run — deliberately not stride-aligned, so restores land at a
@@ -255,8 +264,17 @@ fn bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber() {
     let m = parse_module(FIBER_LOOP).expect("parses");
     let args = [Value::I64(900)]; // fiber loops 900× before its first suspend ⇒ several strides deep
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
-            .expect("the single-vCPU engine accepts the fiber generator")
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("the single-vCPU engine accepts the fiber generator")
     };
 
     let probes: Vec<u64> = (0..=5000).step_by(131).collect();
@@ -322,8 +340,17 @@ fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     let m = parse_module(LOOP_THREADS).expect("parses");
     let args = [Value::I64(400)]; // two workers × 400 iters ⇒ several thousand turns, many strides
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
-            .expect("the scheduled bytecode engine accepts the thread.spawn loop")
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("the scheduled bytecode engine accepts the thread.spawn loop")
     };
 
     let probes: Vec<u64> = (0..=6000).step_by(149).collect();
@@ -376,8 +403,17 @@ fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
     let m = parse_module(THREADS_WITH_FIBERS).expect("parses");
     let args = [Value::I64(400)]; // two fibers × 400 iters ⇒ several thousand turns, many strides
     let mk = || {
-        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false)
-            .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
     };
 
     let probes: Vec<u64> = (0..=6000).step_by(149).collect();
@@ -430,8 +466,19 @@ fn bytecode_checkpoint_reverse_sweep_is_bounded() {
     use std::time::Instant;
     let m = parse_module(LOOP_WITH_MEM).expect("parses");
     let args = [Value::I32(8_000)]; // ~64k ops — many strides deep
-    let mk =
-        || BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new(), false).unwrap();
+    let mk = || {
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+        )
+        .unwrap()
+    };
     let deep = 60_000u64;
     let steps = 60u64;
 
