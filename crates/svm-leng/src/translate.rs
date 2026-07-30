@@ -422,7 +422,47 @@ impl Translator {
                 _ => {}
             }
         }
+        // **Local** consts inside proc bodies that are *aggregates* (a local `const` string/table)
+        // are materialized module-wide too (their mangled names are unique), so `(addr name)`
+        // resolves. Scalar local consts stay inlined per-function (see the `const` statement).
+        for item in root.args() {
+            if item.tag() == Some("proc") {
+                if let Some(body) = item.args().get(4) {
+                    self.collect_local_aggregate_consts(body, &mut off)?;
+                }
+            }
+        }
         self.globals_top = off;
+        Ok(())
+    }
+
+    /// Recurse a proc body, materializing each **aggregate** local `const` (a `const` whose value is
+    /// an `oconstr`/`aconstr`) into a module data segment + addressable global — the same treatment
+    /// top-level aggregate consts get.
+    fn collect_local_aggregate_consts(
+        &mut self,
+        node: &Node,
+        off: &mut u64,
+    ) -> Result<(), LengError> {
+        if node.tag() == Some("const") {
+            let a = node.args();
+            if a.len() >= 4 {
+                let name = sym_def(&a[0])?;
+                if !self.globals.contains_key(&name) && int_literal(&a[3]).is_none() {
+                    if let Some((bytes, desc)) = self.const_aggregate_bytes(&a[3])? {
+                        let sz = bytes.len() as u64;
+                        self.data_inits.push((*off, bytes));
+                        self.globals.insert(name, (*off, desc));
+                        *off += sz.max(8);
+                    }
+                }
+            }
+        }
+        if let Node::List(items) = node {
+            for c in items {
+                self.collect_local_aggregate_consts(c, off)?;
+            }
+        }
         Ok(())
     }
 
@@ -574,6 +614,17 @@ impl Translator {
                     bytes.resize(off + data.len(), 0);
                 }
                 bytes[off..off + data.len()].copy_from_slice(&data);
+            } else if ka[1].tag() == Some("addr") {
+                // A pointer to another const/global (`more = (addr strlit…)`). In runnable mode the
+                // target is at a fixed window offset, so bake its address in. In **link** mode this
+                // needs a real data relocation the static const bytes can't carry — fail-closed.
+                let target = ka[1].args().first().and_then(|n| n.as_atom());
+                match target.and_then(|t| self.globals.get(t)) {
+                    Some((goff, _)) if !self.link_mode => {
+                        bytes[off..off + 8].copy_from_slice(&goff.to_le_bytes());
+                    }
+                    _ => return Ok(None),
+                }
             } else {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
@@ -2157,14 +2208,18 @@ impl<'a> FuncGen<'a> {
                 self.write_local(&name, v)
             }
             Some("const") => {
-                // A **local `const`** `(const :name pragmas type value)` — a scalar int/char/bool
-                // constant, inlined at use. (Aggregate/table consts stay unsupported for now.)
+                // A **local `const`** `(const :name pragmas type value)`: a scalar int/char/bool is
+                // inlined at use; an aggregate was already materialized as a module global by
+                // `collect_local_aggregate_consts` (so nothing to do here).
                 let a = s.args();
                 if a.len() >= 4 {
                     let name = sym_def(&a[0])?;
                     if let Some(v) = int_literal(&a[3]) {
                         self.local_consts.insert(name, v);
                         return Ok(());
+                    }
+                    if self.t.globals.contains_key(&name) {
+                        return Ok(()); // pre-materialized aggregate const
                     }
                     return Err(LengError::Unsupported(format!(
                         "non-scalar local const `{name}`"
