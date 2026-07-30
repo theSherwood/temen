@@ -1278,27 +1278,30 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
         b"-Iusr/include",
     ];
     // Time (instantiate, run) for a backend, best-of-`reps` on each phase; returns (ms, ms, out_len).
-    let bench = |backend: Backend, args: &[Vec<u8>], files: &[(String, Vec<u8>)], dirs: &[String], reps| {
-        let cfg = RunConfig {
-            args: args.to_vec(),
-            ..RunConfig::default()
+    let bench =
+        |backend: Backend, args: &[Vec<u8>], files: &[(String, Vec<u8>)], dirs: &[String], reps| {
+            let cfg = RunConfig {
+                args: args.to_vec(),
+                ..RunConfig::default()
+            };
+            let (mut inst_ms, mut run_ms, mut out) = (u128::MAX, u128::MAX, 0usize);
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let instance = instantiate_with_imports(
+                    linked.clone(),
+                    cc1_imports(files.to_vec(), dirs.to_vec()),
+                )
+                .expect("instantiate");
+                inst_ms = inst_ms.min(t0.elapsed().as_millis());
+                let t1 = Instant::now();
+                let r = instance
+                    .run_with_caps(backend, &cfg, &[])
+                    .expect("run backend");
+                run_ms = run_ms.min(t1.elapsed().as_millis());
+                out = r.stdout.len();
+            }
+            (inst_ms, run_ms, out)
         };
-        let (mut inst_ms, mut run_ms, mut out) = (u128::MAX, u128::MAX, 0usize);
-        for _ in 0..reps {
-            let t0 = Instant::now();
-            let instance =
-                instantiate_with_imports(linked.clone(), cc1_imports(files.to_vec(), dirs.to_vec()))
-                    .expect("instantiate");
-            inst_ms = inst_ms.min(t0.elapsed().as_millis());
-            let t1 = Instant::now();
-            let r = instance
-                .run_with_caps(backend, &cfg, &[])
-                .expect("run backend");
-            run_ms = run_ms.min(t1.elapsed().as_millis());
-            out = r.stdout.len();
-        }
-        (inst_ms, run_ms, out)
-    };
     println!("\n=== chibicc self-compile: native vs SVM bytecode vs SVM JIT (best-of-3, ms) ===");
     println!(
         "{:<14} {:>8} | {:>10} {:>8} | {:>10} {:>8} {:>8}   out",
@@ -1310,12 +1313,18 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
     {
         let files = vec![("t.c".to_string(), b"int main(void){return 42;}\n".to_vec())];
         let dirs: Vec<String> = vec![];
-        let args: Vec<Vec<u8>> = vec![b"chibicc".to_vec(), b"--emit-object".to_vec(), b"t.c".to_vec()];
+        let args: Vec<Vec<u8>> = vec![
+            b"chibicc".to_vec(),
+            b"--emit-object".to_vec(),
+            b"t.c".to_vec(),
+        ];
         let (bi, br, _) = bench(Backend::Bytecode, &args, &files, &dirs, 3);
         let (ji, jr, _) = bench(Backend::Jit, &args, &files, &dirs, 3);
         println!(
             "{:<14} {:>8} | {bi:>10} {br:>8} | {ji:>10} {jr:>8} {:>8}   (fixed floor)",
-            "(trivial)", "-", ji + jr
+            "(trivial)",
+            "-",
+            ji + jr
         );
     }
     for tu in tus {
