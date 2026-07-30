@@ -46,11 +46,17 @@ int align_to(int n, int align) {
 // on so the W1 debugger can consume the source-line/variable waist, `-g0` is the explicit off (a no-op
 // against the default). The playground passes `-g` only when the user opts into source-level debugging.
 int main(int argc, char **argv) {
-  char *inc = "/include";
+  int n_inc = 0;
   int ai = 1;
   while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
     if (argv[ai][1] == 'I') {
-      inc = argv[ai] + 2;
+      // Multiple `-I` dirs, searched in the order given (first `-I` searched first). One dir was
+      // enough for a self-contained program, but compiling chibicc's *own* TUs pulls chibicc.h's
+      // system-header closure, which spans chibicc's bundled `include/` **and** the system roots
+      // (`/usr/include[/x86_64-linux-gnu]`) — the memfs seed mounts each at its real path and the
+      // search order mirrors native chibicc's `add_default_include_paths` (bundled first).
+      strarray_push(&include_paths, argv[ai] + 2);
+      n_inc++;
       ai++;
     } else if (!strcmp(argv[ai], "--data-page") && ai + 1 < argc) {
       opt_data_page = atoi(argv[ai + 1]);
@@ -73,7 +79,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   base_file = argv[ai];
-  strarray_push(&include_paths, inc);
+  if (n_inc == 0)
+    strarray_push(&include_paths, "/include"); // default mount when no -I is given (existing tests)
 
   // Define the predefined macros (`__FILE__`, `__LINE__`, `__STDC__`, `__SIZEOF_*`, `__linux__`, …)
   // so real programs and glibc-shape headers (e.g. `<assert.h>`'s `__FILE__`/`__LINE__`) work. Safe
