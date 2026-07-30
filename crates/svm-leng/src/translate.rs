@@ -1030,7 +1030,13 @@ impl Translator {
         let framed_var = var_descs
             .iter()
             .any(|(vn, d)| matches!(d, TyDesc::Agg(_)) || addr.contains(vn));
-        framed_var || self.agg_temp_bytes(body) > 0
+        // An address-taken **scalar** param is spilled to a frame slot (an aggregate param is not).
+        let spilled_param = self.param_types(&p.args()[1]).is_ok_and(|pts| {
+            pts.iter().any(|(pn, tnode)| {
+                addr.contains(pn) && !matches!(self.tydesc(tnode), Ok(TyDesc::Agg(_)))
+            })
+        });
+        framed_var || spilled_param || self.agg_temp_bytes(body) > 0
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -1288,15 +1294,16 @@ impl Translator {
             collect_addr_taken(b, &mut addr_taken);
         }
         // An address-taken **aggregate** param is already passed by-address — its slot value *is*
-        // the address, so `(addr p)` works with no spill. A scalar param has no address (it lives in
-        // an SSA slot); taking its address still fail-closes (scalar spill is a later refinement).
-        for (pn, _) in &params {
-            if addr_taken.contains(pn) && !matches!(local_desc.get(pn), Some(TyDesc::Agg(_))) {
-                return Err(LengError::Unsupported(format!(
-                    "address of scalar parameter `{pn}` (param spill is a later refinement)"
-                )));
-            }
-        }
+        // the address, so `(addr p)` works with no spill. An address-taken **scalar** param is
+        // *spilled*: it gets a frame slot, its incoming value is stored there at entry, and all
+        // reads/writes/`(addr p)` go through the frame.
+        let spill_params: Vec<(String, ValType)> = params
+            .iter()
+            .filter(|(pn, _)| {
+                addr_taken.contains(pn) && !matches!(local_desc.get(pn), Some(TyDesc::Agg(_)))
+            })
+            .cloned()
+            .collect();
 
         // A var is frame-resident if it is an aggregate (indexed by `at`/`dot`) or address-taken;
         // the rest are SSA slots. Frame locals get natural-size byte offsets.
@@ -1322,6 +1329,18 @@ impl Translator {
                 if !ssa_vars.iter().any(|(n, _)| n == vn) {
                     ssa_vars.push((vn.clone(), ValType::I32));
                 }
+            }
+        }
+        // Spilled scalar params get a frame slot too (their incoming value is stored there at entry).
+        for (pn, _) in &spill_params {
+            if !mem.contains_key(pn) {
+                let desc = local_desc
+                    .get(pn)
+                    .cloned()
+                    .unwrap_or(TyDesc::Scalar(ValType::I64));
+                let sz = self.sizeof(&desc);
+                mem.insert(pn.clone(), (frame_size, desc));
+                frame_size += sz.max(8);
             }
         }
         // Reserve scratch frame space above the named locals for **aggregate rvalue temps** (an
@@ -1378,6 +1397,7 @@ impl Translator {
             mem,
             frame_size,
             temp_base,
+            spill_params,
             sret,
         );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
@@ -1428,6 +1448,9 @@ struct FuncGen<'a> {
     /// Bump pointer into the aggregate-rvalue temp region (`[temp_base, frame_size)`) — the next
     /// scratch offset an `(oconstr …)` argument is constructed at.
     temp_next: u64,
+    /// Address-taken scalar params to **spill** at entry: their incoming SSA value is stored into a
+    /// frame slot (they're also in `mem`), so `(addr p)` and later reads/writes go through the frame.
+    spill_params: Vec<(String, ValType)>,
     /// `Some((slot, desc))` when this proc returns an aggregate by sret: `cur[slot]` is the caller's
     /// destination pointer, into which `ret` copies/constructs the aggregate before a void return.
     sret: Option<(usize, TyDesc)>,
@@ -1467,6 +1490,7 @@ impl<'a> FuncGen<'a> {
         mem: HashMap<String, (u64, TyDesc)>,
         frame_size: u64,
         temp_base: u64,
+        spill_params: Vec<(String, ValType)>,
         sret: Option<(usize, TyDesc)>,
     ) -> Self {
         let slot_of = slots
@@ -1485,6 +1509,7 @@ impl<'a> FuncGen<'a> {
             has_sp,
             mem,
             temp_next: temp_base,
+            spill_params,
             frame_size,
             sret,
             label_block: HashMap::new(),
@@ -1536,6 +1561,30 @@ impl<'a> FuncGen<'a> {
             let ty = self.slots[i].1;
             let v = self.emit_const(ty, 0);
             self.cur.push(v.id);
+        }
+        // Spill each address-taken scalar param: store its incoming SSA value into its frame slot.
+        // (Only reachable when there are spills, hence a frame with `$sp` at slot 0.)
+        if self.spill_params.is_empty() {
+            return;
+        }
+        let sp = self.cur[0];
+        for (name, _) in self.spill_params.clone() {
+            let (off, desc) = self.mem[&name].clone();
+            let val = self.cur[self.slot_of[&name]];
+            self.used_memory = true;
+            match desc {
+                TyDesc::Narrow { bytes, .. } => self.cur_buf.push_str(&format!(
+                    "  i32.store{} v{sp} v{val} offset={off}\n",
+                    bytes * 8
+                )),
+                _ => {
+                    let ty = desc.scalar_ty().unwrap_or(ValType::I64);
+                    self.cur_buf.push_str(&format!(
+                        "  {}.store v{sp} v{val} offset={off}\n",
+                        prefix(ty)
+                    ));
+                }
+            }
         }
     }
 

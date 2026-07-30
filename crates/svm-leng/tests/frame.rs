@@ -116,3 +116,25 @@ fn frameless_caller_of_framed_callee_gets_a_frame() {
     );
     assert_eq!(run(&m, 1, &[8192, 42]), 42);
 }
+
+#[test]
+fn scalar_param_spill() {
+    // Taking the address of a by-value scalar param spills it to a frame slot: its incoming value is
+    // stored there at entry, and `(addr x)` / reads / writes go through the frame. f(x) = { p = &x;
+    // *p = 99; return x } — the write through the pointer must be visible when x is read back.
+    let leng = "\
+(stmts
+ (proc :f.0 (params (param :x.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :p.0 . (ptr (i +64)) (addr x.0))
+   (asgn (deref p.0) 99)
+   (ret x.0))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // f is frame-needing (spill): ($sp, x) -> i64. Result is 99 regardless of the incoming x.
+    assert_eq!(
+        run(&m, 0, &[8192, 5]),
+        99,
+        "write through &x is seen reading x"
+    );
+    assert_eq!(run(&m, 0, &[8192, 0]), 99);
+}
