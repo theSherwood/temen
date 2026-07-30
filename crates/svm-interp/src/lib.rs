@@ -9588,13 +9588,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // joins the forged-handle / dead / bomb family and matches the JIT, which
                             // raises `FiberFault` from its first-resume type-check (`fiber_rt`). The
                             // claim already took the slot to `Running`, so this fiber stays inert.
-                            let callee = table_lookup(fs, funcref, &fiber_sig())
-                                .map_err(|_| Trap::FiberFault)?;
-                            // First entry: call `func(sp, arg)` on the fiber's data stack. Fibers
-                            // are module-0 only (a unit cannot use `cont.*`, gated at compile).
+                            // Resolve the entry through the **module-0 dispatch table** (as
+                            // `call_indirect` does), not the running frame's local index space — so a
+                            // fiber a *submitted unit* creates over a slot (`cont.new <slot>`) reaches
+                            // the right function (old / module 0, or an installed unit), matching the
+                            // JIT's shared-`fn_table` resolution (DESIGN.md §22 "Concurrency", fibers
+                            // in submitted units). A forged / wrong-type funcref is a **fiber** fault
+                            // (the fault arose from a `cont.*` op), joining the forged-handle / dead /
+                            // bomb family and matching the JIT's first-resume type-check.
+                            let (cmod, cfunc) = dispatch_indirect(
+                                dt,
+                                &funcs,
+                                units,
+                                invoked,
+                                funcref,
+                                &fiber_sig(),
+                            )
+                            .map_err(|_| Trap::FiberFault)?;
                             vec![Frame {
-                                func: callee,
-                                module: 0,
+                                func: cfunc,
+                                module: cmod,
                                 block: 0,
                                 inst: 0,
                                 vals: vec![Reg::from_i64(sp), Reg::from_i64(av)],
@@ -11386,18 +11399,6 @@ fn simd_swizzle(a: [u8; 16], b: [u8; 16]) -> [u8; 16] {
     o
 }
 
-/// Resolve a `call_indirect`: mask the index into the power-of-two-padded function
-/// table, then check the selected entry's signature against `ty` (the §3c table
-/// type-id check). Masking — not branching — keeps the table load Spectre-v1 safe.
-fn table_lookup(funcs: &[Func], idx: i32, ty: &FuncType) -> Result<FuncIdx, Trap> {
-    let mask = funcs.len().next_power_of_two() - 1;
-    let slot = (idx as u32 as usize) & mask;
-    match funcs.get(slot) {
-        Some(c) if c.params == ty.params && c.results == ty.results => Ok(slot as FuncIdx),
-        _ => Err(Trap::IndirectCallType),
-    }
-}
-
 fn fbin32(op: FBinOp, a: f32, b: f32) -> f32 {
     match op {
         FBinOp::Add => a + b,
@@ -12912,6 +12913,13 @@ pub struct Host {
     /// JIT's `table_reserve_log2` for the backends to agree on slot indices. `0` ⇒ natural size
     /// (no install room).
     jit_table_log2: u8,
+    /// Whether guest-submitted `Jit` units in this domain may host §12 **fibers** (`cont.*`) —
+    /// DESIGN.md §22 "Concurrency" (renegotiated 2026-07-30). Off by default (a fiber-using unit is
+    /// rejected); a fiber-hosting grant sets it, and the JIT run entry stands up the parent's fiber
+    /// runtime (`CompiledModule::enable_fiber_hosting`) so a submitted unit's `cont.*` resolve. The
+    /// interpreter's `INVOKE_MODULE` already runs `cont.*` in its eval loop, so it needs no runtime
+    /// stand-up — the flag only records the grant for backend parity.
+    jit_hosts_fibers: bool,
     /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
     /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
     cap_record: Option<Vec<CapRecord>>,
@@ -13175,6 +13183,7 @@ impl Host {
             jit_domains: Vec::new(),
             jit_validator: None,
             jit_table_log2: 0,
+            jit_hosts_fibers: false,
             cap_record: None,
             cap_replay: None,
             durable: false,
@@ -13266,6 +13275,7 @@ impl Host {
         twin.stdin_block = self.stdin_block;
         twin.clock_ns = self.clock_ns;
         twin.jit_table_log2 = self.jit_table_log2;
+        twin.jit_hosts_fibers = self.jit_hosts_fibers;
         Some(twin)
     }
 
@@ -15002,6 +15012,18 @@ impl Host {
     /// `install`; `0` ⇒ natural size.
     pub fn jit_table_log2(&self) -> u8 {
         self.jit_table_log2
+    }
+
+    /// Mark this run's granted `Jit` domain(s) as **fiber-hosting** — a submitted unit may use §12
+    /// fibers (`cont.*`), DESIGN.md §22 "Concurrency". The JIT run entry then stands up the parent's
+    /// fiber runtime (`enable_fiber_hosting`); the interpreter needs no setup. Set before the run.
+    pub fn set_jit_hosts_fibers(&mut self, on: bool) {
+        self.jit_hosts_fibers = on;
+    }
+
+    /// Whether guest-submitted `Jit` units may host fibers (see [`Host::set_jit_hosts_fibers`]).
+    pub fn jit_hosts_fibers(&self) -> bool {
+        self.jit_hosts_fibers
     }
 
     /// Tighten (or widen) every granted `Jit` domain's compile quota — the §15-style resource

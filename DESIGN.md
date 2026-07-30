@@ -2570,11 +2570,28 @@ that keeps "no escape-TCB change" true:** trap-confinement (I1) bounds accesses 
 bound against a larger region — an escape, without touching the confinement lowering. The fix lives in the
 authority-TCB `Jit` handler: **reject any submitted module whose declared memory ≠ the parent window**
 (the host then compiles the blob with the parent's base/reserved, so I1 confines it exactly as the main
-module). The handler also rejects data segments and §12 concurrency ops inside a *submitted unit* (a
-JIT'd blob stays single-threaded; the *parent* may be multi-threaded). A per-domain **compile quota**
-(`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB only); B2
-leaves the indirect-call lowering byte-identical and only adds dynamic table population** on top of the
-intern.
+module). The handler also rejects data segments inside a *submitted unit*. A per-domain **compile
+quota** (`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB
+only); B2 leaves the indirect-call lowering byte-identical and only adds dynamic table population** on
+top of the intern.
+
+**Concurrency in a submitted unit (renegotiated 2026-07-30).** The original MVP also rejected *all* §12
+ops in a submitted unit ("a JIT'd blob stays single-threaded"). That is now split: a submitted unit may
+host **fibers** (`cont.new`/`cont.resume`/`suspend`) — they switch stacks *within* the domain on the
+caller's thread, so a unit that runs its own scheduler to completion never parks across the synchronous
+`cap.call` it runs inside — while **threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`)
+stay rejected (a spawned vCPU would outlive the `cap.call` and collide with the serialized `Mutex<Host>`
+path). Fibers add **no escape-TCB surface**: the runtime is the same domain-shared fiber table the parent
+already uses, reached through the existing `invoke_extra` seam; the fault confinement (I1), the memory-match
+precondition, and the data-segment rejection are unchanged. Mechanics: the parent stands up its fiber
+runtime even when it uses no fibers itself (`grant_jit_fibers` → `CompiledModule::enable_fiber_hosting`,
+which builds the table/runtime/`cont.*` thunk env post-compile so a submitted unit's `cont.*` resolve
+`CURRENT_RT`); the shared `jit_resolve_and_validate` admits `cont.*` and rejects only threads/futex on both
+backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
+the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
+`fn_table`. Threads-in-a-submitted-unit and fibers over *installed*-unit entries (module ≥ 1) remain
+deferred. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
+`submitted_unit_threads_still_rejected_with_fiber_hosting`.
 
 ### Code reclaim — whole-module compaction
 

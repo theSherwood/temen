@@ -3967,9 +3967,20 @@ impl CompiledModule {
         }
         for f in funcs {
             ensure_supported(f)?;
-            if f.uses_concurrency() {
+            // Threads/futex in a submitted unit stay unsupported (a spawned vCPU would outlive the
+            // `cap.call` this unit runs inside; DESIGN.md §22 "Concurrency").
+            if f.uses_threads() || f.uses_futex() {
                 return Err(JitError::Unsupported(
-                    "an incrementally defined function using fibers/threads is not supported yet",
+                    "an incrementally defined function using threads/futex is not supported yet",
+                ));
+            }
+            // Fibers ARE hosted — but only when the domain stood up a fiber runtime
+            // (`enable_fiber_hosting`, driven by a fiber-hosting `Jit` grant). Without it the
+            // `cont.*` thunk addresses are null, so a fiber-using unit must fail closed rather than
+            // lower a `call_indirect` through null.
+            if f.uses_fibers() && self.fiber.is_null() {
+                return Err(JitError::Unsupported(
+                    "a submitted unit using fibers requires a fiber-hosting Jit domain",
                 ));
             }
         }
@@ -4068,6 +4079,98 @@ impl CompiledModule {
                 ),
             })
             .collect())
+    }
+
+    /// Stand up the §12 **fiber runtime** on an already-compiled module so guest-submitted units
+    /// (`define_extra` / `invoke_extra`) may host `cont.*` (DESIGN.md §22 "Concurrency",
+    /// renegotiated 2026-07-30). A `Jit`-granting parent typically does not itself use fibers, so
+    /// its `compile` left `self.fiber` null — and a fiber-using submitted unit then lowers `cont.*`
+    /// through null thunks (`define_extra` rejects it via [`FiberEnv::is_null`]). This installs the
+    /// **same** runtime `compile` builds when the top-level module uses fibers — the domain-shared
+    /// table, the root vCPU's [`fiber_rt::FiberRuntime`], the `cont.*` thunk env, and the call
+    /// trampoline — reusing the incremental define+finalize path (`define_extra`'s, W^X-safe: only
+    /// the fresh trampoline page is mprotected; running code is untouched).
+    ///
+    /// Called by the `Jit` run entries between `compile` and `run` for a **fiber-hosting** grant.
+    /// The subsequent `run` publishes `CURRENT_RT` from `self.fiber_rt` (set here), so a submitted
+    /// unit's `cont.*`, running on the caller's stack inside the synchronous `cap.call`, resolve it.
+    /// A submitted unit whose own scheduler creates fibers over unit-local entries needs those
+    /// entries reachable as funcrefs (§22 install / the shared `fn_table`) — same as any `cont.new`.
+    ///
+    /// **Idempotent** and behavior-preserving: a no-op if fibers are already hosted (the parent used
+    /// `cont.*`/`gc.roots`), reusing an existing table/trampoline a thread-only parent already built.
+    #[cfg(fiber_rt)]
+    pub fn enable_fiber_hosting(&mut self, quota: Quota) -> Result<(), JitError> {
+        if !self.fiber.is_null() {
+            return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
+        }
+        let quota = quota.clamped();
+        // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
+        // remaps — DESIGN.md §22). A later `define_extra` interning the same signature gets this id,
+        // so id-equality stays ≡ structural equality. Consulted only here, guest not yet running.
+        let fiber_type_id = intern_type(&mut self.distinct, &fiber_func_type())?;
+        // `cont.new` masks a funcref into the shared table; the table mask is safe (indices stay in
+        // `[0, table_len)`; padding slots trap on the type check) and equals `compile`'s funcs-based
+        // mask for a domain with no reserved install table (the fiber-hosting consumer).
+        let fiber_mask = self.fn_table_mask;
+        // Domain-shared handle namespace + §15 quota — reuse the one a thread-only parent built.
+        let table = match &self.fiber_table {
+            Some(t) => std::sync::Arc::clone(t),
+            None => {
+                let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(quota.max_fibers));
+                self.fiber_table = Some(std::sync::Arc::clone(&t));
+                t
+            }
+        };
+        let mut rt = Box::new(fiber_rt::FiberRuntime::new(
+            table,
+            fiber_type_id,
+            fiber_mask,
+        ));
+        // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). A
+        // thread-only parent already built it (`compile`, `uses_threads` arm); else build it now,
+        // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`.
+        let tramp = match self.call_tramp {
+            Some(t) => t,
+            None => {
+                let mut ctx = self.module.make_context();
+                build_fiber_call_trampoline(&mut self.module, &mut ctx.func);
+                let id = self
+                    .module
+                    .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module
+                    .define_function(id, &mut ctx)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module.clear_context(&mut ctx);
+                self.module
+                    .finalize_definitions()
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                let addr = self.module.get_finalized_function(id);
+                // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the ABI its
+                // builder emitted (`code` + the guest entry's Tail args) — the same `transmute`
+                // `compile` does for its own trampoline.
+                unsafe { std::mem::transmute::<*const u8, fiber_rt::FiberCallTramp>(addr) }
+            }
+        };
+        rt.set_call_tramp(tramp);
+        self.fiber_rt = Some(rt);
+        self.call_tramp = Some(tramp);
+        self.fiber_cfg = Some((fiber_type_id, fiber_mask));
+        self.fiber = FiberEnv {
+            new_thunk: fiber_rt::fiber_new as *const () as i64,
+            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+            roots_thunk: fiber_rt::svm_gc_roots_flush as *const () as i64,
+        };
+        Ok(())
+    }
+
+    /// Fiber hosting on a target without stack-switch support: a no-op — fibers stay unsupported, so
+    /// a fiber-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
+    #[cfg(not(fiber_rt))]
+    pub fn enable_fiber_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
+        Ok(())
     }
 
     /// **Install** an incrementally-defined function into the live `call_indirect` table (DESIGN.md §22
@@ -5114,6 +5217,12 @@ impl FiberEnv {
             suspend_thunk: 0,
             roots_thunk: 0,
         }
+    }
+    /// No fiber runtime is stood up for this module (the `cont.*` thunk addresses are unbaked). A
+    /// submitted unit that uses fibers must be rejected in this state — else its `cont.*` would
+    /// `call_indirect` through a null thunk. `enable_fiber_hosting` clears this for a `Jit` domain.
+    fn is_null(&self) -> bool {
+        self.new_thunk == 0
     }
 }
 
