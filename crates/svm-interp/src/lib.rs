@@ -12133,7 +12133,7 @@ enum Binding {
     /// §3.6 slice 3 — a **live-callee offer**: a capability whose provider is another *running*
     /// domain (a §14 child), carried as an index into [`Host::live_impls`] (the entry holds the
     /// callee's live powerbox Arc + target impl-export — index-carried to keep `Binding: Copy`,
-    /// like [`Binding::GuestImpl`]/[`Binding::PipeEnd`]). A call through it does not run a
+    /// like [`Binding::Offer`]/[`Binding::PipeEnd`]). A call through it does not run a
     /// passive `drive_arc` sub-run — it **enqueues** onto the callee's inbound dispatch queue
     /// and **parks the calling fiber** until the callee's serve loop completes the dispatch
     /// (the caller-parking half of the unified model; serviced in the eval loop, which alone
@@ -12212,13 +12212,13 @@ enum Binding {
     /// [`Host::host_procs_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
     HostProcRegion(u32),
     /// A **wired interface offer** (IMPORTS.md §3.2): a guest-implemented capability, carrying the
-    /// index of its [`GuestImplEntry`] in [`Host::guest_impls`] (out-of-line so `Binding` stays
+    /// index of its [`OfferEntry`] in [`Host::offers`] (out-of-line so `Binding` stays
     /// `Copy`, like [`Binding::HostProc`]). Op `i` dispatches to the offer's `ops[i]` function via
     /// the **generic dispatch** (one implementation, all three backends): a v1 **pure dispatch** —
     /// a fresh reference run over the offer's functions with no window and an empty powerbox, so
     /// the impl computes over its arguments alone. Exporter-domain state is the designed
     /// follow-up.
-    GuestImpl(u32),
+    Offer(u32),
     /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its [`BudgetState`] in
     /// [`Host::budgets`]. Authority over a passable, **splittable** resource-quota vector (fuel / mem /
     /// spawn): `split` attenuates a sub-budget out of the remaining, `read` reports it. Out-of-line (an
@@ -12350,9 +12350,9 @@ pub enum NonDurableKind {
     Pipe,
     /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
     /// offering domain's functions, so it must be re-wired after restore, not snapshotted.
-    GuestImpl,
+    Offer,
     /// §3.6 a live-callee offer — points at a *running* domain's powerbox, which no snapshot
-    /// can carry; re-wired after restore like a GuestImpl.
+    /// can carry; re-wired after restore like a Offer.
     LiveImpl,
     /// PROCESS.md §5 a window minter — mutable quota state (and the detached children it
     /// minted are outside the snapshot anyway); re-granted by the embedder after restore.
@@ -12634,12 +12634,12 @@ pub type HostProcRegion = Box<
 >;
 
 /// A **wired interface offer**'s host-side state (IMPORTS.md §3.2), indexed by the id a
-/// [`Binding::GuestImpl`] carries: the offering module's functions, the offer's per-op funcidx
+/// [`Binding::Offer`] carries: the offering module's functions, the offer's per-op funcidx
 /// list, the op signatures **derived** from those functions' declared types (never self-asserted),
 /// and the interned interface id ([`Host::intern_interface`]). Minted only by the wiring party
 /// ([`Host::wire_offer_func`]) — declaring an offer confers nothing; this entry existing in a domain's
 /// table is what moves authority. Op `i` runs `funcs[ops[i]]` as a **v1 pure dispatch** (see
-/// [`Binding::GuestImpl`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
+/// [`Binding::Offer`]): windowless, empty powerbox, fixed fuel — arguments in, results out.
 /// A slot's retained §3.5 requirement set: the manifest's `(names, sigs)`, shared with the
 /// attach-time coverage walk.
 type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
@@ -12675,7 +12675,7 @@ pub fn coverage_remap(
 }
 
 #[derive(Clone)]
-pub struct GuestImplEntry {
+pub struct OfferEntry {
     pub funcs: Arc<[Func]>,
     pub ops: Arc<[u32]>,
     pub sigs: Arc<[FuncType]>,
@@ -12696,10 +12696,10 @@ pub struct GuestImplEntry {
     /// ops run over this persistent window + powerbox ([`Host::wire_offer_proc`]), so state
     /// survives across calls — the stateful wrap ("an `Fs` backed by the provider's own
     /// window"). Shared (`Arc`) across re-grants: a parent and its children handed the same
-    /// offer drive one service instance, like a pipe's shared backing. The blocking lock is
-    /// deadlock-free by construction: a provider can never hold an offer
-    /// ([`Host::grant_impl_cap`] refuses one), so provider chains are acyclic and the lock
-    /// order is always domain-host → provider, never the reverse.
+    /// offer drive one service instance, like a pipe's shared backing. Admission is
+    /// **try-enter** (CALLS.md increment 2): a busy instance answers a probeable `-EAGAIN`,
+    /// never a blocking wait — so deadlock is impossible structurally, providers may hold
+    /// offers, and a cyclic call is a refusal, not a hang.
     pub state: Option<Arc<Mutex<ProviderState>>>,
 }
 
@@ -12769,7 +12769,7 @@ pub struct ProviderState {
     host: Host,
     /// §5.3 **provider-pays metering** (resolved 2026-07-20): the provider funds its own
     /// dispatch compute out of this drainable reserve — its code, its choice to offer.
-    /// Each op call is capped by `min(GUEST_IMPL_FUEL, remaining)` and drains what it
+    /// Each op call is capped by `min(OFFER_FUEL, remaining)` and drains what it
     /// used; a dry reserve makes further calls an inert `CapFault` (probeable by the
     /// caller, visible to the wirer via [`Host::impl_fuel_remaining`] — the §15 "read the
     /// meters on what you granted" story). A provider worried about a hammering child
@@ -12782,10 +12782,10 @@ pub struct ProviderState {
 const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 
 /// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
-/// see [`Binding::GuestImpl`]). A looping impl hits `OutOfFuel` and the caller's call traps,
+/// see [`Binding::Offer`]). A looping impl hits `OutOfFuel` and the caller's call traps,
 /// fail-closed and identically on every backend. Caller-fuel threading is the designed
 /// follow-up alongside exporter-domain state.
-const GUEST_IMPL_FUEL: u64 = 1 << 26;
+const OFFER_FUEL: u64 = 1 << 26;
 
 /// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
 /// re-grant the capability the slot names from `src`'s handle table into `dst`'s, replacing the
@@ -12901,9 +12901,9 @@ pub struct Host {
     /// carries, [`Host::grant_host_proc_region`]) — a `HostProc` plus a [`RegionMinter`]. Same
     /// take-out/run/restore dispatch as `host_procs`.
     host_procs_region: Vec<HostProcRegion>,
-    /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::GuestImpl`]
+    /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::Offer`]
     /// carries ([`Host::wire_offer_func`]).
-    guest_impls: Vec<GuestImplEntry>,
+    offers: Vec<OfferEntry>,
     /// The per-`Host` **structural interface intern** (D59 applied to capability interfaces):
     /// index `i` holds the op-signature list whose interface id is `GUEST_IMPL_BASE + i`, so
     /// id-equality ≡ structural equality within this table. Flat and scanned linearly — offers
@@ -13250,7 +13250,7 @@ impl Host {
             blockings: Vec::new(),
             host_procs: Vec::new(),
             host_procs_region: Vec::new(),
-            guest_impls: Vec::new(),
+            offers: Vec::new(),
             iface_intern: Vec::new(),
             import_remaps: Vec::new(),
             import_reqs: Vec::new(),
@@ -13298,7 +13298,7 @@ impl Host {
     /// caller is always parked *inside* a call through such an offer, so it necessarily holds one.
     ///
     /// **Fails closed** (returns `None`) for any domain carrying capability state the core cannot yet
-    /// duplicate on its own: closure-based host caps (`host_procs` / `host_procs_region` / `guest_impls`,
+    /// duplicate on its own: closure-based host caps (`host_procs` / `host_procs_region` / `offers`,
     /// not `Clone`), module grants, JIT / ring / async / offload / serve state, or in-flight freeze
     /// residue. Those a real `fork` (of a personality-wired domain such as bash) requires are **re-wired
     /// into the twin by the personality layer** (PR 3), not cloned here. So this only ever forks a
@@ -13310,7 +13310,7 @@ impl Host {
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
         let simple = self.host_procs.is_empty()
             && self.host_procs_region.is_empty()
-            && self.guest_impls.is_empty()
+            && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
             && self.rings.is_empty()
             && self.jit_domains.is_empty()
@@ -13392,7 +13392,7 @@ impl Host {
     /// bindings — no rewrite, no window stash. Binding, per slot, in order:
     ///
     /// 1. **A named grant that is a wired offer** (§3.3 wrap/override): a cap registered under
-    ///    exactly the import's name that resolves to a [`Binding::GuestImpl`] binds the slot to
+    ///    exactly the import's name that resolves to a [`Binding::Offer`] binds the slot to
     ///    its first op whose derived signature equals the declaration (structural, fail-closed —
     ///    a name match with no signature match never silently binds).
     /// 2. **The reference policy** (`write`/`read`/`exit` → first granted cap of the matching
@@ -13463,7 +13463,7 @@ impl Host {
             // match is the coverage walk (name-keyed against a named provider; exact positional
             // against a name-less legacy wire), producing the slot's frozen op remap.
             if let Some(h) = self.resolve_cap_name(&im.name) {
-                if let Ok(entry) = self.resolve_guest_impl(h) {
+                if let Ok(entry) = self.resolve_offer(h) {
                     let (en, es) = (Arc::clone(&entry.names), Arc::clone(&entry.sigs));
                     let cov = coverage_remap(&req_names, &req_sigs, &en, &es);
                     match cov.and_then(|remap| {
@@ -13945,7 +13945,7 @@ impl Host {
             // hide that it did. A forged/closed handle is an inert `CapFault` (§3c).
             5 => {
                 let h = *args.first().ok_or(Trap::Malformed)? as i32;
-                if let Ok(e) = self.resolve_guest_impl(h) {
+                if let Ok(e) = self.resolve_offer(h) {
                     return Ok(vec![e.depth as i64]);
                 }
                 // Not a wired offer: any live binding is platform-terminated (the vtable is
@@ -14011,9 +14011,7 @@ impl Host {
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostProc))
                 }
-                Binding::GuestImpl(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::GuestImpl))
-                }
+                Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
                     // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
                     // slot) is durably capturable — named structurally so the thaw re-links it.
@@ -14086,7 +14084,7 @@ impl Host {
                 Binding::JitDomain(_) => NonDurableKind::JitDomain,
                 Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => NonDurableKind::HostProc,
-                Binding::GuestImpl(_) => NonDurableKind::GuestImpl,
+                Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
@@ -14384,8 +14382,8 @@ impl Host {
             })
             .collect();
         let type_id = self.intern_interface(&sigs);
-        let idx = self.guest_impls.len() as u32;
-        self.guest_impls.push(GuestImplEntry {
+        let idx = self.offers.len() as u32;
+        self.offers.push(OfferEntry {
             funcs: Arc::clone(funcs),
             ops: ops.into(),
             sigs,
@@ -14394,7 +14392,7 @@ impl Host {
             depth: 1,
             state: None,
         });
-        Some(self.grant(type_id, Binding::GuestImpl(idx)))
+        Some(self.grant(type_id, Binding::Offer(idx)))
     }
 
     /// Wire an **instanced** offer (IMPORTS.md §3.2 v2 — exporter-domain state): like
@@ -14424,8 +14422,8 @@ impl Host {
             mm
         });
         let type_id = self.intern_interface(&sigs);
-        let idx = self.guest_impls.len() as u32;
-        self.guest_impls.push(GuestImplEntry {
+        let idx = self.offers.len() as u32;
+        self.offers.push(OfferEntry {
             funcs,
             ops: ops.into(),
             sigs,
@@ -14438,7 +14436,7 @@ impl Host {
                 fuel: PROVIDER_FUEL_RESERVE,
             }))),
         });
-        Some(self.grant(type_id, Binding::GuestImpl(idx)))
+        Some(self.grant(type_id, Binding::Offer(idx)))
     }
 
     /// §3.5: register the running module's self-referential surface (type-section interfaces,
@@ -14681,7 +14679,7 @@ impl Host {
             return Ok(1);
         }
         // A wired guest impl may cover a subset requirement — the name-keyed walk.
-        if let Ok(e) = self.resolve_guest_impl(handle) {
+        if let Ok(e) = self.resolve_offer(handle) {
             let (en, es) = (Arc::clone(&e.names), Arc::clone(&e.sigs));
             return Ok(coverage_remap(&names, &sigs, &en, &es).is_some() as i64);
         }
@@ -14721,8 +14719,8 @@ impl Host {
             })
             .clone();
         let type_id = self.intern_interface(&sigs);
-        let idx = self.guest_impls.len() as u32;
-        self.guest_impls.push(GuestImplEntry {
+        let idx = self.offers.len() as u32;
+        self.offers.push(OfferEntry {
             funcs,
             ops: Arc::from(e.ops.clone()),
             sigs,
@@ -14731,7 +14729,7 @@ impl Host {
             depth: 1,
             state: Some(state),
         });
-        let h = self.grant(type_id, Binding::GuestImpl(idx));
+        let h = self.grant(type_id, Binding::Offer(idx));
         self.self_reified.insert(k, h);
         Ok(h)
     }
@@ -14755,15 +14753,13 @@ impl Host {
     /// Re-grant one of **this** domain's capabilities into the provider instance behind `offer`,
     /// registered under `name` in the provider's §7 name directory (IMPORTS.md §3.2 v2): how a
     /// wrap comes to hold the real capability it forwards to. Same re-grant policy as a §14
-    /// child (coordinate-free caps and pipe ends; stdio shares this domain's sinks) with one
-    /// deliberate exception: **never another offer** — providers stay offer-free so provider
-    /// chains are acyclic and the blocking provider lock can never deadlock. `None` (nothing
-    /// granted) for a non-instanced offer, a non-grantable cap, or an offer-shaped `cap`.
+    /// child (coordinate-free caps and pipe ends; stdio shares this domain's sinks) —
+    /// **including other offers** (CALLS.md increment 2): with try-enter admission a cyclic or
+    /// re-entrant call finds the instance busy and gets a probeable `-EAGAIN`, so the old
+    /// "providers never hold offers" acyclicity rule is no longer load-bearing and is lifted.
+    /// `None` (nothing granted) for a non-instanced offer or a non-grantable cap.
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
-        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
-        if self.resolve_guest_impl(cap).is_ok() {
-            return None; // offers never nest in providers (acyclicity = deadlock-freedom)
-        }
+        let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         let h = self.regrant_into_child(cap, &mut st.host)?;
         st.host.register_cap_name(name, h);
@@ -14774,7 +14770,7 @@ impl Host {
     /// meter ("read the meters on what you granted", §15). `None` for a forged handle or a
     /// pure (non-instanced) offer.
     pub fn impl_fuel_remaining(&self, offer: i32) -> Option<u64> {
-        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
+        let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
         Some(st.fuel)
     }
@@ -14783,7 +14779,7 @@ impl Host {
     /// its own service — top-up or clamp). `None` (no change) for a forged handle or a pure
     /// offer.
     pub fn set_impl_fuel_reserve(&mut self, offer: i32, fuel: u64) -> Option<()> {
-        let state = self.resolve_guest_impl(offer).ok()?.state.clone()?;
+        let state = self.resolve_offer(offer).ok()?.state.clone()?;
         state.lock().unwrap_or_else(|e| e.into_inner()).fuel = fuel;
         Some(())
     }
@@ -14791,28 +14787,28 @@ impl Host {
     /// Adopt a wired offer re-granted from a parent domain (IMPORTS.md §3.3 — the wrap/override
     /// leg of [`Host::regrant_into_child`]): install the entry under **this** host's interned id
     /// for its (unchanged) signature list, one provenance hop deeper, and grant the handle.
-    fn adopt_guest_impl(&mut self, entry: GuestImplEntry) -> i32 {
+    fn adopt_offer(&mut self, entry: OfferEntry) -> i32 {
         let type_id = self.intern_interface(&entry.sigs);
-        let idx = self.guest_impls.len() as u32;
-        self.guest_impls.push(GuestImplEntry {
+        let idx = self.offers.len() as u32;
+        self.offers.push(OfferEntry {
             type_id,
             depth: entry.depth + 1,
             ..entry
         });
-        self.grant(type_id, Binding::GuestImpl(idx))
+        self.grant(type_id, Binding::Offer(idx))
     }
 
     /// Resolve `handle` to its wired-offer state (§3c: mask + generation, then the binding must
-    /// actually be a [`Binding::GuestImpl`]) — the eval loop's lookup when servicing a dispatch
+    /// actually be a [`Binding::Offer`]) — the eval loop's lookup when servicing a dispatch
     /// (slice 3), and the wiring-time lookup for [`Host::bound_import_for_impl`]. A forged /
     /// closed / non-offer handle is an inert `CapFault`.
-    pub fn resolve_guest_impl(&self, handle: i32) -> Result<&GuestImplEntry, Trap> {
+    pub fn resolve_offer(&self, handle: i32) -> Result<&OfferEntry, Trap> {
         // The slot's own type_id feeds the canonical resolve (§3c mask + generation + type run
         // through the one hinge, never re-implemented); the binding-kind match below is the check
         // that the id actually names a wired offer.
         let expect = self.table[(handle as u32 as usize) & (CAP - 1)].type_id;
         match self.resolve(handle, expect)? {
-            Binding::GuestImpl(idx) => self.guest_impls.get(idx as usize).ok_or(Trap::CapFault),
+            Binding::Offer(idx) => self.offers.get(idx as usize).ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
         }
     }
@@ -14830,7 +14826,7 @@ impl Host {
         declared: &FuncType,
         rebindable: bool,
     ) -> Option<BoundImport> {
-        let entry = self.resolve_guest_impl(handle).ok()?;
+        let entry = self.resolve_offer(handle).ok()?;
         let sig = entry.sigs.get(op as usize)?;
         if sig != declared {
             return None;
@@ -15489,7 +15485,7 @@ impl Host {
         self.resolve_pipe_end(handle).is_some()
             || self.resolve_live_impl(handle).is_some()
             || self.resolve_region(handle).is_ok()
-            || self.resolve_guest_impl(handle).is_ok()
+            || self.resolve_offer(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
     }
 
@@ -15528,9 +15524,9 @@ impl Host {
         // table + op list) is adopted into the child's own table under the child's interned id,
         // one domain boundary deeper (§3.1 provenance: the impl terminates in an ancestor, and
         // the depth records how far up).
-        if let Ok(entry) = self.resolve_guest_impl(handle) {
+        if let Ok(entry) = self.resolve_offer(handle) {
             let entry = entry.clone();
-            return Some(child.adopt_guest_impl(entry));
+            return Some(child.adopt_offer(entry));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
@@ -15812,7 +15808,7 @@ impl Host {
                 let cover = if exact {
                     Some((0..req_sigs.len() as u32).collect::<Arc<[u32]>>())
                 } else {
-                    self.resolve_guest_impl(new_handle).ok().and_then(|e| {
+                    self.resolve_offer(new_handle).ok().and_then(|e| {
                         let (en, es) = (Arc::clone(&e.names), Arc::clone(&e.sigs));
                         coverage_remap(req_names, req_sigs, &en, &es)
                     })
@@ -15937,12 +15933,8 @@ impl Host {
             // backends on one implementation. Exporter-domain state (the stateful "parent `Fs`
             // backed by its own window") is the designed follow-up; fuel is a fixed deterministic
             // budget until caller-fuel threading lands with it.
-            Binding::GuestImpl(idx) => {
-                let entry = self
-                    .guest_impls
-                    .get(idx as usize)
-                    .ok_or(Trap::CapFault)?
-                    .clone();
+            Binding::Offer(idx) => {
+                let entry = self.offers.get(idx as usize).ok_or(Trap::CapFault)?.clone();
                 let f = *entry.ops.get(op as usize).ok_or(Trap::CapFault)?;
                 let sig = entry.sigs.get(op as usize).ok_or(Trap::CapFault)?;
                 if args.len() != sig.params.len() {
@@ -15955,20 +15947,28 @@ impl Host {
                 // caller's call traps, fail-closed, identically on every backend.
                 match &entry.state {
                     // §3.2 v2 **instanced** offer: run over the provider's persistent window +
-                    // powerbox (exporter-domain state). The blocking lock is deadlock-free by
-                    // construction — providers never hold offers (`grant_impl_cap` refuses
-                    // them), so provider chains are acyclic and the lock order is always
-                    // domain-host → provider; cross-domain contention on a shared provider
-                    // serializes here, bounded by the impl fuel budget.
+                    // powerbox (exporter-domain state). CALLS.md increment 2: admission is
+                    // **try-enter** — a busy provider answers a probeable `-EAGAIN` (the caller
+                    // retries), never a blocking wait. This makes deadlock impossible
+                    // *structurally* (a cyclic or re-entrant call finds the instance busy and
+                    // errnos), so the old acyclicity rule — "providers never hold offers" — is
+                    // lifted: a provider may consume offers, and a cycle is a probeable refusal,
+                    // not a hang. The queue-on-contention upgrade is CALLS.md increment 3+.
                     //
                     // §5.3 **provider pays**: each call is funded from the provider's drainable
-                    // reserve (capped per-call by GUEST_IMPL_FUEL); a dry reserve is an inert
+                    // reserve (capped per-call by OFFER_FUEL); a dry reserve is an inert
                     // CapFault the caller can probe and the wirer can meter
                     // ([`Host::impl_fuel_remaining`]) — its code, its choice to offer, its
-                    // budget. A provider worried about a hammering caller rate-limits or kills
-                    // that caller itself.
+                    // budget. (Caller-pays unification is deferred to the JIT-arm increment:
+                    // fuel is observable, so it must switch on every backend at once.)
                     Some(state) => {
-                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut st = match state.try_lock() {
+                            Ok(g) => g,
+                            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                            Err(std::sync::TryLockError::WouldBlock) => {
+                                return Ok(vec![EAGAIN]);
+                            }
+                        };
                         let st = &mut *st;
                         if st.fuel == 0 {
                             return Err(Trap::CapFault);
@@ -15981,7 +15981,7 @@ impl Host {
                             .zip(&arg_slots)
                             .map(|(ty, &s)| slot_to_val(*ty, s))
                             .collect();
-                        let budget = st.fuel.min(GUEST_IMPL_FUEL);
+                        let budget = st.fuel.min(OFFER_FUEL);
                         let mut impl_fuel = budget;
                         let (res, _, _) = drive_arc(
                             entry.funcs.clone(),
@@ -16012,7 +16012,7 @@ impl Host {
                             .zip(&arg_slots)
                             .map(|(ty, &s)| slot_to_val(*ty, s))
                             .collect();
-                        let mut impl_fuel = GUEST_IMPL_FUEL;
+                        let mut impl_fuel = OFFER_FUEL;
                         let (res, _, _) = drive_arc(
                             entry.funcs.clone(),
                             f,

@@ -3706,7 +3706,7 @@ impl HostCap {
     /// fail-closed signature check against the import's declaration
     /// ([`instantiate_with_imports`] refuses a mismatch).
     ///
-    /// v1 executes a wired op as a **pure dispatch** (see `svm_interp::Binding::GuestImpl`):
+    /// v1 executes a wired op as a **pure dispatch** (see `svm_interp::Binding::Offer`):
     /// the impl computes over its arguments alone — no window, no capabilities.
     ///
     /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.

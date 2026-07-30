@@ -2,7 +2,7 @@
 //!
 //! * `intern_interface` — the per-`Host` structural interface intern (D59 applied to
 //!   capability interfaces): id-equality ≡ structural equality of the op-signature list;
-//! * `wire_offer_func` — the authority-moving act: mint a `Binding::GuestImpl` entry whose op
+//! * `wire_offer_func` — the authority-moving act: mint a `Binding::Offer` entry whose op
 //!   signatures are *derived* from the offered functions' declared types, fail-closed;
 //! * `bound_import_for_impl` — the wiring-time structural signature check that binds an
 //!   import slot to one op of a wired offer;
@@ -155,7 +155,7 @@ fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
     let handle = h
         .wire_offer_func(&funcs, &[1, 0])
         .expect("well-formed offer");
-    let entry = h.resolve_guest_impl(handle).expect("handle resolves");
+    let entry = h.resolve_offer(handle).expect("handle resolves");
     // Op order is the offer's, and each op's signature IS the named function's declared type.
     assert_eq!(&*entry.ops, &[1, 0]);
     assert_eq!(
@@ -171,9 +171,9 @@ fn wire_impl_derives_sigs_and_mints_a_resolvable_handle() {
     // shape gets a fresh one.
     let same = h.wire_offer_func(&funcs, &[1, 0]).expect("second offer");
     let other = h.wire_offer_func(&funcs, &[2]).expect("distinct offer");
-    let tid = h.resolve_guest_impl(handle).unwrap().type_id;
-    assert_eq!(h.resolve_guest_impl(same).unwrap().type_id, tid);
-    assert_ne!(h.resolve_guest_impl(other).unwrap().type_id, tid);
+    let tid = h.resolve_offer(handle).unwrap().type_id;
+    assert_eq!(h.resolve_offer(same).unwrap().type_id, tid);
+    assert_ne!(h.resolve_offer(other).unwrap().type_id, tid);
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn wire_impl_fails_closed() {
     // Nothing was minted by the refusals: a fresh wire still works and a forged handle
     // still resolves nowhere.
     assert!(h.wire_offer_func(&funcs, &[0]).is_some());
-    assert!(matches!(h.resolve_guest_impl(0x7f), Err(Trap::CapFault)));
+    assert!(matches!(h.resolve_offer(0x7f), Err(Trap::CapFault)));
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn bound_import_for_impl_checks_the_slot_signature_structurally() {
     assert_eq!(b.op, 1);
     assert_eq!(b.handle, handle);
     assert!(b.bound && !b.rebindable);
-    assert_eq!(b.type_id, h.resolve_guest_impl(handle).unwrap().type_id);
+    assert_eq!(b.type_id, h.resolve_offer(handle).unwrap().type_id);
 
     let r = h
         .bound_import_for_impl(
@@ -233,7 +233,7 @@ fn a_wired_op_executes_through_the_generic_dispatch() {
     let mut h = Host::new();
     let funcs = offer_funcs();
     let handle = h.wire_offer_func(&funcs, &[1, 0]).expect("offer");
-    let tid = h.resolve_guest_impl(handle).unwrap().type_id;
+    let tid = h.resolve_offer(handle).unwrap().type_id;
     // op 0 = add(a, b).
     assert_eq!(
         h.cap_dispatch_slots(tid, 0, handle, &[40, 2], None),
@@ -264,7 +264,7 @@ fn a_wired_impl_is_windowless_and_powerboxless() {
     h.grant_clock(); // live caps in the wiring domain, unreachable from the impl
     let funcs = offer_funcs();
     let handle = h.wire_offer_func(&funcs, &[3]).expect("offer");
-    let tid = h.resolve_guest_impl(handle).unwrap().type_id;
+    let tid = h.resolve_offer(handle).unwrap().type_id;
     assert!(
         h.cap_dispatch_slots(tid, 0, handle, &[0], None).is_err(),
         "a load inside a windowless impl must trap"
@@ -331,7 +331,7 @@ fn an_offer_regrants_into_a_child_one_hop_deeper() {
         .spawn_named_child(&[("adder".into(), handle)], 1 << 16)
         .expect("offer handles are re-grantable");
     let ch = child.resolve_cap_name("adder").expect("named in the child");
-    let entry = child.resolve_guest_impl(ch).expect("adopted entry");
+    let entry = child.resolve_offer(ch).expect("adopted entry");
     assert_eq!(entry.depth, 2, "one re-grant hop past the wiring domain");
     let tid = entry.type_id;
     assert_eq!(
@@ -474,7 +474,7 @@ fn an_instanced_offer_keeps_exporter_domain_state_across_calls() {
     svm_verify::verify_module(&provider).expect("provider verifies");
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
     // The counter lives in the provider's window, not the caller's — successive calls see it.
     for want in 1..=3i64 {
         assert_eq!(
@@ -493,7 +493,7 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
     svm_verify::verify_module(&provider).expect("verifies");
     let mut parent = Host::new();
     let offer = parent.wire_offer_proc(&provider, &[0]).expect("offer");
-    let ptid = parent.resolve_guest_impl(offer).unwrap().type_id;
+    let ptid = parent.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
         parent.cap_dispatch_slots(ptid, 0, offer, &[], None),
         Ok(vec![1])
@@ -503,7 +503,7 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
         .spawn_named_child(&[("counter".into(), offer)], 1 << 16)
         .expect("spawn");
     let ch = child.resolve_cap_name("counter").expect("named");
-    let ctid = child.resolve_guest_impl(ch).unwrap().type_id;
+    let ctid = child.resolve_offer(ch).unwrap().type_id;
     assert_eq!(
         child.cap_dispatch_slots(ctid, 0, ch, &[], None),
         Ok(vec![2]),
@@ -544,7 +544,7 @@ fn a_cap_argument_is_translated_across_the_offer_boundary() {
     svm_verify::verify_module(&provider).expect("provider verifies");
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
     let clock = h.grant_clock();
     // The provider reads *its* Clock (a fresh, independent instance in the provider's table,
     // deterministic from 0), proving it resolved the translated cap and called through it.
@@ -568,7 +568,7 @@ fn a_forged_cap_argument_fails_closed() {
     svm_verify::verify_module(&provider).expect("verifies");
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
         h.cap_dispatch_slots(tid, 0, offer, &[0xDEAD_BEEFu32 as i32 as i64], None),
         Err(Trap::CapFault),
@@ -593,7 +593,7 @@ fn a_cap_result_is_translated_back_to_the_caller() {
     svm_verify::verify_module(&provider).expect("verifies");
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
     let clock = h.grant_clock();
     let out = h
         .cap_dispatch_slots(tid, 0, offer, &[clock as i64], None)
@@ -640,7 +640,7 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
     let out = h.grant_stream(svm_interp::StreamRole::Out);
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
     h.grant_impl_cap(offer, out, "out").expect("grantable");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
     assert_eq!(
         h.cap_dispatch_slots(tid, 0, offer, &[], None),
         Ok(vec![2]),
@@ -659,7 +659,7 @@ fn provider_pays_from_a_drainable_reserve() {
     let provider = counter_provider();
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
-    let tid = h.resolve_guest_impl(offer).unwrap().type_id;
+    let tid = h.resolve_offer(offer).unwrap().type_id;
 
     let full = h
         .impl_fuel_remaining(offer)
@@ -683,17 +683,18 @@ fn provider_pays_from_a_drainable_reserve() {
 }
 
 #[test]
-fn grant_impl_cap_refuses_offers_and_pure_offers() {
-    // Acyclicity: a provider can never hold an offer (the deadlock-freedom invariant), and a
-    // v1 pure offer has no provider to grant into.
+fn grant_impl_cap_accepts_offers_and_refuses_pure_targets() {
+    // CALLS.md increment 2: with try-enter admission, deadlock is impossible structurally, so
+    // the old acyclicity refusal ("providers never hold offers") is lifted — a provider may
+    // consume offers. A v1 pure offer still has no provider instance to grant into.
     let provider = counter_provider();
     let mut h = Host::new();
     let instanced = h.wire_offer_proc(&provider, &[0]).expect("instanced");
     let pure = h.wire_offer_func(&offer_funcs(), &[0]).expect("pure");
     let clock = h.grant_clock();
     assert!(
-        h.grant_impl_cap(instanced, pure, "svc").is_none(),
-        "offers never nest in providers"
+        h.grant_impl_cap(instanced, pure, "svc").is_some(),
+        "an offer now nests in a provider (cycles are a probeable -EAGAIN, not a deadlock)"
     );
     assert!(
         h.grant_impl_cap(pure, clock, "clk").is_none(),
@@ -706,6 +707,40 @@ fn grant_impl_cap_refuses_offers_and_pure_offers() {
 }
 
 #[test]
+fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
+    // The structural deadlock-freedom the try-enter admission buys (CALLS.md increment 2),
+    // pinned end to end: a provider granted ITS OWN offer calls it from inside its handler.
+    // The nested dispatch finds the instance busy (the outer call holds it) and answers a
+    // probeable `-EAGAIN` — under the old blocking lock this exact shape was the deadlock the
+    // acyclicity rule existed to forbid. The handler returns the errno; the caller observes it.
+    let provider = svm_text::parse_module(
+        "memory 16\n\
+         data 0 \"me\"\n\
+         func () -> (i64) {\n\
+         block 0 () {\n\
+           vp = i64.const 0\n\
+           vn = i64.const 2\n\
+           vh = cap.self.resolve vp vn\n\
+           vr = cap.call 268435456 0 () -> (i64) vh ()\n\
+           return vr\n\
+           }\n\
+         }\n",
+    )
+    .expect("self-calling provider parses");
+    svm_verify::verify_module(&provider).expect("verifies");
+    let mut h = Host::new();
+    let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
+    h.grant_impl_cap(offer, offer, "me")
+        .expect("the offer re-grants into its own provider");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[], None),
+        Ok(vec![-11]),
+        "the re-entrant inner call answers -EAGAIN (busy instance), threaded back — no hang"
+    );
+}
+
+#[test]
 fn a_wired_offer_is_non_durable_and_drains_cleanly() {
     let mut h = Host::new();
     let funcs = offer_funcs();
@@ -713,13 +748,13 @@ fn a_wired_offer_is_non_durable_and_drains_cleanly() {
 
     // Freeze refuses while the offer is live (all-or-nothing), naming the kind.
     let refusal = h.capture_durable_handles().expect_err("non-durable");
-    assert_eq!(refusal.kind, NonDurableKind::GuestImpl);
+    assert_eq!(refusal.kind, NonDurableKind::Offer);
 
     // Draining closes the slot; the guest-held handle value is then inert (D37: the
     // generation is retained, never recycled into a false positive).
     let drained = h.drain_non_durable();
-    assert!(drained.iter().any(|d| d.kind == NonDurableKind::GuestImpl));
-    assert!(matches!(h.resolve_guest_impl(handle), Err(Trap::CapFault)));
+    assert!(drained.iter().any(|d| d.kind == NonDurableKind::Offer));
+    assert!(matches!(h.resolve_offer(handle), Err(Trap::CapFault)));
     h.capture_durable_handles()
         .expect("table is snapshottable once drained");
 }

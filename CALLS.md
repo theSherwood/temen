@@ -141,21 +141,33 @@ plumbing that lands in increments (§8).
 
 ## 8. Increment plan (same discipline as FORK.md: smallest verifiable step first)
 
-1. **Rename-only PR** — the §6 table, no behavior change (mechanical, reviewable as a pure diff).
-2. **Library-provider admission** — serve-queue admission into a domain with no running main;
-   retire the instanced path onto it (delete `ProviderState`, the two-lock sub-run, acyclicity).
-   Eval-loop first; the instanced offer's tests convert into the new path's tests.
+1. **Rename. DONE (2026-07-30).** The §6 table: `offer_func`/`offer_proc`/`host_proc` across
+   svm-run constructors, `Host` methods, and the `host_proc` family; interp-internal
+   `GuestImpl`→`Offer` (`Binding::Offer`, `OfferEntry`, `resolve_offer`, `OFFER_FUEL`).
+   Mechanical, no behavior change.
+2. **De-fang the instanced path. DONE (2026-07-30).** Re-sequenced from the original "retire onto
+   library admission" once the build surfaced that `offer_proc` is covered by tests **on all three
+   backends** (`imports_impl`), so retiring it onto an eval-loop-only mechanism would *regress*
+   the very parity this design exists to close. Instead, the instanced path keeps its all-backend
+   generic-dispatch home but loses its teeth: admission is **try-enter** — a busy instance answers
+   a probeable `-EAGAIN`, never a blocking wait — so deadlock is impossible *structurally*, and
+   the acyclicity rule ("providers never hold offers") is **lifted**: `grant_impl_cap` now accepts
+   offers, and a cyclic/re-entrant call is a refusal, not a hang (pinned by test: a provider
+   granted its own offer calls it; the caller observes `-EAGAIN`). The blocking-lock deadlock
+   argument leaves the TCB. Deferred with it: caller-pays **fuel** — fuel exhaustion is
+   observable, so it must switch on every backend at once (increment 5, with the JIT arm).
 3. **Inline fast path (interp)** — uncontended `single`-provider calls animate the handler on the
-   caller's thread (coroutine-drive shape); contended calls take the queue. Differential-tested
-   against increment 2's queue-only behavior (results must be identical).
+   caller's thread (coroutine-drive shape) *outside* the caller's powerbox lock (the lock narrows
+   to the two `cap`-slot translation edges); contended calls take the queue instead of `-EAGAIN`.
+   Differential-tested against increment 2's behavior (results must be identical).
 4. **Promotion (interp)** — a handler that parks mid-inline-animation files its reified fiber +
    waiter; caller parks on the reply. (Mostly `handler_parks` re-plumbed.)
-5. **JIT arm** — the thunk fast path; park = thread-block on the reply. Closes the parity gap.
-6. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
-
-Open question to settle during increment 2: **fuel.** Inline animation naturally burns *caller*
-fuel (it is the caller's thread); a process provider's own execution burns its own. Simpler than
-provider-reserve, but a behavior change from the instanced path — pin it in the docs when it lands.
+5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
+   here**, uniformly on all backends. Closes the `live_impl` parity gap.
+6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
+   executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
+   goal, now reachable without a parity regression).
+7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 ## 9. Invariants this must not break
 
