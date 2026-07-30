@@ -124,6 +124,61 @@ block 3 (vi2: i64, vacc2: i64) {
   }
 }";
 
+/// A **threaded** guest whose workers drive §12 fibers: the root spawns two workers, each of which
+/// creates a fiber that loops `n` times incrementing the shared counter at address 0, then suspends and
+/// returns. Because the increment loop runs *inside* the fiber, most turns execute with a fiber as the
+/// worker's active continuation (worker parked on the resume chain) — so the scheduled checkpoints
+/// capture live per-task fibers plus the run-shared fiber registry, interleaved across the two vCPUs.
+const THREADS_WITH_FIBERS: &str = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vsp = i64.const 0
+  vh0 = thread.spawn 1 vsp vn
+  vh1 = thread.spawn 1 vsp vn
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 0
+  vr = i64.load vaddr
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vn: i64) {
+  vf = ref.func 2
+  vz = i64.const 0
+  vc = cont.new vf vz
+  vst, vy = cont.resume vc vn
+  vst2, vr = cont.resume vc vz
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1(varg)
+}
+block 1 (vi: i64) {
+  vz = i64.eqz vi
+  br_if vz 2() 3(vi)
+}
+block 2 () {
+  vzero = i64.const 0
+  vres = suspend vzero
+  vr = i64.const 0
+  return vr
+}
+block 3 (vi2: i64) {
+  vaddr = i64.const 0
+  vc = i64.load vaddr
+  v1 = i64.const 1
+  vsum = i64.add vc v1
+  i64.store vaddr vsum
+  vm1 = i64.const -1
+  vnext = i64.add vi2 vm1
+  br 1(vnext)
+  }
+}";
+
 /// A stable per-`seek` observation: the logical clock, the call stack (each frame's IR pc), and the
 /// running-sum window bytes. Identical between a from-0 replay and a checkpoint-restored replay iff
 /// restore is faithful.
@@ -309,6 +364,58 @@ fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
     assert!(
         warm.checkpoint_count() > 0,
         "checkpointing stays on for a pure thread.spawn/join loop (no fibers/coroutines/§14 children)",
+    );
+}
+
+#[test]
+fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
+    // Two worker vCPUs each drive a fiber (the increment loop runs inside the fiber), so nearly every
+    // scheduled checkpoint captures live per-task fibers + the run-shared registry, interleaved. A
+    // checkpoint-restored `seek` must reproduce the whole cross-thread state exactly as a from-turn-0
+    // replay — proving the scheduled fiber snapshot/restore is faithful.
+    let m = parse_module(THREADS_WITH_FIBERS).expect("parses");
+    let args = [Value::I64(400)]; // two fibers × 400 iters ⇒ several thousand turns, many strides
+    let mk = || {
+        BytecodeBackend::new(m.clone(), 0, &args, u64::MAX, false, Vec::new())
+            .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
+    };
+
+    let probes: Vec<u64> = (0..=6000).step_by(149).collect();
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs_sched(&mut b, t)
+        })
+        .collect();
+    // Sanity: the run genuinely executes inside a fiber body (func 2) on a worker, so the checkpoints
+    // below capture live fibers, not just the root/worker frames.
+    assert!(
+        cold.iter()
+            .any(|(_, _, _, _, stacks)| stacks.contains(":2:")),
+        "the run spends turns inside a fiber body (func 2)",
+    );
+
+    let mut warm = mk();
+    warm.seek(6000);
+    assert!(
+        warm.checkpoint_count() > 0,
+        "a deep scheduled seek through the fiber bodies lays down checkpoints with live fibers",
+    );
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_sched(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm scheduled seek ≡ cold at every forward probe with live per-task fibers",
+    );
+    let warm_back: Vec<_> = probes
+        .iter()
+        .rev()
+        .map(|&t| obs_sched(&mut warm, t))
+        .collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(
+        warm_back, cold_back,
+        "warm scheduled backward sweep ≡ cold (per-task chains + run-shared registry restore faithfully)",
     );
 }
 
