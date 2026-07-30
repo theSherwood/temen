@@ -2554,10 +2554,16 @@ fn sym_def(node: &Node) -> Result<String, LengError> {
 
 /// Parse a Leng integer literal (decimal, optional sign).
 fn parse_int(s: &str) -> Result<i64, ()> {
-    s.parse::<i64>().map_err(|_| ())
+    // A trailing `u` marks an unsigned literal (nimony emits e.g. an SSO string's packed bytes as
+    // `122511465736197u`); keep the bit pattern, and allow values above i64::MAX via u64.
+    let t = s.strip_suffix('u').unwrap_or(s);
+    if let Ok(n) = t.parse::<i64>() {
+        return Ok(n);
+    }
+    t.parse::<u64>().map(|n| n as i64).map_err(|_| ())
 }
 
 /// The integer value of an atom literal node, if it is one.
 fn int_literal(node: &Node) -> Option<i64> {
-    node.as_atom().and_then(|s| s.parse::<i64>().ok())
+    node.as_atom().and_then(|s| parse_int(s).ok())
 }

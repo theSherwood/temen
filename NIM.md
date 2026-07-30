@@ -479,9 +479,23 @@ plumbing. Five workstreams, roughly independent:
     writer/reader pair sharing a global defined in a third data-only unit, real nimony
     `bump`/`store` (`bump()` increments `store.counter` across the boundary → 1), and two
     fail-closed cases (`tests/link.rs`).
-  - **Remaining for full W2:** string-literal data (`LongString` payloads) and translating the
-    `ini`/`main`/`gvar` scaffolding whole-module, so the *entire* `system` module links (Path A),
-    not hand-picked procs.
+  - **✅ Short string literals (SSO) — DONE 2026-07-30.** nimony's `string` is a small-string
+    object `{bytes: u64@0, more: ptr@8}` (confirmed from the system module's `basic_types.nim`): a
+    *short* literal packs its chars into the inline `bytes` word with a nil `more`, so it's an
+    ordinary `(oconstr string (kv bytes.0 <packed-u64>) (kv more.0 (nil)))` — no data segment.
+    Lowering it took two things: unsigned literals (`122511465736197u`) now parse (bit-pattern
+    preserved, `u64`-wide), and the external `string` type's layout must be available. That layout
+    normally comes from the `system` module across the link (cross-module *type* resolution — the
+    third symbol kind after funcs and data; Path A); until that's automatic, `translate_proc_with_types`
+    supplies it as a type prelude. Tested: a hand-written SSO construct-and-read (*runs*), an
+    over-`i64::MAX` unsigned literal, and **real nimony `greet(): string = "hello"`** (genuine SSO
+    `oconstr` by sret — translates + verifies given the real `string` def; running needs the ARC
+    `=wasMoved`/`=destroy` imports, W3).
+  - **Remaining for full W2:** automatic cross-module **type** resolution (pool the linked units'
+    type defs so `string.0.<stem>` resolves without a hand-supplied prelude — the architectural
+    knot is that `svm-leng` computes aggregate layouts at *translate* time, so the defining unit's
+    types must be present then), long-string (`LongString`) data, and whole-module scaffolding
+    translation so the *entire* `system` module links (Path A), not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

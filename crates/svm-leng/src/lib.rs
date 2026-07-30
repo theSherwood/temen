@@ -96,6 +96,37 @@ pub fn translate_proc_to_text(src: &str, name: &str) -> Result<String, LengError
     translate::Translator::new().one_proc(&root, name)
 }
 
+/// Merge a fragment of external **type declarations** into a module before translation. `types` is
+/// a `(stmts (type …)*)` fragment (e.g. the `string`/`LongString` defs from the compiled `system`
+/// module, named with the global names the module references, like `string.0.sysvq0asl`); its type
+/// defs are prepended so `collect_types` registers their layouts. This is the manual precursor to
+/// automatic cross-module type resolution (NIM.md W2, Path A) — a module can't lower a value of an
+/// external aggregate type (a string literal's `string`) without that type's layout.
+fn merge_type_prelude(types: &str, src: &str) -> Result<Node, LengError> {
+    let pre = nif::parse(types).map_err(LengError::Parse)?;
+    let root = nif::parse(src).map_err(LengError::Parse)?;
+    let mut merged = vec![Node::Atom("stmts".into())];
+    for r in [pre, root] {
+        if let Node::List(items) = r {
+            merged.extend(items.into_iter().skip(1)); // drop the leading `stmts` atom
+        }
+    }
+    Ok(Node::List(merged))
+}
+
+/// As [`translate_proc`], but with a fragment of external **type declarations** ([`merge_type_prelude`])
+/// available — so a proc that constructs/returns a value of a type another module defines (a `string`
+/// literal) can lower it. Returns the parsed (unverified) [`Module`].
+pub fn translate_proc_with_types(src: &str, name: &str, types: &str) -> Result<Module, LengError> {
+    let root = merge_type_prelude(types, src)?;
+    let text = translate::Translator::new().one_proc(&root, name)?;
+    svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })
+}
+
 /// As [`translate_proc_to_text`], returning the parsed (unverified) [`Module`].
 pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
     let text = translate_proc_to_text(src, name)?;
