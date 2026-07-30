@@ -13017,6 +13017,85 @@ impl Host {
         }
     }
 
+    /// FORK.md PR 1 increment 3 — duplicate this domain's powerbox for a live `fork()` **twin**: a
+    /// fresh `Host` with its **own handle namespace** (the `table` is copied, so the twin holds
+    /// equivalent handles at the same values) over the **same shared backings** POSIX `fork` shares —
+    /// the `Arc`-backed pipes / regions / module grants, and the stdout/stderr sinks — stamped with a
+    /// **new `domain_id`**. The twin's serve state, JIT context, and local stdout/stderr buffers start
+    /// fresh (its own).
+    ///
+    /// **Fails closed** (returns `None`) for any domain carrying capability state the core cannot yet
+    /// duplicate on its own: closure-based host caps (`host_fns` / `host_fns_region` / `guest_impls`,
+    /// not `Clone`), live-callee offers, JIT / ring / async / offload / serve state, or in-flight
+    /// freeze residue. Those a real `fork` (of a personality-wired domain such as bash) requires are
+    /// **re-wired into the twin by the personality layer** (PR 3), not cloned here. So this only ever
+    /// forks a *provably-simple* domain: a handle table over `Copy` bindings (Instantiator /
+    /// AddressSpace / Stream / Exit / Clock / Memory / SharedRegion / Module / Budget), a self-module,
+    /// an attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding
+    /// a `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
+    // Wired into `clone_caller`'s twin construction in the next slice (increment 3b); landed first as a
+    // fails-closed, unit-tested primitive (the S13 CoW-clone crux) per FORK.md's TDD-first plan.
+    #[allow(dead_code)]
+    fn fork_powerbox(&self) -> Option<Host> {
+        // The core can duplicate only a simple domain; anything else the personality must re-wire.
+        let simple = self.host_fns.is_empty()
+            && self.host_fns_region.is_empty()
+            && self.guest_impls.is_empty()
+            && self.live_impls.is_empty()
+            && self.pending_live_impls.is_empty()
+            && self.rings.is_empty()
+            && self.jit_domains.is_empty()
+            && self.blockings.is_empty()
+            && self.window_minters.is_empty()
+            && self.svc_queue.is_empty()
+            && self.svc_results.is_empty()
+            && self.modules.is_empty()
+            && self.self_instance.is_none()
+            && self.pool.is_none()
+            && self.async_notify.is_none()
+            && self.cap_record.is_none()
+            && self.cap_replay.is_none()
+            && self.cap_pages.is_none()
+            && self.frozen_fibers.is_empty()
+            && self.frozen_vcpus.is_empty()
+            && self.frozen_nested.is_empty()
+            && self.frozen_child_state.is_empty();
+        if !simple {
+            return None;
+        }
+        let mut twin = Host::new(); // fresh `domain_id`
+                                    // Own handle namespace, same bindings (indices into the shared backings below).
+        twin.table = self.table.clone();
+        // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
+        twin.regions = self.regions.clone();
+        twin.pipes = self.pipes.clone();
+        twin.region_hook = self.region_hook.clone();
+        twin.region_factory = self.region_factory;
+        // Shared stdout/stderr sinks — fork shares stdout/stderr.
+        twin.out_sink = self.out_sink.clone();
+        twin.err_sink = self.err_sink.clone();
+        // The twin gets its own copy of the value-typed quota vectors.
+        twin.budgets = self.budgets.clone();
+        twin.quota = self.quota;
+        // Structural intern / import binding tables ride along (same program surface).
+        twin.iface_intern = self.iface_intern.clone();
+        twin.import_remaps = self.import_remaps.clone();
+        twin.import_reqs = self.import_reqs.clone();
+        twin.import_bindings = self.import_bindings.clone();
+        twin.cap_names = self.cap_names.clone();
+        twin.self_module = self.self_module.clone();
+        twin.self_reified = self.self_reified.clone(); // empty (self_instance is None)
+        twin.attestation = self.attestation;
+        twin.durable = self.durable;
+        // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
+        twin.stdin = self.stdin.clone();
+        twin.stdin_pos = self.stdin_pos;
+        twin.stdin_block = self.stdin_block;
+        twin.clock_ns = self.clock_ns;
+        twin.jit_table_log2 = self.jit_table_log2;
+        Some(twin)
+    }
+
     /// Install this domain's **import-binding table** (§7 / IMPORTS.md phase 1): entry `i` is the
     /// instantiation-time resolution of the module's import `i` — the bound `(type_id, op)` plus the
     /// granted handle. An executable [`svm_ir::CAP_IMPORT_TYPE_ID`] dispatch translates through it,
@@ -16760,6 +16839,34 @@ impl Mem {
         }
     }
 
+    /// FORK.md PR 1 increment 3b — a **private** window copy for a live `fork()` twin: a fresh `Mem`
+    /// with its **own** backing (a new `Region`) holding a byte-for-byte copy of this window's mapped
+    /// prefix, and its own empty address space. Unlike [`fork_for_thread`](Mem::fork_for_thread) (shares
+    /// the `Arc<Region>` bytes) and [`nested_view`](Mem::nested_view) (shares bytes, confines), the twin
+    /// does **not** alias the parent's memory — a write by either copy after the fork is invisible to
+    /// the other (POSIX-fork semantics). Requires a [`snapshot_safe`](Mem::snapshot_safe) window (no §13
+    /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
+    /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
+    // Wired into `clone_caller`'s twin construction alongside `Host::fork_powerbox` (increment 3b);
+    // landed first as a fails-closed, unit-tested primitive.
+    #[allow(dead_code)]
+    fn fork_private(&self) -> Option<Mem> {
+        if !self.snapshot_safe() {
+            return None;
+        }
+        let reserved = self.window.reserved();
+        let mapped = self.window.mapped();
+        if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
+            return None;
+        }
+        let mut twin = Mem::with_reservation(
+            reserved.trailing_zeros() as u8,
+            mapped.trailing_zeros() as u8,
+        );
+        twin.seed(&self.window_snapshot());
+        Some(twin)
+    }
+
     /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
     /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
     /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
@@ -18403,6 +18510,118 @@ mod region_minter_tests {
         let plain = host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
         let region = host.grant_host_fn_region(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(plain >= 0 && region >= 0 && plain != region);
+    }
+}
+
+#[cfg(test)]
+mod fork_powerbox_tests {
+    //! FORK.md PR 1 increment 3 — `Host::fork_powerbox`, the twin's powerbox. It copies the domain's
+    //! **handle namespace** (so the twin holds equivalent handles at the same values) over the **same
+    //! shared `Arc` backings** POSIX `fork` shares, with a **new `domain_id`** — and **fails closed**
+    //! for any domain carrying capability state the core can't yet duplicate on its own.
+    use super::*;
+
+    #[test]
+    fn fork_copies_the_handle_namespace_and_mints_a_new_domain() {
+        let mut host = Host::new();
+        let h_inst = host.grant_instantiator(0, 1u64 << 16);
+        let h_out = host.grant_stream(StreamRole::Out);
+        let twin = host.fork_powerbox().expect("a simple domain forks");
+        // A distinct domain identity — the twin is its own domain.
+        assert_ne!(
+            twin.domain_id(),
+            host.domain_id(),
+            "the twin is minted a fresh domain_id"
+        );
+        // The same handle values resolve to the same bindings in the twin (copied namespace).
+        assert!(
+            matches!(
+                twin.resolve(h_inst, cap_id::INSTANTIATOR),
+                Ok(Binding::Instantiator { .. })
+            ),
+            "the instantiator handle resolves in the twin"
+        );
+        assert!(
+            matches!(
+                twin.resolve(h_out, cap_id::STREAM),
+                Ok(Binding::Stream(StreamRole::Out))
+            ),
+            "the stdout stream handle resolves in the twin"
+        );
+    }
+
+    #[test]
+    fn fork_shares_arc_backings_but_gives_the_twin_its_own_table() {
+        let mut host = Host::new();
+        // A SharedRegion's backing is an `Arc` — fork shares it (shared memory survives the fork).
+        let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![9u8; 32])));
+        let hr = host
+            .try_grant_shared_region_backed(backing)
+            .expect("region grant");
+        let twin = host.fork_powerbox().expect("forks");
+        let (hid, tid) = match (
+            host.resolve(hr, cap_id::SHARED_REGION),
+            twin.resolve(hr, cap_id::SHARED_REGION),
+        ) {
+            (Ok(Binding::SharedRegion(a)), Ok(Binding::SharedRegion(b))) => {
+                (a as usize, b as usize)
+            }
+            other => panic!("region handle should resolve in both, got {other:?}"),
+        };
+        assert!(
+            Arc::ptr_eq(&host.regions[hid], &twin.regions[tid]),
+            "the twin shares the very same region backing (fork shares shared memory)"
+        );
+        // But the tables are independent objects: a later grant into the parent is not in the twin.
+        let h_new = host.grant_stream(StreamRole::In);
+        assert!(
+            twin.resolve(h_new, cap_id::STREAM).is_err(),
+            "a handle granted to the parent AFTER the fork is absent from the twin"
+        );
+    }
+
+    #[test]
+    fn fork_refuses_a_domain_with_closure_caps() {
+        let mut host = Host::new();
+        host.grant_host_fn(Box::new(|_, _, _| Ok(vec![0])));
+        assert!(
+            host.fork_powerbox().is_none(),
+            "a domain holding a closure-based host_fn fails closed — the personality re-wires it (PR 3)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mem_fork_tests {
+    //! FORK.md PR 1 increment 3b — `Mem::fork_private`, the twin's **private** window copy. It copies
+    //! the parent's mapped bytes into a fresh backing that does **not** alias the parent (POSIX-fork
+    //! memory semantics), distinct from `fork_for_thread`/`nested_view`, which share the backing bytes.
+    use super::*;
+
+    #[test]
+    fn fork_private_copies_bytes_but_does_not_alias() {
+        let m = Mem::with_reservation(16, 16); // a fully-mapped 64 KiB window
+        m.set_byte(0, 0xAB);
+        m.set_byte(100, 0x7F);
+        let twin = m.fork_private().expect("a simple window forks");
+        // The twin starts as a byte-for-byte copy of the parent.
+        assert_eq!(twin.byte(0), 0xAB);
+        assert_eq!(twin.byte(100), 0x7F);
+        // A write by the twin does not touch the parent — the copy is private, not shared.
+        twin.set_byte(0, 0x01);
+        assert_eq!(
+            m.byte(0),
+            0xAB,
+            "parent byte unchanged by a twin write (private copy, not aliased)"
+        );
+        assert_eq!(twin.byte(0), 0x01);
+        // And a parent write does not touch the twin.
+        m.set_byte(100, 0x02);
+        assert_eq!(
+            twin.byte(100),
+            0x7F,
+            "twin byte unchanged by a parent write"
+        );
     }
 }
 
