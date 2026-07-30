@@ -520,9 +520,19 @@ compiler bug is a clean error, never an escape.
    `emit_object_libc_float_runs_byte_exact_under_powerbox`, runs `demo_float.c`'s `%.17g`/`%g`/`%e`/`%f`
    battery through the real emit-object compile on interp==JIT, byte-for-byte against glibc's own output.
 
-   **Remaining for 2c.** The **bootstrap-fixpoint** differential (§5 E) — now unblocked on both edges:
-   the running compiler can read its own multi-file source from a seeded memfs *and* emit float constants
-   losslessly.
+   **→ Stage-2 conformance slice #1 DONE 2026-07-30 — the guest compiles chibicc's *own* source,
+   byte-matching native.** The linked whole cc1 compiles a real upstream chibicc TU (`hashmap.c`) —
+   pulling chibicc.h's **full system-header closure** (~95 files: `<stdio.h>`/`<stdlib.h>`/`<string.h>`/
+   … resolved through glibc's `bits/`, `sys/`, `asm/` trees, plus chibicc's bundled `include/`) from a
+   seeded memfs — and the emitted IR is **byte-identical to native `chibicc_ref`** on interp==JIT. The
+   hardest input on the path to the fixpoint: the SVM-executed compiler is faithful not just on crafted
+   programs but on the compiler's own code. Mechanics (`whole_cc1_compiles_its_own_tu_matching_native`):
+   the closure is discovered with `chibicc -M`, seeded at **repo-relative** keys (the fs cap refuses
+   absolute paths — `read_path`); the guest searches `frontend/chibicc/include` + `usr/include[...]` in
+   the memfs while native reads the real `/usr/include`, and only the TU's own `__FILE__` reaches the IR
+   (no header paths), so the two stay byte-comparable. `cc1_main.c` gained multi-`-I` support for the
+   multi-root search. **Remaining for the fixpoint:** widen to all nine TUs, then the true
+   instantiate-and-rerun `chibicc2 == chibicc3` (run a guest-compiled `chibicc2` to reproduce `chibicc3`).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

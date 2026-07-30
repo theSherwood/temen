@@ -1273,6 +1273,148 @@ fn native_cc1(extra_args: &[&str], stdin: &[u8]) -> Vec<u8> {
     out.stdout
 }
 
+/// The **transitive header/source closure** a chibicc TU pulls, computed by asking native chibicc for
+/// its own dependency list (`-M`). Returns `(files, dirs)` for seeding the guest memfs: `files` maps
+/// each closure member to its bytes at a **relative** key (the fs cap refuses absolute paths, §fs
+/// `read_path`), `dirs` names every ancestor directory. The TU itself is in the closure, so it seeds
+/// too. Native reads the identical files from the real tree; header paths never reach the emitted IR
+/// (only the TU's own `__FILE__`), so the two sides stay byte-comparable despite the `/usr` vs `usr`
+/// `-I` difference. Linux-only (real glibc header tree). Returns `None` if `chibicc -M` can't run.
+#[cfg(target_os = "linux")]
+fn chibicc_tu_closure(tu_rel: &str) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    let root = repo_root();
+    // Run `-M` on the **relative** TU path (cwd = repo root) so repo-local deps come back relative
+    // (`frontend/chibicc/hashmap.c`, `frontend/chibicc/chibicc.h`) — matching the guest's base_file and
+    // `-I` keys. An absolute input would emit absolute deps and the memfs keys wouldn't line up.
+    let out = Command::new(chibicc())
+        .args(["-M", "-c", tu_rel])
+        .current_dir(&root)
+        .output()
+        .expect("run chibicc -M");
+    assert!(
+        out.status.success(),
+        "chibicc -M failed on {tu_rel}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("-M output is UTF-8");
+    // `-M` prints `target.o: dep dep \<newline> dep ...`; everything after the first ':' is the deps.
+    let deps = text.split_once(':').map(|(_, d)| d).unwrap_or("");
+    let mut files = Vec::new();
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for tok in deps.split_whitespace() {
+        if tok == "\\" {
+            continue; // line-continuation marker
+        }
+        // Real host path: absolute (`/usr/...`, or `/<repo>/frontend/...` when chibicc is invoked by
+        // absolute argv0) or repo-relative (`./frontend/...`, `frontend/...`).
+        let real = if tok.starts_with('/') {
+            PathBuf::from(tok)
+        } else {
+            root.join(tok.trim_start_matches("./"))
+        };
+        // Memfs key: repo-relative for repo files (so it matches the guest's relative `-I` and
+        // base_file), else the system path with its leading '/' stripped (`/usr/... → usr/...`).
+        let rel = match real.strip_prefix(&root) {
+            Ok(r) => r.to_string_lossy().into_owned(),
+            Err(_) => real.to_string_lossy().trim_start_matches('/').to_string(),
+        };
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let rel = rel.as_str();
+        let bytes =
+            std::fs::read(&real).unwrap_or_else(|e| panic!("read closure file {real:?}: {e}"));
+        let mut anc = Path::new(rel).parent();
+        while let Some(d) = anc {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            dirs.insert(d.to_string_lossy().into_owned());
+            anc = d.parent();
+        }
+        files.push((rel.to_string(), bytes));
+    }
+    (files, dirs.into_iter().collect())
+}
+
+/// The native oracle for a **file** compile (vs [`native_cc1`]'s stdin form): run `chibicc_ref` with
+/// `args` from the repo root so repo-relative sources/`-I`s resolve against the real tree, returning
+/// the emitted IR. Used to diff the guest compiling a real chibicc TU against native.
+#[cfg(target_os = "linux")]
+fn native_cc1_file(args: &[&str]) -> Vec<u8> {
+    let out = Command::new(chibicc_ref())
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .expect("run chibicc_ref on a file");
+    assert!(
+        out.status.success(),
+        "native chibicc_ref (file) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// **Bootstrap-fixpoint slice #1 (SELFHOST_C.md §5 E, task #7): the guest compiles chibicc's *own*
+/// source.** The linked whole cc1 ([`link_whole_cc1`]) compiles a real upstream chibicc TU
+/// (`hashmap.c`) — pulling chibicc.h's full system-header closure (~95 files) from the seeded memfs —
+/// and the emitted IR must byte-match native `chibicc_ref` on the identical source. This is the
+/// stage-2 conformance check: the SVM-executed compiler is faithful to native not just on crafted
+/// programs but on the compiler's own code, the hardest input on the path to `chibicc2 == chibicc3`.
+///
+/// The header closure is discovered with `chibicc -M` and seeded at relative keys (the fs cap refuses
+/// absolute paths); the guest searches `usr/include[...]` in the memfs while native reads the real
+/// `/usr/include` — identical bytes, and only the TU's own `__FILE__` reaches the IR, so byte-exact.
+/// Heavy (`#[ignore]`d): builds/links the whole cc1, runs it on two engines over glibc-scale headers.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "heavy: the guest compiles a real chibicc TU (full glibc header closure) on two engines"]
+fn whole_cc1_compiles_its_own_tu_matching_native() {
+    let linked = link_whole_cc1();
+
+    let tu = "frontend/chibicc/hashmap.c";
+    let (files, dirs) = chibicc_tu_closure(tu);
+    assert!(
+        files.len() > 20,
+        "the closure should pull chibicc.h's system headers, got {} files",
+        files.len()
+    );
+
+    // Guest `-I`s are relative (memfs, no absolute paths), in native's default search order: chibicc's
+    // bundled `include/` first, then the system roots. The TU is a memfs file (not stdin) so its quoted
+    // `#include "chibicc.h"` resolves against its own dir.
+    let guest = cc1_compile(
+        &linked,
+        &[
+            b"chibicc",
+            b"--emit-object",
+            b"-Ifrontend/chibicc/include",
+            b"-Iusr/include/x86_64-linux-gnu",
+            b"-Iusr/include",
+            tu.as_bytes(),
+        ],
+        b"",
+        files,
+        dirs,
+    );
+
+    // Native reads the real header tree (absolute `-I`); header paths never reach the IR, so the only
+    // variables are the substrate (guest libc + SVM vs system libc + native CPU).
+    let native = native_cc1_file(&[
+        "--emit-object",
+        "-Ifrontend/chibicc/include",
+        "-I/usr/include/x86_64-linux-gnu",
+        "-I/usr/include",
+        tu,
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&guest),
+        String::from_utf8_lossy(&native),
+        "guest-compiled IR for {tu} is byte-identical to native chibicc_ref"
+    );
+}
+
 /// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The
 /// nine cc1 TUs + `emit_libc.c` link into one module ([`link_whole_cc1`]); here that module runs
 /// through `_start` under the powerbox and **compiles C to SVM IR inside the sandbox** — the self-host
