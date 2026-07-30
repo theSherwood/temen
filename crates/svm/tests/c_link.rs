@@ -1279,6 +1279,11 @@ fn native_cc1(extra_args: &[&str], stdin: &[u8]) -> Vec<u8> {
 /// through `os_emit.c`'s `__vm_fs` seam, while stdout/stdin stay on the `Stream` cap. The native side
 /// reads the identical header from a real `-I` directory; the emitted IR matches (headers aren't named
 /// in the output, `-g` off), so the guest fs path reproduces the native include exactly.
+/// (c) A **corpus** of feature-diverse standalone programs (SELFHOST_C.md §5 E, task #7) — widening the
+/// differential toward the bootstrap fixpoint by exercising a broad C surface (structs/arrays, enums +
+/// function pointers + switch, unions + bitfields, goto/ternary/comma, globals + static locals + string
+/// literals, `long long` + shifts + 2-D arrays, designated initializers + compound literals); each is
+/// byte-identical guest-vs-native, catching any construct where the SVM-executed compiler would diverge.
 ///
 /// Heavy (`make`s chibicc, compiles ten TUs `--emit-object`, links + verifies, runs on two engines, and
 /// clang-builds the reference), so `#[ignore]`d — run explicitly:
@@ -1337,4 +1342,64 @@ fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
         native_cc1(&[&iarg], src_inc),
         "#include: guest IR (header read from the in-sandbox memfs) == native (header from disk)"
     );
+
+    // (c) Corpus widening toward the bootstrap fixpoint (SELFHOST_C.md §5 E, task #7): feature-diverse
+    // standalone programs, each proving the guest-executed compiler emits byte-identical IR to native
+    // across a broad C surface — structs + arrays of structs, enums + function pointers + switch,
+    // unions + bitfields + casts, goto/ternary/comma + do-while, globals + static locals + string
+    // literals, `long long` + shifts + 2-D arrays, and designated initializers + compound literals.
+    // No `#include` (pure language surface ⇒ no header seeding); each result is `main`'s exit code, but
+    // it is the *emitted IR* that is diffed, so the diff exercises codegen breadth, not runtime.
+    let corpus: &[(&str, &[u8])] = &[
+        (
+            "structs+arrays",
+            br#"struct P { int x, y; };
+int dist2(struct P *a, struct P *b) { int dx = a->x - b->x, dy = a->y - b->y; return dx * dx + dy * dy; }
+int main(void) { struct P ps[3] = {{0, 0}, {3, 4}, {6, 8}}; int s = 0; for (int i = 0; i < 2; i++) s += dist2(&ps[i], &ps[i + 1]); return s & 0xff; }
+"#,
+        ),
+        (
+            "enum+fnptr+switch",
+            br#"enum Op { ADD, SUB, MUL };
+int apply(enum Op o, int a, int b) { switch (o) { case ADD: return a + b; case SUB: return a - b; case MUL: return a * b; } return 0; }
+int main(void) { int (*f)(enum Op, int, int) = apply; int s = 0; for (enum Op o = ADD; o <= MUL; o++) s += f(o, 7, 3); return s & 0xff; }
+"#,
+        ),
+        (
+            "union+bitfield+cast",
+            br#"union U { unsigned int u; struct { unsigned a : 4, b : 4, c : 24; } f; };
+int main(void) { union U x; x.u = 0xABCDEF12u; unsigned t = (unsigned)x.f.a + x.f.b; return (int)(t + (x.u >> 28)) & 0xff; }
+"#,
+        ),
+        (
+            "goto+ternary+comma",
+            br#"int main(void) { int i = 0, s = 0; start: s += i; i++; if (i < 5) goto start; int t = (s > 10) ? (s * 2, s + 1) : 0; do { t--; } while (t > 20); return t & 0xff; }
+"#,
+        ),
+        (
+            "globals+static+strlit",
+            br#"static const char *msg = "hello";
+int counter(void) { static int n = 0; return ++n; }
+int main(void) { int s = 0; for (const char *p = msg; *p; p++) s += *p; for (int i = 0; i < 3; i++) s += counter(); return s & 0xff; }
+"#,
+        ),
+        (
+            "longlong+shifts+2d",
+            br#"int main(void) { long long acc = 0; int m[3][3]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) m[i][j] = (i << 4) | j; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) acc += m[i][j] * 0x10LL; return (int)(acc >> 3) & 0xff; }
+"#,
+        ),
+        (
+            "designated+compound",
+            br#"struct R { int a, b, c; };
+int main(void) { struct R r = {.a = 1, .c = 3}; int arr[5] = {[2] = 9, [4] = 1}; int n = sizeof arr / sizeof arr[0]; struct R q = (struct R){.b = 5}; return (r.a + r.c + arr[2] + arr[4] + n + q.b) & 0xff; }
+"#,
+        ),
+    ];
+    for (name, src) in corpus {
+        assert_eq!(
+            cc1_compile(&linked, &[b"chibicc", b"-"], src, vec![], vec![]),
+            native_cc1(&[], src),
+            "corpus `{name}`: guest-executed compiler emits byte-identical IR to native"
+        );
+    }
 }
