@@ -16,6 +16,21 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+> **A CI guard now enforces this list.** The `workflows-in-sync` job (`workflows_src == workflows`)
+> reds the run whenever any `.github/workflows_src/*.yml` differs from `.github/workflows/*.yml`, so
+> pending changes can't be silently forgotten — the run stays red until the owner copies them over
+> (`cp .github/workflows_src/*.yml .github/workflows/`) and this section is drained. The guard only
+> starts enforcing once it is itself copied into `.github/workflows/ci.yml` for the first time.
+
+- **ci.yml** (2026-07-29): add the `workflows-in-sync` guard described above, and gate the `miri`
+  job to `schedule` + `workflow_dispatch` (nightly + manual) instead of every PR — Miri interprets
+  `svm-mem` and takes ~18 min, second only to the windows `build · test` on the critical path, and
+  the unsafe substrate it guards changes rarely (it now rides the daily cron like asan/tsan). **If
+  `miri` is a required status check in branch protection, remove it there** (a skipped required check
+  blocks merges). Also fixes a pre-existing pending line: the "build + stage chibicc asset" step's
+  inline `run: node -e "…skipped: "+e.message"` was invalid YAML (a colon-space in a plain scalar —
+  GHA would reject the whole file); it is now a `|` block scalar so the copy-over is safe.
+
 - **ci.yml** (2026-07-29): `cross-os` (windows/macOS `build · test`) gains
   `env: CARGO_PROFILE_TEST_DEBUG: "0"`, mirroring the `check` gate. Windows `build · test` is CI's
   wall-clock critical path (~20 min, vs ~18 for miri and ≤12 for everything else); dropping unused

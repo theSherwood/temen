@@ -85,6 +85,45 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: node browser/check-play-assets.mjs
 
+  # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
+  # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
+  # (`cp .github/workflows_src/*.yml .github/workflows/`). This guard reds the run when the two drift —
+  # a staged change hasn't been applied, or one dir was edited without the other — so pending workflow
+  # changes can't be silently forgotten. (This job lives in the copied-over `.github/workflows/ci.yml`,
+  # so it can only start catching drift once the two are first brought into sync.)
+  workflows-in-sync:
+    name: workflows_src == workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: .github/workflows_src/*.yml must match .github/workflows/*.yml
+        run: |
+          set -u
+          fail=0
+          shopt -s nullglob
+          # Every staged .yml must exist in workflows/ and be byte-identical.
+          for src in .github/workflows_src/*.yml; do
+            base=$(basename "$src")
+            dst=".github/workflows/$base"
+            if [ ! -f "$dst" ]; then
+              echo "::error file=$src::$base is in workflows_src/ but not workflows/ — copy it over"
+              fail=1
+            elif ! diff -u "$dst" "$src"; then
+              echo "::error file=$src::$base differs from workflows/$base — run: cp .github/workflows_src/*.yml .github/workflows/ (see .github/workflows_src/README.md)"
+              fail=1
+            fi
+          done
+          # And nothing may live only in workflows/ (a .yml deleted from the source but left running).
+          for dst in .github/workflows/*.yml; do
+            base=$(basename "$dst")
+            if [ ! -f ".github/workflows_src/$base" ]; then
+              echo "::error file=$dst::$base is in workflows/ but not workflows_src/ — add it to the source (or delete it)"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then echo "workflows_src/ and workflows/ are in sync."; fi
+          exit "$fail"
+
   cross-os:
     name: build · test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -236,6 +275,13 @@ jobs:
     # Miri-aware (a heap-backed fallback replaces the mmap FFI under `cfg(miri)`), so its raw-pointer
     # atomics and the Mapped-vs-Paged differential get provenance/race-checked — complementing loom
     # (which models the protocol atomics) and TSan.
+    #
+    # Nightly + manual only (CI speed): Miri interprets svm-mem and takes ~18 min — second only to the
+    # windows `build · test` on the run's critical path. The unsafe substrate it guards changes rarely,
+    # so it rides the daily `schedule` cron like the other deep UB checks (asan/tsan/asan-jit-setjmp)
+    # rather than gating every PR. NOTE: if `miri` is a *required* status check in branch protection,
+    # drop it from that list (a skipped required check blocks merges).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: miri (svm-mem unsafe substrate)
     runs-on: ubuntu-latest
     steps:
@@ -431,7 +477,12 @@ jobs:
       # fail-soft so a build hiccup degrades to a SKIP, never a red build (the test guards on the asset).
       - name: build + stage chibicc asset
         working-directory: browser
-        run: node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
+        # Block scalar: the inline JS contains a colon-space ("skipped: "+e.message) which is invalid
+        # as a YAML plain scalar (GHA rejects the whole file). This pending step was never valid to
+        # copy over as-is; `|` makes the body literal. Fixed here so the workflows-in-sync guard's
+        # copy-over can't break CI parsing.
+        run: |
+          node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
       # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
       # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
       - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
