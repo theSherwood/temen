@@ -1007,7 +1007,9 @@ fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
 /// (`printf_emit.c`), run on interp==JIT under the powerbox. The headline is `%.17g` — the format
 /// chibicc itself emits for float literals — round-tripping the values that a lossy formatter gets
 /// wrong (0.1, 2/3, 1e-7). The oracle is glibc's own output for the identical calls (verified
-/// natively): a `double` printed with `%.17g` must read back bit-identical.
+/// natively): a `double` printed with `%.17g` must read back bit-identical. Linux-only (mirrors the
+/// sibling printf gate — `object_unit_emit_libc`/`cc1_imports` compile the system-header libc).
+#[cfg(target_os = "linux")]
 #[test]
 fn emit_object_libc_float_runs_byte_exact_under_powerbox() {
     use svm_run::{instantiate_with_imports, Outcome, RunConfig, Value};
