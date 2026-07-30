@@ -216,6 +216,37 @@ fn submitted_unit_threads_still_rejected_with_fiber_hosting() {
     );
 }
 
+/// **Unit-own fiber entry** (DESIGN.md §22 "unit-own funcref"): a submitted unit creates a fiber over
+/// its OWN function — `ref.func 1` names the unit's func 1 (its fiber body), not a parent function.
+/// `define_extra` auto-installs the unit's functions into reserved `call_indirect` slots and remaps
+/// `ref.func N` to those slots, so `cont.new(ref.func 1)` resolves to the unit's own func 1 through
+/// the ordinary masked dispatch. The unit's entry resumes it twice (suspend 10, then return 107).
+/// JIT-only for now — the interpreter mirror lands with the differential; here we pin the JIT result.
+#[test]
+fn submitted_unit_fibers_over_its_own_func_jit() {
+    let b = blob(
+        "memory 16\n\
+func () -> (i64) {\nblock 0 () {\n  v0 = ref.func 1\n  v1 = i64.const 32768\n  v2 = cont.new v0 v1\n  v3 = i64.const 10\n  v4, v5 = cont.resume v2 v3\n  v6 = i64.const 7\n  v7, v8 = cont.resume v2 v6\n  return v8\n  }\n}\n\
+func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+    );
+    // Parent: compile the blob, then invoke its 0-arg entry. Reserve a Jit table (log2=3) so the
+    // unit's two functions have padding slots to auto-install into.
+    let parent = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n";
+    let guest = with_len(parent, b.len());
+    let m = parse_module(&guest).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut init = vec![0u8; BLOB_OFF + b.len()];
+    init[BLOB_OFF..].copy_from_slice(&b);
+    let mut host = Host::new();
+    let h = grant_jit_fibers(&mut host, &m, 3);
+    let (out, _) = jit_cap_run(&m, 0, &[h as i64], &init, DEFAULT_RESERVED_LOG2, 3, &mut host)
+        .expect("jit run");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[107]),
+        "unit should fiber over its own func to 107, got {out:?}"
+    );
+}
+
 fn with_len(src: &str, len: usize) -> String {
     src.replace("BLOBLEN", &len.to_string())
 }
