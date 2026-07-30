@@ -21,6 +21,24 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I54 — `c_shell::stage0_shell_ring_pipeline_status_and_early_exit` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #545
+
+**Symptom.** On PR #545 (a **`crates/svm-leng`-only** change — zero lines in `crates/svm` or the
+shell/pipeline/bytecode-engine path) the `build · test · fmt · clippy` job failed with
+`crates/svm/tests/c_shell.rs:333` — `assertion left == right failed: bytecode (browser engine)
+output must match interp`. The bytecode-engine output carried **two extra leading lines**
+(`one\nthree\n`) versus interp — i.e. a **ring-pipeline output-ordering** difference, not a wrong
+result. **Unrelated to the diff** and **flaky, not deterministic**: the test passed **3/3** locally
+back-to-back on the same commit.
+
+**Family.** Same `build · test · fmt · clippy` gate and the same scheduling-nondeterminism shape as
+I52/I53 — a ring pipeline's stage-completion interleaving is order-sensitive, and under CI load the
+bytecode (browser) engine and the interp can drain the ring in a different order, so the early-exit
+status lines and the piped stdout appear interleaved differently. Fix sketch: make the ring-pipeline
+early-exit drain deterministic (flush/join the pipeline's stages in a fixed order before reading the
+combined output), or have the test compare a set/sorted view of the lines rather than raw byte order.
+Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
+
 ### I53 — `clone_caller::clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #539
 
 **Symptom.** On PR #539 (a **docs + `#[ignore]`d-test + `workflows_src` only** change — zero lines in
