@@ -926,7 +926,7 @@ fn emit_object_libc_core_compiles_and_is_intrinsic_free() {
         .iter()
         .map(|i| i.name.as_str())
         .collect();
-    for cap in ["write", "read"] {
+    for cap in ["stream_write", "stream_read"] {
         assert!(
             imports.contains(&cap),
             "emit-object libc reaches stdout/stdin via the powerbox `{cap}` cap; imports: {imports:?}"
@@ -947,7 +947,7 @@ fn emit_object_libc_core_compiles_and_is_intrinsic_free() {
 #[cfg(target_os = "linux")]
 #[test]
 fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
-    use svm_run::{instantiate, Outcome, RunConfig, Value};
+    use svm_run::{instantiate_with_imports, Outcome, RunConfig, Value};
 
     // Entry unit first so `demo2`'s `_start` is merged function 0; the libc has no `main`.
     let demo = object_unit_file("crates/svm/tests/fixtures/emit_libc/demo2.c");
@@ -970,14 +970,19 @@ fn emit_object_libc_printf_runs_byte_exact_under_powerbox() {
     }
     for cap in &imports {
         assert!(
-            matches!(*cap, "write" | "read" | "exit" | "vm_map" | "vm_page_size"),
-            "only default-powerbox caps remain; unexpected import `{cap}` in {imports:?}"
+            matches!(
+                *cap,
+                "stream_write" | "stream_read" | "vm_fs" | "exit" | "vm_map" | "vm_page_size"
+            ),
+            "only powerbox + fs caps remain; unexpected import `{cap}` in {imports:?}"
         );
     }
     svm_verify::verify_module(&linked).expect("verify linked emit-object libc program");
 
-    // Run `_start` on the tree-walk oracle and the JIT (§18); `run_diff` asserts they agree.
-    let inst = instantiate(linked).expect("instantiate");
+    // Run `_start` on the tree-walk oracle and the JIT (§18); `run_diff` asserts they agree. Bound to
+    // the fs+powerbox registry (`demo2` writes only to stdout / an in-memory stream, so its `vm_fs`
+    // slot, if present, is never exercised — the empty memfs suffices).
+    let inst = instantiate_with_imports(linked, cc1_imports(vec![], vec![])).expect("instantiate");
     let run = inst
         .run_diff(&RunConfig::default())
         .expect("run _start on interp+jit");
@@ -1041,13 +1046,18 @@ fn whole_cc1_links_against_emit_libc_with_only_powerbox_caps() {
             .any(|e| e.name == "_start" && e.func == 0),
         "cc1_main's _start is merged function 0"
     );
-    // The decisive close: no libc symbol is left dangling — every import is a powerbox cap. (The 2a
-    // link still had `fopen`/`vfprintf`/`strlen`/… as manifest imports; the libc now supplies them.)
+    // The decisive close: no libc symbol is left dangling — every import is a powerbox or fs cap. (The
+    // 2a link still had `fopen`/`vfprintf`/`strlen`/… as manifest imports; the libc now supplies them.)
+    // The stdio edge is `stream_write`/`stream_read` (fd-dispatch owns `write`/`read`), and the fs edge
+    // is the single `vm_fs` seam (2c) — both bound by [`cc1_imports`].
     let imports: Vec<&str> = linked.imports.iter().map(|i| i.name.as_str()).collect();
     for imp in &imports {
         assert!(
-            matches!(*imp, "write" | "read" | "exit" | "vm_map" | "vm_page_size"),
-            "every remaining import is a default-powerbox cap; unexpected `{imp}` in {imports:?}"
+            matches!(
+                *imp,
+                "stream_write" | "stream_read" | "vm_fs" | "exit" | "vm_map" | "vm_page_size"
+            ),
+            "every remaining import is a powerbox or fs cap; unexpected `{imp}` in {imports:?}"
         );
     }
     // And the stdio streams are real definitions now, not the 2a stub.
@@ -1109,55 +1119,61 @@ fn chibicc_ref() -> &'static Path {
     .as_path()
 }
 
-/// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The
-/// nine cc1 TUs + `emit_libc.c` link into one module ([`link_whole_cc1`]); here that module runs
-/// through `_start` under the powerbox and **compiles a C program to SVM IR inside the sandbox** — the
-/// self-host lever, now executed rather than merely linked. Proven three ways at once: the emitted IR
-/// is byte-identical on the **interpreter and the JIT** (§18 oracle), it **parses** as a real module,
-/// and it is **byte-identical to the native reference** (`chibicc_ref`, the same `cc1_main` entry built
-/// with system clang + libc) — so the guest libc + SVM engine reproduce the native frontend exactly.
-///
-/// The source is fed on **stdin** (`chibicc -` → `read_file("-")`), and the IR comes back on stdout:
-/// the recognized `read`/`write` powerbox builtins already serve fd 0/1, so this first run of the
-/// linked compiler needs no filesystem cap. A `#include`-bearing program needs a real fd≥3 file read —
-/// an fd-aware `read` in the frontend (`gen_builtin_stream` ignores fd today, and the generic host-cap
-/// lowering `gen_builtin_import` is disabled under `--emit-object`) — which is the next 2c sub-slice.
-///
-/// Heavy (`make`s chibicc, compiles ten TUs `--emit-object`, links + verifies the module, runs it on
-/// two engines, and clang-builds the native reference), so `#[ignore]`d like the `codegen_ir.c` compile
-/// — run explicitly: `cargo test -p svm --test c_link -- --ignored self_compiles`.
+/// The name-keyed capability registry the linked cc1 runs against (SELFHOST_C.md §7, 2c). The
+/// emit-object compiler reaches the host only through the recognized `__vm_*` builtins the frontend
+/// lowers (`codegen_ir.c`); this binds each to a concrete cap:
+///   * `stream_write`/`stream_read` → the powerbox `Stream` out/in (stdout/stderr, stdin);
+///   * `exit` → the `Exit` cap; `vm_map`/`vm_page_size` → the `Memory` cap (window growth);
+///   * `vm_fs` → a **seeded in-memory filesystem**. The guest passes the fs op in arg0
+///     (`__vm_fs(op, …)`), so one manifest slot carries the whole protocol: a thin wrapper forwards
+///     `args[0]` as the op and `args[1..]` as its arguments to the shared `mem_fs` handler
+///     (`crates/svm-run/src/fs.rs`). `files`/`dirs` seed the memfs — a `#include` header lives here.
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "heavy: builds + links + runs the whole cc1 on two engines and clang-builds the reference"]
-fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
-    use svm_run::{instantiate, Backend, RunConfig};
+fn cc1_imports(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> svm_run::Imports {
+    use svm_run::HostCap;
+    // The fs seam: op-in-arg0 over one shared mem_fs store (fresh per host grant, deterministic seed).
+    let fs = HostCap::host_fn(0, move || {
+        let (mut inner, _handle) = svm_run::fs::mem_fs_seeded_shared(files.clone(), dirs.clone());
+        Box::new(
+            move |_slot_op: u32, args: &[i64], mem: Option<&mut dyn svm_interp::GuestMem>| {
+                inner(args[0] as u32, &args[1..], mem)
+            },
+        )
+    });
+    svm_run::Imports::new()
+        .provide("stream_write", HostCap::stdout())
+        .provide("stream_read", HostCap::stdin())
+        .provide("exit", HostCap::exit())
+        .provide("vm_map", HostCap::memory(0))
+        .provide("vm_page_size", HostCap::memory(3))
+        .provide("vm_fs", fs)
+}
 
-    let linked = link_whole_cc1();
-
-    // A no-`#include` program (its result is `main`'s exit code): recursion, an array + loop, a couple
-    // of calls — enough that the emitted IR exercises the codegen, not a one-liner. Read on stdin.
-    let src: &[u8] = b"int add(int a, int b) { return a + b; }\n\
-        int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\n\
-        int main(void) {\n\
-        \x20 int xs[4];\n\
-        \x20 int s = 0;\n\
-        \x20 for (int i = 0; i < 4; i++) { xs[i] = i * i; s += xs[i]; }\n\
-        \x20 return add(s, fib(10));\n\
-        }\n";
-
+/// Run the linked cc1 (`args` = argv, `stdin` = the source for `chibicc -`) on the interpreter **and**
+/// the JIT under [`cc1_imports`] (memfs seeded with `files`/`dirs`), assert the two engines emit
+/// byte-identical IR (§18) that parses, and return that IR. The self-compile pipeline, both engines.
+#[cfg(target_os = "linux")]
+fn cc1_compile(
+    linked: &svm_ir::Module,
+    args: &[&[u8]],
+    stdin: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    dirs: Vec<String>,
+) -> Vec<u8> {
+    use svm_run::{instantiate_with_imports, Backend, RunConfig};
     let cfg = RunConfig {
-        args: vec![b"chibicc".to_vec(), b"-".to_vec()],
-        stdin: src.to_vec(),
+        args: args.iter().map(|a| a.to_vec()).collect(),
+        stdin: stdin.to_vec(),
         ..RunConfig::default()
     };
-    let inst = instantiate(linked).expect("instantiate the linked cc1");
-    let interp = inst
-        .run_with_caps(Backend::TreeWalk, &cfg, &[])
-        .expect("run the linked cc1 on the interpreter");
-    let jit = inst
-        .run_with_caps(Backend::Jit, &cfg, &[])
-        .expect("run the linked cc1 on the JIT");
-
+    let run = |backend| {
+        instantiate_with_imports(linked.clone(), cc1_imports(files.clone(), dirs.clone()))
+            .expect("instantiate the linked cc1 against the fs+powerbox registry")
+            .run_with_caps(backend, &cfg, &[])
+            .expect("run the linked cc1")
+    };
+    let interp = run(Backend::TreeWalk);
+    let jit = run(Backend::Jit);
     assert!(
         !interp.stdout.is_empty(),
         "the compiler emitted SVM IR (interp stderr: {})",
@@ -1167,16 +1183,19 @@ fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
         interp.stdout, jit.stdout,
         "the linked compiler emits byte-identical IR on the interpreter and the JIT (§18)"
     );
-
-    // The emitted IR is a real, parseable SVM module.
     let ir = String::from_utf8(interp.stdout.clone()).expect("emitted IR is UTF-8");
     svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("emitted IR should parse: {e:?}\n{ir}"));
+    interp.stdout
+}
 
-    // The native oracle: the same `cc1_main` entry, built with system clang + libc, fed the same
-    // source on stdin. `-g` is off by default on both sides, so there is no `debug.file <path>` line —
-    // the compare is a true byte-for-byte diff of the emitted IR.
-    let mut child = Command::new(chibicc_ref())
-        .arg("-")
+/// The native oracle: `chibicc_ref` (same `cc1_main` entry, system clang + libc) fed `stdin` for
+/// `chibicc [extra_args...] -`, returning the emitted IR. `-g` is off by default on both sides, so
+/// there is no `debug.file <path>` line — a true byte-for-byte compare of the emitted IR.
+#[cfg(target_os = "linux")]
+fn native_cc1(extra_args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    let mut cmd = Command::new(chibicc_ref());
+    cmd.args(extra_args).arg("-");
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1186,16 +1205,86 @@ fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
         .stdin
         .take()
         .expect("chibicc_ref stdin")
-        .write_all(src)
+        .write_all(stdin)
         .expect("write source to chibicc_ref");
-    let native = child.wait_with_output().expect("wait for chibicc_ref");
+    let out = child.wait_with_output().expect("wait for chibicc_ref");
     assert!(
-        native.status.success(),
+        out.status.success(),
         "native chibicc_ref failed: {}",
-        String::from_utf8_lossy(&native.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
+    out.stdout
+}
+
+/// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The
+/// nine cc1 TUs + `emit_libc.c` link into one module ([`link_whole_cc1`]); here that module runs
+/// through `_start` under the powerbox and **compiles C to SVM IR inside the sandbox** — the self-host
+/// lever, executed rather than merely linked. Two programs, each proven three ways at once: byte-
+/// identical on the **interpreter and the JIT** (§18), a **parseable** module, and byte-identical to the
+/// **native reference** (`chibicc_ref`, the same `cc1_main` entry built with system clang + libc).
+///
+/// (a) A no-`#include` program on stdin (`chibicc -`) — the base self-compile.
+/// (b) A `#include`-bearing program whose header the running compiler **reads from a seeded in-sandbox
+/// filesystem** (`vm_fs` cap → `mem_fs`) — the 2c fs slice: `fopen`/`fread` on fd≥3 reach the memfs
+/// through `os_emit.c`'s `__vm_fs` seam, while stdout/stdin stay on the `Stream` cap. The native side
+/// reads the identical header from a real `-I` directory; the emitted IR matches (headers aren't named
+/// in the output, `-g` off), so the guest fs path reproduces the native include exactly.
+///
+/// Heavy (`make`s chibicc, compiles ten TUs `--emit-object`, links + verifies, runs on two engines, and
+/// clang-builds the reference), so `#[ignore]`d — run explicitly:
+/// `cargo test -p svm --test c_link -- --ignored self_compiles`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "heavy: builds + links + runs the whole cc1 on two engines and clang-builds the reference"]
+fn whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit() {
+    let linked = link_whole_cc1();
+
+    // (a) A no-`#include` program (its result is `main`'s exit code): recursion, an array + loop, a
+    // couple of calls — enough that the emitted IR exercises the codegen, not a one-liner. On stdin.
+    let src: &[u8] = b"int add(int a, int b) { return a + b; }\n\
+        int fib(int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }\n\
+        int main(void) {\n\
+        \x20 int xs[4];\n\
+        \x20 int s = 0;\n\
+        \x20 for (int i = 0; i < 4; i++) { xs[i] = i * i; s += xs[i]; }\n\
+        \x20 return add(s, fib(10));\n\
+        }\n";
+    let guest = cc1_compile(&linked, &[b"chibicc", b"-"], src, vec![], vec![]);
     assert_eq!(
-        interp.stdout, native.stdout,
-        "guest-emitted IR is byte-identical to the native reference (same frontend, different substrate)"
+        guest,
+        native_cc1(&[], src),
+        "no-#include: guest-emitted IR is byte-identical to the native reference"
+    );
+
+    // (b) A `#include`-bearing program: the header is read from the seeded memfs through the `vm_fs`
+    // cap. The source is on stdin; `#include <vec.h>` resolves against the default `/include` search
+    // path (cc1_main), which the memfs serves at `include/vec.h`. The native side reads the identical
+    // header from a real `-I` directory. Same source + header both ways ⇒ identical IR.
+    let hdr: &[u8] = b"#ifndef VEC_H\n#define VEC_H\n\
+        static int sq(int x) { return x * x; }\n\
+        static int cube(int x) { return x * sq(x); }\n\
+        #endif\n";
+    let src_inc: &[u8] = b"#include <vec.h>\n\
+        int main(void) {\n\
+        \x20 int acc = 0;\n\
+        \x20 for (int i = 1; i <= 5; i++) acc += sq(i) + cube(i);\n\
+        \x20 return acc & 0xff;\n\
+        }\n";
+    let guest_inc = cc1_compile(
+        &linked,
+        &[b"chibicc", b"-"],
+        src_inc,
+        vec![("include/vec.h".to_string(), hdr.to_vec())],
+        vec!["include".to_string()],
+    );
+    // Native reads the same header from a real directory on the `-I` path (cc1_main takes one `-I`).
+    let incdir = std::env::temp_dir().join(format!("svm_cc1_inc_{}", std::process::id()));
+    std::fs::create_dir_all(&incdir).expect("create native include dir");
+    std::fs::write(incdir.join("vec.h"), hdr).expect("write native header");
+    let iarg = format!("-I{}", incdir.display());
+    assert_eq!(
+        guest_inc,
+        native_cc1(&[&iarg], src_inc),
+        "#include: guest IR (header read from the in-sandbox memfs) == native (header from disk)"
     );
 }

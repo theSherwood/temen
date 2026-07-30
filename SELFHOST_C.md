@@ -483,14 +483,31 @@ compiler bug is a clean error, never an escape.
    per-TU; only the bump pointer is shared). The whole-program on-ramp path is textually unchanged (the
    `#else static` branch). Subset-link tests that omit the libc gained a tiny `alloc_state_stub()` owner.
 
-   **Remaining for 2c.** (a) The `#include`/filesystem path: a source that `#include`s a header needs a
-   real fd≥3 file read, but `gen_builtin_stream` **ignores fd today** (`write`→stdout, `read`→stdin
-   always) and the generic host-cap lowering `gen_builtin_import` is **disabled under `--emit-object`**
-   (an undefined extern is a cross-TU function there, fail-closed) — so reaching an fs cap needs an
-   fd-aware `read`/`write` + an fs seam in the frontend (a recognized `__vm_*` builtin family or a
-   memfs-on-stdin shim), a `chibicc.svmb`-independent frontend slice. (b) The float-input dtoa
-   (`printf_emit.c`'s `%.17g` is best-effort, so a float-literal source won't diff byte-exact yet).
-   (c) The **bootstrap-fixpoint** differential (§5 E).
+   **→ Emit-object 2c increment 2 DONE 2026-07-30 — the `#include`/filesystem path: the running
+   compiler reads a header from an in-sandbox filesystem.** The blocker was real: `gen_builtin_stream`
+   ignores fd (`write`→stdout, `read`→stdin always) and the generic host-cap lowering
+   `gen_builtin_import` is off under `--emit-object`, so an emit-object guest could not reach an fs cap
+   at all. Closed with a small **recognized-builtin** fs seam in the frontend (`codegen_ir.c`, purely
+   additive — no existing emit changes, so **no `chibicc.svmb` rebuild**):
+   - `__vm_fs(op, a, b, c, d)` → `call.sym "vm_fs"` with the **op in arg0** — one manifest slot carrying
+     the whole fs op protocol (open/read/write/seek/close/stat, `crates/svm-run/src/fs.rs`), mirroring
+     `__vm_host_call(handle, op, …)` but as a single named import the on-ramp's `__vm_cap_resolve` path
+     (unlowerable under emit-object) can't express.
+   - `__vm_stream_write`/`__vm_stream_read` → `call.sym "stream_write"/"stream_read"` (the raw fd-less
+     `Stream` primitives) — distinct names from the `write`/`read` builtins so `os_emit.c` can *define*
+     `write`/`read` as fd-dispatchers (0/1/2 → stream, ≥3 → `__vm_fs`) without recursing, exactly like
+     the on-ramp's `os_shim.c` does over its intrinsics. `open`/`close`/`lseek`/`stat` ride `__vm_fs`.
+   The harness binds the six caps by name (`c_link.rs::cc1_imports` via `instantiate_with_imports` + a
+   new `HostCap::memory(op)`): `stream_write`/`stream_read` → `Stream`, `exit` → `Exit`,
+   `vm_map`/`vm_page_size` → `Memory`, and **`vm_fs` → a seeded `mem_fs`** (a thin wrapper forwards
+   `args[0]` as the op). Gated by `whole_cc1_self_compiles…`: the linked compiler compiles a
+   `#include <vec.h>` program **reading the header from the in-sandbox memfs**, byte-identical on
+   interp==JIT and byte-identical to native `chibicc_ref` (which reads the same header from a real `-I`
+   dir). The stdout/stdin edge stays on the `Stream` cap, so the fs cap is only files (fd≥3).
+
+   **Remaining for 2c.** (b) The float-input dtoa (`printf_emit.c`'s `%.17g` is best-effort, so a
+   float-literal source won't diff byte-exact yet). (c) The **bootstrap-fixpoint** differential (§5 E) —
+   now unblocked: the running compiler can read its own multi-file source from a seeded memfs.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
