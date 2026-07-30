@@ -21,7 +21,7 @@ prospective interactive embedder (c_interpret) that the W1–W6 scope does not y
 | **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`svm_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
 | **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `svm-dap`, `DEBUGGING.md` |
 | **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `svm-opt` instrumentation pass, C ABI `svm_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
-| **W4** blocking-input suspend/resume | **Partial** — the `VcpuEvent::StdinPark` suspend/resume seam **shipped in the browser** (`bytecode.rs`, `svm_pg_*` console path); the generic W1-session `provide_stdin` + `CapTape`/seek-replay form is the **remaining** piece | `bytecode.rs`, `browser/src/lib.rs`, this doc |
+| **W4** blocking-input suspend/resume | **Partial** — the `VcpuEvent::StdinPark` suspend/resume seam **shipped in the browser** (`bytecode.rs`, `svm_pg_*` console path), and the **`CapTape` replay half landed** (2026-07-30 check: `svm-dap` records nondeterministic cap inputs and `replay_cap_tape`s them on rebuild — reverse debugging rewinds stdout byte-identically, `browser/tests/chibicc_debug.rs`); remaining: the **interactive mid-session provide verb** on the debug session (the DAP session takes *preloaded* stdin only) | `bytecode.rs`, `svm-dap/src/backend.rs`, this doc |
 | **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.svmb` asset + `svm_run_onramp_fs` + `svm_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
 | **W6** small host/tooling items | **Mostly remaining** — only the *native* seeded scheduler (`attach_scheduled_seeded`) exists; the four browser/tooling items (seed-via-ABI, `display` frame-query, memory-map JSON, compile metrics) are unbuilt | mixed |
 | **—** consumer-surfaced needs not yet scoped | **Not scoped** — telemetry stream, cache-coherence view, adversarial+replayable scheduling, paging counters, state writes, sem/barrier libc | new section below |
@@ -187,9 +187,13 @@ ordering, and browser counters match the native run of the same hook stream.
 > suspended at the first stdin read, `pg_pump` returns on the park, and the query entry pushes bytes
 > and resumes (`browser/src/lib.rs`). What's **remaining** vs. the sketch below: it is packaged as
 > the `svm_pg_*` REPL/Postgres path, **not** as a generic `svm_dbg_provide_stdin` on the **W1 debug
-> session**, and it is **not** yet joined to the `CapTape`/`seek`-replay determinism the acceptance
-> criteria require (provided bytes must replay faithfully on a later `seek`). The text below is the
-> original sketch.
+> session**. **Update 2026-07-30:** the `CapTape`/`seek`-replay half **landed** — the `svm-dap`
+> backend records nondeterministic cap inputs (clock / stdin `read` / host-fn) and replays the tape
+> on every rebuild, so reverse debugging reproduces earlier stdout byte-identically
+> (`svm-dap/src/backend.rs` `replay_cap_tape`; `browser/tests/chibicc_debug.rs`). The one remaining
+> piece is the **interactive provide verb on the debug session itself**: today the DAP session takes
+> *preloaded* stdin at launch; a park-on-exhausted-stdin + provide-and-resume request (appending to
+> the same tape) closes W4. The text below is the original sketch.
 
 **Need.** Interactive guests read input that does not exist yet (a REPL prompt, a stdin-driven
 program). The embedder needs the run to **suspend** when input is exhausted, surface that to
@@ -298,11 +302,78 @@ is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
   also use **semaphores and barriers** (`sem_*`, `pthread_barrier_*`). These need guest-libc
   equivalents over SVM's threading primitives (a frontend/libc item, not an engine one).
 
+### Closure sketch (2026-07-30) — mechanisms that stay SVM-shaped
+
+How each X-item closes without new engine surface, without consumer coupling, and with models kept
+out of the TCB. Everything below is either an observer seam, host-side tooling in the cdylib, guest
+libc, or a standard DAP verb.
+
+- **X2 + X4's fault counter are access-stream consumers — with two feeds.** The models (a
+  configurable cache/coherence model, a first-touch shadow-set fault counter) live **host-side in
+  the cdylib** either way; what differs is where the access stream comes from:
+  - **Under a debug session: the debugger's own access decode, *not* the hook pass.** The W3 pass
+    *rewrites the module* (inserted hook `cap.call`s — `mem_hook_stats` reports `inserted_insts`),
+    so instrumenting a debugged guest would surface synthetic ops in the machine view, shift SSA
+    slots, and skew the op-clock that `seek` indexes — turning a profiling panel on must not
+    change what the debugger shows. The debug tier already observes accesses without any rewrite:
+    `watch_hit_before` (`bytecode.rs`) decodes the next op's accessed range from live block-local
+    values — it is how watchpoints landed uninstrumented. Generalize that decode into an optional
+    per-op **access sink** on the debug session: no module rewrite, op-clock unchanged, zero cost
+    when no sink is installed, full `MemEvent` vocabulary (loads/stores/atomics/`Copy`/`Fill`).
+  - **Outside a debug session (run-mode profiling): the W3 hook pass**, as designed — the rewrite
+    is invisible when nothing inspects the machine.
+  - **The two feeds are each other's oracle**: the same program's sink stream (uninstrumented) and
+    hook stream (instrumented) must be identical — a house-style differential that also pins the
+    sink's op coverage.
+
+  Design notes verified against the as-built hook (`MemEvent`, `svm-run/src/lib.rs`):
+  - `MemEvent` carries **no vCPU identity**, and coherence state is meaningless without it. Add
+    attribution **at dispatch, host-side** (sink or hook) — on the cooperative tier the dispatcher
+    knows the executing vCPU — so the event type, the instrumentation pass, and the engine are
+    untouched. This pins coherence modeling to the **interpreter tier**; acceptable and worth
+    stating (it is the same tier boundary the debugger already has), not discovered later.
+  - `Copy`/`Fill` arrive as **span events**; consumers expand spans to lines/pages themselves.
+  - **Capability-written bytes** (stdin fill, `fs`/`display` I/O) never appear as guest accesses.
+    A model that should count them needs a host-side tap where caps write into the window —
+    plumbing in the cdylib, still no engine change; per-model decision.
+  - Model state lives **outside VM snapshots**: `seek`/reverse must reset-and-replay (or snapshot)
+    the model alongside the checkpoint ladder, or its panels desynchronize from the slider.
+- **X4 splits three ways.** Fault counter → hooks (above). Committed/reserved pages → the **W6
+  memory-map JSON** (real Memory-capability state, not a model). Settable heap limit → a
+  **Memory-capability growth cap**, so guest `malloc` over `vm_map` returns NULL naturally — a
+  powerbox policy knob, not an engine change (a hook *veto* is the wrong OOM semantics: it traps).
+- **X1 decomposes; none of it is mem-hook work.** Context-switch / sync-event / causality records
+  belong to a **scheduler trace seam**: the cooperative debug scheduler already *makes* every one
+  of these decisions (turns, parks, wakes, who-woke-whom) — an optional, zero-cost-when-off event
+  tape over decisions already taken is observer-only and widens no guest authority. Flame-chart
+  samples need **no new surface** — periodic `stackTrace` polling at turn boundaries. Shared-state
+  "contested" tracking **is** hook-derivable once accesses are attributed (last-writer / multi-
+  writer per range) — a third host-side hook consumer.
+- **X3 generalizes W6's seed item.** Expose **scheduler policy** (seed + quantum bounds) rather
+  than the seed alone; quantum = 1 *is* the chaos case, and the native deterministic explorer
+  already runs memop-granularity `quantum = 1` (`svm-interp`). Forced switch = a debug-session
+  verb that ends the current turn at the next safe point — driver-side, deterministic, recordable.
+- **X5 is standard DAP.** Implement `setVariable` / `writeMemory` on the existing backend, and
+  record debugger writes on the same input tape as W4's provided stdin (the `CapTape` shape) so a
+  later `seek` replays them and time-travel stays truthful.
+- **X6 is guest C.** `sem_*` / `pthread_barrier_*` as guest-libc headers over the existing
+  futex/wait-notify ops. The proven pattern is `frontend/chibicc/include/pthread.h`: mutex +
+  condvar built on the `__vm_wait32` / `__vm_notify` intrinsics (lowered to `memory.wait`/
+  `memory.notify` by `codegen_ir.c`) — sem/barrier are the same construction, currently declared
+  out of scope in that header. (An earlier draft cited the postgres demo's `ipc_shim.c`; corrected
+  — that shim is a single-process no-op counter, not a futex user.) Zero engine surface.
+- **Batching:** `svm_dap_request` is one-request-per-pump today; accept a **JSON array of requests
+  per pump** (replies already come back as an array). One FFI crossing per step for a step + N
+  state reads, embedder-neutral, no new ABI entries.
+
 Two adjacent risks the same pass surfaced, for the record (they are effort/measurement, not new
 scope): the **per-step ABI cost** — a real embedder polls ~20 state reads plus a JSON parse per
-step, so the W1 session should expose a **single batched per-step state bundle**, not N calls; and
-**frontend acceptance of SSE intrinsics** (`<xmmintrin.h>` / `__m128` / `_mm_*`) — the W2 XMM→`v128`
-remap presumes chibicc *accepts* those programs, which is a frontend-coverage check, not a view remap.
+step, so the W1 session should expose a **single batched per-step state bundle**, not N calls (the
+array-pump above); and **frontend acceptance of SSE intrinsics** (`<xmmintrin.h>` / `__m128` /
+`_mm_*`) — the W2 XMM→`v128` remap presumes chibicc *accepts* those programs, which is a
+frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has since been
+**mitigated in code**: the checkpoint ladder (`DEBUGGING.md` slice 4-perf, `DebugRunSnapshot` at
+`CHECKPOINT_STRIDE`) bounds replay to the tail past the nearest snapshot, on both engines.
 
 ## Non-goals
 
@@ -320,11 +391,129 @@ remap presumes chibicc *accepts* those programs, which is a frontend-coverage ch
 
 ## Suggested slice order
 
-> **2026-07-28:** W1 (+ time-travel/watchpoints), W2 v1, and **W5** are done; **W4**'s suspend/resume
-> seam shipped in the browser (its generic-debug-session + replay form remains). The live remaining
-> order is **W4 (generic form) → W3-in-browser → the W6 browser/tooling items → W2 v2**, plus the
-> **consumer-surfaced needs** section below as those are demanded. The 07-24 order (**W4 → W5 → W3 →
-> W2 v2**) is superseded.
+> **2026-07-30 — implementation plan for the remaining work** (supersedes the 07-28 and 07-24
+> orders; the original numbered list below stays as the record). Status at this date: W1
+> (+ time-travel/watchpoints), W2 v1, and W5 are done; W4 lacks only the interactive provide verb;
+> the checkpoint ladder and `CapTape` replay have landed. Each slice lands with CI-gating tests,
+> differential wherever two observers see the same program, per `AGENTS.md`.
+>
+> 1. **W4 finish — `provideStdin` on the debug session.** Integration note (2026-07-30, verified):
+>    in a debug run stdin is served by the **Host's stdin cap** (`grant_io_powerbox`, `host.stdin`
+>    — `svm-dap/src/backend.rs`), not the Vcpu event loop, so `VcpuEvent::StdinPark` is *not* the
+>    seam here. The work: a **would-block outcome** on the stdin cap when the buffer is exhausted
+>    (instead of serving EOF), surfaced as a new stop variant threaded `DebugRun`/
+>    `ScheduledDebugRun` stop enums → the `Debuggee` trait → the DAP `stopped` event; a custom
+>    `provideStdin` request appends to `host.stdin` and resumes (re-executing the read). Replay is
+>    free: `record_caps`/`replay_cap_tape` already tape stdin inputs, so provided bytes join the
+>    tape. Acceptance: the W4 block above (two round-trips; `seek(0)` replays both
+>    byte-identically, no re-park).
+> 2. **DAP array-pump.** `svm_dap_request` accepts a JSON **array** of requests per pump (replies
+>    already come back as an array); singletons unchanged. Integration (verified): a pure
+>    `browser/src/lib.rs` change at the `server.handle` call — `svm_dap::parse` already returns
+>    `Json::Arr` for a top-level array (today it falls through to a clean single failure), so the
+>    pump matches `Arr` and flat-maps `handle` per element; `web/dap.js` already parses the reply
+>    as an array and filters by `type`, so the JS client needs no change. Acceptance: a step + N
+>    state reads in one FFI crossing; existing DAP tests pass untouched.
+> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize the per-op
+>    access decode behind `watch_hit_before` into an optional sink on
+>    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
+>    module rewrite, op-clock unchanged. Scope note (2026-07-30, verified): the shared decode is
+>    `access_of` (`lib.rs`), and it is **single-range only — `mem.copy`/`mem.move`/`mem.fill`
+>    fall through to `MemAccess::None`**. So the sink needs a multi-range event vocabulary — not
+>    a plumbed-through `MemAccess`; **decided (owner, 2026-07-30): the sink vocabulary is
+>    `MemEvent`** (`svm-run`, whose `Copy`/`Fill` carry spans), shared verbatim with the hook
+>    pass so the differential compares like with like. Threading (verified): the sink rides the
+>    same path as the existing `watch_specs` — a field on `BytecodeBackend` re-installed after
+>    every `seek` rebuild (`fresh_single`), a slot on `DebugRun`/`ScheduledDebugRun` next to
+>    `watchpoints`, fired at the same pre-op sites (`run_to` / `drive`'s check block); the
+>    snapshot structs exclude it exactly as they exclude watchpoints (backend re-applies after
+>    restore); a launch-arg flag parses in `on_launch` next to `engine`/`stdin`. The same
+>    fall-through means **watchpoints likely never fire on bulk-op writes**
+>    (a `memcpy` over a watched byte won't stop) on *either* engine — parity hides it because both
+>    share the decode shape; pin it with a test and fix it in this slice (the sink-vs-hook
+>    differential would have exposed it regardless). Acceptance: sink stream **≡ the W3 hook-pass
+>    stream** on the same program (uninstrumented vs. instrumented) across the full `MemEvent`
+>    vocabulary; a bulk-op watchpoint fires at the same clock on both engines; all debug parity
+>    tests pass with a sink installed.
+> 4. **X2 + X4's fault counter — cache/coherence + paging models, host-side in the cdylib.** A
+>    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
+>    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
+>    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
+>    includes the **W3 browser export**. Integration (verified): the browser crate depends on
+>    **neither `svm-run` nor `svm-opt`** (it runs the engine directly via
+>    `compile_and_run_with_host`), so the W3 export is *not* re-exporting
+>    `Instance::with_mem_hooks` — it adds the wasm-clean `svm-opt` dep (deps: `svm-ir` +
+>    `svm-verify` only) and reproduces the rewrite + handle bake-in locally in the cdylib,
+>    re-honoring the manifest exclusion (`svm-run`'s hooks refuse a manifest-carrying instance);
+>    natural entries are `svm_run`/`svm_run0` (via `run_at`) and the powerbox twins. Model
+>    snapshotting: there is **no checkpoint callback** — the ladder is private to the DAP backend
+>    and self-disables silently when a run leaves the checkpointable subset — so the model
+>    snapshots by watching `Debuggee::clock()`/`turn()` at its own stride; expose
+>    `checkpoint_clocks()` (one-liner — the snapshot types' `clock()`/`turn()` are already `pub`)
+>    if the model should align with the engine's ladder, and surface the self-disable so the
+>    model can drop to rebuild-from-0 with the engine. Acceptance: strided-vs-sequential miss
+>    ordering; browser counters ≡ native on the same stream; `seek(t)` model state ≡ a from-0 run
+>    to `t`, including after checkpointing self-disables.
+> 5. **X4's real-state half + W6 memory-map.** The window memory-map JSON (data segments, heap
+>    extent, data-stack region, cap-mapped regions) and a **Memory-capability growth cap** so
+>    guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
+>    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
+>    mapped/reserved) + the `svm-ir` powerbox layout constants (args/stack), with the **heap
+>    cursor read from guest memory** — `POWERBOX_HEAP_BRK`/`_TOP` are window words at offsets
+>    32/40, a `read_window`, not host state (`Mem::layout_snapshot` is the serialization
+>    precedent). The growth cap is greenfield: **nothing accounts `vm_map` growth today** — the
+>    only bound is the geometric `reserved` check in `prot_pages`; `MAX_MINTED_REGION` caps §14
+>    region mints only, and `Quota`/`Limits` have no memory field (aggregate metering is
+>    explicitly deferred to §15/D48). The cap is a payload on `Binding::Memory` (a unit variant
+>    today) checked in `Mem::map` beside the reserved bound — and it must round-trip the durable
+>    codec (`DurableBinding::Memory`, both directions). Acceptance: JSON matches module +
+>    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows;
+>    durable freeze/thaw preserves the cap.
+> 6. **X1 — scheduler trace seam + shared-state consumer.** An optional, zero-cost-when-off event
+>    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
+>    edge) with batch readback; the shared-state consumer (last-writer / contested per range) over
+>    the attributed sink. Integration (verified): every decision point sits in
+>    `ScheduledDebugRun::drive` — the pick (`dbg_pinned_coro` → stepping thread → lowest-index
+>    `dbg_pick_runnable`), join parks (`dbg_join` → `BlockedJoin`), futex parks (`dbg_wait` →
+>    `BlockedWait`, with timed wakeups fired inside the *picker*), and notify (`dbg_notify`).
+>    Join wake edges already carry both identities (`dbg_complete` enumerates); the futex wake
+>    edge needs the wakee's index materialized — the `dbg_notify` scan becomes `.enumerate()`,
+>    a one-token change. Acceptance: the tape is bit-identical across a replay of the same run;
+>    wake edges match wait/notify semantics on a fixture; contested flags match a hand-computed
+>    oracle.
+> 7. **X3 — scheduler policy + forced switch.** Reframed by verification: the bytecode debug
+>    scheduler is **hardwired** — lowest-index pick, one op per turn, no seed or quantum anywhere
+>    (`on_launch` documents "seed/schedule ignored" for the bytecode engine; seeding exists only
+>    on the tree-walker's `attach_scheduled_seeded`, seed `u64`, no quantum there either). Since
+>    the turn quantum is already 1 op, **chaos-granularity interleaving is the default** — what's
+>    missing is *variation*: a seed-parameterized deterministic pick (the tree-walker's
+>    xorshift-with-fixpoint-guard is the precedent, and its `sched_tape()` shows how to recover
+>    the realized plan), plus a forced-switch session verb. Both must preserve the load-bearing
+>    replay property ("replaying `t` ticks from a fresh session reproduces the state at turn
+>    `t`") that `drive_scheduled_to` + `ScheduledSnapshot` depend on — so the seed is session
+>    state and forced switches are **recorded** (tape-shaped, like CapTape) and re-applied at the
+>    same turns on replay. Acceptance: same seed → identical slice-6 tape; a forced switch lands
+>    at a deterministic turn and survives `seek`.
+> 8. **X5 — DAP `setVariable` / `writeMemory`.** Greenfield at all three layers (verified): the
+>    `Inspector` has no write methods, the `Debuggee` trait has no write operation, and
+>    `DapServer` handles neither request (nor `readMemory`) — so this is a new trait method +
+>    engine implementations + new `handle` arms. Debugger writes are recorded on the session
+>    input tape (the `CapTape` shape) so replay re-applies them. Acceptance: write → `seek` back
+>    → `seek` forward re-observes the write; parity with the tree-walker where both back the
+>    same request.
+> 9. **X6 — guest-libc sem/barrier.** Extend `frontend/chibicc/include/pthread.h` — which already
+>    builds mutex + condvar on the `__vm_wait32`/`__vm_notify` futex intrinsics and declares
+>    sem/barrier out of scope — with `sem_*` (counter + futex) and `pthread_barrier_*`
+>    (generation counter + futex) by the same construction; add the headers to the browser
+>    playground's seeded set (which today ships **no** threading headers at all). Zero engine
+>    surface. Acceptance: producer/consumer and barrier-phase fixtures run on interp + JIT with
+>    identical output.
+> 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
+>    (finite register file) stays demand-driven.
+>
+> Order rationale: 1–2 are small and unblock any embedder spike (interactivity + step latency);
+> 3 is the hinge the model slices stand on; 4–5 close the perf/memory panels; 6–7 close the
+> threading story; 8–10 are an independent tail, land any time.
 
 1. **W1 spike** — single-vCPU interactive step + source breakpoint exported from the cdylib,
    driven by a throwaway page, parity-checked against the native `Inspector`. De-risks
