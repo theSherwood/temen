@@ -185,6 +185,15 @@ pub trait Debuggee {
         false
     }
 
+    // --- access sink / models --------------------------------------------------------------------
+    /// Install the session's access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3): every
+    /// module-0 memory op reaches it, `seek` replays included. `false` when this backend has no
+    /// sink (the tree-walker) — a `memModel` launch fails cleanly instead of silently observing
+    /// nothing. Default: unsupported.
+    fn set_access_sink(&mut self, _sink: SharedSink) -> bool {
+        false
+    }
+
     // --- powerbox output -------------------------------------------------------------------------
     /// The guest's captured stdout at the current stop, if this session runs under a powerbox (else
     /// empty). The server surfaces it as DAP `output` events; on a reverse `seek` it reflects exactly
@@ -363,8 +372,10 @@ fn wrap_sink(sink: &SharedSink) -> AccessSinkFn {
 
 /// The op-clock stride between time-travel checkpoints (DEBUGGING.md W1). Matches the tree-walker
 /// `Inspector`'s `SEEK_CHECKPOINT_STRIDE`, so a reverse `seek`/`step_back` replays at most this many
-/// ops past the nearest snapshot instead of O(t) from clock 0.
-const CHECKPOINT_STRIDE: u64 = 1024;
+/// ops past the nearest snapshot instead of O(t) from clock 0. `pub(crate)`: the host-side models
+/// (`models.rs`) snapshot their own state at the same boundaries, so any clock the engine can
+/// restore to has a matching model snapshot (their seek-consistency hinges on the strides agreeing).
+pub(crate) const CHECKPOINT_STRIDE: u64 = 1024;
 
 impl BytecodeBackend {
     /// Open a bytecode debug session on `module`'s `func(args)`. A `thread.spawn` guest gets the
@@ -983,6 +994,11 @@ impl Debuggee for BytecodeBackend {
         true
     }
     fn supports_watch(&self) -> bool {
+        true
+    }
+    /// The engine-level sink installer (both bytecode engines support it).
+    fn set_access_sink(&mut self, sink: SharedSink) -> bool {
+        BytecodeBackend::set_access_sink(self, sink);
         true
     }
     /// W4 blocking stdin: append the provided bytes to the parked single-vCPU run's stdin — the

@@ -5115,6 +5115,181 @@ pub extern "C" fn svm_dap_response_len() -> usize {
     unsafe { (*core::ptr::addr_of!(DAP_OUT)).1 }
 }
 
+// ---- W3 in the browser: run-mode memory profiling (INTERACTIVE_EMBEDDING.md slice 4) -------------
+// The debug tier feeds the host-side models through the access sink (`svm-dap`); a **non-debug**
+// profiling run uses the W3 instrumentation pass instead: rewrite the module so every memory op
+// announces itself on a host-fn capability — the `svm-run` `with_mem_hooks` twin, reproduced here
+// because the cdylib depends on neither `svm-run` nor its OS-bound PAL (`svm-opt` is pure IR and
+// wasm-clean) — feed the same `MemModel`, and stash its stats JSON. The rewrite never meets a
+// debugger: run-mode entries inspect nothing, so the inserted ops are invisible by construction.
+
+/// The stashed stats JSON of the most recent [`svm_mem_profile`] run.
+static mut MEMPROF: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
+/// The `svm-run` `decode_mem_event` twin (the op/arg layout is owned by
+/// `svm_opt::instrument::mem_hook_op`). Drift between the twins is pinned by
+/// `browser/tests/mem_profile.rs`, which compares this hook-fed model against a sink-fed one on
+/// the same guest, stats-for-stats.
+fn decode_mem_event(op: u32, args: &[i64]) -> Option<svm_interp::MemEvent> {
+    use svm_interp::MemEvent as E;
+    use svm_opt::instrument::mem_hook_op as k;
+    let a = |i: usize| args.get(i).copied().map(|v| v as u64);
+    Some(match (op, args.len()) {
+        (k::LOAD, 2) => E::Load {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::STORE, 2) => E::Store {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_LOAD, 2) => E::AtomicLoad {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_STORE, 2) => E::AtomicStore {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_RMW, 2) => E::AtomicRmw {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_CMPXCHG, 2) => E::AtomicCmpxchg {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::COPY, 3) => E::Copy {
+            dst: a(0)?,
+            src: a(1)?,
+            len: a(2)?,
+        },
+        (k::FILL, 2) => E::Fill {
+            dst: a(0)?,
+            len: a(1)?,
+        },
+        _ => return None,
+    })
+}
+
+/// Profile `[ptr, len)`'s module (function 0, deny-all plus the hook grant — a compute guest):
+/// instrument with the W3 pass, re-verify (fail-closed like every rewrite), run on the bytecode
+/// engine feeding a [`svm_dap::models::MemModel`] (geometry from the args; `0` = the teaching
+/// default), and stash the stats JSON for [`svm_mem_profile_stats_ptr`]. Returns `0` on a clean
+/// run, `1` on a guest trap (stats still stashed — the final event is the attempted faulting
+/// access), `-1` undecodable, `-2` manifest-carrying (fail-closed: the hook grant would occupy
+/// import slot 0 — IMPORTS.md §2.1, the `svm-run` rule), `-3` failed re-verification, `-4`
+/// outside the bytecode subset.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn svm_mem_profile(
+    ptr: *const u8,
+    len: usize,
+    l1_sets: u32,
+    l1_ways: u32,
+    l1_line: u32,
+    l2_sets: u32,
+    l2_ways: u32,
+    l2_line: u32,
+    page_size: u32,
+) -> i32 {
+    use std::sync::{Arc, Mutex};
+    let put = |data: Vec<u8>| unsafe { stash(&mut *core::ptr::addr_of_mut!(MEMPROF), data) };
+    // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        put(Vec::new());
+        return -1;
+    };
+    if !m.imports.is_empty() {
+        put(Vec::new());
+        return -2;
+    }
+    // Discover the handle the hook grant will mint (grants are deterministic; the run host below
+    // grants the hook first, so a scratch first-grant yields the exact baked-in value).
+    let handle = {
+        let mut scratch = Host::new();
+        scratch.grant_host_fn(Box::new(|_, _, _| Ok(vec![])))
+    };
+    let spec = svm_opt::instrument::MemHookSpec {
+        type_id: svm_interp::cap_id::HOST_FN,
+        handle,
+    };
+    let (im, _stats) = svm_opt::instrument::instrument_mem_hooks(&m, spec);
+    if let Err(e) = svm_verify::verify_module(&im) {
+        put(format!("{e:?}").into_bytes()); // the error text, for diagnostics
+        return -3;
+    }
+    let d = svm_dap::models::MemModelCfg::default();
+    let dim = |v: u32, def: u64| if v == 0 { def } else { v as u64 };
+    let cfg = svm_dap::models::MemModelCfg {
+        l1: svm_dap::models::CacheCfg {
+            sets: dim(l1_sets, d.l1.sets),
+            ways: if l1_ways == 0 {
+                d.l1.ways
+            } else {
+                l1_ways as usize
+            },
+            line: dim(l1_line, d.l1.line),
+        },
+        l2: svm_dap::models::CacheCfg {
+            sets: dim(l2_sets, d.l2.sets),
+            ways: if l2_ways == 0 {
+                d.l2.ways
+            } else {
+                l2_ways as usize
+            },
+            line: dim(l2_line, d.l2.line),
+        },
+        page_size: dim(page_size, d.page_size),
+    };
+    let model = Arc::new(Mutex::new(svm_dap::models::MemModel::new(cfg)));
+    model
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_snapshots(false); // run-mode: forward-only clock, no seeks
+    let feed = Arc::clone(&model);
+    let mut host = Host::new();
+    let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
+    let h = host.grant_host_fn(Box::new(move |op, args, _mem| {
+        if let Some(ev) = decode_mem_event(op, args) {
+            n += 1;
+            feed.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(n, 0, ev);
+        }
+        Ok(vec![])
+    }));
+    debug_assert_eq!(h, handle, "the hook grant is the first grant");
+    let mut fuel = u64::MAX;
+    let res = bytecode::compile_and_run_with_host(&im, 0, &[], &mut fuel, &mut host);
+    let status = match &res {
+        None => {
+            put(Vec::new());
+            return -4;
+        }
+        Some(Ok(_)) => 0,
+        Some(Err(_)) => 1,
+    };
+    let json = model
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stats_json()
+        .to_string();
+    put(json.into_bytes());
+    status
+}
+
+/// Pointer / length of the most recent [`svm_mem_profile`] stats JSON.
+#[no_mangle]
+pub extern "C" fn svm_mem_profile_stats_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(MEMPROF)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_mem_profile_stats_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(MEMPROF)).1 }
+}
+
 // ---- wasm-JIT tier (BROWSER.md § "wasm-JIT tier"), slice 2: emit + expose to the JS host ---------
 
 /// Trap codes the emitted wasm delivers through its `env.trap` import — re-exported from the

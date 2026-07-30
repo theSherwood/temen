@@ -457,7 +457,18 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    stream** on the same program (uninstrumented vs. instrumented) across the full `MemEvent`
 >    vocabulary; a bulk-op watchpoint fires at the same clock on both engines; all debug parity
 >    tests pass with a sink installed.
-> 4. **X2 + X4's fault counter — cache/coherence + paging models, host-side in the cdylib.** A
+> 4. ~~**X2 + X4's fault counter**~~ **DONE 2026-07-30** — `svm-dap::models::MemModel`: per-vCPU
+>    L1s + shared L2 with MESI line states and LRU, first-touch fault counter, `memModel` launch
+>    arg + `memModelStats` request (counters + line-state grids JSON), armed through a `Debuggee`
+>    capability probe (tree-walker fails closed). Seek consistency by a **model-side snapshot
+>    ladder at the engine's stride** (no new engine seam needed — the `checkpoint_clocks()` idea
+>    was dropped as unnecessary): `seek(t)` model state ≡ a from-0 run to `t`, pinned through the
+>    real checkpoint ladder. The **W3 browser export** landed as `svm_mem_profile` (+ stats
+>    readback): the cdylib adds wasm-clean `svm-opt`, instruments locally (manifest-carrying
+>    modules refused, the svm-run slot-0 rule), and feeds the same model — with the **two feeds
+>    pinned equal** (`browser/tests/mem_profile.rs`: hook-fed ≡ sink-fed stats-for-stats;
+>    `crates/svm-dap/tests/mem_model.rs`: ordering, faults, seek consistency, DAP flow). Original
+>    spec: A
 >    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
 >    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
 >    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
