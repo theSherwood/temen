@@ -2844,6 +2844,15 @@ unsafe fn powerbox_compile_run(
             quota,
             CLI_JIT_TABLE_LOG2,
         )?;
+        // Fiber-hosting grant (`set_jit_hosts_fibers`, e.g. the powerbox): stand up the fiber runtime
+        // so a submitted unit's `cont.*` resolve even when the top-level module uses no fibers itself.
+        // Idempotent when the top-level already built its fiber runtime (`enable_fiber_hosting`).
+        if m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jit_hosts_fibers()
+        {
+            cm.enable_fiber_hosting(quota)?;
+        }
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
@@ -2876,6 +2885,11 @@ unsafe fn powerbox_compile_run(
         CLI_JIT_TABLE_LOG2,
     )?;
     let host = &mut *raw_host;
+    // Fiber-hosting grant (see the locked branch above): enable it so a submitted unit's `cont.*`
+    // resolve even when this (single-threaded) top-level module uses no fibers of its own.
+    if host.jit_hosts_fibers() {
+        cm.enable_fiber_hosting(quota)?;
+    }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
     // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
@@ -3076,6 +3090,14 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
     h.set_jit_validator(jit_blob_validator);
+    // The powerbox `Jit` grant hosts §12 **fibers** (`cont.*`) in submitted units (DESIGN.md §22
+    // "Concurrency"): the maximal CLI grant admits a unit running its own cooperative scheduler —
+    // e.g. `[interpret …]` of concurrent JACL source (spawn/await), whose in-guest entry runs the
+    // program body on a scheduler root fiber. `powerbox_compile_run` reads this to `enable_fiber_hosting`
+    // on the top-level module so a submitted unit's `cont.*` resolve even when the top-level program
+    // uses no fibers of its own. Threads/futex in a submitted unit stay rejected (they would outlive
+    // the synchronous `cap.call`). In-domain stack switches, not an escape vector.
+    h.set_jit_hosts_fibers(true);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
     let v = [
         h.grant_stream(StreamRole::Out),
