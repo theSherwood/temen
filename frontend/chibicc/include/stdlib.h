@@ -47,10 +47,30 @@ static void abort(void) {
 #define __SVM_HEAP_BASE 268435456L // 256 MiB: above the (<= 64 MiB) backed prefix, in the tail
 #define __SVM_HDR 16L // per-allocation header (holds the payload size; keeps 16-byte alignment)
 
-static long __svm_brk = __SVM_HEAP_BASE;       // next free byte (atomic bump pointer)
-static long __svm_committed = __SVM_HEAP_BASE; // first byte past the committed region
-static long __svm_page = 0;                    // cached host page granularity (0 = not yet queried)
-static int __svm_grow_lock = 0;                // spinlock guarding heap *growth* (page commits) only
+// Allocator-state linkage. A whole-program build (the on-ramp, and every playground program) is one
+// translation unit, so the bump-pointer state is a self-contained `static`. The **emit-object
+// multi-TU self-host** build is different: each TU `#include`s this header and would otherwise mint
+// its *own* `static __svm_brk` at 256 MiB, so the per-TU allocators would hand out **overlapping**
+// addresses and corrupt each other at run time. There the state must be a **single shared instance**:
+// the emit-object build force-includes `selfhost_prelude.h` (which sets `__SVM_LIBC_EXTERN`), the libc
+// unit (`emit_libc.c`) additionally sets `__SVM_LIBC_OWNER` to hold the one definition, and every other
+// TU sees an `extern` and links to it cross-TU (the same data-symbol path as chibicc's `ty_int`). The
+// allocator *functions* below stay `static` per unit — only this *state* is shared, so all the per-TU
+// `malloc`s cooperate on one bump pointer.
+#if defined(__SVM_LIBC_OWNER)
+#define __SVM_HEAP_STATE            // exported definition (non-`static` ⇒ an emit-object data symbol)
+#define __SVM_HEAP_INIT(v) = (v)
+#elif defined(__SVM_LIBC_EXTERN)
+#define __SVM_HEAP_STATE extern     // imported: declaration only, no storage, no initializer
+#define __SVM_HEAP_INIT(v)
+#else
+#define __SVM_HEAP_STATE static     // whole-program: self-contained, as before
+#define __SVM_HEAP_INIT(v) = (v)
+#endif
+__SVM_HEAP_STATE long __svm_brk __SVM_HEAP_INIT(__SVM_HEAP_BASE);       // next free byte (bump pointer)
+__SVM_HEAP_STATE long __svm_committed __SVM_HEAP_INIT(__SVM_HEAP_BASE); // first byte past committed
+__SVM_HEAP_STATE long __svm_page __SVM_HEAP_INIT(0);                    // cached host page granularity
+__SVM_HEAP_STATE int __svm_grow_lock __SVM_HEAP_INIT(0);               // spinlock for heap *growth* only
 
 // Heap-growth granularity = the **host page**, queried once and cached. The runtime's `map` commits
 // and zero-fills the whole host page(s) covering a request (host-page default: 4 KiB on x86-64,
