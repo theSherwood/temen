@@ -108,3 +108,21 @@ fn aggregate_local_in_frame() {
     let sp = 4096;
     assert_eq!(run(&m, 0, &[sp]), 60);
 }
+
+#[test]
+fn oconstr_aggregate_argument() {
+    // An aggregate literal in *argument* position: `caller` builds `{a:x, b:7}` inline and passes it
+    // to `addp` by value. The `(oconstr …)` is constructed into a scratch frame temp and passed
+    // by-address. `addp` reads a+b through its by-address param. caller(5) = addp({5,7}) = 12.
+    let leng = "\
+(stmts
+ (type :P.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64))))
+ (proc :addp.0 (params (param :p.0 . P.0.)) (i +64) .
+  (stmts . (ret (add (i +64) (dot p.0 a.0 0) (dot p.0 b.0 0)))))
+ (proc :caller.0 (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (call addp.0 (oconstr P.0. (kv a.0 x.0) (kv b.0 7)))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // caller is frame-needing (holds the temp): ($sp, x) -> i64.
+    assert_eq!(run(&m, 1, &[4096, 5]), 12, "addp of a+b with a=5, b=7");
+    assert_eq!(run(&m, 1, &[4096, 100]), 107);
+}

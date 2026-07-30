@@ -596,6 +596,31 @@ impl Translator {
         }
     }
 
+    /// The frame bytes needed for aggregate-rvalue temps in a body: each aggregate `(oconstr T …)` /
+    /// `(aconstr T …)` in **call-argument** position (the only spot emission builds a temp — an
+    /// aggregate arg passes by-address). Matching emission exactly matters: an aggregate constructor
+    /// in *return*/assign position builds in place, not a temp, and must NOT reserve space (else the
+    /// proc becomes spuriously frame-needing and its ABI changes). See [`FuncGen::agg_rvalue_temp`].
+    fn agg_temp_bytes(&self, node: &Node) -> u64 {
+        let mut total = 0;
+        if node.tag() == Some("call") {
+            for arg in node.args().iter().skip(1) {
+                if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
+                    if let Some(Ok(d @ TyDesc::Agg(_))) = arg.args().first().map(|t| self.tydesc(t))
+                    {
+                        total += self.sizeof(&d);
+                    }
+                }
+            }
+        }
+        if let Node::List(items) = node {
+            for c in items {
+                total += self.agg_temp_bytes(c);
+            }
+        }
+        total
+    }
+
     /// The type descriptor of a Leng type node: a named symbol is an aggregate; `ptr`/`aptr` are
     /// scalar `i64` (the pointer itself); otherwise an integer scalar.
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
@@ -1191,7 +1216,13 @@ impl Translator {
                 }
             }
         }
-        let needs_frame = !mem.is_empty();
+        // Reserve scratch frame space above the named locals for **aggregate rvalue temps** (an
+        // `(oconstr T …)` passed as a call argument is constructed here and passed by-address).
+        let temp_base = frame_size;
+        if let Some(b) = body {
+            frame_size += self.agg_temp_bytes(b);
+        }
+        let needs_frame = frame_size > 0;
         let has_sret = sret_desc.is_some();
 
         // SSA slots (block-parameter set): [$sp] ++ [$sret] ++ params ++ non-framed scalar vars.
@@ -1232,6 +1263,7 @@ impl Translator {
             needs_frame,
             mem,
             frame_size,
+            temp_base,
             sret,
         );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
@@ -1279,6 +1311,9 @@ struct FuncGen<'a> {
     mem: HashMap<String, (u64, TyDesc)>,
     /// Total frame bytes; a call to a frame-needing proc passes `sp + frame_size` as its frame.
     frame_size: u64,
+    /// Bump pointer into the aggregate-rvalue temp region (`[temp_base, frame_size)`) — the next
+    /// scratch offset an `(oconstr …)` argument is constructed at.
+    temp_next: u64,
     /// `Some((slot, desc))` when this proc returns an aggregate by sret: `cur[slot]` is the caller's
     /// destination pointer, into which `ret` copies/constructs the aggregate before a void return.
     sret: Option<(usize, TyDesc)>,
@@ -1317,6 +1352,7 @@ impl<'a> FuncGen<'a> {
         has_sp: bool,
         mem: HashMap<String, (u64, TyDesc)>,
         frame_size: u64,
+        temp_base: u64,
         sret: Option<(usize, TyDesc)>,
     ) -> Self {
         let slot_of = slots
@@ -1334,6 +1370,7 @@ impl<'a> FuncGen<'a> {
             local_desc,
             has_sp,
             mem,
+            temp_next: temp_base,
             frame_size,
             sret,
             label_block: HashMap::new(),
@@ -2862,9 +2899,42 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
-    /// One call argument → its SVM value id. An **aggregate** argument is passed by address (the
-    /// callee's param is a by-address pointer); a scalar is evaluated and coerced to the param type.
+    /// Allocate `size` bytes of aggregate-rvalue scratch (`sp + temp_next`) and bump the pointer.
+    fn alloc_temp(&mut self, size: u64) -> u32 {
+        let off = self.temp_next;
+        self.temp_next += size;
+        let sp = self.cur[0];
+        self.add_const_off(sp, off)
+    }
+
+    /// If `node` is an **aggregate rvalue** — `(oconstr T …)`/`(aconstr T …)` with an aggregate `T` —
+    /// construct it into a fresh temp slot and return `(temp address, desc)`; else `None`. This is how
+    /// an aggregate literal reaches *argument* position (aggregates are passed by-address), e.g.
+    /// `(call &.0. s (oconstr string …))`.
+    fn agg_rvalue_temp(&mut self, node: &Node) -> Result<Option<(u32, TyDesc)>, LengError> {
+        if !matches!(node.tag(), Some("oconstr") | Some("aconstr")) {
+            return Ok(None);
+        }
+        let tnode = node
+            .args()
+            .first()
+            .ok_or_else(|| LengError::Malformed("constructor needs a type".into()))?;
+        let desc = self.t.tydesc(tnode)?;
+        if !matches!(desc, TyDesc::Agg(_)) {
+            return Ok(None);
+        }
+        let addr = self.alloc_temp(self.t.sizeof(&desc));
+        self.assign_aggregate(addr, &desc, node)?;
+        Ok(Some((addr, desc)))
+    }
+
+    /// One call argument → its SVM value id. An **aggregate** argument is passed by address: an
+    /// aggregate *lvalue* by its own address, an aggregate *rvalue* (`(oconstr …)`) via a temp; a
+    /// scalar is evaluated and coerced to the param type.
     fn call_arg(&mut self, arg: &Node, want: ValType) -> Result<u32, LengError> {
+        if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+            return Ok(addr);
+        }
         if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
             let (addr, _) = self.lvalue_addr(arg)?;
             return Ok(addr);
@@ -2885,7 +2955,10 @@ impl<'a> FuncGen<'a> {
         let mut argtys = Vec::new();
         for arg in args {
             // Aggregate args pass by address (matching by-address params); scalars by value.
-            if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+                argvals.push(addr);
+                argtys.push(ValType::I64);
+            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
                 let (addr, _) = self.lvalue_addr(arg)?;
                 argvals.push(addr);
                 argtys.push(ValType::I64);
