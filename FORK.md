@@ -176,10 +176,18 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   vs the original §8.2 plan:** because both copies resume in the **same live run**, no durable window-image
   serialization is needed — the reply crosses via the existing race-safe `cap_reply_or_stash` path. The
   durable freeze/flatten (§8.2) is only relevant to *snapshot/migration*, which is off fork's live path.
-- **Increment 3 — the twin + second ticket. NEXT (the deep core; see §8.3).** Duplicate the parked caller
-  vCPU (its live window + continuation) into a fresh domain parked under a second ticket; the servicer
-  replies to both. The powerbox duplication is the crux (the S13 CoW-clone heart).
-- **PR 3 — the `fork` personality op** replies `pid`/`0` to the two tickets (FORK.md §5).
+- **Increment 3 — the twin. DONE (PR #531 = primitives; this PR = wiring).** `clone_caller(reply_orig,
+  reply_twin)` duplicates the parked caller vCPU into a fresh domain (`VCpu::fork_twin` over
+  `Mem::fork_private` + `Host::fork_powerbox`) and delivers each its reply via
+  `Scheduler::fork_parked_caller`. Both resume past the same fork `cap.call` — return-twice, one live
+  run. **No second ticket** in the end: the twin's reply is known at clone time, so it is enqueued
+  `runnable` with `pending = CapResult(reply_twin)` rather than parked. Only a **bare** root park (no
+  children/fibers) forks; otherwise it degrades to a single reply (never hangs). `fork_powerbox` shares
+  `live_impls` (a forking caller always holds the offer it is parked in).
+- **PR 3 — the `fork` personality op** replies `pid`/`0` to the two copies, and **re-wires the
+  personality's closure caps** (libc `host_fns`, fds) into the twin — the part `fork_powerbox` fails
+  closed on. That closure re-wiring, and a `Waiter::Fiber` (non-root) caller, are what remain for a real
+  bash `fork()`.
 
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
