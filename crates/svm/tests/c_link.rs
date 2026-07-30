@@ -75,8 +75,16 @@ fn selfhost_dir() -> PathBuf {
 /// spaced `-I dir` is a no-op — a real cc1 TU that isn't a sibling of `chibicc.h` needs this).
 #[cfg(target_os = "linux")]
 fn emit_object_real(cfile: &Path, include_dirs: &[PathBuf], tag: &str) -> LinkUnit {
+    // Unique per call: the test binary runs tests in parallel threads (one process ⇒ one pid), and
+    // several compile the same `tag` (e.g. `emit_libc.c` from three different tests). A pid+tag-only
+    // name would let those concurrent compiles clobber each other's IR file mid-write — a real race
+    // that surfaced as a libc unit with missing exports. The atomic id makes every output distinct,
+    // matching what `object_unit` already does for the string-sourced units.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
     let irfile = std::env::temp_dir().join(format!(
-        "svm_clink_real_{}_{}.svm",
+        "svm_clink_real_{}_{}_{id}.svm",
         tag.replace(['.', '/'], "_"),
         std::process::id()
     ));
