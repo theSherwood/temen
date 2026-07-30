@@ -182,6 +182,131 @@ fn real_cross_module_global() {
 }
 
 #[test]
+fn cross_module_value_type_resolves() {
+    // Module `u` declares a local of type `Pair.0.modp` — *defined in module `p`*. Unlike proc/data
+    // symbols (resolved at link time), an aggregate type's layout is needed at *translate* time
+    // (field offsets are baked into loads/stores), so `link_units` pools every unit's type defs
+    // under their stem-suffixed global names before translating any. mk(v) = p.x + p.y = v + 7.
+    let mod_p = "\
+(stmts
+ (type :Pair.0. . (object . (fld :x.0 . (i +64)) (fld :y.0 . (i +64)))))";
+    let mod_u = "\
+(stmts
+ (proc :mk.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :p.0 . Pair.0.modp (oconstr Pair.0.modp (kv x.0 v.0) (kv y.0 7)))
+   (ret (add (i +64) (dot p.0 x.0 0) (dot p.0 y.0 0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["mk.0."],
+        },
+        LengModule {
+            stem: "modp",
+            src: mod_p,
+            names: &[], // type-only unit: it just defines `Pair`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // mk is frame-needing (aggregate local): ($sp, v) -> i64.
+    assert_eq!(run(&linked, 0, &[4096, 35]), 42, "p.x + p.y = 35 + 7");
+    // Compiled *standalone*, the same unit fail-closes — the external layout exists only across
+    // the link. No silent scalar-guess for a value of an unknown aggregate type.
+    assert!(
+        svm_leng::compile_object(&LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["mk.0."],
+        })
+        .is_err(),
+        "standalone object with an external value type must fail closed"
+    );
+}
+
+#[test]
+fn nested_cross_module_types_resolve() {
+    // `Outer.0.modp` embeds `Inner.0.` *by value*. The pooled export rewrites the field's type
+    // name to its suffixed form (`Inner.0.modp`), so the importing unit resolves the nested layout
+    // too: get(v) = pre + in.b = 9 + v.
+    let mod_p = "\
+(stmts
+ (type :Inner.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64))))
+ (type :Outer.0. . (object . (fld :pre.0 . (i +64)) (fld :in.0 . Inner.0.))))";
+    let mod_u = "\
+(stmts
+ (proc :get.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :o.0 . Outer.0.modp .)
+   (asgn (dot (dot o.0 in.0 0) b.0 0) v.0)
+   (asgn (dot o.0 pre.0 0) 9)
+   (ret (add (i +64) (dot o.0 pre.0 0) (dot (dot o.0 in.0 0) b.0 0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["get.0."],
+        },
+        LengModule {
+            stem: "modp",
+            src: mod_p,
+            names: &[],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(
+        run(&linked, 0, &[4096, 33]),
+        42,
+        "9 + 33 through the nested field"
+    );
+}
+
+/// Real nimony `greet(): string = "hello"` — the SSO literal — linked against a stand-in system
+/// unit carrying the real `string` def under the real system stem. `string.0.sysvq0asl` resolves
+/// from the *linked unit's* type def: no hand-supplied prelude (contrast `strings.rs`, which feeds
+/// the same fixture through `translate_proc_with_types`). The ARC hooks `=wasMoved`/`=destroy`
+/// bind to no-op stubs (an SSO literal owns no heap). greet writes its result through sret —
+/// bytes = the packed literal, more = nil — identically on both engines.
+#[test]
+fn real_string_type_resolves_across_link() {
+    const REAL: &str = include_str!("fixtures/real_string.leng.nif");
+    let system_stub = "\
+(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr (i +64)))))
+ (proc :=wasMoved.2. (params (param :p.0 . (ptr (i +64)))) . . (stmts . (ret .)))
+ (proc :=destroy.2. (params (param :s.0 . (ptr string.0.))) . . (stmts . (ret .))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "strmodx",
+            src: REAL,
+            names: &["greet.0."],
+        },
+        LengModule {
+            stem: "sysvq0asl",
+            src: system_stub,
+            names: &["=wasMoved.2.", "=destroy.2."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // greet (func 0) is frame-needing and aggregate-returning: ($sp, $sret) -> ().
+    let (sp, sret) = (1024i64, 512usize);
+    let seed = vec![0u8; 4096];
+    let ivals = vec![Value::I64(sp), Value::I64(sret as i64)];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = svm_interp::run_capture(&linked, 0, &ivals, &mut fuel, &seed);
+    ir.expect("interp greet");
+    let (_jout, jmem) =
+        svm_jit::compile_and_run_capture(&linked, 0, &[sp, sret as i64], &seed).expect("jit greet");
+    let n = imem.len().min(jmem.len());
+    assert_eq!(imem[..n], jmem[..n], "§9 interp/JIT window parity");
+    let bytes = u64::from_le_bytes(imem[sret..sret + 8].try_into().unwrap());
+    let more = u64::from_le_bytes(imem[sret + 8..sret + 16].try_into().unwrap());
+    assert_eq!(bytes, 122511465736197, "the packed \"hello\" SSO word");
+    assert_eq!(more, 0, "short string: `more` is nil");
+}
+
+#[test]
 fn unresolved_cross_module_call_is_fail_closed() {
     // `top` calls `missing.0.modx`, which no linked unit exports → a clean link error.
     let mod_a = "\

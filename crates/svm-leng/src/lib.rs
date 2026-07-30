@@ -165,9 +165,15 @@ pub struct LengModule<'a> {
 /// Link-unit mode: globals via `data.self` (so `link` relocates each unit's data into a disjoint
 /// window region — an absolute-offset unit would silently alias), and each proc exported under its
 /// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
-fn translate_object_module(unit: &LengModule) -> Result<Module, LengError> {
+/// `ext_types` are external aggregate layouts (sibling units' pooled type defs, under their
+/// stem-suffixed names) available while translating — see [`link_units`].
+fn translate_object_module(
+    unit: &LengModule,
+    ext_types: &[(String, translate::Layout)],
+) -> Result<Module, LengError> {
     let root = nif::parse(unit.src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
+    t.import_types(ext_types);
     let text = t.some_procs(&root, unit.names)?;
     let mut module = svm_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
@@ -195,8 +201,15 @@ fn translate_object_module(unit: &LengModule) -> Result<Module, LengError> {
 /// unit: globals via `data.self`, cross-module callees as named imports, and its procs exported
 /// **in-band** under their global names. Untrusted like any frontend output — the bytes pass the
 /// hardened `decode_unit` firewall on the way back in, and the linked result is re-verified.
+///
+/// Compiled **standalone**, without sibling units: a value of an aggregate type *another* module
+/// defines (a `string` literal's `string.0.<stem>`) fail-closes here, because its layout is needed
+/// at translate time. [`link_units`] pools the linked units' type defs so those resolve.
 pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
-    Ok(svm_encode::encode_unit(&translate_object_module(unit)?))
+    Ok(svm_encode::encode_unit(&translate_object_module(
+        unit,
+        &[],
+    )?))
 }
 
 /// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), *through the `.svmo`
@@ -206,8 +219,27 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
 /// object is a first-class citizen the shared linker — and other frontends' objects — compose with.
 /// Units keep the given order, so the first module's first proc is func 0 (a natural entry). Not
 /// verified here (untrusted frontend — the caller runs `svm_verify::verify_module` on the result).
+///
+/// **Cross-module type resolution**: proc and data symbols resolve at *link* time, but an aggregate
+/// **type**'s layout is needed at *translate* time (field offsets are baked into loads/stores). So
+/// before translating any unit, every unit's `(type …)` defs are pooled under their stem-suffixed
+/// global names ([`translate::Translator::export_types`]) and made available to all — a module
+/// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
+/// hand-supplied prelude.
 pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
-    let objects: Vec<Vec<u8>> = units.iter().map(compile_object).collect::<Result<_, _>>()?;
+    let mut pooled = Vec::new();
+    for unit in units {
+        let root = nif::parse(unit.src).map_err(LengError::Parse)?;
+        pooled.extend(translate::Translator::export_types(&root, unit.stem)?);
+    }
+    let objects: Vec<Vec<u8>> = units
+        .iter()
+        .map(|u| {
+            Ok(svm_encode::encode_unit(&translate_object_module(
+                u, &pooled,
+            )?))
+        })
+        .collect::<Result<_, LengError>>()?;
     let mut link_units = Vec::with_capacity(objects.len());
     for bytes in &objects {
         let module = svm_encode::decode_unit(bytes)

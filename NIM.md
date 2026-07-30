@@ -491,10 +491,22 @@ plumbing. Five workstreams, roughly independent:
     over-`i64::MAX` unsigned literal, and **real nimony `greet(): string = "hello"`** (genuine SSO
     `oconstr` by sret — translates + verifies given the real `string` def; running needs the ARC
     `=wasMoved`/`=destroy` imports, W3).
-  - **Remaining for full W2:** automatic cross-module **type** resolution (pool the linked units'
-    type defs so `string.0.<stem>` resolves without a hand-supplied prelude — the architectural
-    knot is that `svm-leng` computes aggregate layouts at *translate* time, so the defining unit's
-    types must be present then), long-string (`LongString`) data, and whole-module scaffolding
+  - **✅ Automatic cross-module type resolution — DONE 2026-07-30.** The third symbol kind after
+    funcs and data. Proc/data symbols resolve at *link* time, but an aggregate **type**'s layout is
+    needed at *translate* time (field offsets are baked into loads/stores) — so `link_units` first
+    pools every unit's `(type …)` defs under their stem-suffixed global names
+    (`Translator::export_types`, rewriting nested same-module field types to their suffixed forms
+    too) and pre-registers the pool in each unit's translator (`import_types`) before translating
+    any. A module constructing a `string.0.sysvq0asl` now gets the system module's layout
+    automatically; `translate_proc_with_types` remains as the manual escape hatch for
+    single-module entry points. A *standalone* `compile_object` of a unit with an external value
+    type still fail-closes (the layout only exists across the link) — if that ever needs to work
+    without siblings, types would ride in-band in `.svmo`, a format question for later. Tested:
+    hand-written flat + *nested* external value types (both run, both engines), the standalone
+    fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
+    against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
+    `more` land in the sret slot identically on both engines (`tests/link.rs`).
+  - **Remaining for full W2:** long-string (`LongString`) data, and whole-module scaffolding
     translation so the *entire* `system` module links (Path A), not hand-picked procs.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS

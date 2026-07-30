@@ -4,9 +4,10 @@
 //! `(oconstr string (kv bytes.0 <packed-u64>) (kv more.0 (nil)))` — no data segment at all.
 //!
 //! Two pieces make that lower: unsigned literals (`122511465736197u`) parse, and the external
-//! `string` type's layout is available. The layout normally comes from the `system` module across
-//! the link (cross-module type resolution, Path A); until that's automatic, `translate_proc_with_types`
-//! supplies it as a prelude — here, the *real* `string` def.
+//! `string` type's layout is available. `link_units` resolves the layout automatically from the
+//! defining unit (see `link.rs::real_string_type_resolves_across_link`); this file exercises the
+//! *manual* escape hatch, `translate_proc_with_types`, which supplies it as a prelude — here, the
+//! *real* `string` def.
 
 use svm_interp::Value;
 

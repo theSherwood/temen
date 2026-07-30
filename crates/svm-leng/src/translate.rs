@@ -100,14 +100,14 @@ struct Sig {
 /// What a computed lvalue address points at — a scalar (with load/store width) or a named
 /// aggregate (whose fields/elements are reached by further `dot`/`at`).
 #[derive(Clone, Debug)]
-enum TyDesc {
+pub(crate) enum TyDesc {
     Scalar(ValType),
     Agg(String),
 }
 
 /// The in-memory layout of a named aggregate type (`(type :Name … Body)`).
 #[derive(Clone, Debug)]
-enum Layout {
+pub(crate) enum Layout {
     /// `(object … (fld :f … T)*)` — fields packed at natural size (consistent within svm-leng;
     /// C-ABI/SysV offsets are a later refinement for host interop).
     Object {
@@ -381,12 +381,12 @@ impl Translator {
         }
         // Record which declared types are aggregates (object/array) *before* resolving, so
         // `tydesc` classifies every other named type (enum/distinct/…) as a scalar as it resolves
-        // fields.
-        self.agg_names = raw
-            .iter()
-            .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
-            .map(|(n, _)| n.clone())
-            .collect();
+        // fields. Extend (don't overwrite): external types registered by `import_types` stay.
+        self.agg_names.extend(
+            raw.iter()
+                .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
+                .map(|(n, _)| n.clone()),
+        );
         let names: Vec<String> = raw.keys().cloned().collect();
         for name in names {
             self.resolve_type(&name, &raw)?;
@@ -480,6 +480,67 @@ impl Translator {
         };
         self.types.insert(name.to_string(), layout);
         Ok(())
+    }
+
+    /// Pre-register **external** aggregate type layouts (another module's types, under the
+    /// stem-suffixed global names this module references them by — [`export_types`]). Must run
+    /// before `collect_types`, whose `resolve_type` skips already-registered names.
+    pub fn import_types(&mut self, ext: &[(String, Layout)]) {
+        for (name, layout) in ext {
+            self.agg_names.insert(name.clone());
+            self.types.insert(name.clone(), layout.clone());
+        }
+    }
+
+    /// Collect a module's aggregate type layouts under their **stem-suffixed global names** — the
+    /// form *other* modules reference them by (a type `T.0.` defined in module `stem` is
+    /// `T.0.<stem>` elsewhere, the same mangling as procs/gvars). Field/element types that name a
+    /// sibling type from the same module are rewritten to their suffixed form too, so nested
+    /// aggregates resolve in the importing translator. This is the cross-module *type* half of
+    /// linking (NIM.md W2): layouts are baked at translate time, unlike proc/data symbols, which
+    /// resolve at link time — so `link_units` pools these across its units before translating any.
+    pub fn export_types(root: &Node, stem: &str) -> Result<Vec<(String, Layout)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        let local: std::collections::HashSet<&String> = t.types.keys().collect();
+        let suffix = |n: &String| {
+            if local.contains(n) {
+                format!("{n}{stem}")
+            } else {
+                n.clone()
+            }
+        };
+        let rewrite = |d: &TyDesc| match d {
+            TyDesc::Agg(n) => TyDesc::Agg(suffix(n)),
+            s => s.clone(),
+        };
+        let mut out: Vec<(String, Layout)> = t
+            .types
+            .iter()
+            .map(|(name, layout)| {
+                let l = match layout {
+                    Layout::Object { fields, size } => Layout::Object {
+                        fields: fields
+                            .iter()
+                            .map(|(f, off, d)| (f.clone(), *off, rewrite(d)))
+                            .collect(),
+                        size: *size,
+                    },
+                    Layout::Array {
+                        elem,
+                        elem_size,
+                        size,
+                    } => Layout::Array {
+                        elem: rewrite(elem),
+                        elem_size: *elem_size,
+                        size: *size,
+                    },
+                };
+                (format!("{name}{stem}"), l)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
     }
 
     /// Translate a `(stmts TopLevelConstruct*)` module to SVM text (all procs).
