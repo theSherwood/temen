@@ -513,13 +513,20 @@ impl Translator {
             let w = elem_size.min(8);
             let mut bytes = vec![0u8; total];
             for (i, v) in a[1..].iter().enumerate() {
-                let n = match int_literal(v) {
-                    Some(n) => n,
-                    None => return Ok(None),
-                };
                 let off = i * elem_size;
-                if off + w <= bytes.len() {
-                    bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
+                if let Some(n) = int_literal(v) {
+                    if off + w <= bytes.len() {
+                        bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
+                    }
+                } else if let Some((ebytes, _)) = self.const_aggregate_bytes(v)? {
+                    // An **aggregate** element (an array of `string`s — each an SSO `oconstr`):
+                    // materialize it recursively and place its bytes.
+                    let end = (off + ebytes.len()).min(bytes.len());
+                    if off < end {
+                        bytes[off..end].copy_from_slice(&ebytes[..end - off]);
+                    }
+                } else {
+                    return Ok(None);
                 }
             }
             return Ok(Some((bytes, TyDesc::Agg(tyname.to_string()))));
@@ -3192,6 +3199,7 @@ fn int_literal(node: &Node) -> Option<i64> {
         // Boolean literals are integer-valued (`case` over a bool branches on `(true)`/`(false)`).
         Some("true") => return Some(1),
         Some("false") => return Some(0),
+        Some("nil") => return Some(0), // a null pointer literal (a `string`'s `more` in an SSO const)
         _ => {}
     }
     node.as_atom()
