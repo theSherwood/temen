@@ -235,25 +235,37 @@ parent**, so the parked caller is the child's own vCPU (`Waiter::VCpu(child)`) a
 the twin as a sibling child it holds.
 
 **The twin, on the live parked vCPU `v` (= `Waiter::VCpu`).** No durable serialization — copy the live
-structure:
-  1. **Window:** `twin_mem` = a fresh `Mem` seeded from `v.mem`'s bytes (`snapshot`/`seed`, or a
-     `fork_for_thread`-style deep copy). A private window — fork does **not** share memory.
-  2. **Continuation:** `twin.frames = v.frames.clone()`, positioned at the same post-`cap.call` resume
-     point, `pending = CapResult(reply_for_twin)`.
-  3. **Powerbox — the crux (S13 CoW-clone heart).** `twin_host` = a fresh `Host` that **copies `v.host`'s
-     handle table** (`table: Vec<Slot>`) so the twin has its own handle namespace, but **shares** the
-     `Arc`-backed capability backings that POSIX fork shares (pipes/`PipeBacking`, regions/`RegionBacking`,
-     module grants — already `Arc`, so cloning the `Slot` clones the `Arc`) and gives the twin a **new
-     `domain_id`**. Deciding copy-vs-share per `Slot` kind is the sensitive part; get it wrong and either
-     the twin aliases the parent's private state (a confinement-adjacent correctness bug) or loses a shared
-     fd. Start with a **minimal powerbox** caller (just an instantiator handle, no pipes/regions) to prove
-     the table-copy + new-domain path, then extend to shared backings.
-  4. **Register + park:** enqueue `twin` as a new task/domain in the scheduler (a sibling child of the
-     servicer, recorded in its `nested_children`/`child_hosts` so it holds the `child_handle`), parked under
-     a **second** `(callee, ticket')` — or, since the twin's reply is known at clone time, just set its
-     `pending` and push it `runnable`.
-  5. **Return** the twin's `child_handle` to the servicer; the `fork` op (PR 3) then replies `pid` to the
-     original ticket (increment 2's path) and `0` to the twin.
+structure. Split into sub-slices by risk:
+
+- **Increment 3a — `Host::fork_powerbox`, the powerbox crux. DONE (PR #531).** A fresh `Host` that copies
+  the handle table (own namespace, same values → same bindings) over the same shared `Arc` backings POSIX
+  fork shares (regions/pipes + stdout/stderr sinks), new `domain_id`. **Fails closed** on any domain with
+  closure host caps (not `Clone`), live offers, module grants, or JIT/ring/serve/freeze state — the
+  personality re-wires those (PR 3). Copy-vs-share decided per backing, never silent. Unit-tested.
+- **Increment 3b — wire the twin into `clone_caller`. NEXT.** The remaining sub-steps, each with a real
+  primitive gap to fill:
+  1. **Window deep-copy — a NEW `Mem` primitive is needed.** Both existing builders *share* the backing
+     bytes: `fork_for_thread` shares the `Arc<Region>` + address space, `nested_view` shares bytes and
+     confines. Fork needs a **private copy** of the caller's window (a fresh `Region` with `v.mem`'s bytes
+     memcpy'd in, its own address space) — write `Mem::fork_private()` (snapshot `v.mem`'s window, seed a
+     fresh backing). A shared window would make the two copies alias memory — not a fork.
+  2. **Continuation:** `twin.frames = v.frames.clone()`, `pending = CapResult(reply_for_twin)`, and a
+     **fresh `registry`** (the twin is its own domain, not sharing `v`'s fiber table).
+  3. **Register in the scheduler:** build the twin `Box<VCpu>` with a new `TaskId` and push it `runnable`
+     (its reply is known at clone time — no second-ticket park needed). Reuse the `thread.spawn`
+     vCPU-construction shape; register it as the servicer's child so it holds the `child_handle`.
+  4. **Dual reply + return:** reply `reply_orig` to `v` (increment 2's path) and hand `twin` `reply_twin`
+     via its `pending`; return the twin's `child_handle`. `clone_caller`'s signature grows a second reply
+     arg (or the `fork` op supplies both in PR 3).
+  5. **Observability harness (correct topology):** parent spawns child; child calls the parent's servicer
+     and parks (→ `Waiter::VCpu(child)`); the parent clones it. Both copies write their reply to the
+     **shared stdout sink** (fork shares stdout) so the test sees both `A` and `B` — avoids join-table
+     plumbing for the first proof.
+- **PR 3 — the `fork` personality op** replies `pid`/`0`, and re-wires the personality's closure caps
+  (libc host_fns, fds) into the twin (the part `fork_powerbox` fails closed on).
+
+**Success criterion:** one servicer handler, one caller child; `clone_caller` inside → the original returns
+`A` and the twin returns `B` from the **same** call site, both in one live run, interp==JIT.
 
 **Success criterion:** one servicer handler, one caller child that calls it; `clone_caller` inside the
 handler → the original returns `A` and the twin returns `B` from the **same** call site, both resuming in
