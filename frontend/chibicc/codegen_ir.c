@@ -1046,6 +1046,53 @@ static int gen_builtin_page_size(Node *node) {
   return r;
 }
 
+// Raw powerbox **Stream** primitives for the emit-object os layer (SELFHOST_C.md §7, 2c). An os shim
+// that fd-dispatches file I/O (fd 0/1/2 → stream, fd≥3 → the fs cap) must *define* `write`/`read`, which
+// shadows the fd-less `write`/`read` builtins (§3e) — so it needs a *distinct* name to still reach
+// stdout/stdin without recursing into its own definition. `__vm_stream_write(buf,len)` /
+// `__vm_stream_read(buf,len)` lower to `call.sym "stream_write"/"stream_read"` on the Stream cap (the
+// host binds each name to its `(type_id, op)` — Stream op1/op0 — at load). The on-ramp reaches the same
+// endpoints through the `__vm_stream_*` svm-llvm intrinsics; this is the emit-object equivalent.
+static int gen_builtin_stream_raw(Node *node, const char *name) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_stream_write/read expects (buf, len)");
+  int buf, lenv;
+  eval2(a, a->next, &buf, &lenv);
+  buf = widen_i64(buf, a->ty);
+  int len = widen_i64(lenv, a->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = call.sym \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf, len);
+  return r; // i64 byte count
+}
+
+// The emit-object **filesystem** seam (SELFHOST_C.md §7, 2c). `--emit-object` doesn't lower the on-ramp's
+// `__vm_cap_resolve`/`__vm_host_call` (so an os shim can't reach an fs cap the on-ramp way), and its
+// generic host-cap lowering (`gen_builtin_import`) is off — so file I/O needs a recognized builtin. This
+// is it: `__vm_fs(op, a, b, c, d)` lowers to `call.sym "vm_fs"` with the **op selected by arg0** (mirroring
+// `__vm_host_call(handle, op, …)` but as a single named import), so the whole fs op protocol
+// (open/read/write/seek/close/stat — `crates/svm-run/src/fs.rs`) rides one manifest slot the host binds to
+// a seeded memfs. Args are simple expressions (like the other `__vm_*` builtins); no branching args.
+static int gen_builtin_fs(Node *node) {
+  int argc = 0;
+  for (Node *p = node->args; p; p = p->next)
+    argc++;
+  if (argc != 5)
+    error_tok(node->tok, "codegen_ir: __vm_fs expects (op, a, b, c, d)");
+  Node *a = node->args;
+  int op = widen_i64(gen_expr(a), a->ty);
+  int a1 = widen_i64(gen_expr(a->next), a->next->ty);
+  int a2 = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int a3 = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
+  int a4 = widen_i64(gen_expr(a->next->next->next->next), a->next->next->next->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = call.sym \"vm_fs\" (i64, i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d, v%d)\n",
+          r, h, op, a1, a2, a3, a4);
+  return r; // i64 result (fd / bytes / 0 / negative errno)
+}
+
 // §9/§12 async I/O ring builtins (iface 9). `__vm_io_submit_async(sq, n, counter)` lowers to
 // `cap.call 9 1`: kick `n` deferred ops (64-byte SQEs at `sq`, each a `Blocking.work`) onto the host
 // offload pool and **return immediately** with the count submitted. `__vm_io_reap(cq, max)` lowers to
@@ -1702,6 +1749,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_region_page_size(node);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
+        if (!strcmp(fname, "__vm_stream_write"))
+          return gen_builtin_stream_raw(node, "stream_write");
+        if (!strcmp(fname, "__vm_stream_read"))
+          return gen_builtin_stream_raw(node, "stream_read");
+        if (!strcmp(fname, "__vm_fs"))
+          return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
           return gen_builtin_fiber_new(node);
         if (!strcmp(fname, "__vm_fiber_resume"))

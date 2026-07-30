@@ -3588,6 +3588,22 @@ impl HostCap {
             iface: None,
         }
     }
+    /// The `Memory` capability: `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` are ops 0/1/2/3 on the
+    /// guest window. `op` selects which — so `HostCap::memory(0)` binds a `vm_map` import and
+    /// `HostCap::memory(3)` a `vm_page_size` import. Granting it twice (once per name) is fine: the
+    /// capability acts on the single shared window, not per-handle state, so both handles see the same
+    /// growth. This is the name-keyed ([`instantiate_with_imports`]) counterpart to the fixed powerbox's
+    /// one Memory grant serving all four names by `(type_id, op)`.
+    pub fn memory(op: u32) -> HostCap {
+        HostCap {
+            type_id: cap_id::MEMORY,
+            op,
+            grant: Arc::new(|h, _| h.grant_memory()),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
+    }
     /// A **host-defined** capability (iface [`cap_id::HOST_FN`]) — arbitrary semantics behind a named
     /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
     /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
