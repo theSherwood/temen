@@ -272,15 +272,31 @@ different things depending on which pair you compare:
   grown tail page — `map`/`unmap` zero on commit, so uncommitted pages read zero and round-trip trivially),
   and the prot map is reinstalled verbatim on restore. The root gate weakens from `snapshot_safe` to
   `layout_snapshot_safe`, whose sole disqualifier is §13 region aliasing (a `Backed` page's bytes live in a
-  shared cross-domain `SharedRegion`, not this window's backing). Nested children still use the stricter
-  bytes-only `snapshot_safe` (their prot maps aren't captured yet — slice 6b). Oracle:
-  `bytecode_debug_page_mapping.rs` — a fixture that grows/protects/unmaps then loads the unmapped page (a
-  terminal `MemoryFault`), round-tripped warm≡cold at **every** checkpointable clock on both the single-vCPU
-  `DebugRun` and the threaded `ScheduledDebugRun`; the forward replay re-executes the grown-page load (would
-  fault if the `Rw` entry were dropped) and the terminal unmapped load (would *not* fault, diverging, if the
-  `Unmapped` entry were dropped), so it pins protection-map fidelity, not just bytes. Still excluded (→
-  replay-from-0): **demand** coroutines / **page-mapping children** (nested prot maps — slice 6b) and §13
-  region-aliased windows.
+  shared cross-domain `SharedRegion`, not this window's backing). Oracle: `bytecode_debug_page_mapping.rs`
+  — a fixture that grows/protects/unmaps then loads the unmapped page (a terminal `MemoryFault`),
+  round-tripped warm≡cold at **every** checkpointable clock on both the single-vCPU `DebugRun` and the
+  threaded `ScheduledDebugRun`; the forward replay re-executes the grown-page load (would fault if the `Rw`
+  entry were dropped) and the terminal unmapped load (would *not* fault, diverging, if the `Unmapped` entry
+  were dropped), so it pins protection-map fidelity, not just bytes.
+
+  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** The bytes
+  +protmap capture now reaches §14 children too. A **demand** (`fault_yields`) coroutine — its window
+  starts all-`Unmapped`, pages supplied `Rw` by the parent on fault — and a coroutine or `instantiate`
+  child that `map`/`unmap`/`protect`ed its own confined window were the last non-pristine cases still
+  forcing replay-from-0. Now each child's **own page-protection map** rides in its snapshot
+  (`CoroSnapshot.prot` / `EnvSnapshot.prot`, via `Mem::prot_snapshot`/`install_prot`), reinstalled on the
+  rebuilt `nested_view`; the child's *bytes* still ride in the parent/shared window snapshot (they share
+  the backing region), and `CoroSnapshot` now also carries `fault_yields` so a mid-demand coroutine
+  resumes with the right fault semantics. The child gate (`child_checkpointable`, shared by both engines
+  for coroutines and envs) is `layout_snapshot_safe` (no §13 regions) **and** `nested_within_prefix` — the
+  child's extent must lie within the parent's captured prefix, so its bytes are covered by the parent
+  reseed (a child carved into the parent's uncommitted reserved tail stays excluded). Oracles:
+  `bytecode_debug_demand_checkpoint.rs` (a single-vCPU demand coroutine, restored at *every* clock
+  including suspended mid-fault, matching the tree-walker result) and `bytecode_debug_child_page_mapping.rs`
+  (a scheduled `instantiate` child that unmaps a page then faults loading it — exercising `EnvSnapshot.prot`
+  on the multi-vCPU engine). Both assert *every* clock/turn is checkpointable (fails under the old
+  `fault_yields`/bytes-only exclusions). Still excluded (→ replay-from-0): §13 **region-aliased** windows
+  (cross-domain shared bytes) and children carved beyond the parent's captured prefix.
 
   **Subset extended to §12 fibers + §14 same-module coroutines (slice 4-perf, single-vCPU).** The
   single-vCPU `DebugRun` checkpointable subset no longer excludes fibers/coroutines. **Fibers**: the
@@ -530,12 +546,13 @@ different things depending on which pair you compare:
   engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
   is bounded too), and its checkpointable subset now covers **§12 fibers + §14 coroutines** (same-module
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
-  on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping *root* windows**
-  (`map`/`unmap`/`protect`/grow — the protection map is captured alongside the bytes). Follow-ups: the §3.6
-  serve/live-call machinery inside a confined child, env teardown / D37 revocation, and — if a use case
-  demands it — extending the checkpointable subset further to **demand** coroutines / **page-mapping
-  children** (nested prot maps — slice 6b) and §13 **region-aliased** windows (cross-domain shared bytes) —
-  today those fall back to replay-from-0, which stays correct, just unbounded.
+  on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
+  (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
+  page-protection map is captured alongside the bytes. Follow-ups: the §3.6 serve/live-call machinery
+  inside a confined child, env teardown / D37 revocation, and — if a use case demands it — extending the
+  checkpointable subset to §13 **region-aliased** windows (cross-domain shared bytes) and children carved
+  beyond the parent's captured prefix — today those fall back to replay-from-0, which stays correct, just
+  unbounded.
 
 ---
 

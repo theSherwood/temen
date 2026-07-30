@@ -17731,6 +17731,35 @@ impl Mem {
         }
     }
 
+    /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a
+    /// §14 **child** window — a coroutine or `instantiate` child, whose *bytes* live in the parent backing
+    /// (shared via [`nested_view`](Mem::nested_view)) and ride in the parent's [`layout_snapshot`], but
+    /// whose page map is its own (a fresh `AddrSpace`, not the parent's). Precondition:
+    /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (no §13 regions). Reinstated with
+    /// [`install_prot`](Mem::install_prot).
+    fn prot_snapshot(&self) -> Vec<(u64, PageProt)> {
+        let space = self.space.read().unwrap_or_else(|e| e.into_inner());
+        space.prot.iter().map(|(&pg, &p)| (pg, p)).collect()
+    }
+
+    /// Install a [`prot_snapshot`](Mem::prot_snapshot) into this freshly built child window — the page-map
+    /// half of a child restore (the byte half is the parent reseed the child's `nested_view` shares). No
+    /// reseed: the child's bytes are already correct in the shared backing.
+    fn install_prot(&self, prot: &[(u64, PageProt)]) {
+        if !prot.is_empty() {
+            self.space_write().prot = prot.iter().copied().collect();
+        }
+    }
+
+    /// Whether this child window's full extent `[base, base + reserved)` lies within `parent`'s mapped
+    /// prefix `[0, mapped)` — i.e. the child's bytes are wholly covered by the parent's
+    /// [`layout_snapshot`] (which reaches at least `parent.mapped`), so a child checkpoint need only carry
+    /// the child's page map. A child carved into the parent's uncommitted reserved tail is *not* covered
+    /// and stays outside the checkpointable subset.
+    fn nested_within_prefix(&self, parent: &Mem) -> bool {
+        self.window.base().saturating_add(self.window.reserved()) <= parent.window.mapped()
+    }
+
     /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
     /// escape-oracle starts with non-zero bytes *outside* the child's slice — a child write that
     /// escaped its `[base, base+size)` slice would then perturb a byte the snapshot catches.
