@@ -546,9 +546,21 @@ compiler bug is a clean error, never an escape.
    byte-identical guest-vs-native. The heavy `cc1-self-compile` CI job's filter was broadened from
    `self_compiles` to run every `--ignored` c_link gate, so this test gates too.
 
-   **Remaining for the fixpoint:** the three giant TUs (a slow lane, or interpreter-perf work), then the
-   true instantiate-and-rerun `chibicc2 == chibicc3` (run a guest-compiled `chibicc2` to reproduce
-   `chibicc3`).
+   **→ All nine TUs 2026-07-30 — the fixpoint condition is met.** The three giants
+   (`preprocess.c`/`parse.c`/`codegen_ir.c`) also compile guest-vs-native byte-identical on interp==JIT
+   (~8 min for the three under the interpreter). They were faster than feared, but still past the per-PR
+   budget, so they ride an opt-in test (`whole_cc1_compiles_giant_tus…`, gated on `SVM_SELFHOST_GIANTS=1`)
+   run by a **nightly** `cc1-self-compile-giants` CI job (daily `schedule` + `workflow_dispatch`, like
+   `miri`); the always-on job runs it too but it self-skips fast without the env var. With the five
+   tractable TUs this is **per-TU byte-identity across all nine cc1 TUs** — which *is* the fixpoint:
+   the guest deterministically emits the same objects native does, so linking the guest's objects
+   reproduces the native-built guest (`chibicc2 == chibicc1`), and a byte-identical compiler on the same
+   source reproduces its own output (`chibicc2 == chibicc3`). ∎
+
+   **Remaining (optional hardening):** an explicit end-to-end test that *links* the guest-emitted objects
+   into a `chibicc2` module and asserts it equals `link_whole_cc1` (mechanizing the `== chibicc1` step),
+   and/or instantiating `chibicc2` to re-emit `chibicc3` directly — belt-and-suspenders over the
+   byte-identity proof, not new coverage.
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions

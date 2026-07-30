@@ -1449,6 +1449,31 @@ fn whole_cc1_compiles_its_own_tu_matching_native() {
     }
 }
 
+/// The **giant** chibicc TUs (`preprocess.c`/`parse.c`/`codegen_ir.c`, 1.2k–3.4k lines) on the same
+/// guest-vs-native differential as [`whole_cc1_compiles_its_own_tu_matching_native`]. Compiling these
+/// under the tree-walk interpreter is minutes each (~1h for all three on two engines), far past the
+/// per-PR CI budget — so this is **opt-in**: it no-ops fast unless `SVM_SELFHOST_GIANTS=1` is set
+/// (a nightly lane sets it). Proving these three (on top of the five tractable TUs) closes per-TU
+/// byte-identity across all nine cc1 TUs — the sufficient condition for `chibicc2 == chibicc3` (linking
+/// the guest's objects then reproduces the native-built guest, which reproduces its own output).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "very heavy (~1h): giant chibicc TUs on two engines; opt-in via SVM_SELFHOST_GIANTS=1"]
+fn whole_cc1_compiles_giant_tus_matching_native() {
+    if std::env::var_os("SVM_SELFHOST_GIANTS").is_none() {
+        eprintln!("skipping giant-TU self-compile; set SVM_SELFHOST_GIANTS=1 to run (~1h)");
+        return;
+    }
+    let linked = link_whole_cc1();
+    for tu in [
+        "frontend/chibicc/preprocess.c",
+        "frontend/chibicc/parse.c",
+        "frontend/chibicc/codegen_ir.c",
+    ] {
+        assert_guest_tu_matches_native(&linked, tu);
+    }
+}
+
 /// **2c — the linked whole compiler *runs* and self-hosts a real compile** (SELFHOST_C.md §7). The
 /// nine cc1 TUs + `emit_libc.c` link into one module ([`link_whole_cc1`]); here that module runs
 /// through `_start` under the powerbox and **compiles C to SVM IR inside the sandbox** — the self-host
