@@ -72,6 +72,15 @@ fn bitwise_and_shift_ops() {
 }
 
 #[test]
+fn char_literals() {
+    // nimony emits char literals as `'c'` / `'\HH'`. `'0'` = 48, `'\0A'` = 10; 48 + 10 = 58.
+    let leng = "\
+(stmts
+ (proc :m.0 . (i +64) . (stmts . (ret (add (i +64) '0' '\\0A')))))";
+    assert_eq!(run_i64(leng, 0, &[]), 58);
+}
+
+#[test]
 fn bitnot_and_logical_not() {
     // bitnot: ~0 = -1. not: logical negation of a bool (0/1).
     assert_eq!(

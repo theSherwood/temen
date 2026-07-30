@@ -1494,44 +1494,7 @@ impl<'a> FuncGen<'a> {
                         .args()
                         .first()
                         .ok_or_else(|| LengError::Malformed("deref needs an operand".into()))?;
-                    // A **symbol pointer**: a local whose pointee type we tracked.
-                    if let Some(pname) = operand.as_atom() {
-                        let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                            LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-                        })?;
-                        let pv = self.lookup(pname).ok_or_else(|| {
-                            LengError::Unsupported(format!("unknown pointer `{pname}`"))
-                        })?;
-                        return Ok((pv.id, desc));
-                    }
-                    // A **computed pointer** with an explicit pointee type: `(deref (cast (ptr T)
-                    // e))` — evaluate `e` as the address, take the pointee `T` from the cast. nimony
-                    // emits this to read through a re-typed address (`=destroy` reads a string's low
-                    // length byte via `(ptr (u 8))`).
-                    if operand.tag() == Some("cast") {
-                        let ca = operand.args();
-                        if ca.len() >= 2 {
-                            if let Some(pointee) = ptr_pointee(&ca[0]) {
-                                let desc = self.t.tydesc(pointee)?;
-                                let addr = self.expr_typed(&ca[1], ValType::I64)?;
-                                return Ok((addr.id, desc));
-                            }
-                        }
-                    }
-                    // A **pointer-valued lvalue**: `(deref (dot s more))` — a typed-pointer field.
-                    // Load the pointer value at the field's address; its pointee is the address of
-                    // the target aggregate. Walks `string.more → LongString` for the ARC ops.
-                    let (laddr, ldesc) = self.lvalue_addr(operand)?;
-                    if let TyDesc::Ptr(pointee) = ldesc {
-                        let pv = self.fresh();
-                        self.used_memory = true;
-                        self.cur_buf
-                            .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
-                        return Ok((pv, *pointee));
-                    }
-                    Err(LengError::Unsupported(
-                        "deref of non-pointer expression".into(),
-                    ))
+                    self.pointer_operand(operand)
                 }
                 Some("dot") => {
                     let a = node.args();
@@ -1551,17 +1514,14 @@ impl<'a> FuncGen<'a> {
                     Ok((self.add_scaled(baddr, idx.id, esize), edesc))
                 }
                 Some("pat") => {
+                    // `(pat ptr idx)` — pointer-indexed lvalue: `*(ptr + idx)`. The pointer may be a
+                    // symbol or a computed pointer (same resolution as `deref`); the element size is
+                    // the pointee's.
                     let a = node.args();
-                    let pname = a.first().and_then(|n| n.as_atom()).ok_or_else(|| {
-                        LengError::Unsupported("pat on non-symbol pointer".into())
-                    })?;
-                    let pdesc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                        LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-                    })?;
-                    let p = self.expr(&a[0])?;
+                    let (pv, pdesc) = self.pointer_operand(&a[0])?;
                     let esize = self.t.sizeof(&pdesc);
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
-                    Ok((self.add_scaled(p.id, idx.id, esize), pdesc))
+                    Ok((self.add_scaled(pv, idx.id, esize), pdesc))
                 }
                 other => Err(LengError::Unsupported(format!(
                     "lvalue `{}`",
@@ -1569,6 +1529,41 @@ impl<'a> FuncGen<'a> {
                 ))),
             },
         }
+    }
+
+    /// Resolve a **pointer expression** to `(value id, pointee descriptor)` — shared by `deref`/`pat`.
+    /// A pointer is a **symbol** local (its tracked pointee), a `(cast (ptr T) e)` **computed
+    /// pointer** (evaluate `e`, pointee `T`), or a **pointer-valued lvalue** (`(dot s more)` — load
+    /// the pointer, pointee from the `Ptr` field type). Anything else fail-closes.
+    fn pointer_operand(&mut self, operand: &Node) -> Result<(u32, TyDesc), LengError> {
+        if let Some(pname) = operand.as_atom() {
+            let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
+                LengError::Unsupported(format!("`{pname}` is not a known pointer"))
+            })?;
+            let pv = self
+                .lookup(pname)
+                .ok_or_else(|| LengError::Unsupported(format!("unknown pointer `{pname}`")))?;
+            return Ok((pv.id, desc));
+        }
+        if operand.tag() == Some("cast") {
+            let ca = operand.args();
+            if ca.len() >= 2 {
+                if let Some(pointee) = ptr_pointee(&ca[0]) {
+                    let desc = self.t.tydesc(pointee)?;
+                    let addr = self.expr_typed(&ca[1], ValType::I64)?;
+                    return Ok((addr.id, desc));
+                }
+            }
+        }
+        let (laddr, ldesc) = self.lvalue_addr(operand)?;
+        if let TyDesc::Ptr(pointee) = ldesc {
+            let pv = self.fresh();
+            self.used_memory = true;
+            self.cur_buf
+                .push_str(&format!("  v{pv} = i64.load v{laddr}\n"));
+            return Ok((pv, *pointee));
+        }
+        Err(LengError::Unsupported("not a pointer expression".into()))
     }
 
     /// Load the scalar value of an lvalue.
@@ -2314,6 +2309,9 @@ impl<'a> FuncGen<'a> {
                 }
                 if let Ok(f) = a.parse::<f64>() {
                     return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
+                }
+                if let Some(c) = char_literal(a) {
+                    return Ok(self.emit_const(ValType::I32, c)); // char literal `'0'` / `'\0A'`
                 }
                 // A link unit: a leftover atom is a cross-module data symbol — load through `data.sym`.
                 if self.t.link_mode {
@@ -3062,7 +3060,23 @@ fn int_literal(node: &Node) -> Option<i64> {
         // A suffixed integer literal `N'iXX` in constant position — the value is the first son.
         return node.args().first().and_then(int_literal);
     }
-    node.as_atom().and_then(|s| parse_int(s).ok())
+    node.as_atom()
+        .and_then(|s| parse_int(s).ok().or_else(|| char_literal(s)))
+}
+
+/// A NIF **character literal** — `'0'` (the byte 48), `'\0A'` (a `\HH` hex escape) — to its byte
+/// value. `None` if `s` isn't a `'…'`-delimited char.
+fn char_literal(s: &str) -> Option<i64> {
+    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    if let Some(hex) = inner.strip_prefix('\\') {
+        // `\HH` — the same hex-byte escape NIF strings use.
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    let mut chars = inner.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c as i64),
+        _ => None,
+    }
 }
 
 /// The pointee type node of a `(ptr T)` / `(aptr T)` type, if `node` is one (else `None` — e.g. a
