@@ -25,10 +25,18 @@ cd "$WORK"
 command -v nim >/dev/null || { echo "error: nim (devel) not on PATH" >&2; exit 1; }
 NIM_BIN="$(dirname "$(command -v nim)")"
 
-# nimony + its sibling nativenif (the native backend's nim.cfg reach it via `../nativenif`). Clone
+# nimony + its sibling nativenif (the native backend's nim.cfg reach it via `../nativenif`). We need
 # master (blob-filtered — all commits, lazy blobs) so the pinned commit is present, then check it out.
+# The toolchain cache restores `nimony/bin` (built output) WITHOUT `nimony/.git`, so on a warm cache
+# `nimony/` exists but is not a checkout — and `git clone nimony` aborts on the non-empty dir. Init a
+# repo in place and fetch instead, which works whether `nimony/` is absent (cold) or holds a restored
+# `bin/` (warm); fetching all branches mirrors the old clone's reachability so the pinned SHA is found.
 if [ ! -d nimony/.git ]; then
-  git clone --filter=blob:none https://github.com/nim-lang/nimony nimony
+  mkdir -p nimony
+  git -C nimony init -q
+  git -C nimony remote add origin https://github.com/nim-lang/nimony 2>/dev/null \
+    || git -C nimony remote set-url origin https://github.com/nim-lang/nimony
+  git -C nimony fetch --filter=blob:none origin
 fi
 git -C nimony checkout --detach "$NIMONY_REF"
 [ -d nativenif/.git ] || git clone --depth 1 https://github.com/nim-lang/nativenif nativenif
