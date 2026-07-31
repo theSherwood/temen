@@ -30,6 +30,15 @@ identical until the next agent edit.
   condition for the `chibicc2 == chibicc3` fixpoint. (The always-on job already runs the giant test too
   via `-- --ignored`, but it self-skips fast without the env var.)
 
+- **`nim-e2e` job** — builds the real nimony toolchain (`scripts/ci/provision-nimony.sh`, cached) and
+  runs `crates/svm-leng/tests/nim_e2e.rs`, which compiles small **Nim source** programs through
+  `nimony c` and runs them on both SVM engines. The tests self-skip (pass) in the always-on `check`
+  job because the toolchain isn't there; this job provides it so they actually execute. **Two things
+  to do on copy-over:** (1) pin `alaviss/setup-nim@0.1.1` by SHA (left as a tag — no vetted SHA to
+  hand); (2) confirm the heavy cold build (~10-15 min) fits the runner budget — it's a mirror of
+  nim-lang/nimony's own CI and hasn't been run in *this* repo's CI yet, so the first green run is the
+  real validation.
+
 *(Previously drained 2026-07-30, when the whole backlog was copied over: the `workflows-in-sync`
 guard, nightly-only `miri`, `cross-os` `CARGO_PROFILE_TEST_DEBUG: "0"`, the `playground-assets` job +
 the `pages.yml` reachability step, the `bench_chibicc_jit.mjs` / `browser-shell-test.mjs` /

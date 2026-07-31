@@ -582,10 +582,27 @@ plumbing. Five workstreams, roughly independent:
     `o.vt.mt[i]` method-table walk, via cast-deref static typing + `i64` slot → `i32` funcref), and
     `baseobj` base-subobject upcasts. Linking the whole object end-to-end now needs only the 25
     imports bound (W3, below); the object itself is produced and structurally sound.
-  - **Remaining for the full `system` *link+run*:** bind the 25 W3 bottom-edge imports to a runtime
-    shim (`mmap`→bump allocator, `c_memcpy`→`mem.copy`, atomics→plain ops in the single-threaded
-    model, `cWriteErr`→host write), then link + verify + run a real heap program. The ARC-heavy
-    string path — what a real string program needs at the boundary — already links and runs.
+  - **✅ Real Nim source runs on SVM, toolchain-driven — MET 2026-07-31 (W3, the Path A payoff).**
+    The 25 bottom-edge C imports bind to a **20-function SVM runtime shim** (a pure-IR link unit,
+    `tests/fixtures/system_runtime.svm.txt`): `mmap`→a bump allocator (cursor at window offset 8),
+    `c_memcpy`→`mem.copy`, `c_memset`→`mem.fill`, `c_memcmp`→a byte-compare loop, the GCC atomics→
+    plain memory ops (the in-process model is single-threaded), `ctz64`/`clz64`→`i64.ctz`/`clz`,
+    `bswap64`→a shift/or chain, `cWriteErr`→success, `munmap`/`dl*`/`_exit`→inert. `svm-leng` gained
+    `link_whole_with_runtime` (program + `system` + runtime units in one link).
+    The test is **end-to-end from Nim source, not a committed artifact** (`tests/nim_e2e.rs`): it
+    drives the real toolchain (`nimony c` → nifler → nimony → hexer) on small `.nim` programs, links
+    the emitted Leng with the shim into one verified import-free module, and runs on **both engines**
+    (§9 parity) — `addTwo`, a `while`/`if` routine (`sumTo`/`maxOf`), and the real allocator
+    (`osAllocPages`, page-advancing). Because the `.x.nif` is regenerated each run, the test can't rot
+    against a frozen snapshot. The toolchain is built in a dedicated CI job
+    (`scripts/ci/provision-nimony.sh`); when it's absent the tests **skip** (the translator's own
+    logic stays covered by the fast, toolchain-free unit tests).
+  - **Remaining toward a full program:** heap programs (`seq`/`string`) surface one more translator
+    slice — a generic instantiated `seq[T]` `oconstr` in the *program* module lowers as a scalar
+    (`Unsupported("expression oconstr")`) because its type isn't yet registered as an aggregate. The
+    allocator's higher layers (`alloc`/`rawAlloc` over an initialized `MemRegion`) also need the
+    system `ini` chain run first. The ARC-heavy string path already links and runs against real
+    `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

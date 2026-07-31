@@ -275,6 +275,17 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
+    link_selected_with_extra(units, Vec::new())
+}
+
+/// [`link_selected`] with pre-built **runtime** link units appended (e.g. the W3 bottom-edge shim
+/// binding `mmap`/`memcpy`/atomics). The nimony units pool their aggregate types and compile as
+/// usual; the extra units link in as-is, so their exports resolve the nimony modules' unbound
+/// bottom-edge imports. This is how a real program links: the compiled stdlib plus a host runtime.
+fn link_selected_with_extra(
+    units: &[(&str, &str, Select)],
+    extra: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -288,7 +299,7 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
             )?))
         })
         .collect::<Result<_, LengError>>()?;
-    let mut link_units = Vec::with_capacity(objects.len());
+    let mut link_units = Vec::with_capacity(objects.len() + extra.len());
     for bytes in &objects {
         let module = svm_encode::decode_unit(bytes)
             .map_err(|e| LengError::Malformed(format!("decode `.svmo` object: {e:?}")))?;
@@ -308,6 +319,7 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
             data_exports,
         });
     }
+    link_units.extend(extra);
     svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
 }
 
@@ -332,6 +344,22 @@ pub fn link_whole_units(units: &[WholeModule]) -> Result<Module, LengError> {
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
     link_selected(&sel)
+}
+
+/// Link whole nimony modules **together with a host runtime** (NIM.md W3): the program and the
+/// compiled `system` module link as in [`link_whole_units`], and `runtime` supplies pre-built link
+/// units whose exports bind the stdlib's bottom-edge C imports (`mmap`, `memcpy`, the atomics, …).
+/// This is the full shape of a running program — real stdlib over a host runtime — as one linked
+/// [`Module`] (still unverified; the caller runs `svm_verify::verify_module`).
+pub fn link_whole_with_runtime(
+    units: &[WholeModule],
+    runtime: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Whole))
+        .collect();
+    link_selected_with_extra(&sel, runtime)
 }
 
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.
