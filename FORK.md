@@ -212,6 +212,44 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   `Waiter::Fiber` (non-root fiber) caller, which nested-child callers do **not** need (a §14 child parks
   as `Waiter::VCpu`, so nested-guest fork works without it).
 
+### 8.5 Track 2 plan — a real program forking on svm (2026-07-31, from the machinery map)
+
+The substrate (pid-mode `clone_caller`, `fork_powerbox`, `fork_parked_caller`) has landed; **no new
+interp op is needed.** The remaining work is *integration plumbing* to get a compiled-C guest into the
+right topology. The minimal live-run fork demo already exists — `svm-interp/tests/clone_caller.rs`
+`SRC_FORK_PID`: a manager (func 0) spawns a server (func 1, a `svc.wait` loop whose func-2 handler runs
+pid-mode `clone_caller`), mints the fork offer with `child_offer` (Instantiator op 14), spawns the caller
+with `instantiate_named` (op 11) re-granting that offer, and the caller forks and both copies write pid/0
+to a shared stdout stream. That guest is **hand-written IR** and uses a **regranted stream** (no libc).
+The remaining slices turn that into a *compiled-C* program with *real libc*:
+
+- **Slice 1 — forkable libc. DONE (this PR).** `svm_posix::grant` mints libc via
+  `grant_host_proc_forkable` over the shared `Inner`, so a chibicc-world domain's libc carries across a
+  twin (was fail-closed). `posix_cap` (on-ramp) was already forkable (§8.4).
+- **Slice 2 — the `__px_` shim fork binding** (blocker A). The compiled-C tests bind through
+  `bind_shim` (`crates/svm/tests/*`), which strips `__px_` and calls `svm_posix::resolve` — no `fork`
+  branch, no offer arg. Add the `__px_fork` analogue of `bind_with_fork` so a compiled-C `__px_fork`
+  import routes to the fork offer `(type_id, handle)`. (The plain-libc `bind_with_fork` already exists.)
+- **Slice 3 — libc into a nested child** (blocker D / the real gap). A §14 child spawned by
+  `instantiate_named`/op 13 gets an *attenuated* powerbox (instantiator + address space + regranted
+  streams/pipes) — **not** posix libc. Existing compiled-C children get libc only because they run as a
+  *separate top-level run* via the `set_spawn` delegate (`c_posix_spawn.rs`), which cannot be the
+  *parked* caller a fork needs. So a nested fork-guest needs libc in its powerbox: extend
+  `regrant_into_child` to carry a **forkable `HostProc`** (re-grant the libc handle, sharing `Inner`), or
+  give the child a fresh forkable libc at spawn. This is the load-bearing new interp/posix plumbing.
+- **Slice 4 — the compiled-C entry ABI over `instantiate_named`** (blocker C). The spawn ABI hands a
+  child entry an `(i64)` starter arg; hand-written guests are `func (i64)->(i64)`. Confirm/adapt a
+  compiled-C `_start` (entry idx 0, chibicc convention) to tolerate the starter-arg/entry convention when
+  spawned via op 11/13 (existing op-13 compiled-C exec is `c_shell_exec.rs`). The **main untested seam**.
+- **Slice 5 — the end-to-end test.** `crates/svm/tests/` (depends on both svm-posix and svm-interp): a
+  chibicc-compiled C `fork()` program under the manager topology, forking for real, parent-sees-pid /
+  child-sees-0, both copies doing libc I/O over the shared memfs. interp==JIT differential. The first
+  real program forking on svm.
+
+Key refs: `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
+`bind_with_fork` (`svm-posix/src/lib.rs`), `bind_shim` + harness (`crates/svm/tests/c_posix_spawn.rs`),
+op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (svm-interp).
+
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
 **Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**
