@@ -12743,6 +12743,16 @@ impl AsyncCounter for RegionCounter {
 pub type HostProc =
     Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
 
+/// FORK.md PR 5 — a host proc's **fork factory**: mints a fresh [`HostProc`] closure for a `fork()`
+/// twin's powerbox. The runtime can never fork a `HostProc` itself (the closure's captured state is
+/// opaque — the same wall in Rust as a C embedder's `void* ctx`), so forkability is a capability the
+/// **provider** supplies: the factory duplicates-or-shares its own state (svm-posix shares the
+/// fd-table/memfs `Arc`s — fork-shares-fds semantics; a C embedder would `dup` its structs) and
+/// returns the child's closure. A `host_proc` granted *without* a factory keeps today's behavior:
+/// [`Host::fork_powerbox`] fails closed on it. `Arc` so the factory itself rides into the twin —
+/// a forked domain remains forkable (fork-of-fork, nested guests).
+pub type HostProcFork = Arc<dyn Fn() -> HostProc + Send + Sync>;
+
 /// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
 /// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
 /// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
@@ -13043,6 +13053,10 @@ pub struct Host {
     /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostProc`]
     /// carries ([`Host::grant_host_proc`]). A dispatch takes the closure out, runs it, and restores it.
     host_procs: Vec<HostProc>,
+    /// FORK.md PR 5 — per-`host_procs` entry fork factories, parallel by index. `Some` = the provider
+    /// supplied a [`HostProcFork`] ([`Host::grant_host_proc_forkable`]) and [`Host::fork_powerbox`]
+    /// carries the cap into a twin by minting a fresh closure; `None` = non-forkable (fail closed).
+    host_proc_forks: Vec<Option<HostProcFork>>,
     /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostProcRegion`]
     /// carries, [`Host::grant_host_proc_region`]) — a `HostProc` plus a [`RegionMinter`]. Same
     /// take-out/run/restore dispatch as `host_procs`.
@@ -13397,6 +13411,7 @@ impl Host {
             region_factory: None,
             blockings: Vec::new(),
             host_procs: Vec::new(),
+            host_proc_forks: Vec::new(),
             host_procs_region: Vec::new(),
             offers: Vec::new(),
             iface_intern: Vec::new(),
@@ -13455,8 +13470,14 @@ impl Host {
     /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
     fn fork_powerbox(&self) -> Option<Host> {
+        // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
+        // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
+        // closure itself, and a partial carry would silently drop capabilities, so one factory-less
+        // entry fails the whole fork closed (the pre-PR-5 behavior).
+        let procs_forkable = self.host_procs.len() == self.host_proc_forks.len() // parallel-table sanity
+                && self.host_proc_forks.iter().all(|f| f.is_some());
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
-        let simple = self.host_procs.is_empty()
+        let simple = procs_forkable
             && self.host_procs_region.is_empty()
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
@@ -13491,6 +13512,15 @@ impl Host {
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();
+        // Forkable host procs: each provider factory mints the twin's fresh closure over its own
+        // (shared or duplicated) state, at the same index so the copied table's `HostProc(i)` slots
+        // resolve; the factories themselves ride along, so the twin remains forkable (fork-of-fork).
+        twin.host_procs = self
+            .host_proc_forks
+            .iter()
+            .map(|f| (f.as_ref().unwrap())())
+            .collect();
+        twin.host_proc_forks = self.host_proc_forks.clone();
         // Shared stdout/stderr sinks — fork shares stdout/stderr.
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
@@ -14484,6 +14514,19 @@ impl Host {
     pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
         let idx = self.host_procs.len() as u32;
         self.host_procs.push(f);
+        self.host_proc_forks.push(None);
+        self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
+    }
+
+    /// FORK.md PR 5 — like [`Host::grant_host_proc`], but **forkable**: the provider also supplies a
+    /// [`HostProcFork`] factory that mints a fresh handler closure over its own (shared or duplicated)
+    /// state, so [`Host::fork_powerbox`] can carry this capability into a `fork()` twin. The runtime
+    /// never inspects the closure's state — forking it is the provider's job, expressed by this
+    /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
+    pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
+        let idx = self.host_procs.len() as u32;
+        self.host_procs.push(f);
+        self.host_proc_forks.push(Some(fork));
         self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
     }
 
@@ -19184,12 +19227,61 @@ mod fork_powerbox_tests {
     }
 
     #[test]
-    fn fork_refuses_a_domain_with_closure_caps() {
+    fn fork_refuses_a_domain_with_a_factory_less_host_proc() {
         let mut host = Host::new();
         host.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
         assert!(
             host.fork_powerbox().is_none(),
-            "a domain holding a closure-based host_proc fails closed — the personality re-wires it (PR 3)"
+            "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
+        );
+        // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
+        host.grant_host_proc_forkable(
+            Box::new(|_, _, _| Ok(vec![1])),
+            Arc::new(|| Box::new(|_, _, _| Ok(vec![1]))),
+        );
+        assert!(
+            host.fork_powerbox().is_none(),
+            "one factory-less host_proc fails the whole fork closed even beside a forkable one"
+        );
+    }
+
+    /// FORK.md PR 5 — the `fork_ctx` mechanism: a host proc granted WITH a fork factory rides into
+    /// the twin. The factory mints a fresh closure over provider-shared state (an `Arc` counter
+    /// here, standing in for svm-posix's shared fd table), so the twin's handle dispatches at the
+    /// same index and both copies observe the one shared backing — fork-shares-fds semantics.
+    #[test]
+    fn fork_carries_a_forkable_host_proc_via_its_factory() {
+        let counter = Arc::new(Mutex::new(0i64));
+        let make = {
+            let counter = Arc::clone(&counter);
+            move || -> HostProc {
+                let counter = Arc::clone(&counter);
+                Box::new(move |_op, _args, _mem| {
+                    let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
+                    *c += 1;
+                    Ok(vec![*c])
+                })
+            }
+        };
+        let mut host = Host::new();
+        let h = host.grant_host_proc_forkable(make(), Arc::new(make));
+        let twin = host.fork_powerbox().expect("a forkable host_proc forks");
+        // Same handle value resolves in the twin, through the factory-minted fresh closure.
+        let mut twin = twin;
+        assert_eq!(
+            host.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            Ok(vec![1]),
+            "parent's first call"
+        );
+        assert_eq!(
+            twin.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            Ok(vec![2]),
+            "the twin's call went through its own closure onto the SAME shared state (fork shares fds)"
+        );
+        // The factory rode along: the twin itself remains forkable (fork-of-fork / nesting).
+        assert!(
+            twin.fork_powerbox().is_some(),
+            "a forked domain is still forkable — nested guests can fork"
         );
     }
 }
