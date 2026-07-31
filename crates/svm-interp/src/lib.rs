@@ -7826,6 +7826,156 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
+        // CALLS.md 4a — switch this vCPU into an **instanced offer's handler** as a reified fiber
+        // over the provider's world, run-to-completion (the `serve_switch` shape, cross-world).
+        // `$entry: &OfferEntry` (`state.is_some()`), `$op: u32` the offer op, `$args: &[i64]` the
+        // caller's raw arg slots. On a clean switch this `continue 'frames` into the handler; on a
+        // busy instance it `continue`s with a probeable `-EAGAIN`; it **falls through** (does
+        // nothing) only when it *declines* the in-loop path — a durable caller/provider or a
+        // `ref.func` handler — leaving the caller to run the byte-identical 3a `drive_arc` sub-run.
+        // The provider's `{mem, host, fuel, code}` are installed on this vCPU for the handler and
+        // restored when it returns (the [`OfferAnim`] settle in `Terminator::Return`). Defined here
+        // — after `let top`, inside the loop — so the `'frames` label and `top` are in scope (the
+        // `serve_switch` pattern). Zero cost: a `macro_rules!` is purely syntactic.
+        macro_rules! animate_instanced_offer {
+            ($entry:expr, $op:expr, $args:expr) => {{
+                let entry_: &OfferEntry = $entry;
+                let op_: u32 = $op;
+                let args_: &[i64] = $args;
+                if !durable && !unit_uses_ref_func(&entry_.funcs) {
+                    if let (Some(&f_), Some(osig_)) =
+                        (entry_.ops.get(op_ as usize), entry_.sigs.get(op_ as usize))
+                    {
+                        if args_.len() == osig_.params.len() {
+                            let state_ = entry_.state.clone().ok_or(Trap::CapFault)?;
+                            // The three admission outcomes, decided under one brief state lock (the
+                            // busy check+set is atomic under it, so concurrent callers serialize).
+                            enum Adm {
+                                Eagain,
+                                Decline,
+                                Go(Vec<i64>, u64, Option<Mem>, Host),
+                            }
+                            let adm_ = {
+                                let mut guard_ = match state_.try_lock() {
+                                    Ok(g) => g,
+                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                                    // Held only by the 3a fallback (durable providers) or a
+                                    // wiring/introspection API; the animated path releases it and
+                                    // guards with `busy`. A held lock reads as busy: -EAGAIN.
+                                    Err(std::sync::TryLockError::WouldBlock) => {
+                                        frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                        continue;
+                                    }
+                                };
+                                let st_ = &mut *guard_;
+                                if st_.busy {
+                                    Adm::Eagain
+                                } else if st_.fuel == 0 || st_.host.is_durable() {
+                                    // Dry reserve or a durable provider world: the 3a `drive_arc`
+                                    // fallback handles both, byte-identically.
+                                    Adm::Decline
+                                } else {
+                                    // Edge 1 — cap args caller→provider (caller `hg` held only
+                                    // here); a forged/dead cap fails closed as 3a's edge-1 `?`,
+                                    // with no world checked out yet.
+                                    let mut arg_slots_ = args_.to_vec();
+                                    {
+                                        let mut hg =
+                                            host.lock().unwrap_or_else(|e| e.into_inner());
+                                        translate_cap_slots(
+                                            &mut hg,
+                                            &mut st_.host,
+                                            &osig_.params,
+                                            &mut arg_slots_,
+                                        )?;
+                                    }
+                                    let budget_ = st_.fuel.min(OFFER_FUEL);
+                                    st_.busy = true;
+                                    let pm_ = st_.mem.take();
+                                    let ph_ = std::mem::replace(&mut st_.host, Host::new());
+                                    Adm::Go(arg_slots_, budget_, pm_, ph_)
+                                }
+                                // `guard_` drops — the state lock is not held across the run.
+                            };
+                            match adm_ {
+                                Adm::Eagain => {
+                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                    continue;
+                                }
+                                Adm::Decline => {} // fall through to the caller's 3a sub-run
+                                Adm::Go(arg_slots_, budget_, pm_, ph_) => {
+                                    // Allocate the handler fiber slot; exhaustion is backpressure —
+                                    // undo the checkout, answer -EAGAIN (never a trap).
+                                    let handle_ =
+                                        match registry.create(0, 0, spawn_quota.max_fibers, false) {
+                                            Ok(h_) => h_,
+                                            Err(_) => {
+                                                let mut st_ = state_
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                st_.mem = pm_;
+                                                st_.host = ph_;
+                                                st_.busy = false;
+                                                frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                                continue;
+                                            }
+                                        };
+                                    let (hslot_, _) = registry.claim(handle_)?;
+                                    // Install the provider world on this vCPU: mem, host (fresh Arc
+                                    // for the handler's cap.calls), fuel (+ the top-level-entry
+                                    // charge mirroring `drive_arc`:1918), and code (invoke seam —
+                                    // `entry.funcs` as `INVOKE_MODULE`). Restored by the settle.
+                                    let saved_mem_ = std::mem::replace(mem, pm_);
+                                    let saved_host_ =
+                                        std::mem::replace(host, Arc::new(Mutex::new(ph_)));
+                                    let saved_fuel_ = *fuel;
+                                    *fuel = budget_ - 1; // budget_ >= 1 (fuel != 0 above)
+                                    let saved_invoked_ =
+                                        std::mem::replace(invoked, Some(entry_.funcs.clone()));
+                                    let saved_ref_ = invoked_ref_slots.take();
+                                    let hvals_: Vec<Reg> = osig_
+                                        .params
+                                        .iter()
+                                        .zip(&arg_slots_)
+                                        .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
+                                        .collect();
+                                    *offer_anim = Some(OfferAnim {
+                                        state: state_.clone(),
+                                        handler_slot: hslot_,
+                                        saved_mem: saved_mem_,
+                                        saved_host: saved_host_,
+                                        saved_fuel: saved_fuel_,
+                                        saved_invoked: saved_invoked_,
+                                        saved_ref_slots: saved_ref_,
+                                        budget: budget_,
+                                        results: Arc::from(osig_.results.clone()),
+                                    });
+                                    // Park the caller frames as this handler's resumer and switch
+                                    // in (serve_switch shape; no `shadow_switch` — non-durable).
+                                    let parked_ = std::mem::take(frames);
+                                    *parked_frames += parked_.len();
+                                    if *cur == ROOT_FIBER {
+                                        *root_parked = Some(parked_);
+                                    } else {
+                                        registry.park_resumer(*cur, parked_);
+                                    }
+                                    chain.push(hslot_);
+                                    *cur = hslot_;
+                                    *frames = vec![Frame {
+                                        func: f_,
+                                        module: INVOKE_MODULE,
+                                        block: 0,
+                                        inst: 0,
+                                        vals: hvals_,
+                                    }];
+                                    continue 'frames;
+                                }
+                            }
+                        }
+                    }
+                }
+            }};
+        }
         if frames[top].module != cur_module {
             cur_module = frames[top].module;
             cur_funcs =
@@ -9583,162 +9733,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_of(h, *type_id)
                     };
                     if let Some(entry) = inst_offer {
-                        // CALLS.md 4a: animate the handler as a reified fiber in THIS vCPU's
-                        // registry over the provider's world (`{mem, host, fuel, code}` swapped),
-                        // run-to-completion — byte-identical to the 3a `drive_arc` sub-run, but the
-                        // handler is now a real registry fiber (the piece 4b promotes to park). The
-                        // On a clean switch this `continue 'frames` into the handler; on a busy
-                        // instance it `continue`s with a probeable `-EAGAIN`; it falls through only
-                        // when it **declines** the in-loop path (a durable caller/provider, or a
-                        // `ref.func` handler), leaving the byte-identical 3a `drive_arc` sub-run.
-                        // The switch settles in the `Terminator::Return` fiber-exit (`offer_anim`).
-                        // (Inlined here — extracts to a loop-scoped macro when the import/sym/dyn
-                        // arms adopt it, so `top`/`'frames` stay in scope.)
-                        if !durable && !unit_uses_ref_func(&entry.funcs) {
-                            if let (Some(&f_), Some(osig_)) =
-                                (entry.ops.get(*op as usize), entry.sigs.get(*op as usize))
-                            {
-                                if argv.len() == osig_.params.len() {
-                                    let state_ = entry.state.clone().ok_or(Trap::CapFault)?;
-                                    // The three admission outcomes, decided under one brief state
-                                    // lock (the busy check+set is atomic under it, so concurrent
-                                    // callers serialize).
-                                    enum Adm {
-                                        Eagain,
-                                        Decline,
-                                        Go(Vec<i64>, u64, Option<Mem>, Host),
-                                    }
-                                    let adm_ = {
-                                        let mut guard_ = match state_.try_lock() {
-                                            Ok(g) => g,
-                                            Err(std::sync::TryLockError::Poisoned(p)) => {
-                                                p.into_inner()
-                                            }
-                                            // Held only by the 3a fallback (durable providers) or a
-                                            // wiring/introspection API; the animated path releases it
-                                            // and guards with `busy`. A held lock reads as busy.
-                                            Err(std::sync::TryLockError::WouldBlock) => {
-                                                frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                                continue;
-                                            }
-                                        };
-                                        let st_ = &mut *guard_;
-                                        if st_.busy {
-                                            Adm::Eagain
-                                        } else if st_.fuel == 0 || st_.host.is_durable() {
-                                            // Dry reserve or a durable provider world: the 3a
-                                            // `drive_arc` fallback handles both, byte-identically.
-                                            Adm::Decline
-                                        } else {
-                                            // Edge 1 — cap args caller→provider (caller `hg` held
-                                            // only here); a forged/dead cap fails closed as 3a's
-                                            // edge-1 `?`, no world checked out yet.
-                                            let mut arg_slots_ = argv.clone();
-                                            {
-                                                let mut hg =
-                                                    host.lock().unwrap_or_else(|e| e.into_inner());
-                                                translate_cap_slots(
-                                                    &mut hg,
-                                                    &mut st_.host,
-                                                    &osig_.params,
-                                                    &mut arg_slots_,
-                                                )?;
-                                            }
-                                            let budget_ = st_.fuel.min(OFFER_FUEL);
-                                            st_.busy = true;
-                                            let pm_ = st_.mem.take();
-                                            let ph_ = std::mem::replace(&mut st_.host, Host::new());
-                                            Adm::Go(arg_slots_, budget_, pm_, ph_)
-                                        }
-                                        // `guard_` drops — the state lock is not held across the run.
-                                    };
-                                    match adm_ {
-                                        Adm::Eagain => {
-                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                            continue;
-                                        }
-                                        Adm::Decline => {} // fall through to the 3a sub-run below
-                                        Adm::Go(arg_slots_, budget_, pm_, ph_) => {
-                                            // Allocate the handler fiber slot; exhaustion is
-                                            // backpressure — undo the checkout, answer -EAGAIN.
-                                            let handle_ = match registry.create(
-                                                0,
-                                                0,
-                                                spawn_quota.max_fibers,
-                                                false,
-                                            ) {
-                                                Ok(h_) => h_,
-                                                Err(_) => {
-                                                    let mut st_ = state_
-                                                        .lock()
-                                                        .unwrap_or_else(|e| e.into_inner());
-                                                    st_.mem = pm_;
-                                                    st_.host = ph_;
-                                                    st_.busy = false;
-                                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                                    continue;
-                                                }
-                                            };
-                                            let (hslot_, _) = registry.claim(handle_)?;
-                                            // Install the provider world on this vCPU: mem, host
-                                            // (fresh Arc for the handler's cap.calls), fuel (+ the
-                                            // top-level-entry charge mirroring `drive_arc`:1918),
-                                            // and code (invoke seam — `entry.funcs` as
-                                            // `INVOKE_MODULE`). Restored by the settle on return.
-                                            let saved_mem_ = std::mem::replace(mem, pm_);
-                                            let saved_host_ =
-                                                std::mem::replace(host, Arc::new(Mutex::new(ph_)));
-                                            let saved_fuel_ = *fuel;
-                                            *fuel = budget_ - 1; // budget_ >= 1 (fuel != 0 above)
-                                            let saved_invoked_ = std::mem::replace(
-                                                invoked,
-                                                Some(entry.funcs.clone()),
-                                            );
-                                            let saved_ref_ = invoked_ref_slots.take();
-                                            let hvals_: Vec<Reg> = osig_
-                                                .params
-                                                .iter()
-                                                .zip(&arg_slots_)
-                                                .map(|(ty, &s)| {
-                                                    Reg::from_value(slot_to_val(*ty, s))
-                                                })
-                                                .collect();
-                                            *offer_anim = Some(OfferAnim {
-                                                state: state_.clone(),
-                                                handler_slot: hslot_,
-                                                saved_mem: saved_mem_,
-                                                saved_host: saved_host_,
-                                                saved_fuel: saved_fuel_,
-                                                saved_invoked: saved_invoked_,
-                                                saved_ref_slots: saved_ref_,
-                                                budget: budget_,
-                                                results: Arc::from(osig_.results.clone()),
-                                            });
-                                            // Park the caller frames as this handler's resumer and
-                                            // switch in (serve_switch shape; no `shadow_switch` —
-                                            // the animation is non-durable).
-                                            let parked_ = std::mem::take(frames);
-                                            *parked_frames += parked_.len();
-                                            if *cur == ROOT_FIBER {
-                                                *root_parked = Some(parked_);
-                                            } else {
-                                                registry.park_resumer(*cur, parked_);
-                                            }
-                                            chain.push(hslot_);
-                                            *cur = hslot_;
-                                            *frames = vec![Frame {
-                                                func: f_,
-                                                module: INVOKE_MODULE,
-                                                block: 0,
-                                                inst: 0,
-                                                vals: hvals_,
-                                            }];
-                                            continue 'frames;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // CALLS.md 4a — animate the instanced offer's handler as a reified fiber in
+                        // this vCPU's registry over the provider's world (`continue 'frames` on a
+                        // switch, `-EAGAIN` on a busy instance), or fall through to the byte-identical
+                        // 3a `drive_arc` sub-run when it declines (durable caller/provider, `ref.func`).
+                        animate_instanced_offer!(&entry, *op, &argv);
                         let results = drive_instanced_offer(host, &entry, *op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -9912,6 +9911,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_import(*import | (*op << 16))
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -10012,6 +10014,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_import(*import)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -10049,6 +10054,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_dyn(*ty, *op, h)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, tyv) in results.iter().zip(&sig.results) {
                             frames[top]
