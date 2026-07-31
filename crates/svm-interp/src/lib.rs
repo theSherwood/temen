@@ -3914,6 +3914,10 @@ enum Blocked {
 enum Pending {
     /// Finish a `thread.join`: take the child's result from `threads[slot]`.
     Join { slot: usize },
+    /// Finish a `reap` (FORK.md §8.6 — servicer-side `wait()`): take the twin's outcome from the
+    /// scheduler by `TaskId` and push its **exit status** (a clean `Ok(first i64)`; a trapped twin
+    /// becomes a nonzero crash status — never a propagated trap, so the waiting shell survives).
+    ReapPid { pid: TaskId },
     /// Finish an `atomic.wait`, pushing this status (woken / not-equal / timed-out).
     Wait(i32),
     /// Finish a §14 co-fiber `yield`: push the value the parent's `resume` delivered (the result of
@@ -4026,6 +4030,12 @@ struct Sched {
     results: BTreeMap<TaskId, Outcome>,
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
+    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, the only ids `reap`
+    /// (servicer-side `wait()`) will act on. Inserted when a twin is forked, removed when it is
+    /// reaped; a `pid` not present is `-ECHILD` (so a bogus/foreign pid cannot park a waiter
+    /// forever). Confinement is capability-shaped: only a domain holding the fork/wait offer can
+    /// drive `reap` at all, and even then only over a real twin.
+    forked_twins: BTreeSet<TaskId>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
@@ -4389,6 +4399,9 @@ impl Scheduler {
         s.live += 1;
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.pending = Some(Pending::CapResult(reply_twin));
+        // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
+        // deliver its exit status to the parent; removed when reaped (or swept at teardown).
+        s.forked_twins.insert(twin_id);
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
         // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
@@ -4398,7 +4411,85 @@ impl Scheduler {
         self.work.notify_all();
         Some(twin_id as i64)
     }
+
+    /// FORK.md §8.6 — the servicer side of `wait(pid)`. From within a serve handler, reap the twin
+    /// `pid` on behalf of the caller parked on `(callee_id, ticket)`:
+    ///   * `pid` is not a live twin this servicer minted → [`ReapOutcome::NoChild`] (handler
+    ///     replies `-ECHILD`).
+    ///   * the caller has **not parked yet** — the serve/park race, where the servicer drains the
+    ///     dispatch (`svc_enqueue` woke it) before the caller inserts its `CapReply` waiter — →
+    ///     [`ReapOutcome::Retry`] (handler replies `-EAGAIN`; the guest retries, exactly as it does
+    ///     for a raced `fork`). Distinguishing this from `NoChild` is the correctness hinge: a real
+    ///     shell's `wait` must survive the race, not spuriously report the child vanished.
+    ///   * the twin already finished → [`ReapOutcome::Replied`] with the status, delivered now.
+    ///   * the twin is still running → [`ReapOutcome::Replied(0)`] after moving the caller into
+    ///     `join_waiters[pid]` with [`Pending::ReapPid`], so the twin's completion (the generic
+    ///     join-wake) resumes it with the status.
+    ///
+    /// `Replied` means the caller's reply is handled here (the dispatch marks the ticket replied);
+    /// the other two leave the caller in place for the handler's own errno reply. Real scheduler only.
+    fn reap_parked_caller(&self, callee_id: usize, ticket: u64, pid: TaskId) -> ReapOutcome {
+        let mut s = self.lock();
+        if !s.forked_twins.contains(&pid) {
+            return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
+        }
+        // Claim the parked caller — the same shape `fork_parked_caller` removes. A miss means the
+        // caller's `CapReply` waiter is not registered yet (the serve/park race) — the twin is real
+        // (it's in `forked_twins`), so this is retryable, never `-ECHILD`.
+        let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
+            Some(Waiter::VCpu(v)) => v,
+            Some(other) => {
+                s.ticket_waiters.insert((callee_id, ticket), other);
+                return ReapOutcome::Retry;
+            }
+            None => return ReapOutcome::Retry,
+        };
+        if let Some(out) = s.results.remove(&pid) {
+            // Twin already finished: reap it now and re-admit the caller with the status.
+            s.forked_twins.remove(&pid);
+            let status = reap_status(&out.result);
+            v.pending = Some(Pending::CapResult(status));
+            s.runnable.push_back(v);
+            self.work.notify_one();
+            ReapOutcome::Replied(status)
+        } else {
+            // Twin still running: park the caller on it; the generic join-wake (a twin finishing)
+            // re-admits it, and `Pending::ReapPid` takes the status on resume.
+            v.pending = Some(Pending::ReapPid { pid });
+            s.join_waiters.insert(pid, v);
+            ReapOutcome::Replied(0)
+        }
+    }
 }
+
+/// FORK.md §8.6 — the three ways a servicer-side `reap` (`wait(pid)`) resolves. See
+/// [`Scheduler::reap_parked_caller`].
+enum ReapOutcome {
+    /// The caller's reply was delivered here (now, or deferred on twin-exit); withhold the handler's.
+    Replied(i64),
+    /// `pid` is not a twin this servicer minted — a genuine `-ECHILD`.
+    NoChild,
+    /// The caller's waiter is not registered yet (serve/park race) — retryable, `-EAGAIN`.
+    Retry,
+}
+
+/// FORK.md §8.6 — a twin's exit status for servicer-side `wait()`. A clean finish yields the twin's
+/// first `i64` result (an `exit(n)` / `return n`); a **trapped** twin yields a single nonzero crash
+/// status — never a propagated trap — so a crashing command cannot crash the waiting shell
+/// (STAGE1.md). POSIX's exact `128 + signal` encoding is a shell/guest concern (ISSUES.md I43).
+fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
+    match result {
+        Ok(vals) => match vals.first() {
+            Some(Value::I64(x)) => *x,
+            Some(Value::I32(x)) => *x as i64,
+            _ => 0,
+        },
+        Err(_) => REAP_CRASH_STATUS,
+    }
+}
+
+/// FORK.md §8.6 — the crash status a trapped twin reaps as (see [`reap_status`]).
+const REAP_CRASH_STATUS: i64 = 128;
 
 /// Move any expired `wait` timers' vCPUs back to the run-queue with a timed-out status. (A waiter
 /// already woken by `notify` is simply absent — its stale timer is skipped.)
@@ -5329,6 +5420,20 @@ impl SchedRef {
     fn take_result(&self, id: TaskId) -> Option<Outcome> {
         match self {
             SchedRef::Real(s) => s.lock().results.remove(&id),
+            SchedRef::Det(d) => d.lock().results.remove(&id),
+        }
+    }
+    /// FORK.md §8.6 — reap a finished **twin**'s outcome (for a resuming deferred `reap`): take its
+    /// result *and* retire it from `forked_twins`, so the id is no longer reapable — a second
+    /// `wait(pid)` on it is `-ECHILD`, never a re-park that would hang. Twins only ever exist on the
+    /// `Real` scheduler (fork is Real-only), so the `Det` arm is unreachable and just takes.
+    fn reap_twin(&self, id: TaskId) -> Option<Outcome> {
+        match self {
+            SchedRef::Real(s) => {
+                let mut g = s.lock();
+                g.forked_twins.remove(&id);
+                g.results.remove(&id)
+            }
             SchedRef::Det(d) => d.lock().results.remove(&id),
         }
     }
@@ -7594,6 +7699,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 vals.first().copied().unwrap_or(Value::I64(0)),
             ));
         }
+        Some(Pending::ReapPid { pid }) => {
+            // The twin `pid` finished and the generic join-wake re-admitted us. Take its outcome
+            // and push its **exit status** — a trapped twin becomes a crash status, never a
+            // propagated trap (unlike `Join`), so a crashing command cannot crash the shell.
+            let out = v.sched.reap_twin(pid).ok_or(Trap::Malformed)?;
+            let status = reap_status(&out.result);
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Reg::from_i64(status));
+        }
         Some(Pending::Wait(status)) => {
             let top = v.frames.len() - 1;
             v.frames[top].vals.push(Reg::from_i32(status));
@@ -9309,6 +9423,55 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     sched.cap_reply_or_stash(ticket, fallback, host);
                                     reply_orig.map_or(EAGAIN, |_| 0)
                                 }
+                            }
+                        }
+                        _ => EINVAL,
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
+                // FORK.md §8.6 — `reap` (self-namespace op 12): serviced here (needs the eval-loop
+                // -local `serve_run`). From within a handler, reap the twin named by the single
+                // `pid` arg on behalf of the parked caller — the servicer side of `wait(pid)`. The
+                // scheduler delivers the twin's exit status as the caller's reply (now, or on
+                // twin-exit); a `pid` that is not a live twin this servicer minted is `-ECHILD`.
+                // `-EINVAL` outside a handler / on a non-`Real` tier (like `clone_caller`).
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_REAP,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let pid = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => -1,
+                    };
+                    let r = match serve_run.as_mut() {
+                        Some(sr) if *cur != sr.serve_cur => {
+                            if let SchedRef::Real(sr_sched) = sched {
+                                let ticket = sr.ticket;
+                                let callee_id =
+                                    host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
+                                        as usize;
+                                match sr_sched.reap_parked_caller(callee_id, ticket, pid as TaskId)
+                                {
+                                    // The scheduler owns the caller's reply now — withhold the
+                                    // handler's own, exactly as `clone_caller` does.
+                                    ReapOutcome::Replied(status) => {
+                                        sr.replied = true;
+                                        status
+                                    }
+                                    // Unknown pid: the handler's -ECHILD reply reaches the caller
+                                    // through the normal serve path (stashed if it hasn't parked).
+                                    ReapOutcome::NoChild => ECHILD,
+                                    // Serve/park race: -EAGAIN, and the guest retries — the twin is
+                                    // real, so this must never masquerade as -ECHILD.
+                                    ReapOutcome::Retry => EAGAIN,
+                                }
+                            } else {
+                                EINVAL
                             }
                         }
                         _ => EINVAL,
@@ -12105,6 +12268,7 @@ const EAGAIN: i64 = -11;
 const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
+const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this servicer minted
 const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
 
 /// A `Trap` → small status code for an `IoRing` CQE, numbered to match the JIT's `TrapKind` codes
@@ -12965,6 +13129,18 @@ pub const CAP_SELF_SVC_WAIT: u32 = 10;
 /// handler→ticket linkage: it returns the served ticket, or `-EINVAL` when not called from a handler.
 /// Eval-loop-only (needs `serve_run`); a host-side dispatch answers a probeable `-EINVAL`.
 pub const CAP_SELF_CLONE_CALLER: u32 = 11;
+
+/// FORK.md §8.6 — the reserved self-namespace op for `reap` (the servicer-side primitive `wait()`
+/// is sugar over): from **within a serve handler**, reap a **twin** the fork servicer minted, on
+/// behalf of the caller parked on this dispatch. Given a `pid` (a twin `TaskId` returned by a
+/// prior pid-mode `clone_caller`), it delivers that twin's **exit status** as the parked caller's
+/// reply — immediately if the twin already finished, else by parking the caller until it does
+/// (`Pending::ReapPid`). Unlike `join`, a twin **trap does not propagate** to the waiter: a
+/// crashing command must not crash the shell (STAGE1.md), so a trapped twin reaps as a nonzero
+/// crash status. Confined to ids fork actually minted (`Sched::forked_twins`); any other `pid` is
+/// `-ECHILD`. Eval-loop-only (needs `serve_run`) and Real-scheduler-only (like `clone_caller`); a
+/// host-side or non-serving dispatch answers a probeable `-EINVAL`. Pinned at 12.
+pub const CAP_SELF_REAP: u32 = 12;
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
@@ -16026,7 +16202,9 @@ impl Host {
                 // trap — the guest's serve loop can fall back. (The tree-walk eval loop intercepts
                 // these before dispatch; the bytecode engine declines them at compile and falls back
                 // to the tree-walker.)
-                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT | CAP_SELF_CLONE_CALLER if op >> 8 == 0 => {
+                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT | CAP_SELF_CLONE_CALLER | CAP_SELF_REAP
+                    if op >> 8 == 0 =>
+                {
                     Ok(vec![EINVAL])
                 }
                 _ => Err(Trap::CapFault),

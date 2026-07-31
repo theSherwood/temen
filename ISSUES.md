@@ -154,6 +154,20 @@ direction accordingly: either run teardown drains still-runnable forked twins be
 delivered to the handler) so the test stops encoding the race. The doubling/dedup sketch above is
 withdrawn.
 
+**Related manifestation 2026-07-31 — the `-EAGAIN`/`-ECHILD` serve-race in fork + wait (FORK.md
+§8.6).** The same enqueue-before-park window has a second face on the servicer side, surfaced building
+`reap` (`wait(pid)`): `svc_enqueue` makes a dispatch visible and wakes the server *before* the caller
+registers its `CapReply` waiter, so a servicer that runs `clone_caller`/`reap` can find **no parked
+caller** (`ticket_waiters` miss). `fork` already answers this with `-EAGAIN` (pid mode); `reap` must
+answer it the same way (`ReapOutcome::Retry` → `-EAGAIN`) and **not** confuse it with a genuine
+unknown-pid `-ECHILD`. The fix is guest-side and realistic: the `fork_then_wait` test retries both
+`fork` and `wait` on `-EAGAIN` (`while ((s = wait(pid)) < 0);`), which converges and makes it **stable
+0/50 under the full parallel `clone_caller` suite** where a one-shot form flaked ~1/15 with `left:
+[-10]` (a raced `wait` mis-reported `-ECHILD`, or a raced `fork` handed the parent a bogus pid). This
+is the same root class as I53 — not a new bug — and the retry idiom is the standing mitigation for the
+serve/park race on **any** handler that needs its parked caller. Fully closing it would require the
+serve protocol to register the caller's waiter before the dispatch is servable (still S4).
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and

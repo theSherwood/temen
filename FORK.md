@@ -379,3 +379,51 @@ structure. Split into sub-slices by risk:
 handler → the original returns `A` and the twin returns `B` from the **same** call site, both resuming in
 one live run, interp==JIT. **Load-bearing risk:** the powerbox copy-vs-share decision — TDD-first, and a
 `Slot`-kind audit before wiring shared backings.
+
+## 8.6 fork + wait — reaping the twin (2026-07-31)
+
+Track 2 landed `fork()`-returns-twice for compiled C. A shell's command loop is `pid = fork(); … ;
+wait(pid)` — so the next verb is **`wait`**: the parent blocks until its twin exits and observes the
+exit status. The substrate already had the whole reap primitive — a finished task's `Outcome` is keyed
+by `TaskId` in `Sched::results`, and `Blocked::Join { child }` (+ `join_waiters`) parks until that task
+finishes and wakes the parked joiner — but the ordinary `join` op (Instantiator op 1) reaps by a
+**handle** (a `threads`-table slot), and a fork twin is minted straight onto `runnable` with no handle
+in anyone's table. So the twin was un-reapable by the forking guest.
+
+**The verb.** `reap` — a self-namespace op (`CAP_SELF_REAP = 12`, the sibling of `clone_caller = 11`),
+served the same way: the fork server serves a **second** offer verb (`wait`) whose handler calls `reap`
+on the caller parked on its dispatch. Symmetric with `clone_caller` — no new Instantiator op, no new
+grant-graph edge, and the guest stays destitute (it reaches `wait` only through the offer the manager
+granted, exactly as it reaches `fork`). Confinement is capability-shaped **plus** a `Sched::forked_twins`
+allow-set: `reap` acts only on ids `fork` actually minted, so a bogus/foreign pid is `-ECHILD`, never a
+park that hangs.
+
+**Reap ≠ join — a crashing command must not crash the shell.** `join` propagates a child trap as the
+joiner's own trap (`out.result?`). `wait` must not: a trapped twin reaps as a nonzero *crash status*
+(`reap_status`; the exact POSIX `128 + signal` encoding is a shell/guest concern, ISSUES.md I43). This
+is the one real semantic difference, and it is why `reap` is its own op rather than a rebind of `join`.
+
+**Two paths.** `reap_parked_caller` claims the parked caller (the shape `fork_parked_caller` removes),
+then: twin already finished → deliver its status now (`CapResult`); twin still running → move the caller
+into `join_waiters[pid]` with `Pending::ReapPid`, and the twin's completion (the generic join-wake)
+resumes it with the status. `reap_twin` takes the outcome *and* retires the id from `forked_twins`, so a
+second `wait(pid)` is `-ECHILD`, never a re-park.
+
+**The serve/park race — `wait` retries on `-EAGAIN`, like `fork`.** `svc_enqueue` makes a dispatch
+visible and wakes the server *before* the caller registers its `CapReply` waiter, so under load a
+servicer can drain the dispatch before the caller parks. `fork` already fails such a race with `-EAGAIN`
+(pid mode), and the guest retries. `reap` faces the **same** race and must not confuse it with a real
+`-ECHILD`: `ReapOutcome::Retry` (twin exists in `forked_twins` but no waiter registered yet) → `-EAGAIN`;
+`ReapOutcome::NoChild` (unknown pid) → `-ECHILD`. The realistic shell idiom `while ((s = wait(pid)) < 0);`
+retries the transient failure and converges — which is exactly why the `clone_caller.rs` fork+wait test
+is stable under a full parallel suite where a one-shot form would flake (the I53 family).
+
+**Proven.** `clone_caller.rs::fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer` — one
+server serves `fork` + `wait` over one offer; the caller forks, the twin `exit(42)`s, the parent
+`wait(3)`s (the deferred path — it waits the instant it forks), reaps `42`, and the run returns it.
+Interp only, like every fork test.
+
+**Remaining for the shell loop:** `exec`/`execve` (the twin replaces its image with a command — image
+-replace on the durable-clone capstone), then wiring `fork`/`wait` end-to-end through a compiled-C
+`sh_spawn` (the `c_fork.rs` guest gains the `wait` import), and job-control `waitpid` flags (`WNOHANG`,
+group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking `results` probe.
