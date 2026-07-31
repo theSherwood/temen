@@ -2093,6 +2093,119 @@ fn c_pthread_cond_handoff() {
     }
 }
 
+/// `<semaphore.h>` value semantics, single-threaded (no parking): two trywaits drain an
+/// initial count of 2, a third reports EAGAIN, a post is consumed by a wait without blocking,
+/// and `sem_getvalue` reads the drained count. Any deviation sets a bit in the result.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_sem_value_semantics() {
+    let src = "#include <semaphore.h>\n\
+        int main(void) {\n\
+        \x20 sem_t s;\n\
+        \x20 sem_init(&s, 0, 2);\n\
+        \x20 int r = 0;\n\
+        \x20 if (sem_trywait(&s) != 0) r |= 1;\n\
+        \x20 if (sem_trywait(&s) != 0) r |= 2;\n\
+        \x20 if (sem_trywait(&s) != 11) r |= 4;\n\
+        \x20 sem_post(&s);\n\
+        \x20 if (sem_wait(&s) != 0) r |= 8;\n\
+        \x20 int v;\n\
+        \x20 sem_getvalue(&s, &v);\n\
+        \x20 if (v != 0) r |= 16;\n\
+        \x20 sem_destroy(&s);\n\
+        \x20 return r;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(0)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// The classic bounded producer/consumer over two semaphores (`items`/`slots`) and a 4-slot ring:
+/// the producer pushes 1..=8, the consumer (main) drains and sums them. The semaphores carry all
+/// the synchronization — the sum is 36 and the freed `slots` count is back to 4 on every
+/// interleaving (a lost wakeup or a skipped slot would deadlock or mis-sum).
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_sem_producer_consumer() {
+    let src = "#include <pthread.h>\n\
+        #include <semaphore.h>\n\
+        static int buf[4];\n\
+        static int head = 0, tail = 0;\n\
+        static sem_t items, slots;\n\
+        static void *producer(void *arg) {\n\
+        \x20 (void)arg;\n\
+        \x20 for (int i = 1; i <= 8; i++) {\n\
+        \x20   sem_wait(&slots);\n\
+        \x20   buf[head & 3] = i;\n\
+        \x20   head++;\n\
+        \x20   sem_post(&items);\n\
+        \x20 }\n\
+        \x20 return 0;\n\
+        }\n\
+        int main(void) {\n\
+        \x20 sem_init(&items, 0, 0);\n\
+        \x20 sem_init(&slots, 0, 4);\n\
+        \x20 pthread_t t;\n\
+        \x20 pthread_create(&t, 0, producer, 0);\n\
+        \x20 int sum = 0;\n\
+        \x20 for (int n = 0; n < 8; n++) {\n\
+        \x20   sem_wait(&items);\n\
+        \x20   sum += buf[tail & 3];\n\
+        \x20   tail++;\n\
+        \x20   sem_post(&slots);\n\
+        \x20 }\n\
+        \x20 pthread_join(t, 0);\n\
+        \x20 int v;\n\
+        \x20 sem_getvalue(&slots, &v);\n\
+        \x20 return sum * 10 + v;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(364)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// `pthread_barrier_t` across three phases with four participants (three spawned + main): every
+/// thread bumps the phase counter *before* the barrier and checks it reads the full 4 *after* —
+/// nobody passes a generation early — and exactly one caller per phase gets
+/// `PTHREAD_BARRIER_SERIAL_THREAD`. Score: 3 serial releases ×100 + 12 full-count checks = 312.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_barrier_phases() {
+    let src = "#include <pthread.h>\n\
+        static pthread_barrier_t bar;\n\
+        static int count[3];\n\
+        static void *worker(void *arg) {\n\
+        \x20 (void)arg;\n\
+        \x20 long score = 0;\n\
+        \x20 for (int p = 0; p < 3; p++) {\n\
+        \x20   __vm_atomic_add32(&count[p], 1);\n\
+        \x20   int r = pthread_barrier_wait(&bar);\n\
+        \x20   if (r == PTHREAD_BARRIER_SERIAL_THREAD) score += 100;\n\
+        \x20   else if (r != 0) return (void *)-1L;\n\
+        \x20   if (__vm_atomic_load32(&count[p]) == 4) score += 1;\n\
+        \x20 }\n\
+        \x20 return (void *)score;\n\
+        }\n\
+        int main(void) {\n\
+        \x20 pthread_barrier_init(&bar, 0, 4);\n\
+        \x20 pthread_t t[3];\n\
+        \x20 for (int i = 0; i < 3; i++) pthread_create(&t[i], 0, worker, 0);\n\
+        \x20 long total = (long)worker(0);\n\
+        \x20 for (int i = 0; i < 3; i++) {\n\
+        \x20   void *r;\n\
+        \x20   pthread_join(t[i], &r);\n\
+        \x20   total += (long)r;\n\
+        \x20 }\n\
+        \x20 return (int)total;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(312)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
 // §13/§14 the **magic ring buffer in real C**, end to end through the `__vm_region_*` builtins —
 // proving the powerbox wiring (the 5th handle: an AddressSpace the guest mints from) and the
 // builtin lowering, differentially on both backends. A guest mints a region, maps it at two

@@ -586,13 +586,21 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    `crates/svm-dap/tests/state_writes.rs`: var + window + threaded writes shifting results and
 >    surviving `seek(0)` re-drive bit-identically, pre-write-clock state reading original,
 >    DAP round-trip incl. Variables-pane readback, and fail-closed surfaces.
-> 9. **X6 — guest-libc sem/barrier.** Extend `frontend/chibicc/include/pthread.h` — which already
->    builds mutex + condvar on the `__vm_wait32`/`__vm_notify` futex intrinsics and declares
->    sem/barrier out of scope — with `sem_*` (counter + futex) and `pthread_barrier_*`
->    (generation counter + futex) by the same construction; add the headers to the browser
->    playground's seeded set (which today ships **no** threading headers at all). Zero engine
->    surface. Acceptance: producer/consumer and barrier-phase fixtures run on interp + JIT with
->    identical output.
+> 9. ~~**X6 — guest-libc sem/barrier.**~~ **DONE 2026-07-31** — zero engine surface, as designed:
+>    `pthread_barrier_*` joined mutex/cond in `frontend/chibicc/include/pthread.h` (a
+>    generation-count barrier over the futex — arrivals fetch-add, the last resets + bumps the
+>    `__gen` word + notifies; the atomic re-check in `__vm_wait32` makes it lost-wakeup-free and
+>    the generation turn makes it immediately reusable), and POSIX `sem_*` landed in a new
+>    `frontend/chibicc/include/semaphore.h` (CAS-decrement while positive, park on the exhausted
+>    word, post = add + notify; `init/destroy/wait/trywait/post/getvalue`). Both headers are now
+>    also seeded into the browser playground's `/include` set — from the *frontend copies* via
+>    `include_str!`, one source of truth. Gated by `svm/tests/c_frontend.rs`
+>    (`c_sem_value_semantics`, `c_sem_producer_consumer` — bounded ring, sum 36 + slots restored —
+>    and `c_pthread_barrier_phases` — 4 participants × 3 phases, full-count-after-wait + exactly
+>    one `PTHREAD_BARRIER_SERIAL_THREAD` per phase), all differential interp == JIT via
+>    `run_c_full`; plus `browser/tests/chibicc_threads.rs` compiling the same shapes through
+>    chibicc-the-guest against the seeded headers (native tests can't spin the cross-Worker vCPU
+>    host, so the browser side proves the compile pipeline).
 > 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
 >    (finite register file) stays demand-driven.
 >

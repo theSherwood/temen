@@ -2522,6 +2522,18 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/math.h",
             include_str!("../playground-include/math.h"),
         ),
+        // The §12 threading layer (INTERACTIVE_EMBEDDING.md slice 9): pthreads + POSIX semaphores
+        // over the VM's futex/atomics builtins. Seeded from the *frontend's* bundled copies —
+        // one source of truth, since the guest chibicc lowers the same `__vm_*` builtins the
+        // native frontend does.
+        (
+            "include/pthread.h",
+            include_str!("../../frontend/chibicc/include/pthread.h"),
+        ),
+        (
+            "include/semaphore.h",
+            include_str!("../../frontend/chibicc/include/semaphore.h"),
+        ),
         // The system-header surface chibicc's *own* sources #include (SELFHOST_C.md §7, stage-2). Most
         // are thin stubs — the sandbox has no processes/globbing/wall-clock — present so `chibicc.h`
         // parses; `<time.h>` returns a fixed 1970 epoch (for the `__DATE__`/`__TIME__` macros), and the
@@ -2627,7 +2639,7 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
                     acc.push('/');
                 }
                 acc.push_str(seg);
-                if !dirs.iter().any(|d| *d == acc) {
+                if !dirs.contains(&acc) {
                     dirs.push(acc.clone());
                 }
             }
