@@ -604,6 +604,17 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
 >    (finite register file) stays demand-driven.
 >
+> **Post-plan residue (2026-07-31, surfaced by the first embedder spike):** the consumer's
+> memory panel and history slider needed two request arms the plan's slices had left implicit —
+> the standard **`readMemory`** (the `writeMemory` twin; base64 at a decimal/hex reference +
+> offset, `supportsReadMemoryRequest` advertised) and a custom **`seek`** verb (`arguments.t` on
+> the reverse coordinate — turn multithreaded, clock single-threaded; forward or backward via
+> the checkpoint ladder, landing as an ordinary stop and replying with the landed `t`). Both
+> were engine-supported already (`read_window` / `Debuggee::seek`) — DONE as dispatch arms,
+> gated by `crates/svm-dap/tests/read_seek.rs` on both engines. The spike itself measured
+> ~0.08 ms per step+poll and ~2 ms `stepBack` through the wasm32 cdylib — the embedder-side
+> latency questions the plan deferred are settled.
+>
 > Order rationale: 1–2 are small and unblock any embedder spike (interactivity + step latency);
 > 3 is the hinge the model slices stand on; 4–5 close the perf/memory panels; 6–7 close the
 > threading story; 8–10 are an independent tail, land any time.

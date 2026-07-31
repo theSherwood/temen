@@ -2596,6 +2596,33 @@ fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
     argv
 }
 
+/// The **self-host** card's argv (SELFHOST_C.md §5): compile one of chibicc's *own* cc1 TUs to a
+/// linkable **object** unit (`--emit-object`, `cc -c`), reading the TU + its full system-header closure
+/// from the seeded memfs. Mirrors `guest_emit_object` in `crates/svm/tests/c_link.rs` — relative `-I`s
+/// (the fs cap refuses absolute paths), the self-host prelude force-included (chibicc's parser can't
+/// ingest modern glibc's ISO-C23 `strtoul`/… redirects), output to stdout (no out arg). `tu` is the
+/// memfs-relative input path (e.g. `frontend/chibicc/hashmap.c`). Borrows `tu`; caller keeps it alive.
+fn chibicc_selfhost_argv(tu: &[u8], debug_info: bool) -> Vec<&[u8]> {
+    // No `--data-page`: an emit-object *unit* is relinked (the linker page-aligns each unit's data, D40),
+    // so the object stays canonical — byte-identical to the proven native path (`c_link.rs`, which passes
+    // no data-page), which is what the CI gate diffs against.
+    let mut argv: Vec<&[u8]> = vec![
+        b"chibicc",
+        b"--emit-object",
+        b"-include",
+        b"crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h",
+        b"-Ifrontend/chibicc",
+        b"-Ifrontend/chibicc/include",
+        b"-Iusr/include/x86_64-linux-gnu",
+        b"-Iusr/include",
+    ];
+    if debug_info {
+        argv.push(b"-g");
+    }
+    argv.push(tu);
+    argv
+}
+
 /// Assemble the chibicc card's memfs image: the user's source `src` at `in.c`, the built-in playground
 /// libc headers under `include/` ([`playground_include_files`]), plus any caller headers from the
 /// optional `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash). Shared by the
@@ -2732,6 +2759,52 @@ pub extern "C" fn svm_run_onramp_fs(
     };
     let argv = chibicc_card_argv(debug_info != 0);
     let out = onramp_fs_exec(&m, &image, &argv, &[]);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.svmb` in
+/// `--emit-object` mode over one of chibicc's *own* cc1 TUs, seeded from `[img_ptr, img_len)` — the
+/// committed closure image (`chibicc_selfhost.img`: the TU sources + their glibc header closure +
+/// `selfhost_prelude.h`) — and emit that TU's linkable **object** unit as SVM-IR **text** on
+/// `svm_stdout_ptr`/`_len`. `[tu_ptr, tu_len)` is the memfs-relative TU path. Unlike
+/// [`svm_run_onramp_fs`] (which merges the playground libc + seeds `/in.c`), the image is passed
+/// **raw** — the self-host closure is self-contained. The wasm-JIT twin is
+/// [`svm_selfhost_jit_emit_object_fs`]. Sets [`svm_status`]/[`svm_exit_code`]; returns the guest result.
+#[no_mangle]
+pub extern "C" fn svm_selfhost_emit_object_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    tu_ptr: *const u8,
+    tu_len: usize,
+    debug_info: i32,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    let argv = chibicc_selfhost_argv(tu, debug_info != 0);
+    let out = onramp_fs_exec(&m, image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -4755,6 +4828,60 @@ pub extern "C" fn svm_onramp_jit_run_open_fs(
     let argv = chibicc_card_argv(debug_info != 0);
     // The play threads build imports a **shared** memory, so the emitted module must too.
     match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// The self-host card's window: **2^27 = 128 MiB**, larger than the single-file card's
+/// [`JIT_RUN_WIN_LOG2`] (32 MiB). chibicc's largest TU, `codegen_ir.c`, emits ~1.2 MB of IR and its
+/// compile working set overruns 32 MiB — the run traps `unreachable` mid-emit (measured). 128 MiB clears
+/// every cc1 TU (all byte-identical to native); the max-memory cap is 1 GiB, so this stays well within.
+const SELFHOST_WIN_LOG2: u8 = 27;
+
+/// **Self-host card — wasm-JIT tier** (the fast twin of [`svm_selfhost_emit_object_fs`]). Emit
+/// `chibicc.svmb`'s `_start` to wasm and run it in `--emit-object` mode over one of chibicc's own cc1
+/// TUs (seeded from the raw closure image `[img_ptr, img_len)`, memfs-relative TU path
+/// `[tu_ptr, tu_len)`), so the browser compiles chibicc's own source on emitted wasm — every cc1 TU,
+/// giants included, in a few hundred ms (SELFHOST_C.md). Drives the same finish path as the shipping JIT
+/// card ([`svm_onramp_jit_run_finish`] → the object text on `svm_stdout_*`). Runs in a 128 MiB window
+/// ([`SELFHOST_WIN_LOG2`]). Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]).
+#[no_mangle]
+pub extern "C" fn svm_selfhost_jit_emit_object_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    tu_ptr: *const u8,
+    tu_len: usize,
+    debug_info: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return -STATUS_VERIFY_ERR;
+    }
+    let argv = chibicc_selfhost_argv(tu, debug_info != 0);
+    match JitOnrampRun::open_owned_run_fs(&m, SELFHOST_WIN_LOG2, true, image, &argv, Vec::new()) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };

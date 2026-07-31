@@ -579,6 +579,13 @@ jobs:
         # copy-over can't break CI parsing.
         run: |
           node -e "try{require('child_process').execFileSync('bash',['../crates/svm-run/demos/chibicc_selfhost/build_chibicc_svmb.sh'],{stdio:'inherit'});require('fs').copyFileSync('/tmp/svm_chibicc_cache/chibicc.svmb','web/assets/chibicc.svmb');console.log('staged chibicc.svmb')}catch(e){console.log('chibicc asset skipped: '+e.message)}"
+      # The self-host closure image (chibicc_selfhost.img) for the "chibicc compiles its own source" card:
+      # chibicc's own cc1 TU sources + the glibc header closure, seeded so browser-play-editor-test.mjs can
+      # run chibicc.svmb --emit-object over them and diff the object against native chibicc (which this step
+      # also builds, for `-M` closure discovery + the byte-identity oracle). Fail-soft → the test SKIPs.
+      - name: build + stage self-host closure image
+        working-directory: browser
+        run: node build-selfhost-assets.mjs || echo "self-host image skipped"
       # gencorpus (native) writes the corpus; build the wasm32 THREADS module (shared memory + atomics,
       # so it needs -Z build-std); then drive it in real Chromium under COOP/COEP.
       - name: Build threads module + run in Chromium (powerbox + multi-Worker → 4000)
