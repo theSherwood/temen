@@ -21,6 +21,88 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I60 — the vendored-`svm` submodule is a *linked worktree* of the parent repo's `.git`, so a `git gc` in one checkout can prune unpushed commits authored in the other's detached HEAD (S3, tooling hazard — cost real committed work this run) — recorded 2026-07-31 on the JACL SVM-backend migration
+
+**Symptom.** JACL vendors this repo at `jacl_impl/vendor/svm` as a **linked git worktree** sharing the
+parent's object store (`jacl_impl/vendor/svm/.git` is a `gitdir:` pointer into
+`jacl_impl/.git/worktrees/svm`, not an independent clone). While work was committed on the vendored
+worktree's **detached HEAD** but not yet pushed to a branch ref, a concurrent `git gc`/auto-gc running
+against the *shared* object store pruned the commit as unreachable: it vanished from `reflog` and
+`fsck --lost-found`, forcing every change to be re-applied from scratch against an advanced `main`.
+This is the direct cause of how messy the SVM-backend-migration run was.
+
+**Root cause.** A detached-HEAD commit is reachable only from `HEAD` in *that* worktree. Auto-gc
+triggered from another worktree (or the parent) enumerates roots across the shared store; a
+per-worktree `HEAD` reflog is honored, but the window between committing and the reflog/ref being
+durable — plus `gc --prune=now`-style aggressive settings — let an unreferenced tip be collected.
+Nothing in the tree is *wrong*; this is a property of `git worktree` + detached HEAD + shared gc that
+bites the vendored-submodule development model specifically.
+
+**Mitigation / working rule (no code fix — a discipline note).** When developing in the vendored
+worktree: (1) **never work on a detached HEAD** — `git checkout -B <branch>` immediately so every
+commit is anchored to a ref that gc treats as a root; (2) **push early** so `origin/<branch>` is a
+durable root even if the local ref is lost; (3) avoid `git gc`/`git worktree prune` against the shared
+store while another worktree holds unpushed detached commits; (4) `git config gc.auto 0` in the
+vendored worktree during a long editing session is the cheap belt-and-suspenders. Recorded so the next
+agent anchors to a branch first instead of rediscovering the loss.
+
+### I59 — the detached `browser` workspace duplicates `svm_ir`/`svm_interp` when several test targets are built together, producing transient `E0308 "multiple different versions of crate"` (S4, build flake) — recorded 2026-07-31 wiring the JACL on-ramp playground
+
+**Symptom.** Building/running more than one `browser/tests/*.rs` target in a single `cargo test`
+invocation intermittently fails to compile with `E0308 mismatched types: … expected struct
+svm_ir::Module (…), found struct svm_ir::Module (…)` — the *same* type reported as two different
+crate instances. Building the targets **one at a time** (`cargo test --test <one>`) resolves it every
+time; the tree is not miscompiled.
+
+**Root cause (same family as I55/I18).** `browser/` is a **separate workspace** (its own `Cargo.lock`)
+that depends on the main-workspace crates by path. Under some target/feature-unification orderings when
+multiple test binaries are compiled together, Cargo instantiates `svm_ir`/`svm_interp` twice (distinct
+`-Cmetadata`), and a value produced by one instance can't satisfy a signature from the other. It's a
+resolver/unification nondeterminism, not a code defect — hence transient and per-invocation.
+
+**Mitigation / fix sketch.** Immediate: run browser test targets individually in CI and locally (the
+`real-browser`/wasm gates already do this per-`.mjs`; the native `browser/tests/*.rs` are the exposed
+surface). Durable options, in order of preference: fold new native browser tests into a **single** test
+binary (as I3/I30 did for the heavy `svm` links — prefer extending an existing target over adding a
+new one), or fold `browser` back into the main workspace so there is one dependency instantiation.
+Logged per the CLAUDE.md "log flakiness early" rule so it isn't re-diagnosed from scratch.
+
+### I58 — the on-ramp compiler-guest hard-codes a 4 KiB `vm_map` alignment, so it faults on any host whose software page size is coarser (S3, latent — wasm was the trigger this run; 16 KiB native hosts are the next) — recorded 2026-07-31, the JACL on-ramp heap fix (`059c1b4a`)
+
+**Symptom.** The self-hosted JACL compiler-guest (`jacl_compiler.svmb`), which grows its heap with
+`vm_map`s as it stages macros, `MemoryFault`ed mid-compile **only on wasm32** (native ran clean). Root
+cause was a page-size mismatch: the guest maps its heap in **4 KiB** increments, but the interpreter's
+software prot-map granularity (`host_page_size()` in `crates/svm-interp/src/lib.rs`) was **64 KiB** on
+wasm — a `map` of one 4 KiB guest page left the rest of the enclosing 64 KiB host page unmapped, so the
+guest's next store past 4 KiB hit an uncommitted page and trapped. Reproduced natively by forcing
+`host_page_size() = 64 KiB` (the guest then faults identically).
+
+**The applied fix is a host-side patch, not the root fix.** `059c1b4a` sets `host_page_size() = 4096`
+on `#[cfg(target_family = "wasm")]` (native keeps `page_size::get()` so the interpreter's
+uncommitted-tail faulting still *agrees with the native JIT's `PROT_NONE`* — the interp≡JIT
+differential; see the demand-paging note below). That makes the software prot-map granularity match
+what the guest assumes on wasm, which is why the tour now compiles in-browser. But it only papers over
+the mismatch where we hit it.
+
+**The real latent bug (unfixed).** The guest assuming a fixed 4 KiB page is wrong on **any** host whose
+page size is coarser than 4 KiB — notably **16 KiB-page native hosts** (Apple-silicon macOS, some
+ARM64 Linux configs), where `page_size::get()` returns 16384 and the identical fault is reachable
+*natively*, with no wasm involved. We simply haven't run the growing compiler-guest on such a host yet.
+
+**Fix sketch (guest-side, page-size-agnostic).** Have the compiler-guest import a `vm_page_size`
+capability (or read it from the powerbox at start-up) and **align its `map` requests up to the
+runtime's actual page size** instead of assuming 4 KiB — round both the base and the length to
+`vm_page_size` before each grow. Then drop the wasm `host_page_size()` override and let the guest be
+correct on 4 K/16 K/64 K hosts uniformly. This is the small, boring fix; the host override is the
+stopgap that unblocked the browser tour.
+
+**Why not just demand-page the interpreter's tail.** Considered and rejected this run: making the
+interpreter lazily commit the uncommitted tail of a mapped region (so a 4 KiB `map` implicitly covers
+its enclosing host page) would make the **interpreter stop faulting where the native Cranelift JIT
+still faults** (the JIT guards uncommitted pages with `PROT_NONE`; `confine_checked` deliberately
+matches that). That divergence breaks the interp≡JIT differential — the escape oracle — so the guest
+aligning to the true page size is the correct layer to fix, not the confinement path.
+
 ### I57 — `provision-nimony.sh` failed the `nim end-to-end` job with `fatal: destination path 'nimony' already exists and is not an empty directory` on any warm nimony cache (S4, CI break) — surfaced 2026-07-31 on PR #560, **FIXED same day** (`claude/bash-svm-viability-uqj6ts`)
 
 **Symptom.** On PR #560 (fork capstone — touches only `svm-interp`, one new `svm` test, and `FORK.md`,
