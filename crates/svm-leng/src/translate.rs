@@ -272,6 +272,13 @@ pub(crate) struct Translator {
     link_mode: bool,
     /// Cross-module callees lowered to SVM imports (discovered during emission).
     imports: RefCell<ImportTable>,
+    /// **External funcref globals** — another unit's `gvar` whose type is a `proctype`, under the
+    /// stem-suffixed name this module references it by ([`export_funcrefs`]). A cross-module
+    /// `(call oomHandler.0.<sys> …)` targets a function-*pointer* data symbol, not a proc: with the
+    /// pooled signature here, `lvalue_type`/`lvalue_addr` treat it as an `FnPtr` global (address via
+    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call_indirect`. Empty
+    /// unless the linker pooled sibling units' funcref gvars.
+    ext_funcrefs: HashMap<String, FnPtrSig>,
 }
 
 impl Translator {
@@ -289,6 +296,7 @@ impl Translator {
             globals: HashMap::new(),
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
+            ext_funcrefs: HashMap::new(),
         }
     }
 
@@ -1039,6 +1047,39 @@ impl Translator {
             self.agg_names.insert(name.clone());
             self.types.insert(name.clone(), layout.clone());
         }
+    }
+
+    /// Pre-register **external funcref globals** — another module's `gvar`s whose type is a
+    /// `proctype`, under the stem-suffixed names this module references them by
+    /// ([`export_funcrefs`]). See the [`ext_funcrefs`](Self::ext_funcrefs) field: this is what turns
+    /// a cross-module `(call <funcref-gvar> …)` from a (wrong) proc import into a `data.sym` load +
+    /// `call_indirect`.
+    pub fn import_funcrefs(&mut self, ext: &[(String, FnPtrSig)]) {
+        for (name, sig) in ext {
+            self.ext_funcrefs.insert(name.clone(), sig.clone());
+        }
+    }
+
+    /// Collect a module's **funcref globals** under their stem-suffixed global names — the form
+    /// *other* modules reference them by. A `gvar`/`tvar` whose type is a `proctype` (e.g. the
+    /// stdlib's `oomHandler`) is a function-*pointer* data symbol; a sibling unit that calls through
+    /// it needs the `call_indirect` signature at translate time (the funcref value itself, an `i32`
+    /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
+    /// [`export_types`]; [`link_selected`] pools these across its units before translating any.
+    pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        t.collect_globals(root)?;
+        let mut out: Vec<(String, FnPtrSig)> = t
+            .globals
+            .iter()
+            .filter_map(|(name, (_, desc))| match desc {
+                TyDesc::FnPtr(sig) => Some((format!("{name}{stem}"), (**sig).clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
     }
 
     /// Collect a module's aggregate type layouts under their **stem-suffixed global names** — the
@@ -1954,6 +1995,13 @@ impl<'a> FuncGen<'a> {
                         return Ok((v.id, desc));
                     }
                 }
+                // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
+                // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
+                // and `indirect_callee` recover the `call_indirect` signature.
+                if let Some(sig) = self.t.ext_funcrefs.get(name).cloned() {
+                    let addr = self.emit_data_sym(name, 0);
+                    return Ok((addr, TyDesc::FnPtr(Box::new(sig))));
+                }
                 // In a link unit, an atom resolved by none of the above is a **cross-module data
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
                 // scalar; the linker binds it, and an unresolved name is a fail-closed link error.
@@ -2231,6 +2279,10 @@ impl<'a> FuncGen<'a> {
                 }
                 if let Some((_, d)) = self.t.globals.get(name) {
                     return Some(d.clone());
+                }
+                if let Some(sig) = self.t.ext_funcrefs.get(name) {
+                    // A cross-module funcref global — an `FnPtr` data symbol (see `ext_funcrefs`).
+                    return Some(TyDesc::FnPtr(Box::new(sig.clone())));
                 }
                 self.local_desc.get(name).cloned()
             }

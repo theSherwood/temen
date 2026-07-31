@@ -506,6 +506,21 @@ plumbing. Five workstreams, roughly independent:
     fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
     against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
     `more` land in the sret slot identically on both engines (`tests/link.rs`).
+  - **✅ Cross-module funcref globals — DONE 2026-07-31.** The fourth cross-module symbol kind. A
+    stdlib `gvar` whose type is a `proctype` (the allocator's `oomHandler`, `gExitFlush`,
+    `scheduler`) is a function-*pointer* **data** symbol, not a proc — so a sibling module's
+    `(call oomHandler.0.<sys> …)` must lower to a `data.sym` load of the `i32` funcref +
+    `call_indirect`, not a proc import (which fail-closes at link as `Unresolved`, since the owning
+    module exports the name as *data*). Like aggregate **types**, the `call_indirect` signature is
+    needed at *translate* time, so `link_selected` now also pools every unit's funcref gvars
+    (`Translator::export_funcrefs`, name+stem → `FnPtrSig`) and pre-registers them
+    (`import_funcrefs`); `lvalue_type`/`lvalue_addr` then treat a pooled name as an `FnPtr` global
+    (address via `data.sym`), and the existing `indirect_callee` path lowers the call unchanged. With
+    this, a real allocating program links with **zero unresolved imports** (`oomHandler` binds). The
+    funcref value itself stays zero-until-`ini` (a symbol-initialized gvar; see the `gExitFlush`
+    note) — this slice is purely the cross-module *call-site* lowering. Tested: two hand-written
+    modules where `w` calls through a `proctype` gvar defined in `s` (setter stores `ref.func`, then
+    dispatch), both engines (`tests/link.rs`).
   - **✅ Whole-module link objects — DONE 2026-07-30 (Path A shape).** `link_units` lifts a
     *hand-picked subset* of a module's procs (the "go deep" mode); a real program instead links
     *whole compiled modules* — every proc plus the scaffolding nimony emits (`ini`
@@ -597,12 +612,20 @@ plumbing. Five workstreams, roughly independent:
     against a frozen snapshot. The toolchain is built in a dedicated CI job
     (`scripts/ci/provision-nimony.sh`); when it's absent the tests **skip** (the translator's own
     logic stays covered by the fast, toolchain-free unit tests).
-  - **Remaining toward a full program:** heap programs (`seq`/`string`) surface one more translator
-    slice — a generic instantiated `seq[T]` `oconstr` in the *program* module lowers as a scalar
-    (`Unsupported("expression oconstr")`) because its type isn't yet registered as an aggregate. The
-    allocator's higher layers (`alloc`/`rawAlloc` over an initialized `MemRegion`) also need the
-    system `ini` chain run first. The ARC-heavy string path already links and runs against real
-    `=wasMoved`/`=destroy`.
+  - **Remaining toward a full program:** heap programs (`seq`/`string`) now **link with zero
+    unresolved imports** (the cross-module funcref-gvar slice above bound `oomHandler`), and the
+    generic instantiated `seq[T]` `oconstr` was a red herring — the type *is* registered as an
+    aggregate; the earlier `Unsupported("expression oconstr")` was a harness bug (import discovery
+    compiled a *program* module standalone, which can't resolve a cross-module aggregate type like
+    `string.0.<sys>` — now discovered from the self-contained `system` module only). Two gaps still
+    stand between "links" and "runs": **(1) cross-module frame-needing calls** — a program calling a
+    frame-needing stdlib proc (`alloc`, linked sig `($sp, size)`) doesn't pass `$sp`, because
+    `call_import` derives the signature from the args and can't see the callee needs a frame
+    (verify: `CallArgCountMismatch`, expected 2 found 1); the fix mirrors the funcref pooling —
+    export each proc's frame-need so `call_import` prepends `sp + frame_size`. **(2) the `ini`
+    allocator-init chain** — `alloc`/`rawAlloc` run over a `MemRegion` the system `ini` must set up
+    first, so a real heap program must enter through its init chain, not a cold leaf call. The
+    ARC-heavy string path already links and runs against real `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

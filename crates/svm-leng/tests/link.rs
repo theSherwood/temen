@@ -337,3 +337,47 @@ fn unresolved_cross_module_global_is_fail_closed() {
         other => panic!("expected a fail-closed link error, got {other:?}"),
     }
 }
+
+/// A cross-module call **through a funcref global** — the funcref counterpart of
+/// `cross_module_global_read_write`. Module `s` defines a `proctype` gvar `hook`, a handler `dbl`,
+/// and a setter that stores `ref.func dbl` into `hook`; module `w` calls `hook.<s>(x)`. A funcref
+/// gvar is a *data* symbol, not a proc, so the call must lower to a `data.sym` load + `call_indirect`
+/// (using the pooled proctype signature), not a proc import. `drive` sets the hook, then dispatches
+/// through it: `drive(x) = dbl(x) = 2x`.
+#[test]
+fn cross_module_funcref_global_call() {
+    let mod_s = "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :hook.0. . IntFn.0.)
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2))))
+ (proc :sethook.0. (params) . .
+  (stmts . (asgn hook.0. dbl.0.))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts .
+   (call sethook.0.mods)
+   (ret (call hook.0.mods x.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["sethook.0.", "dbl.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // drive = module w's first proc → func 0.
+    assert_eq!(
+        run(&linked, 0, &[21]),
+        42,
+        "drive sets hook=dbl, calls hook(21)"
+    );
+    assert_eq!(run(&linked, 0, &[-5]), -10);
+}

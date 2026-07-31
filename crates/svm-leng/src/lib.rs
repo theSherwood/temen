@@ -192,10 +192,12 @@ fn translate_object_module(
     src: &str,
     sel: Select,
     ext_types: &[(String, translate::Layout)],
+    ext_funcrefs: &[(String, translate::FnPtrSig)],
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
+    t.import_funcrefs(ext_funcrefs);
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
     let (text, export_names) = match sel {
@@ -245,6 +247,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         unit.src,
         Select::Names(unit.names),
         &[],
+        &[],
     )?))
 }
 
@@ -257,6 +260,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
         &[],
     )?))
 }
@@ -287,15 +291,21 @@ fn link_selected_with_extra(
     extra: Vec<svm_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
+    let mut pooled_funcrefs = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
+        pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
     }
     let objects: Vec<Vec<u8>> = units
         .iter()
         .map(|(stem, src, sel)| {
             Ok(svm_encode::encode_unit(&translate_object_module(
-                stem, src, *sel, &pooled,
+                stem,
+                src,
+                *sel,
+                &pooled,
+                &pooled_funcrefs,
             )?))
         })
         .collect::<Result<_, LengError>>()?;

@@ -147,9 +147,12 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
 /// modules actually reference — discovered from each module's compiled object, so the mangled atomic
 /// symbol names never have to be hard-coded.
 fn link_with_runtime(mods: &[(String, String)]) -> Module {
-    // Discover the real import names by compiling each module to an object.
+    // Discover the real import names from the **system module** only (stem `sysv…`). Every
+    // bottom-edge C import (`mmap`, `memcpy`, the atomics, …) originates there, and — unlike a
+    // program module that references a cross-module aggregate type such as `string.0.sysv…` — the
+    // system module is self-contained, so it compiles standalone (no pooled types) for discovery.
     let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods {
+    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
         let obj = svm_encode::decode_unit(
             &svm_leng::compile_whole_object(&svm_leng::WholeModule { stem, src })
                 .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
