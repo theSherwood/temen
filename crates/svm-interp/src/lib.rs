@@ -15705,6 +15705,15 @@ impl Host {
             || self.resolve_region(handle).is_ok()
             || self.resolve_offer(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
+            || self.forkable_host_proc(handle)
+    }
+
+    /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
+    /// the one `HostProc` shape [`Host::regrant_into_child`] can carry into a child (re-minting the
+    /// handler over the shared provider state). A factory-less/opaque host proc cannot be re-granted.
+    fn forkable_host_proc(&self, handle: i32) -> bool {
+        matches!(self.resolve(handle, cap_id::HOST_PROC), Ok(Binding::HostProc(idx))
+            if self.host_proc_forks.get(idx as usize).is_some_and(|f| f.is_some()))
     }
 
     /// Re-grant `handle` from this (parent) host into `child` — the §14 child-powerbox re-grant policy:
