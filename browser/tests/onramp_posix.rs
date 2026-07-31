@@ -1,7 +1,7 @@
 //! The **POSIX personality** on-ramp entry (`onramp_posix_exec` / the wasm `svm_run_onramp_posix`
 //! export) — STAGE1.md "real posix shell in the playground", slice 1. Where `onramp_exec` runs a
 //! `.svmb` under the fixed §3e powerbox (stdout/stdin/exit/memory), this runs it under the full
-//! `svm-posix` personality: one `HostFn` capability implementing the libc/memfs surface, with the
+//! `svm-posix` personality: one `HostProc` capability implementing the libc/memfs surface, with the
 //! module's manifest imports bound to it **by name** (`svm_posix::bind`). This is the seam the real
 //! `svm-posix` shell (and any chibicc program linking the personality libc) runs through.
 //!

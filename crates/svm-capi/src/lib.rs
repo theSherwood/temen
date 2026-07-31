@@ -23,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::time::Duration;
 
-use svm_interp::{GuestMem, HostFn, Trap};
+use svm_interp::{GuestMem, HostProc, Trap};
 use svm_run::{
     instantiate, instantiate_with_imports, Backend, HostCap, Imports, Instance, Limits, MemEvent,
     MemHookFn, Outcome, Run, RunConfig, Value,
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn svm_module_free(m: *mut SvmModule) {
 /// the capability call (fail-closed). `ctx` is the opaque pointer registered alongside the callback.
 /// `mem` is the calling guest's linear-memory window (`NULL` if the module declares none), readable /
 /// writable through [`svm_guest_read`] / [`svm_guest_write`] — valid only for this call (F5).
-pub type SvmHostFn = extern "C" fn(
+pub type SvmHostProc = extern "C" fn(
     ctx: *mut c_void,
     op: u32,
     args: *const i64,
@@ -207,7 +207,7 @@ pub type SvmHostFn = extern "C" fn(
     mem: *mut SvmGuestMem,
 ) -> i32;
 
-/// An opaque handle to the calling guest's linear-memory window, handed to an [`SvmHostFn`] for the
+/// An opaque handle to the calling guest's linear-memory window, handed to an [`SvmHostProc`] for the
 /// duration of one call. Access it **only** through [`svm_guest_read`] / [`svm_guest_write`] (each
 /// bounds-checked against the window, fail-closed) — the raw window pointer is never exposed, so a C
 /// callback gets exactly the §7 confinement the built-in `Stream`/`Memory` caps do. The wrapped
@@ -225,7 +225,7 @@ pub struct SvmGuestMem {
 /// the window — the same bounds check the built-in capabilities apply (fail-closed, never an over-read).
 ///
 /// # Safety
-/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostFn`] call (or null); `dst` points to at
+/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostProc`] call (or null); `dst` points to at
 /// least `len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn svm_guest_read(
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn svm_guest_read(
 /// in-window, writable range (a read-only / unmapped page fails closed, exactly like the built-ins).
 ///
 /// # Safety
-/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostFn`] call (or null); `src` points to at
+/// `mem` is an `SvmGuestMem*` handed to the current [`SvmHostProc`] call (or null); `src` points to at
 /// least `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn svm_guest_write(
@@ -354,16 +354,16 @@ pub unsafe extern "C" fn svm_imports_provide_clock(i: *mut SvmImports, name: *co
 /// any instance built from this registry; `ctx` valid for that lifetime (and thread-safe if the guest
 /// is concurrent).
 #[no_mangle]
-pub unsafe extern "C" fn svm_imports_provide_host_fn(
+pub unsafe extern "C" fn svm_imports_provide_host_proc(
     i: *mut SvmImports,
     name: *const c_char,
     op: u32,
-    f: SvmHostFn,
+    f: SvmHostProc,
     ctx: *mut c_void,
 ) -> i32 {
     let ctx = CtxPtr(ctx);
-    // `make` is called once per backend host; each builds a fresh `HostFn` that trampolines into `f`.
-    let cap = HostCap::host_fn(op, move || -> HostFn {
+    // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
+    let cap = HostCap::host_proc(op, move || -> HostProc {
         let ctx = ctx;
         Box::new(move |op, args, mem| {
             // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field

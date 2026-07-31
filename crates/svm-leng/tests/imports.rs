@@ -57,9 +57,9 @@ fn import_runs_when_bound() {
     let m = svm_leng::translate(MOD).unwrap();
     // Bind import slot 0 to a host fn `ext_double(x) = x * 2`, then use_ext(x) = x*2 + 1.
     let mut host = Host::new();
-    let handle = host.grant_host_fn(Box::new(|_op, args, _mem| Ok(vec![args[0] * 2])));
+    let handle = host.grant_host_proc(Box::new(|_op, args, _mem| Ok(vec![args[0] * 2])));
     host.set_import_bindings(vec![BoundImport::required(
-        svm_interp::cap_id::HOST_FN,
+        svm_interp::cap_id::HOST_PROC,
         0,
         handle,
     )]);

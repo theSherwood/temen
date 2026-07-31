@@ -42,7 +42,7 @@ fn parse(src: &str) -> svm_ir::Module {
 /// identically either way.
 fn run(m: &svm_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
-    let handle = host.grant_host_fn(Box::new(|op, args, _mem| {
+    let handle = host.grant_host_proc(Box::new(|op, args, _mem| {
         assert_eq!(op, 0, "the guest calls op 0");
         Ok(vec![args[0] + args[1]])
     }));

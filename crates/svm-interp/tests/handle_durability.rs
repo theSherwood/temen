@@ -98,7 +98,7 @@ fn capture_refuses_a_non_durable_handle() {
 }
 
 /// Draining the non-durable handles turns a capture refusal into a successful one: the out-of-line
-/// bindings (an `IoRing` and a `HostFn`) are closed, the durable `Clock` is kept, and
+/// bindings (an `IoRing` and a `HostProc`) are closed, the durable `Clock` is kept, and
 /// `capture_durable_handles` then succeeds. The drained set comes back in ascending slot order so the
 /// embedder can audit the relinquished authority (DURABILITY.md §12.5 handle hardening).
 #[test]
@@ -106,7 +106,7 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0 — durable
     a.grant_io_ring(); // slot 1 — non-durable
-    a.grant_host_fn(Box::new(|_op, _args, _mem| Ok(vec![0]))); // slot 2 — non-durable
+    a.grant_host_proc(Box::new(|_op, _args, _mem| Ok(vec![0]))); // slot 2 — non-durable
 
     assert!(
         a.capture_durable_handles().is_err(),
@@ -114,14 +114,18 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     );
 
     let drained = a.drain_non_durable();
-    assert_eq!(drained.len(), 2, "the io_ring and the host_fn were drained");
+    assert_eq!(
+        drained.len(),
+        2,
+        "the io_ring and the host_proc were drained"
+    );
     assert_eq!(
         (drained[0].slot, drained[0].kind),
         (1, NonDurableKind::IoRing)
     );
     assert_eq!(
         (drained[1].slot, drained[1].kind),
-        (2, NonDurableKind::HostFn)
+        (2, NonDurableKind::HostProc)
     );
 
     let captured = a

@@ -1,5 +1,5 @@
 //! End-to-end C linking against the **POSIX personality** (`svm-posix`) through §7 named imports:
-//! each import name binds to `(HOST_FN, op)` on the granted personality handle as an
+//! each import name binds to `(HOST_PROC, op)` on the granted personality handle as an
 //! instantiation-time **slot binding** ([`svm_posix::resolve`] + `Host::set_import_bindings`) —
 //! the module bytes are never rewritten (IMPORTS.md phase 4).
 //!
@@ -24,7 +24,7 @@
 //! Each program runs `_start` (function 0) on **both** the interpreter and the JIT under an identical
 //! host, asserting they agree on the result *and* the observable personality state (captured stdout,
 //! the memfs) — so it doubles as a cross-backend differential, capability effects included. The
-//! personality's `HostFn` dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk
+//! personality's `HostProc` dispatches through the same `cap_dispatch_slots` the JIT's `cap.call` thunk
 //! calls, so parity comes for free. Requires a unix C toolchain (`make` + `cc`) to build the chibicc
 //! fork, so the suite is gated to `#![cfg(unix)]` (like `c_frontend.rs`).
 #![cfg(unix)]
@@ -91,7 +91,7 @@ fn c_to_ir(src: &str) -> String {
 
 /// Install the shim's import-slot bindings: strip the `__px_` prefix (which keeps the shim's
 /// externs clear of chibicc's builtin names) and map the bare libc name through
-/// [`svm_posix::resolve`] to `(HOST_FN, op)` on the granted personality `handle` — the phase-4
+/// [`svm_posix::resolve`] to `(HOST_PROC, op)` on the granted personality `handle` — the phase-4
 /// no-rewrite binding (`Host::set_import_bindings`). A name outside the personality leaves its
 /// slot unbound (a dispatch through it is a fail-closed `CapFault`).
 fn bind_shim(m: &svm_ir::Module, host: &mut Host, handle: i32) {

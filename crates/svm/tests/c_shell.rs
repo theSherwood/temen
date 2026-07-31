@@ -6,7 +6,7 @@
 //! into once the fork/exec surface lands. The shell's libc calls reach the personality **by name**:
 //! `write`/`read`/`exit` are *defined* by the guest shim (shadowing chibicc's Stream/Exit builtins,
 //! S15b) and forward — fd preserved — to `__px_`-prefixed generic imports; `getcwd`/`chdir`/`getenv`
-//! are ordinary generic imports. The linker maps each name to its interface `(HOST_FN, op)`
+//! are ordinary generic imports. The linker maps each name to its interface `(HOST_PROC, op)`
 //! (`svm_ir::Resolved::Cap`, link-time symbol resolution); the guest discovers the granted handles
 //! itself via `cap.self` reflection, so there is no positional powerbox anywhere.
 //!
@@ -126,7 +126,7 @@ fn grant_hooks() -> GrantChildHooks {
 
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
-/// through [`svm_posix::resolve`] to `(HOST_FN, op)`; `__spawn`/`__join` are the shell's own
+/// through [`svm_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
 /// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `cap.call`
 /// dispatches on the guest's own handle operand, discovered at run time via
 /// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3

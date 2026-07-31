@@ -3,7 +3,7 @@
 //! The "host provides libc as a capability; the §7 named-import mechanism carries it" story — the
 //! same shape as [`svm-wasi`](../svm_wasi), generalized from a WASI subset to the POSIX/libc surface a
 //! fork-less shell (BusyBox `ash` → Bash) links against. [`resolve`] binds libc symbol names to a
-//! single [`svm_interp::cap_id::HOST_FN`] capability; [`handler`] implements the ops over the guest
+//! single [`svm_interp::cap_id::HOST_PROC`] capability; [`handler`] implements the ops over the guest
 //! window. All libc *semantics* live **here** — outside the interp escape-TCB — reached only through a
 //! granted, masked, type-checked handle (DESIGN.md §7).
 //!
@@ -26,10 +26,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{cap_id, GuestMem, Host, HostFn, Trap};
+use svm_interp::{cap_id, GuestMem, Host, HostProc, Trap};
 use svm_ir::ResolvedCap;
 
-/// Op numbers on the shared `HOST_FN` handle; [`resolve`] maps libc names to these.
+/// Op numbers on the shared `HOST_PROC` handle; [`resolve`] maps libc names to these.
 pub const OP_WRITE: u32 = 0;
 pub const OP_READ: u32 = 1;
 pub const OP_MALLOC: u32 = 2;
@@ -480,7 +480,7 @@ impl Posix {
 }
 
 /// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
-/// [`cap_id::HOST_FN`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
+/// [`cap_id::HOST_PROC`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
 /// Unknown names return `None`, so binding fails closed. Both bare (`"write"`) and `"posix."`-
 /// prefixed names resolve, so it works whether the frontend emits raw libc symbols or namespaced ones.
 pub fn resolve(name: &str) -> Option<ResolvedCap> {
@@ -526,13 +526,13 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         _ => return None,
     };
     Some(ResolvedCap {
-        type_id: cap_id::HOST_FN,
+        type_id: cap_id::HOST_PROC,
         op,
     })
 }
 
 /// Bind a manifest module's import slots to this personality (IMPORTS.md): each import name maps
-/// through [`resolve`] to its `(HOST_FN, op)` on the granted personality `handle`, installed as
+/// through [`resolve`] to its `(HOST_PROC, op)` on the granted personality `handle`, installed as
 /// instance bindings ([`Host::set_import_bindings`]) — the module bytes are never modified and its
 /// `call.import`s dispatch through the slots. The guest declares plain libc signatures and never
 /// threads a handle argument; the import section is its capability manifest. Returns `false`
@@ -555,7 +555,7 @@ pub fn bind(m: &svm_ir::Module, host: &mut Host, handle: i32) -> bool {
     true
 }
 
-/// Grant a POSIX personality on `host`, returning the `HOST_FN` handle and a [`Posix`] handle to its
+/// Grant a POSIX personality on `host`, returning the `HOST_PROC` handle and a [`Posix`] handle to its
 /// captured state. `heap_base`/`heap_end` bound the window region `malloc` hands out (both window
 /// offsets, `heap_base <= heap_end`, within the guest window and clear of the guest's static
 /// data/stack). `stdin` preloads standard input for `read(0, …)`. Every libc import in a linked module
@@ -566,22 +566,22 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     let posix = Posix {
         inner: Arc::clone(&inner),
     };
-    let handle = host.grant_host_fn(handler(inner));
+    let handle = host.grant_host_proc(handler(inner));
     (handle, posix)
 }
 
 /// Build the personality as a re-grantable **capability factory** for the powerbox model (svm-run's
 /// `HostCap`), instead of granting it on a specific `Host` by name binding like [`grant`]. Returns a
 /// shared [`Posix`] handle (read captured output, `set_spawn`, `raise_signal`) and a `make` closure that
-/// produces the `HostFn` handler over the *same* shared state each time it is called (once per backend,
+/// produces the `HostProc` handler over the *same* shared state each time it is called (once per backend,
 /// so the interp and JIT hosts share one personality state). This is how the **LLVM on-ramp** reaches
-/// the personality: the embedder wraps `make` in a `HostCap` at [`cap_id::HOST_FN`] and grants it under a
+/// the personality: the embedder wraps `make` in a `HostCap` at [`cap_id::HOST_PROC`] and grants it under a
 /// name (e.g. `"posix"`), and an on-ramp guest calls `__vm_host_call(__vm_cap_resolve("posix"), op, …)`.
 pub fn cap(
     heap_base: u64,
     heap_end: u64,
     stdin: Vec<u8>,
-) -> (Posix, impl Fn() -> HostFn + Send + Sync + 'static) {
+) -> (Posix, impl Fn() -> HostProc + Send + Sync + 'static) {
     let inner = Arc::new(Mutex::new(new_inner(heap_base, heap_end, stdin)));
     let posix = Posix {
         inner: Arc::clone(&inner),
@@ -626,9 +626,9 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
     }
 }
 
-/// Build the POSIX [`HostFn`] handler over shared `inner`. Dispatches on the op number; an unknown op
+/// Build the POSIX [`HostProc`] handler over shared `inner`. Dispatches on the op number; an unknown op
 /// on this handle is a `CapFault` (as for any capability).
-fn handler(inner: Arc<Mutex<Inner>>) -> HostFn {
+fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
     Box::new(move |op, args, mem| {
         let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
         match op {
@@ -1534,7 +1534,7 @@ mod tests {
     const HEAP_END: u64 = 64 << 10;
     const WIN: usize = 128 << 10;
 
-    /// func 0 `(host_fn_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
+    /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
     /// `write(1, ptr, 2)`, then encode `write_result * 1_000_000 + ptr`. `malloc` hands out the aligned
     /// heap base (`4096`), `write` returns `2`, so the result is `2_004096` — and stdout is `"hi"`.
     const MALLOC_WRITE: &str = "memory 17\n\
@@ -1696,7 +1696,7 @@ block 0 (vph: i32) {\n\
             iout, b"hi",
             "interp: bytes written to stdout via the personality"
         );
-        // JIT parity: the HostFn dispatches through the same Host path, so identical result + output.
+        // JIT parity: the HostProc dispatches through the same Host path, so identical result + output.
         assert!(
             matches!(jo, JitOutcome::Returned(ref s) if s == &[2_004_096]),
             "jit: must match interp, got {jo:?}"
@@ -2603,7 +2603,7 @@ block 0 (vph: i32) {\n\
 
     #[test]
     fn resolve_binds_libc_names() {
-        // The §7 name → (HOST_FN, op) map a linker uses to bind a shell's libc imports.
+        // The §7 name → (HOST_PROC, op) map a linker uses to bind a shell's libc imports.
         assert_eq!(resolve("malloc").map(|c| c.op), Some(OP_MALLOC));
         assert_eq!(resolve("posix.write").map(|c| c.op), Some(OP_WRITE));
         assert_eq!(resolve("_exit").map(|c| c.op), Some(OP_EXIT));
