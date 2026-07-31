@@ -9582,6 +9582,69 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
                     }
+                    // §3.6 slice 4 (parity with `call.import`): a symbolic slot the instance bound
+                    // to a **live-callee** offer routes through caller-parking, not the generic
+                    // dispatch — enqueue on the callee, park this fiber until the reply. CallSym is
+                    // "a flat call.import (op 0)", so the op is the bound base op alone. This is the
+                    // path a compiled-C `fork()` (chibicc emits `call.sym "__fork"`) rides.
+                    let live = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.import_live_target(*import)
+                    };
+                    if let Some((callee, export, base_op)) = live {
+                        let (ticket, callee_id) = {
+                            let mut cg = callee.lock().unwrap_or_else(|e| e.into_inner());
+                            (cg.svc_enqueue(export, base_op, argv), cg.domain_id())
+                        };
+                        match ticket {
+                            Some(t) => {
+                                sched.svc_wake(callee_id as usize);
+                                if *cur != ROOT_FIBER {
+                                    if let SchedRef::Real(sr) = sched {
+                                        let regc = Arc::clone(registry);
+                                        let calleec = Arc::clone(&callee);
+                                        let svck = host
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .domain_id()
+                                            as usize;
+                                        fiber_park!(|slot: usize| {
+                                            let mut sg = sr.lock();
+                                            if sg.dead.contains_key(&(callee_id as usize)) {
+                                                drop(sg);
+                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
+                                            } else {
+                                                sg.ticket_waiters.insert(
+                                                    (callee_id as usize, t),
+                                                    Waiter::Fiber {
+                                                        reg: Arc::clone(&regc),
+                                                        slot,
+                                                        svc: svck,
+                                                    },
+                                                );
+                                                drop(sg);
+                                                let early = calleec
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .svc_results
+                                                    .remove(&t);
+                                                if let Some(r) = early {
+                                                    regc.wake_blocked(slot, Reg::from_i64(r));
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
+                            }
+                            None => {
+                                if !sig.results.is_empty() {
+                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =

@@ -243,14 +243,17 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
   *parked* caller a fork needs. So a nested fork-guest needs libc in its powerbox: extend
   `regrant_into_child` to carry a **forkable `HostProc`** (re-grant the libc handle, sharing `Inner`), or
   give the child a fresh forkable libc at spawn. This is the load-bearing new interp/posix plumbing.
-- **Slice 4 — the compiled-C entry ABI over `instantiate_named`** (blocker C). The spawn ABI hands a
-  child entry an `(i64)` starter arg; hand-written guests are `func (i64)->(i64)`. Confirm/adapt a
-  compiled-C `_start` (entry idx 0, chibicc convention) to tolerate the starter-arg/entry convention when
-  spawned via op 11/13 (existing op-13 compiled-C exec is `c_shell_exec.rs`). The **main untested seam**.
-- **Slice 5 — the end-to-end test.** `crates/svm/tests/` (depends on both svm-posix and svm-interp): a
-  chibicc-compiled C `fork()` program under the manager topology, forking for real, parent-sees-pid /
-  child-sees-0, both copies doing libc I/O over the shared memfs. interp==JIT differential. The first
-  real program forking on svm.
+- **Slice 4 — the compiled-C entry ABI over op 13. DONE.** No adaptation was needed: chibicc's
+  `--child-entry` `_start` (the `c_shell_exec.rs` shape) already tolerates the op-13 starter-arg/carve
+  convention. The libc face is one wrapper — `long fork(void){ return __fork(0,0); }` — over an extern
+  `long __fork(int h, long a)`; chibicc drops the leading `int h` as the cap-handle dummy, so the call
+  lowers to `(i64)->(i64)`, matching the fork offer op. (Handle arg must be `int`, not `long`, or the
+  emitted `call.sym` handle operand is `i64` and fails verify.)
+- **Slice 5 — the end-to-end test. DONE.** `crates/svm/tests/c_fork.rs`: a chibicc-compiled C `fork()`
+  program under the manager topology, forking for real — parent sees the twin's pid (3), the twin sees 0,
+  both copies `write(1, &slot, 8)` their result to the one shared stdout stream. **The first real
+  program forking on svm.** (Interp only, like every `clone_caller` test — the serve substrate is
+  eval-loop-only; JIT parity for the fork substrate is a separate track.)
 
 **Status (2026-07-31) — the real-libc capstone has landed; only the chibicc *frontend* remains.**
 `crates/svm/tests/fork_manager.rs` is the end-to-end real-libc fork: the manager spawns the server,
@@ -272,12 +275,17 @@ the original slice-2 framing: the nested compiled-C path does **not** go through
 `bind_shim` (that is the *same-module top-level* libc-handle ABI); a separate-module command binds
 `write`/`read` by the manifest's reference policy and `fork` by the named-offer step.
 
-**Remaining for a *compiled-C* program:** slice 4 (compiled-C `_start`/entry ABI over op 13 — the
-`c_shell_exec.rs` `--child-entry` convention, plus a `long fork(void){ return __fork(0); }` libc wrapper
-whose `__fork` import matches the offer's `(i64)->(i64)`) + slice 5 (the chibicc end-to-end test). The
-runtime substrate underneath both is now proven end to end (`fork_manager.rs` + `fork_import.rs`).
+**Update (slices 4+5 done) — Track 2 is complete: a real compiled-C `fork()` runs on svm.**
+`crates/svm/tests/c_fork.rs` compiles an ordinary C `fork()` program with chibicc and forks it for real
+under the manager topology. Landing it needed one more interp fix: `Inst::CallSym` (chibicc's lowering
+for an extern call) did not probe `import_live_target`, so a symbolic slot bound to a live-callee offer
+went to the generic dispatch and answered `-EINVAL` instead of parking the caller — only `Inst::CallImport`
+had the §3.6-slice-4 routing. CallSym now carries the same probe (it is "a flat call.import (op 0)"), so a
+compiled-C `fork()` parks and returns twice like the hand-written form. All three fork tests
+(`fork_manager` real-libc, `fork_import` named-import, `c_fork` compiled-C) pass; the wider `call.sym`
+users (`c_shell_exec`, dynlink) stay green.
 
-Key refs: `fork_import.rs` (named-import fork binding), `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
+Key refs: `c_fork.rs` (compiled-C fork), `fork_import.rs` (named-import fork binding), `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
 `bind_with_fork` (`svm-posix/src/lib.rs`), `bind_shim` + harness (`crates/svm/tests/c_posix_spawn.rs`),
 op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (svm-interp).
 
