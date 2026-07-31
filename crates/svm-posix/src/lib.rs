@@ -583,7 +583,12 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     let posix = Posix {
         inner: Arc::clone(&inner),
     };
-    let handle = host.grant_host_proc(handler(inner));
+    // FORK.md PR 5 — grant **forkable**: the factory re-mints the handler over the *same* shared
+    // `Inner` (fd table + memfs + cwd/env + captured output), so a `fork()` twin inherits the whole
+    // libc state, shared — POSIX fork-shares-open-file-descriptions. `Host::fork_powerbox` calls this
+    // factory to carry libc into the twin, instead of failing closed on an opaque closure.
+    let make = move || handler(Arc::clone(&inner));
+    let handle = host.grant_host_proc_forkable(make(), Arc::new(make));
     (handle, posix)
 }
 
@@ -2451,6 +2456,79 @@ block 0 (vph: i32) {\n\
             jposix.stdout(),
             b"/bin",
             "jit: echoed value must match interp"
+        );
+    }
+
+    /// FORK.md PR 5 — `svm_posix::grant` is **forkable**: the fork factory (`cap`'s `make`) mints libc
+    /// handlers over the *same* shared `Inner` (memfs + fd table + cwd/env), so a `fork()` twin's libc
+    /// inherits the parent's open-file state — POSIX fork-shares-open-file-descriptions. This pins the
+    /// factory half at the personality level: a handler minted by the factory sees a file the shared
+    /// `Posix` handle wrote host-side. (The interp half — `fork_powerbox` carrying the factory across a
+    /// twin — is pinned by `svm-interp`'s `fork_carries_a_forkable_host_proc_via_its_factory`.)
+    ///
+    /// func 0 `(handle) -> i64`: stage `"greet"` at offset 0, `open(., 5, O_RDONLY)` → fd, `read(fd,
+    /// buf=32, 3)`, `write(1, buf, 3)` echoing to stdout, return the byte count.
+    const READ_GREET: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vph: i32) {\n\
+  vp0 = i64.const 0\n\
+  vg = i32.const 103\n\
+  i32.store8 vp0 vg\n\
+  vp1 = i64.const 1\n\
+  vr = i32.const 114\n\
+  i32.store8 vp1 vr\n\
+  vp2 = i64.const 2\n\
+  ve = i32.const 101\n\
+  i32.store8 vp2 ve\n\
+  vp3 = i64.const 3\n\
+  ve2 = i32.const 101\n\
+  i32.store8 vp3 ve2\n\
+  vp4 = i64.const 4\n\
+  vt = i32.const 116\n\
+  i32.store8 vp4 vt\n\
+  vpath = i64.const 0\n\
+  vplen = i64.const 5\n\
+  vflags = i64.const 0\n\
+  vfd = cap.call 13 5 (i64, i64, i64) -> (i64) vph (vpath, vplen, vflags)\n\
+  vbuf = i64.const 32\n\
+  vcap = i64.const 3\n\
+  vn = cap.call 13 1 (i64, i64, i64) -> (i64) vph (vfd, vbuf, vcap)\n\
+  vfd1 = i64.const 1\n\
+  vw = cap.call 13 0 (i64, i64, i64) -> (i64) vph (vfd1, vbuf, vn)\n\
+  return vn\n\
+  }\n\
+}\n";
+
+    #[test]
+    fn grant_is_forkable_and_the_factory_shares_the_memfs() {
+        let m = parse_module(READ_GREET).expect("parse");
+        verify_module(&m).expect("verify");
+        // `cap()` exposes the fork factory `make` — the exact factory `grant` now registers as forkable.
+        // A handler minted from it (a `fork()` twin's libc) must observe the shared memfs.
+        let (posix, make) = cap(HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("greet", b"hi!"); // host writes into the shared memfs
+        let mut host = Host::new();
+        let h = host.grant_host_proc(make()); // a factory-minted libc handler (the twin's libc)
+        let mut fuel = 5_000_000u64;
+        let ir = run_capture_reserved_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[0u8; WIN],
+            0,
+            &mut host,
+        )
+        .0;
+        assert_eq!(
+            ir,
+            Ok(vec![Value::I64(3)]),
+            "read 3 bytes through the factory-minted libc handler"
+        );
+        assert_eq!(
+            posix.stdout(),
+            b"hi!",
+            "the factory-minted handler shared the parent's memfs — fork-shares-fds"
         );
     }
 
