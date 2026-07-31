@@ -425,6 +425,21 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
             "data.ptr relocations are object-dialect; resolve via link before encode_module"
         );
     }
+    // Object-only `data.funcref` relocation section (D-LINK, data→code), next to `data.ptr`: count,
+    // then each entry's `at` offset and target func `name`. Like `data.ptr`, absent from the runnable
+    // dialect — `link` resolves and clears these.
+    if object {
+        write_uleb(&mut out, m.data_funcrefs.len() as u64);
+        for r in &m.data_funcrefs {
+            write_uleb(&mut out, r.at);
+            write_str(&mut out, &r.name);
+        }
+    } else {
+        assert!(
+            m.data_funcrefs.is_empty(),
+            "data.funcref relocations are object-dialect; resolve via link before encode_module"
+        );
+    }
     // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
     // import-free module (every prior frontend's output, and any unit whose symbols were already
     // resolved) writes a single `0` here. A non-empty section is a unit shipped with **unresolved**
@@ -1848,6 +1863,17 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             data_ptrs.push(DataPtr { at, target });
         }
     }
+    // Object-only `data.funcref` relocation section, mirroring the encoder. Byte shape only — the
+    // linker resolves `name` and range-checks `at`.
+    let mut data_funcrefs = Vec::new();
+    if object {
+        let nrefs = c.count()?;
+        for _ in 0..nrefs {
+            let at = c.uleb()?;
+            let name = c.str()?;
+            data_funcrefs.push(svm_ir::DataFuncref { at, name });
+        }
+    }
     // §7 import section (v2): mirrors the encoder. Grows on demand (the count is attacker-influenced).
     let nimports = c.count()?;
     let mut imports = Vec::new();
@@ -1957,6 +1983,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     }
     Ok(Module {
         data_ptrs,
+        data_funcrefs,
         funcs,
         memory,
         data,
@@ -2753,6 +2780,7 @@ mod object_tests {
                     },
                 },
             ],
+            data_funcrefs: Vec::new(),
             data_exports: vec![DataExport {
                 name: "g_mine".into(),
                 offset: 16,
@@ -2802,6 +2830,7 @@ mod object_tests {
         // A resolved module (flag 0) decodes identically on both entry points.
         let m = Module {
             data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,
@@ -3023,6 +3052,7 @@ mod debug_tests {
     fn module(debug_info: Option<DebugInfo>) -> Module {
         Module {
             data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,

@@ -720,6 +720,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     Ok(Transpiled {
         module: Module {
             data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             funcs,
             memory,
             data,

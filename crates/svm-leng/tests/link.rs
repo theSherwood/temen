@@ -337,3 +337,142 @@ fn unresolved_cross_module_global_is_fail_closed() {
         other => panic!("expected a fail-closed link error, got {other:?}"),
     }
 }
+
+/// A cross-module call **through a funcref global** — the funcref counterpart of
+/// `cross_module_global_read_write`. Module `s` defines a `proctype` gvar `hook`, a handler `dbl`,
+/// and a setter that stores `ref.func dbl` into `hook`; module `w` calls `hook.<s>(x)`. A funcref
+/// gvar is a *data* symbol, not a proc, so the call must lower to a `data.sym` load + `call_indirect`
+/// (using the pooled proctype signature), not a proc import. `drive` sets the hook, then dispatches
+/// through it: `drive(x) = dbl(x) = 2x`.
+#[test]
+fn cross_module_funcref_global_call() {
+    let mod_s = "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :hook.0. . IntFn.0.)
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2))))
+ (proc :sethook.0. (params) . .
+  (stmts . (asgn hook.0. dbl.0.))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts .
+   (call sethook.0.mods)
+   (ret (call hook.0.mods x.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["sethook.0.", "dbl.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // drive = module w's first proc → func 0.
+    assert_eq!(
+        run(&linked, 0, &[21]),
+        42,
+        "drive sets hook=dbl, calls hook(21)"
+    );
+    assert_eq!(run(&linked, 0, &[-5]), -10);
+}
+
+/// A cross-module call to a **frame-needing proc**. Module `s`'s `count` takes `(addr i)` of a local,
+/// so its emitted signature carries a leading `$sp`; module `w`'s `drive` calls `count.<s>(n)`. The
+/// caller must hand down that `$sp` — but `call_import` derives an import's signature from the *args*
+/// and can't see the hidden frame param, so the linker runs a **whole-program frame fixpoint**: it
+/// pools every unit's own frame-needing procs and propagates transitively across module boundaries.
+/// `count` is frame-needing on its own; `drive` becomes frame-needing because it calls `count`, so it
+/// too gains an `$sp` (to have one to pass down). `drive(n) = count(n) = n`.
+#[test]
+fn cross_module_frame_needing_call() {
+    let mod_s = "\
+(stmts
+ (proc :incp.0. (params (param :p.0 . (ptr (i +64)))) (void) .
+  (stmts . (asgn (deref p.0) (add (i +64) (deref p.0) 1))))
+ (proc :count.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :i.0 . (i +64) 0)
+   (while (lt i.0 n.0) (stmts . (call incp.0. (addr i.0))))
+   (ret i.0))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call count.0.mods n.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["count.0.", "incp.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // drive (func 0) is frame-needing via the fixpoint → its signature gained a leading `$sp`.
+    assert_eq!(
+        (linked.funcs[0].params.len(), linked.funcs[0].results.len()),
+        (2, 1),
+        "drive should be lowered as (sp, n) -> (i64)"
+    );
+    // Pass a window offset as drive's own frame `$sp`; it hands a fresh sub-frame to count.
+    let sp = 8192;
+    for n in [0, 1, 5, 50] {
+        assert_eq!(
+            run(&linked, 0, &[sp, n]),
+            n,
+            "drive({n}) = count({n}) = {n}"
+        );
+    }
+}
+
+/// A funcref global with a **static proc initializer** — `var hook = dbl` — materialized by the
+/// linker. Module `s` declares `hook: IntFn` initialized to `dbl` and never assigns it at runtime;
+/// module `w`'s `drive` calls through `hook`. A funcref gvar's initial value is a *function index*
+/// the linker only knows once it assigns func bases, so `svm-leng` emits a `data.funcref` relocation
+/// (the funcref twin of `data.ptr`) that `link` resolves into the gvar's data slot — the value
+/// `ref.func dbl` would yield. Unlike `cross_module_funcref_global_call` (which stores the funcref at
+/// runtime), nothing here writes `hook`, so `drive(n) = dbl(n) = 2n` proves the initializer was
+/// materialized statically. This is what lets a real stdlib program's `oomHandler`/`gExitFlush`
+/// funcref gvars work without the system `ini` (which never writes them).
+#[test]
+fn funcref_global_static_initializer() {
+    let mod_s = "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :hook.0. . IntFn.0. dbl.0.)
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call hook.0.mods n.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["dbl.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // No setter runs — `hook` holds `dbl`'s index purely from the materialized initializer.
+    assert_eq!(
+        run(&linked, 0, &[21]),
+        42,
+        "drive calls the materialized hook = dbl"
+    );
+    assert_eq!(run(&linked, 0, &[-5]), -10);
+}

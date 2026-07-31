@@ -1521,6 +1521,9 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         memory,
         data,
         data_ptrs,
+        // `data.funcref` relocations have no text opcode — the nimony frontend attaches them to the
+        // parsed object module directly (they need the module stem, which the text layer lacks).
+        data_funcrefs: Vec::new(),
         imports: std::mem::take(&mut p.imports),
         exports,
         data_exports,

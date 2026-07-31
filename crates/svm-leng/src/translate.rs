@@ -261,6 +261,12 @@ pub(crate) struct Translator {
     /// `data.ptr <at> self <target_off>` the linker fixes up (svm_ir D-LINK). Runnable mode bakes the
     /// absolute offset directly instead, so this stays empty there.
     data_ptrs: Vec<(u64, u64)>,
+    /// **Data-image funcref relocations** (link mode): a `proctype` gvar whose static initializer is
+    /// a proc (`var oomHandler = continueAfterOutOfMem`). Each `(off, sym)` is the gvar's slot offset
+    /// and the initializer proc's *local* name; `translate_object_module` suffixes `sym` with the
+    /// module stem and emits a `svm_ir::DataFuncref` the linker resolves to the merged funcidx. Empty
+    /// in runnable mode (no linker to fix it up).
+    funcref_inits: Vec<(u64, String)>,
     /// End of the globals region (unit-local). The globals occupy `[16, globals_top)`.
     globals_top: u64,
     /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.svmo`
@@ -272,6 +278,21 @@ pub(crate) struct Translator {
     link_mode: bool,
     /// Cross-module callees lowered to SVM imports (discovered during emission).
     imports: RefCell<ImportTable>,
+    /// **External funcref globals** — another unit's `gvar` whose type is a `proctype`, under the
+    /// stem-suffixed name this module references it by ([`export_funcrefs`]). A cross-module
+    /// `(call oomHandler.0.<sys> …)` targets a function-*pointer* data symbol, not a proc: with the
+    /// pooled signature here, `lvalue_type`/`lvalue_addr` treat it as an `FnPtr` global (address via
+    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call_indirect`. Empty
+    /// unless the linker pooled sibling units' funcref gvars.
+    ext_funcrefs: HashMap<String, FnPtrSig>,
+    /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
+    /// `$sp` param (they take a local's address; see [`proc_needs_frame`](Self::proc_needs_frame)),
+    /// under the stem-suffixed names this module calls them by ([`export_proc_frames`]). A
+    /// cross-module call lowers to an import whose signature `call_import` derives from the *args* —
+    /// blind to the callee's hidden `$sp`. With the callee named here, `call_import` prepends
+    /// `sp + frame_size` (the caller's own frame top) as the leading arg, exactly as a direct call
+    /// to a frame-needing proc does. Empty unless the linker pooled sibling units' proc frames.
+    ext_frame_procs: std::collections::HashSet<String>,
 }
 
 impl Translator {
@@ -284,11 +305,14 @@ impl Translator {
             proctypes: HashMap::new(),
             data_inits: Vec::new(),
             data_ptrs: Vec::new(),
+            funcref_inits: Vec::new(),
             globals_top: 16,
             link_mode: false,
             globals: HashMap::new(),
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
+            ext_funcrefs: HashMap::new(),
+            ext_frame_procs: std::collections::HashSet::new(),
         }
     }
 
@@ -414,14 +438,22 @@ impl Translator {
                                 };
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if let (Some(sym), TyDesc::FnPtr(_)) = (init.as_atom(), &desc) {
+                                // A **funcref gvar** with a static proc initializer (`var oomHandler =
+                                // continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). The func
+                                // index isn't known until the linker assigns func bases, so record a
+                                // `data.funcref` reloc: the linker writes `ref.func sym`'s value into
+                                // this slot. Without it the slot stays 0 and the first indirect call
+                                // through the gvar traps — the system `ini` does *not* write it (its
+                                // value *is* this initializer). The name is suffixed with the module
+                                // stem in `translate_object_module` (the linker resolves it there).
+                                self.funcref_inits.push((off, sym.to_string()));
                             } else if init.as_atom().is_some() {
-                                // A **symbol** initializer — a proc pointer (`gExitFlush =
-                                // nimNoopFlush`) or another global's address. Its pointer value is
-                                // opaque in this model: we don't materialize usable proc addresses,
-                                // and an indirect call through it fail-closes. So reserve the scalar
-                                // slot zero-initialized; nimony's `ini`/setup writes the real pointer
-                                // before any use. (Relocating such an initializer to the referenced
-                                // symbol is a later refinement.)
+                                // A **symbol** initializer that is *not* a funcref gvar — another
+                                // global's address (a data pointer). Its value is opaque in this model;
+                                // reserve the slot zero-initialized. (Relocating a data-pointer global
+                                // initializer to its target is a later refinement, the `data.ptr`
+                                // twin of the funcref case above.)
                             } else {
                                 return Err(LengError::Unsupported(format!(
                                     "non-scalar-int global initializer for `{name}`"
@@ -533,6 +565,20 @@ impl Translator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
         out
+    }
+
+    /// This unit's **funcref data relocations** as `svm_ir::DataFuncref`s: each `proctype` gvar with
+    /// a static proc initializer, at its slot offset, naming the initializer proc under its
+    /// stem-suffixed global name (the form the linker's func-symbol table resolves). See
+    /// [`funcref_inits`](Self::funcref_inits); called after translation (link mode only).
+    pub fn funcref_relocs(&self, stem: &str) -> Vec<svm_ir::DataFuncref> {
+        self.funcref_inits
+            .iter()
+            .map(|(at, sym)| svm_ir::DataFuncref {
+                at: *at,
+                name: format!("{sym}{stem}"),
+            })
+            .collect()
     }
 
     /// The module's **`exportc` symbols** as exports under their *C* names — the conventional entry
@@ -1041,6 +1087,91 @@ impl Translator {
         }
     }
 
+    /// Pre-register **external funcref globals** — another module's `gvar`s whose type is a
+    /// `proctype`, under the stem-suffixed names this module references them by
+    /// ([`export_funcrefs`]). See the [`ext_funcrefs`](Self::ext_funcrefs) field: this is what turns
+    /// a cross-module `(call <funcref-gvar> …)` from a (wrong) proc import into a `data.sym` load +
+    /// `call_indirect`.
+    pub fn import_funcrefs(&mut self, ext: &[(String, FnPtrSig)]) {
+        for (name, sig) in ext {
+            self.ext_funcrefs.insert(name.clone(), sig.clone());
+        }
+    }
+
+    /// Collect a module's **funcref globals** under their stem-suffixed global names — the form
+    /// *other* modules reference them by. A `gvar`/`tvar` whose type is a `proctype` (e.g. the
+    /// stdlib's `oomHandler`) is a function-*pointer* data symbol; a sibling unit that calls through
+    /// it needs the `call_indirect` signature at translate time (the funcref value itself, an `i32`
+    /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
+    /// [`export_types`]; [`link_selected`] pools these across its units before translating any.
+    pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        t.collect_globals(root)?;
+        let mut out: Vec<(String, FnPtrSig)> = t
+            .globals
+            .iter()
+            .filter_map(|(name, (_, desc))| match desc {
+                TyDesc::FnPtr(sig) => Some((format!("{name}{stem}"), (**sig).clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
+    }
+
+    /// Pre-register **external frame-needing procs** — sibling units' procs whose emitted signature
+    /// carries a leading `$sp` param, under the stem-suffixed names this module calls them by
+    /// ([`export_proc_frames`]). See the [`ext_frame_procs`](Self::ext_frame_procs) field: this is
+    /// what makes a cross-module call to such a proc pass the hidden `$sp`.
+    pub fn import_proc_frames(&mut self, ext: &[String]) {
+        for name in ext {
+            self.ext_frame_procs.insert(name.clone());
+        }
+    }
+
+    /// A module's proc **frame-graph nodes** for the linker's whole-program frame fixpoint: one
+    /// `(global_name, base_needs_frame, global_callees)` per proc. `global_name` is the stem-suffixed
+    /// name other modules call it by; `base_needs_frame` is its *own* [`proc_needs_frame`] (address
+    /// of a local, aggregate local, arg temp — no propagation yet); `global_callees` are the callees'
+    /// global names (a bare `foo.0.` local call resolves to `foo.0.<stem>`; a cross-module
+    /// `foo.0.<other>` is already global). A proc's emitted signature carries a leading `$sp` iff it
+    /// is frame-needing, and a cross-module caller must pass that `$sp` — but frame-need propagates
+    /// transitively across module boundaries (`alloc.1.` → `alloc.0.`, and a program proc → the
+    /// stdlib's `alloc`), so [`link_selected`] runs the fixpoint over *all* units' nodes before
+    /// translating any, rather than each unit guessing in isolation.
+    pub fn proc_frame_nodes(
+        root: &Node,
+        stem: &str,
+    ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        t.collect_globals(root)?;
+        // Resolve a callee name to its global form: a local proc's name ends in `.` (the empty
+        // module-hash slot) → suffix with this stem; a cross-module reference already carries a stem.
+        let globalize = |callee: &str| -> String {
+            if callee.ends_with('.') {
+                format!("{callee}{stem}")
+            } else {
+                callee.to_string()
+            }
+        };
+        let mut out = Vec::new();
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_importc_proc(item) {
+                let name = sym_def(&item.args()[0])?;
+                let base = t.proc_needs_frame(item);
+                let mut callees = std::collections::HashSet::new();
+                if let Some(body) = item.args().get(4) {
+                    collect_calls(body, &mut callees);
+                }
+                let callees = callees.iter().map(|c| globalize(c)).collect();
+                out.push((format!("{name}{stem}"), base, callees));
+            }
+        }
+        Ok(out)
+    }
+
     /// Collect a module's aggregate type layouts under their **stem-suffixed global names** — the
     /// form *other* modules reference them by (a type `T.0.` defined in module `stem` is
     /// `T.0.<stem>` elsewhere, the same mangling as procs/gvars). Field/element types that name a
@@ -1173,7 +1304,7 @@ impl Translator {
                     continue;
                 }
                 if let Some(b) = node.args().get(4) {
-                    if body_calls_framed(b, &self.procs) {
+                    if body_calls_framed(b, &self.procs, &self.ext_frame_procs) {
                         to_frame.push(name);
                     }
                 }
@@ -1954,6 +2085,13 @@ impl<'a> FuncGen<'a> {
                         return Ok((v.id, desc));
                     }
                 }
+                // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
+                // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
+                // and `indirect_callee` recover the `call_indirect` signature.
+                if let Some(sig) = self.t.ext_funcrefs.get(name).cloned() {
+                    let addr = self.emit_data_sym(name, 0);
+                    return Ok((addr, TyDesc::FnPtr(Box::new(sig))));
+                }
                 // In a link unit, an atom resolved by none of the above is a **cross-module data
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
                 // scalar; the linker binds it, and an unresolved name is a fail-closed link error.
@@ -2231,6 +2369,10 @@ impl<'a> FuncGen<'a> {
                 }
                 if let Some((_, d)) = self.t.globals.get(name) {
                     return Some(d.clone());
+                }
+                if let Some(sig) = self.t.ext_funcrefs.get(name) {
+                    // A cross-module funcref global — an `FnPtr` data symbol (see `ext_funcrefs`).
+                    return Some(TyDesc::FnPtr(Box::new(sig.clone())));
                 }
                 self.local_desc.get(name).cloned()
             }
@@ -3285,17 +3427,7 @@ impl<'a> FuncGen<'a> {
         let mut argvals = Vec::new();
         // A frame-needing callee gets a fresh frame beyond ours: `sp_callee = sp + frame_size`.
         if callee_needs_frame {
-            if !self.has_sp {
-                return Err(LengError::Unsupported(format!(
-                    "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
-                )));
-            }
-            let sp = self.cur[0];
-            let fs = self.emit_const(ValType::I64, self.frame_size as i64);
-            let spid = self.fresh();
-            self.cur_buf
-                .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
-            argvals.push(spid);
+            argvals.push(self.emit_callee_sp(callee)?);
         }
         for (arg, want) in a[1..].iter().zip(ptys) {
             argvals.push(self.call_arg(arg, want)?);
@@ -3558,9 +3690,31 @@ impl<'a> FuncGen<'a> {
         Ok(self.expr_typed(arg, want)?.id)
     }
 
+    /// The `$sp` a frame-needing callee receives: `sp + frame_size` — the top of *this* proc's own
+    /// frame, giving the callee fresh space beyond ours. A frameless caller has no `$sp` to hand
+    /// down, so calling a frame-needing proc from one fails closed.
+    fn emit_callee_sp(&mut self, callee: &str) -> Result<u32, LengError> {
+        if !self.has_sp {
+            return Err(LengError::Unsupported(format!(
+                "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
+            )));
+        }
+        let sp = self.cur[0];
+        let fs = self.emit_const(ValType::I64, self.frame_size as i64);
+        let spid = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
+        Ok(spid)
+    }
+
     /// Lower a cross-module call to a declared SVM `import` + `call.import`. Param types come from
     /// the args; the return arity from the call position (a stmt-call is treated as void). The
     /// runtime binds the import by name at instantiation — the frontend only makes it well-typed.
+    ///
+    /// A callee the linker pooled as **frame-needing** ([`ext_frame_procs`](Translator::ext_frame_procs))
+    /// has a hidden leading `$sp` param the args don't mention; we prepend `sp + frame_size` so the
+    /// import's signature and operands match the resolved proc — the cross-module twin of the
+    /// direct-call frame handoff.
     fn call_import(
         &mut self,
         name: &str,
@@ -3569,6 +3723,10 @@ impl<'a> FuncGen<'a> {
     ) -> Result<Val, LengError> {
         let mut argvals = Vec::new();
         let mut argtys = Vec::new();
+        if self.t.ext_frame_procs.contains(name) {
+            argvals.push(self.emit_callee_sp(name)?);
+            argtys.push(ValType::I64);
+        }
         for arg in args {
             // Aggregate args pass by address (matching by-address params); scalars by value.
             if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
@@ -3764,15 +3922,36 @@ fn is_float(t: ValType) -> bool {
 
 /// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
 /// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
-fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>) -> bool {
+fn body_calls_framed(
+    node: &Node,
+    procs: &HashMap<String, Sig>,
+    ext: &std::collections::HashSet<String>,
+) -> bool {
     if node.tag() == Some("call") {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
-            if procs.get(callee).is_some_and(|s| s.needs_frame) {
+            // A **local** frame-needing callee (bare `foo.0.`) or a **cross-module** one (`foo.0.<stem>`
+            // the linker pooled as frame-needing) both force this proc to own an `$sp` to hand down.
+            if procs.get(callee).is_some_and(|s| s.needs_frame) || ext.contains(callee) {
                 return true;
             }
         }
     }
-    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs)))
+    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs, ext)))
+}
+
+/// Collect every direct **call callee** name in a proc body (bare `foo.0.` for a local proc,
+/// `foo.0.<stem>` for a cross-module one). Feeds the linker's whole-program frame fixpoint.
+fn collect_calls(node: &Node, out: &mut std::collections::HashSet<String>) {
+    if node.tag() == Some("call") {
+        if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
+            out.insert(callee.to_string());
+        }
+    }
+    if let Node::List(items) = node {
+        for c in items {
+            collect_calls(c, out);
+        }
+    }
 }
 
 /// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.

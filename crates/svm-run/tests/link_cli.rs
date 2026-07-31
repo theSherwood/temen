@@ -45,6 +45,7 @@ fn unit_b() -> Module {
                 addend: 0,
             },
         }],
+        data_funcrefs: vec![],
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I64],
