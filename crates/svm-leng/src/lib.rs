@@ -193,11 +193,13 @@ fn translate_object_module(
     sel: Select,
     ext_types: &[(String, translate::Layout)],
     ext_funcrefs: &[(String, translate::FnPtrSig)],
+    ext_frame_procs: &[String],
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
     t.import_funcrefs(ext_funcrefs);
+    t.import_proc_frames(ext_frame_procs);
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
     let (text, export_names) = match sel {
@@ -248,6 +250,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         Select::Names(unit.names),
         &[],
         &[],
+        &[],
     )?))
 }
 
@@ -260,6 +263,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
         &[],
         &[],
     )?))
@@ -292,11 +296,38 @@ fn link_selected_with_extra(
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     let mut pooled_funcrefs = Vec::new();
+    // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
+    let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
+        frame_nodes.extend(translate::Translator::proc_frame_nodes(&root, stem)?);
     }
+    // Whole-program frame fixpoint: a proc needs a frame if it does itself, or if it calls one that
+    // does — transitively, across module boundaries (`program → seq → alloc → alloc.0.`). Each unit
+    // then translates knowing the *final* frame-need of every callee, so a cross-module call to a
+    // frame-needing proc passes `$sp` and never mismatches the resolved signature.
+    let mut pooled_frame_procs: std::collections::HashSet<String> = frame_nodes
+        .iter()
+        .filter(|(_, own, _)| *own)
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    loop {
+        let mut added = false;
+        for (name, _, callees) in &frame_nodes {
+            if !pooled_frame_procs.contains(name)
+                && callees.iter().any(|c| pooled_frame_procs.contains(c))
+            {
+                pooled_frame_procs.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let pooled_frame_procs: Vec<String> = pooled_frame_procs.into_iter().collect();
     let objects: Vec<Vec<u8>> = units
         .iter()
         .map(|(stem, src, sel)| {
@@ -306,6 +337,7 @@ fn link_selected_with_extra(
                 *sel,
                 &pooled,
                 &pooled_funcrefs,
+                &pooled_frame_procs,
             )?))
         })
         .collect::<Result<_, LengError>>()?;

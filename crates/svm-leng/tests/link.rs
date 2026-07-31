@@ -381,3 +381,55 @@ fn cross_module_funcref_global_call() {
     );
     assert_eq!(run(&linked, 0, &[-5]), -10);
 }
+
+/// A cross-module call to a **frame-needing proc**. Module `s`'s `count` takes `(addr i)` of a local,
+/// so its emitted signature carries a leading `$sp`; module `w`'s `drive` calls `count.<s>(n)`. The
+/// caller must hand down that `$sp` — but `call_import` derives an import's signature from the *args*
+/// and can't see the hidden frame param, so the linker runs a **whole-program frame fixpoint**: it
+/// pools every unit's own frame-needing procs and propagates transitively across module boundaries.
+/// `count` is frame-needing on its own; `drive` becomes frame-needing because it calls `count`, so it
+/// too gains an `$sp` (to have one to pass down). `drive(n) = count(n) = n`.
+#[test]
+fn cross_module_frame_needing_call() {
+    let mod_s = "\
+(stmts
+ (proc :incp.0. (params (param :p.0 . (ptr (i +64)))) (void) .
+  (stmts . (asgn (deref p.0) (add (i +64) (deref p.0) 1))))
+ (proc :count.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :i.0 . (i +64) 0)
+   (while (lt i.0 n.0) (stmts . (call incp.0. (addr i.0))))
+   (ret i.0))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call count.0.mods n.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["count.0.", "incp.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // drive (func 0) is frame-needing via the fixpoint → its signature gained a leading `$sp`.
+    assert_eq!(
+        (linked.funcs[0].params.len(), linked.funcs[0].results.len()),
+        (2, 1),
+        "drive should be lowered as (sp, n) -> (i64)"
+    );
+    // Pass a window offset as drive's own frame `$sp`; it hands a fresh sub-frame to count.
+    let sp = 8192;
+    for n in [0, 1, 5, 50] {
+        assert_eq!(
+            run(&linked, 0, &[sp, n]),
+            n,
+            "drive({n}) = count({n}) = {n}"
+        );
+    }
+}

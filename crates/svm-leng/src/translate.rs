@@ -279,6 +279,14 @@ pub(crate) struct Translator {
     /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call_indirect`. Empty
     /// unless the linker pooled sibling units' funcref gvars.
     ext_funcrefs: HashMap<String, FnPtrSig>,
+    /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
+    /// `$sp` param (they take a local's address; see [`proc_needs_frame`](Self::proc_needs_frame)),
+    /// under the stem-suffixed names this module calls them by ([`export_proc_frames`]). A
+    /// cross-module call lowers to an import whose signature `call_import` derives from the *args* —
+    /// blind to the callee's hidden `$sp`. With the callee named here, `call_import` prepends
+    /// `sp + frame_size` (the caller's own frame top) as the leading arg, exactly as a direct call
+    /// to a frame-needing proc does. Empty unless the linker pooled sibling units' proc frames.
+    ext_frame_procs: std::collections::HashSet<String>,
 }
 
 impl Translator {
@@ -297,6 +305,7 @@ impl Translator {
             consts: HashMap::new(),
             imports: RefCell::new(ImportTable::default()),
             ext_funcrefs: HashMap::new(),
+            ext_frame_procs: std::collections::HashSet::new(),
         }
     }
 
@@ -1082,6 +1091,58 @@ impl Translator {
         Ok(out)
     }
 
+    /// Pre-register **external frame-needing procs** — sibling units' procs whose emitted signature
+    /// carries a leading `$sp` param, under the stem-suffixed names this module calls them by
+    /// ([`export_proc_frames`]). See the [`ext_frame_procs`](Self::ext_frame_procs) field: this is
+    /// what makes a cross-module call to such a proc pass the hidden `$sp`.
+    pub fn import_proc_frames(&mut self, ext: &[String]) {
+        for name in ext {
+            self.ext_frame_procs.insert(name.clone());
+        }
+    }
+
+    /// A module's proc **frame-graph nodes** for the linker's whole-program frame fixpoint: one
+    /// `(global_name, base_needs_frame, global_callees)` per proc. `global_name` is the stem-suffixed
+    /// name other modules call it by; `base_needs_frame` is its *own* [`proc_needs_frame`] (address
+    /// of a local, aggregate local, arg temp — no propagation yet); `global_callees` are the callees'
+    /// global names (a bare `foo.0.` local call resolves to `foo.0.<stem>`; a cross-module
+    /// `foo.0.<other>` is already global). A proc's emitted signature carries a leading `$sp` iff it
+    /// is frame-needing, and a cross-module caller must pass that `$sp` — but frame-need propagates
+    /// transitively across module boundaries (`alloc.1.` → `alloc.0.`, and a program proc → the
+    /// stdlib's `alloc`), so [`link_selected`] runs the fixpoint over *all* units' nodes before
+    /// translating any, rather than each unit guessing in isolation.
+    pub fn proc_frame_nodes(
+        root: &Node,
+        stem: &str,
+    ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        t.collect_globals(root)?;
+        // Resolve a callee name to its global form: a local proc's name ends in `.` (the empty
+        // module-hash slot) → suffix with this stem; a cross-module reference already carries a stem.
+        let globalize = |callee: &str| -> String {
+            if callee.ends_with('.') {
+                format!("{callee}{stem}")
+            } else {
+                callee.to_string()
+            }
+        };
+        let mut out = Vec::new();
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_importc_proc(item) {
+                let name = sym_def(&item.args()[0])?;
+                let base = t.proc_needs_frame(item);
+                let mut callees = std::collections::HashSet::new();
+                if let Some(body) = item.args().get(4) {
+                    collect_calls(body, &mut callees);
+                }
+                let callees = callees.iter().map(|c| globalize(c)).collect();
+                out.push((format!("{name}{stem}"), base, callees));
+            }
+        }
+        Ok(out)
+    }
+
     /// Collect a module's aggregate type layouts under their **stem-suffixed global names** — the
     /// form *other* modules reference them by (a type `T.0.` defined in module `stem` is
     /// `T.0.<stem>` elsewhere, the same mangling as procs/gvars). Field/element types that name a
@@ -1214,7 +1275,7 @@ impl Translator {
                     continue;
                 }
                 if let Some(b) = node.args().get(4) {
-                    if body_calls_framed(b, &self.procs) {
+                    if body_calls_framed(b, &self.procs, &self.ext_frame_procs) {
                         to_frame.push(name);
                     }
                 }
@@ -3337,17 +3398,7 @@ impl<'a> FuncGen<'a> {
         let mut argvals = Vec::new();
         // A frame-needing callee gets a fresh frame beyond ours: `sp_callee = sp + frame_size`.
         if callee_needs_frame {
-            if !self.has_sp {
-                return Err(LengError::Unsupported(format!(
-                    "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
-                )));
-            }
-            let sp = self.cur[0];
-            let fs = self.emit_const(ValType::I64, self.frame_size as i64);
-            let spid = self.fresh();
-            self.cur_buf
-                .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
-            argvals.push(spid);
+            argvals.push(self.emit_callee_sp(callee)?);
         }
         for (arg, want) in a[1..].iter().zip(ptys) {
             argvals.push(self.call_arg(arg, want)?);
@@ -3610,9 +3661,31 @@ impl<'a> FuncGen<'a> {
         Ok(self.expr_typed(arg, want)?.id)
     }
 
+    /// The `$sp` a frame-needing callee receives: `sp + frame_size` — the top of *this* proc's own
+    /// frame, giving the callee fresh space beyond ours. A frameless caller has no `$sp` to hand
+    /// down, so calling a frame-needing proc from one fails closed.
+    fn emit_callee_sp(&mut self, callee: &str) -> Result<u32, LengError> {
+        if !self.has_sp {
+            return Err(LengError::Unsupported(format!(
+                "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
+            )));
+        }
+        let sp = self.cur[0];
+        let fs = self.emit_const(ValType::I64, self.frame_size as i64);
+        let spid = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
+        Ok(spid)
+    }
+
     /// Lower a cross-module call to a declared SVM `import` + `call.import`. Param types come from
     /// the args; the return arity from the call position (a stmt-call is treated as void). The
     /// runtime binds the import by name at instantiation — the frontend only makes it well-typed.
+    ///
+    /// A callee the linker pooled as **frame-needing** ([`ext_frame_procs`](Translator::ext_frame_procs))
+    /// has a hidden leading `$sp` param the args don't mention; we prepend `sp + frame_size` so the
+    /// import's signature and operands match the resolved proc — the cross-module twin of the
+    /// direct-call frame handoff.
     fn call_import(
         &mut self,
         name: &str,
@@ -3621,6 +3694,10 @@ impl<'a> FuncGen<'a> {
     ) -> Result<Val, LengError> {
         let mut argvals = Vec::new();
         let mut argtys = Vec::new();
+        if self.t.ext_frame_procs.contains(name) {
+            argvals.push(self.emit_callee_sp(name)?);
+            argtys.push(ValType::I64);
+        }
         for arg in args {
             // Aggregate args pass by address (matching by-address params); scalars by value.
             if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
@@ -3816,15 +3893,36 @@ fn is_float(t: ValType) -> bool {
 
 /// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
 /// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
-fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>) -> bool {
+fn body_calls_framed(
+    node: &Node,
+    procs: &HashMap<String, Sig>,
+    ext: &std::collections::HashSet<String>,
+) -> bool {
     if node.tag() == Some("call") {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
-            if procs.get(callee).is_some_and(|s| s.needs_frame) {
+            // A **local** frame-needing callee (bare `foo.0.`) or a **cross-module** one (`foo.0.<stem>`
+            // the linker pooled as frame-needing) both force this proc to own an `$sp` to hand down.
+            if procs.get(callee).is_some_and(|s| s.needs_frame) || ext.contains(callee) {
                 return true;
             }
         }
     }
-    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs)))
+    matches!(node, Node::List(items) if items.iter().any(|c| body_calls_framed(c, procs, ext)))
+}
+
+/// Collect every direct **call callee** name in a proc body (bare `foo.0.` for a local proc,
+/// `foo.0.<stem>` for a cross-module one). Feeds the linker's whole-program frame fixpoint.
+fn collect_calls(node: &Node, out: &mut std::collections::HashSet<String>) {
+    if node.tag() == Some("call") {
+        if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
+            out.insert(callee.to_string());
+        }
+    }
+    if let Node::List(items) = node {
+        for c in items {
+            collect_calls(c, out);
+        }
+    }
 }
 
 /// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
