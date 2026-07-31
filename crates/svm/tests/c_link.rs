@@ -1393,18 +1393,28 @@ fn bench_self_compile_native_vs_bytecode_vs_jit() {
             ji + jr
         );
     }
+    let profile = if cfg!(debug_assertions) {
+        "DEBUG"
+    } else {
+        "release"
+    };
     println!(
         "\nlinked cc1: {nfuncs} funcs, {ninsns} IR insns.  \
-         pure svm_jit::compile (no execution, best-of-3): {jit_compile_ms} ms — the fixed \
-         'compile-the-compiler' cost.\n\
-         The powerbox JIT fuses compile+run with no module cache, so `jit-run` pays this on \
-         *every* call.\n\
-         Read it as  jit-run ≈ compile-the-compiler + execution;  execution = jit-run − ~{jit_compile_ms}ms \
-         (a few hundred ms, single-digit × native).\n\
-         A compile-once/run-many deployment amortizes the fixed cost to ~0 and the JIT lands near native; \
-         `jit-run` here does not.\n\
-         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`. native has no \
-         separate instantiate.)\n"
+         pure svm_jit::compile (Cranelift, opt_level=speed, no execution, best-of-3): {jit_compile_ms} ms [{profile} build].\n\
+         *** PROFILE CAVEAT: `cargo test` builds Cranelift ITSELF unoptimized (no [profile.test] dep \
+         override), so in a DEBUG build every engine column here is ~10-15x inflated. The SAME compile \
+         in a release build is ~0.7s, not ~10s — that ~15x is the debug-Cranelift penalty, NOT the \
+         production JIT cost. Run with `cargo test --release` for representative engine numbers; native \
+         (an external clang-built process) is unaffected either way. ***\n\
+         `jit-run` is still a genuine cost in kind: the powerbox entry is run-once (`_start`), so it \
+         Cranelift-compiles the whole {nfuncs}-fn guest AND executes it every call — a `compile one file, \
+         exit` invocation really does pay the full compile (release: ~0.7s here, not ~10s).\n\
+         The compile so dominates that this bench cannot isolate execution (compile ≈ run; re-running \
+         `_start` on a dirtied window isn't valid), so per-file execution sits below the compile's own \
+         run-to-run variance — measured here only as 'small vs compile', not precisely.\n\
+         When the fixed compile amortizes (long-lived process reusing a persistent CompiledModule / \
+         JitSession) it drops out; a run-once self-host does not get that.\n\
+         (bc-inst / jit-inst = per-call instantiate — negligible; the cost lives in `run`.)\n"
     );
 }
 
