@@ -13,7 +13,7 @@
 //!   drained cleanly.
 
 use std::sync::Arc;
-use svm_interp::{cap_id, Host, NonDurableKind, Trap, Value};
+use svm_interp::{cap_id, run_with_host, Host, NonDurableKind, Trap, Value};
 use svm_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, LoadOp, Terminator, ValType};
 
 /// A one-block leaf `(params) -> (results)` whose body just returns its first param (or
@@ -483,6 +483,43 @@ fn an_instanced_offer_keeps_exporter_domain_state_across_calls() {
             "provider state persists across dispatches"
         );
     }
+}
+
+#[test]
+fn an_instanced_offer_dispatches_via_capcall_through_the_eval_loop() {
+    // CALLS.md increment 3, slice 1 — exercise the narrowed **`cap.call`** arm END TO END
+    // (`imports_impl` covers the `call.import` form; the direct-handle `cap.call` arm, and thus
+    // `Host::instanced_offer_of`, is otherwise unexercised through the eval loop). A consumer guest
+    // `cap.call`s the wired instanced offer three times; the provider window counter persists across
+    // the narrowed-lock sub-runs, so it returns 3.
+    let provider = counter_provider();
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let mut h = Host::new();
+    let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+
+    // The offer handle + interned type_id are runtime values; embed them as the consumer's
+    // dynamic-mode `cap.call` operands (the escape-hatch form for an undeclared grant).
+    let consumer_src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vh = i32.const {offer}\n\
+           v1 = cap.call {tid} 0 () -> (i64) vh ()\n\
+           v2 = cap.call {tid} 0 () -> (i64) vh ()\n\
+           v3 = cap.call {tid} 0 () -> (i64) vh ()\n\
+           return v3\n\
+           }}\n\
+         }}\n"
+    );
+    let consumer = svm_text::parse_module(&consumer_src).expect("consumer parses");
+    let mut fuel = 1_000_000u64;
+    let r = run_with_host(&consumer, 0, &[], &mut fuel, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(3)]),
+        "the cap.call arm drives the instanced offer; provider state persists across the three calls"
+    );
 }
 
 #[test]

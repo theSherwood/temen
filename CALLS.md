@@ -161,12 +161,45 @@ plumbing that lands in increments (§8).
    granted its own offer calls it; the caller observes `-EAGAIN`). The blocking-lock deadlock
    argument leaves the TCB. Deferred with it: caller-pays **fuel** — fuel exhaustion is
    observable, so it must switch on every backend at once (increment 5, with the JIT arm).
-3. **Inline fast path (interp)** — uncontended `single`-provider calls animate the handler on the
-   caller's thread (coroutine-drive shape) *outside* the caller's powerbox lock (the lock narrows
-   to the two `cap`-slot translation edges); contended calls take the queue instead of `-EAGAIN`.
-   Differential-tested against increment 2's behavior (results must be identical).
-4. **Promotion (interp)** — a handler that parks mid-inline-animation files its reified fiber +
-   waiter; caller parks on the reply. (Mostly `handler_parks` re-plumbed.)
+3. **Inline fast path (interp).** Decomposed into slices, smallest verifiable step first; the
+   original "contended calls take the queue instead of `-EAGAIN`" half is **re-scoped** to co-land
+   with increment 4 (see 3c) because it is unsafe without promotion.
+   - **3a — Narrow the powerbox lock. DONE (2026-07-31).** The instanced sub-run now runs with the
+     caller's powerbox lock held **only** around the two `cap`-slot translation edges, never across
+     the `drive_arc` sub-run (a new `drive_instanced_offer` free fn; per-arm pre-probes
+     `instanced_offer_of`/`_for_import`/`_for_dyn` mirroring the LiveImpl pre-probe, wired into the
+     `cap.call`/`call.import`/`call.sym`/`call.import.dyn` eval-loop arms). `drive_arc` and
+     try-enter/`-EAGAIN` are kept verbatim, so behavior is **byte-identical** to increment 2
+     (pinned by the existing `impl_wiring`/`imports_impl`/`bytecode_diff`/`jit_diff` suites, plus a
+     new `concurrent_instanced_offer_calls_are_safe_under_the_narrowed_lock` two-vCPU safety test).
+     No generation re-check is needed on the relock this slice: the instance is named by the cloned
+     `state` `Arc` and results are minted fresh, and `drive_arc` has no suspension point (the
+     re-check belongs to 3c/increment 4, where a handler parks). The only new lock edge is
+     `state → hg`; it cannot cycle with the generic `hg → state.try_lock()` (non-blocking) during a
+     live run — the blocking `hg → state` introspection APIs are not called concurrently with a run
+     (invariant doc'd on `grant_impl_cap`; clean fix rides increment 6).
+   - **3b — Inline animation (interp). RE-SCOPED into increment 4 (2026-07-31).** Investigation
+     found the drive-mechanism swap is not a worthwhile *standalone* slice: `drive_arc` already runs
+     a single-vCPU, run-to-completion offer handler entirely on the **calling thread** (`worker_loop`,
+     no worker OS threads spawned unless the handler itself spawns), so replacing it with an
+     *isolated* nested `run_inner` buys only marginal per-call setup — and its output is **throwaway**,
+     because the value of inline animation (a parked handler as a *reified fiber*, the CALLS.md §4
+     "free by construction" promotion) needs the handler to run as a fiber in a **shared** scheduler,
+     not a fresh isolated one. That shared-scheduler cross-domain fiber (different `mem`/`host`, the
+     caller's registry) *is* the promotion machinery. So the real inline animation lands **with
+     increment 4**, not before it; 3a stands as the clean, complete standalone slice.
+   - **3c — Queue-on-contention (co-lands with increment 4).** Replacing `-EAGAIN` with queue+park
+     is **unsafe for same-thread re-entrant/cyclic calls without promotion** — the caller would
+     park waiting for an instance it itself holds (self-deadlock). It therefore lands *with* the
+     promotion machinery (increment 4), which reifies a parked handler and frees the thread; until
+     then a busy instance keeps answering the probeable `-EAGAIN`.
+4. **Inline animation + promotion (interp)** — the unified-model core, absorbing 3b and 3c. Run
+   the offer handler as a **reified fiber in the caller's (shared) scheduler** over the provider's
+   world (the §4 inline-animation fast path), so a handler that parks mid-animation files its
+   reified fiber + waiter and the caller parks on the reply (`handler_parks` re-plumbed) — which in
+   turn makes queue-on-contention (3c) safe for re-entrant/cyclic calls (a parked holder frees the
+   thread). The cross-domain fiber (different `mem`/`host`, the caller's registry) is the piece 3a
+   deliberately stopped short of. Fuel is reproduced exactly against 3a's `drive_arc` behavior.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
    here**, uniformly on all backends. Closes the `live_impl` parity gap.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
