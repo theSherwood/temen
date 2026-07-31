@@ -158,6 +158,19 @@ struct Sig {
     sret: Option<TyDesc>,
 }
 
+/// The SVM signature of a **function pointer** (nimony `proctype`), as an indirect call needs it:
+/// the `call_indirect` `FuncType`. An aggregate-returning proctype is sret-lowered here — a leading
+/// `i64` `$sret` pointer param and no result — exactly as a direct aggregate-returning proc is, so
+/// the two ABIs match and a proc can be called either directly or through a pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FnPtrSig {
+    params: Vec<ValType>,
+    results: Vec<ValType>,
+    /// True if this proctype returns an aggregate by sret — `params[0]` is then the `$sret` pointer
+    /// and `results` is empty. Such a call must flow to an aggregate destination (`call_sret`).
+    sret: bool,
+}
+
 /// What a computed lvalue address points at — a scalar (with load/store width) or a named
 /// aggregate (whose fields/elements are reached by further `dot`/`at`).
 #[derive(Clone, Debug)]
@@ -180,6 +193,11 @@ pub(crate) enum TyDesc {
     /// whose *own address* is the array base. `at`/`pat` index it by the element (boxed) type; you
     /// never load the whole thing.
     FlexArray(Box<TyDesc>),
+    /// A **function pointer** (`proctype`) — a callable value. Its machine representation is an `i32`
+    /// **function index** (`ref.func`'s result; `call_indirect`'s masked table index, §3c), but its
+    /// storage slot is a full 8-byte pointer word in nimony's layout, so `sizeof` is 8 while
+    /// load/store use `i32`. Carries the signature an indirect call through it needs.
+    FnPtr(Box<FnPtrSig>),
     Agg(String),
 }
 
@@ -190,6 +208,8 @@ impl TyDesc {
         match self {
             TyDesc::Scalar(t) => Some(*t),
             TyDesc::Ptr(_) => Some(ValType::I64),
+            // A funcref value is an `i32` function index (its 8-byte slot notwithstanding).
+            TyDesc::FnPtr(_) => Some(ValType::I32),
             _ => None,
         }
     }
@@ -219,6 +239,15 @@ pub(crate) struct Translator {
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
     /// type (`enum`, `distinct` int, `proctype`, opaque/external) is an integer scalar.
     agg_names: std::collections::HashSet<String>,
+    /// Named-type **pointer aliases** — a `(type :RootRef … (ptr T))` declares `RootRef` as an alias
+    /// for a typed pointer. Without this, a bare-symbol type not in `agg_names` falls back to a plain
+    /// `i64` scalar, so a param typed `RootRef` wouldn't `deref`. Records the resolved `TyDesc::Ptr`
+    /// (or any non-scalar alias) so `tydesc` recovers the pointee for `deref`/`dot`.
+    ty_aliases: HashMap<String, TyDesc>,
+    /// Named `proctype` declarations → their function-pointer signature. Populated before object
+    /// layouts resolve, so a field/param typed by a proctype name (or a `(ptr proctype)` alias)
+    /// resolves to `TyDesc::FnPtr` and an indirect call through it recovers the `call_indirect` sig.
+    proctypes: HashMap<String, FnPtrSig>,
     /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
     /// starts zeroed); non-zero initializers are a later slice.
     globals: HashMap<String, (u64, TyDesc)>,
@@ -251,6 +280,8 @@ impl Translator {
             procs: HashMap::new(),
             types: HashMap::new(),
             agg_names: std::collections::HashSet::new(),
+            ty_aliases: HashMap::new(),
+            proctypes: HashMap::new(),
             data_inits: Vec::new(),
             data_ptrs: Vec::new(),
             globals_top: 16,
@@ -668,6 +699,7 @@ impl Translator {
             TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
             TyDesc::Scalar(_) => 8,
             TyDesc::Ptr(_) => 8,
+            TyDesc::FnPtr(_) => 8, // a full pointer-word slot, though accessed as an i32 index
             TyDesc::FlexArray(_) => 0, // a size-0 inline tail
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
@@ -706,9 +738,16 @@ impl Translator {
     /// scalar `i64` (the pointer itself); otherwise an integer scalar.
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
         match node.tag() {
+            // A **function pointer** written inline: `(proctype …)`. nimony also spells a callable
+            // field as `(ptr <proctype>)`; both are the same funcref value, so map either to `FnPtr`.
+            Some("proctype") => Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(node)?))),
             // A **typed pointer**: value type `i64`, carrying the pointee for `deref`. A pointer to
-            // an opaque/void pointee (`(ptr (void))`, `(ptr)`) stays a bare `i64` scalar.
+            // an opaque/void pointee (`(ptr (void))`, `(ptr)`) stays a bare `i64` scalar. A pointer
+            // to a `proctype` (inline or named) is a funcref, not a data pointer.
             Some("ptr") | Some("aptr") => match node.args().first() {
+                Some(t) if self.is_proctype(t) => {
+                    Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(t)?)))
+                }
                 Some(t) if t.tag() != Some("void") => Ok(TyDesc::Ptr(Box::new(self.tydesc(t)?))),
                 _ => Ok(TyDesc::Scalar(ValType::I64)),
             },
@@ -739,12 +778,80 @@ impl Translator {
             Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
             None => match node.as_atom() {
                 // A bare-symbol type is an aggregate only if it's a declared object/array; any other
-                // named type (enum, distinct int, proctype, opaque external) is an integer scalar.
+                // named type (enum, distinct int, proctype, opaque external) is an integer scalar —
+                // unless it's a declared pointer alias (`(type :RootRef … (ptr T))`), which carries a
+                // typed pointee so `deref` works.
                 Some(name) if self.agg_names.contains(name) => Ok(TyDesc::Agg(name.to_string())),
+                Some(name) if self.proctypes.contains_key(name) => {
+                    Ok(TyDesc::FnPtr(Box::new(self.proctypes[name].clone())))
+                }
+                Some(name) if self.ty_aliases.contains_key(name) => {
+                    Ok(self.ty_aliases[name].clone())
+                }
                 Some(_) => Ok(TyDesc::Scalar(ValType::I64)),
                 None => Err(LengError::Malformed("expected a type".into())),
             },
         }
+    }
+
+    /// True if `t` denotes a `proctype` — written inline as `(proctype …)` or as a named proctype.
+    fn is_proctype(&self, t: &Node) -> bool {
+        t.tag() == Some("proctype") || t.as_atom().is_some_and(|n| self.proctypes.contains_key(n))
+    }
+
+    /// The `call_indirect` signature of a `proctype` — a named one (looked up) or an inline
+    /// `(proctype <base> (params …) <rettype> (pragmas …))`. An aggregate return is sret-lowered
+    /// (leading `i64` `$sret` pointer param, no result), matching a direct aggregate-returning proc.
+    fn proctype_sig(&self, node: &Node) -> Result<FnPtrSig, LengError> {
+        if let Some(name) = node.as_atom() {
+            return self
+                .proctypes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| LengError::Unsupported(format!("unknown proctype `{name}`")));
+        }
+        let a = node.args();
+        let pi = a
+            .iter()
+            .position(|n| n.tag() == Some("params"))
+            .ok_or_else(|| LengError::Malformed("proctype needs (params …)".into()))?;
+        let mut params = Vec::new();
+        for prm in a[pi].args() {
+            if prm.tag() == Some("param") {
+                let pa = prm.args();
+                if pa.len() >= 3 {
+                    params.push(self.param_val_ty(&pa[2])?);
+                }
+            }
+        }
+        // The return type node sits just after `(params …)`; `.` (Empty) is void.
+        let ret_node = a.get(pi + 1);
+        let (results, sret) = match ret_node {
+            None => (vec![], false),
+            Some(r) if r.is_empty_marker() => (vec![], false),
+            Some(r) => match self.tydesc(r)? {
+                // An aggregate return becomes an sret pointer param — no direct result.
+                TyDesc::Agg(_) => {
+                    params.insert(0, ValType::I64);
+                    (vec![], true)
+                }
+                d => (vec![d.scalar_ty().unwrap_or(ValType::I32)], false),
+            },
+        };
+        Ok(FnPtrSig {
+            params,
+            results,
+            sret,
+        })
+    }
+
+    /// The SVM value type of a **param**: a funcref (`proctype`) param is an `i32` function index;
+    /// everything else follows [`val_ty`] (aggregates/pointers by-address `i64`, ints, floats).
+    fn param_val_ty(&self, t: &Node) -> Result<ValType, LengError> {
+        if matches!(self.tydesc(t)?, TyDesc::FnPtr(_)) {
+            return Ok(ValType::I32);
+        }
+        val_ty(t)
     }
 
     /// Collect all `(type :Name … Body)` top-level declarations into the layout registry, resolving
@@ -767,9 +874,54 @@ impl Translator {
                 .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
                 .map(|(n, _)| n.clone()),
         );
+        // Record `proctype` signatures next — after `agg_names` (so an aggregate return classifies as
+        // sret) but before object layouts resolve (so a `(ptr proctype)` field lowers to `FnPtr`). A
+        // fixpoint handles a proctype whose signature references another proctype (higher-order).
+        loop {
+            let mut progress = false;
+            for (name, body) in &raw {
+                if body.tag() != Some("proctype") || self.proctypes.contains_key(name) {
+                    continue;
+                }
+                if let Ok(sig) = self.proctype_sig(body) {
+                    self.proctypes.insert(name.clone(), sig);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
         let names: Vec<String> = raw.keys().cloned().collect();
-        for name in names {
-            self.resolve_type(&name, &raw)?;
+        for name in &names {
+            self.resolve_type(name, &raw)?;
+        }
+        // Record named-type **pointer aliases** (`(type :RootRef … (ptr T))`) so a param/field typed
+        // by that name resolves to a typed pointer, not a bare `i64`. A fixpoint handles one alias
+        // naming another (`(type :A . B)` where `B` is itself a ptr alias); it converges once no new
+        // alias resolves. Object/array names are excluded — those are aggregates, handled above.
+        loop {
+            let mut progress = false;
+            for name in &names {
+                if self.agg_names.contains(name) || self.ty_aliases.contains_key(name) {
+                    continue;
+                }
+                let body = raw[name];
+                let desc = match body.tag() {
+                    Some("ptr") | Some("aptr") => self.tydesc(body)?,
+                    // A bare-symbol alias to a name we've already recognized as a pointer alias.
+                    None => match body.as_atom().and_then(|s| self.ty_aliases.get(s)) {
+                        Some(d) => d.clone(),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                self.ty_aliases.insert(name.clone(), desc);
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
         }
         Ok(())
     }
@@ -1195,7 +1347,7 @@ impl Translator {
                     "param needs :name pragmas type".into(),
                 ));
             }
-            out.push((sym_def(&pa[0])?, val_ty(&pa[2])?));
+            out.push((sym_def(&pa[0])?, self.param_val_ty(&pa[2])?));
         }
         Ok(out)
     }
@@ -1227,11 +1379,11 @@ impl Translator {
     /// If `node` is `(ptr T)`/`(aptr T)`, the descriptor `T` points at. A `void`/opaque pointee has
     /// no typed target (a `deref` of it fail-closes), so it yields `None`.
     fn pointee_desc(&self, node: &Node) -> Result<Option<TyDesc>, LengError> {
-        match node.tag() {
-            Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) if t.tag() != Some("void") => Ok(Some(self.tydesc(t)?)),
-                _ => Ok(None),
-            },
+        // A typed pointer — whether written inline as `(ptr T)`/`(aptr T)` or named via a pointer
+        // alias (`(type :RootRef … (ptr T))`) — resolves through `tydesc` to `TyDesc::Ptr(pointee)`.
+        // An opaque `(ptr (void))` is a bare `i64` scalar (no pointee to track).
+        match self.tydesc(node)? {
+            TyDesc::Ptr(pointee) => Ok(Some(*pointee)),
             _ => Ok(None),
         }
     }
@@ -1822,6 +1974,20 @@ impl<'a> FuncGen<'a> {
                         .ok_or_else(|| LengError::Malformed("deref needs an operand".into()))?;
                     self.pointer_operand(operand)
                 }
+                Some("baseobj") => {
+                    // `(baseobj BaseType Levels ObjExpr)` — the base sub-object of `ObjExpr`. Single
+                    // inheritance inlines the base at offset 0 (see `resolve_type`), so the base's
+                    // address is the object's own address, retyped to the base aggregate.
+                    let a = node.args();
+                    let obj = a.get(2).ok_or_else(|| {
+                        LengError::Malformed("baseobj needs BaseType Levels Obj".into())
+                    })?;
+                    let (addr, _) = self.lvalue_addr(obj)?;
+                    let base = a[0]
+                        .as_atom()
+                        .ok_or_else(|| LengError::Malformed("baseobj needs a base type".into()))?;
+                    Ok((addr, TyDesc::Agg(base.to_string())))
+                }
                 Some("dot") => {
                     let a = node.args();
                     let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
@@ -1922,6 +2088,17 @@ impl<'a> FuncGen<'a> {
                     ty: ValType::I64,
                 })
             }
+            TyDesc::FnPtr(_) => {
+                // A funcref value is an `i32` function index in a pointer-word slot: load 4 bytes.
+                let id = self.fresh();
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  v{id} = i32.load v{addr}\n"));
+                Ok(Val {
+                    id,
+                    ty: ValType::I32,
+                })
+            }
             TyDesc::Narrow { bytes, signed } => {
                 // A sub-word load, widened to `i32` (`i32.load8_u` / `load16_s` / …).
                 let id = self.fresh();
@@ -1954,10 +2131,19 @@ impl<'a> FuncGen<'a> {
                 .push_str(&format!("  i32.store{} v{addr} v{}\n", bytes * 8, v.id));
             return Ok(());
         }
+        if let TyDesc::FnPtr(_) = desc {
+            // Store the `i32` funcref (a proc name → `ref.func`, else a funcref value) into the slot.
+            let v = self.funcref_value(rhs)?;
+            self.used_memory = true;
+            self.cur_buf
+                .push_str(&format!("  i32.store v{addr} v{v}\n"));
+            return Ok(());
+        }
         let ty = match desc {
             TyDesc::Scalar(t) => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
+            TyDesc::FnPtr(_) => unreachable!("handled above"),
             TyDesc::FlexArray(_) => {
                 return Err(LengError::Unsupported(
                     "assigning to a flexible array (index it with `at`/`pat`)".into(),
@@ -2056,6 +2242,14 @@ impl<'a> FuncGen<'a> {
                     if let Some(p) = op.as_atom() {
                         return self.pointee.get(p).cloned();
                     }
+                    // A cast to a typed pointer (`(deref (cast (ptr T) …))`) yields the pointee `T` —
+                    // the same rule `pointer_operand` uses at runtime. Without it the static-type
+                    // chain breaks on RTTI walks (`(cast (ptr RootObj) …)` → `.vt` → `.mt`).
+                    if op.tag() == Some("cast") {
+                        if let Some(pointee) = op.args().first().and_then(ptr_pointee) {
+                            return self.t.tydesc(pointee).ok();
+                        }
+                    }
                     match self.lvalue_type(op)? {
                         TyDesc::Ptr(pointee) => Some(*pointee),
                         _ => None,
@@ -2080,6 +2274,12 @@ impl<'a> FuncGen<'a> {
                     let bd = self.lvalue_type(node.args().first()?)?;
                     self.array_of(&bd).ok().map(|(_, d)| d)
                 }
+                // `(baseobj BaseType Levels Obj)` — a base sub-object, typed as the base aggregate.
+                Some("baseobj") => node
+                    .args()
+                    .first()
+                    .and_then(|n| n.as_atom())
+                    .map(|b| TyDesc::Agg(b.to_string())),
                 _ => None,
             },
         }
@@ -2191,11 +2391,43 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  i64.store v{addr} v{}\n", v.id));
                 Ok(())
             }
+            TyDesc::FnPtr(_) => {
+                // A funcref member: store the `i32` function index (4 bytes of the pointer slot).
+                let v = self.funcref_value(expr)?;
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  i32.store v{addr} v{v}\n"));
+                Ok(())
+            }
             TyDesc::FlexArray(_) => Err(LengError::Unsupported(
                 "storing to a flexible array member (index it with `at`/`pat`)".into(),
             )),
             TyDesc::Agg(_) => self.assign_aggregate(addr, desc, expr),
         }
+    }
+
+    /// Evaluate a **funcref-producing** expression to its `i32` function index. A bare proc symbol
+    /// becomes `ref.func <idx>` (its function index); anything else is an already-computed funcref
+    /// value (a funcref field/param/local), loaded as an `i32`. A proc that needs a stack frame can't
+    /// be reached indirectly (no `$sp` to hand down), so taking its address fails closed.
+    fn funcref_value(&mut self, expr: &Node) -> Result<u32, LengError> {
+        if let Some(name) = expr.as_atom() {
+            if let Some(sig) = self.t.procs.get(name) {
+                if sig.needs_frame {
+                    return Err(LengError::Unsupported(format!(
+                        "cannot take a funcref of frame-needing proc `{name}` (indirect calls pass no `$sp`)"
+                    )));
+                }
+                let idx = sig.index;
+                let id = self.fresh();
+                self.cur_buf
+                    .push_str(&format!("  v{id} = ref.func {idx}\n"));
+                return Ok(id);
+            }
+        }
+        // An already-materialized funcref value (a `proctype` local/param/field).
+        let v = self.expr_typed(expr, ValType::I32)?;
+        Ok(v.id)
     }
 
     /// `StmtList ::= (stmts SCOPE? Stmt*)` — real hexer often omits the leading SCOPE atom.
@@ -2220,6 +2452,13 @@ impl<'a> FuncGen<'a> {
     }
 
     fn stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        // A `.` Empty marker or an empty `()` placeholder carries no statement — nimony emits these
+        // in module scaffolding (`ini`/C-`main`). Inert: skip.
+        if s.is_empty_marker()
+            || (s.tag().is_none() && s.as_atom().is_none() && s.args().is_empty())
+        {
+            return Ok(());
+        }
         match s.tag() {
             // Nested block / scope: recurse (hexer emits `(stmts (stmts …))` and `(scope (stmts …))`).
             Some("stmts") => self.stmt_list(s),
@@ -3000,6 +3239,16 @@ impl<'a> FuncGen<'a> {
         if a.is_empty() {
             return Err(LengError::Malformed("call needs a callee".into()));
         }
+        // An **indirect call** through a function pointer (a `proctype` field/param/global, or a
+        // `(cast <proctype> …)`) — the callee is a funcref value, not a named proc.
+        if let Some((idx, sig)) = self.indirect_callee(&a[0])? {
+            if sig.sret {
+                return Err(LengError::Unsupported(
+                    "aggregate-returning indirect call must be directly assigned to an aggregate destination".into(),
+                ));
+            }
+            return self.emit_call_indirect(idx, &sig, &a[1..]);
+        }
         let callee = a[0].as_atom().ok_or_else(|| {
             LengError::Unsupported("indirect call (callee is not a symbol)".into())
         })?;
@@ -3079,6 +3328,16 @@ impl<'a> FuncGen<'a> {
     /// destination. Arg order matches `P`'s signature: `[$sp?] [dest_addr] [params…]`.
     fn call_sret(&mut self, e: &Node, dest_addr: u32) -> Result<(), LengError> {
         let a = e.args();
+        // An **indirect** aggregate-returning call — through a `proctype` funcref (a field like
+        // `Continuation.fn`, or a funcref global). The sret pointer rides as the first arg.
+        if let Some((idx, sig)) = self.indirect_callee(&a[0])? {
+            if !sig.sret {
+                return Err(LengError::Unsupported(
+                    "indirect call in aggregate position does not return an aggregate".into(),
+                ));
+            }
+            return self.emit_call_indirect_sret(idx, &sig, &a[1..], dest_addr);
+        }
         let callee = a[0]
             .as_atom()
             .ok_or_else(|| LengError::Unsupported("indirect aggregate-returning call".into()))?;
@@ -3127,6 +3386,132 @@ impl<'a> FuncGen<'a> {
             .join(", ");
         self.cur_buf
             .push_str(&format!("  call {index} ({arglist})\n"));
+        Ok(())
+    }
+
+    /// If `a0` is a **funcref callee** — a `(cast <proctype> …)` or a `proctype`-typed value (a
+    /// field/param/local/global holding a function pointer) — resolve it to `(idx value, signature)`
+    /// for an indirect call; else `None` (a direct/import call). The index is the `i32` funcref:
+    /// loaded from a scalar SSA binding, from memory (`i32.load`), or evaluated from the cast source.
+    fn indirect_callee(&mut self, a0: &Node) -> Result<Option<(u32, FnPtrSig)>, LengError> {
+        if a0.tag() == Some("cast") {
+            let ca = a0.args();
+            // A cast whose target is a funcref — an inline `(proctype …)`, a named proctype, or a
+            // `(ptr proctype)` alias (nimony's RTTI method-slot cast). The source is the funcref
+            // value: a `proctype` field/slot is already an `i32` index; an opaque `(ptr void)` method
+            // slot is an `i64` that narrows to the `i32` table index.
+            if ca.len() >= 2 {
+                if let Ok(TyDesc::FnPtr(sig)) = self.t.tydesc(&ca[0]) {
+                    let v = self.expr(&ca[1])?;
+                    let idx = self.convert(v, ValType::I32);
+                    return Ok(Some((idx.id, *sig)));
+                }
+            }
+        }
+        let sig = match self.lvalue_type(a0) {
+            Some(TyDesc::FnPtr(s)) => *s,
+            _ => return Ok(None),
+        };
+        let id = match a0.as_atom() {
+            // A scalar funcref param/local is an SSA value; a funcref global/field lives in memory.
+            Some(name) if self.lookup(name).is_some() => self.lookup(name).unwrap().id,
+            _ => self.load_lvalue(a0)?.id,
+        };
+        Ok(Some((id, sig)))
+    }
+
+    /// Emit a scalar/void **`call_indirect`** through funcref `idx` with signature `sig` and the given
+    /// Leng argument nodes. Args are lowered exactly as a direct call's (aggregates by-address).
+    fn emit_call_indirect(
+        &mut self,
+        idx: u32,
+        sig: &FnPtrSig,
+        args: &[Node],
+    ) -> Result<Val, LengError> {
+        if args.len() != sig.params.len() {
+            return Err(LengError::Malformed(format!(
+                "indirect call: {} args for {} params",
+                args.len(),
+                sig.params.len()
+            )));
+        }
+        let mut argvals = Vec::new();
+        for (arg, want) in args.iter().zip(&sig.params) {
+            argvals.push(self.call_arg(arg, *want)?);
+        }
+        let arglist = argvals
+            .iter()
+            .map(|id| format!("v{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plist = sig
+            .params
+            .iter()
+            .map(|t| prefix(*t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rlist = sig
+            .results
+            .iter()
+            .map(|t| prefix(*t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match sig.results.first() {
+            Some(rt) => {
+                let id = self.fresh();
+                self.cur_buf.push_str(&format!(
+                    "  v{id} = call_indirect ({plist}) -> ({rlist}) v{idx} ({arglist})\n"
+                ));
+                Ok(Val { id, ty: *rt })
+            }
+            None => {
+                self.cur_buf.push_str(&format!(
+                    "  call_indirect ({plist}) -> () v{idx} ({arglist})\n"
+                ));
+                Ok(Val {
+                    id: u32::MAX,
+                    ty: ValType::I32,
+                })
+            }
+        }
+    }
+
+    /// Emit an aggregate-returning **`call_indirect`** through funcref `idx`: the `sret` pointer
+    /// `dest_addr` rides as the first arg (matching `sig.params[0]`, the lowered sret slot), then the
+    /// Leng args. `sig.params[1..]` are the visible param types.
+    fn emit_call_indirect_sret(
+        &mut self,
+        idx: u32,
+        sig: &FnPtrSig,
+        args: &[Node],
+        dest_addr: u32,
+    ) -> Result<(), LengError> {
+        let visible = &sig.params[1..]; // params[0] is the sret pointer
+        if args.len() != visible.len() {
+            return Err(LengError::Malformed(format!(
+                "indirect sret call: {} args for {} params",
+                args.len(),
+                visible.len()
+            )));
+        }
+        let mut argvals = vec![dest_addr];
+        for (arg, want) in args.iter().zip(visible) {
+            argvals.push(self.call_arg(arg, *want)?);
+        }
+        let arglist = argvals
+            .iter()
+            .map(|id| format!("v{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plist = sig
+            .params
+            .iter()
+            .map(|t| prefix(*t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.cur_buf.push_str(&format!(
+            "  call_indirect ({plist}) -> () v{idx} ({arglist})\n"
+        ));
         Ok(())
     }
 
