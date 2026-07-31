@@ -391,3 +391,170 @@ fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
         "child sees 0, parent sees the pid — fork()'s return-twice contract"
     );
 }
+
+/// FORK.md §8.6 — **fork + wait**, the shell's command loop in miniature: `while ((pid = fork()) <
+/// 0); if (pid) { while ((s = wait(pid)) < 0); } else exit(42);`. One server serves **two** verbs
+/// over one offer — `fork` (op 0 → `clone_caller`, func 2) and `wait` (op 1 → `reap`, func 3). The
+/// caller C (func 4) forks, then **branches on the return**: the twin (pid 0) exits `42`; the
+/// original (pid 3) `wait(3)`s and writes the reaped status to stdout. Because C waits the instant it
+/// forks, the twin is usually still running — so `reap` takes the **deferred** path (park the parent
+/// in `join_waiters[3]`, resumed by the twin's completion with `Pending::ReapPid`). The reaped status
+/// is the twin's `exit(42)`, and the run (root joins C, the original) returns it.
+///
+/// **Both `fork` and `wait` retry on `-EAGAIN`** — the realistic shell idiom. Either call can lose
+/// the serve/park race under load (the servicer drains the dispatch before the caller registers its
+/// `CapReply` waiter): `fork` then fails `-EAGAIN` (the existing pid-mode contract) and `reap`
+/// returns `-EAGAIN` too (never `-ECHILD` — the twin is real). The retry loops make the outcome
+/// deterministic regardless of interleaving, which is why the test is stable under a full parallel
+/// suite where the raw one-shot form flakes (ISSUES.md I53 family). Interp only, like every fork test.
+const SRC_FORK_WAIT: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
+data 300 "svc"
+data 310 "o"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32) {
+  ve1 = i64.const 1
+  voffs = i64.const 131072
+  vlog = i64.const 12
+  vq = i64.const 0
+  vs = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve1, voffs, vlog, vq)
+  vz0 = i64.const 0
+  vcap = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 256
+  vnp = i32.const 300
+  i32.store va0 vnp
+  va1 = i64.const 260
+  vnl = i32.const 3
+  i32.store va1 vnl
+  va2 = i64.const 264
+  i32.store va2 vcap
+  va3 = i64.const 272
+  vnp2 = i32.const 310
+  i32.store va3 vnp2
+  va4 = i64.const 276
+  vnl2 = i32.const 1
+  i32.store va4 vnl2
+  va5 = i64.const 280
+  i32.store va5 vout
+  vgp = i64.const 256
+  vgn = i64.const 2
+  ve4 = i64.const 4
+  voffc = i64.const 135168
+  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve4, voffc, vlog, vq)
+  vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
+  return vjc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsvc = i64.const 6518387
+  vzero = i64.const 0
+  i64.store vzero vsvc
+  voname = i64.const 111
+  va8 = i64.const 8
+  i64.store va8 voname
+  br 1()
+  }
+block 1 () {
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = cap.self.resolve vp0 vl3
+  vc0 = i64.const 0
+  vpid = cap.call 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vz1 = i64.const 0
+  vforkfail = i64.lt_s vpid vz1
+  br_if vforkfail 1() 2(vpid)
+  }
+block 2 (vpid: i64) {
+  vz2 = i64.const 0
+  vparent = i64.ne vpid vz2
+  br_if vparent 3(vpid) 5()
+  }
+block 3 (vpid: i64) {
+  vp0b = i64.const 0
+  vl3b = i64.const 3
+  vhsvc2 = cap.self.resolve vp0b vl3b
+  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc2 (vpid)
+  vz3 = i64.const 0
+  vwaitfail = i64.lt_s vstatus vz3
+  br_if vwaitfail 3(vpid) 4(vstatus)
+  }
+block 4 (vstatus: i64) {
+  vp8 = i64.const 8
+  vl1 = i64.const 1
+  vho = cap.self.resolve vp8 vl1
+  vp16 = i64.const 16
+  i64.store vp16 vstatus
+  vlen = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  return vstatus
+  }
+block 5 () {
+  v42 = i64.const 42
+  return v42
+  }
+}
+"#;
+
+#[test]
+fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
+    let m = module(SRC_FORK_WAIT);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let mut fuel = 60_000_000u64;
+    let r = run_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(out_h)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    // The original C forked (pid 3), waited on it, and returned the reaped status — joined to root.
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the parent's wait(pid) reaped the twin's exit(42)"
+    );
+    // Exactly ONE write reached stdout: the parent's reaped status. The twin took the `else` branch
+    // (exit 42) and never wrote — proving the branch-on-fork-return split parent from child.
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        bytes.len(),
+        8,
+        "only the parent wrote — the child exited without writing"
+    );
+    let status = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    assert_eq!(status, 42, "the reaped status is the twin's exit code");
+}
