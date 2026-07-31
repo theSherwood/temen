@@ -201,6 +201,7 @@ impl DapServer {
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
+            "forceSwitch" => self.on_force_switch(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -349,6 +350,9 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
+            // Slice 7: the seeded pick is honored on the threaded bytecode engine (a seed with a
+            // single-vCPU module fails the launch inside `new` — fail-closed).
+            let seed = args.get("seed").and_then(|v| v.as_i64()).map(|v| v as u64);
             match BytecodeBackend::new(
                 module,
                 func,
@@ -358,6 +362,7 @@ impl DapServer {
                 stdin,
                 block_stdin,
                 mem_limit,
+                seed,
             ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
@@ -971,6 +976,29 @@ impl DapServer {
         };
         let ok = session.inspector.provide_stdin(data.as_bytes());
         (ok, Json::Null, vec![])
+    }
+
+    /// The custom `forceSwitch` request (slice 7): override the schedule's next pick —
+    /// `arguments.threadId` names the target DAP thread (task + 1), absent = "switch away" to the
+    /// lowest-index other runnable task. The override is recorded at the current turn and survives
+    /// `seek` (replays re-apply it). Replies with the resolved `threadId`; fails cleanly when
+    /// unsupported (tree-walker, single-vCPU) or the target isn't runnable.
+    fn on_force_switch(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let target = args
+            .and_then(|a| a.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .map(|tid| (tid - 1).max(0) as usize);
+        let Some(chosen) = session.inspector.force_switch(target) else {
+            return (false, Json::Null, vec![]);
+        };
+        (
+            true,
+            Json::obj(vec![("threadId", Json::i(chosen as i64 + 1))]),
+            vec![],
+        )
     }
 
     /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —

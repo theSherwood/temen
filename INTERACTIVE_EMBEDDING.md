@@ -544,7 +544,19 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    a one-token change. Acceptance: the tape is bit-identical across a replay of the same run;
 >    wake edges match wait/notify semantics on a fixture; contested flags match a hand-computed
 >    oracle.
-> 7. **X3 — scheduler policy + forced switch.** Reframed by verification: the bytecode debug
+> 7. ~~**X3 — scheduler policy + forced switch.**~~ **DONE 2026-07-31** — the **seeded pick**:
+>    `splitmix64(seed ^ turn)` chooses uniformly among the runnable set, a pure function of
+>    `(seed, turn)` so every replay (full or from a checkpoint) reproduces the schedule with zero
+>    captured scheduler state (invariant 7); `None` keeps the lowest-index default bit-identically.
+>    **Forced switches** resolve to concrete `(turn, task)` at record time and are re-applied on
+>    every rebuild (seek *and* rev-trace probes — policy is semantic, unlike the observation-only
+>    sink/trace). Precedence: coroutine pin > forced > stepping thread > policy pick. DAP: `seed`
+>    honored on the threaded bytecode engine (single-vCPU + seed fails closed), `forceSwitch`
+>    request (optional `threadId`, replies with the resolved one). Gated by
+>    `crates/svm-dap/tests/sched_policy.rs`: per-seed determinism + genuine variation vs. the
+>    default, seeded schedule and forced switches surviving `seek` bit-identically (via the
+>    slice-6 tape), fail-closed launches/requests, and cross-session tape reproduction over DAP.
+>    Original spec: Reframed by verification: the bytecode debug
 >    scheduler is **hardwired** — lowest-index pick, one op per turn, no seed or quantum anywhere
 >    (`on_launch` documents "seed/schedule ignored" for the bytecode engine; seeding exists only
 >    on the tree-walker's `attach_scheduled_seeded`, seed `u64`, no quantum there either). Since

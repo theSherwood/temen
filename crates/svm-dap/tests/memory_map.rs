@@ -27,8 +27,18 @@ block 0 () {
 
 fn run_map_twice(mem_limit: Option<u64>) -> (i64, BytecodeBackend) {
     let m = parse_module(MAP_TWICE).expect("parses");
-    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, true, Vec::new(), false, mem_limit)
-        .expect("subset");
+    let mut b = BytecodeBackend::new(
+        m,
+        0,
+        &[],
+        u64::MAX,
+        true,
+        Vec::new(),
+        false,
+        mem_limit,
+        None,
+    )
+    .expect("subset");
     let stop = Debuggee::run_until_stop(&mut b);
     let Stop::Finished(Ok(vals)) = stop else {
         panic!("the map guest should finish cleanly: {stop:?}");
@@ -72,8 +82,18 @@ block 0 () {
 }
 "#;
     let m = parse_module(SRC).expect("parses");
-    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, true, Vec::new(), false, Some(65536))
-        .expect("subset");
+    let mut b = BytecodeBackend::new(
+        m,
+        0,
+        &[],
+        u64::MAX,
+        true,
+        Vec::new(),
+        false,
+        Some(65536),
+        None,
+    )
+    .expect("subset");
     let Stop::Finished(Ok(vals)) = Debuggee::run_until_stop(&mut b) else {
         panic!("finishes");
     };

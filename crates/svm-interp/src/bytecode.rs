@@ -5317,6 +5317,15 @@ pub struct ScheduledDebugRun {
     /// [`set_sched_trace`](ScheduledDebugRun::set_sched_trace); `None` (the default) is zero-cost.
     /// Re-armed by the DAP backend on `seek` rebuilds (the replay refills it deterministically).
     sched_trace: Option<Vec<SchedTraceEvent>>,
+    /// The **seeded pick** (slice 7): `Some(seed)` chooses uniformly among the runnable set via
+    /// `splitmix64(seed ^ turn)` — an adversarial-variation knob whose choice is a pure function
+    /// of `(seed, turn)`, so replay reproduces it with no captured scheduler state. `None` (the
+    /// default) keeps the original lowest-index pick.
+    sched_seed: Option<u64>,
+    /// Recorded **forced switches** (slice 7): concrete `(turn, task)` overrides, resolved at
+    /// record time and re-applied by the DAP backend on rebuilds — so a `seek` replays them at the
+    /// identical turns. Empty (the default) is zero-cost.
+    forced: Vec<(u64, usize)>,
     /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
     /// taken by the backend to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -5876,6 +5885,26 @@ fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32)
     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
 }
 
+/// SplitMix64 — the stateless mix behind the **seeded pick** (slice 7): the choice at a turn is a
+/// pure function of `(seed, turn)`, so any replay — full or from a checkpoint — reproduces the
+/// schedule with zero captured scheduler state (INVARIANTS.md #7: recovery never replays captured
+/// scheduler records).
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The forced-switch override recorded for `turn`, if any (slice 7). Entries are concrete
+/// `(turn, task)` pairs resolved at record time, so a replay re-applies the identical choice.
+fn forced_at(forced: &[(u64, usize)], turn: u64) -> Option<usize> {
+    forced
+        .iter()
+        .find(|(t, _)| *t == turn)
+        .map(|(_, task)| *task)
+}
+
 /// The task **pinned** to the scheduler because it is mid-`resume` inside a §14 coroutine body
 /// (`active_coro` set). A coroutine `resume` is atomic w.r.t. other vCPUs, so while its body is being
 /// stepped op-by-op the scheduler must keep running that same vCPU — never interleaving another thread —
@@ -5886,16 +5915,38 @@ fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
     tasks.iter().position(|t| t.vt.active_coro.is_some())
 }
 
-/// Pick the next thread to run: the lowest-index runnable one. If none is runnable, advance the futex
-/// `clock` to the earliest `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`),
-/// then retry. `None` only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`.
-fn dbg_pick_runnable(tasks: &mut [DbgTask], clock: &mut u64) -> Option<usize> {
+/// Pick the next thread to run under the session's **schedule policy** (slice 7): a forced-switch
+/// entry for this `turn` wins (when its task is runnable), then a `seed`ed pick chooses uniformly
+/// among the runnable set via [`splitmix64`]`(seed ^ turn)`, else the lowest-index runnable — the
+/// original deterministic default. If none is runnable, advance the futex `clock` to the earliest
+/// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
+/// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
+/// pure function of `(seed, forced, turn, task states)`, so replay reproduces it exactly.
+fn dbg_pick_runnable(
+    tasks: &mut [DbgTask],
+    clock: &mut u64,
+    seed: Option<u64>,
+    forced: &[(u64, usize)],
+    turn: u64,
+) -> Option<usize> {
     loop {
-        if let Some(i) = tasks
+        // A forced switch recorded for this turn wins while its task is runnable.
+        if let Some(f) = forced_at(forced, turn) {
+            if matches!(tasks.get(f).map(|t| &t.state), Some(DbgTaskState::Runnable)) {
+                return Some(f);
+            }
+        }
+        let runnable: Vec<usize> = tasks
             .iter()
-            .position(|t| matches!(t.state, DbgTaskState::Runnable))
-        {
-            return Some(i);
+            .enumerate()
+            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
+            .map(|(i, _)| i)
+            .collect();
+        if !runnable.is_empty() {
+            return Some(match seed {
+                None => runnable[0], // the original lowest-index default
+                Some(s) => runnable[(splitmix64(s ^ turn) % runnable.len() as u64) as usize],
+            });
         }
         let next = tasks
             .iter()
@@ -5967,6 +6018,8 @@ impl ScheduledDebugRun {
             watchpoints: Vec::new(),
             access_sink: None,
             sched_trace: None,
+            sched_seed: None,
+            forced: Vec::new(),
             last_watch: None,
             stopped: None,
             focus: 0,
@@ -6009,6 +6062,27 @@ impl ScheduledDebugRun {
         self.sched_trace.as_deref()
     }
 
+    /// Set (or clear) the **seeded pick** — see [`ScheduledDebugRun::sched_seed`]. Set before
+    /// driving (the DAP backend applies it at construction and on every rebuild).
+    pub fn set_sched_seed(&mut self, seed: Option<u64>) {
+        self.sched_seed = seed;
+    }
+
+    /// Replace the recorded **forced switches** — concrete `(turn, task)` overrides (slice 7).
+    pub fn set_forced_switches(&mut self, forced: Vec<(u64, usize)>) {
+        self.forced = forced;
+    }
+
+    /// The currently-runnable task indices (the forced-switch verb resolves its target from this).
+    pub fn runnable_tasks(&self) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Take the `(addr, write)` of the watchpoint the last stop fired on (cleared by the read), so the
     /// backend can report `StopReason::Watchpoint`. `None` if the last stop was a breakpoint / step.
     pub fn take_watch_hit(&mut self) -> Option<(u64, bool)> {
@@ -6043,6 +6117,8 @@ impl ScheduledDebugRun {
             watchpoints,
             access_sink,
             sched_trace,
+            sched_seed,
+            forced,
             last_watch,
             fn_block_base,
             stopped,
@@ -6061,12 +6137,21 @@ impl ScheduledDebugRun {
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
             // stuck; unblocks a stepped `join`/`wait`).
             let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
+            // Precedence: the coroutine pin (an atomicity constraint) > a forced switch recorded
+            // for this turn (explicit user intent) > the stepping thread > the policy pick.
             let ti = if let Some(p) = dbg_pinned_coro(tasks) {
                 p
+            } else if let Some(f) = forced_at(forced, *turn).filter(|f| {
+                matches!(
+                    tasks.get(*f).map(|t| &t.state),
+                    Some(DbgTaskState::Runnable)
+                )
+            }) {
+                f
             } else {
                 match step {
                     Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
-                    _ => match dbg_pick_runnable(tasks, clock) {
+                    _ => match dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn) {
                         Some(i) => i,
                         None => return SchedStop::Blocked,
                     },
@@ -6320,12 +6405,17 @@ impl ScheduledDebugRun {
             fn_block_base,
             access_sink,
             sched_trace,
+            sched_seed,
+            forced,
             ..
         } = self;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
-        // pin on replay reconstructs the coroutine's op sequence deterministically.
+        // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
+        // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
         let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
-        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| dbg_pick_runnable(tasks, clock)) else {
+        let Some(ti) = dbg_pinned_coro(tasks)
+            .or_else(|| dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn))
+        else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
         if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
