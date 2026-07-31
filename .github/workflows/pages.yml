@@ -81,6 +81,14 @@ jobs:
         working-directory: browser
         run: node build-onramp-assets.mjs
 
+      # The chibicc self-host closure image (chibicc_selfhost.img) — chibicc's own cc1 TU sources + the
+      # glibc header closure chibicc.h pulls, seeded so the "chibicc compiles its own source" card can
+      # run chibicc.svmb --emit-object over them in-browser. Builds a native chibicc for `-M` closure
+      # discovery. Fail-soft (MAY_BE_ABSENT): a build hiccup degrades the card to a build hint, no 404.
+      - name: build self-host closure image
+        working-directory: browser
+        run: node build-selfhost-assets.mjs || echo "self-host image skipped"
+
       # PostgreSQL playground artifacts — regenerated from source so they never drift from the code.
       # The two CODE-INDEPENDENT inputs (whole-program bitcode + initdb'd cluster) are cached, keyed on
       # the Postgres version + the shim/build-script sources; the CODE-COUPLED outputs
