@@ -6,7 +6,8 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -16,6 +17,10 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_eval.svmb'));
 const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.svmb'));
+// The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
+// check additionally needs the native `chibicc` (built by that same script) as the reference oracle.
+const selfhostBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc_selfhost.img'));
+const nativeChibicc = join(HERE, '..', 'frontend', 'chibicc', 'chibicc');
 
 const chromium = (await import('playwright')).chromium;
 const { server, port } = await startServer(process.cwd());
@@ -196,6 +201,75 @@ try {
       : fail(`chibicc memstream: ${JSON.stringify({ state: ms.state, out: ms.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
+  }
+
+  // The self-host capstone card (SELFHOST_C.md §7 step 5): chibicc.svmb compiles chibicc's *own* cc1
+  // TUs to linkable objects, in-browser, on the wasm-JIT. Pins: (1) it runs and emits a real object;
+  // (2) the object is byte-identical to a native `chibicc --emit-object` (the fixpoint, over the real
+  // glibc header closure seeded from the committed image); (3) the interpreter and JIT tiers agree.
+  if (selfhostBuilt) {
+    const shName = 'chibicc compiles its own source (self-host → SVM)';
+    // Pick a substantial TU (tokenize.c, ~800 lines) via the card's translation-unit dropdown.
+    const tuRel = 'frontend/chibicc/tokenize.c';
+    await page.evaluate(([sel, tu]) => {
+      const s = document.querySelector(`${sel} select`);
+      s.value = tu;
+      s.dispatchEvent(new Event('change'));
+    }, [card(shName), tuRel]);
+    await runCard(page, shName, 60_000);
+    const sh = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+      result: document.querySelector(`${sel} .result`).textContent,
+      pane: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(shName));
+    // The pane is a one-line header (`──── chibicc compiled its own tokenize.c → … ────`) then the object.
+    const guestObj = sh.pane.slice(sh.pane.indexOf('\n') + 1);
+    const wellFormed = sh.state === 'done' && guestObj.includes('func') && guestObj.includes('export')
+      && sh.msg.includes('wasm-JIT');
+    wellFormed
+      ? ok('self-host: chibicc compiled its own tokenize.c → linkable SVM-IR object in-browser (wasm-JIT)')
+      : fail(`self-host run: ${JSON.stringify({ state: sh.state, msg: sh.msg, pane: sh.pane.slice(0, 80) })}`);
+
+    // Byte-identity to native chibicc — the fixpoint, enforced. The native binary is the reference
+    // oracle (built by build-selfhost-assets.mjs); same relative flags as `chibicc_selfhost_argv`
+    // (no --data-page — the object is canonical). Skipped if the native binary isn't present.
+    if (wellFormed && existsSync(nativeChibicc)) {
+      const REPO = join(HERE, '..');
+      const prelude = 'crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h';
+      const refOut = join(REPO, 'target', 'selfhost_playtest_tokenize.svm');
+      try {
+        execFileSync(nativeChibicc, [
+          '-cc1', '-include', prelude, '-Ifrontend/chibicc', '-Ifrontend/chibicc/include',
+          '-I/usr/include/x86_64-linux-gnu', '-I/usr/include', '--emit-object',
+          '-cc1-input', tuRel, '-cc1-output', refOut, tuRel,
+        ], { cwd: REPO });
+        const nativeObj = readFileSync(refOut, 'utf8');
+        guestObj === nativeObj
+          ? ok(`self-host: in-browser object byte-identical to native chibicc (${nativeObj.length} B)`)
+          : fail(`self-host byte-identity: guest ${guestObj.length} B vs native ${nativeObj.length} B differ`);
+      } catch (e) {
+        console.log(`  SKIP: self-host byte-identity (native chibicc reference failed: ${e.message})`);
+      }
+    } else if (wellFormed) {
+      console.log('  SKIP: self-host byte-identity (native frontend/chibicc/chibicc not built)');
+    }
+
+    // "Prove interp ≡ JIT": recompile the same TU on both engines and assert the objects are identical.
+    await page.click(`${card(shName)} button.prove`);
+    await page.waitForFunction(
+      (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+      `${card(shName)} .state`, { timeout: 90_000 },
+    );
+    const shp = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+    }), card(shName));
+    shp.state === 'done' && shp.msg.includes('byte-identical')
+      ? ok('self-host interpreter ≡ wasm-JIT — byte-identical object (in-browser)')
+      : fail(`self-host parity: ${JSON.stringify(shp)}`);
+  } else {
+    console.log('  SKIP: chibicc self-host (chibicc_selfhost.img not built — run build-selfhost-assets.mjs)');
   }
 
   // The SQL card mounted a SQL-mode editor.

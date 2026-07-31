@@ -48,6 +48,7 @@ const BUILT_AT_DEPLOY = new Set([
   'tcl_init.svmb',        // build-onramp-assets.mjs (fetches Tcl + openlibm; full Tcl_Init)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
+  'chibicc_selfhost.img', // build-selfhost-assets.mjs (chibicc's own TU sources + their glibc header closure)
 ]);
 
 // The subset of deploy-built assets allowed to be absent even in the assembled site. Only doom.svmb:
@@ -58,6 +59,7 @@ const BUILT_AT_DEPLOY = new Set([
 const MAY_BE_ABSENT = new Set([
   'doom.svmb',
   'tcl_init.svmb', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link
+  'chibicc_selfhost.img', // build-selfhost-assets.mjs needs a native chibicc + the glibc header tree
 ]);
 
 function referencedAssets() {

@@ -568,6 +568,29 @@ compiler bug is a clean error, never an escape.
    same opt-in `SVM_SELFHOST_GIANTS=1` nightly lane (it guest-compiles all nine, incl. the giants). With
    this, the fixpoint is closed both ways — per-TU byte-identity **and** the linked-module equality it
    implies.
+
+   **→ In the browser 2026-07-31 — the self-host card, slice 1 (tractable TUs).** The self-host reached
+   the **playground**: a new card, *"chibicc compiles its own source (self-host → SVM)"*
+   (`browser/web/play.js`, `kind: 'selfhost'`), runs the shipped `chibicc.svmb` in `--emit-object` mode
+   over chibicc's *own* cc1 TUs, **client-side on the wasm-JIT**, emitting each TU's linkable object. Pick
+   a TU from the dropdown → the page seeds a committed **closure image** (`chibicc_selfhost.img`: the TU
+   sources + the ~96-file glibc header closure `chibicc.h` pulls + `selfhost_prelude.h`, built by
+   `browser/build-selfhost-assets.mjs` via `chibicc -M`) on an `fs` cap and runs
+   `svm_selfhost_jit_emit_object_fs` (a 128 MiB window — `codegen_ir.c`'s ~1.2 MB output overruns the
+   single-file card's 32 MiB and traps `unreachable` mid-emit; measured) with a bytecode fallback. The
+   emitted object is **byte-identical to native `chibicc --emit-object`**, gated in real Chromium
+   (`browser-play-editor-test.mjs`: compiles `tokenize.c` in-browser, diffs the object against the native
+   binary, and the card's "Prove interp ≡ JIT" shows both tiers byte-identical), plus a native
+   `browser/tests/chibicc_selfhost_asset.rs` over all five tractable TUs.
+   - *Surfaced + fixed a real stale-asset regression:* `--emit-object` (added to `cc1_main.c` in the
+     emit-object work) was **never compiled into the shipped `chibicc.svmb`** — the committed asset
+     predated it in content, so `chibicc.svmb --emit-object` broke (the flag fell through to `base_file`).
+     The card would have been dead on arrival; rebuilding the asset (`build_chibicc_svmb.sh`, now 335
+     funcs) fixed it, and the two gates keep it from drifting again.
+   - **Slice 1 scope:** the five tractable TUs (`strings`/`hashmap`/`unicode`/`type`/`tokenize`), each
+     compiling in a few hundred ms on the wasm-JIT. Residual for slice 2: the three giants
+     (`preprocess`/`parse`/`codegen_ir` — the 128 MiB window already handles them, measured) and the
+     N-way **link → run chibicc2** capstone (the browser link FFI over the emitted objects + `emit_libc`).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
