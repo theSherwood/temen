@@ -311,6 +311,19 @@ is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
   also use **semaphores and barriers** (`sem_*`, `pthread_barrier_*`). These need guest-libc
   equivalents over SVM's threading primitives (a frontend/libc item, not an engine one).
 
+### Cost model (2026-07-30, as-built): everything is opt-in
+
+Every landed X-slice is armed explicitly and pays nothing un-armed (invariant 9b). Concretely:
+the access sink, the memory models, and the scheduler trace tape live on the **debug engines
+only** (`DebugRun`/`ScheduledDebugRun` — the production run loops, the tree-walker's undebugged
+path, and both fast backends are untouched), each gated by an `Option` that defaults `None`; the
+bulk-op watchpoint decode runs only when watchpoints are armed (the pre-existing emptiness
+gates); the run-mode profiler is a separate entry that instruments its own module copy. The one
+addition on a shared production path is the Memory-cap growth limit: **one `Option::is_some`
+branch per `vm_map`/`vm_unmap` capability call** (allocator-growth frequency, not per memory
+access; accounting only runs with a limit set) plus two words on `Host`. No per-op, per-access,
+or per-turn cost exists anywhere for a domain that opts into nothing.
+
 ### Closure sketch (2026-07-30) — mechanisms that stay SVM-shaped
 
 How each X-item closes without new engine surface, without consumer coupling, and with models kept
@@ -428,7 +441,15 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    pump matches `Arr` and flat-maps `handle` per element; `web/dap.js` already parses the reply
 >    as an array and filters by `type`, so the JS client needs no change. Acceptance: a step + N
 >    state reads in one FFI crossing; existing DAP tests pass untouched.
-> 3. **Debug-session access sink** — the hinge for X2/X4/X1-shared-state. Generalize the per-op
+> 3. ~~**Debug-session access sink**~~ **DONE 2026-07-30** — as specced: `MemEvent` moved to
+>    `svm-interp` (re-exported by `svm-run`), `mem_event_of` raw-address decode, sinks on both
+>    debug engines fired from every advance path (seek replay included), backend `SharedSink`
+>    re-installed on rebuilds (rev-trace probes silent), and the **bulk-op watchpoint blind spot
+>    fixed on both engines** via the shared `watch_accesses` decode (v128 included; `access_of` /
+>    DPOR untouched). Gated by `crates/svm/tests/access_sink_diff.rs`: sink stream ≡ the
+>    `mem_hooks_diff.rs` hook stream, dst-write + src-read `mem.copy` watchpoints stop both
+>    engines identically, and the sink is inert (result + op-clock bit-identical). Original spec:
+>    the hinge for X2/X4/X1-shared-state. Generalize the per-op
 >    access decode behind `watch_hit_before` into an optional sink on
 >    `DebugRun`/`ScheduledDebugRun`, attributed with the executing vCPU; zero cost when absent, no
 >    module rewrite, op-clock unchanged. Scope note (2026-07-30, verified): the shared decode is
@@ -449,7 +470,18 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    stream** on the same program (uninstrumented vs. instrumented) across the full `MemEvent`
 >    vocabulary; a bulk-op watchpoint fires at the same clock on both engines; all debug parity
 >    tests pass with a sink installed.
-> 4. **X2 + X4's fault counter — cache/coherence + paging models, host-side in the cdylib.** A
+> 4. ~~**X2 + X4's fault counter**~~ **DONE 2026-07-30** — `svm-dap::models::MemModel`: per-vCPU
+>    L1s + shared L2 with MESI line states and LRU, first-touch fault counter, `memModel` launch
+>    arg + `memModelStats` request (counters + line-state grids JSON), armed through a `Debuggee`
+>    capability probe (tree-walker fails closed). Seek consistency by a **model-side snapshot
+>    ladder at the engine's stride** (no new engine seam needed — the `checkpoint_clocks()` idea
+>    was dropped as unnecessary): `seek(t)` model state ≡ a from-0 run to `t`, pinned through the
+>    real checkpoint ladder. The **W3 browser export** landed as `svm_mem_profile` (+ stats
+>    readback): the cdylib adds wasm-clean `svm-opt`, instruments locally (manifest-carrying
+>    modules refused, the svm-run slot-0 rule), and feeds the same model — with the **two feeds
+>    pinned equal** (`browser/tests/mem_profile.rs`: hook-fed ≡ sink-fed stats-for-stats;
+>    `crates/svm-dap/tests/mem_model.rs`: ordering, faults, seek consistency, DAP flow). Original
+>    spec: A
 >    configurable cache model (levels/sets/ways/line size; per-vCPU L1s + shared L2 via the
 >    attribution) with counters + a line-state JSON dump, and a first-touch shadow-set fault
 >    counter. Fed by the slice-3 sink under debug and by the W3 pass in run mode — this slice
@@ -468,9 +500,16 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    model can drop to rebuild-from-0 with the engine. Acceptance: strided-vs-sequential miss
 >    ordering; browser counters ≡ native on the same stream; `seek(t)` model state ≡ a from-0 run
 >    to `t`, including after checkpointing self-disables.
-> 5. **X4's real-state half + W6 memory-map.** The window memory-map JSON (data segments, heap
->    extent, data-stack region, cap-mapped regions) and a **Memory-capability growth cap** so
->    guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
+> 5. ~~**X4's real-state half + W6 memory-map.**~~ **DONE 2026-07-30** — `Mem::map_info` (one
+>    read-only accessor: page size, mapped/reserved, explicit-state pages) → the `memoryMap` DAP
+>    request (geometry + segments + grown-tail pages + powerbox stack/heap regions; tree-walker
+>    fails closed), and the growth cap as **Host policy at the Memory-cap dispatch**
+>    (`set_mem_map_limit` / `memoryLimit` launch arg): a `vm_map` past the limit returns
+>    `-ENOMEM` probeably (invariant 5 — guest `malloc` observes NULL), `vm_unmap` returns bytes
+>    to the budget, and the accounting rides `HostReplaySubstate` so checkpoint restores keep it.
+>    Gated by `crates/svm-dap/tests/memory_map.rs`. Original spec: the window memory-map JSON
+>    (data segments, heap extent, data-stack region, cap-mapped regions) and a
+>    **Memory-capability growth cap** so guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
 >    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
 >    mapped/reserved) + the `svm-ir` powerbox layout constants (args/stack), with the **heap
 >    cursor read from guest memory** — `POWERBOX_HEAP_BRK`/`_TOP` are window words at offsets
@@ -483,7 +522,17 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    codec (`DurableBinding::Memory`, both directions). Acceptance: JSON matches module +
 >    Memory-cap state across a run; a capped guest observes NULL where the uncapped one grows;
 >    durable freeze/thaw preserves the cap.
-> 6. **X1 — scheduler trace seam + shared-state consumer.** An optional, zero-cost-when-off event
+> 6. ~~**X1 — scheduler trace seam + shared-state consumer.**~~ **DONE 2026-07-30** —
+>    `SchedTraceEvent` tape on `ScheduledDebugRun` (turns, `parkJoin`/`parkWait`,
+>    `wakeNotify`/`wakeJoin` with **both identities**, `wakeTimeout`, `spawn`), derived by
+>    **state-diffing at the two driver sites** — zero helper churn, armed-only cost, the host
+>    records and never chooses differently (invariant 4). `schedTrace` launch arg + request
+>    (threaded bytecode only, fail-closed elsewhere), re-armed on seek rebuilds (the replay
+>    refills the tape deterministically — pinned bit-identical). The shared-state consumer rides
+>    `MemModel` (per-word last-writer + contested over the attributed sink, in `memModelStats`).
+>    Gated by `crates/svm-dap/tests/sched_trace.rs` — including the honest negative: a fixture
+>    whose wait falls through `WAIT_NOT_EQUAL` shows *no* park edge. Original spec: an optional,
+>    zero-cost-when-off event
 >    tape on the cooperative debug scheduler (turn start/end, park/wake with reason, waker→wakee
 >    edge) with batch readback; the shared-state consumer (last-writer / contested per range) over
 >    the attributed sink. Integration (verified): every decision point sits in

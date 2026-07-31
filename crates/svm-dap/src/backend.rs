@@ -26,8 +26,12 @@
 //! (server level).
 
 use svm_interp::bytecode::{
-    self, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledSnapshot,
+    self, AccessSinkFn, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
+    ScheduledSnapshot,
 };
+use svm_interp::MemEvent;
+
+use crate::json::Json;
 use svm_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
     StreamRole, Trap, Value, VarValue, WatchId, WatchKind,
@@ -102,6 +106,7 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
 /// `powerbox` (recording cap inputs, and replaying `tape` from a prior forward run so a reverse-`seek`
 /// rebuild re-executes with identical clock/stdin inputs), else deny-all (`DebugRun::new`). `None` if the
 /// module is outside the engine's subset.
+#[allow(clippy::too_many_arguments)]
 fn build_single_run(
     module: &Module,
     func: FuncIdx,
@@ -109,6 +114,7 @@ fn build_single_run(
     powerbox: bool,
     stdin: &[u8],
     block_stdin: bool,
+    mem_limit: Option<u64>,
     tape: &CapTape,
 ) -> Option<DebugRun> {
     if !powerbox {
@@ -116,6 +122,9 @@ fn build_single_run(
     }
     let mut host = Host::new();
     grant_io_powerbox(&mut host, module, stdin);
+    // Slice 5: the Memory-capability growth cap — a `vm_map` past the limit returns -ENOMEM, so a
+    // guest malloc observes NULL (the OOM-teaching knob). Re-armed on every seek rebuild.
+    host.set_mem_map_limit(mem_limit);
     // W4 blocking stdin: a `read` on an exhausted buffer parks the run (`StopReason::StdinPark`)
     // instead of returning EOF; `provideStdin` appends bytes and a resume re-issues the read.
     // Re-armed on every `seek` rebuild so a read past the replay frontier parks again.
@@ -180,6 +189,36 @@ pub trait Debuggee {
     /// the next resume re-issues the read against them. `false` when this backend/session has no
     /// blocking stdin (the `provideStdin` request fails cleanly). Default: unsupported.
     fn provide_stdin(&mut self, _bytes: &[u8]) -> bool {
+        false
+    }
+
+    // --- memory map (slice 5) --------------------------------------------------------------------
+    /// The window's memory-map introspection as JSON (geometry, data segments, explicit-state
+    /// pages, powerbox stack/heap regions). `None` when this backend doesn't expose it (the
+    /// tree-walker) or the module has no memory — the `memoryMap` request fails cleanly.
+    fn memory_map(&self) -> Option<Json> {
+        None
+    }
+
+    // --- scheduler trace (slice 6) ---------------------------------------------------------------
+    /// Arm the scheduler trace tape ([`bytecode::SchedTraceEvent`]) — turns, parks, wakes with
+    /// both identities, spawns. `false` when this backend/session has no schedule to trace (the
+    /// tree-walker, a single-vCPU session): a `schedTrace` launch fails cleanly. Default:
+    /// unsupported.
+    fn set_sched_trace(&mut self, _on: bool) -> bool {
+        false
+    }
+    /// The trace tape so far as a JSON array (`None` when unarmed/unsupported).
+    fn sched_trace_json(&self) -> Option<Json> {
+        None
+    }
+
+    // --- access sink / models --------------------------------------------------------------------
+    /// Install the session's access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3): every
+    /// module-0 memory op reaches it, `seek` replays included. `false` when this backend has no
+    /// sink (the tree-walker) — a `memModel` launch fails cleanly instead of silently observing
+    /// nothing. Default: unsupported.
+    fn set_access_sink(&mut self, _sink: SharedSink) -> bool {
         false
     }
 
@@ -314,6 +353,12 @@ pub struct BytecodeBackend {
     /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Single-vCPU
     /// powerbox sessions only — `new` declines a threaded module with this set (fail-closed).
     block_stdin: bool,
+    /// Slice 5: the session's Memory-capability growth cap ([`Host::set_mem_map_limit`]) — set on
+    /// the powerbox at build and on every seek rebuild. `None` = unbounded.
+    mem_limit: Option<u64>,
+    /// Slice 6: whether the scheduler trace tape is armed (threaded engine only) — re-armed on
+    /// every seek rebuild so the replay refills the tape deterministically.
+    sched_trace: bool,
     /// The recorded [`CapTape`] of nondeterministic cap **inputs** (clock / stdin `read` / host-fn) from
     /// the furthest-forward execution — replayed on a reverse `seek` rebuild so re-execution sees
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
@@ -338,12 +383,33 @@ pub struct BytecodeBackend {
     /// state), after which `seek` reverts to replay-from-0 for the rest of the session — mirroring
     /// `Inspector::maybe_checkpoint`.
     checkpointing: bool,
+    /// The session's shared access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3), re-installed
+    /// into the live engine on every `seek` rebuild (the `watch_specs` pattern) — so a model fed by
+    /// it observes the replay too and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
+    /// The rev-trace probes stay silent (they build raw runs, no sink). `None` = no consumer.
+    access_sink: Option<SharedSink>,
+}
+
+/// A shared, re-installable access-sink consumer: `(clock-or-turn, task, event)`. `Arc<Mutex<…>>`
+/// so the backend can hand a fresh boxed wrapper to every rebuilt run while one consumer (a
+/// host-side model) accumulates.
+pub type SharedSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(u64, usize, MemEvent) + Send>>;
+
+/// Wrap the shared consumer as the engine's boxed sink ([`AccessSinkFn`]).
+fn wrap_sink(sink: &SharedSink) -> AccessSinkFn {
+    let s = std::sync::Arc::clone(sink);
+    Box::new(move |clock, task, ev| {
+        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+        (*g)(clock, task, ev)
+    })
 }
 
 /// The op-clock stride between time-travel checkpoints (DEBUGGING.md W1). Matches the tree-walker
 /// `Inspector`'s `SEEK_CHECKPOINT_STRIDE`, so a reverse `seek`/`step_back` replays at most this many
-/// ops past the nearest snapshot instead of O(t) from clock 0.
-const CHECKPOINT_STRIDE: u64 = 1024;
+/// ops past the nearest snapshot instead of O(t) from clock 0. `pub(crate)`: the host-side models
+/// (`models.rs`) snapshot their own state at the same boundaries, so any clock the engine can
+/// restore to has a matching model snapshot (their seek-consistency hinges on the strides agreeing).
+pub(crate) const CHECKPOINT_STRIDE: u64 = 1024;
 
 impl BytecodeBackend {
     /// Open a bytecode debug session on `module`'s `func(args)`. A `thread.spawn` guest gets the
@@ -351,6 +417,7 @@ impl BytecodeBackend {
     /// is outside the bytecode engine's subset (`compile_module` declines it). `powerbox` runs a
     /// spawn-free guest under the on-ramp I/O powerbox (`stdin` preloads `read`); a threaded guest ignores
     /// it (deny-all).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         module: Module,
         func: FuncIdx,
@@ -359,6 +426,7 @@ impl BytecodeBackend {
         powerbox: bool,
         stdin: Vec<u8>,
         block_stdin: bool,
+        mem_limit: Option<u64>,
     ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let engine = if bytecode::module_spawns_threads(&module) {
@@ -376,6 +444,7 @@ impl BytecodeBackend {
                 powerbox,
                 &stdin,
                 block_stdin,
+                mem_limit,
                 &tape,
             )?))
         };
@@ -391,12 +460,27 @@ impl BytecodeBackend {
             powerbox,
             stdin,
             block_stdin,
+            mem_limit,
             tape,
             rev_trace: None,
             checkpoints: Vec::new(),
             sched_checkpoints: Vec::new(),
             checkpointing: true,
+            access_sink: None,
+            sched_trace: false,
         })
+    }
+
+    /// Install the session's **access-sink consumer** (INTERACTIVE_EMBEDDING.md slice 3): every
+    /// module-0 memory op the session executes — including `seek`-replay re-execution — reaches
+    /// `sink` as `(clock-or-turn, task, MemEvent)`. Re-installed transparently across `seek`
+    /// rebuilds; the rev-trace probes never fire it.
+    pub fn set_access_sink(&mut self, sink: SharedSink) {
+        match &mut self.engine {
+            Engine::Single(run) => run.set_access_sink(wrap_sink(&sink)),
+            Engine::Threaded(run) => run.set_access_sink(wrap_sink(&sink)),
+        }
+        self.access_sink = Some(sink);
     }
 
     /// Number of time-travel checkpoints currently in the ladder (single-vCPU or scheduled — only one
@@ -418,6 +502,7 @@ impl BytecodeBackend {
             self.powerbox,
             &self.stdin,
             self.block_stdin,
+            self.mem_limit,
             &self.tape,
         )
     }
@@ -786,6 +871,15 @@ impl Debuggee for BytecodeBackend {
                     .map(|(_, a, l, k)| (*a, *l, *k))
                     .collect(),
             );
+            // Re-install the access sink *before* the replay drive, so a model consumer observes
+            // the re-execution and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
+            if let Some(sink) = &self.access_sink {
+                run.set_access_sink(wrap_sink(sink));
+            }
+            // Re-arm the trace tape: the replay refills it deterministically from the restore point.
+            if self.sched_trace {
+                run.set_sched_trace(true);
+            }
             // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
             // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
             if self.checkpointing {
@@ -806,6 +900,10 @@ impl Debuggee for BytecodeBackend {
         let Some(mut run) = self.fresh_single() else {
             return Stop::Blocked;
         };
+        // Re-install the access sink *before* the replay drive (see the threaded path above).
+        if let Some(sink) = &self.access_sink {
+            run.set_access_sink(wrap_sink(sink));
+        }
         // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
         // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
         if self.checkpointing {
@@ -940,6 +1038,156 @@ impl Debuggee for BytecodeBackend {
         true
     }
     fn supports_watch(&self) -> bool {
+        true
+    }
+    /// The memory-map JSON: window geometry + explicit-state pages from the engine
+    /// ([`Mem::map_info`]), data-segment placements from the module, the powerbox stack layout
+    /// constants, and — under the powerbox — the guest heap cursor (window words at
+    /// `POWERBOX_HEAP_BRK`/`_TOP`; the heap base is the mapped end, §1a growth into the tail).
+    fn memory_map(&self) -> Option<Json> {
+        let (page, mapped, reserved, pages) = match &self.engine {
+            Engine::Single(run) => run.mem_map_info(),
+            Engine::Threaded(run) => run.mem_map_info(),
+        }?;
+        let kinds = ["ro", "rw", "unmapped", "region"];
+        let mut fields = vec![
+            ("pageSize", Json::i(page as i64)),
+            ("mapped", Json::i(mapped as i64)),
+            ("reserved", Json::i(reserved as i64)),
+            (
+                "segments",
+                Json::Arr(
+                    self.module
+                        .data
+                        .iter()
+                        .map(|d| {
+                            Json::obj(vec![
+                                ("offset", Json::i(d.offset as i64)),
+                                ("len", Json::i(d.bytes.len() as i64)),
+                                ("readonly", Json::Bool(d.readonly)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "pages",
+                Json::Arr(
+                    pages
+                        .iter()
+                        .map(|(base, k)| {
+                            Json::obj(vec![
+                                ("base", Json::i(*base as i64)),
+                                (
+                                    "kind",
+                                    Json::s(kinds.get(*k as usize).copied().unwrap_or("?")),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "stack",
+                Json::obj(vec![
+                    ("argsBase", Json::i(svm_ir::POWERBOX_ARGS_BASE as i64)),
+                    ("argsEnd", Json::i(svm_ir::POWERBOX_ARGS_END as i64)),
+                    ("stackPage", Json::i(svm_ir::POWERBOX_STACK_PAGE as i64)),
+                    (
+                        "stackReserve",
+                        Json::i(svm_ir::POWERBOX_STACK_RESERVE as i64),
+                    ),
+                ]),
+            ),
+        ];
+        if self.powerbox {
+            let word = |off: u64| -> Option<i64> {
+                let b = self.read_window(off, 8).ok()?;
+                Some(i64::from_le_bytes(b.try_into().ok()?))
+            };
+            if let (Some(brk), Some(top)) = (
+                word(svm_ir::POWERBOX_HEAP_BRK),
+                word(svm_ir::POWERBOX_HEAP_TOP),
+            ) {
+                fields.push((
+                    "heap",
+                    Json::obj(vec![
+                        ("base", Json::i(mapped as i64)),
+                        ("brk", Json::i(brk)),
+                        ("top", Json::i(top)),
+                    ]),
+                ));
+            }
+        }
+        Some(Json::obj(fields))
+    }
+    /// The trace tape is a threaded-engine feature (a single vCPU has no schedule).
+    fn set_sched_trace(&mut self, on: bool) -> bool {
+        match &mut self.engine {
+            Engine::Threaded(run) => {
+                run.set_sched_trace(on);
+                self.sched_trace = on;
+                true
+            }
+            Engine::Single(_) => false,
+        }
+    }
+    fn sched_trace_json(&self) -> Option<Json> {
+        let Engine::Threaded(run) = &self.engine else {
+            return None;
+        };
+        let tape = run.sched_trace()?;
+        use bytecode::SchedTraceEvent as E;
+        Some(Json::Arr(
+            tape.iter()
+                .map(|e| match e {
+                    E::Turn { turn, task } => Json::obj(vec![
+                        ("kind", Json::s("turn")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                    E::ParkJoin { turn, task, child } => Json::obj(vec![
+                        ("kind", Json::s("parkJoin")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                        ("child", Json::i(*child as i64)),
+                    ]),
+                    E::ParkWait { turn, task, key } => Json::obj(vec![
+                        ("kind", Json::s("parkWait")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                        ("key", Json::i(*key as i64)),
+                    ]),
+                    E::WakeNotify { turn, waker, wakee } => Json::obj(vec![
+                        ("kind", Json::s("wakeNotify")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("waker", Json::i(*waker as i64)),
+                        ("wakee", Json::i(*wakee as i64)),
+                    ]),
+                    E::WakeJoin { turn, waker, wakee } => Json::obj(vec![
+                        ("kind", Json::s("wakeJoin")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("waker", Json::i(*waker as i64)),
+                        ("wakee", Json::i(*wakee as i64)),
+                    ]),
+                    E::WakeTimeout { turn, task } => Json::obj(vec![
+                        ("kind", Json::s("wakeTimeout")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                    E::Spawn { turn, parent, task } => Json::obj(vec![
+                        ("kind", Json::s("spawn")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("parent", Json::i(*parent as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                })
+                .collect(),
+        ))
+    }
+    /// The engine-level sink installer (both bytecode engines support it).
+    fn set_access_sink(&mut self, sink: SharedSink) -> bool {
+        BytecodeBackend::set_access_sink(self, sink);
         true
     }
     /// W4 blocking stdin: append the provided bytes to the parked single-vCPU run's stdin — the

@@ -13,6 +13,7 @@
 //! client connects to.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
 use svm_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, VarLoc};
@@ -20,7 +21,8 @@ use svm_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, Var
 mod backend;
 mod expr;
 mod json;
-pub use backend::{BytecodeBackend, Debuggee};
+pub mod models;
+pub use backend::{BytecodeBackend, Debuggee, SharedSink};
 pub use json::{parse, Json};
 
 /// The DAP server: protocol state + (after `launch`) a debug [`Session`]. Drive it by feeding parsed
@@ -41,6 +43,10 @@ pub struct DapServer {
 /// subset, the engine the browser playground runs), chosen by the launch `engine` argument.
 struct Session {
     inspector: Box<dyn Debuggee>,
+    /// The session's memory model (INTERACTIVE_EMBEDDING.md slice 4), fed by the engine's access
+    /// sink when the `launch` arg `memModel` armed one; read back by `memModelStats`. `None` = no
+    /// model, no sink, no cost.
+    mem_model: Option<Arc<Mutex<models::MemModel>>>,
     debug: Option<DebugInfo>,
     /// `(file, line) → first *stoppable* IR pc on that line` — the reverse of `Inspector::source_loc`,
     /// for binding source-line breakpoints. Only non-terminator pcs are indexed (a terminator is never
@@ -192,6 +198,9 @@ impl DapServer {
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
             "provideStdin" => self.on_provide_stdin(args),
+            "memModelStats" => self.on_mem_model_stats(),
+            "memoryMap" => self.on_memory_map(),
+            "schedTrace" => self.on_sched_trace(),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -329,9 +338,27 @@ impl DapServer {
         if block_stdin && (engine != "bytecode" || !powerbox) {
             return (false, Json::Null, vec![]);
         }
+        // `memoryLimit: N` (slice 5): cap the Memory capability's total committed bytes — a
+        // `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching
+        // knob). Needs the powerbox's Memory grant on the bytecode engine; fail-closed elsewhere.
+        let mem_limit = args
+            .get("memoryLimit")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as u64);
+        if mem_limit.is_some() && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
-            match BytecodeBackend::new(module, func, &call_args, fuel, powerbox, stdin, block_stdin)
-            {
+            match BytecodeBackend::new(
+                module,
+                func,
+                &call_args,
+                fuel,
+                powerbox,
+                stdin,
+                block_stdin,
+                mem_limit,
+            ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
                 Some(b) => {
@@ -356,8 +383,66 @@ impl DapServer {
             };
             (Box::new(insp), scheduled)
         };
+        // `memModel` (INTERACTIVE_EMBEDDING.md slice 4): arm a host-side cache/paging model over
+        // the engine's access sink. Geometry keys are optional (teaching-scale defaults). Installed
+        // through the `Debuggee` capability probe, so an engine without a sink (the tree-walker)
+        // fails the launch cleanly instead of silently observing nothing.
+        let mut inspector = inspector;
+        let mem_model = match args.get("memModel") {
+            None => None,
+            Some(mm) => {
+                let d = models::MemModelCfg::default();
+                let cache = |j: Option<&Json>, d: models::CacheCfg| models::CacheCfg {
+                    sets: j
+                        .and_then(|c| c.get("sets"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.sets),
+                    ways: j
+                        .and_then(|c| c.get("ways"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as usize)
+                        .unwrap_or(d.ways),
+                    line: j
+                        .and_then(|c| c.get("line"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.line),
+                };
+                let cfg = models::MemModelCfg {
+                    l1: cache(mm.get("l1"), d.l1),
+                    l2: cache(mm.get("l2"), d.l2),
+                    page_size: mm
+                        .get("pageSize")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.page_size),
+                };
+                let model = Arc::new(Mutex::new(models::MemModel::new(cfg)));
+                let feed = Arc::clone(&model);
+                let sink: SharedSink = Arc::new(Mutex::new(
+                    move |clock: u64, task: usize, ev: svm_interp::MemEvent| {
+                        feed.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe(clock, task, ev)
+                    },
+                ));
+                if !inspector.set_access_sink(sink) {
+                    return (false, Json::Null, vec![]); // fail-closed: no sink on this engine
+                }
+                Some(model)
+            }
+        };
+        // `schedTrace: true` (slice 6): arm the scheduler trace tape — a threaded bytecode
+        // session only; fail-closed elsewhere (a single vCPU has no schedule to trace).
+        if args.get("schedTrace").and_then(|v| v.as_bool()) == Some(true)
+            && !inspector.set_sched_trace(true)
+        {
+            return (false, Json::Null, vec![]);
+        }
         self.session = Some(Session {
             inspector,
+            mem_model,
             debug,
             line_index,
             terminator_only_lines,
@@ -886,6 +971,39 @@ impl DapServer {
         };
         let ok = session.inspector.provide_stdin(data.as_bytes());
         (ok, Json::Null, vec![])
+    }
+
+    /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
+    /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
+    fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(tape) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inspector.sched_trace_json())
+        else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, tape, vec![])
+    }
+
+    /// The custom `memoryMap` request (slice 5): the window's memory-map introspection — geometry,
+    /// data segments, explicit-state pages, the powerbox stack/heap regions — as JSON. Fails
+    /// cleanly when the backend doesn't expose it (tree-walker) or there is no session.
+    fn on_memory_map(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(map) = self.session.as_ref().and_then(|s| s.inspector.memory_map()) else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, map, vec![])
+    }
+
+    /// The custom `memModelStats` request (slice 4): the armed memory model's counters + line-state
+    /// grids, as JSON. Fails cleanly when the session has no model.
+    fn on_mem_model_stats(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(model) = self.session.as_ref().and_then(|s| s.mem_model.as_ref()) else {
+            return (false, Json::Null, vec![]);
+        };
+        let body = model.lock().unwrap_or_else(|e| e.into_inner()).stats_json();
+        (true, body, vec![])
     }
 
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {

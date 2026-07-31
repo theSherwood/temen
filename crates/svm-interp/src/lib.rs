@@ -497,16 +497,18 @@ impl DebugCtx {
         !self.shared().watchpoints.is_empty()
     }
 
-    /// Decide whether to pause *before* the op at `pc`. `access` is the op's memory effect (only
-    /// computed by the caller when watchpoints are armed; [`MemAccess::None`] otherwise); `inst` is
-    /// the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op has not run,
-    /// `clock` unchanged, so the continuation re-enters here); `None` charges one tick of logical
-    /// time and lets the op run. The `resume_clock` guard makes resume step off the current op.
+    /// Decide whether to pause *before* the op at `pc`. `accesses` are the op's memory effects
+    /// ([`watch_accesses`] — two entries so a bulk copy's dst-write and src-read both check; only
+    /// computed by the caller when watchpoints are armed, `[MemAccess::None; 2]` otherwise);
+    /// `inst` is the op itself (for the `cap.call` boundary stop). `Some(reason)` pauses (the op
+    /// has not run, `clock` unchanged, so the continuation re-enters here); `None` charges one
+    /// tick of logical time and lets the op run. The `resume_clock` guard makes resume step off
+    /// the current op.
     fn before_op(
         &mut self,
         pc: IrPc,
         inst: &Inst,
-        access: MemAccess,
+        accesses: [MemAccess; 2],
         depth: usize,
     ) -> Option<StopReason> {
         // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
@@ -528,7 +530,7 @@ impl DebugCtx {
                 None // scheduled-seek fast-forward: run past stops (clock still ticks below)
             } else if sh.breakpoints.contains(&pc) {
                 Some(StopReason::Breakpoint)
-            } else if let Some((addr, write)) = sh.watch_hit(access) {
+            } else if let Some((addr, write)) = accesses.iter().find_map(|a| sh.watch_hit(*a)) {
                 Some(StopReason::Watchpoint { addr, write })
             } else if let Some(r) = sh.cap_stop(inst) {
                 Some(r)
@@ -633,6 +635,9 @@ struct HostReplaySubstate {
     svc_queue: Vec<SvcDispatch>,
     svc_results: Vec<(u64, i64)>,
     svc_next_ticket: u64,
+    /// The Memory-cap growth-cap accounting at the checkpoint (slice 5) — without it, a restore
+    /// would zero the count and the limit would go lenient after a seek.
+    mem_mapped_bytes: u64,
 }
 
 /// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
@@ -2817,6 +2822,136 @@ fn access_of(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> MemAccess {
         Inst::MemoryWait { ty, addr, .. } => range(*addr, 0, atomic_width(*ty), false),
         Inst::MemoryNotify { addr, .. } => range(*addr, 0, 4, true),
         _ => MemAccess::None, // ThreadSpawn / ThreadJoin: ordering via the enabled set, not a race
+    }
+}
+
+/// One guest memory access, reported **before** it executes (pre-confinement, so a faulting run's
+/// final event is the *attempted* faulting access). `addr` is the effective guest address (base +
+/// immediate offset), unmasked. Bulk ops are one event carrying their span operands — `Copy`
+/// covers both `mem.copy` and `mem.move`; consumers expand spans themselves. v128 accesses are
+/// `Load`/`Store` with `width` 16.
+///
+/// The shared access vocabulary of SVM's two observation seams (INTERACTIVE_EMBEDDING.md): the W3
+/// instrumentation pass (`svm-opt`; `svm-run` re-exports this type for its hook API) and the
+/// debug-session **access sink** ([`bytecode::AccessSinkFn`]) — a differential pins the two
+/// streams equal on the same program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemEvent {
+    Load { addr: u64, width: u32 },
+    Store { addr: u64, width: u32 },
+    AtomicLoad { addr: u64, width: u32 },
+    AtomicStore { addr: u64, width: u32 },
+    AtomicRmw { addr: u64, width: u32 },
+    AtomicCmpxchg { addr: u64, width: u32 },
+    Copy { dst: u64, src: u64, len: u64 },
+    Fill { dst: u64, len: u64 },
+}
+
+/// The [`MemEvent`] the op at hand would report, from the live SSA values — the sink-side
+/// counterpart of the W3 pass's per-op events: **raw pre-confinement addresses**, identical
+/// vocabulary (the `access_sink_diff` differential pins the streams equal). `None` for a
+/// non-memory op or an unreadable operand.
+pub(crate) fn mem_event_of(inst: &Inst, vals: &[Reg]) -> Option<MemEvent> {
+    let v = |i: ValIdx| get(vals, i).map(|s| s.i64() as u64).ok();
+    Some(match inst {
+        Inst::Load {
+            op, addr, offset, ..
+        } => MemEvent::Load {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: op.info().2,
+        },
+        Inst::Store {
+            op, addr, offset, ..
+        } => MemEvent::Store {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: op.info().2,
+        },
+        Inst::V128Load { addr, offset, .. } => MemEvent::Load {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: 16,
+        },
+        Inst::V128Store { addr, offset, .. } => MemEvent::Store {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: 16,
+        },
+        Inst::AtomicLoad {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicLoad {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicStore {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicStore {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicRmw {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicRmw {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::AtomicCmpxchg {
+            ty, addr, offset, ..
+        } => MemEvent::AtomicCmpxchg {
+            addr: v(*addr)?.wrapping_add(*offset),
+            width: atomic_width(*ty),
+        },
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => MemEvent::Copy {
+            dst: v(*dst)?,
+            src: v(*src)?,
+            len: v(*len)?,
+        },
+        Inst::MemFill { dst, len, .. } => MemEvent::Fill {
+            dst: v(*dst)?,
+            len: v(*len)?,
+        },
+        _ => return None,
+    })
+}
+
+/// The watched-range analysis of one op, **bulk and v128 ops included** — up to two confined
+/// range accesses: `[dst-write, src-read]` for `mem.copy`/`mem.move`, `[dst-write, None]` for
+/// `mem.fill`, a 16-byte range for v128, and `[access_of(..), None]` otherwise. Bulk spans clamp
+/// their width to `u32::MAX` (a > 4 GiB span's tail is out of watch range — accepted corner).
+/// Shared by both debug engines' watchpoint checks, so a `memcpy`/`memset` over a watched byte
+/// stops on either — the fix for the bulk-op watchpoint blind spot (`access_of` itself is left
+/// untouched: it is DPOR's conflict primitive, a separate concern).
+pub(crate) fn watch_accesses(inst: &Inst, vals: &[Reg], mem: &Option<Mem>) -> [MemAccess; 2] {
+    let none = [MemAccess::None; 2];
+    let Some(m) = mem.as_ref() else {
+        return none;
+    };
+    let val = |i: ValIdx| get(vals, i).map(|s| s.i64() as u64).ok();
+    let span = |addr: Option<u64>, len: Option<u64>, write: bool| -> MemAccess {
+        let (Some(a), Some(l)) = (addr, len) else {
+            return MemAccess::None;
+        };
+        let width = l.min(u32::MAX as u64) as u32;
+        if width == 0 {
+            return MemAccess::None;
+        }
+        match m.confine_checked(a, 0, width) {
+            Ok(base) => MemAccess::Range { base, width, write },
+            Err(_) => MemAccess::None,
+        }
+    };
+    match inst {
+        Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => [
+            span(val(*dst), val(*len), true),
+            span(val(*src), val(*len), false),
+        ],
+        Inst::MemFill { dst, len, .. } => [span(val(*dst), val(*len), true), MemAccess::None],
+        Inst::V128Load { addr, offset, .. } => [
+            span(val(*addr).map(|a| a.wrapping_add(*offset)), Some(16), false),
+            MemAccess::None,
+        ],
+        Inst::V128Store { addr, offset, .. } => [
+            span(val(*addr).map(|a| a.wrapping_add(*offset)), Some(16), true),
+            MemAccess::None,
+        ],
+        _ => [access_of(inst, vals, mem), MemAccess::None],
     }
 }
 
@@ -7605,16 +7740,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     block: frames[top].block,
                     inst: frames[top].inst,
                 };
-                // Watchpoints reuse `access_of` — the same confined-range analysis the DPOR
-                // explorer uses — but only when armed (it confines, so it isn't free). Breakpoints,
-                // stepping, and the cap.call stop need no memory analysis.
+                // Watchpoints reuse the confined-range analysis (`watch_accesses` — bulk and v128
+                // ops included, so a `memcpy` over a watched byte stops), but only when armed (it
+                // confines, so it isn't free). Breakpoints, stepping, and the cap.call stop need
+                // no memory analysis.
                 let inst = &block.insts[frames[top].inst];
-                let access = if dbg.watches_armed() {
-                    access_of(inst, &frames[top].vals, &*mem)
+                let accesses = if dbg.watches_armed() {
+                    watch_accesses(inst, &frames[top].vals, &*mem)
                 } else {
-                    MemAccess::None
+                    [MemAccess::None; 2]
                 };
-                if let Some(reason) = dbg.before_op(pc, inst, access, frames.len()) {
+                if let Some(reason) = dbg.before_op(pc, inst, accesses, frames.len()) {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
@@ -12840,6 +12976,16 @@ pub struct Host {
     /// Transient: the last `Stream{In}` `read` parked (buffer empty under [`Self::stdin_block`]). The
     /// bytecode `CapCall` arm takes this to yield [`Outcome::StdinPark`] instead of completing the read.
     stdin_parked: bool,
+    /// The **Memory-capability growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
+    /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` may hold through
+    /// this cap — a map past it fails probeably (`-ENOMEM`, invariant 5), so a guest allocator
+    /// returns NULL. Policy lives here at the cap, never in `Mem`/the TCB. `None` (default) =
+    /// unbounded, zero-cost.
+    mem_map_limit: Option<u64>,
+    /// Bytes currently mapped through the Memory cap while a limit is set (map adds, unmap
+    /// subtracts). Rebuilt naturally by a from-0 replay (Memory is a live, untaped cap); carried
+    /// by [`HostReplaySubstate`] so a checkpoint restore keeps the accounting.
+    mem_mapped_bytes: u64,
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -13233,6 +13379,8 @@ impl Host {
             stdin_pos: 0,
             stdin_block: false,
             stdin_parked: false,
+            mem_map_limit: None,
+            mem_mapped_bytes: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
             out_sink: None,
@@ -13361,6 +13509,8 @@ impl Host {
         twin.stdin = self.stdin.clone();
         twin.stdin_pos = self.stdin_pos;
         twin.stdin_block = self.stdin_block;
+        twin.mem_map_limit = self.mem_map_limit;
+        twin.mem_mapped_bytes = self.mem_mapped_bytes;
         twin.clock_ns = self.clock_ns;
         twin.jit_table_log2 = self.jit_table_log2;
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
@@ -13575,6 +13725,13 @@ impl Host {
         self.stdin.extend_from_slice(bytes);
     }
 
+    /// Set (or clear) the **Memory-capability growth cap** — see [`Host::mem_map_limit`]. With a
+    /// limit, a `vm_map` whose committed total would exceed it returns `-ENOMEM` (probeable; a
+    /// guest `malloc` over `vm_map` returns NULL), and `vm_unmap` returns its bytes to the budget.
+    pub fn set_mem_map_limit(&mut self, limit: Option<u64>) {
+        self.mem_map_limit = limit;
+    }
+
     /// Take the transient "the last stdin read parked" flag (the `CapCall` arm uses it to yield
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
     pub(crate) fn take_stdin_parked(&mut self) -> bool {
@@ -13728,6 +13885,7 @@ impl Host {
             svc_queue,
             svc_results,
             svc_next_ticket,
+            mem_mapped_bytes: self.mem_mapped_bytes,
         }
     }
 
@@ -13752,6 +13910,7 @@ impl Host {
             s.svc_results.clone(),
             s.svc_next_ticket,
         );
+        self.mem_mapped_bytes = s.mem_mapped_bytes;
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -16075,8 +16234,27 @@ impl Host {
                 let len = *args.get(1).unwrap_or(&0) as u64;
                 let prot = *args.get(2).unwrap_or(&0) as i32;
                 Ok(vec![match op {
-                    0 => mem.map(off, len, prot),
-                    1 => mem.unmap(off, len),
+                    0 => {
+                        // The growth cap (slice 5): at the limit, map fails probeably — the
+                        // OOM-teaching knob. Accounting only runs with a limit set.
+                        if let Some(limit) = self.mem_map_limit {
+                            if self.mem_mapped_bytes.saturating_add(len) > limit {
+                                return Ok(vec![ENOMEM]);
+                            }
+                        }
+                        let r = mem.map(off, len, prot);
+                        if r >= 0 && self.mem_map_limit.is_some() {
+                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
+                        }
+                        r
+                    }
+                    1 => {
+                        let r = mem.unmap(off, len);
+                        if r >= 0 && self.mem_map_limit.is_some() {
+                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
+                        }
+                        r
+                    }
                     2 => mem.protect(off, len, prot),
                     3 => mem.page_size(),
                     _ => EINVAL,
@@ -18098,6 +18276,35 @@ impl Mem {
     /// reproduce it (and reinstating a cross-domain alias on restore is out of scope). `has_regions` is
     /// the monotonic "ever aliased a region" flag, set at the same choke as the `Backed` insert, so its
     /// clear state proves no `Backed` page exists.
+    /// Read-only **memory-map introspection** (INTERACTIVE_EMBEDDING.md slice 5, W6 tooling):
+    /// `(page_size, mapped, reserved, pages)`, where `pages` lists every page with an explicit
+    /// state as `(page_base_offset, kind)` — kind `0` = read-only (`protect`ed), `1` = read-write
+    /// (grown/re-committed, e.g. `vm_map` in the reserved tail), `2` = unmapped hole, `3` =
+    /// region-backed (§13 alias). Pages absent from the list take the region default: read-write
+    /// below `mapped`, unmapped above. Pure observation over existing state.
+    pub fn map_info(&self) -> (u64, u64, u64, Vec<(u64, u8)>) {
+        let sp = self.space.read().unwrap_or_else(|e| e.into_inner());
+        let pages = sp
+            .prot
+            .iter()
+            .map(|(page, p)| {
+                let kind = match p {
+                    PageProt::Ro => 0u8,
+                    PageProt::Rw => 1,
+                    PageProt::Unmapped => 2,
+                    PageProt::Backed { .. } => 3,
+                };
+                (page * self.page, kind)
+            })
+            .collect();
+        (
+            self.page,
+            self.window.mapped(),
+            self.window.reserved(),
+            pages,
+        )
+    }
+
     fn layout_snapshot_safe(&self) -> bool {
         !self.has_regions.load(Ordering::Relaxed)
     }
