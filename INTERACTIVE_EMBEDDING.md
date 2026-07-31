@@ -634,6 +634,25 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >   large mallocs and multiple thread stacks commit into the reserved tail on demand. A real
 >   pthreads program now runs to `counter=6` under the debugger with both vCPUs scheduled.
 >
+> **Post-plan residue (2026-07-31, closing the interactive threading tier):** two more, both DONE:
+> - **Source-line stepping + the thread list work while stepping on the scheduled engine.** A
+>   fresh scheduled launch left the run `stopped: None`, so the first `stepIn` fell through to
+>   `run_until_stop` and ran the whole program — a threaded lesson couldn't be stepped at all. The
+>   single-vCPU `DebugRun` is entry-stopped by construction; the scheduled run now gets the same
+>   via a `locate()` in `build_scheduled_run` (the seek path already called it post-replay; a
+>   fresh launch didn't). Now `stepIn` advances one source line at a time with a resolvable frame,
+>   and the second vCPU appears in the thread list *while stepping* once the root passes
+>   `thread.spawn`. Gated by `crates/svm-dap/tests/threaded_powerbox.rs`
+>   (`threaded_stepping_stops_and_spawns_mid_run`).
+> - **Real C11 atomics in the playground.** The playground shipped no `<stdatomic.h>` (a threaded
+>   atomic lesson failed to compile), and the frontend's display-only one maps the ops to plain
+>   `*p += v` — wrong for a *lock-free* counter (it would race under interleaving). Added
+>   `browser/playground-include/stdatomic.h`: `atomic_load`/`store`/`fetch_add` `_Generic`-dispatch
+>   on pointee width to the genuine `__vm_atomic_*` RMW builtins, so a mutex-free `atomic_fetch_add`
+>   counter is exactly correct under any schedule. A real "atomic counter survives chaos mode"
+>   program now steps into its spawned worker and runs to `40`. Gated by
+>   `browser/tests/chibicc_threads.rs` (`stdatomic_lowers_to_real_atomics_in_the_playground`).
+>
 > Order rationale: 1–2 are small and unblock any embedder spike (interactivity + step latency);
 > 3 is the hinge the model slices stand on; 4–5 close the perf/memory panels; 6–7 close the
 > threading story; 8–10 are an independent tail, land any time.
