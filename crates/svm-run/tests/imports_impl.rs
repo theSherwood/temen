@@ -1,6 +1,6 @@
 //! IMPORTS.md **§3.2** — provider-side interface offers wired into import slots, end to end:
 //! a provider module declares `export "adder" impl <funcidx>...`, the embedder binds a
-//! consumer's import slot to one op of that offer (`HostCap::impl_offer`), and the consumer's
+//! consumer's import slot to one op of that offer (`HostCap::offer_func`), and the consumer's
 //! `call.import` executes the offered guest function — identically on all three backends,
 //! through the one shared generic dispatch (v1 pure dispatch: the impl computes over its
 //! arguments alone — no window, no capabilities).
@@ -57,7 +57,7 @@ fn a_wired_offer_runs_identically_on_all_three_backends() {
     let registry = Imports::new()
         .provide(
             "add",
-            HostCap::impl_offer(&provider, "adder", 0).expect("offer resolves"),
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(consumer.clone(), registry).expect("instantiate");
@@ -97,7 +97,7 @@ fn offer_signature_mismatch_fails_instantiation_closed() {
     let registry = Imports::new()
         .provide(
             "add",
-            HostCap::impl_offer(&provider, "adder", 0).expect("offer resolves"),
+            HostCap::offer_func(&provider, "adder", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let err = match instantiate_with_imports(consumer, registry) {
@@ -160,7 +160,7 @@ fn an_instanced_offer_keeps_state_across_calls_on_all_three_backends() {
     let registry = Imports::new()
         .provide(
             "bump",
-            HostCap::impl_service(&provider, "counter", 0).expect("offer resolves"),
+            HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
         )
         .provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
@@ -177,11 +177,105 @@ fn an_instanced_offer_keeps_state_across_calls_on_all_three_backends() {
     }
 }
 
+/// CALLS.md increment 3, slice 1 (lock-narrowing) — two vCPUs of one domain call the SAME
+/// instanced offer concurrently. Each `bump` is wrapped in a retry-on-`-EAGAIN` loop, so under
+/// the try-enter admission a contended caller re-attempts rather than losing an increment; the
+/// root spawns a worker, both bump once, join, then the root bumps a third time and exits with
+/// the count. The provider window state is shared, so exactly three successful increments land
+/// regardless of interleaving ⇒ `Exited(3)`. The point is **safety under the narrowed lock**
+/// (the sub-run now runs with the caller powerbox lock released, `state → hg` order): the run
+/// must neither deadlock nor corrupt the shared counter. (A deterministic *liveness* test — that
+/// the cap surface stays live *during* a blocking handler — waits for cooperative handler parking
+/// in increment 4; a blocking nested `drive_arc` still ties up its worker thread this slice.)
+const STATEFUL_MULTI_CONSUMER: &str = "\
+memory 16
+import 0 \"bump\" () -> (i64)
+import 1 \"exit\" (i32) -> ()
+
+func () -> () {
+block 0 () {
+  vsp = i64.const 0
+  vh = thread.spawn 1 vsp vsp
+  vaddr = i64.const 0
+  i32.store vaddr vh
+  br 1()
+  }
+block 1 () {
+  vr = call.import 0 ()
+  vz = i64.const 0
+  vlt = i64.lt_s vr vz
+  br_if vlt 1() 2()
+  }
+block 2 () {
+  va2 = i64.const 0
+  vh2 = i32.load va2
+  vj = thread.join vh2
+  br 3()
+  }
+block 3 () {
+  vr2 = call.import 0 ()
+  vz2 = i64.const 0
+  vlt2 = i64.lt_s vr2 vz2
+  br_if vlt2 3() 4(vr2)
+  }
+block 4 (vfinal: i64) {
+  vc = i32.wrap_i64 vfinal
+  call.import 1 (vc)
+  unreachable
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+  }
+block 1 () {
+  vr = call.import 0 ()
+  vz = i64.const 0
+  vlt = i64.lt_s vr vz
+  br_if vlt 1() 2(vr)
+  }
+block 2 (vw: i64) {
+  return vw
+  }
+}
+
+export 0 func \"_start\" 0
+";
+
 #[test]
-fn impl_offer_fails_closed_on_unknown_offer_or_op() {
+fn concurrent_instanced_offer_calls_are_safe_under_the_narrowed_lock() {
+    let provider = parse_module(STATEFUL_PROVIDER).expect("provider parses");
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_MULTI_CONSUMER).expect("consumer parses");
+
+    // The offer is called through the eval loop (the tree-walker services the narrowed path;
+    // the bytecode engine declines offer ops and falls back to it), so both backends exercise
+    // `drive_instanced_offer` under two concurrent vCPUs of one domain.
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        let registry = Imports::new()
+            .provide(
+                "bump",
+                HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
+            )
+            .provide("exit", HostCap::exit());
+        let inst = instantiate_with_imports(consumer.clone(), registry).expect("instantiate");
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: three successful concurrent+serial bumps must land exactly, no deadlock"
+        );
+    }
+}
+
+#[test]
+fn offer_func_fails_closed_on_unknown_offer_or_op() {
     let provider = parse_module(PROVIDER).expect("provider parses");
-    assert!(HostCap::impl_offer(&provider, "nope", 0).is_none());
-    assert!(HostCap::impl_offer(&provider, "adder", 1).is_none());
+    assert!(HostCap::offer_func(&provider, "nope", 0).is_none());
+    assert!(HostCap::offer_func(&provider, "adder", 1).is_none());
 }
 
 // --- §3.5 grouped host-native providers (HostCap::iface) --------------------------------------

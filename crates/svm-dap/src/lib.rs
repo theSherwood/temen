@@ -12,15 +12,17 @@
 //! scripting a DAP conversation; [`run_stdio`] is the thin `Content-Length`-framed wire loop a real
 //! client connects to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
-use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
-use svm_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
+use svm_interp::{Inspector, IrPc, Stop, StopReason, Trap, Value, VarValue, WatchId, WatchKind};
+use svm_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod backend;
 mod expr;
 mod json;
-pub use backend::{BytecodeBackend, Debuggee};
+pub mod models;
+pub use backend::{BytecodeBackend, Debuggee, SharedSink};
 pub use json::{parse, Json};
 
 /// The DAP server: protocol state + (after `launch`) a debug [`Session`]. Drive it by feeding parsed
@@ -41,10 +43,21 @@ pub struct DapServer {
 /// subset, the engine the browser playground runs), chosen by the launch `engine` argument.
 struct Session {
     inspector: Box<dyn Debuggee>,
+    /// The session's memory model (INTERACTIVE_EMBEDDING.md slice 4), fed by the engine's access
+    /// sink when the `launch` arg `memModel` armed one; read back by `memModelStats`. `None` = no
+    /// model, no sink, no cost.
+    mem_model: Option<Arc<Mutex<models::MemModel>>>,
     debug: Option<DebugInfo>,
-    /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
-    /// binding source-line breakpoints.
+    /// `(file, line) → first *stoppable* IR pc on that line` — the reverse of `Inspector::source_loc`,
+    /// for binding source-line breakpoints. Only non-terminator pcs are indexed (a terminator is never
+    /// a stoppable position — see [`terminator_only_lines`](Session::terminator_only_lines)).
     line_index: BTreeMap<(u32, u32), IrPc>,
+    /// `(file, line)`s whose *only* mapped ops are block terminators (`return`/`br`) — e.g. a bare
+    /// `return x;` where `x` was computed on an earlier line. No engine can pause at a terminator
+    /// (`cur_ir_pc`/`before_op` never fire there), so a breakpoint on such a line can never stop:
+    /// `setBreakpoints` reports it `verified: false` rather than falsely binding it (which silently ran
+    /// the guest to completion). Kept distinct from "line has no code at all" so the message can say why.
+    terminator_only_lines: BTreeSet<(u32, u32)>,
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
     /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
@@ -66,6 +79,10 @@ struct Session {
     /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
     /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
     scheduled: bool,
+    /// Byte length of the guest stdout last surfaced as a DAP `output` event — so each stop emits one
+    /// only when the captured output *changed*. On a reverse `seek` the output shrinks, so the event
+    /// carries the **full** current stdout (not an append delta) and the client replaces its view.
+    stdout_shown: usize,
 }
 
 impl Session {
@@ -180,6 +197,15 @@ impl DapServer {
             "stepBack" => self.on_step_back(),
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
+            "provideStdin" => self.on_provide_stdin(args),
+            "memModelStats" => self.on_mem_model_stats(),
+            "memoryMap" => self.on_memory_map(),
+            "schedTrace" => self.on_sched_trace(),
+            "forceSwitch" => self.on_force_switch(args),
+            "setVariable" => self.on_set_variable(args),
+            "writeMemory" => self.on_write_memory(args),
+            "readMemory" => self.on_read_memory(args),
+            "seek" => self.on_seek(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -238,6 +264,12 @@ impl DapServer {
             // source variable's window range, backed by `Inspector::set_watchpoint`. Two-request
             // protocol — `dataBreakpointInfo` mints a `dataId`, `setDataBreakpoints` arms it.
             ("supportsDataBreakpoints", Json::Bool(true)),
+            // State writes (INTERACTIVE_EMBEDDING.md slice 8): edit a variable / raw memory at a
+            // stop, recorded so reverse debugging re-applies them (bytecode backend; the
+            // tree-walker fails the requests cleanly).
+            ("supportsSetVariable", Json::Bool(true)),
+            ("supportsWriteMemoryRequest", Json::Bool(true)),
+            ("supportsReadMemoryRequest", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -279,7 +311,10 @@ impl DapServer {
             .unwrap_or(1_000_000_000) as u64;
 
         let debug = module.debug_info.clone();
-        let line_index = debug.as_ref().map(build_line_index).unwrap_or_default();
+        let (line_index, terminator_only_lines) = debug
+            .as_ref()
+            .map(|di| build_line_index(di, &module))
+            .unwrap_or_default();
         // Execution mode (DEBUGGING.md Milestone B): `seed` ⇒ a fuzzed interleaving; `schedule`
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
@@ -292,8 +327,53 @@ impl DapServer {
             .get("engine")
             .and_then(|v| v.as_str())
             .unwrap_or("treewalk");
+        // `powerbox: "onramp"` runs the guest under the on-ramp I/O powerbox (stdout/stdin/exit/memory),
+        // so a manifest program that calls a host capability — a chibicc `printf` → `write` — runs and its
+        // output is captured (surfaced as DAP `output` events), instead of `CapFault`ing. Absent ⇒
+        // deny-all (compute-only), unchanged. `stdin` preloads `read(0, …)`.
+        let powerbox = args.get("powerbox").and_then(|v| v.as_str()) == Some("onramp");
+        let stdin = args
+            .get("stdin")
+            .and_then(|v| v.as_str())
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
+        // `blockStdin: true` (INTERACTIVE_EMBEDDING.md W4): a `read` on an exhausted stdin buffer
+        // parks the session (a `stopped` event, reason `"stdin"`) instead of returning EOF; the
+        // custom `provideStdin` request appends bytes and a resume re-issues the read. Bytecode
+        // engine, single-vCPU, powerbox sessions only — anything else fails the launch (fail-closed)
+        // rather than silently keeping EOF semantics.
+        let block_stdin = args
+            .get("blockStdin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if block_stdin && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
+        // `memoryLimit: N` (slice 5): cap the Memory capability's total committed bytes — a
+        // `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching
+        // knob). Needs the powerbox's Memory grant on the bytecode engine; fail-closed elsewhere.
+        let mem_limit = args
+            .get("memoryLimit")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as u64);
+        if mem_limit.is_some() && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
-            match BytecodeBackend::new(module, func, &call_args, fuel) {
+            // Slice 7: the seeded pick is honored on the threaded bytecode engine (a seed with a
+            // single-vCPU module fails the launch inside `new` — fail-closed).
+            let seed = args.get("seed").and_then(|v| v.as_i64()).map(|v| v as u64);
+            match BytecodeBackend::new(
+                module,
+                func,
+                &call_args,
+                fuel,
+                powerbox,
+                stdin,
+                block_stdin,
+                mem_limit,
+                seed,
+            ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
                 Some(b) => {
@@ -318,16 +398,76 @@ impl DapServer {
             };
             (Box::new(insp), scheduled)
         };
+        // `memModel` (INTERACTIVE_EMBEDDING.md slice 4): arm a host-side cache/paging model over
+        // the engine's access sink. Geometry keys are optional (teaching-scale defaults). Installed
+        // through the `Debuggee` capability probe, so an engine without a sink (the tree-walker)
+        // fails the launch cleanly instead of silently observing nothing.
+        let mut inspector = inspector;
+        let mem_model = match args.get("memModel") {
+            None => None,
+            Some(mm) => {
+                let d = models::MemModelCfg::default();
+                let cache = |j: Option<&Json>, d: models::CacheCfg| models::CacheCfg {
+                    sets: j
+                        .and_then(|c| c.get("sets"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.sets),
+                    ways: j
+                        .and_then(|c| c.get("ways"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as usize)
+                        .unwrap_or(d.ways),
+                    line: j
+                        .and_then(|c| c.get("line"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.line),
+                };
+                let cfg = models::MemModelCfg {
+                    l1: cache(mm.get("l1"), d.l1),
+                    l2: cache(mm.get("l2"), d.l2),
+                    page_size: mm
+                        .get("pageSize")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v.max(1)) as u64)
+                        .unwrap_or(d.page_size),
+                };
+                let model = Arc::new(Mutex::new(models::MemModel::new(cfg)));
+                let feed = Arc::clone(&model);
+                let sink: SharedSink = Arc::new(Mutex::new(
+                    move |clock: u64, task: usize, ev: svm_interp::MemEvent| {
+                        feed.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe(clock, task, ev)
+                    },
+                ));
+                if !inspector.set_access_sink(sink) {
+                    return (false, Json::Null, vec![]); // fail-closed: no sink on this engine
+                }
+                Some(model)
+            }
+        };
+        // `schedTrace: true` (slice 6): arm the scheduler trace tape — a threaded bytecode
+        // session only; fail-closed elsewhere (a single vCPU has no schedule to trace).
+        if args.get("schedTrace").and_then(|v| v.as_bool()) == Some(true)
+            && !inspector.set_sched_trace(true)
+        {
+            return (false, Json::Null, vec![]);
+        }
         self.session = Some(Session {
             inspector,
+            mem_model,
             debug,
             line_index,
+            terminator_only_lines,
             breakpoints: Vec::new(),
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
             place_refs: Vec::new(),
             data_watch_ids: Vec::new(),
             scheduled,
+            stdout_shown: 0,
         });
         (true, Json::Null, vec![])
     }
@@ -360,6 +500,22 @@ impl DapServer {
         let mut out = Vec::new();
         for bp in &requested {
             let line = bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32;
+            // A line whose only ops are terminators (a bare `return x;` etc.) has no stoppable pc:
+            // report it unverified with a reason, rather than binding a breakpoint that never fires.
+            if file_idx.is_some_and(|fi| session.terminator_only_lines.contains(&(fi, line))) {
+                out.push(Json::obj(vec![
+                    ("verified", Json::Bool(false)),
+                    ("line", Json::i(line as i64)),
+                    (
+                        "message",
+                        Json::s(
+                            "no stoppable instruction on this line (it maps only to a return/branch); \
+                             set the breakpoint on an earlier line",
+                        ),
+                    ),
+                ]));
+                continue;
+            }
             match file_idx.and_then(|fi| resolve_line(&session.line_index, fi, line)) {
                 Some((actual_line, pc)) => {
                     session.inspector.set_breakpoint(pc);
@@ -817,6 +973,243 @@ impl DapServer {
         PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 
+    /// The custom `provideStdin` request (W4 blocking stdin): append `arguments.data` to the parked
+    /// session's stdin. The client then resumes (`continue`/`next`) and the parked read re-issues
+    /// against the new bytes. Fails cleanly when there is no session, no `data`, or the session is
+    /// not a blocking-stdin one (`Debuggee::provide_stdin` returns `false`).
+    fn on_provide_stdin(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let Some(data) = args.and_then(|a| a.get("data")).and_then(|d| d.as_str()) else {
+            return (false, Json::Null, vec![]);
+        };
+        let ok = session.inspector.provide_stdin(data.as_bytes());
+        (ok, Json::Null, vec![])
+    }
+
+    /// The standard `setVariable` request (slice 8): write an integer value to a named local in
+    /// the scope's frame. The write is recorded by the backend and re-applied on every seek
+    /// replay, so reverse debugging stays truthful. Fails cleanly on the tree-walker, a non-int
+    /// value, or an unresolvable name.
+    fn on_set_variable(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let vref = args
+            .get("variablesReference")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let Some(name) = args.get("name").and_then(|n| n.as_str()).map(String::from) else {
+            return fail;
+        };
+        let Some(value) = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        // Resolve the scope reference to its (thread, frame), like `variables` does.
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        let Some(&(tid, frame_idx)) = vref
+            .checked_sub(1)
+            .and_then(|r| session.frame_refs.get(r as usize))
+        else {
+            return fail;
+        };
+        session.inspector.select_task(tid);
+        // The var's byte width for a memory-located write, resolved like the Variables pane: the
+        // innermost in-scope declaration's scalar width.
+        let frames = session.inspector.backtrace();
+        let Some(frame) = frames.get(frame_idx) else {
+            return fail;
+        };
+        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
+        let func = frame.pc.func;
+        let Some((ty_name, type_id)) = session.debug.as_ref().and_then(|debug| {
+            debug
+                .vars
+                .iter()
+                .filter(|v| {
+                    (v.func == func || v.func == svm_ir::GLOBAL_SCOPE)
+                        && scope_covers(v.scope, line)
+                        && v.name == name
+                })
+                .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
+                .map(|v| (v.ty.clone(), v.type_id))
+        }) else {
+            return fail;
+        };
+        let width = scalar_width(self.types(), type_id, &ty_name);
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        if !session.inspector.write_var(frame_idx, &name, value, width) {
+            return fail;
+        }
+        (
+            true,
+            Json::obj(vec![("value", Json::s(value.to_string()))]),
+            vec![],
+        )
+    }
+
+    /// The standard `writeMemory` request (slice 8): base64 `data` at `memoryReference` (a decimal
+    /// or `0x` window address) + `offset`. Recorded and replay-applied like `setVariable`.
+    fn on_write_memory(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let Some(addr) = args
+            .get("memoryReference")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        let Some(bytes) = args
+            .get("data")
+            .and_then(|v| v.as_str())
+            .and_then(base64_decode)
+        else {
+            return fail;
+        };
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        let target = (addr as u64).wrapping_add(offset as u64);
+        if !session.inspector.write_window(target, &bytes) {
+            return fail;
+        }
+        (
+            true,
+            Json::obj(vec![("bytesWritten", Json::i(bytes.len() as i64))]),
+            vec![],
+        )
+    }
+
+    /// The standard `readMemory` request (`writeMemory`'s read twin — the memory-panel poll an
+    /// interactive embedder drives): `count` bytes at `memoryReference` (decimal or `0x` hex)
+    /// + `offset`, base64 in the reply. Fails cleanly on an unreadable range or no session.
+    fn on_read_memory(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let Some(addr) = args
+            .get("memoryReference")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        let Some(count) = args
+            .get("count")
+            .and_then(|v| v.as_i64())
+            .and_then(|c| usize::try_from(c).ok())
+        else {
+            return fail;
+        };
+        let Some(session) = self.session.as_ref() else {
+            return fail;
+        };
+        let target = (addr as u64).wrapping_add(offset as u64);
+        let Ok(bytes) = session.inspector.read_window(target, count) else {
+            return fail;
+        };
+        (
+            true,
+            Json::obj(vec![
+                ("address", Json::s(format!("0x{target:x}"))),
+                ("data", Json::s(base64_encode(&bytes))),
+            ]),
+            vec![],
+        )
+    }
+
+    /// The custom `seek` request (the history slider's verb): jump the session to time
+    /// `arguments.t` — the global scheduler turn multithreaded, the op clock single-threaded,
+    /// the same coordinate `reverseContinue` navigates. Forward or backward; replays through the
+    /// checkpoint ladder and lands as an ordinary stop (a seek past the end terminates). Replies
+    /// with the landed `t`.
+    fn on_seek(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(t) = args
+            .and_then(|a| a.get("t"))
+            .and_then(|v| v.as_i64())
+            .and_then(|t| u64::try_from(t).ok())
+        else {
+            return (false, Json::Null, vec![]);
+        };
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let stop = session.inspector.seek(t);
+        let landed = if session.scheduled {
+            session.inspector.turn()
+        } else {
+            session.inspector.clock()
+        };
+        let events = self.stop_events(stop);
+        (true, Json::obj(vec![("t", Json::i(landed as i64))]), events)
+    }
+
+    /// The custom `forceSwitch` request (slice 7): override the schedule's next pick —
+    /// `arguments.threadId` names the target DAP thread (task + 1), absent = "switch away" to the
+    /// lowest-index other runnable task. The override is recorded at the current turn and survives
+    /// `seek` (replays re-apply it). Replies with the resolved `threadId`; fails cleanly when
+    /// unsupported (tree-walker, single-vCPU) or the target isn't runnable.
+    fn on_force_switch(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let target = args
+            .and_then(|a| a.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .map(|tid| (tid - 1).max(0) as usize);
+        let Some(chosen) = session.inspector.force_switch(target) else {
+            return (false, Json::Null, vec![]);
+        };
+        (
+            true,
+            Json::obj(vec![("threadId", Json::i(chosen as i64 + 1))]),
+            vec![],
+        )
+    }
+
+    /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
+    /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
+    fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(tape) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inspector.sched_trace_json())
+        else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, tape, vec![])
+    }
+
+    /// The custom `memoryMap` request (slice 5): the window's memory-map introspection — geometry,
+    /// data segments, explicit-state pages, the powerbox stack/heap regions — as JSON. Fails
+    /// cleanly when the backend doesn't expose it (tree-walker) or there is no session.
+    fn on_memory_map(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(map) = self.session.as_ref().and_then(|s| s.inspector.memory_map()) else {
+            return (false, Json::Null, vec![]);
+        };
+        (true, map, vec![])
+    }
+
+    /// The custom `memModelStats` request (slice 4): the armed memory model's counters + line-state
+    /// grids, as JSON. Fails cleanly when the session has no model.
+    fn on_mem_model_stats(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(model) = self.session.as_ref().and_then(|s| s.mem_model.as_ref()) else {
+            return (false, Json::Null, vec![]);
+        };
+        let body = model.lock().unwrap_or_else(|e| e.into_inner()).stats_json();
+        (true, body, vec![])
+    }
+
     fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
         if self.session.is_none() {
             return (false, Json::Null, vec![]);
@@ -966,7 +1359,11 @@ impl DapServer {
             .stopped_task()
             .map(|t| t as i64 + 1)
             .unwrap_or(1);
-        (true, Json::Null, vec![stopped_event(reason, tid)])
+        // Flush the (rewound) powerbox output before the stop, so the client sees the captured stdout as
+        // it stood at this earlier point (the reverse search left the run rebuilt at `landed`).
+        let mut events = self.output_events();
+        events.push(stopped_event(reason, tid));
+        (true, Json::Null, events)
     }
 
     fn on_evaluate(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
@@ -1045,6 +1442,8 @@ impl DapServer {
         let (result, ty) = match expr::eval(&expr, &mut env) {
             Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
             Some(expr::Value::Float(x)) => (x.to_string(), String::new()),
+            // A bare pointer rvalue renders as its address value (navigate it with `->`/`[]`/`*`).
+            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new()),
             Some(expr::Value::Place { addr, type_id }) => {
                 if matches!(
                     types.get(type_id as usize),
@@ -1086,21 +1485,59 @@ impl DapServer {
     }
 
     /// Map a resume's outcome to the DAP event(s) that follow the response. The previous stop's
-    /// frame references are now stale, so clear them; the next `stackTrace` assigns fresh ones.
+    /// frame references are now stale, so clear them; the next `stackTrace` assigns fresh ones. Any new
+    /// powerbox stdout is flushed as an `output` event first, so the client sees the guest's output
+    /// before the stop/terminate.
     fn stop_events(&mut self, stop: Stop) -> Vec<Event> {
         if let Some(s) = self.session.as_mut() {
             s.frame_refs.clear();
             s.place_refs.clear();
         }
+        let mut events = self.output_events();
         let tid = self.stopped_thread_id();
         match stop {
-            Stop::Break { reason, .. } => vec![stopped_event(dap_reason(reason), tid)],
-            Stop::Finished(_) => {
+            Stop::Break { reason, .. } => events.push(stopped_event(dap_reason(reason), tid)),
+            Stop::Finished(result) => {
                 self.terminated = true;
-                vec![("terminated", Json::obj(vec![]))]
+                // Standard DAP: an `exited` event carrying the guest's exit code precedes
+                // `terminated`, so a client can show "exited with N". The on-ramp powerbox turns
+                // `main`'s return into an `exit` capability call (`Trap::Exit(code)`); a deny-all
+                // compute session instead finishes with returned values, whose first scalar is the
+                // result. A non-exit trap (fault/unreachable/…) exits non-zero the way a real
+                // process would on a signal.
+                events.push((
+                    "exited",
+                    Json::obj(vec![("exitCode", Json::i(exit_code_of(&result) as i64))]),
+                ));
+                events.push(("terminated", Json::obj(vec![])));
             }
-            Stop::Blocked => vec![stopped_event("pause", tid)],
+            Stop::Blocked => events.push(stopped_event("pause", tid)),
         }
+        events
+    }
+
+    /// A DAP `output` event carrying the guest's captured stdout when a powerbox session's output has
+    /// **changed** since the last stop. The event carries the *full* current stdout — on a reverse `seek`
+    /// the output shrinks, so the client **replaces** its view rather than appending. Empty when there is
+    /// no powerbox output, or it is unchanged (a compute-only / deny-all session never emits one).
+    fn output_events(&mut self) -> Vec<Event> {
+        let Some(s) = self.session.as_mut() else {
+            return vec![];
+        };
+        let out = s.inspector.stdout();
+        if out.len() == s.stdout_shown {
+            return vec![];
+        }
+        let len = out.len();
+        let text = String::from_utf8_lossy(out).into_owned();
+        s.stdout_shown = len;
+        vec![(
+            "output",
+            Json::obj(vec![
+                ("category", Json::s("stdout")),
+                ("output", Json::s(&text)),
+            ]),
+        )]
     }
 
     /// The DAP thread id of the stopped thread (vCPU id + 1); `1` in single-threaded mode.
@@ -1110,6 +1547,23 @@ impl DapServer {
             .and_then(|s| s.inspector.stopped_task())
             .map(|t| t as i64 + 1)
             .unwrap_or(1)
+    }
+}
+
+/// The exit code a finished run reports to the DAP `exited` event. A powerbox guest ends via the
+/// `exit` capability (`Trap::Exit(code)`) — the usual case, carrying `main`'s return. A compute
+/// session returns values directly; its first scalar is the result (truncated to i32, like a
+/// process exit status). Any other trap is a non-zero abnormal exit (1), mirroring a process
+/// killed by a fault.
+fn exit_code_of(result: &Result<Vec<Value>, Trap>) -> i32 {
+    match result {
+        Ok(vals) => match vals.first() {
+            Some(Value::I32(n)) => *n,
+            Some(Value::I64(n)) => *n as i32,
+            _ => 0,
+        },
+        Err(Trap::Exit(code)) => *code,
+        Err(_) => 1,
     }
 }
 
@@ -1132,18 +1586,99 @@ fn parse_data_id(s: &str) -> Option<(u64, u64)> {
     Some((addr.parse().ok()?, len.parse().ok()?))
 }
 
+/// Parse a decimal or `0x`-hex integer (the `setVariable` value / `writeMemory` address forms).
+fn parse_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return i64::from_str_radix(h, 16).ok();
+    }
+    t.parse::<i64>().ok()
+}
+
+/// Minimal RFC 4648 base64 decoder (the DAP `writeMemory` payload encoding) — standard alphabet,
+/// `=` padding, no line breaks. `None` on any malformed input.
+/// Minimal RFC 4648 base64 encoder (the `readMemory` payload encoding) — standard alphabet, padded.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let acc = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(acc >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let raw: &[u8] = s.trim().as_bytes();
+    if !raw.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    for chunk in raw.chunks(4) {
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for &c in &chunk[..4 - pad] {
+            acc = (acc << 6) | val(c)?;
+        }
+        acc <<= 6 * pad as u32;
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - pad]);
+    }
+    Some(out)
+}
+
 fn dap_reason(r: StopReason) -> &'static str {
     match r {
         StopReason::Breakpoint => "breakpoint",
         StopReason::Step => "step",
         StopReason::Watchpoint { .. } => "data breakpoint",
         StopReason::CapCall { .. } => "pause",
+        // W4 blocking stdin: parked at a `read` awaiting input — the client shows an input prompt
+        // and resumes after `provideStdin`.
+        StopReason::StdinPark => "stdin",
     }
 }
 
-/// `(file, line) → smallest IR pc on that line`, the reverse of `Inspector::source_loc`.
-fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
+/// The source-line breakpoint tables: `(file, line) → smallest stoppable IR pc`, and the set of
+/// `(file, line)`s that map *only* to a block terminator (so they can't bind — see `build_line_index`).
+type LineTables = (BTreeMap<(u32, u32), IrPc>, BTreeSet<(u32, u32)>);
+
+/// Build the `(file, line) → smallest stoppable IR pc` index used to bind source-line breakpoints,
+/// plus the set of lines that map *only* to block terminators. A terminator (`Block::term`, whose IR
+/// `inst` index is `>= block.insts.len()`) is never a stoppable position — no engine pauses at one —
+/// so it is excluded from the index; a line left with no stoppable pc is recorded as terminator-only
+/// so `setBreakpoints` can report it honestly instead of binding a breakpoint that never fires.
+fn build_line_index(di: &DebugInfo, module: &Module) -> LineTables {
+    let is_terminator = |pc: &IrPc| {
+        module
+            .funcs
+            .get(pc.func as usize)
+            .and_then(|f| f.blocks.get(pc.block))
+            .is_none_or(|b| pc.inst >= b.insts.len())
+    };
     let mut idx: BTreeMap<(u32, u32), IrPc> = BTreeMap::new();
+    let mut has_term: BTreeSet<(u32, u32)> = BTreeSet::new(); // lines seen with a terminator loc
     for l in &di.locs {
         let pc = IrPc {
             module: 0,
@@ -1151,6 +1686,10 @@ fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
             block: l.block as usize,
             inst: l.inst as usize,
         };
+        if is_terminator(&pc) {
+            has_term.insert((l.file, l.line));
+            continue;
+        }
         idx.entry((l.file, l.line))
             .and_modify(|e| {
                 if pc < *e {
@@ -1159,7 +1698,12 @@ fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
             })
             .or_insert(pc);
     }
-    idx
+    // Terminator-only = saw a terminator on this line and *no* non-terminator op (order-independent).
+    let term_only = has_term
+        .into_iter()
+        .filter(|k| !idx.contains_key(k))
+        .collect();
+    (idx, term_only)
 }
 
 /// Bind a requested line to the nearest line at/after it that has code (so a breakpoint on a blank
@@ -1418,9 +1962,21 @@ impl expr::Resolver for EvalEnv<'_> {
                 }
             }
             // A promoted scalar (single value / location list): the Inspector resolves it at the
-            // frame's pc; map the read-back value to an Int/Float operand.
+            // frame's pc; map the read-back value to an Int/Float operand — or, for a **pointer**-typed
+            // promoted value, a `Ptr` rvalue so `p->field` / `p[i]` navigate from its value (the
+            // window-var path already yields a `Place`; this is the SSA-promoted pointer chibicc emits
+            // for `struct T *p = &x;`).
             VarLoc::Ssa { .. } | VarLoc::SsaList(_) => {
                 let width = scalar_width(self.types, var.type_id, &var.ty);
+                if let Some(&TypeDef::Pointer { pointee, .. }) =
+                    var.type_id.and_then(|t| self.types.get(t as usize))
+                {
+                    let v = self.inspector.read_var(self.frame_idx, name, width)?;
+                    return var_to_i64(&v).map(|addr| expr::Value::Ptr {
+                        addr: addr as u64,
+                        pointee,
+                    });
+                }
                 match self.inspector.read_var(self.frame_idx, name, width)? {
                     VarValue::Value(Value::F32(x)) => Some(expr::Value::Float(x as f64)),
                     VarValue::Value(Value::F64(x)) => Some(expr::Value::Float(x)),
@@ -1447,6 +2003,14 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn index(&mut self, base: &expr::Value, index: i64) -> Option<expr::Value> {
+        // A pointer *rvalue* indexes from its own value: `p[i] == *(p + i)`, no read-out first.
+        if let &expr::Value::Ptr { addr, pointee } = base {
+            let stride = type_size(self.types, pointee) as u64;
+            return Some(expr::Value::Place {
+                addr: addr.wrapping_add((index as u64).wrapping_mul(stride)),
+                type_id: pointee,
+            });
+        }
         let &expr::Value::Place { addr, type_id } = base else {
             return None;
         };
@@ -1458,7 +2022,7 @@ impl expr::Resolver for EvalEnv<'_> {
                     type_id: *elem,
                 })
             }
-            // `p[i] == *(p + i)`: dereference, then offset by the element stride.
+            // `p[i] == *(p + i)`: dereference (read the stored pointer), then offset by the stride.
             TypeDef::Pointer { pointee, .. } => {
                 let base = self.read_ptr(addr)?;
                 let stride = type_size(self.types, *pointee) as u64;
@@ -1472,6 +2036,13 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn deref(&mut self, base: &expr::Value) -> Option<expr::Value> {
+        // A pointer rvalue derefs to a `Place` at its own value (`*p` where `p` is a promoted pointer).
+        if let &expr::Value::Ptr { addr, pointee } = base {
+            return Some(expr::Value::Place {
+                addr,
+                type_id: pointee,
+            });
+        }
         let &expr::Value::Place { addr, type_id } = base else {
             return None;
         };
@@ -1485,6 +2056,10 @@ impl expr::Resolver for EvalEnv<'_> {
     }
 
     fn load(&mut self, v: &expr::Value) -> Option<expr::Value> {
+        // A pointer rvalue loads to its numeric value (so `p` on its own prints as an address).
+        if let &expr::Value::Ptr { addr, .. } = v {
+            return Some(expr::Value::Int(addr as i64));
+        }
         let &expr::Value::Place { addr, type_id } = v else {
             return Some(*v); // an Int/Float literal resolves to itself
         };

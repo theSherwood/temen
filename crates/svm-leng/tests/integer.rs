@@ -42,6 +42,108 @@ fn constant_arithmetic() {
 }
 
 #[test]
+fn suffixed_literals() {
+    // nimony emits typed literals as `(suf <value> "<type>")` — e.g. `255'i64`. They evaluate to the
+    // value at the suffix's width. `(add (i +64) (suf 200 "i64") (suf 55 "u8")) = 255`.
+    let leng = "\
+(stmts
+ (proc :main.0 . (i +64) .
+  (stmts . (ret (add (i +64) (suf 200 \"i64\") (suf 55 \"u8\"))))))";
+    assert_eq!(run_i64(leng, 0, &[]), 255);
+}
+
+#[test]
+fn bitwise_and_shift_ops() {
+    // nimony's arithmetics: bitand/bitor/bitxor/shl/shr/bitnot, same (Type a b) shape as arith.
+    // ((0xF0 & 0x3C) | 0x01) = 0x30 | 1 = 0x31; (0x31 ^ 0x0F) = 0x3E; (0x3E << 2) = 0xF8;
+    // (0xF8 >> 3) = 0x1F = 31.
+    let leng = "\
+(stmts
+ (proc :main.0 . (i +64) .
+  (stmts .
+   (ret (shr (u +64)
+     (shl (i +64)
+       (bitxor (i +64)
+         (bitor (i +64) (bitand (i +64) 240 60) 1)
+         15)
+       2)
+     3)))))";
+    assert_eq!(run_i64(leng, 0, &[]), 31);
+}
+
+#[test]
+fn narrow_int_local() {
+    // A sub-word (`i8`) local — like `system`'s `min`/`max` result — now gets its own (i32) SSA slot
+    // and can be assigned in both `if` branches, then widened on return. min(3,5)=3, min(200,5)=5.
+    let leng = "\
+(stmts
+ (proc :m.0 (params (param :x.0 . (i +64)) (param :y.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i 8) .)
+   (if (elif (le x.0 y.0) (stmts . (asgn r.0 x.0)))
+       (else (stmts . (asgn r.0 y.0))))
+   (ret (conv (i +64) r.0)))))";
+    assert_eq!(run_i64(leng, 0, &[3, 5]), 3);
+    assert_eq!(run_i64(leng, 0, &[100, 5]), 5);
+}
+
+#[test]
+fn bool_case_values() {
+    // `case` over a bool branches on `(true)`/`(false)` literals (system's `$` for bool).
+    let leng = "\
+(stmts
+ (proc :b.0 (params (param :e.0 . (bool))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (case e.0
+    (of (ranges (false)) (stmts . (asgn r.0 10)))
+    (of (ranges (true)) (stmts . (asgn r.0 20))))
+   (ret r.0))))";
+    assert_eq!(run_i64(leng, 0, &[0]), 10);
+    assert_eq!(run_i64(leng, 0, &[1]), 20);
+}
+
+#[test]
+fn char_literals() {
+    // nimony emits char literals as `'c'` / `'\HH'`. `'0'` = 48, `'\0A'` = 10; 48 + 10 = 58.
+    let leng = "\
+(stmts
+ (proc :m.0 . (i +64) . (stmts . (ret (add (i +64) '0' '\\0A')))))";
+    assert_eq!(run_i64(leng, 0, &[]), 58);
+}
+
+#[test]
+fn bitnot_and_logical_not() {
+    // bitnot: ~0 = -1. not: logical negation of a bool (0/1).
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (bitnot (i +64) 0)))))",
+            0,
+            &[]
+        ),
+        -1
+    );
+    // not(3 == 4) = not(false) = true = 1.
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (not (eq 3 4))))))",
+            0,
+            &[]
+        ),
+        1
+    );
+    // not(2 == 2) = not(true) = false = 0.
+    assert_eq!(
+        run_i64(
+            "(stmts (proc :m.0 . (i +64) . (stmts . (ret (not (eq 2 2))))))",
+            0,
+            &[]
+        ),
+        0
+    );
+}
+
+#[test]
 fn params_and_locals() {
     // addup(a, b): int = (var t = b*2; a + t)
     let leng = "\
@@ -117,10 +219,28 @@ fn run_i64_i32arg(leng: &str, idx: usize, arg: i32) -> i64 {
 
 #[test]
 fn unsupported_is_fail_closed() {
-    // A float type is out of the integer subset → a clean Unsupported error, never a bad module.
-    let leng = "(stmts (proc :h.0 . (f +64) . (stmts . (ret 0))))";
+    // A `try`/exception construct is outside the subset → a clean Unsupported error, never a bad
+    // module. (Floats, once unsupported here, are now handled — see tests/floats.rs.)
+    let leng = "(stmts (proc :h.0 . (i +64) . (stmts . (try (stmts .) (stmts .) (stmts .)))))";
     match translate(leng) {
-        Err(LengError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported, got {other:?}"),
+        Err(LengError::Unsupported(_)) | Err(LengError::Malformed(_)) => {}
+        other => panic!("expected a fail-closed error, got {other:?}"),
     }
+}
+
+#[test]
+fn overflow_keeping_arithmetic() {
+    // nimony's overflow-checked add lowers to `(keepovf (add …) dest)` + an `(if (ovf) …)` guard.
+    // With checks off, svm arithmetic wraps and `(ovf)` is always false, so it's a plain wrapping
+    // store and the guard never fires. f(a,b) = a+b.
+    let leng = "\
+(stmts
+ (proc :f.0 (params (param :a.0 . (i +64)) (param :b.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (keepovf (add (i +64) a.0 b.0) r.0)
+   (if (elif (ovf) (stmts . (ret 0))))
+   (ret r.0))))";
+    assert_eq!(run_i64(leng, 0, &[3, 4]), 7);
+    assert_eq!(run_i64(leng, 0, &[100, 23]), 123);
 }

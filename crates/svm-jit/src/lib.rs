@@ -2944,6 +2944,7 @@ impl CompiledModule {
                 epoch_addr,
                 fuel_addr,
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
                 fi as u32,
                 srcloc_map.as_ref(),
                 var_labels,
@@ -3967,9 +3968,20 @@ impl CompiledModule {
         }
         for f in funcs {
             ensure_supported(f)?;
-            if f.uses_concurrency() {
+            // Threads/futex in a submitted unit stay unsupported (a spawned vCPU would outlive the
+            // `cap.call` this unit runs inside; DESIGN.md §22 "Concurrency").
+            if f.uses_threads() || f.uses_futex() {
                 return Err(JitError::Unsupported(
-                    "an incrementally defined function using fibers/threads is not supported yet",
+                    "an incrementally defined function using threads/futex is not supported yet",
+                ));
+            }
+            // Fibers ARE hosted — but only when the domain stood up a fiber runtime
+            // (`enable_fiber_hosting`, driven by a fiber-hosting `Jit` grant). Without it the
+            // `cont.*` thunk addresses are null, so a fiber-using unit must fail closed rather than
+            // lower a `call_indirect` through null.
+            if f.uses_fibers() && self.fiber.is_null() {
+                return Err(JitError::Unsupported(
+                    "a submitted unit using fibers requires a fiber-hosting Jit domain",
                 ));
             }
         }
@@ -3990,6 +4002,38 @@ impl CompiledModule {
                     .map_err(|e| JitError::Backend(e.to_string()))
             })
             .collect::<Result<_, _>>()?;
+
+        // Auto-install for unit-own funcrefs (DESIGN.md §22 "unit-own funcref"): if the unit takes
+        // its OWN functions' addresses (`ref.func`), each such funcref must be a real shared-table
+        // slot or it would resolve against the *parent's* table. Reserve one padding slot per unit
+        // function up front, so `ref.func N` lowers to `ref_slots[N]` (below); the finalized code is
+        // published into these slots after the build. `None` when the unit takes no funcref — then
+        // `ref.func` never fires and no slots are consumed. Single `cap.call`, so the picked padding
+        // slots stay free until we `install_at` them (no concurrent install races within a compile).
+        let uses_ref_func = funcs.iter().any(|f| {
+            f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::RefFunc { .. })))
+        });
+        let ref_slots: Option<Vec<u32>> = if uses_ref_func {
+            let free: Vec<u32> = self
+                .fn_table
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.type_id() == PADDING_TYPE_ID)
+                .map(|(i, _)| i as u32)
+                .take(funcs.len())
+                .collect();
+            if free.len() < funcs.len() {
+                return Err(JitError::Unsupported(
+                    "not enough reserved call_indirect slots for a submitted unit's own funcrefs \
+                     (grant a larger Jit table)",
+                ));
+            }
+            Some(free)
+        } else {
+            None
+        };
 
         let mut ctx = self.module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
@@ -4012,6 +4056,7 @@ impl CompiledModule {
                 self.epoch_addr,
                 self.fuel_addr, // same counted-fuel cell as the parent module's functions
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
                 0,
                 None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
                 None, // …nor value-label points (Stage 3a)
@@ -4049,6 +4094,27 @@ impl CompiledModule {
         self.module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+        // Publish the unit's now-finalized functions into the slots reserved above, so a `ref.func`
+        // funcref (remapped to `ref_slots[N]`) resolves to the unit's own function through the
+        // ordinary masked dispatch (DESIGN.md §22 "unit-own funcref"). Slots were picked from the
+        // padding pool and are still free (single `cap.call`), so each `install_at` succeeds.
+        if let Some(slots) = &ref_slots {
+            for ((f, id), &slot) in funcs.iter().zip(&ids).zip(slots) {
+                let code = self.module.get_finalized_function(*id);
+                let type_id = type_id_of(
+                    &self.distinct,
+                    &FuncType {
+                        params: f.params.clone(),
+                        results: f.results.clone(),
+                    },
+                );
+                if !self.install_at(slot, code, type_id) {
+                    return Err(JitError::Backend(format!(
+                        "auto-install of a unit funcref into slot {slot} failed"
+                    )));
+                }
+            }
+        }
         // Per function: the buffer-ABI trampoline (for `invoke` over a window) **and** the
         // natural-ABI entry + interned `type_id` (for B2 `install` into the function table —
         // `call_indirect` calls the natural ABI, not the trampoline).
@@ -4068,6 +4134,98 @@ impl CompiledModule {
                 ),
             })
             .collect())
+    }
+
+    /// Stand up the §12 **fiber runtime** on an already-compiled module so guest-submitted units
+    /// (`define_extra` / `invoke_extra`) may host `cont.*` (DESIGN.md §22 "Concurrency",
+    /// renegotiated 2026-07-30). A `Jit`-granting parent typically does not itself use fibers, so
+    /// its `compile` left `self.fiber` null — and a fiber-using submitted unit then lowers `cont.*`
+    /// through null thunks (`define_extra` rejects it via [`FiberEnv::is_null`]). This installs the
+    /// **same** runtime `compile` builds when the top-level module uses fibers — the domain-shared
+    /// table, the root vCPU's [`fiber_rt::FiberRuntime`], the `cont.*` thunk env, and the call
+    /// trampoline — reusing the incremental define+finalize path (`define_extra`'s, W^X-safe: only
+    /// the fresh trampoline page is mprotected; running code is untouched).
+    ///
+    /// Called by the `Jit` run entries between `compile` and `run` for a **fiber-hosting** grant.
+    /// The subsequent `run` publishes `CURRENT_RT` from `self.fiber_rt` (set here), so a submitted
+    /// unit's `cont.*`, running on the caller's stack inside the synchronous `cap.call`, resolve it.
+    /// A submitted unit whose own scheduler creates fibers over unit-local entries needs those
+    /// entries reachable as funcrefs (§22 install / the shared `fn_table`) — same as any `cont.new`.
+    ///
+    /// **Idempotent** and behavior-preserving: a no-op if fibers are already hosted (the parent used
+    /// `cont.*`/`gc.roots`), reusing an existing table/trampoline a thread-only parent already built.
+    #[cfg(fiber_rt)]
+    pub fn enable_fiber_hosting(&mut self, quota: Quota) -> Result<(), JitError> {
+        if !self.fiber.is_null() {
+            return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
+        }
+        let quota = quota.clamped();
+        // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
+        // remaps — DESIGN.md §22). A later `define_extra` interning the same signature gets this id,
+        // so id-equality stays ≡ structural equality. Consulted only here, guest not yet running.
+        let fiber_type_id = intern_type(&mut self.distinct, &fiber_func_type())?;
+        // `cont.new` masks a funcref into the shared table; the table mask is safe (indices stay in
+        // `[0, table_len)`; padding slots trap on the type check) and equals `compile`'s funcs-based
+        // mask for a domain with no reserved install table (the fiber-hosting consumer).
+        let fiber_mask = self.fn_table_mask;
+        // Domain-shared handle namespace + §15 quota — reuse the one a thread-only parent built.
+        let table = match &self.fiber_table {
+            Some(t) => std::sync::Arc::clone(t),
+            None => {
+                let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(quota.max_fibers));
+                self.fiber_table = Some(std::sync::Arc::clone(&t));
+                t
+            }
+        };
+        let mut rt = Box::new(fiber_rt::FiberRuntime::new(
+            table,
+            fiber_type_id,
+            fiber_mask,
+        ));
+        // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). A
+        // thread-only parent already built it (`compile`, `uses_threads` arm); else build it now,
+        // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`.
+        let tramp = match self.call_tramp {
+            Some(t) => t,
+            None => {
+                let mut ctx = self.module.make_context();
+                build_fiber_call_trampoline(&mut self.module, &mut ctx.func);
+                let id = self
+                    .module
+                    .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module
+                    .define_function(id, &mut ctx)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module.clear_context(&mut ctx);
+                self.module
+                    .finalize_definitions()
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                let addr = self.module.get_finalized_function(id);
+                // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the ABI its
+                // builder emitted (`code` + the guest entry's Tail args) — the same `transmute`
+                // `compile` does for its own trampoline.
+                unsafe { std::mem::transmute::<*const u8, fiber_rt::FiberCallTramp>(addr) }
+            }
+        };
+        rt.set_call_tramp(tramp);
+        self.fiber_rt = Some(rt);
+        self.call_tramp = Some(tramp);
+        self.fiber_cfg = Some((fiber_type_id, fiber_mask));
+        self.fiber = FiberEnv {
+            new_thunk: fiber_rt::fiber_new as *const () as i64,
+            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+            roots_thunk: fiber_rt::svm_gc_roots_flush as *const () as i64,
+        };
+        Ok(())
+    }
+
+    /// Fiber hosting on a target without stack-switch support: a no-op — fibers stay unsupported, so
+    /// a fiber-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
+    #[cfg(not(fiber_rt))]
+    pub fn enable_fiber_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
+        Ok(())
     }
 
     /// **Install** an incrementally-defined function into the live `call_indirect` table (DESIGN.md §22
@@ -4642,6 +4800,7 @@ fn compile_child(
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
             None, // …nor value-label points (Stage 3a)
@@ -5007,21 +5166,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // §12.8 4A.5 durable-runtime-internal: a baked thunk over a per-OS-thread word (like
                 // the TLS register), so supported on every target.
                 Inst::DurableShadowBase => {}
-                // `i64x2` min/max has no single-instruction lowering on the target ISAs, so Cranelift
-                // can't legalize it; bail to `Unsupported` (the interp oracle still covers it, and wasm
-                // never emits it — `i64x2` has no min/max op). `i8x16.mul` *is* now lowered (widen →
-                // `i16x8` multiply → low-byte pack; see the `VIntBin` lowering), so it stays supported.
-                Inst::VIntBin { shape, op, .. }
-                    if !matches!(
-                        (*shape, *op),
-                        (
-                            VShape::I64x2,
-                            VIntBinOp::MinS
-                                | VIntBinOp::MinU
-                                | VIntBinOp::MaxS
-                                | VIntBinOp::MaxU
-                        )
-                    ) => {}
+                // Every `VIntBin` lane op is lowered: `i8x16.mul` via widen → `i16x8` multiply →
+                // low-byte pack, and `i64x2` min/max via per-lane compare + `bitselect` (x86/aarch64
+                // have no native `i64` vector min/max) — see the `VIntBin` lowering.
+                Inst::VIntBin { .. } => {}
                 // Lane compares lower to a single Cranelift `icmp`/`fcmp` (legalize on every target).
                 Inst::VIntCmp { .. } | Inst::VFloatCmp { .. } => {}
                 // Lane shifts lower to vector `ishl`/`ushr`/`sshr`; Cranelift legalizes every shape
@@ -5125,6 +5273,12 @@ impl FiberEnv {
             suspend_thunk: 0,
             roots_thunk: 0,
         }
+    }
+    /// No fiber runtime is stood up for this module (the `cont.*` thunk addresses are unbaked). A
+    /// submitted unit that uses fibers must be rejected in this state — else its `cont.*` would
+    /// `call_indirect` through a null thunk. `enable_fiber_hosting` clears this for a `Jit` domain.
+    fn is_null(&self) -> bool {
+        self.new_thunk == 0
     }
 }
 
@@ -5264,6 +5418,15 @@ struct Lower<'a> {
     frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call_indirect`.
     fn_table_mask: u64,
+    /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
+    /// compile this is `None` and `ref.func N` lowers to the bare index `N` (module-0 slot N). For a
+    /// guest-submitted unit that takes its own functions' addresses, `define_extra` auto-installs the
+    /// unit's functions into reserved `call_indirect` slots and passes the map here (indexed by the
+    /// unit-local function index), so `ref.func N` lowers to `iconst(ref_slots[N])` — the real shared
+    /// table slot — instead of `N`, which would resolve against the *parent's* table. This is what
+    /// lets a unit `cont.new`/`thread.spawn`/`call_indirect` over its OWN function; it changes only
+    /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
+    ref_slots: Option<&'a [u32]>,
     /// The host `cap.call` thunk + ctx (constant addresses).
     cap: CapEnv,
     /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
@@ -5372,6 +5535,7 @@ fn build_clif(
     epoch_addr: i64,
     fuel_addr: i64,
     fn_table_mask: u64,
+    ref_slots: Option<&[u32]>,
     func_idx: u32,
     srclocs: Option<&SrcLocMap>,
     var_labels: Option<&VarLabelMap>,
@@ -5459,6 +5623,7 @@ fn build_clif(
         guard_offset,
         frontend_config: module.target_config(),
         fn_table_mask,
+        ref_slots,
         cap,
         fiber,
         thread,
@@ -6580,6 +6745,26 @@ fn lower_block(
                         b.ins().unarrow(pl, ph)
                     }
                     VIntBinOp::Mul => b.ins().imul(x, y),
+                    // `i64x2` min/max: x86/aarch64 have no native `i64` vector min/max, so Cranelift
+                    // cannot legalize `smin`/`umin`/`smax`/`umax` here. Synthesize per-lane
+                    // compare + `bitselect` (both legalize on every target): `bitselect(m, x, y)` ==
+                    // `(x & m) | (y & !m)` keeps `x` in the lanes where the compare mask is all-ones.
+                    VIntBinOp::MinS if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::SignedLessThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MinU if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::UnsignedLessThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MaxS if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::SignedGreaterThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
+                    VIntBinOp::MaxU if *shape == VShape::I64x2 => {
+                        let m = b.ins().icmp(IntCC::UnsignedGreaterThan, x, y);
+                        b.ins().bitselect(m, x, y)
+                    }
                     VIntBinOp::MinS => b.ins().smin(x, y),
                     VIntBinOp::MinU => b.ins().umin(x, y),
                     VIntBinOp::MaxS => b.ins().smax(x, y),
@@ -7085,7 +7270,17 @@ fn lower_block(
             }
             // A funcref is just the function index as plain i32 data (§3c) — the same
             // value the interpreter materializes; `call_indirect` masks it into the table.
-            Inst::RefFunc { func } => b.ins().iconst(I32, *func as i64),
+            Inst::RefFunc { func } => {
+                // A submitted unit's own-function address must be a real shared-table slot (the unit
+                // is auto-installed there — DESIGN.md §22 "unit-own funcref"), so it resolves to the
+                // unit's function through the ordinary masked dispatch instead of the parent's table.
+                // Top-level compiles have no remap: `ref.func N` is module-0 slot N verbatim.
+                let idx = match lower.ref_slots {
+                    Some(slots) => *slots.get(*func as usize).unwrap_or(func),
+                    None => *func,
+                };
+                b.ins().iconst(I32, idx as i64)
+            }
             // §12 standalone fence. Cranelift emits a full (seq-cst) barrier regardless of the
             // requested `order` — the same sound strengthening the atomics use.
             Inst::AtomicFence { .. } => {

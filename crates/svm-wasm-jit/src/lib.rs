@@ -724,6 +724,11 @@ fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
             Inst::FToISat { op, .. } | Inst::FToITrap { op, .. } => tys.push(op.parts().1.val()),
             Inst::IToFConv { op, .. } => tys.push(op.parts().1.val()),
             Inst::Cast { op, .. } => tys.push(op.sig().2),
+            // Pointer provenance ops are plain `i64` off-CHERI: `ptr.add` a wrapping add, `ptr.cast`
+            // a no-op. Both yield `i64`.
+            Inst::PtrAdd { .. } | Inst::PtrCast { .. } => tys.push(ValType::I64),
+            // A standalone fence orders accesses without touching memory; no SSA result.
+            Inst::AtomicFence { .. } => {}
             // `Fma` has no core-wasm scalar opcode (relaxed-SIMD only), so it stays interpreter-tier.
             Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
@@ -1031,20 +1036,13 @@ pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
 
 // ---- the emitter ---------------------------------------------------------------------------------
 
-/// Compile every function of a **verified** `m` into one wasm module, importing a **non-shared**
-/// `env.memory`. See [`compile_module_shared`] for the browser (threads-build) link target.
+/// Compile every function of a **verified** `m` into one wasm module (whole-module, all in-subset),
+/// importing a **non-shared** `env.memory` — the differential/link helper. Pass `shared_memory` to
+/// [`compile_module_with`] for the browser threads-build link target (shared `env.memory`); the
+/// emitted code is otherwise byte-identical (only the memory-import limits differ), so the
+/// `tests/differential.rs` run under `wasmi` — which has no shared memory — covers both.
 pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
     compile_module_with(m, false)
-}
-
-/// Like [`compile_module`] but the imported `env.memory` is declared **shared** — the browser
-/// wasm-JIT tier links the emitted module against the cdylib's shared linear memory (the threads
-/// build), and wasm requires the import's shared flag to match the provided memory's. The emitted
-/// code is otherwise byte-identical to the non-shared form (only the memory-import limits differ),
-/// so the `compile_module` differential (`tests/differential.rs`, under `wasmi`, which has no
-/// shared-memory support) fully covers this variant's codegen.
-pub fn compile_module_shared(m: &Module) -> Result<Vec<u8>, Error> {
-    compile_module_with(m, true)
 }
 
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
@@ -1063,7 +1061,7 @@ pub const ENV_CELL_BYTES: usize = ENV_SCRATCH_OFF as usize + XCALL_MAX_SLOTS * 8
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per SVM function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
 /// and `env.call_interp`. Returns [`Error::Unsupported`] if *any* function is outside the v1 subset
-/// — for a mixed integer/interp guest use [`compile_module_mixed`].
+/// — for a partly-emittable guest use the [`compile_jit`] front door.
 pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     let a = analyze(m);
     if !a.in_subset.iter().all(|&s| s) {
@@ -1074,40 +1072,6 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     let n = m.funcs.len();
     let emitted: Vec<usize> = (0..n).collect();
     let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
-    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
-}
-
-/// Compile a **mixed-tier** guest (`BROWSER.md` § "wasm-JIT tier", slice 3): emit the in-subset
-/// functions and route a call to an interp leaf through `env.call_interp` (the engine runs it on the
-/// bytecode interpreter — see [`Analysis`]). [`Error::Unsupported`] unless [`Analysis::mixed_ok`].
-pub fn compile_module_mixed(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
-    compile_module_mixed_entry(m, 0, shared_memory)
-}
-
-/// Like [`compile_module_mixed`] but eligibility is rooted at `entry` (the function the host calls),
-/// not func 0 — for a module whose entry kernel isn't func 0 (the cross-engine bench). Every emitted
-/// function is still exported as `f{svm_idx}`, so the host calls `f{entry}`.
-pub fn compile_module_mixed_entry(
-    m: &Module,
-    entry: u32,
-    shared_memory: bool,
-) -> Result<Vec<u8>, Error> {
-    let a = analyze_from(m, entry);
-    if !a.mixed_ok {
-        return Err(Error::Unsupported("guest is not mixed-tier runnable"));
-    }
-    // Emit the reachable in-subset functions in SVM-index order; each gets the next wasm index.
-    // Interp leaves (and unreachable / non-subset functions) get no wasm index — a call to a leaf
-    // goes to the import. Restricting to `reachable` keeps an unreachable in-subset function (whose
-    // own callees `mixed_ok` never checked) from being emitted with an unroutable call.
-    let mut wasm_of: Vec<Option<u32>> = vec![None; m.funcs.len()];
-    let mut emitted: Vec<usize> = Vec::new();
-    for (i, slot) in wasm_of.iter_mut().enumerate() {
-        if a.reachable[i] && a.in_subset[i] {
-            *slot = Some(IMPORTED_FUNCS + emitted.len() as u32);
-            emitted.push(i);
-        }
-    }
     emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
 }
 
@@ -1292,7 +1256,7 @@ pub fn outline_cap_calls(m: &mut Module) {
 /// Compile a **whole-module reactor** guest with **widened cross-tier calls** (Doom-perf): emit every
 /// reachable in-subset function to wasm and route a **direct** `Call` to any reachable, non-emitted,
 /// **integer-signature** function through `env.call_interp` — not just the strict memory-free/call-free
-/// [`interp_leaf`]s [`compile_module_mixed_entry`] allows. A cross-tier callee here may touch memory,
+/// `interp_leaf`s the throwaway-window path allows. A cross-tier callee here may touch memory,
 /// call other functions, and use capabilities, so the host's `call_interp` callback **must run it over
 /// the SAME (shared) window + host** as the emitted code (a fresh window would lose its memory
 /// effects) — the contract this mode adds over the leaf-only modes, which run leaves over a throwaway
@@ -1346,7 +1310,7 @@ pub fn compile_module_reactor(
 }
 
 /// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
-/// per-Worker JIT). Unlike [`compile_module_mixed_entry`], eligibility is **not** rooted at one
+/// per-Worker JIT). Unlike the rooted, wasm-driven [`compile_module_reactor`], eligibility is **not** rooted at one
 /// entry: the guest keeps running on the resumable interpreter (which drives `thread.spawn`/`join`,
 /// atomics, `memory.wait`), and a direct `Call` to any emitted function surfaces as a *tier-up* the
 /// host runs on the emitted region — so a pure compute leaf reachable **only** through
@@ -1415,6 +1379,98 @@ pub fn compile_module_tierup(
     }
     let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf)?;
     Ok((wasm, emit))
+}
+
+// ---- the unified front door -----------------------------------------------------------------------
+
+/// The embedder's **invocation intent** — the one thing that is *not* derivable from the IR (two
+/// guests can have byte-identical IR and differ only in how the host chooses to drive them). Everything
+/// else — which functions emit, who owns the top-level frame, where the bytecode fallback kicks in — is
+/// derived from the module by [`compile_jit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// Run `entry` once to completion (a batch `_start`, or the cross-engine bench's kernel).
+    Batch { entry: u32 },
+    /// A long-lived reactor re-entered at `entry` (`tick`) each activation.
+    Reactor { entry: u32 },
+    /// Threaded / no single root — vCPUs enter through `thread.spawn`, so there is no top-level
+    /// wasm frame the host can own; the interpreter must drive.
+    Threaded,
+}
+
+/// How the host must drive the wasm [`Artifact::wasm`] — the strategy [`compile_jit`] picked from the
+/// IR. The two variants are the irreducible fork (who owns the top-level stack frame), forced by
+/// wasm's inability to unwind a frame across a suspension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveMode {
+    /// **Wasm owns the top-level frame:** the host calls `f{entry}` directly; a reachable function
+    /// with `emitted[i] == false` is a cross-tier callee run on the bytecode interpreter over the
+    /// shared window via `env.call_interp`. Chosen when the guest is rooted and nothing reachable can
+    /// suspend (a wasm frame can't unwind for a stack switch).
+    WasmDriven { entry: u32 },
+    /// **The bytecode interpreter owns the top-level frame** and drives scheduling / suspension /
+    /// threads; a direct `Call` to an `emitted[i]` function tiers up onto the emitted region. The
+    /// universal fallback — it runs any guest, JIT-accelerating whatever compute it can (possibly
+    /// nothing, i.e. a pure-bytecode run).
+    InterpDriven,
+}
+
+/// A compiled guest plus how to drive it: the emitted wasm, the per-function **emitted** bitmap
+/// (`emitted[i]` ⇒ `f{i}` is exported and runs as wasm; the rest are interpreter-serviced), and the
+/// [`DriveMode`] the host must use.
+pub struct Artifact {
+    pub wasm: Vec<u8>,
+    pub emitted: Vec<bool>,
+    pub drive: DriveMode,
+}
+
+/// Whether any function reachable from `entry` uses a §12 concurrency op (`cont.*`/`suspend`/
+/// `thread.*`/futex). Such a guest cannot be wasm-driven: the interpreter must own the stack so it can
+/// unwind across a suspension / block a vCPU (a wasm frame can neither).
+fn reachable_concurrency(m: &Module, entry: u32) -> bool {
+    let a = analyze_from(m, entry);
+    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_concurrency())
+}
+
+/// **The single wasm-JIT front door.** The embedder supplies only the invocation [`Shape`]; the
+/// execution *strategy* is derived from the IR: a rooted, suspension-free guest is **wasm-driven**
+/// (the whole hot path is emitted wasm, fastest), everything else is **interpreter-driven** with
+/// per-function tier-up (the interpreter owns scheduling/suspension and lifts hot compute). Either
+/// way non-emitted functions fall back to the bytecode interpreter, so this never fails to produce a
+/// runnable artifact for a verified module.
+///
+/// This removes the strategy choice from consumers: picking wrong could previously only cost
+/// performance (never correctness), so deriving it here is pure upside. The one honest parameter left
+/// is the `shape` — the host's own invocation intent, which the bytes can't express.
+pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Artifact, Error> {
+    let interp_driven = |m: &Module| -> Result<Artifact, Error> {
+        let (wasm, emitted) = compile_module_tierup(m, shared_memory)?;
+        Ok(Artifact {
+            wasm,
+            emitted,
+            drive: DriveMode::InterpDriven,
+        })
+    };
+    match shape {
+        // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
+        Shape::Threaded => interp_driven(m),
+        Shape::Batch { entry } | Shape::Reactor { entry } => {
+            // Wasm-drivable iff rooted-eligible AND nothing reachable can suspend across a wasm frame.
+            // The concurrency check makes this selection strictly more conservative than the raw
+            // `compile_module_reactor` entry (which would emit a suspending cross-tier callee it can't
+            // safely unwind) — closing that latent sharp edge.
+            if !reachable_concurrency(m, entry) {
+                if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
+                    return Ok(Artifact {
+                        wasm,
+                        emitted,
+                        drive: DriveMode::WasmDriven { entry },
+                    });
+                }
+            }
+            interp_driven(m)
+        }
+    }
 }
 
 /// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
@@ -2278,6 +2334,23 @@ fn emit_block_body(
                 code.push(OP_SELECT);
                 set_result(cx, code, k, &mut next_val);
             }
+            // Pointer provenance ops (off-CHERI, plain `i64`): `ptr.add` is a wrapping `i64.add`;
+            // `ptr.cast` is a free identity that forwards its operand into the result local.
+            Inst::PtrAdd { a, b: rb } => {
+                get(code, cx, *a);
+                get(code, cx, *rb);
+                code.push(0x7c); // i64.add (wrapping)
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::PtrCast { a, .. } => {
+                get(code, cx, *a);
+                set_result(cx, code, k, &mut next_val);
+            }
+            // Standalone fence: a pure ordering barrier with no data effect. The wasm-JIT only
+            // compiles single-threaded guests (concurrency folds to the interp), where a fence is
+            // observably a no-op — so emit nothing (matching the oracle, which honors it identically
+            // single-threaded).
+            Inst::AtomicFence { .. } => {}
             Inst::Load {
                 op, addr, offset, ..
             } => {

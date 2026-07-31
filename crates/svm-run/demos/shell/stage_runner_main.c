@@ -5,9 +5,19 @@ long write(long fd, void *buf, long n);
 long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
 long __vm_region_page_size(int r);
 
-/* Pin the declared window at `memory 18` (chibicc sizes proportionally to the static region): the
-   shell spawns stages with size_log2 = 18, and a §14 module child's carve must equal its declared
-   memory. The harness asserts the pin, so drift is loud. */
+/* The stage window: `1 << SVM_STAGE_LOG2` bytes — equal to the carve the shell spawns each stage into
+   (a §14 child's carve must equal its declared memory). Default 18 (256 KiB), the size chibicc lands
+   at under the native differential's 16 KiB data page (with `window_pin_` below); the browser's 64 KiB
+   page rounds the data sections up so the window is naturally 19 (512 KiB), and the fixture builds with
+   `-D SVM_STAGE_LOG2=19` so the ring maps below sit at the right half-window offset. */
+#ifndef SVM_STAGE_LOG2
+#define SVM_STAGE_LOG2 18
+#endif
+#define SVM_STAGE_WIN (1L << SVM_STAGE_LOG2)
+
+/* Pin the declared window up to `SVM_STAGE_WIN` (chibicc sizes it to the next power of two ≥ 2·data_end)
+   under the 16 KiB page, where the runner's static region is otherwise too small. Harmless under the
+   64 KiB page (the section alignment already reaches the next size); the harness asserts the result. */
 static char window_pin_[50000];
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
@@ -101,13 +111,16 @@ int main(int argc, char **argv) {
   long g = __vm_region_page_size(regs[0]);
   if (g <= 64) return 125;
   rcap = g - 64;
-  /* Map the rings into the upper half of the 256 KiB window — clear of the globals/args/frame
-     region below and shallow enough that the data stack (near the top) never reaches down here. */
-  if (__vm_region_map(regs[0], 131072, 0, g, 3) != 0) return 125;
-  rin = 131072;
+  /* Map the rings into the **upper half** of the window (`SVM_STAGE_WIN/2`) — clear of the
+     globals/args/frame region below and shallow enough that the data stack (near the top) never
+     reaches down here. The half-window base scales with the window size, so it holds under both the
+     18 (256 KiB, base 128 KiB) native and 19 (512 KiB, base 256 KiB) browser fixtures. */
+  long mb = SVM_STAGE_WIN / 2;
+  if (__vm_region_map(regs[0], mb, 0, g, 3) != 0) return 125;
+  rin = mb;
   if (nregs > 1) {
-    if (__vm_region_map(regs[1], 131072 + g, 0, g, 3) != 0) return 125;
-    rout = 131072 + g;
+    if (__vm_region_map(regs[1], mb + g, 0, g, 3) != 0) return 125;
+    rout = mb + g;
   }
 
   char *cmd = argv[0];

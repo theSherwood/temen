@@ -413,6 +413,13 @@ enum Op {
         size_log2: u32,
         quota: u32,
         dst: u32,
+        /// §14 `instantiate_named` (op 11, PROCESS.md S2): the `(grants_ptr, grants_n)` register pair
+        /// for the child's by-name grant list (op 0 is `None`). Same-module counterpart of op 13 — the
+        /// child runs the holder's *own* program at `entry`, but its powerbox additionally carries the
+        /// re-granted `grants_n × {name_off, name_len, handle, flags}` caps read from the parent window
+        /// (via the shared `Host::spawn_named_child`), so a spawned stage resolves an inherited region
+        /// (a ring end) or `stdout` by name — the concurrent-pipeline spawn.
+        grants: Option<(u32, u32)>,
     },
     /// §14 `Instantiator.instantiate_module(module, entry, off, size_log2, quota)` (op 5): like
     /// [`Op::Instantiate`], but the child runs a host-granted **separate** `Module` (`module` is its
@@ -715,6 +722,21 @@ impl ModuleSource {
         mods.push(std::sync::Arc::new(unit));
         mods.len() - 1
     }
+
+    /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
+    /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
+    /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
+    fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
+        self.mods.lock().unwrap_or_else(|e| e.into_inner())[1..].to_vec()
+    }
+
+    /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
+    fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
+        let mut mods = self.mods.lock().unwrap_or_else(|e| e.into_inner());
+        mods.truncate(1);
+        mods.extend(units.iter().cloned());
+    }
 }
 
 /// Build a §14 child / coroutine's natural dispatch table over its `module` in the shared source.
@@ -833,11 +855,17 @@ fn scan_seams(funcs: &[Func]) -> Seams {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
-                    // ops 0/1 = instantiate/join, op 5 = instantiate_module (executor children);
-                    // everything else on INSTANTIATOR/YIELDER is the inline coroutine round-trip.
+                    // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 11 =
+                    // instantiate_named, op 13 = instantiate_module_named (all executor children,
+                    // scheduler-driven — the named variants re-grant caps but spawn the same kind of
+                    // confined task); everything else on INSTANTIATOR/YIELDER is the inline coroutine
+                    // round-trip. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
+                    // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
+                    // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 14,
+                        op: 0 | 1 | 5 | 11 | 13 | 14,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -1388,6 +1416,20 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     size_log2: g(args[2]),
                     quota: g(args[3]),
                     dst,
+                    grants: None,
+                },
+                // op 11 = instantiate_named: op 0 + a by-name grant list. Args:
+                // (grants_ptr, grants_n, entry, off, size_log2, quota). The child runs the holder's own
+                // program (same module as op 0); the driver reads the grant records from the parent
+                // window and re-grants each cap into the child powerbox.
+                (cap_id::INSTANTIATOR, 11) if args.len() >= 6 => Op::Instantiate {
+                    handle: g(*handle),
+                    entry: g(args[2]),
+                    off: g(args[3]),
+                    size_log2: g(args[4]),
+                    quota: g(args[5]),
+                    dst,
+                    grants: Some((g(args[0]), g(args[1]))),
                 },
                 (cap_id::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
@@ -2855,7 +2897,14 @@ impl<'p> Vcpu<'p> {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 }) => {
+                    // op 11 (named grants) is driven by the scheduler `drive` arm (the browser's
+                    // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
+                    // no child powerbox, so it declines a grant list rather than silently drop it.
+                    if grants.is_some() {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    }
                     if let Some(ev) =
                         self.event_instantiate(ibase, isz, entry, off, size_log2, quota, dst)
                     {
@@ -3600,6 +3649,7 @@ pub fn ir_value_trace(
 /// lives directly on the [`DebugRun`]/[`ScheduledDebugRun`]; a §14 **separate-module** child carries its
 /// own here (built from the granted `Module` at spawn, keyed by its pushed source index) so
 /// `read_var`/`var_addr`/`value_in_frame` resolve inside the child's body, not just module 0's.
+#[derive(Clone)]
 struct ModuleDebug {
     /// The child's index in the shared [`ModuleSource`] (`>= 1`) — matched against a frame's module so a
     /// frame outside this child (e.g. an installed §22 unit) isn't misread against these tables.
@@ -3640,6 +3690,176 @@ impl ModuleDebug {
             fn_block_base,
             fn_block_types,
         }
+    }
+}
+
+/// A single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
+/// [`DebugRun`]'s root continuation at logical time [`clock`](DebugRunSnapshot::clock), so a reverse
+/// `seek`/`step_back` on the DAP backend can restart a replay here instead of from clock 0 — bounding
+/// the replay to the checkpoint stride. The bytecode counterpart of the tree-walker's `SeekCheckpoint`.
+/// Opaque to the backend, which only stores it in a ladder and hands it back to [`DebugRun::restore`].
+pub struct DebugRunSnapshot {
+    clock: u64,
+    /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
+    active: Vm,
+    /// The active continuation id — `ROOT_FIBER` or the handle of the fiber currently running.
+    active_id: usize,
+    /// Parked resumers on the §12 fiber resume chain: `(fiber id, its `Vm`, resume-result slot)`. Each
+    /// `Vm` shares the one window (snapshotted in `mem`), so cloning is a faithful deep copy.
+    chain: Vec<(usize, Vm, u32)>,
+    /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
+    fibers: Vec<FiberState>,
+    /// The §14 coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
+    coroutines: Vec<Option<CoroSnapshot>>,
+    /// While stepping inside a coroutine body: `(handle, parent resume-result slot, parent depth)`.
+    active_coro: Option<(usize, u32, usize)>,
+    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** coroutine's pushed program), so
+    /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
+    /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
+    extra_units: Vec<std::sync::Arc<Compiled>>,
+    /// The root window's full memory state — committed bytes **and** page-protection map
+    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore; `None` for a
+    /// memoryless run. Capturing the protection map (not just the prefix bytes) is what admits a
+    /// **page-mapping** root (`map`/`unmap`/`protect`/grow). Fibers and same-module coroutines share this
+    /// one window (coroutines via a `nested_view` over the same backing), so their bytes ride here too.
+    mem: Option<super::MemLayout>,
+    /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
+    host: super::HostReplaySubstate,
+}
+
+/// A §14 coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a `nested_view`
+/// sub-view sharing the parent's backing region, so its bytes are already in the parent `mem` snapshot;
+/// only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds the view over the
+/// restored parent. The host is a fresh Yielder-only powerbox on restore, so only its replay substate is
+/// carried. The coroutine's `module` rides in `vm.module` (`0` = same-module; `>= 1` = a **separate**
+/// module, whose pushed source unit is captured in the run snapshot's `extra_units`); its own §6
+/// metadata (`mod_debug`) is carried so a step-into resolves the separate module's source variables after
+/// restore. The coroutine's own page-protection map (`prot`) is captured too, admitting a **demand**
+/// (`fault_yields`) coroutine — whose pages are `Unmapped` until the parent supplies them — and a
+/// coroutine that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the parent snapshot.
+struct CoroSnapshot {
+    vm: Vm,
+    win_base: u64,
+    size_log2: u8,
+    host: super::HostReplaySubstate,
+    awaiting: Option<u32>,
+    faulted_page: Option<u64>,
+    /// Whether this is a **demand** child (its page faults suspend to the parent to be supplied, rather
+    /// than trapping) — reinstated so a mid-demand coroutine resumes with the same fault semantics.
+    fault_yields: bool,
+    /// The coroutine's own page-protection map ([`Mem::prot_snapshot`]) — which pages are supplied
+    /// (`Rw`)/`Ro`/`Unmapped` in its `nested_view`. Reinstalled with [`Mem::install_prot`] on restore
+    /// (its bytes ride in the parent snapshot). Empty for a pristine coroutine.
+    prot: Vec<(u64, super::PageProt)>,
+    /// A separate-module coroutine's own §6 debug metadata (`None` for a same-module coroutine), cloned
+    /// so `read_var`/`var_addr` resolve inside its body after restore.
+    mod_debug: Option<ModuleDebug>,
+}
+
+impl DebugRunSnapshot {
+    /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
+    pub fn clock(&self) -> u64 {
+        self.clock
+    }
+}
+
+/// Capture a live **same-module** coroutine into a [`CoroSnapshot`]: its `Vm`, its window geometry (the
+/// `nested_view`'s absolute base + size, so `restore` can recreate the view), and its host replay
+/// substate. The coroutine's bytes are *not* copied here — they live in the parent's backing region
+/// (shared via `nested_view`) and ride in the parent window snapshot.
+fn coro_snapshot(c: &Coro) -> CoroSnapshot {
+    CoroSnapshot {
+        vm: c.vm.clone(),
+        win_base: c.mem.as_ref().map_or(0, |m| m.window.base()),
+        size_log2: c
+            .mem
+            .as_ref()
+            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
+        host: c.host.replay_substate(),
+        awaiting: c.awaiting,
+        faulted_page: c.faulted_page,
+        fault_yields: c.fault_yields,
+        prot: c.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
+        mod_debug: c.mod_debug.clone(),
+    }
+}
+
+/// Rebuild a live [`Coro`] from a [`CoroSnapshot`] on restore — the inverse of [`coro_snapshot`]:
+/// recreate its `nested_view` over the (already reseeded) `parent_mem` window so its bytes (shared via
+/// the backing region) are correct, a fresh Yielder-only host carrying the captured replay substate, and
+/// its natural dispatch table over its own `module` (`0` = primary; a separate module resolves against
+/// the just-restored `source`, whose `extra_units` were re-pushed first). Shared by the single-vCPU and
+/// scheduled `restore` paths.
+fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, source: &ModuleSource) -> Coro {
+    let module = cs.vm.module;
+    let progs_len = source.get(module).map_or(0, |u| u.progs.len());
+    let mem = parent_mem.map(|m| m.nested_view(cs.win_base, cs.size_log2));
+    if let Some(m) = &mem {
+        m.install_prot(&cs.prot); // its supplied/`Ro`/`Unmapped` pages (bytes rode in the parent reseed)
+    }
+    let mut host = Host::new();
+    host.grant_yielder();
+    host.restore_replay_substate(&cs.host);
+    Coro {
+        vm: cs.vm.clone(),
+        mem,
+        host,
+        table: build_table_for(progs_len, 0, module as u32),
+        awaiting: cs.awaiting,
+        fault_yields: cs.fault_yields,
+        faulted_page: cs.faulted_page,
+        mod_debug: cs.mod_debug.clone(),
+    }
+}
+
+/// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
+/// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
+/// lies within the parent's snapshotted prefix ([`Mem::nested_within_prefix`], so its bytes ride in the
+/// parent reseed rather than a separate copy). A memoryless child is trivially fine. Shared by the
+/// single-vCPU and scheduled checkpointable gates, for both coroutines and `instantiate` children.
+fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> bool {
+    child.is_none_or(|m| {
+        m.layout_snapshot_safe() && parent.is_some_and(|p| m.nested_within_prefix(p))
+    })
+}
+
+/// Capture a live `instantiate`-child [`DbgEnv`] into an [`EnvSnapshot`]: its window geometry
+/// (`nested_view` base + size) + host replay substate + fuel + its own page-protection map. Its bytes ride
+/// in the shared window snapshot (the view shares the root backing region).
+fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
+    EnvSnapshot {
+        win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
+        size_log2: e
+            .mem
+            .as_ref()
+            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
+        module,
+        host: e.host.replay_substate(),
+        fuel: e.fuel,
+        prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
+    }
+}
+
+/// Rebuild a §14 `instantiate`-child [`DbgEnv`] from an [`EnvSnapshot`] on restore — the inverse of
+/// [`env_snapshot`]: recreate its `nested_view` over the (reseeded) `shared_mem` window, its attenuated
+/// `Instantiator` + `AddressSpace` powerbox over `[0, child_size)` (deterministic in `child_size`), the
+/// captured host replay substate, its natural module-0 table, and its fuel quota.
+fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource) -> DbgEnv {
+    let child_size = 1u64 << es.size_log2;
+    let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2));
+    if let Some(m) = &mem {
+        m.install_prot(&es.prot); // its `map`/`unmap`/`protect`ed pages (bytes rode in the shared reseed)
+    }
+    let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
+    let mut host = Host::new();
+    host.grant_instantiator(0, child_size);
+    host.grant_address_space(0, child_size);
+    host.restore_replay_substate(&es.host);
+    DbgEnv {
+        mem,
+        host,
+        table: build_table_for(progs_len, 0, es.module as u32),
+        fuel: es.fuel,
     }
 }
 
@@ -3685,6 +3905,21 @@ pub struct DebugRun {
     /// the per-op `access_of` computation is skipped entirely. Ids are owned by the caller (the DAP
     /// backend), which re-applies the set after a `seek` rebuild.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// Set when the last advance parked at a **blocking-stdin** `read` ([`Outcome::StdinPark`],
+    /// INTERACTIVE_EMBEDDING.md W4): the read did not execute and `op_clock` did not advance.
+    /// Cleared at each advance entry — the parked read re-executes on resume, so the state
+    /// re-derives (re-parks or proceeds) rather than being carried (invariant 7).
+    stdin_parked: bool,
+    /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
+    /// op with the op's [`MemEvent`](super::MemEvent), the run's `op_clock`, and task 0. `None`
+    /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
+    /// `seek` rebuild (the `watch_specs` pattern) and leaves its rev-trace probes silent.
+    access_sink: Option<AccessSinkFn>,
+    /// The session's **scheduled debugger writes** ([`ScheduledWrite`], slice 8), sorted by clock,
+    /// with the cursor of the next un-applied entry. Empty (the default) is one index compare per
+    /// advance; the DAP backend re-installs the list on every rebuild.
+    scheduled_writes: Vec<(u64, ScheduledWrite)>,
+    write_cursor: usize,
     /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
     /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -3713,15 +3948,74 @@ fn watch_hit_before(
         .get(inst)?;
     let base_off = *fn_block_base.get(func as usize)?.get(block)? as usize;
     let vals = vm.regs.get(vm.base + base_off..)?;
-    let super::MemAccess::Range { base, width, write } = super::access_of(ir_inst, vals, mem)
-    else {
-        return None;
+    // `watch_accesses` (not `access_of`): bulk `mem.copy`/`mem.move`/`mem.fill` and v128 ops
+    // check both their spans, so a memcpy over a watched byte stops here like a plain store.
+    super::watch_accesses(ir_inst, vals, mem)
+        .into_iter()
+        .find_map(|acc| {
+            let super::MemAccess::Range { base, width, write } = acc else {
+                return None;
+            };
+            let end = base.saturating_add(width as u64);
+            watchpoints.iter().find_map(|(addr, len, kind)| {
+                let w_end = addr.saturating_add(*len);
+                (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
+            })
+        })
+}
+
+/// A debug-session **access sink** (INTERACTIVE_EMBEDDING.md slice 3): observes every module-0
+/// memory op the session is about to execute — `(clock-or-turn, task, event)`, with **raw
+/// pre-confinement addresses** (the W3 hook-pass vocabulary, [`super::MemEvent`]) — with **no
+/// module rewrite**, so the machine view, SSA slots, and the op-clock are identical with a sink
+/// installed or absent (invariant 9b: observation never perturbs semantics). Zero cost when
+/// absent (callers gate on `Some`). Fed to host-side models (cache/paging/shared-state) by the
+/// DAP backend.
+pub type AccessSinkFn = Box<dyn FnMut(u64, usize, super::MemEvent) + Send>;
+
+/// The window memory-map introspection tuple — `(page_size, mapped, reserved, explicit-state
+/// pages)`, the shape `Mem::map_info` returns (INTERACTIVE_EMBEDDING.md slice 5).
+pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
+
+/// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
+/// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
+/// scope). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
+/// and address semantics are the instrumentation pass's, pinned by the `access_sink_diff`
+/// differential.
+fn emit_access(
+    vm: &Vm,
+    source: &ModuleSource,
+    funcs: &[Func],
+    fn_block_base: &[Vec<u32>],
+    clock: u64,
+    task: usize,
+    sink: &mut AccessSinkFn,
+) {
+    let Some(pc) = vm.cur_ir_pc(source) else {
+        return;
     };
-    let end = base.saturating_add(width as u64);
-    watchpoints.iter().find_map(|(addr, len, kind)| {
-        let w_end = addr.saturating_add(*len);
-        (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
-    })
+    if pc.module != 0 {
+        return;
+    }
+    let Some(ir_inst) = funcs
+        .get(pc.func as usize)
+        .and_then(|f| f.blocks.get(pc.block))
+        .and_then(|b| b.insts.get(pc.inst))
+    else {
+        return;
+    };
+    let Some(base_off) = fn_block_base
+        .get(pc.func as usize)
+        .and_then(|v| v.get(pc.block))
+    else {
+        return;
+    };
+    let Some(vals) = vm.regs.get(vm.base + *base_off as usize..) else {
+        return;
+    };
+    if let Some(ev) = super::mem_event_of(ir_inst, vals) {
+        sink(clock, task, ev);
+    }
 }
 
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
@@ -4105,6 +4399,164 @@ struct FrameReader<'a> {
     coro_debug: Option<&'a ModuleDebug>,
 }
 
+/// A resolved write destination (slice 8): a typed absolute regs slot (a promoted SSA scalar) or
+/// a confined window address (a memory-located variable).
+enum WriteTarget {
+    Ssa { reg: usize, ty: ValType },
+    Win { addr: u64 },
+}
+
+/// A **debugger write scheduled at a clock/turn** (INTERACTIVE_EMBEDDING.md slice 8): re-applied
+/// whenever execution passes that clock on **any** path — a live resume and a seek replay reach
+/// identical states, which is what keeps the history slider truthful after an edit. `task` names
+/// the focused vCPU a `Var` write resolves in on the scheduled engine (ignored single-vCPU).
+#[derive(Clone, Debug)]
+pub enum ScheduledWrite {
+    Window {
+        addr: u64,
+        bytes: Vec<u8>,
+    },
+    Var {
+        task: usize,
+        frame: usize,
+        name: String,
+        value: i64,
+        width: usize,
+    },
+}
+
+/// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
+/// write: an unresolvable or float target is skipped.
+fn apply_target(
+    target: Option<WriteTarget>,
+    value: i64,
+    width: usize,
+    vm_regs: &mut [Reg],
+    mem: &mut Option<Mem>,
+) {
+    match target {
+        Some(WriteTarget::Ssa { reg, ty }) => {
+            let v = match ty {
+                ValType::I32 => Value::I32(value as i32),
+                ValType::I64 => Value::I64(value),
+                _ => return,
+            };
+            if let Some(r) = vm_regs.get_mut(reg) {
+                *r = Reg::from_value(v);
+            }
+        }
+        Some(WriteTarget::Win { addr }) => {
+            let w = width.clamp(1, 8);
+            if let Some(m) = mem.as_mut() {
+                let _ = m.write_bytes(addr, &value.to_le_bytes()[..w]);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Apply every scheduled write due at `clock` to a **single-vCPU** run's pieces; `cursor` advances
+/// past applied and stale entries (entries below `clock` are inside a restored checkpoint already).
+#[allow(clippy::too_many_arguments)]
+fn apply_due_writes(
+    writes: &[(u64, ScheduledWrite)],
+    cursor: &mut usize,
+    clock: u64,
+    vt: &mut VTask,
+    source: &ModuleSource,
+    mem: &mut Option<Mem>,
+    debug: Option<&DebugInfo>,
+    fn_block_base: &[Vec<u32>],
+    fn_block_types: &[Vec<Vec<ValType>>],
+) {
+    while *cursor < writes.len() && writes[*cursor].0 < clock {
+        *cursor += 1;
+    }
+    while *cursor < writes.len() && writes[*cursor].0 == clock {
+        match &writes[*cursor].1 {
+            ScheduledWrite::Window { addr, bytes } => {
+                if let Some(m) = mem.as_mut() {
+                    let _ = m.write_bytes(*addr, bytes);
+                }
+            }
+            ScheduledWrite::Var {
+                frame,
+                name,
+                value,
+                width,
+                ..
+            } => {
+                if vt.active_coro.is_none() {
+                    let target = FrameReader {
+                        vm: &vt.active,
+                        source,
+                        mem: &*mem,
+                        debug,
+                        fn_block_base,
+                        fn_block_types,
+                        coro_debug: None,
+                    }
+                    .write_target(*frame, name);
+                    apply_target(target, *value, *width, &mut vt.active.regs, mem);
+                }
+            }
+        }
+        *cursor += 1;
+    }
+}
+
+/// The scheduled-engine twin of [`apply_due_writes`]: a `Var` write resolves in its recorded
+/// `task`'s frame.
+#[allow(clippy::too_many_arguments)]
+fn apply_due_writes_sched(
+    writes: &[(u64, ScheduledWrite)],
+    cursor: &mut usize,
+    turn: u64,
+    tasks: &mut [DbgTask],
+    source: &ModuleSource,
+    mem: &mut Option<Mem>,
+    debug: Option<&DebugInfo>,
+    fn_block_base: &[Vec<u32>],
+    fn_block_types: &[Vec<Vec<ValType>>],
+) {
+    while *cursor < writes.len() && writes[*cursor].0 < turn {
+        *cursor += 1;
+    }
+    while *cursor < writes.len() && writes[*cursor].0 == turn {
+        match &writes[*cursor].1 {
+            ScheduledWrite::Window { addr, bytes } => {
+                if let Some(m) = mem.as_mut() {
+                    let _ = m.write_bytes(*addr, bytes);
+                }
+            }
+            ScheduledWrite::Var {
+                task,
+                frame,
+                name,
+                value,
+                width,
+            } => {
+                if let Some(t) = tasks.get_mut(*task) {
+                    if t.vt.active_coro.is_none() {
+                        let target = FrameReader {
+                            vm: &t.vt.active,
+                            source,
+                            mem: &*mem,
+                            debug,
+                            fn_block_base,
+                            fn_block_types,
+                            coro_debug: None,
+                        }
+                        .write_target(*frame, name);
+                        apply_target(target, *value, *width, &mut t.vt.active.regs, mem);
+                    }
+                }
+            }
+        }
+        *cursor += 1;
+    }
+}
+
 impl<'a> FrameReader<'a> {
     /// Call-stack depth (running activation + suspended callers).
     fn depth(&self) -> usize {
@@ -4171,6 +4623,42 @@ impl<'a> FrameReader<'a> {
         let off = *fn_block_base.get(func)?.get(block)? as usize;
         let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
         Some(self.vm.regs[base + off + idx].to_value(ty))
+    }
+
+    /// Where a **write** to source variable `name` in frame `depth` lands (slice 8): the absolute
+    /// regs slot + type for a promoted SSA scalar, or the confined window address for a
+    /// memory-located var — the write-side mirror of [`FrameReader::read_var`]'s resolution.
+    fn write_target(&self, depth: usize, name: &str) -> Option<WriteTarget> {
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        let (di, fn_block_base, fn_block_types) = self.md_for(module)?;
+        let var = super::pick_var(di?, func as FuncIdx, name, block, inst)?;
+        let off = *fn_block_base.get(func)?.get(block)? as usize;
+        let slot = |idx: usize| -> Option<WriteTarget> {
+            let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
+            Some(WriteTarget::Ssa {
+                reg: base + off + idx,
+                ty,
+            })
+        };
+        match &var.loc {
+            VarLoc::Ssa { value } => slot(*value as usize),
+            VarLoc::SsaList(locs) => slot(super::loclist_value(locs, block, inst)? as usize),
+            VarLoc::Window { off: o } => Some(WriteTarget::Win {
+                addr: (self.vm.regs[base].i64() as u64).wrapping_add(*o as u64),
+            }),
+            VarLoc::WindowVia { base: locs, off: o } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                Some(WriteTarget::Win {
+                    addr: addr.wrapping_add(*o as u64),
+                })
+            }
+            VarLoc::Fixed { addr } => Some(WriteTarget::Win { addr: *addr }),
+        }
     }
 
     /// Read a source variable by name in the frame `depth` levels from the top, resolving its `VarLoc`
@@ -4299,6 +4787,10 @@ impl DebugRun {
             op_clock: 0,
             funcs: std::sync::Arc::from(m.funcs.clone()),
             watchpoints: Vec::new(),
+            stdin_parked: false,
+            access_sink: None,
+            scheduled_writes: Vec::new(),
+            write_cursor: 0,
             last_watch: None,
         })
     }
@@ -4322,11 +4814,137 @@ impl DebugRun {
         self.op_clock
     }
 
+    /// Whether the last advance parked at a **blocking-stdin** `read` (W4): the run is live and
+    /// resumable, paused at the read, and the clock did not advance. Arm the mode via
+    /// [`Host::set_stdin_blocking`](super::Host::set_stdin_blocking) on the run's host.
+    pub fn stdin_parked(&self) -> bool {
+        self.stdin_parked
+    }
+
+    /// Append stdin bytes for a parked blocking `read` ([`Host::push_stdin`](super::Host::push_stdin))
+    /// — the next advance re-issues the read against them, and the completed read joins the recorded
+    /// cap tape so a later `seek` replays it faithfully.
+    pub fn provide_stdin(&mut self, bytes: &[u8]) {
+        self.host.push_stdin(bytes);
+    }
+
+    /// Install the session's per-op **access sink** ([`AccessSinkFn`]) — observation only, zero
+    /// cost when never installed. Replaces any prior sink.
+    pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
+        self.access_sink = Some(sink);
+    }
+
+    /// Install the session's **scheduled debugger writes** (slice 8): sorted by clock; entries at
+    /// clocks already passed are skipped (a rebuilt run applies them during its replay instead).
+    pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
+        writes.sort_by_key(|(c, _)| *c);
+        self.write_cursor = writes.partition_point(|(c, _)| *c < self.op_clock);
+        self.scheduled_writes = writes;
+    }
+
+    /// The run's window memory-map introspection ([`MemMapInfo`]). `None` for a memory-less
+    /// module.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
+        self.mem.as_ref().map(|m| m.map_info())
+    }
+
     /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
     /// current op before scanning — used after a `seek`/replay lands exactly on a breakpoint, so a
     /// forward resume makes progress instead of re-reporting the same stop.
     pub fn arm_breakpoint_skip(&mut self) {
         self.at_bp = true;
+    }
+
+    /// Whether this run's state is fully captured by its `VTask` continuation + the window bytes + the
+    /// host's replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
+    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector). The host has grown no state a
+    /// checkpoint can't restore (`checkpoint_safe`) and the shared window has a pristine layout
+    /// (`layout_snapshot_safe`). **§12 fibers** are admitted (their `Vm`s share the one window), except an
+    /// event-parked (`memory.wait`) fiber whose wall-clock deadline is non-deterministic. **§14
+    /// coroutines** are admitted (same-module *or* separate-module, whose pushed unit rides in
+    /// `extra_units`), including **demand** (`fault_yields`) and self-page-mapping ones — their own page
+    /// map is captured (`layout_snapshot_safe`, no §13 regions) and their bytes ride in the parent
+    /// snapshot, provided the child window lies within the parent's captured prefix
+    /// (`nested_within_prefix`). A region-aliased child stays outside. Outside this subset the DAP backend
+    /// falls back to replay-from-clock-0.
+    fn checkpointable(&self) -> bool {
+        self.done.is_none()
+            && self.host.checkpoint_safe()
+            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
+            && !self
+                .fibers
+                .iter()
+                .any(|f| matches!(f, FiberState::WaitParked { .. }))
+            && self
+                .vt
+                .coroutines
+                .iter()
+                .flatten()
+                .all(|c| child_checkpointable(c.mem.as_ref(), self.mem.as_ref()))
+    }
+
+    /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
+    /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
+    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, coroutine
+    /// children) + the shared window bytes + the host's replay substate + any separate-module coroutine's
+    /// pushed source units.
+    pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
+        if !self.checkpointable() {
+            return None;
+        }
+        Some(DebugRunSnapshot {
+            clock: self.op_clock,
+            active: self.vt.active.clone(),
+            active_id: self.vt.active_id,
+            chain: self.vt.chain.clone(),
+            fibers: self.fibers.clone(),
+            coroutines: self
+                .vt
+                .coroutines
+                .iter()
+                .map(|c| c.as_ref().map(coro_snapshot))
+                .collect(),
+            active_coro: self.vt.active_coro,
+            extra_units: self.source.extra_units(),
+            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
+            host: self.host.replay_substate(),
+        })
+    }
+
+    /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
+    /// re-created + tape re-armed by the backend), so a subsequent replay resumes exactly at the
+    /// snapshot's logical time rather than clock 0. Rebuilds the whole `VTask` (active `Vm`, resume
+    /// chain, fiber registry, and each same-module coroutine — its `nested_view` recreated over the
+    /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
+    /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
+    /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
+    pub fn restore(&mut self, snap: &DebugRunSnapshot) {
+        self.vt.active = snap.active.clone();
+        self.vt.active_id = snap.active_id;
+        self.vt.chain = snap.chain.clone();
+        self.vt.active_coro = snap.active_coro;
+        self.fibers = snap.fibers.clone();
+        // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
+        // indices resolve against the source).
+        self.source.reset_extra(&snap.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.restore_layout(layout);
+        }
+        // Rebuild each coroutine: a fresh `nested_view` over the just-reseeded parent window (so its
+        // bytes — shared via the backing region — are already correct) + a fresh Yielder host + a table
+        // over its own module.
+        let parent_mem = self.mem.as_ref();
+        let source = &*self.source;
+        self.vt.coroutines = snap
+            .coroutines
+            .iter()
+            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, source)))
+            .collect();
+        self.host.restore_replay_substate(&snap.host);
+        self.op_clock = snap.clock;
+        self.done = None;
+        self.at_bp = false;
+        self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
     }
 
     /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
@@ -4337,6 +4955,7 @@ impl DebugRun {
             return false;
         }
         self.at_bp = false;
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4346,8 +4965,31 @@ impl DebugRun {
             fibers,
             done,
             op_clock,
+            stdin_parked,
+            funcs,
+            fn_block_base,
+            fn_block_types,
+            debug,
+            access_sink,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
+        apply_due_writes(
+            scheduled_writes,
+            write_cursor,
+            *op_clock,
+            vt,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+        );
+        if let Some(sink) = access_sink.as_mut() {
+            let (cur_vm, _) = vt.debug_active();
+            emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+        }
         match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
             FiberStep::Stepped => {
                 *op_clock += 1;
@@ -4360,6 +5002,12 @@ impl DebugRun {
             }
             FiberStep::Trapped(t) => {
                 *done = Some(Err(t));
+                false
+            }
+            // Parked at a blocking-stdin read (W4): the read did not run and the clock holds —
+            // the run stays live; the driver pushes bytes and re-ticks to re-issue it.
+            FiberStep::Other(Outcome::StdinPark) => {
+                *stdin_parked = true;
                 false
             }
             // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -4376,6 +5024,7 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4387,14 +5036,35 @@ impl DebugRun {
             done,
             op_clock,
             fn_block_base,
+            fn_block_types,
+            debug,
             funcs,
             watchpoints,
+            stdin_parked,
+            access_sink,
+            scheduled_writes,
+            write_cursor,
             last_watch,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => *op_clock += 1,
                 FiberStep::Finished(vals) => {
@@ -4404,6 +5074,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -4444,6 +5119,21 @@ impl DebugRun {
                 *at_bp = true;
                 return Some(pc);
             }
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => {
                     *op_clock += 1;
@@ -4456,6 +5146,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -4474,6 +5169,7 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        self.stdin_parked = false;
         let Self {
             source,
             table,
@@ -4484,10 +5180,33 @@ impl DebugRun {
             at_bp,
             done,
             op_clock,
+            stdin_parked,
+            funcs,
+            fn_block_base,
+            fn_block_types,
+            debug,
+            access_sink,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
+            }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
                 FiberStep::Stepped => *op_clock += 1,
                 FiberStep::Finished(vals) => {
@@ -4497,6 +5216,11 @@ impl DebugRun {
                 }
                 FiberStep::Trapped(t) => {
                     *done = Some(Err(t));
+                    return None;
+                }
+                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
+                FiberStep::Other(Outcome::StdinPark) => {
+                    *stdin_parked = true;
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -4536,8 +5260,12 @@ impl DebugRun {
     }
 
     /// **Step out**: run until the current function returns, stopping at the op in the caller it
-    /// returned to (from the outermost frame, runs to completion). The counterpart of
-    /// `Inspector::step_out`.
+    /// returned to. Runs to completion (returns `None`) when no caller frame has a remaining
+    /// *steppable* op — from the outermost frame, and equally when the caller's only remaining action
+    /// is its own `return` terminator: `step_to` stops only where `cur_ir_pc` is `Some`, and a
+    /// terminator (`SRC_TERM`) yields `None`, so there is no op at the caller's depth to land on. The
+    /// counterpart of `Inspector::step_out`; both engines agree — see the `debug_parity` pin
+    /// `stepout_runs_to_completion_when_caller_immediately_returns`.
     pub fn step_out(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
         let d = self.step_depth();
         self.step_to(Some(d.saturating_sub(1)), fuel)
@@ -4607,6 +5335,50 @@ impl DebugRun {
         }
     }
 
+    /// **Write a source variable by name** (slice 8, the DAP `setVariable` backend): a promoted
+    /// SSA scalar takes `value` coerced to its slot type (integers only); a memory-located var
+    /// takes `value`'s low `width` bytes little-endian at its resolved window address. Refused
+    /// (`false`) mid-coroutine-step, for float slots, or for an unresolvable name — fail-closed,
+    /// never a guess. The DAP backend records successful writes and re-applies them at the same
+    /// clock on every seek replay, so time travel stays truthful.
+    pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
+        if self.vt.active_coro.is_some() {
+            return false; // parent-frame writes only this slice
+        }
+        let Some(target) = self.reader().write_target(depth, name) else {
+            return false;
+        };
+        match target {
+            WriteTarget::Ssa { reg, ty } => {
+                let v = match ty {
+                    ValType::I32 => Value::I32(value as i32),
+                    ValType::I64 => Value::I64(value),
+                    _ => return false,
+                };
+                match self.vt.active.regs.get_mut(reg) {
+                    Some(r) => {
+                        *r = Reg::from_value(v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            WriteTarget::Win { addr } => {
+                let w = width.clamp(1, 8);
+                self.write_window(addr, &value.to_le_bytes()[..w])
+            }
+        }
+    }
+
+    /// **Write bytes into the guest window** (slice 8, the DAP `writeMemory` backend). `false` if
+    /// the range is unmapped or the module has no memory.
+    pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        self.mem
+            .as_mut()
+            .and_then(|m| m.write_bytes(addr, bytes))
+            .is_some()
+    }
+
     /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
     pub fn value(&self, idx: usize) -> Option<Value> {
         self.value_in_frame(0, idx)
@@ -4615,6 +5387,17 @@ impl DebugRun {
     /// The run result once finished (`None` while still running).
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         self.done.as_ref()
+    }
+
+    /// The session's powerbox host (`Host::new_with_host`'s grant), for reading effects a debugged guest
+    /// produced — captured stdout/stderr, and the [`CapTape`](Host::cap_tape) a reverse `seek` replays so
+    /// a **powerbox** run (streams/clock/exit) re-executes with identical cap inputs.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+    /// Mutable powerbox host — e.g. to drain captured stdout between stops.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
     }
 }
 
@@ -4658,7 +5441,10 @@ pub enum SchedBreak {
     Step,
 }
 
-/// One scheduled vCPU under the multi-vCPU debugger.
+/// One scheduled vCPU under the multi-vCPU debugger. `Clone` for time-travel checkpointing (W1): a
+/// scheduled checkpoint captures each task's state so a reverse `seek` restarts from the nearest
+/// snapshot instead of turn 0.
+#[derive(Clone)]
 enum DbgTaskState {
     Runnable,
     /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake.
@@ -4711,6 +5497,85 @@ struct DbgEnv {
     fuel: u64,
 }
 
+/// One scheduled vCPU's captured state inside a [`ScheduledSnapshot`] — its full `VTask` continuation
+/// (active `Vm`, active fiber id, resume `chain`, same-module coroutine children, active-coroutine
+/// cursor, durable shadow-SP), the join-handle table, the env index (`Some(k)` for a §14 `instantiate`
+/// child — see [`ScheduledSnapshot::extra_envs`]), the run state, and the breakpoint-skip flag. The
+/// fiber `Vm`s share the run's window(s), and each coroutine's window is a `nested_view` sharing the
+/// parent backing, so their bytes ride in the snapshot's window bytes; `restore` rebuilds the `VTask`.
+struct DbgTaskSnapshot {
+    active: Vm,
+    active_id: usize,
+    chain: Vec<(usize, Vm, u32)>,
+    coroutines: Vec<Option<CoroSnapshot>>,
+    active_coro: Option<(usize, u32, usize)>,
+    root_shadow_sp: u64,
+    threads: Vec<Option<usize>>,
+    env: Option<usize>,
+    state: DbgTaskState,
+    at_bp: bool,
+}
+
+/// A multi-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
+/// [`ScheduledDebugRun`] at global [`turn`](ScheduledSnapshot::turn), so a reverse `seek`/`step_back`
+/// restarts a replay here instead of from turn 0. Captured only for the simple threaded subset (see
+/// [`ScheduledDebugRun::checkpointable`]: no §12 fibers, no §14 coroutines/`instantiate` children, a
+/// pristine shared window, a restorable host) — where the per-task active `Vm`s + the shared window
+/// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
+/// counterpart of [`DebugRunSnapshot`]. Opaque to the DAP backend, which stores it in a ladder and hands
+/// it back to [`ScheduledDebugRun::restore`].
+pub struct ScheduledSnapshot {
+    turn: u64,
+    clock: u64,
+    tasks: Vec<DbgTaskSnapshot>,
+    /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
+    /// D57), reconstructed verbatim on restore. The parked fiber `Vm`s share the run's window.
+    fibers: Vec<FiberState>,
+    /// The §14 `instantiate`-child environments (handle = index; a task's [`DbgTask::env`] indexes this).
+    /// See [`EnvSnapshot`].
+    extra_envs: Vec<EnvSnapshot>,
+    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** `instantiate_module` child's or
+    /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
+    /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
+    extra_units: Vec<std::sync::Arc<Compiled>>,
+    /// The run window's full memory state — committed bytes **and** page-protection map
+    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore. All tasks share this
+    /// one window; capturing its protection map admits a **page-mapping** run (`map`/`unmap`/`protect`/grow).
+    mem: Option<super::MemLayout>,
+    host: super::HostReplaySubstate,
+}
+
+/// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`]. Like a coroutine
+/// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
+/// snapshot's window bytes and only the view geometry (`win_base`/`size_log2`) is stored; `restore`
+/// rebuilds the view over the reseeded shared window. Its attenuated powerbox (an `Instantiator` +
+/// `AddressSpace`, each over `[0, child_size)`) is deterministic in `child_size = 1 << size_log2`, so
+/// only the host replay substate is carried; a natural dispatch table over the child's [`module`] (a
+/// **separate-module** `instantiate_module` child's pushed unit rides in `extra_units`) and the
+/// sub-allocated `fuel` complete it. The child's own page-protection map (`prot`) is captured alongside,
+/// admitting a child that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the shared
+/// snapshot. A §13 region-aliased child stays outside the checkpointable subset.
+struct EnvSnapshot {
+    win_base: u64,
+    size_log2: u8,
+    /// The child's module in the shared source (`0` = same-module `instantiate`; `>= 1` = a
+    /// **separate-module** `instantiate_module` child, whose pushed unit is captured in the run
+    /// snapshot's `extra_units`). Its natural dispatch table is rebuilt over this index.
+    module: usize,
+    host: super::HostReplaySubstate,
+    fuel: u64,
+    /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
+    /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
+    prot: Vec<(u64, super::PageProt)>,
+}
+
+impl ScheduledSnapshot {
+    /// The global turn this checkpoint was taken at — the ladder key the backend searches.
+    pub fn turn(&self) -> u64 {
+        self.turn
+    }
+}
+
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
 /// deterministic cooperative debug scheduler over one shared `Mem` for a `thread.spawn`/`join` guest.
 /// Mirrors the tree-walker's [`Inspector::attach_scheduled`](crate::Inspector) — a run-shared breakpoint
@@ -4752,6 +5617,28 @@ pub struct ScheduledDebugRun {
     /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
     /// common case, so the per-op `access_of` computation is skipped entirely.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
+    /// op with the global `turn` and the **executing task index** (the vCPU attribution host-side
+    /// models key on). `None` (the default) is zero-cost; the DAP backend re-installs it on every
+    /// `seek` rebuild, like watchpoints.
+    access_sink: Option<AccessSinkFn>,
+    /// The optional **scheduler trace tape** ([`SchedTraceEvent`], slice 6) — armed by
+    /// [`set_sched_trace`](ScheduledDebugRun::set_sched_trace); `None` (the default) is zero-cost.
+    /// Re-armed by the DAP backend on `seek` rebuilds (the replay refills it deterministically).
+    sched_trace: Option<Vec<SchedTraceEvent>>,
+    /// Scheduled debugger writes ([`ScheduledWrite`], slice 8) + the next-un-applied cursor — the
+    /// scheduled-engine twin of `DebugRun::scheduled_writes`.
+    scheduled_writes: Vec<(u64, ScheduledWrite)>,
+    write_cursor: usize,
+    /// The **seeded pick** (slice 7): `Some(seed)` chooses uniformly among the runnable set via
+    /// `splitmix64(seed ^ turn)` — an adversarial-variation knob whose choice is a pure function
+    /// of `(seed, turn)`, so replay reproduces it with no captured scheduler state. `None` (the
+    /// default) keeps the original lowest-index pick.
+    sched_seed: Option<u64>,
+    /// Recorded **forced switches** (slice 7): concrete `(turn, task)` overrides, resolved at
+    /// record time and re-applied by the DAP backend on rebuilds — so a `seek` replays them at the
+    /// identical turns. Empty (the default) is zero-cost.
+    forced: Vec<(u64, usize)>,
     /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
     /// taken by the backend to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -4769,6 +5656,123 @@ pub struct ScheduledDebugRun {
 
 /// Mark task `ti` done and wake any joiner parked on it (delivering its result / propagating a trap) —
 /// the debug-scheduler counterpart of the production [`complete`].
+/// One record on the **scheduler trace tape** (INTERACTIVE_EMBEDDING.md slice 6): the cooperative
+/// debug scheduler's own decisions — turns, parks, wakes with both identities, spawns —
+/// observation-only, derived by diffing task states across each decision (no scheduling logic is
+/// touched; invariant 4 holds — the host records, never chooses differently). `turn` is the global
+/// turn at the decision. The tape is deterministic: the same run replayed yields the identical
+/// tape (the schedule itself is deterministic), which is what makes it a sound timeline source.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SchedTraceEvent {
+    /// `task` ran the op at global `turn`.
+    Turn { turn: u64, task: usize },
+    /// `task` parked joining `child` (`thread.join` on a live child).
+    ParkJoin {
+        turn: u64,
+        task: usize,
+        child: usize,
+    },
+    /// `task` parked on the futex word at window offset `key` (`memory.wait`).
+    ParkWait { turn: u64, task: usize, key: u64 },
+    /// `waker`'s `memory.notify` woke `wakee` off its futex wait.
+    WakeNotify {
+        turn: u64,
+        waker: usize,
+        wakee: usize,
+    },
+    /// `waker`'s completion (thread exit) woke joiner `wakee`.
+    WakeJoin {
+        turn: u64,
+        waker: usize,
+        wakee: usize,
+    },
+    /// `task` woke from a timed `memory.wait` whose deadline passed (the picker's clock advance).
+    WakeTimeout { turn: u64, task: usize },
+    /// `parent`'s `thread.spawn` created `task`.
+    Spawn {
+        turn: u64,
+        parent: usize,
+        task: usize,
+    },
+}
+
+/// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
+/// (aux = child), 2 = blocked-wait (aux = key), 3 = done.
+fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
+    tasks
+        .iter()
+        .map(|t| match t.state {
+            DbgTaskState::Runnable => (0, 0),
+            DbgTaskState::BlockedJoin { child, .. } => (1, child as u64),
+            DbgTaskState::BlockedWait { key, .. } => (2, key),
+            DbgTaskState::Done(_) => (3, 0),
+        })
+        .collect()
+}
+
+/// Diff task states across one advance by `actor` at `turn`, appending the park/wake/spawn events
+/// the transition implies. A task beyond `before`'s length is a fresh spawn by the actor.
+fn trace_diff(
+    before: &[(u8, u64)],
+    tasks: &[DbgTask],
+    turn: u64,
+    actor: usize,
+    out: &mut Vec<SchedTraceEvent>,
+) {
+    let now = trace_tags(tasks);
+    for (j, &(nt, naux)) in now.iter().enumerate() {
+        match before.get(j) {
+            None => out.push(SchedTraceEvent::Spawn {
+                turn,
+                parent: actor,
+                task: j,
+            }),
+            Some(&(wt, waux)) if wt == nt && waux == naux => {}
+            Some(&(wt, _)) => match (wt, nt) {
+                (_, 1) => out.push(SchedTraceEvent::ParkJoin {
+                    turn,
+                    task: j,
+                    child: naux as usize,
+                }),
+                (_, 2) => out.push(SchedTraceEvent::ParkWait {
+                    turn,
+                    task: j,
+                    key: naux,
+                }),
+                (2, 0) => out.push(SchedTraceEvent::WakeNotify {
+                    turn,
+                    waker: actor,
+                    wakee: j,
+                }),
+                (1, 0) => out.push(SchedTraceEvent::WakeJoin {
+                    turn,
+                    waker: actor,
+                    wakee: j,
+                }),
+                _ => {} // a completion or re-key — no timeline edge
+            },
+        }
+    }
+}
+
+/// The pick-phase differ: the only transition a pick can cause is a timed-out `memory.wait` waking
+/// (`dbg_pick_runnable`'s clock advance), so any blocked-wait → runnable here is a `WakeTimeout`.
+fn trace_pick_diff(
+    before: &[(u8, u64)],
+    tasks: &[DbgTask],
+    turn: u64,
+    out: &mut Vec<SchedTraceEvent>,
+) {
+    let now = trace_tags(tasks);
+    for (j, &(nt, _)) in now.iter().enumerate() {
+        if let Some(&(2, _)) = before.get(j) {
+            if nt == 0 {
+                out.push(SchedTraceEvent::WakeTimeout { turn, task: j });
+            }
+        }
+    }
+}
+
 fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
@@ -5194,6 +6198,26 @@ fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32)
     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
 }
 
+/// SplitMix64 — the stateless mix behind the **seeded pick** (slice 7): the choice at a turn is a
+/// pure function of `(seed, turn)`, so any replay — full or from a checkpoint — reproduces the
+/// schedule with zero captured scheduler state (INVARIANTS.md #7: recovery never replays captured
+/// scheduler records).
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The forced-switch override recorded for `turn`, if any (slice 7). Entries are concrete
+/// `(turn, task)` pairs resolved at record time, so a replay re-applies the identical choice.
+fn forced_at(forced: &[(u64, usize)], turn: u64) -> Option<usize> {
+    forced
+        .iter()
+        .find(|(t, _)| *t == turn)
+        .map(|(_, task)| *task)
+}
+
 /// The task **pinned** to the scheduler because it is mid-`resume` inside a §14 coroutine body
 /// (`active_coro` set). A coroutine `resume` is atomic w.r.t. other vCPUs, so while its body is being
 /// stepped op-by-op the scheduler must keep running that same vCPU — never interleaving another thread —
@@ -5204,16 +6228,38 @@ fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
     tasks.iter().position(|t| t.vt.active_coro.is_some())
 }
 
-/// Pick the next thread to run: the lowest-index runnable one. If none is runnable, advance the futex
-/// `clock` to the earliest `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`),
-/// then retry. `None` only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`.
-fn dbg_pick_runnable(tasks: &mut [DbgTask], clock: &mut u64) -> Option<usize> {
+/// Pick the next thread to run under the session's **schedule policy** (slice 7): a forced-switch
+/// entry for this `turn` wins (when its task is runnable), then a `seed`ed pick chooses uniformly
+/// among the runnable set via [`splitmix64`]`(seed ^ turn)`, else the lowest-index runnable — the
+/// original deterministic default. If none is runnable, advance the futex `clock` to the earliest
+/// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
+/// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
+/// pure function of `(seed, forced, turn, task states)`, so replay reproduces it exactly.
+fn dbg_pick_runnable(
+    tasks: &mut [DbgTask],
+    clock: &mut u64,
+    seed: Option<u64>,
+    forced: &[(u64, usize)],
+    turn: u64,
+) -> Option<usize> {
     loop {
-        if let Some(i) = tasks
+        // A forced switch recorded for this turn wins while its task is runnable.
+        if let Some(f) = forced_at(forced, turn) {
+            if matches!(tasks.get(f).map(|t| &t.state), Some(DbgTaskState::Runnable)) {
+                return Some(f);
+            }
+        }
+        let runnable: Vec<usize> = tasks
             .iter()
-            .position(|t| matches!(t.state, DbgTaskState::Runnable))
-        {
-            return Some(i);
+            .enumerate()
+            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
+            .map(|(i, _)| i)
+            .collect();
+        if !runnable.is_empty() {
+            return Some(match seed {
+                None => runnable[0], // the original lowest-index default
+                Some(s) => runnable[(splitmix64(s ^ turn) % runnable.len() as u64) as usize],
+            });
         }
         let next = tasks
             .iter()
@@ -5283,6 +6329,12 @@ impl ScheduledDebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
+            access_sink: None,
+            sched_trace: None,
+            scheduled_writes: Vec::new(),
+            write_cursor: 0,
+            sched_seed: None,
+            forced: Vec::new(),
             last_watch: None,
             stopped: None,
             focus: 0,
@@ -5301,6 +6353,62 @@ impl ScheduledDebugRun {
     /// with a matching read/write kind.
     pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
         self.watchpoints = ranges;
+    }
+
+    /// Install the run-shared per-op **access sink** ([`AccessSinkFn`]) — fired with the global
+    /// `turn` and the executing task index. Observation only; zero cost when never installed.
+    pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
+        self.access_sink = Some(sink);
+    }
+
+    /// Install the session's **scheduled debugger writes** — see `DebugRun::set_scheduled_writes`.
+    pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
+        writes.sort_by_key(|(c, _)| *c);
+        self.write_cursor = writes.partition_point(|(c, _)| *c < self.turn);
+        self.scheduled_writes = writes;
+    }
+
+    /// The focused task index (the one a `write_var` resolves in) — the backend records it on a
+    /// scheduled `Var` write so replays resolve in the same task.
+    pub fn focus_task(&self) -> usize {
+        self.focus
+    }
+
+    /// The shared window's memory-map introspection — see `DebugRun::mem_map_info`.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
+        self.mem.as_ref().map(|m| m.map_info())
+    }
+
+    /// Arm (or drop) the **scheduler trace tape** — see [`SchedTraceEvent`]. Arming resets the
+    /// tape; observation only, zero cost when off.
+    pub fn set_sched_trace(&mut self, on: bool) {
+        self.sched_trace = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// The trace tape so far (`None` when not armed).
+    pub fn sched_trace(&self) -> Option<&[SchedTraceEvent]> {
+        self.sched_trace.as_deref()
+    }
+
+    /// Set (or clear) the **seeded pick** — see [`ScheduledDebugRun::sched_seed`]. Set before
+    /// driving (the DAP backend applies it at construction and on every rebuild).
+    pub fn set_sched_seed(&mut self, seed: Option<u64>) {
+        self.sched_seed = seed;
+    }
+
+    /// Replace the recorded **forced switches** — concrete `(turn, task)` overrides (slice 7).
+    pub fn set_forced_switches(&mut self, forced: Vec<(u64, usize)>) {
+        self.forced = forced;
+    }
+
+    /// The currently-runnable task indices (the forced-switch verb resolves its target from this).
+    pub fn runnable_tasks(&self) -> Vec<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Take the `(addr, write)` of the watchpoint the last stop fired on (cleared by the read), so the
@@ -5335,8 +6443,16 @@ impl ScheduledDebugRun {
             funcs,
             breakpoints,
             watchpoints,
+            access_sink,
+            sched_trace,
+            sched_seed,
+            forced,
+            scheduled_writes,
+            write_cursor,
             last_watch,
             fn_block_base,
+            fn_block_types,
+            debug,
             stopped,
             focus,
             turn,
@@ -5352,17 +6468,31 @@ impl ScheduledDebugRun {
             // it is runnable (so a step stays on it and a step-over runs its own call), else the
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
             // stuck; unblocks a stepped `join`/`wait`).
+            let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
+            // Precedence: the coroutine pin (an atomicity constraint) > a forced switch recorded
+            // for this turn (explicit user intent) > the stepping thread > the policy pick.
             let ti = if let Some(p) = dbg_pinned_coro(tasks) {
                 p
+            } else if let Some(f) = forced_at(forced, *turn).filter(|f| {
+                matches!(
+                    tasks.get(*f).map(|t| &t.state),
+                    Some(DbgTaskState::Runnable)
+                )
+            }) {
+                f
             } else {
                 match step {
                     Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
-                    _ => match dbg_pick_runnable(tasks, clock) {
+                    _ => match dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn) {
                         Some(i) => i,
                         None => return SchedStop::Blocked,
                     },
                 }
             };
+            // Slice 6: the only transition a pick causes is a timed-out wait waking.
+            if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
+                trace_pick_diff(before, tasks, *turn, trace);
+            }
             // Pre-op stop checks (breakpoint / watchpoint), skipped for a thread that just reported (it
             // must make progress off its current op first, so a loop-body stop re-fires each iteration).
             // Scan the task's *active continuation* — the §14 coroutine child (over its confined window)
@@ -5407,6 +6537,30 @@ impl ScheduledDebugRun {
                     *focus = ti;
                     return SchedStop::Break { pc, reason };
                 }
+            }
+            apply_due_writes_sched(
+                scheduled_writes,
+                write_cursor,
+                *turn,
+                tasks,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
+            if let Some(sink) = access_sink.as_mut() {
+                let (cur_vm, _) = tasks[ti].vt.debug_active();
+                emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
+            }
+            // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
+            let trace_turn = *turn;
+            let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
+            if let Some(trace) = sched_trace.as_mut() {
+                trace.push(SchedTraceEvent::Turn {
+                    turn: trace_turn,
+                    task: ti,
+                });
             }
             let step_res = dbg_advance_task(
                 tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
@@ -5458,9 +6612,13 @@ impl ScheduledDebugRun {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     } => {
                         *turn += 1;
-                        if let Err(t) = dbg_instantiate(
+                        // op 11 (named-grant spawn) is not driven by the debugger path.
+                        if grants.is_some() {
+                            dbg_complete(tasks, ti, Err(Trap::Malformed));
+                        } else if let Err(t) = dbg_instantiate(
                             tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
                             size_log2, quota, dst,
                         ) {
@@ -5493,6 +6651,10 @@ impl ScheduledDebugRun {
                     // coroutine / tier-up — outside this slice.
                     _ => return SchedStop::Declined,
                 },
+            }
+            // Slice 6: derive the park/wake/spawn edges this advance caused (see `trace_diff`).
+            if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
+                trace_diff(before, tasks, trace_turn, ti, trace);
             }
             // Post-op step target: the stepping thread reached a qualifying call depth at an instruction.
             // Depth is cumulative across a coroutine boundary (the child's frames sit above the parent's
@@ -5582,13 +6744,53 @@ impl ScheduledDebugRun {
             fibers,
             turn,
             clock,
+            funcs,
+            fn_block_base,
+            fn_block_types,
+            debug,
+            access_sink,
+            sched_trace,
+            sched_seed,
+            forced,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
-        // pin on replay reconstructs the coroutine's op sequence deterministically.
-        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| dbg_pick_runnable(tasks, clock)) else {
+        // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
+        // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
+        let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
+        let Some(ti) = dbg_pinned_coro(tasks)
+            .or_else(|| dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn))
+        else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
+        if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
+            trace_pick_diff(before, tasks, *turn, trace);
+        }
+        apply_due_writes_sched(
+            scheduled_writes,
+            write_cursor,
+            *turn,
+            tasks,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+        );
+        if let Some(sink) = access_sink.as_mut() {
+            let (cur_vm, _) = tasks[ti].vt.debug_active();
+            emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
+        }
+        let trace_turn = *turn;
+        let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
+        if let Some(trace) = sched_trace.as_mut() {
+            trace.push(SchedTraceEvent::Turn {
+                turn: trace_turn,
+                task: ti,
+            });
+        }
         let step_res = dbg_advance_task(
             tasks, ti, extra_envs, fibers, source, table, fuel, mem, host,
         );
@@ -5625,8 +6827,12 @@ impl ScheduledDebugRun {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
-                    if let Err(t) = dbg_instantiate(
+                    // op 11 (named-grant spawn) is not driven by the debugger replay path.
+                    if grants.is_some() {
+                        dbg_complete(tasks, ti, Err(Trap::Malformed));
+                    } else if let Err(t) = dbg_instantiate(
                         tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
                         size_log2, quota, dst,
                     ) {
@@ -5659,12 +6865,28 @@ impl ScheduledDebugRun {
                 _ => return false, // an unsupported op — stop the replay here
             },
         }
+        // Slice 6: the park/wake/spawn edges this replayed op caused (identical to `drive`'s,
+        // so a `tick`-replay refills the tape deterministically).
+        if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
+            trace_diff(before, tasks, trace_turn, ti, trace);
+        }
         !matches!(tasks[0].state, DbgTaskState::Done(_))
     }
 
     /// The current global turn (visible ops replayed so far) — the reverse-`seek` coordinate.
     pub fn op_turn(&self) -> u64 {
         self.turn
+    }
+
+    /// The powerbox host backing this run — for reading effects a debugged multithreaded guest
+    /// produced (captured stdout) and its [`CapTape`](Host::cap_tape) so a reverse `seek` rebuild
+    /// replays identical cap inputs. The scheduled-engine twin of [`DebugRun::host`].
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+    /// Mutable powerbox host — e.g. to drain captured stdout between stops.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
     }
 
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
@@ -5684,6 +6906,153 @@ impl ScheduledDebugRun {
         if let Some(st) = self.stopped {
             self.tasks[st].at_bp = true;
         }
+    }
+
+    /// Whether the scheduled continuation is fully captured by the per-task active `Vm`s + the shared
+    /// window bytes + the host substate + the scheduler clocks — the subset a multi-vCPU time-travel
+    /// **checkpoint** (W1) snapshots. Mirrors [`DebugRun::checkpointable`], extended over every task:
+    /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
+    /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
+    /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
+    /// same-module *or* separate-module (a separate module's pushed unit rides in `extra_units`); and
+    /// **§14 `instantiate` / `instantiate_module` children** are admitted (each [`DbgEnv`] a `nested_view`
+    /// over the shared backing + a deterministic `Instantiator`/`AddressSpace` powerbox + a natural table
+    /// over the child's module, rebuilt on restore) — this is what admits scheduled coroutines, which only
+    /// ever arise alongside an `instantiate` sibling (the bytecode engine rejects `coroutine + thread`).
+    /// Both coroutines and children may be **demand**/self-page-mapping: each child's own page map is
+    /// captured (`child_checkpointable`: `layout_snapshot_safe`, no §13 regions, within the parent's
+    /// prefix) and its bytes ride in the shared snapshot. Still excluded (→ replay-from-turn-0): a
+    /// region-aliased child, or one carved beyond the parent's captured prefix.
+    fn checkpointable(&self) -> bool {
+        self.host.checkpoint_safe()
+            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
+            && !self
+                .fibers
+                .iter()
+                .any(|f| matches!(f, FiberState::WaitParked { .. }))
+            && self.tasks.iter().all(|t| {
+                t.vt.coroutines
+                    .iter()
+                    .flatten()
+                    .all(|c| child_checkpointable(c.mem.as_ref(), self.mem.as_ref()))
+            })
+            && self.extra_envs.iter().all(|e| {
+                e.host.checkpoint_safe() && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
+            })
+    }
+
+    /// Snapshot the scheduled continuation at the current [`turn`](ScheduledDebugRun::op_turn) for the
+    /// backend's checkpoint ladder — `None` outside the [`checkpointable`](ScheduledDebugRun::checkpointable)
+    /// subset. Captures each task's active `Vm` + join table + state, the shared window bytes, the host
+    /// replay substate, and both scheduler clocks; the transient `stopped`/`focus`/`last_watch` are
+    /// *not* captured — [`locate`](ScheduledDebugRun::locate) rederives them from the task states.
+    pub fn snapshot(&self) -> Option<ScheduledSnapshot> {
+        if !self.checkpointable() {
+            return None;
+        }
+        Some(ScheduledSnapshot {
+            turn: self.turn,
+            clock: self.clock,
+            tasks: self
+                .tasks
+                .iter()
+                .map(|t| DbgTaskSnapshot {
+                    active: t.vt.active.clone(),
+                    active_id: t.vt.active_id,
+                    chain: t.vt.chain.clone(),
+                    coroutines: t
+                        .vt
+                        .coroutines
+                        .iter()
+                        .map(|c| c.as_ref().map(coro_snapshot))
+                        .collect(),
+                    active_coro: t.vt.active_coro,
+                    root_shadow_sp: t.vt.root_shadow_sp,
+                    threads: t.threads.clone(),
+                    env: t.env,
+                    state: t.state.clone(),
+                    at_bp: t.at_bp,
+                })
+                .collect(),
+            fibers: self.fibers.clone(),
+            // Each child env's module = the module its owning task runs (`0` = same-module `instantiate`;
+            // `>= 1` = a separate-module `instantiate_module` child), so its table rebuilds correctly.
+            extra_envs: self
+                .extra_envs
+                .iter()
+                .enumerate()
+                .map(|(k, e)| {
+                    let module = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.env == Some(k))
+                        .map_or(0, |t| t.vt.active.module);
+                    env_snapshot(e, module)
+                })
+                .collect(),
+            extra_units: self.source.extra_units(),
+            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
+            host: self.host.replay_substate(),
+        })
+    }
+
+    /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
+    /// breakpoints/watchpoints re-armed by the backend before this call), so a subsequent `tick`-replay
+    /// resumes exactly at the snapshot's global turn rather than turn 0. Rebuilds the task set (each a
+    /// root-only `VTask` around the captured active `Vm`), reseeds the shared window bytes, restores the
+    /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
+    /// it). A separate-module coroutine/child's pushed source units are re-pushed first (so its `module`
+    /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
+    pub fn restore(&mut self, snap: &ScheduledSnapshot) {
+        self.fibers = snap.fibers.clone();
+        // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
+        // resolve against the source).
+        self.source.reset_extra(&snap.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+            m.restore_layout(layout);
+        }
+        // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
+        // windows are `nested_view`s over the just-reseeded shared window (their bytes — shared via the
+        // backing region — are already correct); each table is rebuilt over the child's own module.
+        let shared_mem = self.mem.as_ref();
+        let source = &*self.source;
+        self.extra_envs = snap
+            .extra_envs
+            .iter()
+            .map(|es| rebuild_env(es, shared_mem, source))
+            .collect();
+        self.tasks = snap
+            .tasks
+            .iter()
+            .map(|ts| {
+                let coroutines = ts
+                    .coroutines
+                    .iter()
+                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, source)))
+                    .collect();
+                DbgTask {
+                    vt: VTask {
+                        active: ts.active.clone(),
+                        active_id: ts.active_id,
+                        chain: ts.chain.clone(),
+                        coroutines,
+                        root_shadow_sp: ts.root_shadow_sp,
+                        coro_step_into: true,
+                        active_coro: ts.active_coro,
+                    },
+                    threads: ts.threads.clone(),
+                    env: ts.env,
+                    state: ts.state.clone(),
+                    at_bp: ts.at_bp,
+                }
+            })
+            .collect();
+        self.host.restore_replay_substate(&snap.host);
+        self.turn = snap.turn;
+        self.clock = snap.clock;
+        self.stopped = None;
+        self.focus = 0;
+        self.last_watch = None;
     }
 
     /// The run's result once the root has finished (`None` while still running).
@@ -5773,6 +7142,49 @@ impl ScheduledDebugRun {
     /// The window address of a memory-located source variable in the focused thread's frame `depth`.
     pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
         self.reader().var_addr(depth, name)
+    }
+
+    /// Write a source variable in the **focused** thread's frame — see `DebugRun::write_var`.
+    pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
+        let focus = self.focus;
+        if self
+            .tasks
+            .get(focus)
+            .is_none_or(|t| t.vt.active_coro.is_some())
+        {
+            return false;
+        }
+        let Some(target) = self.reader().write_target(depth, name) else {
+            return false;
+        };
+        match target {
+            WriteTarget::Ssa { reg, ty } => {
+                let v = match ty {
+                    ValType::I32 => Value::I32(value as i32),
+                    ValType::I64 => Value::I64(value),
+                    _ => return false,
+                };
+                match self.tasks[focus].vt.active.regs.get_mut(reg) {
+                    Some(r) => {
+                        *r = Reg::from_value(v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            WriteTarget::Win { addr } => {
+                let w = width.clamp(1, 8);
+                self.write_window(addr, &value.to_le_bytes()[..w])
+            }
+        }
+    }
+
+    /// Write bytes into the shared guest window — see `DebugRun::write_window`.
+    pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        self.mem
+            .as_mut()
+            .and_then(|m| m.write_bytes(addr, bytes))
+            .is_some()
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
@@ -5912,6 +7324,9 @@ enum Outcome {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 11 (`instantiate_named`): the grant-list `(ptr, count)` (op 0 is `None`), read from the
+        /// register operands so the driver can re-grant the named caps into the child's powerbox.
+        grants: Option<(u64, u64)>,
     },
     /// §14 `Instantiator.instantiate_module`: like [`Outcome::Instantiate`], plus the resolved
     /// `Module` handle `mh` whose granted program the child runs (the driver resolves + compiles it).
@@ -6021,7 +7436,10 @@ enum Outcome {
 
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
 /// per-context shadow-SP swap ([`shadow_switch`]) and, on freeze, flattens each `Parked` fiber into its
-/// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`.
+/// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`. `Clone` for
+/// time-travel checkpointing (W1): a fiber-carrying `DebugRun` snapshots its whole registry — each
+/// fiber `Vm` shares the one window (snapshotted separately), so a clone is a faithful deep copy.
+#[derive(Clone)]
 enum FiberState {
     /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`.
     Pending { funcref: i32, sp: i64 },
@@ -6479,6 +7897,9 @@ enum VcpuStop {
         size_log2: i64,
         quota: i64,
         dst: u32,
+        /// op 11 `instantiate_named`: resolved `(grants_ptr, grants_n)` window coordinates of the
+        /// child's by-name grant list (op 0 is `None`).
+        grants: Option<(u64, u64)>,
     },
     /// §14 `Instantiator.instantiate_module` — the driver additionally resolves + compiles the
     /// host-granted `Module` (`mh`) and runs it as the confined child's program.
@@ -6664,9 +8085,14 @@ fn step_vcpu(
                             FiberState::Pending { funcref, sp } => (funcref, sp),
                             _ => unreachable!(),
                         };
-                        // Resolve the fiber entry through module 0's natural table + `fiber_sig`,
-                        // exactly as `table_lookup` does — a forged/mistyped funcref is a
-                        // `FiberFault`. Fibers are module-0 only (a unit cannot use `cont.*`).
+                        // Resolve the fiber entry through module 0's natural table + `fiber_sig` —
+                        // a forged/mistyped funcref is a `FiberFault`. A *submitted unit* may now
+                        // create fibers (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30); it
+                        // names the entry by a raw slot (`cont.new <slot>`), and an entry that is an
+                        // original (module-0) function resolves here exactly as the JIT's shared
+                        // `fn_table` and the tree-walker's `dispatch_indirect` do. (A fiber over an
+                        // *installed* unit function — a module ≥ 1 entry — is the deferred case; it
+                        // would need the module-aware `DomainTable` here, as those two backends use.)
                         let m0 = dom.source.primary();
                         let f = (funcref as u32 as usize) & m0.table_mask;
                         let ok = m0
@@ -6806,6 +8232,7 @@ fn step_vcpu(
                 size_log2,
                 quota,
                 dst,
+                grants,
             } => {
                 return Ok(VcpuStop::Instantiate {
                     ibase,
@@ -6815,6 +8242,7 @@ fn step_vcpu(
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 })
             }
             Outcome::InstantiateModule {
@@ -7222,9 +8650,13 @@ enum TaskState {
         slot: usize,
         dst: u32,
     },
-    /// Parked on `memory.wait` at futex key `key` until notified or `deadline` (logical clock).
+    /// Parked on `memory.wait` at futex `key` until notified or `deadline` (logical clock). The key is
+    /// **backing-identity canonical** ([`super::FutexKey`]): two confined `instantiate` children that
+    /// mapped the same `SharedRegion` into their separate windows park/wake on the same key (S1c), so a
+    /// pipe ring between concurrent stages rendezvous. A plain `thread.spawn` sibling (shared root
+    /// window, anonymous page) keys on its confined address — `FutexKey::Anon`, as before.
     BlockedWait {
-        key: u64,
+        key: super::FutexKey,
         deadline: u64,
         dst: u32,
     },
@@ -7592,6 +9024,7 @@ fn drive(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
                 // Validate the child entry signature against module 0 (a same-module child): it
                 // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
@@ -7654,10 +9087,55 @@ fn drive(
                 };
                 // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
                 // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
-                // over its *own* `[0, child_size)` window. These are its entry arguments.
-                let mut child_host = Host::new();
-                let cinst = child_host.grant_instantiator(0, child_size);
-                let cas = child_host.grant_address_space(0, child_size);
+                // over its *own* `[0, child_size)` window — its entry arguments. op 0 grants only
+                // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
+                // list read from the parent window, so a spawned stage resolves an inherited region
+                // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
+                // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm; grants resolve
+                // against the root `host`, so a confined child's forged handle fails `can_regrant`).
+                let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants {
+                    // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
+                    // records from the parent window (identical to the op-13 `InstantiateModule` arm).
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let list: Result<Vec<(String, i32)>, Trap> = (|| {
+                        let m = pm.ok_or(Trap::Malformed)?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..grants_n {
+                            let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name_bytes = m.read_window(name_off, name_len)?;
+                            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                            list.push((name, handle));
+                        }
+                        Ok(list)
+                    })();
+                    let list = match list {
+                        Ok(l) => l,
+                        Err(t) => {
+                            complete(&mut tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    match host.spawn_named_child(&list, child_size) {
+                        Some(triple) => triple,
+                        None => {
+                            complete(&mut tasks, ti, Err(Trap::CapFault));
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut ch = Host::new();
+                    let cinst = ch.grant_instantiator(0, child_size);
+                    let cas = ch.grant_address_space(0, child_size);
+                    (ch, cinst, cas)
+                };
                 // §3.6: a same-module child serves over the shared program — its serve machinery
                 // (enqueue admission, handler resolution) and any `child_offer` shape read the
                 // domain's registered module, exactly the tree-walker's `self_module` handoff.
@@ -7856,6 +9334,24 @@ fn drive(
                 // handler resolution, and `child_offer` shape all read its module (tree-walk
                 // lockstep: the spawn sets `self_module` from the grant).
                 child_host.set_self_module(&cmodule);
+                // IMPORTS.md phase 3 / §3.3: bind the child module's import manifest against its
+                // granted powerbox — a chibicc child's generic imports (`write`/`read`/`exit`, and any
+                // named grant) resolve here, so a compiled command actually does I/O rather than
+                // `CapFault`ing on its first `write`. `spawn_named_child` registers the *names* but does
+                // not bind the manifest, so the driver does it (the same `bind_child_manifest` the tree-
+                // walker's op-13 arm and the JIT's `child_bind_imports` hook call). A `required` slot
+                // with nothing to bind fails the spawn closed with a probeable `-EINVAL` (as the tree-
+                // walker does), never a trap. Empty for a manifest-free child (imports is empty → Ok).
+                if child_host
+                    .bind_child_manifest(&cmodule.imports, &cmodule.types)
+                    .is_err()
+                {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    continue;
+                }
                 let child_args = if want_as {
                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                 } else {
@@ -8086,11 +9582,24 @@ fn drive(
                     continue;
                 }
                 // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
-                // already changed, return not-equal; else park until notified or timed out.
-                let cur = mem
-                    .as_ref()
-                    .map(|m| m.atomic_value(base, width))
-                    .unwrap_or(0);
+                // already changed, return not-equal; else park until notified or timed out. Both the
+                // value re-read and the rendezvous key are taken against THIS task's own memory: a
+                // confined `instantiate` child steps against its `extra_envs` window, not the root
+                // `mem`, and the key is backing-identity canonical (`futex_key`) so two children that
+                // mapped the same `SharedRegion` into separate windows rendezvous (S1c). Reading the
+                // root `mem` here instead would make a child's `wait` on its mapped ring flag re-read
+                // an unrelated root byte and spin forever.
+                let (cur, key) = {
+                    let tmem: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    (
+                        tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
+                        tmem.map(|m| m.futex_key(base))
+                            .unwrap_or(super::FutexKey::Anon(base)),
+                    )
+                };
                 if cur != expected {
                     tasks[ti]
                         .vt
@@ -8098,42 +9607,59 @@ fn drive(
                         .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                 } else {
                     tasks[ti].state = TaskState::BlockedWait {
-                        key: base,
+                        key,
                         deadline: clock.saturating_add(timeout),
                         dst,
                     };
                 }
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
-                // Wake up to `count` waiters on `base`, lowest task index first (deterministic).
+                // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
+                // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
+                // from one child's window matches a waiter parked from another child's window on the
+                // same `SharedRegion` byte.
+                let key = {
+                    let tmem: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    tmem.map(|m| m.futex_key(base))
+                        .unwrap_or(super::FutexKey::Anon(base))
+                };
                 let want = count as u32;
                 let mut woken = 0u32;
                 for t in &mut tasks {
                     if woken >= want {
                         break;
                     }
-                    if let TaskState::BlockedWait { key, dst: wdst, .. } = t.state {
-                        if key == base {
+                    if let TaskState::BlockedWait {
+                        key: wkey,
+                        dst: wdst,
+                        ..
+                    } = t.state
+                    {
+                        if wkey == key {
                             t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                             t.state = TaskState::Runnable;
                             woken += 1;
                         }
                     }
                 }
-                // §3.6 slice 5a: also wake event-parked FIBER waiters on this key (lowest slot
-                // next, deterministic like the task scan). The status is delivered when a
-                // `cont.resume` claims the fiber — its resumer re-admits it cooperatively.
+                // §3.6 slice 5a: also wake event-parked FIBER waiters (lowest slot next, deterministic
+                // like the task scan). Fibers can't coexist with `instantiate` (the module-level veto),
+                // so a fibered wait is always single-window — it keys on the raw confined address,
+                // unchanged. The status is delivered when a `cont.resume` claims the fiber.
                 for f in fibers.iter_mut() {
                     if woken >= want {
                         break;
                     }
                     if let FiberState::WaitParked {
-                        key,
+                        key: fkey,
                         woken: w @ None,
                         ..
                     } = f
                     {
-                        if *key == base {
+                        if *fkey == base {
                             *w = Some(super::WAIT_WOKEN);
                             woken += 1;
                         }
@@ -8659,7 +10185,13 @@ fn run_vcpu_parallel<'scope, 'env>(
                 size_log2,
                 quota,
                 dst,
+                grants,
             }) => {
+                // op 11 (named-grant spawn) is driven only by the cooperative single-thread `drive`
+                // path (the browser's wasm-safe entry); the OS-thread parallel driver declines it.
+                if grants.is_some() {
+                    return (Err(Trap::Malformed), mem);
+                }
                 // Validate the child entry signature against module 0 and the power-of-two-aligned
                 // carve within `[0, isize)` — identical to the cooperative `drive` arm.
                 let c0 = dom.source.primary();
@@ -9120,6 +10652,12 @@ struct ByteSetJmp {
     dst: u32,
 }
 
+// `Clone` for time-travel checkpointing (DEBUGGING.md W1): a single-vCPU `DebugRun` snapshots its
+// active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
+// (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
+// guest page store is **not** here (it lives in `DebugRun::mem`, snapshotted separately via
+// `Mem::window_snapshot`), so cloning a `Vm` never aliases another run's memory.
+#[derive(Clone)]
 struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
@@ -10092,6 +11630,7 @@ impl Vm {
                     size_log2,
                     quota,
                     dst,
+                    grants,
                 } => {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
@@ -10099,6 +11638,8 @@ impl Vm {
                     let off = r!(*off).i64();
                     let size_log2 = r!(*size_log2).i64();
                     let quota = r!(*quota).i64();
+                    // op 11: resolve the grant-list `(ptr, count)` from their registers (op 0 is None).
+                    let grants = grants.map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
@@ -10112,6 +11653,7 @@ impl Vm {
                         size_log2,
                         quota,
                         dst,
+                        grants,
                     });
                 }
                 // §14 separate-module executor child — like `Instantiate`, but the first arg is a

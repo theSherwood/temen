@@ -204,7 +204,7 @@ no RO data is unaffected.
 - **Host capabilities → compute-only first, then a buffer-marshalled powerbox.** `svm_run` still
   supplies a deny-all `Host`. `svm_run_pb` adds a real capability set — **stdin/stdout/stderr
   streams, a monotonic clock, and exit** — granted by entry arity (1 `Stream(Out)` · 2 `Stream(In)` ·
-  3 `Exit` · 4 `Stream(Err)` · 5 `Clock`), so `hello.svm`'s `(out, in, exit)` shape works unchanged.
+  3 `Exit` · 4 `Stream(Err)` · 5 `Clock`), so `hello.svmt`'s `(out, in, exit)` shape works unchanged.
   The `Host` powerbox is already **deterministic and self-contained** (stream writes accumulate in
   `Host::stdout`/`stderr`, `read` draws from `Host::stdin`, `Clock.now` is a strictly-increasing
   counter), so I/O crosses the wasm boundary the *same way the module does* — through host-allocated

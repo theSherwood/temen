@@ -10,7 +10,7 @@
 //!      identity on every verified module (mirrors the `roundtrip` fuzz target).
 
 use svm::default_args;
-use svm_encode::{decode_module, encode_module};
+use svm_encode::{decode_module, decode_unit, encode_module, encode_unit, DecodeError};
 use svm_interp::run;
 use svm_verify::verify_module;
 
@@ -38,6 +38,21 @@ impl Rng {
 }
 
 fn drive(bytes: &[u8]) {
+    // Object dialect (v9): `decode_unit` shares the decoder and must fail-closed identically;
+    // object round-trip is identity; and the header firewall holds — anything the unit path
+    // decodes that the runnable path rejects is rejected *as an object* (flag bit 0), never
+    // for a later reason (mirrors the `roundtrip`/`decode_verify` fuzz targets).
+    if let Ok(u) = decode_unit(bytes) {
+        assert_eq!(
+            decode_unit(&encode_unit(&u)),
+            Ok(u.clone()),
+            "object round-trip"
+        );
+        match decode_module(bytes) {
+            Ok(_) | Err(DecodeError::ObjectInput) => {}
+            Err(e) => panic!("dialect divergence beyond the object flag: {e:?}"),
+        }
+    }
     // 1. Decode must fail-closed, never panic.
     if let Ok(m) = decode_module(bytes) {
         // 4a. Binary round-trip is identity on every decodable module.
@@ -105,5 +120,64 @@ block 0 () { v0 = i64.const 7
             }
             drive(&buf);
         }
+    }
+
+    // An **object** seed (v9 dialect): mutations reach the object-only sections
+    // (`data.ptr`, data exports) and the link-form opcodes, which pure random noise
+    // rarely constructs past the header.
+    use svm::ir;
+    let mut u = svm_text::parse_module(seeds[1]).expect("seed parses");
+    u.memory = Some(ir::Memory { size_log2: 16 });
+    u.data = vec![ir::Data {
+        offset: 0,
+        readonly: false,
+        bytes: vec![0; 16],
+    }];
+    u.data_ptrs = vec![
+        ir::DataPtr {
+            at: 0,
+            target: ir::DataPtrTarget::SelfOff(8),
+        },
+        ir::DataPtr {
+            at: 8,
+            target: ir::DataPtrTarget::Sym {
+                name: "g".into(),
+                addend: -2,
+            },
+        },
+    ];
+    u.data_exports = vec![ir::DataExport {
+        name: "h".into(),
+        offset: 4,
+    }];
+    u.funcs.push(ir::Func {
+        params: vec![],
+        results: vec![ir::ValType::I64],
+        blocks: vec![ir::Block {
+            params: vec![],
+            insts: vec![
+                ir::Inst::DataSelf { offset: 8 },
+                ir::Inst::DataSym {
+                    name: b"g".to_vec(),
+                    addend: 3,
+                },
+                ir::Inst::DataTop,
+            ],
+            term: ir::Terminator::Return(vec![2]),
+        }],
+    });
+    let base = encode_unit(&u);
+    assert_eq!(decode_unit(&base), Ok(u.clone()), "object seed round-trips");
+    let mut rng = Rng(0xA0761D6478BD642F);
+    for _ in 0..50_000 {
+        let mut buf = base.clone();
+        let muts = 1 + rng.range(4);
+        for _ in 0..muts {
+            if !buf.is_empty() {
+                let i = rng.range(buf.len());
+                buf[i] = rng.byte();
+            }
+        }
+        drive(&buf);
     }
 }

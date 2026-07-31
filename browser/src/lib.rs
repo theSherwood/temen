@@ -25,7 +25,7 @@
 use std::alloc::Layout;
 
 #[cfg(feature = "live")]
-use svm_interp::HostFn;
+use svm_interp::HostProc;
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
@@ -657,7 +657,8 @@ static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 /// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
 /// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
 /// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
-/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_module_tierup`]).
+/// which is the whole point of the threads tier ([`svm_wasm_jit::compile_jit`] with
+/// [`svm_wasm_jit::Shape::Threaded`]).
 ///
 /// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
 /// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
@@ -686,9 +687,16 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
             return 0;
         };
         // Emit the tier-up module against the shared linear memory (the browser threads build) and take
-        // its per-function emit set. `Err` only if the assembler itself rejects the set — treat as "no
-        // tier-up" (fail-closed: the guest keeps interpreting).
-        let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup(&m, true) else {
+        // its per-function emit set. The `Threaded` shape is interpreter-driven by construction (no
+        // single top-level frame — vCPUs enter via `thread.spawn`), so `compile_jit` picks tier-up. `Err`
+        // only if the assembler itself rejects the set — treat as "no tier-up" (fail-closed: the guest
+        // keeps interpreting).
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            emitted: emit,
+            ..
+        }) = svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Threaded, true)
+        else {
             return 0;
         };
         let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
@@ -879,7 +887,15 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
         let Ok(service_m) = svm_text::parse_module(codegen_service_src()) else {
             return 0;
         };
-        let Ok(wasm) = svm_wasm_jit::compile_module_mixed_entry(&service_m, 0, true) else {
+        // The §22 codegen service unit is a fixed, fully-in-subset scalar function, so `compile_jit`
+        // emits it whole and wasm-driven (rooted at func 0). Defensively require that — the §22 path
+        // runs the unit as emitted `f0`, so an interpreter-driven fallback would be a bug; fail closed.
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) = svm_wasm_jit::compile_jit(&service_m, svm_wasm_jit::Shape::Batch { entry: 0 }, true)
+        else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
@@ -895,7 +911,7 @@ pub extern "C" fn svm_par_enable_jit_codegen() -> i32 {
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`svm_par_powerbox`] but the
 /// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
 /// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
-/// [`svm_wasm_jit::compile_module_mixed_entry`], shared memory) + stashed so a guest `Jit.invoke`
+/// [`svm_wasm_jit::compile_jit`] with [`svm_wasm_jit::Shape::Batch`], shared memory) + stashed so a guest `Jit.invoke`
 /// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
 /// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
 /// (on the main thread) before the run.
@@ -1025,7 +1041,7 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The granted unit's per-function tier-up eligibility (`compile_module_tierup`): `f{i}` is emitted
+/// The granted unit's per-function tier-up eligibility (`compile_jit` / `Shape::Threaded`): `f{i}` is emitted
 /// + safe to call. A confined child whose entry is eligible runs on wasm; else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 
@@ -1050,7 +1066,14 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         let Some(m) = &cfg.module else {
             return 0;
         };
-        let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_tierup(m, true) else {
+        // A §14 instantiator child runs interpreter-driven on its own Worker (the `Threaded` shape),
+        // tiering up its in-subset functions.
+        let Ok(svm_wasm_jit::Artifact {
+            wasm,
+            emitted: eligible,
+            ..
+        }) = svm_wasm_jit::compile_jit(m, svm_wasm_jit::Shape::Threaded, true)
+        else {
             return 0;
         };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
@@ -1743,7 +1766,7 @@ const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clo
 
 /// Run `m`'s function 0 under the **browser powerbox**, seeding `stdin` and capturing the streams.
 ///
-/// Capabilities are granted by the entry's **arity** (so `hello.svm`'s 3-handle `(out, in, exit)`
+/// Capabilities are granted by the entry's **arity** (so `hello.svmt`'s 3-handle `(out, in, exit)`
 /// shape works unchanged), in this order — the browser embedder's ABI:
 ///
 /// | param # | capability        | `cap.call` type_id |
@@ -1866,14 +1889,14 @@ fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
 
 /// A shared **keyboard event queue** (the `keyboard` capability's backing): the host pushes packed
 /// key events, the guest drains them via `__vm_cap_resolve("keyboard")` + `poll`. `Arc<Mutex<…>>` so
-/// the cap's `HostFn` closure and the host/reactor driver share one queue. Packed event layout:
+/// the cap's `HostProc` closure and the host/reactor driver share one queue. Packed event layout:
 /// `(pressed << 16) | (keycode & 0xffff)` — `pressed` is 1 (down) / 0 (up); `poll` returns `-1` when
 /// empty (the doomgeneric `DG_GetKey` shape: pump until empty each frame).
 type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `cap.self.resolve` name,
-/// plus the two by-name graphical `HostFn` capabilities every on-ramp run carries — `display` (op 0 =
+/// plus the two by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
 /// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
@@ -1932,7 +1955,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     {
         let frame = std::sync::Arc::clone(&frame);
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
             if op != 0 {
                 return Ok(vec![-1]); // only present(0) is defined
             }
@@ -1963,7 +1986,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     {
         let keys = std::sync::Arc::clone(&keys);
-        let handle = host.grant_host_fn(Box::new(move |op, _args, _mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem| {
             if op != 0 {
                 return Ok(vec![-1]); // only poll(0) is defined
             }
@@ -1982,7 +2005,7 @@ fn grant_onramp_caps(
     // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
     #[cfg(target_arch = "wasm32")]
     {
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
             match op {
                 // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
                 0 => {
@@ -2019,7 +2042,7 @@ fn grant_onramp_caps(
     // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
     if let Some((name, data)) = fs {
         let mut cursors: Vec<u64> = Vec::new();
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| match op {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| match op {
             0 => {
                 let requested = mem
                     .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
@@ -2077,7 +2100,7 @@ fn grant_onramp_caps(
 /// imports bind at instantiation, taking **no** handle arguments — the positional (slot-order
 /// handle-args) entry form died in phase 4 and an import-bearing module without the manifest entry
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
-/// `files.lua`) is a `host_fn` resolved by name — a Stage-1 follow-on, not part of this prefix.
+/// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
@@ -2205,7 +2228,7 @@ pub fn onramp_jit_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 
 /// Run `m`'s function 0 under the **POSIX personality** (POSIX.md / STAGE1.md) instead of the fixed
 /// on-ramp powerbox — the seam that lets the real `svm-posix` shell (and any chibicc program linking
-/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostFn` capability
+/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostProc` capability
 /// implementing the libc/memfs surface (`read`/`write`/`open`/`opendir`/`getcwd`/…), and
 /// [`svm_posix::bind`] binds the module's manifest imports to it **by name** (IMPORTS.md phase 4 —
 /// slot `i` ↔ import `i`, bound at instantiation; the module bytes are never rewritten). `stdin`
@@ -2218,7 +2241,7 @@ pub fn onramp_jit_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// runs the sequential personality (files, redirects, in-process pipelines) only.
 ///
 /// Runs on the **bytecode** engine (the browser's interpreter tier), the same engine [`onramp_exec`]
-/// uses; the personality's `HostFn` dispatches through the guest window `bytecode` hands it.
+/// uses; the personality's `HostProc` dispatches through the guest window `bytecode` hands it.
 pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
@@ -2281,15 +2304,50 @@ pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// window (inert this slice — see above), and the POSIX personality itself (its captured stdout is the
 /// shell's output). The personality heap is the top 64 KiB (the shell never `malloc`s).
 pub fn posix_shell_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    posix_shell_exec_with(m, stdin, &[])
+}
+
+/// As [`posix_shell_exec`], plus a **PATH registry** of external commands `(name, module)` — each
+/// granted as a `Module` and registered so an unknown command name in the script is `exec`'d as a
+/// separate compiled child (op 13, STAGE1.md §5) instead of `<cmd>: not found`. Registering the
+/// `__stage` ring-filter runner here is what makes `cat f | sort | uniq`-style pipelines take the
+/// **concurrent ring path** (op 11 + `SharedRegion` + futex) rather than sequential memfs staging.
+/// Grant order + the shared-stdout unification mirror `c_shell.rs`'s `setup` exactly, so a run here
+/// discovers the same handles as the byte-checked differential and its output (shell builtins + child
+/// stages) lands in one captured stdout.
+pub fn posix_shell_exec_with(
+    m: &svm_ir::Module,
+    stdin: &[u8],
+    cmds: &[(&str, &svm_ir::Module)],
+) -> PbOutcome {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut host = Host::new();
-    // Grant order mirrors `c_shell.rs`'s `setup` (Stream, Instantiator, AddressSpace, then personality)
-    // so a run here discovers the same handles as the tested one.
-    let _out = host.grant_stream(StreamRole::Out);
+    // Grant order mirrors `c_shell.rs`'s `setup` (shared stdout sink, Stream, Instantiator,
+    // AddressSpace, the command Modules, then the personality) so a run here discovers the same handles
+    // as the tested one, and the shell's fd-1 writes + each child's re-granted `Stream` share one sink.
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst = host.grant_instantiator(0, win);
     let _as = host.grant_address_space(0, win);
+    let cmd_handles: Vec<(&str, i32, u8)> = cmds
+        .iter()
+        .map(|(n, cm)| {
+            (
+                *n,
+                host.grant_module(cm),
+                cm.memory.map_or(0, |mm| mm.size_log2),
+            )
+        })
+        .collect();
     let heap_base = win.saturating_sub(64 << 10);
     let (_px, posix) = svm_posix::grant(&mut host, heap_base, win, stdin.to_vec());
+    posix.set_stdout_sink(sink);
+    posix.set_exec_stdout(out_h);
+    posix.set_exec_stdin(in_h, in_fifo);
+    for (n, h, wl) in &cmd_handles {
+        posix.register_command(n, *h, *wl);
+    }
     let mut fuel = 200_000_000u64;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
@@ -2383,7 +2441,7 @@ fn pg_setup(
     // later ([`svm_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = svm_fs::mem_fs_seeded_shared(files, dirs);
-    let fsh = host.grant_host_fn(fs_hostfn);
+    let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`).
@@ -2536,11 +2594,225 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/stdint.h",
             include_str!("../playground-include/stdint.h"),
         ),
+        (
+            "include/stddef.h",
+            include_str!("../playground-include/stddef.h"),
+        ),
+        (
+            "include/limits.h",
+            include_str!("../playground-include/limits.h"),
+        ),
+        (
+            "include/errno.h",
+            include_str!("../playground-include/errno.h"),
+        ),
+        (
+            "include/assert.h",
+            include_str!("../playground-include/assert.h"),
+        ),
+        (
+            "include/math.h",
+            include_str!("../playground-include/math.h"),
+        ),
+        // The §12 threading layer (INTERACTIVE_EMBEDDING.md slice 9): pthreads + POSIX semaphores
+        // over the VM's futex/atomics builtins. Seeded from the *frontend's* bundled copies —
+        // one source of truth, since the guest chibicc lowers the same `__vm_*` builtins the
+        // native frontend does.
+        (
+            "include/pthread.h",
+            include_str!("../../frontend/chibicc/include/pthread.h"),
+        ),
+        (
+            "include/semaphore.h",
+            include_str!("../../frontend/chibicc/include/semaphore.h"),
+        ),
+        // C11 atomics (INTERACTIVE_EMBEDDING.md): the playground's own `<stdatomic.h>` maps the
+        // atomic ops to the **real** VM atomic builtins (not plain `*p += v` like the frontend's
+        // display header), so a lock-free `atomic_fetch_add` counter stays correct under any
+        // interleaving — the "atomic counter survives chaos mode" lesson.
+        (
+            "include/stdatomic.h",
+            include_str!("../playground-include/stdatomic.h"),
+        ),
+        // The system-header surface chibicc's *own* sources #include (SELFHOST_C.md §7, stage-2). Most
+        // are thin stubs — the sandbox has no processes/globbing/wall-clock — present so `chibicc.h`
+        // parses; `<time.h>` returns a fixed 1970 epoch (for the `__DATE__`/`__TIME__` macros), and the
+        // fs syscalls (`open`/`read` in `<unistd.h>`) match `<stdio.h>`'s `fopen`/`fread`.
+        (
+            "include/stdnoreturn.h",
+            include_str!("../playground-include/stdnoreturn.h"),
+        ),
+        (
+            "include/strings.h",
+            include_str!("../playground-include/strings.h"),
+        ),
+        (
+            "include/glob.h",
+            include_str!("../playground-include/glob.h"),
+        ),
+        (
+            "include/libgen.h",
+            include_str!("../playground-include/libgen.h"),
+        ),
+        (
+            "include/unistd.h",
+            include_str!("../playground-include/unistd.h"),
+        ),
+        (
+            "include/time.h",
+            include_str!("../playground-include/time.h"),
+        ),
+        (
+            "include/sys/stat.h",
+            include_str!("../playground-include/sys/stat.h"),
+        ),
+        (
+            "include/sys/types.h",
+            include_str!("../playground-include/sys/types.h"),
+        ),
+        (
+            "include/sys/wait.h",
+            include_str!("../playground-include/sys/wait.h"),
+        ),
     ];
     HEADERS
         .iter()
         .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
         .collect()
+}
+
+/// The chibicc card's argv (shared by the bytecode [`svm_run_onramp_fs`] and the JIT
+/// [`svm_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
+/// (64 KiB wasm host page), so its read-only globals must not share a host page with writable data
+/// (D40). Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR, so a
+/// clean run compiles far less IR); pass `debug_info` (a `-g` flag) only when the user opts into
+/// source-level debugging (the DAP panel maps C `file:line`/locals through chibicc's debug section).
+fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
+    let mut argv: Vec<&'static [u8]> = vec![b"chibicc", b"--data-page", b"65536"];
+    if debug_info {
+        argv.push(b"-g");
+    }
+    argv.push(b"/in.c");
+    argv
+}
+
+/// The **self-host** card's argv (SELFHOST_C.md §5): compile one of chibicc's *own* cc1 TUs to a
+/// linkable **object** unit (`--emit-object`, `cc -c`), reading the TU + its full system-header closure
+/// from the seeded memfs. Mirrors `guest_emit_object` in `crates/svm/tests/c_link.rs` — relative `-I`s
+/// (the fs cap refuses absolute paths), the self-host prelude force-included (chibicc's parser can't
+/// ingest modern glibc's ISO-C23 `strtoul`/… redirects), output to stdout (no out arg). `tu` is the
+/// memfs-relative input path (e.g. `frontend/chibicc/hashmap.c`). Borrows `tu`; caller keeps it alive.
+fn chibicc_selfhost_argv(tu: &[u8], debug_info: bool) -> Vec<&[u8]> {
+    // No `--data-page`: an emit-object *unit* is relinked (the linker page-aligns each unit's data, D40),
+    // so the object stays canonical — byte-identical to the proven native path (`c_link.rs`, which passes
+    // no data-page), which is what the CI gate diffs against.
+    let mut argv: Vec<&[u8]> = vec![
+        b"chibicc",
+        b"--emit-object",
+        b"-include",
+        b"crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h",
+        b"-Ifrontend/chibicc",
+        b"-Ifrontend/chibicc/include",
+        b"-Iusr/include/x86_64-linux-gnu",
+        b"-Iusr/include",
+    ];
+    if debug_info {
+        argv.push(b"-g");
+    }
+    argv.push(tu);
+    argv
+}
+
+/// Assemble the chibicc card's memfs image: the user's source `src` at `in.c`, the built-in playground
+/// libc headers under `include/` ([`playground_include_files`]), plus any caller headers from the
+/// optional `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash). Shared by the
+/// bytecode and JIT card entries so both seed an identical filesystem. `Err(STATUS_DECODE_ERR)` if the
+/// caller image doesn't decode.
+fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<Vec<u8>, i32> {
+    // The guest maps the absolute `/in.c`/`/include/*` back to these cap-relative keys (`in.c`,
+    // `include/…`); chibicc's fixed `/include` search path resolves the headers.
+    let (mut files, mut dirs) = if img_len == 0 {
+        (Vec::new(), Vec::new())
+    } else {
+        // SAFETY: the host guarantees `[img_ptr, img_len)` is a live allocation it just filled.
+        let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+        svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?
+    };
+    // Seed the built-in playground libc headers under `/include` so a compiled program can
+    // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
+    for (key, bytes) in playground_include_files() {
+        if !files.iter().any(|(k, _)| *k == key) {
+            files.push((key, bytes));
+        }
+    }
+    if !dirs.iter().any(|d| d == "include") {
+        dirs.push("include".to_string());
+    }
+    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs), so register `include/sys`.
+    if !dirs.iter().any(|d| d == "include/sys") {
+        dirs.push("include/sys".to_string());
+    }
+    // Split the editor buffer into a **multi-file** project: the compile targets `/in.c` (the text
+    // before the first marker), and each `//// file: NAME` marker seeds a sibling file the entry can
+    // `#include "NAME"` (chibicc resolves quote-includes against the source's own directory, `/`). No
+    // marker ⇒ the whole buffer is `/in.c`, exactly as before. Any `NAME` with a `/` seeds under that
+    // directory (its parent dirs are registered so the memfs can hold it).
+    for (key, bytes) in split_multifile_source(src) {
+        if let Some((dir, _)) = key.rsplit_once('/') {
+            // Register every ancestor directory of a nested file (e.g. `a/b/c.h` → `a`, `a/b`).
+            let mut acc = String::new();
+            for seg in dir.split('/') {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(seg);
+                if !dirs.contains(&acc) {
+                    dirs.push(acc.clone());
+                }
+            }
+        }
+        // A seeded file wins over any same-key caller-image entry (the editor is the source of truth).
+        files.retain(|(k, _)| *k != key);
+        files.push((key, bytes));
+    }
+    Ok(svm_fs::encode_image(&files, &dirs))
+}
+
+/// Split a card editor buffer into memfs files on `//// file: NAME` marker lines. The text before the
+/// first marker is the entry (`in.c`); each marker begins a new file `NAME` (a leading `/` is trimmed;
+/// a `NAME` with slashes nests). No marker ⇒ a single `in.c` (the whole buffer). Used by both the
+/// bytecode and JIT card entries so multi-file behaves identically across tiers.
+pub fn split_multifile_source(src: &[u8]) -> Vec<(String, Vec<u8>)> {
+    // A line is a marker iff, ignoring leading whitespace, it is `////` followed by (optional space)
+    // `file:` (case-insensitive) then a non-empty filename.
+    fn marker_name(line: &str) -> Option<String> {
+        let rest = line.trim_start().strip_prefix("////")?.trim_start();
+        // Case-insensitive `file:` prefix.
+        let after = rest.get(..5).filter(|p| p.eq_ignore_ascii_case("file:"))?;
+        let _ = after;
+        let name = rest[5..].trim().trim_start_matches('/').trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    let text = String::from_utf8_lossy(src);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut cur_name = "in.c".to_string();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        if let Some(name) = marker_name(line.trim_end_matches('\n')) {
+            files.push((cur_name, cur.into_bytes()));
+            cur_name = name;
+            cur = String::new();
+        } else {
+            cur.push_str(line);
+        }
+    }
+    files.push((cur_name, cur.into_bytes()));
+    files
 }
 
 /// **Run chibicc-the-guest to compile a C source** — the playground C-compiler demo (SELFHOST_C.md
@@ -2578,46 +2850,61 @@ pub extern "C" fn svm_run_onramp_fs(
         set(STATUS_VERIFY_ERR);
         return 0;
     }
-    // Assemble the memfs from the source + the optional header image (headers under `include/`,
-    // which chibicc's fixed `/include` search path resolves against). The guest maps the absolute
-    // `/in.c`/`/include/*` back to these cap-relative keys (`in.c`, `include/…`).
-    let (mut files, mut dirs) = if img_len == 0 {
-        (Vec::new(), Vec::new())
-    } else {
-        let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
-        match svm_fs::decode_image(image) {
-            Ok(seed) => seed,
-            Err(_) => {
-                set(STATUS_DECODE_ERR);
-                return 0;
-            }
+    let image = match chibicc_card_image(img_ptr, img_len, src) {
+        Ok(image) => image,
+        Err(status) => {
+            set(status);
+            return 0;
         }
     };
-    // Seed the built-in playground libc headers under `/include` so a compiled program can
-    // `#include <stdio.h>` etc. — a caller-supplied image (same key) takes precedence.
-    for (key, bytes) in playground_include_files() {
-        if !files.iter().any(|(k, _)| *k == key) {
-            files.push((key, bytes));
+    let argv = chibicc_card_argv(debug_info != 0);
+    let out = onramp_fs_exec(&m, &image, &argv, &[]);
+    set(out.status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
+        EXIT_CODE = out.exit_code;
+    }
+    out.value
+}
+
+/// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.svmb` in
+/// `--emit-object` mode over one of chibicc's *own* cc1 TUs, seeded from `[img_ptr, img_len)` — the
+/// committed closure image (`chibicc_selfhost.img`: the TU sources + their glibc header closure +
+/// `selfhost_prelude.h`) — and emit that TU's linkable **object** unit as SVM-IR **text** on
+/// `svm_stdout_ptr`/`_len`. `[tu_ptr, tu_len)` is the memfs-relative TU path. Unlike
+/// [`svm_run_onramp_fs`] (which merges the playground libc + seeds `/in.c`), the image is passed
+/// **raw** — the self-host closure is self-contained. The wasm-JIT twin is
+/// [`svm_selfhost_jit_emit_object_fs`]. Sets [`svm_status`]/[`svm_exit_code`]; returns the guest result.
+#[no_mangle]
+pub extern "C" fn svm_selfhost_emit_object_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    tu_ptr: *const u8,
+    tu_len: usize,
+    debug_info: i32,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
         }
-    }
-    if !dirs.iter().any(|d| d == "include") {
-        dirs.push("include".to_string());
-    }
-    files.push(("in.c".to_string(), src.to_vec()));
-    let image = svm_fs::encode_image(&files, &dirs);
-    // `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
-    // read-only globals must not share a host page with writable data (D40) — chibicc pins the
-    // RO/writable isolation to the host page. (Native reference compiles at the 16 KiB default.)
-    // Debug info is **off by default** (`debug_info == 0`) — the `debug.*` waist is ~a third of the
-    // emitted IR, so a clean run compiles far less IR (much faster on the bytecode interpreter). The
-    // playground passes `debug_info != 0` (a `-g` flag) only when the user opts into source-level
-    // debugging (the DAP panel maps C `file:line`/locals through chibicc's emitted debug section).
-    let argv: &[&[u8]] = if debug_info != 0 {
-        &[b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"]
-    } else {
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"]
     };
-    let out = onramp_fs_exec(&m, &image, argv, &[]);
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return 0;
+    }
+    let argv = chibicc_selfhost_argv(tu, debug_info != 0);
+    let out = onramp_fs_exec(&m, image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -3251,11 +3538,21 @@ impl JitOnrampReactor {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
         }
-        // Emit the whole `tick` (cross-tier helpers routed to `env.call_interp`). Fall back if the
-        // guest isn't reactor-emittable (e.g. its `tick` directly makes a cap.call → not in-subset).
-        let (emitted_wasm, emitted) =
-            svm_wasm_jit::compile_module_reactor(&module, tick, shared_memory)
-                .map_err(|_| STATUS_UNSUPPORTED)?;
+        // Emit the whole `tick`, wasm-driven (cross-tier helpers routed to `env.call_interp`). The
+        // front door derives the strategy: a `tick` whose reachable set can suspend is *not*
+        // wasm-drivable (a JITted frame can't unwind across a stack switch), so it reports
+        // `InterpDriven` instead of emitting a reactor this driver couldn't run — fall back to the
+        // pure interpreter then, exactly as when the `tick` is out of subset.
+        let artifact = svm_wasm_jit::compile_jit(
+            &module,
+            svm_wasm_jit::Shape::Reactor { entry: tick },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampReactor {
             module,
             program,
@@ -3377,6 +3674,19 @@ pub struct JitOnrampRun {
     exited: bool,
 }
 
+/// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
+/// [`onramp_fs_exec`] (a seeded memfs + argv). `Stdin` grants the plain on-ramp powerbox
+/// ([`grant_onramp_caps`]); `Fs` grants the headless powerbox with a mounted `fs` image and seeds
+/// `argv` at `POWERBOX_ARGS_BASE` (the chibicc-in-the-browser card: `/in.c` + `/include/*.h`).
+enum RunInput {
+    Stdin(Vec<u8>),
+    Fs {
+        image: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        stdin: Vec<u8>,
+    },
+}
+
 impl JitOnrampRun {
     /// Open a single-shot JIT run over a **caller-owned** window (the FFI path: `win_ptr` addresses this
     /// module's own linear memory). `win_size == 1 << win_log2`.
@@ -3403,7 +3713,7 @@ impl JitOnrampRun {
             win_base,
             win_log2,
             shared_memory,
-            stdin,
+            RunInput::Stdin(stdin),
         )
     }
 
@@ -3416,6 +3726,75 @@ impl JitOnrampRun {
         win_log2: u8,
         shared_memory: bool,
         stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with(m, win_log2, shared_memory, RunInput::Stdin(stdin))
+    }
+
+    /// Like [`open_owned_run`](Self::open_owned_run), but the guest reads its input from a seeded
+    /// **memfs** `image` (mounted on the `fs` cap) with `argv` seeded at `POWERBOX_ARGS_BASE` — the
+    /// single-shot JIT twin of [`onramp_fs_exec`]. This is the chibicc-in-the-browser card's fast tier:
+    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits SVM-IR text on stdout.
+    pub fn open_owned_run_fs(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        Self::open_owned_run_with(
+            m,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin,
+            },
+        )
+    }
+
+    /// Open a single-shot JIT run over a **caller-owned** window with a seeded memfs (the FFI twin of
+    /// [`open_owned_run_fs`](Self::open_owned_run_fs)).
+    ///
+    /// # Safety
+    /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
+    /// module's linear memory, used solely as this run's window, valid until the run is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn open_shared_run_fs(
+        m: &svm_ir::Module,
+        win_ptr: *mut u8,
+        win_size: u64,
+        win_log2: u8,
+        shared_memory: bool,
+        image: &[u8],
+        argv: &[&[u8]],
+        stdin: Vec<u8>,
+    ) -> Result<JitOnrampRun, i32> {
+        let win_base = win_ptr as usize;
+        let back = std::sync::Arc::new(svm_interp::Region::shared(win_ptr, win_size));
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            win_ptr,
+            win_size,
+            win_base,
+            win_log2,
+            shared_memory,
+            RunInput::Fs {
+                image: image.to_vec(),
+                argv: argv.iter().map(|a| a.to_vec()).collect(),
+                stdin,
+            },
+        )
+    }
+
+    fn open_owned_run_with(
+        m: &svm_ir::Module,
+        win_log2: u8,
+        shared_memory: bool,
+        input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
         let declared = m.memory.map_or(0, |mc| mc.size_log2);
         let win_log2 = win_log2.max(declared);
@@ -3435,7 +3814,7 @@ impl JitOnrampRun {
             win_base,
             win_log2,
             shared_memory,
-            stdin,
+            input,
         )
     }
 
@@ -3449,7 +3828,7 @@ impl JitOnrampRun {
         win_base: usize,
         win_log2: u8,
         shared_memory: bool,
-        stdin: Vec<u8>,
+        input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
         let mut module = m.clone();
@@ -3460,19 +3839,41 @@ impl JitOnrampRun {
                 mc.size_log2 = win_log2;
             }
         }
-        let mut host = Host::new();
-        host.stdin = stdin;
-        // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered by
-        // name; `display` too (unused by a pure compute guest, present for parity with
-        // `onramp_exec`). No `fs` (input comes from stdin).
-        let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
+        // from the input shape. `frame` is only ever populated by a `display.present` — kept for
+        // struct parity; a compiler/compute guest never presents.
+        let (host, init_mem, frame): (Host, Vec<u8>, _) = match input {
+            RunInput::Stdin(stdin) => {
+                let mut host = Host::new();
+                host.stdin = stdin;
+                // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
+                // by name; `display` too (unused by a pure compute guest, present for parity with
+                // `onramp_exec`). No `fs` (input comes from stdin).
+                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                (host, Vec::new(), frame)
+            }
+            RunInput::Fs { image, argv, stdin } => {
+                // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as the
+                // bytecode `onramp_fs_exec` builds it — the `MemFsHandle` is dropped (no snapshot here).
+                let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+                let (mut host, init_mem, _fsh) = pg_setup(&module, &image, &argv_refs)?;
+                host.stdin = stdin;
+                let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+                (host, init_mem, frame)
+            }
+        };
         // Compile once — reused for every cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
-        // Materialize `.data`/`.rodata` into the window before the emitted `_start` runs (the interpreter
-        // does this at instantiation; the emitted `_start` seeds only the heap + stashes handles).
+        // Materialize the window before the emitted `_start` runs (the interpreter does this at
+        // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
+        // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
+        // module's data page (65 KiB), so they never overlap the argv prefix at POWERBOX_ARGS_BASE.
         // SAFETY: `[win_ptr, win_size)` is a live window (owned backing or the caller's linear memory).
         unsafe {
             let win = core::slice::from_raw_parts_mut(win_ptr, win_size as usize);
+            if init_mem.len() <= win.len() {
+                win[..init_mem.len()].copy_from_slice(&init_mem);
+            }
             for seg in &module.data {
                 let off = seg.offset as usize;
                 let end = off.saturating_add(seg.bytes.len());
@@ -3481,11 +3882,19 @@ impl JitOnrampRun {
                 }
             }
         }
-        // Emit rooted at func 0 (`_start`); cross-tier helpers route to `env.call_interp`. Fall back if
-        // `_start` itself is out of subset.
-        let (emitted_wasm, emitted) =
-            svm_wasm_jit::compile_module_reactor(&module, 0, shared_memory)
-                .map_err(|_| STATUS_UNSUPPORTED)?;
+        // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to `env.call_interp`.
+        // The front door reports `InterpDriven` (→ fall back to the pure interpreter) if `_start` is out
+        // of subset or its reachable set can suspend — this driver can only run a wasm-driven artifact.
+        let artifact = svm_wasm_jit::compile_jit(
+            &module,
+            svm_wasm_jit::Shape::Batch { entry: 0 },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
         Ok(JitOnrampRun {
             module,
             program,
@@ -3798,18 +4207,69 @@ pub extern "C" fn svm_run_onramp_posix(
     out.value
 }
 
+/// Parse the shell's **PATH-registry blob** at `[ptr, len)` into `(name, module)` pairs. Layout, all
+/// integers little-endian: a `u32` entry count, then per entry a `u32` name length + that many UTF-8
+/// name bytes + a `u32` module length + that many encoded-module bytes. It bundles the `__stage`
+/// ring-filter runner and every external command (`primes`, …) into one buffer so `svm_run_shell` takes
+/// a single extra arg. Defensive: a truncated or malformed blob, or an entry whose module fails to
+/// decode, drops that entry (and everything after a length that overruns) rather than trapping — the
+/// shell still runs, just without the affected command. Returns owned `(String, Module)`s.
+fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, svm_ir::Module)> {
+    let mut out = Vec::new();
+    let rd_u32 = |b: &[u8], at: usize| -> Option<usize> {
+        b.get(at..at + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+    };
+    let count = match rd_u32(bytes, 0) {
+        Some(c) => c,
+        None => return out,
+    };
+    let mut off = 4usize;
+    for _ in 0..count {
+        let Some(nlen) = rd_u32(bytes, off) else {
+            break;
+        };
+        off += 4;
+        let Some(name_bytes) = bytes.get(off..off + nlen) else {
+            break;
+        };
+        let Ok(name) = core::str::from_utf8(name_bytes) else {
+            break;
+        };
+        off += nlen;
+        let Some(mlen) = rd_u32(bytes, off) else {
+            break;
+        };
+        off += 4;
+        let Some(mod_bytes) = bytes.get(off..off + mlen) else {
+            break;
+        };
+        off += mlen;
+        if let Ok(m) = svm_encode::decode_module(mod_bytes) {
+            out.push((name.to_string(), m));
+        }
+    }
+    out
+}
+
 /// Decode the module at `[mod_ptr, mod_len)` and run it as the **`svm-posix` shell** (see
 /// [`posix_shell_exec`]) with `[stdin_ptr, stdin_len)` as the script — the playground's shell card.
-/// Same capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via
-/// `svm_stdout_ptr`+`svm_stdout_len`, the exit code via [`svm_exit_code`], the status via
-/// [`svm_status`]. Returns the guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots
-/// with the other run exports — read them before the next call.
+/// `[cmds_ptr, cmds_len)`, when non-empty, is the **PATH-registry blob** ([`parse_shell_cmds`]): the
+/// `__stage` ring-filter runner (so `cat f | sort | uniq` takes the **concurrent ring path** — op 11 +
+/// `SharedRegion` + futex) and any **external commands** (`primes N`, …) the shell `exec`s as op-13
+/// §14 children. Pass `cmds_len = 0` to run bare (memfs pipelines, no external commands). Same
+/// capture/accessor contract as [`svm_run_onramp`]: read the captured stdout via `svm_stdout_ptr`+
+/// `svm_stdout_len`, the exit code via [`svm_exit_code`], the status via [`svm_status`]. Returns the
+/// guest's `i64` result. Shares the `OUT`/`ERR`/`EXIT_CODE` capture slots with the other run exports —
+/// read them before the next call.
 #[no_mangle]
 pub extern "C" fn svm_run_shell(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
+    cmds_ptr: *const u8,
+    cmds_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `svm_alloc`ations it just filled.
@@ -3826,7 +4286,16 @@ pub extern "C" fn svm_run_shell(
             return 0;
         }
     };
-    let out = posix_shell_exec(&m, stdin);
+    // The PATH registry (`__stage` + external commands). A truncated/undecodable blob is non-fatal:
+    // `parse_shell_cmds` drops the bad entries and the shell runs with whatever registered.
+    let owned = if cmds_ptr.is_null() || cmds_len == 0 {
+        Vec::new()
+    } else {
+        let cb = unsafe { core::slice::from_raw_parts(cmds_ptr, cmds_len) };
+        parse_shell_cmds(cb)
+    };
+    let cmds: Vec<(&str, &svm_ir::Module)> = owned.iter().map(|(n, m)| (n.as_str(), m)).collect();
+    let out = posix_shell_exec_with(&m, stdin, &cmds);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -3838,21 +4307,21 @@ pub extern "C" fn svm_run_shell(
 }
 
 /// **In-browser link + run of a frontend-emitted program** (docs/SVM_BROWSER_PLAN.md option (b)):
-/// the live-editing path, language-agnostic. Given a **program** module as SVM-IR **text**, a
-/// **library** module as SVM-IR text (its exports inline — e.g. a language runtime blob), and the
-/// name of the export to run, this parses both, links them (`link_with_manifest`), wraps the named
-/// entry in a powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same
-/// on-ramp powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native
-/// link/encode step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
+/// the live-editing path, language-agnostic. Given a **program** unit and a **library** unit —
+/// each either SVM-IR **text** or a **binary object** (`.svmo` bytes, the v9 object dialect;
+/// told apart by the `SVM\0` magic, so the two params mix freely) — and the name of the export
+/// to run, this loads both, links them (`link_with_manifest`), wraps the named entry in a
+/// powerbox `_start` (`synth_manifest_start`), verifies, and runs it through the same on-ramp
+/// powerbox as [`svm_run_onramp`] — so freshly-emitted source runs without a native link/encode
+/// step. Results are read back through the same accessors (`svm_stdout_ptr`/`_len`,
 /// `svm_status`, `svm_exit_code`).
 ///
 /// This is the generic browser counterpart to the native link path: **nothing here is specific to
-/// any source language.** The caller supplies the program's own-data relocations as a flat buffer of
-/// little-endian `u32` triples `(func, block, inst)` at `[reloc_ptr, reloc_ptr + reloc_len)` — each
-/// applied as a [`RelocKind::SelfData`] patch on the program unit (self-data addressing; a trailing
-/// partial triple is ignored). A frontend's own wire format (how it delivers those relocs alongside
-/// the module text, what it names its entry export, which blob is its runtime) stays entirely on the
-/// caller's side; it lands here already decomposed into these generic parameters.
+/// any source language.** A program's own-data addresses ride in its module text as `data.self
+/// <offset>` instructions (resolved to the program unit's assigned window base by the linker), so no
+/// separate relocation buffer is passed — the self-describing link forms replaced the old
+/// `(func, block, inst)` reloc table. A frontend's own wire format (what it names its entry export,
+/// which blob is its runtime) stays entirely on the caller's side.
 ///
 /// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
 /// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
@@ -3865,70 +4334,87 @@ pub extern "C" fn svm_link_run(
     lib_len: usize,
     entry_ptr: *const u8,
     entry_len: usize,
-    reloc_ptr: *const u8,
-    reloc_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
-        if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
-    };
-    let prog_text = match core::str::from_utf8(slice(prog_ptr, prog_len)) {
-        Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
-    };
-    let lib_text = match core::str::from_utf8(slice(lib_ptr, lib_len)) {
-        Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
     };
     let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
         Ok(s) => s,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
     };
     let stdin = slice(stdin_ptr, stdin_len);
 
-    // The program's own-data relocations: a flat buffer of LE u32 triples (func, block, inst), each a
-    // SelfData patch. Alignment-free (read the bytes little-endian) since the host buffer is align-1.
-    let reloc_bytes = slice(reloc_ptr, reloc_len);
-    let relocs: Vec<svm_ir::DataReloc> = reloc_bytes
-        .chunks_exact(12)
-        .map(|c| {
-            let u = |i: usize| u32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
-            svm_ir::DataReloc { func: u(0), block: u(4), inst: u(8), kind: svm_ir::RelocKind::SelfData }
-        })
+    // A unit is binary iff it opens with the container magic (`SVM\0`) — text IR can't start
+    // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
+    // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
+    let load_unit = |bytes: &[u8]| -> Option<svm_ir::Module> {
+        if bytes.starts_with(b"SVM\0") {
+            svm_encode::decode_unit(bytes).ok()
+        } else {
+            svm_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+        }
+    };
+    let program = match load_unit(slice(prog_ptr, prog_len)) {
+        Some(m) => m,
+        None => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let lib = match load_unit(slice(lib_ptr, lib_len)) {
+        Some(m) => m,
+        None => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let lib_exports: Vec<(String, svm_ir::FuncIdx)> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
         .collect();
 
-    let program = match svm_text::parse_module(prog_text) {
-        Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
-    };
-    let lib = match svm_text::parse_module(lib_text) {
-        Ok(m) => m,
-        Err(_) => { set(STATUS_DECODE_ERR); return 0; }
-    };
-    let lib_exports: Vec<(String, svm_ir::FuncIdx)> =
-        lib.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
-
     let linked = match svm_ir::link_with_manifest(&[
-        svm_ir::LinkUnit { module: lib, exports: lib_exports, ..Default::default() },
+        svm_ir::LinkUnit {
+            module: lib,
+            exports: lib_exports,
+            ..Default::default()
+        },
         svm_ir::LinkUnit {
             module: program,
             exports: vec![(entry_name.to_string(), 0)],
-            relocations: relocs,
             ..Default::default()
         },
     ]) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let entry = match linked.resolve_export(entry_name) {
         Some(e) => e,
-        None => { set(STATUS_UNSUPPORTED); return 0; }
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     let module = match svm_ir::synth_manifest_start(linked, entry, false) {
         Ok(m) => m,
-        Err(_) => { set(STATUS_UNSUPPORTED); return 0; }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
     };
     // Verify before running: a program that references an undefined proc links to an unresolvable
     // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
@@ -4397,6 +4883,118 @@ pub extern "C" fn svm_onramp_jit_run_open(
     }
 }
 
+/// Open a **single-shot wasm-JIT run** of the chibicc compiler card: decode the compiler module at
+/// `[mod_ptr, mod_len)`, assemble the same memfs [`svm_run_onramp_fs`] does (the user's source at
+/// `/in.c`, the built-in libc headers + any caller headers under `/include`), and emit `_start` as
+/// wasm — so the browser runs chibicc's compile on the **wasm-JIT** instead of the bytecode
+/// interpreter (the compiler's `fopen`/`write`/`exit` bounce cross-tier). The fast twin of
+/// `svm_run_onramp_fs`; drive it with the same `svm_onramp_jit_run_*` exports (call
+/// [`svm_onramp_jit_run_finish`] for the emitted IR on `svm_stdout_ptr`). `debug_info != 0` compiles
+/// with `-g` (source-level debug section) — off by default, as in `svm_run_onramp_fs`. Returns `0`,
+/// else a negative `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start`
+/// isn't emittable (the page falls back to [`svm_run_onramp_fs`]).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_open_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+    debug_info: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return -STATUS_VERIFY_ERR;
+    }
+    let image = match chibicc_card_image(img_ptr, img_len, src) {
+        Ok(image) => image,
+        Err(status) => {
+            set(status);
+            return -status;
+        }
+    };
+    let argv = chibicc_card_argv(debug_info != 0);
+    // The play threads build imports a **shared** memory, so the emitted module must too.
+    match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// The self-host card's window: **2^27 = 128 MiB**, larger than the single-file card's
+/// [`JIT_RUN_WIN_LOG2`] (32 MiB). chibicc's largest TU, `codegen_ir.c`, emits ~1.2 MB of IR and its
+/// compile working set overruns 32 MiB — the run traps `unreachable` mid-emit (measured). 128 MiB clears
+/// every cc1 TU (all byte-identical to native); the max-memory cap is 1 GiB, so this stays well within.
+const SELFHOST_WIN_LOG2: u8 = 27;
+
+/// **Self-host card — wasm-JIT tier** (the fast twin of [`svm_selfhost_emit_object_fs`]). Emit
+/// `chibicc.svmb`'s `_start` to wasm and run it in `--emit-object` mode over one of chibicc's own cc1
+/// TUs (seeded from the raw closure image `[img_ptr, img_len)`, memfs-relative TU path
+/// `[tu_ptr, tu_len)`), so the browser compiles chibicc's own source on emitted wasm — every cc1 TU,
+/// giants included, in a few hundred ms (SELFHOST_C.md). Drives the same finish path as the shipping JIT
+/// card ([`svm_onramp_jit_run_finish`] → the object text on `svm_stdout_*`). Runs in a 128 MiB window
+/// ([`SELFHOST_WIN_LOG2`]). Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]).
+#[no_mangle]
+pub extern "C" fn svm_selfhost_jit_emit_object_fs(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    tu_ptr: *const u8,
+    tu_len: usize,
+    debug_info: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
+    let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
+    let m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    if svm_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return -STATUS_VERIFY_ERR;
+    }
+    let argv = chibicc_selfhost_argv(tu, debug_info != 0);
+    match JitOnrampRun::open_owned_run_fs(&m, SELFHOST_WIN_LOG2, true, image, &argv, Vec::new()) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
 /// Pointer / length of the emitted `_start` wasm bytes (valid until the run is replaced/closed).
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_run_wasm_ptr() -> *const u8 {
@@ -4725,9 +5323,23 @@ pub extern "C" fn svm_dap_request(ptr: *const u8, len: usize) -> i32 {
         }
         slot.as_mut().unwrap()
     };
-    let reply = svm_dap::Json::Arr(server.handle(&req))
-        .to_string()
-        .into_bytes();
+    // A top-level JSON **array** batches requests (INTERACTIVE_EMBEDDING.md, the step+reads
+    // bundle): each element is handled in order and the reply messages concatenate into the one
+    // reply array — a step + N state reads in a single FFI crossing. A single object stays the
+    // one-request pump; the reply shape is identical either way (`web/dap.js` already consumes an
+    // array and filters by `type`).
+    let reply = match &req {
+        svm_dap::Json::Arr(reqs) => {
+            let mut msgs = Vec::new();
+            for r in reqs {
+                msgs.extend(server.handle(r));
+            }
+            svm_dap::Json::Arr(msgs)
+        }
+        _ => svm_dap::Json::Arr(server.handle(&req)),
+    }
+    .to_string()
+    .into_bytes();
     put(reply);
     0
 }
@@ -4740,6 +5352,181 @@ pub extern "C" fn svm_dap_response_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn svm_dap_response_len() -> usize {
     unsafe { (*core::ptr::addr_of!(DAP_OUT)).1 }
+}
+
+// ---- W3 in the browser: run-mode memory profiling (INTERACTIVE_EMBEDDING.md slice 4) -------------
+// The debug tier feeds the host-side models through the access sink (`svm-dap`); a **non-debug**
+// profiling run uses the W3 instrumentation pass instead: rewrite the module so every memory op
+// announces itself on a host-fn capability — the `svm-run` `with_mem_hooks` twin, reproduced here
+// because the cdylib depends on neither `svm-run` nor its OS-bound PAL (`svm-opt` is pure IR and
+// wasm-clean) — feed the same `MemModel`, and stash its stats JSON. The rewrite never meets a
+// debugger: run-mode entries inspect nothing, so the inserted ops are invisible by construction.
+
+/// The stashed stats JSON of the most recent [`svm_mem_profile`] run.
+static mut MEMPROF: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
+/// The `svm-run` `decode_mem_event` twin (the op/arg layout is owned by
+/// `svm_opt::instrument::mem_hook_op`). Drift between the twins is pinned by
+/// `browser/tests/mem_profile.rs`, which compares this hook-fed model against a sink-fed one on
+/// the same guest, stats-for-stats.
+fn decode_mem_event(op: u32, args: &[i64]) -> Option<svm_interp::MemEvent> {
+    use svm_interp::MemEvent as E;
+    use svm_opt::instrument::mem_hook_op as k;
+    let a = |i: usize| args.get(i).copied().map(|v| v as u64);
+    Some(match (op, args.len()) {
+        (k::LOAD, 2) => E::Load {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::STORE, 2) => E::Store {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_LOAD, 2) => E::AtomicLoad {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_STORE, 2) => E::AtomicStore {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_RMW, 2) => E::AtomicRmw {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::ATOMIC_CMPXCHG, 2) => E::AtomicCmpxchg {
+            addr: a(0)?,
+            width: args[1] as u32,
+        },
+        (k::COPY, 3) => E::Copy {
+            dst: a(0)?,
+            src: a(1)?,
+            len: a(2)?,
+        },
+        (k::FILL, 2) => E::Fill {
+            dst: a(0)?,
+            len: a(1)?,
+        },
+        _ => return None,
+    })
+}
+
+/// Profile `[ptr, len)`'s module (function 0, deny-all plus the hook grant — a compute guest):
+/// instrument with the W3 pass, re-verify (fail-closed like every rewrite), run on the bytecode
+/// engine feeding a [`svm_dap::models::MemModel`] (geometry from the args; `0` = the teaching
+/// default), and stash the stats JSON for [`svm_mem_profile_stats_ptr`]. Returns `0` on a clean
+/// run, `1` on a guest trap (stats still stashed — the final event is the attempted faulting
+/// access), `-1` undecodable, `-2` manifest-carrying (fail-closed: the hook grant would occupy
+/// import slot 0 — IMPORTS.md §2.1, the `svm-run` rule), `-3` failed re-verification, `-4`
+/// outside the bytecode subset.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn svm_mem_profile(
+    ptr: *const u8,
+    len: usize,
+    l1_sets: u32,
+    l1_ways: u32,
+    l1_line: u32,
+    l2_sets: u32,
+    l2_ways: u32,
+    l2_line: u32,
+    page_size: u32,
+) -> i32 {
+    use std::sync::{Arc, Mutex};
+    let put = |data: Vec<u8>| unsafe { stash(&mut *core::ptr::addr_of_mut!(MEMPROF), data) };
+    // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        put(Vec::new());
+        return -1;
+    };
+    if !m.imports.is_empty() {
+        put(Vec::new());
+        return -2;
+    }
+    // Discover the handle the hook grant will mint (grants are deterministic; the run host below
+    // grants the hook first, so a scratch first-grant yields the exact baked-in value).
+    let handle = {
+        let mut scratch = Host::new();
+        scratch.grant_host_proc(Box::new(|_, _, _| Ok(vec![])))
+    };
+    let spec = svm_opt::instrument::MemHookSpec {
+        type_id: svm_interp::cap_id::HOST_PROC,
+        handle,
+    };
+    let (im, _stats) = svm_opt::instrument::instrument_mem_hooks(&m, spec);
+    if let Err(e) = svm_verify::verify_module(&im) {
+        put(format!("{e:?}").into_bytes()); // the error text, for diagnostics
+        return -3;
+    }
+    let d = svm_dap::models::MemModelCfg::default();
+    let dim = |v: u32, def: u64| if v == 0 { def } else { v as u64 };
+    let cfg = svm_dap::models::MemModelCfg {
+        l1: svm_dap::models::CacheCfg {
+            sets: dim(l1_sets, d.l1.sets),
+            ways: if l1_ways == 0 {
+                d.l1.ways
+            } else {
+                l1_ways as usize
+            },
+            line: dim(l1_line, d.l1.line),
+        },
+        l2: svm_dap::models::CacheCfg {
+            sets: dim(l2_sets, d.l2.sets),
+            ways: if l2_ways == 0 {
+                d.l2.ways
+            } else {
+                l2_ways as usize
+            },
+            line: dim(l2_line, d.l2.line),
+        },
+        page_size: dim(page_size, d.page_size),
+    };
+    let model = Arc::new(Mutex::new(svm_dap::models::MemModel::new(cfg)));
+    model
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_snapshots(false); // run-mode: forward-only clock, no seeks
+    let feed = Arc::clone(&model);
+    let mut host = Host::new();
+    let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
+    let h = host.grant_host_proc(Box::new(move |op, args, _mem| {
+        if let Some(ev) = decode_mem_event(op, args) {
+            n += 1;
+            feed.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(n, 0, ev);
+        }
+        Ok(vec![])
+    }));
+    debug_assert_eq!(h, handle, "the hook grant is the first grant");
+    let mut fuel = u64::MAX;
+    let res = bytecode::compile_and_run_with_host(&im, 0, &[], &mut fuel, &mut host);
+    let status = match &res {
+        None => {
+            put(Vec::new());
+            return -4;
+        }
+        Some(Ok(_)) => 0,
+        Some(Err(_)) => 1,
+    };
+    let json = model
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stats_json()
+        .to_string();
+    put(json.into_bytes());
+    status
+}
+
+/// Pointer / length of the most recent [`svm_mem_profile`] stats JSON.
+#[no_mangle]
+pub extern "C" fn svm_mem_profile_stats_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(MEMPROF)).0 }
+}
+#[no_mangle]
+pub extern "C" fn svm_mem_profile_stats_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(MEMPROF)).1 }
 }
 
 // ---- wasm-JIT tier (BROWSER.md § "wasm-JIT tier"), slice 2: emit + expose to the JS host ---------
@@ -4791,18 +5578,30 @@ pub extern "C" fn svm_wasmjit_compile_full(
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return 0;
     };
-    // `compile_module_mixed_entry` (slice 3) emits the reachable in-subset functions and routes a
-    // call to an interp leaf through `env.call_interp` → [`svm_wasmjit_call_interp`]; a
+    // This FFI services cross-tier leaves on a *throwaway* window ([`svm_wasmjit_call_interp`], via
+    // `bytecode::compile_and_run` with no window), so it can only accept guests whose cross-tier
+    // callees are memory-free leaves — the `mixed_ok` condition. `compile_jit`'s wasm-driven path can
+    // *also* emit reactor guests with memory/cap-touching cross-tier callees over a *shared* window,
+    // which this callback can't service — so gate on `mixed_ok` first and fail closed otherwise. For a
+    // `mixed_ok` guest the emitted wasm is byte-identical to the old `compile_module_mixed_entry`
+    // (reactor's cross-tier set collapses to exactly the memory-free leaves). Emits `f{entry}`; a
     // fully-in-subset guest is the special case with no leaves.
-    match svm_wasm_jit::compile_module_mixed_entry(&m, entry, shared != 0) {
-        Ok(wasm) => {
+    if !svm_wasm_jit::analyze_from(&m, entry).mixed_ok {
+        return 0;
+    }
+    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry }, shared != 0) {
+        Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) => {
             // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
             // Keep the decoded module for the cross-tier callback (it runs an interp leaf).
             unsafe { *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m) };
             1
         }
-        Err(_) => 0,
+        _ => 0,
     }
 }
 
@@ -4914,7 +5713,7 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     let mut host = Host::new();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
-    let _ = host.grant_host_fn(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
+    let _ = host.grant_host_proc(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: Vec<Value> = if arity >= 1 {
         vec![Value::I32(arg as i32)]
@@ -5787,7 +6586,7 @@ block 0 (v0: i64) {
 //
 // Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead
 // bridges guest capabilities to **real wasm imports**, so a guest's writes reach the live host
-// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_fn`
+// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_proc`
 // (iface 13) — the designed extension point: a closure supplies the capability's semantics, here by
 // calling out to the imported host function. The guest sees only a masked, type-checked handle.
 
@@ -5811,7 +6610,7 @@ pub mod live {
     const EINVAL: i64 = -22;
 
     /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
-    /// `(console, clock)` capabilities (both iface `HOST_FN` = 13) bridged to the imports above.
+    /// `(console, clock)` capabilities (both iface `HOST_PROC` = 13) bridged to the imports above.
     /// The guest calls `cap.call 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
     /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
     /// `i64` result; sets [`LAST_STATUS`].
@@ -5829,7 +6628,7 @@ pub mod live {
         };
         let mut host = Host::new();
         // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
-        let console: HostFn = Box::new(|op, args, mem| {
+        let console: HostProc = Box::new(|op, args, mem| {
             if op != 1 {
                 return Ok(vec![EINVAL]);
             }
@@ -5850,7 +6649,7 @@ pub mod live {
             }
         });
         // clock (param 2): op 0 = now() → real host time.
-        let clock: HostFn = Box::new(|op, _args, _mem| {
+        let clock: HostProc = Box::new(|op, _args, _mem| {
             if op != 0 {
                 return Ok(vec![EINVAL]);
             }
@@ -5859,10 +6658,10 @@ pub mod live {
         let arity = m.funcs.first().map_or(0, |f| f.params.len());
         let mut slots: Vec<Value> = Vec::new();
         if arity >= 1 {
-            slots.push(Value::I32(host.grant_host_fn(console)));
+            slots.push(Value::I32(host.grant_host_proc(console)));
         }
         if arity >= 2 {
-            slots.push(Value::I32(host.grant_host_fn(clock)));
+            slots.push(Value::I32(host.grant_host_proc(clock)));
         }
         // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
         // `cap.self.resolve`/`label` them at runtime, matching the fixed-powerbox path.

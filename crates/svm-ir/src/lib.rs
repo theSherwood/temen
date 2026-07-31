@@ -1781,6 +1781,42 @@ pub enum Inst {
         handle: ValIdx,
         args: Vec<ValIdx>,
     },
+    /// A **link-form data-symbol address** — the data-side analogue of [`Inst::CallSym`] (D-LINK):
+    /// the window address of the exported data symbol `name`, plus `addend`, materialized as a
+    /// value. Emitted by a separately-compiled unit that references a global it does **not** define
+    /// (a cross-unit `extern`); [`link`] rewrites it **1:1** into a [`Inst::ConstI64`] holding the
+    /// resolved address once it has placed the defining unit's data. Fail-closed: an unresolved name
+    /// fails the link ([`LinkError::Unresolved`]), and a `DataSym` that *survives* into a runnable
+    /// module is a verify error (an object is not executable — the same guarantee as a surviving
+    /// `CallSym`). The name rides in the instruction, so instruction insertion/reordering never
+    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`. The name is a
+    /// `Vec<u8>` (not `String`) so `Inst: Clone` monomorphizes to a `Copy`-element `Vec` clone — like
+    /// `CallSym`'s `args` — and never pulls in the concrete `alloc` `String::clone`, keeping every
+    /// `Inst`-manipulating crate (e.g. `svm-peval`) translatable by the strict LLVM on-ramp (the
+    /// data-oriented IR invariant that keeps the partial evaluator self-hostable).
+    DataSym {
+        name: alloc::vec::Vec<u8>,
+        addend: i64,
+    },
+    /// A **link-form own-data address**: this unit's assigned data base plus `offset` (a unit-local
+    /// data offset), materialized as a value — the self-relative counterpart of [`Inst::DataSym`],
+    /// for a reference to the unit's *own* global whose final window placement the frontend did not
+    /// know at emit time (it is the linker that assigns each unit's data region). [`link`] rewrites
+    /// it to [`Inst::ConstI64`]; surviving into a runnable module is a verify error. Result is `i64`.
+    DataSelf {
+        offset: u64,
+    },
+    /// A **link-form data-stack base**: the address just above *all* of the linked program's data
+    /// (the post-link top-of-data, [`powerbox_entry_sp`]-aligned), materialized as a value. A
+    /// separately-compiled entry unit cannot bake its data-stack pointer as a constant — its own
+    /// `data_end` is only this unit's top, but the linker stacks every unit's data into one window,
+    /// so the true stack base is not known until link time. A frontend emits `data.top` where a
+    /// whole-program build would emit `i64.const data_end` (the `_start` data-SP, and the argv/scratch
+    /// scratch it builds there). [`link`] rewrites it to [`Inst::ConstI64`] once the window layout is
+    /// fixed and grows the merged window to reserve the data stack above it; surviving into a runnable
+    /// module is a verify error. Result is `i64`. (Order-independent — the value is the whole
+    /// program's, not any one unit's — so the entry unit still links wherever `_start` needs it.)
+    DataTop,
     /// **Dynamic-mode** interface dispatch by type-section reference (IMPORTS.md §3.5): drive
     /// the capability behind a runtime `handle` value as interface `ty` (an index into
     /// [`Module::types`] naming a [`TypeEntry::Interface`]), op `op`. The use-site check is
@@ -2381,6 +2417,12 @@ impl Inst {
             | Inst::Cast { .. }
             | Inst::Fma { .. }
             | Inst::RefFunc { .. }
+            // Link-form address materialization: pure (a to-be-`ConstI64`), no fault/mem/effect.
+            // CSE/DCE on them is sound (same name+addend ⇒ same address); the linker rewrites them
+            // to real consts before any backend runs.
+            | Inst::DataSym { .. }
+            | Inst::DataSelf { .. }
+            | Inst::DataTop
             | Inst::PtrAdd { .. }
             | Inst::PtrCast { .. }
             | Inst::SimdWidthBytes
@@ -2598,9 +2640,10 @@ impl Func {
     /// Whether this function uses any §12 fiber/thread/futex op (`cont.*`, `thread.*`,
     /// `atomic.wait`/`notify`). The single source of truth for backends that must agree on
     /// rejecting concurrency in a context that cannot host it — e.g. a §14 JIT child (no
-    /// per-child runtimes) or a guest-submitted `Jit`-capability unit (the single-threaded
-    /// MVP restriction; DESIGN.md §22 "Concurrency") — so the reference interpreter and the JIT
-    /// fail-close on exactly the same set.
+    /// per-child runtimes). A guest-submitted `Jit`-capability unit is now a *finer* gate — it
+    /// admits fibers and rejects only threads/futex ([`uses_threads`](Func::uses_threads) `||`
+    /// [`uses_futex`](Func::uses_futex)), DESIGN.md §22 "Concurrency" (renegotiated 2026-07-30) —
+    /// so this whole-set predicate is no longer what that path uses.
     pub fn uses_concurrency(&self) -> bool {
         self.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
@@ -2615,6 +2658,35 @@ impl Func {
                         | Inst::MemoryNotify { .. }
                 )
             })
+        })
+    }
+
+    /// Whether this function contains a **fiber** op (`cont.new`/`cont.resume`/`suspend`) — the
+    /// scheduling primitives a guest-submitted `Jit` unit **may** host: they switch stacks *within*
+    /// the domain, on the caller's thread, so a unit that runs its own scheduler to completion never
+    /// parks across the synchronous `cap.call` it runs inside (DESIGN.md §22 "Concurrency"). Split
+    /// out of [`uses_concurrency`](Func::uses_concurrency) so the submitted-unit gate can admit
+    /// fibers while still rejecting threads/futex.
+    pub fn uses_fibers(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                )
+            })
+        })
+    }
+
+    /// Whether this function contains a **vCPU/thread** op (`thread.spawn`/`thread.join`) — real OS
+    /// threads (§12 vCPUs), which a submitted `Jit` unit may **not** host yet: a spawned thread would
+    /// outlive the synchronous `cap.call` the unit runs inside and collide with the serialized
+    /// `Mutex<Host>` model (DESIGN.md §22). Split out for the submitted-unit gate.
+    pub fn uses_threads(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. }))
         })
     }
 
@@ -2957,6 +3029,36 @@ pub struct Module {
     /// verifier checks each `func` is in range and names are unique; both backends ignore the table
     /// (they execute a funcidx). Empty for a module with no named entry points.
     pub exports: Vec<Export>,
+    /// Named **data exports** (name → window offset): the data-symbol counterpart of
+    /// [`Module::exports`], the runtime-`Module` analogue of [`LinkUnit::data_exports`]. A
+    /// separately-compiled unit publishes its external-linkage globals here so another unit's
+    /// [`Inst::DataSym`] / `data.ptr` can bind to them at [`link`] time. Declared in the text IR as
+    /// `export <k> data "<name>" <offset>`. Backends ignore it (a data symbol resolves to a plain
+    /// address before anything runs); empty for a module with no exported data. Names share the
+    /// export namespace with [`Module::exports`].
+    pub data_exports: Vec<DataExport>,
+    /// **Data-image pointer relocations** (D-LINK, the data→data case): pointers baked into a
+    /// global's own initializer whose target address the frontend cannot know at emit time because
+    /// the linker assigns each unit's data base — `int *p = &g;`, `static char *kw[] = {…}`,
+    /// chibicc's `Type *ty_int = &(Type){…}`. Each [`DataPtr`] names a byte offset in this module's
+    /// data image and the data address to write there; [`link`] resolves and writes it once the
+    /// window layout is fixed, then clears the list. The code→data case rides the instruction stream
+    /// ([`Inst::DataSelf`]/[`Inst::DataSym`]) — a data pointer has no instruction to carry it, so it
+    /// rides a data-offset-keyed slot instead. Unlike the retired `(func,block,inst)` `DataReloc`,
+    /// the key is a **data** offset, and data images are never instrumented or reordered by a pass
+    /// (only instruction streams are), so it cannot desync. Empty for a runnable module (a survivor
+    /// is a verify error, since nothing would patch the placeholder bytes before they are read).
+    pub data_ptrs: Vec<DataPtr>,
+    /// **Data-image funcref relocations** (D-LINK, the data→code case): a **function index** baked
+    /// into a global's initializer whose value the frontend cannot know at emit time because the
+    /// linker assigns each unit's function base — a `proctype` gvar with a static proc initializer
+    /// (`var oomHandler = continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). Each
+    /// [`DataFuncref`] names a byte offset in this module's data image and the exported function it
+    /// refers to; [`link`] resolves the name to the merged funcidx and writes it as a 4-byte
+    /// little-endian `i32` — the value `ref.func` would yield — then clears the list. The funcref
+    /// twin of [`data_ptrs`](Module::data_ptrs): `ref.func` rides the instruction stream, but a
+    /// funcref stored in static data has no instruction to carry it. Empty for a runnable module.
+    pub data_funcrefs: Vec<DataFuncref>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -3342,6 +3444,60 @@ pub struct Export {
     pub func: FuncIdx,
 }
 
+/// A named **data export**: a `name` a linker binds a cross-unit data reference to, mapping to a
+/// byte `offset` in this unit's (un-relocated) data window — the data-symbol counterpart of
+/// [`Export`], and the in-`Module` form of a [`LinkUnit::data_exports`] entry. Declared in the text
+/// IR as `export <k> data "<name>" <offset>`. [`link`] adds each unit's base to `offset` to place
+/// the symbol in the merged window, then resolves every [`Inst::DataSym`] / `data.ptr` naming it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataExport {
+    pub name: String,
+    pub offset: u64,
+}
+
+/// A **data-image pointer relocation** ([`Module::data_ptrs`], D-LINK): write the 8-byte
+/// little-endian window address of `target` into this unit's data image at byte offset `at`. Models
+/// a pointer stored inside a global's initializer (`int *p = &g;`) — the data→data counterpart of
+/// the code→data [`Inst::DataSelf`]/[`Inst::DataSym`] forms, for the case where the pointer lives in
+/// static data rather than in an instruction. The frontend emits placeholder bytes (any 8 bytes) in
+/// a `data` segment covering `[at, at+8)` and one of these to fix them up; [`link`] overwrites the
+/// full 8 bytes with the resolved absolute address (the addend rides `target`, not the placeholder).
+/// Pointers are 8 bytes because window addresses are `i64` (the width `DataSym`/`DataSelf` yield).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataPtr {
+    /// Byte offset within this unit's (un-relocated) data image where the 8-byte pointer sits.
+    pub at: u64,
+    /// The data address the pointer resolves to, once the linker has placed the units' data.
+    pub target: DataPtrTarget,
+}
+
+/// A **data-image funcref relocation** ([`Module::data_funcrefs`], D-LINK, data→code): write the
+/// 4-byte little-endian merged **function index** of the exported func `name` into this unit's data
+/// image at byte offset `at`. Models a function pointer stored in a global's static initializer
+/// (`void (*f)() = g;` — nimony's `var oomHandler = continueAfterOutOfMem`). The value written is the
+/// one `ref.func name` would yield after the merge (module-0 funcref = its funcidx, §22), so loading
+/// the slot and `call_indirect`-ing through it dispatches to `name`. The frontend emits placeholder
+/// bytes in a `data` segment covering `[at, at+4)` and one of these to fix them up; [`link`]
+/// overwrites the 4 bytes and fails closed ([`LinkError::Unresolved`]) if no unit exports `name`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataFuncref {
+    /// Byte offset within this unit's (un-relocated) data image where the 4-byte funcidx sits.
+    pub at: u64,
+    /// The exported function whose merged index is written — resolved via the link func-symbol table.
+    pub name: String,
+}
+
+/// What a [`DataPtr`] points at — the data-image twin of the code→data link forms.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DataPtrTarget {
+    /// This unit's own data at `offset` → `dbase + offset` (self-relative; the twin of
+    /// [`Inst::DataSelf`]). Any `&g + k` arithmetic is folded into `offset` by the frontend.
+    SelfOff(u64),
+    /// An exported data symbol `name` plus `addend` → `addr(name) + addend` (cross-unit; the twin of
+    /// [`Inst::DataSym`]). Fail-closed at link if no unit exports `name` ([`LinkError::Unresolved`]).
+    Sym { name: String, addend: i64 },
+}
+
 /// One entry in the module-level type section ([`Module::types`]): every declared shape is
 /// either a function signature or an interface built from them. One index space, so imports,
 /// call sites, and impl exports can all reference the same entries (D59: identity is the
@@ -3545,10 +3701,12 @@ fn patch_placeholder(
     }
 }
 
-/// One unit to statically link: a module plus the symbols it **exports** and the **relocations** its
-/// own data references need. Function symbols (`exports`) and its named `Module::imports` are resolved
-/// against the other units by [`link`]; `data_exports` name window offsets within the unit's data; and
-/// `relocations` patch the unit's address constants once its data is placed (see [`DataReloc`]).
+/// One unit to statically link: a module plus the symbols it **exports**. Function symbols
+/// (`exports`) and the unit's named `Module::imports` (`call.sym`) resolve against the other units
+/// by [`link`]; `data_exports` name window offsets within the unit's (un-relocated) data, which the
+/// unit's [`Inst::DataSym`] / `data.ptr` references bind to. A unit's own data addresses ride in the
+/// instruction stream ([`Inst::DataSelf`] / [`Inst::DataSym`]) and in `data.ptr` slots, not in a
+/// side table — the linker rewrites them in place once it has placed the unit's data.
 #[derive(Clone, Debug, Default)]
 pub struct LinkUnit {
     pub module: Module,
@@ -3556,30 +3714,6 @@ pub struct LinkUnit {
     pub exports: Vec<(String, FuncIdx)>,
     /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
     pub data_exports: Vec<(String, u64)>,
-    /// Relocations the unit's data references need after the linker places its data (§ELF-style).
-    pub relocations: Vec<DataReloc>,
-}
-
-/// A relocation: at link time, patch the **constant** at `(func, block, inst)` — which must be a
-/// `ConstI64`/`ConstI32` (an address the frontend left at a unit-local value) — by **adding** a base
-/// resolved from `kind`; the const's current value is the **addend** (so `&g + 4` works). This is how
-/// a unit's data references survive relocation into the one shared window — no IR change, no value
-/// renumbering, just a const edit. `func`/`block`/`inst` are unit-local (applied before concatenation).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DataReloc {
-    pub func: u32,
-    pub block: u32,
-    pub inst: u32,
-    pub kind: RelocKind,
-}
-
-/// What base a [`DataReloc`] adds.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RelocKind {
-    /// This unit's own assigned data base — the const holds a unit-local data offset (an own-data ref).
-    SelfData,
-    /// The resolved address of an exported **data** symbol (a cross-unit data import).
-    DataSymbol(String),
 }
 
 /// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
@@ -3591,10 +3725,11 @@ pub enum LinkError {
     BadExport { symbol: String, index: FuncIdx },
     /// A unit imports a symbol no unit exports.
     Unresolved(String),
+    /// A `data.ptr` slot (`at`) does not lie within any of the unit's data segments — the frontend
+    /// must emit an 8-byte placeholder in a `data` segment covering `[at, at+8)`. A malformed unit.
+    BadDataPtr { at: u64 },
     /// A `CallImport` referenced an out-of-range import (a malformed unit).
     BadImportIndex(u32),
-    /// A relocation pointed at a missing instruction, or one that isn't an address constant.
-    BadReloc(DataReloc),
     /// Retained-manifest linking ([`link_with_manifest`]) found units disagreeing on a shared
     /// import's structural shape or mode, a malformed shape reference, or a grouped
     /// (interface-shaped) call site whose name resolved to a single exported function. The
@@ -3608,8 +3743,9 @@ pub enum LinkError {
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
 /// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
 /// references by its base offset; place each unit's **data** in a non-overlapping window region and
-/// apply its **relocations** so its address constants follow; build function + data symbol tables from
-/// all exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
+/// rewrite its link-form data addresses ([`Inst::DataSelf`]/[`Inst::DataSym`], `data.ptr`) to
+/// concrete `ConstI64`s so they follow the data; build function + data symbol tables from all
+/// exports; and resolve every unit's named imports — a `call` symbol to a **direct call**, a data
 /// symbol to a **constant address** — against them. The result is one import-free, relocated module —
 /// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
 /// signature mismatch is caught there).
@@ -3635,16 +3771,28 @@ pub fn link_with_manifest(units: &[LinkUnit]) -> Result<Module, LinkError> {
 
 fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
-    // list, and its data occupies the window region `[dbase, dbase + data_span)` (16-byte aligned, so
-    // units never overlap). `data_span` is the high-water mark of the unit's own (un-relocated) data.
-    let align16 = |x: u64| (x + 15) & !15;
+    // list, and its data occupies the window region `[dbase, dbase + data_span)`. `data_span` is the
+    // high-water mark of the unit's own (un-relocated) data.
+    //
+    // `dbase` is aligned to the **max host page** ([`POWERBOX_STACK_ALIGN`], 64 KiB), not merely 16
+    // bytes. The confinement runtime applies the D40 read-only-segment protection at *host-page*
+    // granularity — it rounds a read-only segment's end **up to the host page** and marks the page
+    // `PROT_READ`. A frontend lays each unit out so its own read-only and writable data never share a
+    // host page (rodata last, page-aligned), but stacking units 16-byte-tight reintroduces the hazard
+    // *across* units: one unit's read-only tail lands on the same host page as the next unit's writable
+    // head, and that writable data's first store faults. Page-aligning every unit's base keeps each
+    // unit on its own host pages (no cross-unit sharing) **and** preserves each unit's internal
+    // offset-mod-page coloring (the shift is a page multiple), so the intra-unit separation survives
+    // the relocation. The padding is a few reserved (`PROT_NONE`, lazily paged) KiB per unit — free in
+    // the sparse window (§1a), and load-bearing for confinement, not cosmetic.
+    let page_align = |x: u64| (x + (POWERBOX_STACK_ALIGN - 1)) & !(POWERBOX_STACK_ALIGN - 1);
     let mut fbases = Vec::with_capacity(units.len());
     let mut dbases = Vec::with_capacity(units.len());
     let (mut ftotal, mut dtotal): (u32, u64) = (0, 0);
     for u in units {
         fbases.push(ftotal);
         ftotal += u.module.funcs.len() as u32;
-        let dbase = align16(dtotal);
+        let dbase = page_align(dtotal);
         dbases.push(dbase);
         let span = u
             .module
@@ -3663,6 +3811,9 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // The merged module's first-class export table — every unit's function exports, in declaration
     // order (deterministic, unlike a by-name map walk), at their reindexed global funcidxs.
     let mut exports: Vec<Export> = Vec::new();
+    // The merged module's first-class data-export table — every unit's data exports at their
+    // reindexed (base-added) window offsets, in declaration order. Symmetric with `exports`.
+    let mut data_exports: Vec<DataExport> = Vec::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
         for (name, local) in &u.exports {
             if *local as usize >= u.module.funcs.len() {
@@ -3682,11 +3833,14 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
             });
         }
         for (name, local_off) in &u.data_exports {
-            if data_tab.insert(name.clone(), dbase + local_off).is_some()
-                || funcs_tab.contains_key(name)
-            {
+            let addr = dbase + local_off;
+            if data_tab.insert(name.clone(), addr).is_some() || funcs_tab.contains_key(name) {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
+            data_exports.push(DataExport {
+                name: name.clone(),
+                offset: addr,
+            });
         }
     }
     // Per-unit type-section bases (prefix sums), so instruction-level type references
@@ -3755,6 +3909,15 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         disps.push(d);
     }
     // Per unit: place its data, apply its relocations, reindex its functions, resolve its imports.
+    // The data-stack base for a `data.top` (the `_start` data-SP of a linked powerbox program): the
+    // window address just above *all* placed data, aligned exactly as [`powerbox_entry_sp`] does for
+    // the on-ramp entry. It is the whole program's, not any one unit's, so every unit resolves the
+    // same value regardless of link order — the entry unit's `_start` can still be function 0.
+    let entry_sp = dtotal
+        .max(POWERBOX_STACK_ALIGN)
+        .div_ceil(POWERBOX_STACK_ALIGN)
+        * POWERBOX_STACK_ALIGN;
+    let mut has_data_top = false;
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
     for ((u, ((&fbase, &dbase), &tbase)), disp) in units
@@ -3764,20 +3927,27 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     {
         let mut m = u.module.clone();
         offset_type_indices(&mut m, tbase);
+        // Patch this unit's data-image pointers (`data.ptr`, the data→data case) while segment
+        // offsets are still unit-local: overwrite the 8 placeholder bytes at each slot with the
+        // resolved absolute window address. Must precede the segment shift below so `at` and the
+        // covering segment share one coordinate frame; the address written is already absolute
+        // (`dbase`-relative for `self`, the symbol's window address for `sym`).
+        apply_unit_data_ptrs(&mut m, dbase, &data_tab)?;
+        // Patch this unit's data-image funcrefs (`data.funcref`, the data→code case): overwrite the
+        // 4 placeholder bytes at each slot with the resolved merged funcidx. Like `data.ptr`, this
+        // runs while segment offsets are still unit-local (`at` and its covering segment share a
+        // frame). The funcidx is already global (`funcs_tab` holds `fbase + local`), so it needs no
+        // later shift by this unit's `offset_func_indices`.
+        apply_unit_data_funcrefs(&mut m, &funcs_tab)?;
         // Relocate this unit's data segments into its assigned window region…
         for d in &mut m.data {
             d.offset += dbase;
         }
-        // …and patch its address constants so they point at the relocated data (own or imported).
-        for r in &u.relocations {
-            let base = match &r.kind {
-                RelocKind::SelfData => dbase,
-                RelocKind::DataSymbol(name) => *data_tab
-                    .get(name)
-                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?,
-            };
-            apply_reloc(&mut m, r, base)?;
-        }
+        // …and rewrite its link-form data addresses to concrete `ConstI64`s, now that the window
+        // layout is fixed: `data.self <off>` → `dbase + off` (own data), `data.sym "name" +addend`
+        // → `addr(name) + addend` (a cross-unit symbol, fail-closed if unexported). This is the
+        // data twin of the `call.sym → call` rewrite below — a 1:1, position-independent edit.
+        has_data_top |= resolve_unit_data_addrs(&mut m, dbase, entry_sp, &data_tab)?;
         offset_func_indices(&mut m, fbase);
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
@@ -3823,15 +3993,45 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     }
     Ok(Module {
         funcs,
-        // The merged window is the largest any unit declared (they share one linear memory).
+        // The merged window (one shared linear memory) must (a) be at least as large as any unit
+        // declared, (b) cover every relocated data segment — the units' data is **stacked** into
+        // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB — and
+        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] above
+        // `entry_sp` for it (as [`synth_manifest_start`] does for the on-ramp entry), since the
+        // entry unit sized its own window for a stack that has since been pushed up by the other
+        // units' data. Grow to the smallest power-of-two window that holds the max of these — never
+        // shrinking a unit's request. No unit declaring memory ⇒ no data segments, so `None` stays
+        // `None`.
         memory: units
             .iter()
             .filter_map(|u| u.module.memory)
-            .max_by_key(|m| m.size_log2),
+            .map(|m| m.size_log2)
+            .max()
+            .map(|declared| {
+                let cover = if has_data_top {
+                    entry_sp + POWERBOX_STACK_RESERVE
+                } else {
+                    dtotal
+                };
+                let need = if cover <= 1 {
+                    0
+                } else {
+                    (64 - (cover - 1).leading_zeros()) as u8
+                };
+                Memory {
+                    size_log2: declared.max(need),
+                }
+            }),
         data,
         // Empty for [`link`]; the deduped host-bound slots for [`link_with_manifest`].
         imports: merged_imports,
         exports,
+        // Every unit's data symbols at their merged window offsets (symmetric with `exports`).
+        data_exports,
+        // Every unit's `data.ptr` slots were resolved and cleared per-unit above; the linked
+        // module is runnable and carries none.
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
@@ -3929,20 +4129,126 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
     Ok(())
 }
 
-/// Apply one [`DataReloc`]: add `base` to the addend held in the constant it points at (a `ConstI64`/
-/// `ConstI32`). A reloc pointing at a missing or non-constant instruction is fail-closed.
-fn apply_reloc(m: &mut Module, r: &DataReloc, base: u64) -> Result<(), LinkError> {
-    let inst = m
-        .funcs
-        .get_mut(r.func as usize)
-        .and_then(|f| f.blocks.get_mut(r.block as usize))
-        .and_then(|b| b.insts.get_mut(r.inst as usize))
-        .ok_or_else(|| LinkError::BadReloc(r.clone()))?;
-    match inst {
-        Inst::ConstI64(c) => *c = c.wrapping_add(base as i64),
-        Inst::ConstI32(c) => *c = (*c as i64).wrapping_add(base as i64) as i32,
-        _ => return Err(LinkError::BadReloc(r.clone())),
+/// Resolve a unit's **link-form data addresses** to concrete `ConstI64`s, now that the linker has
+/// fixed the window layout (the data twin of [`resolve_imports_with`]'s `call.sym → call` rewrite).
+/// [`Inst::DataSelf`] `{offset}` → `ConstI64(dbase + offset)` (own data). [`Inst::DataSym`]
+/// `{name, addend}` → `ConstI64(addr(name) + addend)`, where `addr` comes from the merged
+/// `data_tab`; an unexported name is fail-closed ([`LinkError::Unresolved`], like a missing function
+/// symbol). Rewrites **1:1** in place (the result value index is unchanged), so no value
+/// renumbering — the same discipline the call-symbol rewrite follows.
+/// `data.top` resolves to `entry_sp` (the whole program's post-link data-stack base, the same for
+/// every unit). Returns `true` if any `data.top` was rewritten, so [`link`] knows to reserve the
+/// data stack above it in the merged window.
+fn resolve_unit_data_addrs(
+    m: &mut Module,
+    dbase: u64,
+    entry_sp: u64,
+    data_tab: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<bool, LinkError> {
+    let mut saw_data_top = false;
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                let addr = match inst {
+                    Inst::DataSelf { offset } => dbase.wrapping_add(*offset),
+                    Inst::DataTop => {
+                        saw_data_top = true;
+                        entry_sp
+                    }
+                    Inst::DataSym { name, addend } => {
+                        // The name is stored as raw bytes (Copy-clone friendly); resolve it against
+                        // the string-keyed symbol table. Non-UTF-8 or unexported ⇒ fail closed.
+                        let key = core::str::from_utf8(name).map_err(|_| {
+                            LinkError::Unresolved(String::from_utf8_lossy(name).into_owned())
+                        })?;
+                        let base = *data_tab
+                            .get(key)
+                            .ok_or_else(|| LinkError::Unresolved(key.to_string()))?;
+                        base.wrapping_add(*addend as u64)
+                    }
+                    _ => continue,
+                };
+                *inst = Inst::ConstI64(addr as i64);
+            }
+        }
     }
+    Ok(saw_data_top)
+}
+
+/// Apply a unit's **data-image pointer relocations** ([`Module::data_ptrs`], the data→data case):
+/// for each [`DataPtr`], resolve its `target` to an absolute window address — `SelfOff(off)` →
+/// `dbase + off` (own data), `Sym { name, addend }` → `addr(name) + addend` (fail-closed on an
+/// unexported name) — and overwrite the 8 little-endian bytes at slot `at` in the covering data
+/// segment. Called with segment offsets still **unit-local**, so `at` indexes directly into the
+/// segment whose `[offset, offset+len)` contains `[at, at+8)`; a slot with no covering segment (or
+/// one whose tail would run past the segment end) is fail-closed ([`LinkError::BadDataPtr`]). Clears
+/// `data_ptrs` on success — the linked module carries none, mirroring the `data.sym`/`data.self`
+/// rewrite that leaves no link form behind.
+fn apply_unit_data_ptrs(
+    m: &mut Module,
+    dbase: u64,
+    data_tab: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<(), LinkError> {
+    for p in &m.data_ptrs {
+        let addr: u64 = match &p.target {
+            DataPtrTarget::SelfOff(off) => dbase.wrapping_add(*off),
+            DataPtrTarget::Sym { name, addend } => {
+                let base = *data_tab
+                    .get(name.as_str())
+                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?;
+                base.wrapping_add(*addend as u64)
+            }
+        };
+        // Find the segment covering `[at, at+8)` and overwrite those 8 bytes (little-endian).
+        // Untrusted unit: use checked arithmetic so a bogus offset fails closed, never panics.
+        let end =
+            p.at.checked_add(8)
+                .ok_or(LinkError::BadDataPtr { at: p.at })?;
+        let seg = m.data.iter_mut().find(|d| {
+            d.offset <= p.at
+                && d.offset
+                    .checked_add(d.bytes.len() as u64)
+                    .is_some_and(|seg_end| end <= seg_end)
+        });
+        let seg = seg.ok_or(LinkError::BadDataPtr { at: p.at })?;
+        let lo = (p.at - seg.offset) as usize;
+        seg.bytes[lo..lo + 8].copy_from_slice(&addr.to_le_bytes());
+    }
+    m.data_ptrs.clear();
+    Ok(())
+}
+
+/// Apply a unit's **data-image funcref relocations** ([`Module::data_funcrefs`], the data→code
+/// case): for each [`DataFuncref`], resolve `name` to its merged funcidx via `funcs_tab` (fail-closed
+/// [`LinkError::Unresolved`] if unexported) and write it as a 4-byte little-endian `i32` into the
+/// covering data segment — the value `ref.func name` yields. A slot not covered by a segment (or one
+/// whose 4 bytes run past a segment end) fails closed ([`LinkError::BadDataPtr`]). Clears
+/// `data_funcrefs` on success — the linked module carries none, mirroring `data_ptrs`.
+fn apply_unit_data_funcrefs(
+    m: &mut Module,
+    funcs_tab: &alloc::collections::BTreeMap<String, FuncIdx>,
+) -> Result<(), LinkError> {
+    for r in &m.data_funcrefs {
+        let func = *funcs_tab
+            .get(r.name.as_str())
+            .ok_or_else(|| LinkError::Unresolved(r.name.clone()))?;
+        let end =
+            r.at.checked_add(4)
+                .ok_or(LinkError::BadDataPtr { at: r.at })?;
+        let seg = m
+            .data
+            .iter_mut()
+            .find(|d| {
+                d.offset <= r.at
+                    && d.offset
+                        .checked_add(d.bytes.len() as u64)
+                        .is_some_and(|seg_end| end <= seg_end)
+            })
+            .ok_or(LinkError::BadDataPtr { at: r.at })?;
+        let lo = (r.at - seg.offset) as usize;
+        seg.bytes[lo..lo + 4].copy_from_slice(&func.to_le_bytes());
+    }
+    m.data_funcrefs.clear();
     Ok(())
 }
 
@@ -4065,6 +4371,8 @@ mod import_tests {
             term: Terminator::Unreachable,
         };
         let mut m = Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
@@ -4075,6 +4383,7 @@ mod import_tests {
             data: vec![],
             imports: vec![],
             exports: vec![],
+            data_exports: vec![],
             impl_exports: vec![],
             debug_info: None,
         };
@@ -4151,6 +4460,96 @@ mod import_tests {
         m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
         let r = resolve_imports_with(&m, |n| policy(n).map(Resolved::Cap)).expect("resolve");
         assert_eq!(r, m, "a no-import module round-trips identically");
+    }
+}
+
+#[cfg(test)]
+mod link_layout_tests {
+    use super::*;
+
+    /// A minimal link unit: one linear-memory window and a single data segment (no funcs/exports),
+    /// enough to exercise the linker's data-stacking layout.
+    fn data_unit(seg_offset: u64, len: usize, readonly: bool) -> LinkUnit {
+        LinkUnit {
+            module: Module {
+                data_ptrs: Vec::new(),
+                data_funcrefs: Vec::new(),
+                types: vec![],
+                funcs: vec![],
+                memory: Some(Memory { size_log2: 16 }),
+                data: vec![Data {
+                    offset: seg_offset,
+                    readonly,
+                    bytes: vec![0u8; len],
+                }],
+                imports: vec![],
+                exports: vec![],
+                data_exports: vec![],
+                impl_exports: vec![],
+                debug_info: None,
+            },
+            exports: vec![],
+            data_exports: vec![],
+        }
+    }
+
+    /// The confinement property the linker must preserve when it stacks units: the runtime applies the
+    /// read-only-segment protection at **host-page** granularity (it rounds a read-only segment up to
+    /// the host page and marks the whole page `PROT_READ`), so **no host page may hold bytes from both
+    /// a read-only and a writable segment** — otherwise the writable data's first store faults. A
+    /// frontend guarantees this within one unit; the linker must not break it *across* units by packing
+    /// one unit's writable head onto the same page as the previous unit's read-only tail. Regression
+    /// guard for the emit-object self-host libc, whose writable arena landed on the entry unit's
+    /// read-only symbol page under the old 16-byte-tight stacking (task #20).
+    #[test]
+    fn stacked_units_never_share_a_host_page_between_ro_and_rw() {
+        // Unit A ends in read-only data whose tail spills into a second 4 KiB page; unit B begins with
+        // writable data at a low in-unit offset. 16-byte-tight, B's store page would coincide with A's
+        // read-only page; page-aligned unit bases keep them apart.
+        let a = data_unit(0, 4096 + 32, true); // read-only
+        let b = data_unit(32, 64, false); // writable, low offset
+        let linked = link_with_manifest(&[a, b]).expect("link ro-provider + rw-consumer");
+
+        // No 64 KiB host page (the max host page, [`POWERBOX_STACK_ALIGN`]) mixes ro and rw bytes.
+        let page = POWERBOX_STACK_ALIGN;
+        let mut ro_pages = alloc::collections::BTreeSet::new();
+        let mut rw_pages = alloc::collections::BTreeSet::new();
+        for d in &linked.data {
+            if d.bytes.is_empty() {
+                continue;
+            }
+            let first = d.offset / page;
+            let last = (d.offset + d.bytes.len() as u64 - 1) / page;
+            for p in first..=last {
+                if d.readonly {
+                    ro_pages.insert(p);
+                } else {
+                    rw_pages.insert(p);
+                }
+            }
+        }
+        let shared: Vec<_> = ro_pages.intersection(&rw_pages).collect();
+        assert!(
+            shared.is_empty(),
+            "no host page may mix read-only and writable data; shared pages: {shared:?}"
+        );
+
+        // Concretely: unit B was relocated onto its own page-aligned base (the mechanism), so its
+        // writable segment keeps its in-unit offset (32) modulo the page and sits above unit A.
+        let rw = linked
+            .data
+            .iter()
+            .find(|d| !d.readonly)
+            .expect("writable segment present");
+        assert_eq!(
+            rw.offset % page,
+            32,
+            "unit base page-aligned; seg keeps in-unit offset 32"
+        );
+        assert!(
+            rw.offset >= page,
+            "unit B relocated to a fresh host page above unit A"
+        );
     }
 }
 

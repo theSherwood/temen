@@ -209,7 +209,7 @@ the MVP powerbox (§3e) — `stdout`/`stderr` go to the real streams and it exit
 guest's code:
 
 ```sh
-cargo run -p svm-run -- crates/svm-run/demos/hello.svm   # text IR → "hello, sandbox!"
+cargo run -p svm-run -- crates/svm-run/demos/hello.svmt   # text IR → "hello, sandbox!"
 cargo run -p svm-run -- crates/svm-run/demos/hello.c     # C source (via the chibicc frontend)
 cargo run -p svm-run -- crates/svm-run/demos/calc.c      # a recursive-descent calculator
 cargo run -p svm-run -- crates/svm-run/demos/rational.c  # exact-rational arithmetic

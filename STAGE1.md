@@ -372,6 +372,21 @@ signals ladder). In dependency order:
 
 1. **Guest libc for bash** — assemble bash's link surface (`glob`/`fnmatch`, regex, `getpwnam`/
    `getgrnam`, `setjmp` — proven — on top of the Postgres shim set). *Medium; incremental.*
+   **[Slice 4a done 2026-07-29 — the two-worlds bridge.]** The POSIX personality (the process/fd/signal
+   ABI of slices 1–3) lived only in the chibicc/name-binding world; the LLVM on-ramp reaches host caps by
+   name via `__vm_cap_resolve` + `__vm_host_call` (the `fs`-cap idiom). `svm_run::posix::posix_cap`
+   (over new `svm_posix::cap`) now exposes the personality as a named powerbox `HostCap`, so an on-ramp
+   guest resolves `"posix"` and drives `pipe`/`dup2`/`posix_spawn`/`waitpid` through it — proven
+   cross-backend (interp==bytecode==JIT) by `crates/svm-llvm/tests/posix_cap.rs` (a compiled-C mini-shell
+   spawns a child with fd inheritance). This is the substrate a bash-on-LLVM `proc_shim` will call
+   instead of the Postgres demo's inert process stubs. *(A program that reaches the host only through
+   `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip svm-llvm's
+   `needs_powerbox_entry` and get the synthesized `_start`; a real shell links libc, so it always does.)*
+   **[Slice 4b done 2026-07-29 — the libc shim + a pipeline.]** `posix_shim.h` gives the on-ramp real-C
+   `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + a fork-free `sh_spawn` over the `"posix"` cap — the
+   World-B analogue of `demos/shell/shim.c`, the layer a shell links. `pipeline.c` runs a real `gen | up`
+   pipeline through it (wire stdout→pipe, run stage 1, restore stdout, wire pipe→stdin, run stage 2 —
+   the classic redirect save/restore), landing "HELLO" on the personality's stdout, cross-backend.
 2. **Build `bash.svmb`** — autoconf cross-config for the svm "platform", `--noediting`, through the
    `clang → svm-llvm-translate` on-ramp (S8), the same path Postgres/SQLite/QuickJS already ride.
    *Medium/mechanical.* Gets bash to *link and start*.
@@ -382,8 +397,32 @@ signals ladder). In dependency order:
    durable-instrumented build + full window copy (CoW later). *Large; the single biggest item.* Until
    it lands, bash runs only a fork-free subset — effectively no real script (`ls | wc` already forks).
 4. **`exec`/`wait`/`waitpid`/`pipe`/`dup2`** wired to the child machinery. *Medium.*
+   **[Slice 1 done 2026-07-29 — the fd surface.]** `pipe`/`dup2`/`dup`/`fcntl` landed as real
+   personality ops (POSIX.md ops 23–26) over a generalized fd table (stdio `0`/`1`/`2` are now ordinary
+   sentinels, so `dup2(pipe_w, 1)` redirect and `close`/reuse of a stdio fd work as POSIX). Pipes are
+   intra-personality (a single guest's two ends share one buffer, non-blocking).
+   **[Slice 2 done 2026-07-29 — spawn/wait + fd inheritance.]** `spawn`/`waitpid`/`wait` landed as
+   personality ops (POSIX.md 27–29). A spawn is *authority* the libc personality does not hold, so the
+   instantiate+run is an **embedder-wired delegate** (`Posix::set_spawn`) — opt-in like the stdout
+   `Stream`, `-ENOSYS` unwired. The child **inherits the caller's fd 0 and fd 1**: `spawn` drains the
+   current fd-0 binding as the child's stdin and routes its captured stdout to the current fd-1 binding,
+   so a `dup2(pipe_w, 1)` / `dup2(file, 1)` redirect before the spawn lands the child's output exactly
+   where POSIX would (proven cross-backend). **[Slice 2.5 done 2026-07-29 — end-to-end with a real
+   child.]** A **compiled-C shell** now drives a **separate compiled-C command** through `spawn`/`waitpid`
+   (`c_posix_spawn.rs`, interp==JIT): the embedder wires the spawn delegate to instantiate + run the
+   child domain on its own Posix personality, and the child's uppercased stdin output flows to the
+   shell's fd 1 while its exit status returns through `waitpid`. (The delegate is the test embedder —
+   promoting a reusable builder into `svm-run` waits on `svm-run` gaining an `svm-posix` dep, deferred
+   until a second consumer needs it.) **Remaining:** `fork`/`vfork`/`execve` (return-twice /
+   image-replace) on the durable-clone capstone.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
+   **[Slice 3 done 2026-07-29 — the L0 doorbell.]** `signal`/`kill`/`sigcheck` landed as personality
+   ops (POSIX.md 30–32, cross-backend). A raised signal (guest `kill`, or the embedder's
+   `Posix::raise_signal` for a terminal `^C`) sets a pending bit; the guest polls `sigcheck` at a safe
+   point and it returns the installed handler pointer of the lowest pending **caught** signal (ignored
+   and default dispositions dropped) — exact for `trap`, no async interruption. **Remaining:** L1
+   interruptible parks + L2 safepoint handlers (interrupt a running loop; default actions), parked S13.
 6. **Job control + terminal** — process groups, `tcsetpgrp`, SIGTSTP/CONT, and readline/termios for
    interactive use. Deferrable behind `--noediting` (batch bash is still real bash); the terminal is
    its own large frontend effort.
@@ -407,23 +446,39 @@ on) **already lowers and drives the core §14 ops, wasm-safely:**
 
 What the browser bytecode engine still **declines** (the real remaining gaps, in rough order):
 
-1. **`instantiate_module_named` (op 13)** — exec-with-inherited-stdout, what the shell's external-
-   command path uses. It has no bytecode lowering (only ops 0/1/5 do) and the cooperative driver
-   doesn't build the child's by-name powerbox. **This is the first parity slice**: lower op 13 (=
-   op 5 + op 11 grants) and drive it cooperatively, following the op-5 pattern that already works —
-   which unblocks *external commands* in the playground shell.
-2. **The ring / `AddressSpace` / `SharedRegion` ops** — `compile_inst` rejects these (concurrent
-   pipelines). Needed for the stripped ring-pipeline path.
-3. **True concurrency.** The cooperative driver runs a child *to completion synchronously*, which is
-   exactly right for sequential spawn/wait but not for *concurrently* live children (a `poll` that
-   must see a still-running child; a pipeline whose stages run interleaved). That needs a cooperative
-   **scheduler** that interleaves live children on one thread (logical clock, no OS threads) — the
-   wasm-safe analogue of the native M:N/JIT-OS-thread executors.
+1. **`instantiate_module_named` (op 13)** *(done — parity slice 1, `bytecode_instantiate_named.rs`)* —
+   exec-with-inherited-stdout, what the shell's external-command path uses. Lowered in `compile_inst`
+   to `Op::InstantiateModule` with a `grants: Option<(ptr, n)>` field (op 5 = `None`); the cooperative
+   `drive` arm reads the by-name grant records from the parent window and builds the child powerbox via
+   the shared `Host::spawn_named_child`. Unblocks *external commands* in the playground shell.
+2. **The ring / `AddressSpace` / `SharedRegion` ops + concurrent stages** *(done — parity slice 2,
+   `bytecode_concurrent_stages.rs`)* — the full concurrent ring pipeline (the tree-walk oracle's
+   `concurrent_stages.rs`, same 410) now runs on the cooperative bytecode driver. The gap turned out
+   **narrower than "lower the region ops"**: `SharedRegion.map`/`page_size` (ops 0/3) and
+   `AddressSpace.create_region` (op 5) already ride the generic `cap.call` dispatch (they service from
+   `(Host, Mem)` alone — only `SharedRegion.grant` op 4 needs a child-powerbox seam, and the ring path
+   doesn't use it), and the production `drive` scheduler was **already** a cooperative multi-vCPU
+   scheduler that parks a task on `memory.wait` and wakes it on `notify` (so item 3 below was already
+   built). Two real changes closed it: (a) **`instantiate_named` (op 11)** — `instantiate` (op 0) plus a
+   by-name grant list, the same-module twin of op 13 — lowered by extending `Op::Instantiate` with the
+   same `grants` field, and `scan_seams` corrected to classify ops 11/13 as `has_instantiate` (not
+   `has_coro`, which with `memory.wait`'s `has_thread` tripped the `has_coro && has_thread` veto → whole-
+   module fallback); and (b) the drive's futex wait/notify now key on the **backing identity**
+   (`Mem::futex_key`, `FutexKey::Region`) computed against the **waiting task's own confined window**
+   (`extra_envs`), not the raw window offset against the root `mem` — so two children that mapped the
+   same `SharedRegion` into separate windows rendezvous (S1c), instead of a child re-reading an
+   unrelated root byte and spinning. Confinement (D38 masking) untouched — authority-TCB only (§2a).
+3. **True concurrency** *(already built — folded into slice 2)* — the cooperative `drive` scheduler
+   already interleaves live children on one thread with a logical clock (`TaskState::BlockedWait` parks,
+   `notify`/child-completion wakes, a stuck set advances the clock, deadlock → `ThreadFault`); a
+   confined `instantiate` child runs as a task slot exactly like a `thread.spawn` sibling. The earlier
+   "runs a child to completion synchronously" note was stale for this driver. `poll` (WNOHANG) is the
+   one remaining nuance and is already backend-portable (see the `poll` note above).
 4. **`fork`** — durable clone over the `Instantiator` child model (§7). Whether the durable
    freeze/thaw path itself runs on the bytecode engine in wasm is the open question that gates *bash*
-   specifically; ops 1–3 are the parity groundwork it sits on.
+   specifically; slices 1–2 are the parity groundwork it sits on.
 
 So this is a **sequence of scoped slices on the bytecode engine**, not an unbounded design problem:
-op 13 → ring ops → cooperative child scheduler → fork. The wasm-JIT tier can defer each §14 seam to
-the bytecode engine (as it already does for its cross-tier helpers), so bringing bytecode to parity
-brings *both* browser engines along. Slice 1 (op 13) is the immediate next step.
+op 13 → ring ops + op 11 → (scheduler, already built) → fork. The wasm-JIT tier can defer each §14 seam
+to the bytecode engine (as it already does for its cross-tier helpers), so bringing bytecode to parity
+brings *both* browser engines along. Slices 1 and 2 are done; **`fork` is the next frontier**.

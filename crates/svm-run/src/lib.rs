@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
-    CapPageMap, GuestMem, Host, HostFn, RegionBacking, StreamRole, Trap,
+    CapPageMap, GuestMem, Host, HostProc, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -32,6 +32,7 @@ pub use svm_interp::{Quota, Value};
 pub use svm_opt::instrument::MemHookStats;
 pub mod exec;
 pub mod fs;
+pub mod posix;
 use svm_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use svm_peval::{SpecArg, SpecConfig};
 
@@ -954,7 +955,14 @@ pub fn jit_resolve_and_validate(
     if !m.data.is_empty() {
         return Err(EINVAL);
     }
-    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
+    // A submitted unit MAY host §12 **fibers** (`cont.*`) — they switch stacks within the domain on
+    // the caller's thread, so a unit running its own scheduler to completion never parks across the
+    // synchronous `cap.call` it runs inside; the parent domain stands up the fiber runtime (see
+    // `CompiledModule::enable_fiber_hosting`, and the interpreter's `INVOKE_MODULE` fiber support).
+    // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) stay rejected: a
+    // spawned vCPU would outlive this `cap.call` and collide with the serialized `Mutex<Host>`
+    // model. (Renegotiated 2026-07-30 — DESIGN.md §22 "Concurrency"; was: all §12 rejected.)
+    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
         return Err(EINVAL);
     }
     // A submitted unit's `call_indirect` (the new→old path) is now allowed: on the JIT it
@@ -976,6 +984,17 @@ pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
+/// Like [`grant_jit`], but the granted domain may host §12 **fibers** (`cont.*`) in submitted units
+/// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] stands up the parent's
+/// fiber runtime (`CompiledModule::enable_fiber_hosting`) so a unit's `cont.*` resolve, and the
+/// interpreter runs them in its eval loop — so the backends stay in differential lockstep.
+/// **Threads/futex** in a submitted unit stay rejected (they would outlive the `cap.call`). Same
+/// handle value + memory-match precondition as [`grant_jit`].
+pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    host.set_jit_hosts_fibers(true);
+    grant_jit(host, m, table_log2)
+}
+
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
 /// ([`CompiledModule`]), with the module pointer registered in `host` so [`cap_thunk`]'s
 /// native `Jit` ops can re-enter it mid-run (`define_extra` / `invoke_extra` while the guest
@@ -992,6 +1011,9 @@ pub fn jit_cap_run(
     table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, Vec<u8>), svm_jit::JitError> {
+    // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
+    // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
+    let hosts_fibers = host.jit_hosts_fibers();
     // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
@@ -1014,6 +1036,9 @@ pub fn jit_cap_run(
             svm_jit::Quota::default(),
             table_reserve_log2,
         )?;
+        if hosts_fibers {
+            cm.enable_fiber_hosting(svm_jit::Quota::default())?;
+        }
         host_mutex
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1043,6 +1068,9 @@ pub fn jit_cap_run(
         svm_jit::Quota::default(),
         table_reserve_log2,
     )?;
+    if hosts_fibers {
+        cm.enable_fiber_hosting(svm_jit::Quota::default())?;
+    }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
     // §3.6 / I36 slice 3: register for the native serve arm too (see `powerbox_compile_run`).
@@ -2816,6 +2844,15 @@ unsafe fn powerbox_compile_run(
             quota,
             CLI_JIT_TABLE_LOG2,
         )?;
+        // Fiber-hosting grant (`set_jit_hosts_fibers`, e.g. the powerbox): stand up the fiber runtime
+        // so a submitted unit's `cont.*` resolve even when the top-level module uses no fibers itself.
+        // Idempotent when the top-level already built its fiber runtime (`enable_fiber_hosting`).
+        if m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jit_hosts_fibers()
+        {
+            cm.enable_fiber_hosting(quota)?;
+        }
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
@@ -2848,6 +2885,11 @@ unsafe fn powerbox_compile_run(
         CLI_JIT_TABLE_LOG2,
     )?;
     let host = &mut *raw_host;
+    // Fiber-hosting grant (see the locked branch above): enable it so a submitted unit's `cont.*`
+    // resolve even when this (single-threaded) top-level module uses no fibers of its own.
+    if host.jit_hosts_fibers() {
+        cm.enable_fiber_hosting(quota)?;
+    }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
     // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
@@ -3048,6 +3090,14 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
     h.set_jit_validator(jit_blob_validator);
+    // The powerbox `Jit` grant hosts §12 **fibers** (`cont.*`) in submitted units (DESIGN.md §22
+    // "Concurrency"): the maximal CLI grant admits a unit running its own cooperative scheduler —
+    // e.g. `[interpret …]` of concurrent JACL source (spawn/await), whose in-guest entry runs the
+    // program body on a scheduler root fiber. `powerbox_compile_run` reads this to `enable_fiber_hosting`
+    // on the top-level module so a submitted unit's `cont.*` resolve even when the top-level program
+    // uses no fibers of its own. Threads/futex in a submitted unit stay rejected (they would outlive
+    // the synchronous `cap.call`). In-domain stack switches, not an escape vector.
+    h.set_jit_hosts_fibers(true);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
     let v = [
         h.grant_stream(StreamRole::Out),
@@ -3485,7 +3535,7 @@ pub struct HostCap {
     /// §3.2 (IMPORTS.md): a **wired interface offer** — the slot binds to op `op` of a guest
     /// `impl` export instead of a host-native capability. When set, `type_id` is unused (the
     /// interface id is interned per-host at wiring) and `grant` is never called. Built by
-    /// [`HostCap::impl_offer`]; signature-checked structurally, fail-closed, at
+    /// [`HostCap::offer_func`]; signature-checked structurally, fail-closed, at
     /// [`instantiate_with_imports`].
     offer: Option<OfferBinding>,
     /// §3.5 (IMPORTS.md): a **grouped host-native provider** — the slot binds a *whole
@@ -3518,7 +3568,7 @@ impl IfaceShape {
     /// embedder can offer a host-native handle as a whole interface without re-declaring its op
     /// names and signatures by hand — e.g. `IfaceShape::builtin(svm_interp::cap_id::STREAM)` for a
     /// host stream. Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins,
-    /// `HOST_FN`) or an unknown id.
+    /// `HOST_PROC`) or an unknown id.
     pub fn builtin(id: u32) -> Option<IfaceShape> {
         svm_interp::builtin_iface_shape(id).map(|ops| IfaceShape {
             ops: ops.into_iter().map(|(n, s)| (n.to_string(), s)).collect(),
@@ -3526,7 +3576,7 @@ impl IfaceShape {
     }
 }
 
-/// The state a [`HostCap::impl_offer`] carries: the offering module's function table and the
+/// The state a [`HostCap::offer_func`] carries: the offering module's function table and the
 /// offer's per-op funcidx list (both shared, cheap to clone per host), plus which op this
 /// import name selects.
 #[derive(Clone)]
@@ -3534,11 +3584,11 @@ struct OfferBinding {
     funcs: Arc<[svm_ir::Func]>,
     ops: Arc<[u32]>,
     op: u32,
-    /// §3.2 v2: `Some` = an **instanced** offer ([`HostCap::impl_service`]) — the provider
+    /// §3.2 v2: `Some` = an **instanced** offer ([`HostCap::offer_proc`]) — the provider
     /// module whose memory declaration + data segments seed a persistent provider domain,
-    /// wired per host with `Host::wire_impl_instance` (each run's fresh host gets a fresh
+    /// wired per host with `Host::wire_offer_proc` (each run's fresh host gets a fresh
     /// provider instance, so backends stay in differential lockstep). `None` = a v1 pure
-    /// offer ([`HostCap::impl_offer`]).
+    /// offer ([`HostCap::offer_func`]).
     provider: Option<Arc<Module>>,
 }
 
@@ -3587,35 +3637,64 @@ impl HostCap {
             iface: None,
         }
     }
-    /// A **host-defined** capability (iface [`cap_id::HOST_FN`]) — arbitrary semantics behind a named
-    /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
-    /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
-    /// `(op, args, guest_mem) -> result slots | Trap`.
-    pub fn host_fn(op: u32, make: impl Fn() -> HostFn + Send + Sync + 'static) -> HostCap {
-        let make = Arc::new(make);
+    /// The `Memory` capability: `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` are ops 0/1/2/3 on the
+    /// guest window. `op` selects which — so `HostCap::memory(0)` binds a `vm_map` import and
+    /// `HostCap::memory(3)` a `vm_page_size` import. Granting it twice (once per name) is fine: the
+    /// capability acts on the single shared window, not per-handle state, so both handles see the same
+    /// growth. This is the name-keyed ([`instantiate_with_imports`]) counterpart to the fixed powerbox's
+    /// one Memory grant serving all four names by `(type_id, op)`.
+    pub fn memory(op: u32) -> HostCap {
         HostCap {
-            type_id: cap_id::HOST_FN,
+            type_id: cap_id::MEMORY,
             op,
-            grant: Arc::new(move |h, _| h.grant_host_fn(make())),
+            grant: Arc::new(|h, _| h.grant_memory()),
             unbound: false,
             offer: None,
             iface: None,
         }
     }
-    /// An **mmap-capable** host-defined capability (§4b): like [`host_fn`](HostCap::host_fn) but the
-    /// handler is registered via [`Host::grant_host_fn_region`], so it is also handed a
+    /// A **host-defined** capability (iface [`cap_id::HOST_PROC`]) — arbitrary semantics behind a named
+    /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
+    /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
+    /// `(op, args, guest_mem) -> result slots | Trap`.
+    pub fn host_proc(op: u32, make: impl Fn() -> HostProc + Send + Sync + 'static) -> HostCap {
+        let make = Arc::new(make);
+        HostCap {
+            type_id: cap_id::HOST_PROC,
+            op,
+            // FORK.md PR 5: `make` is already the fork factory — the multi-backend grant contract
+            // ("a fresh closure per grant over one shared provider state") is exactly the
+            // fork-shares-state contract, so every `HostCap::host_proc`-wired capability (e.g.
+            // `posix_cap`'s libc: shared fd table/memfs) is forkable by construction. A twin's
+            // powerbox re-mints its closure through this same factory (`Host::fork_powerbox`).
+            grant: Arc::new({
+                let make = Arc::clone(&make);
+                move |h, _| {
+                    h.grant_host_proc_forkable(
+                        make(),
+                        Arc::clone(&make) as svm_interp::HostProcFork,
+                    )
+                }
+            }),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
+    }
+    /// An **mmap-capable** host-defined capability (§4b): like [`host_proc`](HostCap::host_proc) but the
+    /// handler is registered via [`Host::grant_host_proc_region`], so it is also handed a
     /// [`svm_interp::RegionMinter`] and can mint a file-backed `SharedRegion` to hand the guest for
-    /// zero-copy aliasing. Resolves under the same [`cap_id::HOST_FN`], so the guest reaches it exactly
-    /// like a plain `host_fn`.
-    pub fn host_fn_region(
+    /// zero-copy aliasing. Resolves under the same [`cap_id::HOST_PROC`], so the guest reaches it exactly
+    /// like a plain `host_proc`.
+    pub fn host_proc_region(
         op: u32,
-        make: impl Fn() -> svm_interp::HostFnRegion + Send + Sync + 'static,
+        make: impl Fn() -> svm_interp::HostProcRegion + Send + Sync + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
-            type_id: cap_id::HOST_FN,
+            type_id: cap_id::HOST_PROC,
             op,
-            grant: Arc::new(move |h, _| h.grant_host_fn_region(make())),
+            grant: Arc::new(move |h, _| h.grant_host_proc_region(make())),
             unbound: false,
             offer: None,
             iface: None,
@@ -3657,16 +3736,16 @@ impl HostCap {
     /// §3.2 (IMPORTS.md): bind an import slot to **op `op` of a guest interface offer** — a
     /// named `impl` export of `provider` (`export "<offer>" impl <funcidx>...`). The wiring is
     /// the authority-moving act: at instantiation the offer is wired into the instance's table
-    /// (`Host::wire_impl` — the interface id is interned per-host from the ops' derived
+    /// (`Host::wire_offer_func` — the interface id is interned per-host from the ops' derived
     /// signatures) and the slot binds to `(interned id, op, handle)` after a structural,
     /// fail-closed signature check against the import's declaration
     /// ([`instantiate_with_imports`] refuses a mismatch).
     ///
-    /// v1 executes a wired op as a **pure dispatch** (see `svm_interp::Binding::GuestImpl`):
+    /// v1 executes a wired op as a **pure dispatch** (see `svm_interp::Binding::Offer`):
     /// the impl computes over its arguments alone — no window, no capabilities.
     ///
     /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
-    pub fn impl_offer(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+    pub fn offer_func(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
         let e = provider.resolve_impl_export(offer)?;
         if op as usize >= e.ops.len() {
             return None;
@@ -3686,14 +3765,14 @@ impl HostCap {
         })
     }
 
-    /// §3.2 v2 (IMPORTS.md): like [`HostCap::impl_offer`], but **instanced** — the offer gets a
+    /// §3.2 v2 (IMPORTS.md): like [`HostCap::offer_func`], but **instanced** — the offer gets a
     /// persistent provider domain (a window seeded from `provider`'s memory declaration + data
     /// segments, plus its own powerbox), so ops keep exporter-domain state across calls within a
     /// run. Each run's fresh host wires a fresh instance from the same initial image, so the
     /// three backends stay in differential lockstep.
     ///
     /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
-    pub fn impl_service(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+    pub fn offer_proc(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
         let e = provider.resolve_impl_export(offer)?;
         if op as usize >= e.ops.len() {
             return None;
@@ -3720,7 +3799,7 @@ impl HostCap {
     /// against `shape` — name-keyed, signature-equal, **subset allowed** (a consumer needing only
     /// `{read, len}` binds a four-op provider), extra provider ops ignored — and the frozen op
     /// remap makes `call.import slot.op` dispatch the right native op. This is the host-side
-    /// mirror of a guest offer: `HostCap::impl_service` wires a guest module as the provider,
+    /// mirror of a guest offer: `HostCap::offer_proc` wires a guest module as the provider,
     /// `HostCap::iface` wires a host-native handle.
     pub fn iface(
         shape: &IfaceShape,
@@ -3780,7 +3859,7 @@ impl Imports {
     /// order) runs `cap`'s grant and registers the handle under the bare module name in the §7
     /// capability-name directory (F7); its siblings resolve that name instead of granting anew, so
     /// all members share one handle — and one state — per run. (Without this, N `provide` calls of
-    /// N `HostCap::host_fn`s would mint N independent closures — N filesystems.) Bonus symmetry:
+    /// N `HostCap::host_proc`s would mint N independent closures — N filesystems.) Bonus symmetry:
     /// the guest can also `cap.self.resolve("{module}")` for the shared handle at runtime.
     pub fn provide_module(mut self, module: &str, cap: HostCap, fields: &[(&str, u32)]) -> Imports {
         for &(field, op) in fields {
@@ -3837,22 +3916,10 @@ pub struct Instance {
     hooks: Option<MemHooks>,
 }
 
-/// One guest memory access, reported to a [`Instance::with_mem_hooks`] handler **before** the
-/// access executes (pre-confinement-check, so a faulting run's final event is the *attempted*
-/// faulting access). `addr` is the effective guest address (base + immediate offset). Bulk ops are
-/// one event carrying their span operands — `Copy` covers both `mem.copy` and `mem.move`;
-/// consumers expand spans themselves. v128 accesses are `Load`/`Store` with `width` 16.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MemEvent {
-    Load { addr: u64, width: u32 },
-    Store { addr: u64, width: u32 },
-    AtomicLoad { addr: u64, width: u32 },
-    AtomicStore { addr: u64, width: u32 },
-    AtomicRmw { addr: u64, width: u32 },
-    AtomicCmpxchg { addr: u64, width: u32 },
-    Copy { dst: u64, src: u64, len: u64 },
-    Fill { dst: u64, len: u64 },
-}
+// The access vocabulary (`MemEvent`) lives in `svm-interp` — it is shared with the debug-session
+// access sink (`bytecode::AccessSinkFn`), and a differential pins the two streams equal — and is
+// re-exported here unchanged as the [`Instance::with_mem_hooks`] handler's event type.
+pub use svm_interp::MemEvent;
 
 /// A per-host memory-hook handler: observe each [`MemEvent`]; return `Err(Trap)` to veto — the run
 /// aborts with that trap, with ordinary backend-identical cap-trap semantics.
@@ -4088,7 +4155,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
 fn generic_dispatch_iface(type_id: u32) -> bool {
     matches!(
         type_id,
-        cap_id::STREAM | cap_id::EXIT | cap_id::CLOCK | cap_id::MEMORY | cap_id::HOST_FN
+        cap_id::STREAM | cap_id::EXIT | cap_id::CLOCK | cap_id::MEMORY | cap_id::HOST_PROC
     )
 }
 
@@ -4134,10 +4201,10 @@ impl Instance {
         // the value the instrumented code must bake in as its `cap.call` handle constant.
         let handle = {
             let mut scratch = Host::new();
-            scratch.grant_host_fn(Box::new(|_, _, _| Ok(vec![])))
+            scratch.grant_host_proc(Box::new(|_, _, _| Ok(vec![])))
         };
         let spec = svm_opt::instrument::MemHookSpec {
-            type_id: cap_id::HOST_FN,
+            type_id: cap_id::HOST_PROC,
             handle,
         };
         let (m, stats) = svm_opt::instrument::instrument_mem_hooks(&self.module, spec);
@@ -4167,7 +4234,7 @@ impl Instance {
     fn grant_mem_hooks(&self, h: &mut Host) {
         let Some(hooks) = &self.hooks else { return };
         let mut hook = (hooks.make)();
-        let handle = h.grant_host_fn(Box::new(move |op, args, _mem| {
+        let handle = h.grant_host_proc(Box::new(move |op, args, _mem| {
             let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
             hook(ev)?;
             Ok(vec![])
@@ -4438,8 +4505,8 @@ impl Instance {
                         let handle = match &off.provider {
                             // §3.2 v2 instanced offer: a fresh provider instance from the
                             // module's initial image, per host — backends stay in lockstep.
-                            Some(m) => h.wire_impl_instance(m, &off.ops),
-                            None => h.wire_impl(&off.funcs, &off.ops),
+                            Some(m) => h.wire_offer_proc(m, &off.ops),
+                            None => h.wire_offer_func(&off.funcs, &off.ops),
                         }
                         .expect("offer validated at instantiation");
                         h.register_cap_name(name, handle);

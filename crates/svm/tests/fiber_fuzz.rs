@@ -219,11 +219,14 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
 fn gen_module(g: &mut Rng) -> Module {
     let nfuncs = 1 + g.range(4);
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: (0..nfuncs).map(|_| gen_func(g, nfuncs, None)).collect(),
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        data_exports: Vec::new(),
         impl_exports: Vec::new(),
         types: Vec::new(),
         debug_info: None,
@@ -242,11 +245,14 @@ fn gen_module(g: &mut Rng) -> Module {
 fn gen_module_acyclic(g: &mut Rng) -> Module {
     let nfuncs = 1 + g.range(4);
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: (0..nfuncs).map(|i| gen_func(g, nfuncs, Some(i))).collect(),
         memory: None,
         data: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        data_exports: Vec::new(),
         impl_exports: Vec::new(),
         types: Vec::new(),
         debug_info: None,

@@ -64,6 +64,19 @@ pub fn print_module(m: &Module) -> String {
             escape_bytes(&d.bytes)
         );
     }
+    // Data-image pointer relocations (the data→data case): `data.ptr <at> self <off>` for a pointer
+    // into this unit's own data, `data.ptr <at> sym "<name>" <addend>` for a cross-unit one. `link`
+    // resolves and clears these, so they print only on a pre-link object.
+    for p in &m.data_ptrs {
+        match &p.target {
+            svm_ir::DataPtrTarget::SelfOff(off) => {
+                let _ = writeln!(s, "data.ptr {} self {off}", p.at);
+            }
+            svm_ir::DataPtrTarget::Sym { name, addend } => {
+                let _ = writeln!(s, "data.ptr {} sym \"{name}\" {addend}", p.at);
+            }
+        }
+    }
     if let Some(mem) = &m.memory {
         let _ = writeln!(s, "memory {}", mem.size_log2);
         s.push('\n');
@@ -116,6 +129,13 @@ pub fn print_module(m: &Module) -> String {
     if !m.exports.is_empty() {
         for (i, e) in m.exports.iter().enumerate() {
             let _ = writeln!(s, "export {i} func \"{}\" {}", e.name, e.func);
+        }
+        s.push('\n');
+    }
+    // Data exports (their own dense index sequence): `export <idx> data "<name>" <offset>`.
+    if !m.data_exports.is_empty() {
+        for (i, e) in m.data_exports.iter().enumerate() {
+            let _ = writeln!(s, "export {i} data \"{}\" {}", e.name, e.offset);
         }
         s.push('\n');
     }
@@ -334,6 +354,13 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
     match inst {
         Inst::ConstI32(c) => format!("i32.const {c}"),
         Inst::ConstI64(c) => format!("i64.const {c}"),
+        // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
+        // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
+        Inst::DataSym { name, addend } => {
+            format!("data.sym \"{}\" {addend}", String::from_utf8_lossy(name))
+        }
+        Inst::DataSelf { offset } => format!("data.self {offset}"),
+        Inst::DataTop => "data.top".to_string(),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
@@ -1077,7 +1104,9 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut funcs = Vec::new();
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
+    let mut data_ptrs: Vec<svm_ir::DataPtr> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
+    let mut data_exports: Vec<svm_ir::DataExport> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
     let mut dbg_files: Vec<String> = Vec::new();
     let mut dbg_locs: Vec<Loc> = Vec::new();
@@ -1351,6 +1380,28 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     bytes,
                 });
             }
+            // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
+            // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
+            // sym "<name>" <addend>` writes a cross-unit data symbol's address. `link` resolves and
+            // clears these; a runnable module carries none. (`data.ptr` lexes as one ident, like the
+            // `debug.*` directives, so it never collides with the `data` segment arm above.)
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                let at = p.parse_u64()?;
+                let kind = p.parse_ident()?;
+                let target = match kind.as_str() {
+                    "self" => svm_ir::DataPtrTarget::SelfOff(p.parse_u64()?),
+                    "sym" => {
+                        let name = String::from_utf8(p.parse_str()?).map_err(|_| {
+                            ParseError("data.ptr sym name is not valid UTF-8".into())
+                        })?;
+                        let addend = p.parse_int()?;
+                        svm_ir::DataPtrTarget::Sym { name, addend }
+                    }
+                    k => return err(format!("data.ptr target must be self or sym: {k}")),
+                };
+                data_ptrs.push(svm_ir::DataPtr { at, target });
+            }
             // The type section (OQ3; §3.5 surface): `type <idx> func (params) -> (results)`
             // declares a signature entry; `type <idx> interface { name: ty, ... }` declares an
             // interface entry with **required op names**. The index is a checked positional
@@ -1419,7 +1470,18 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                             ops,
                         });
                     }
-                    k => return err(format!("export kind must be func or interface: {k}")),
+                    // `export <idx> data "<name>" <offset>`: a data symbol at a window byte offset,
+                    // its own dense index sequence (like func/interface exports each have theirs).
+                    "data" => {
+                        if idx < 0 || idx as usize != data_exports.len() {
+                            return err(
+                                "data export indices must be dense and in declaration order",
+                            );
+                        }
+                        let offset = p.parse_u64()?;
+                        data_exports.push(svm_ir::DataExport { name, offset });
+                    }
+                    k => return err(format!("export kind must be func, interface, or data: {k}")),
                 }
             }
             _ => funcs.push(p.parse_func(funcs.len() as u32)?),
@@ -1458,8 +1520,13 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         funcs,
         memory,
         data,
+        data_ptrs,
+        // `data.funcref` relocations have no text opcode — the nimony frontend attaches them to the
+        // parsed object module directly (they need the module stem, which the text layer lacks).
+        data_funcrefs: Vec::new(),
         imports: std::mem::take(&mut p.imports),
         exports,
+        data_exports,
         impl_exports,
         types: p.types,
         debug_info,
@@ -1518,6 +1585,17 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
                 p.parse_int()?;
                 p.parse_str()?;
+            }
+            // `data.ptr <at> self <off>` / `data.ptr <at> sym "<name>" <addend>` — skip in the
+            // header prescan (carries no function; lexes as its own ident, distinct from `data`).
+            Some(Tok::Ident(s)) if s == "data.ptr" => {
+                p.next()?;
+                p.parse_int()?; // at
+                let kind = p.parse_ident()?;
+                if kind == "sym" {
+                    p.parse_str()?; // name
+                }
+                p.parse_int()?; // self off / sym addend
             }
             // Type-section entries — skip in the header prescan. v7 form: `type <idx> func
             // (sig)` / `type <idx> interface { ... }`; legacy: `type (sig)`.
@@ -2440,6 +2518,23 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
+        // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
+        // them to `i64.const`. The name rides inline — there is no separate relocation table.
+        if op == "data.sym" {
+            let name = self.parse_str()?; // raw bytes (Copy-clone friendly Inst field)
+            let addend = self.parse_int()?;
+            return Ok(Inst::DataSym { name, addend });
+        }
+        if op == "data.self" {
+            let n = self.parse_int()?;
+            let offset = u64::try_from(n)
+                .map_err(|_| ParseError(format!("data.self offset out of range: {n}")))?;
+            return Ok(Inst::DataSelf { offset });
+        }
+        if op == "data.top" {
+            return Ok(Inst::DataTop);
         }
         // Phase-2 `import.attach <idx> v<handle>` (IMPORTS.md): rebind a rebindable import slot.
         if op == "import.attach" {

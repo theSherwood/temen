@@ -11,8 +11,9 @@
 // include dir first); a native `cc` build of the same source uses the platform pthreads + libpthread.
 //
 // Scope (MVP): create/join, mutex (init/destroy/lock/trylock/unlock), cond (init/destroy/wait/
-// signal/broadcast). Out of scope for now: pthread_self/exit/once/cancel, attributes, rwlocks,
-// barriers, TLS keys — add as programs demand them.
+// signal/broadcast), barrier (init/destroy/wait — a generation counter over the futex). POSIX
+// semaphores live in <semaphore.h> (same construction, same primitives). Out of scope for now:
+// pthread_self/exit/once/cancel, attributes, rwlocks, TLS keys — add as programs demand them.
 #ifndef __SVM_PTHREAD_H
 #define __SVM_PTHREAD_H
 
@@ -144,6 +145,46 @@ static int pthread_cond_signal(pthread_cond_t *c) {
 static int pthread_cond_broadcast(pthread_cond_t *c) {
   __vm_atomic_add32(&c->__seq, 1);
   __vm_notify(&c->__seq, 0x7fffffff);
+  return 0;
+}
+
+// ---- barriers ------------------------------------------------------------------------------
+// A generation-count barrier: arrivals fetch-add `__count`; the last one resets it, bumps the
+// `__gen` word, and wakes everyone parked on it. Waiters snapshot `__gen` *before* arriving and
+// park while it is unchanged — `__vm_wait32` re-checks atomically, so a release between the
+// snapshot and the park falls through instead of losing the wakeup. The generation turn also makes
+// the barrier immediately reusable: a fast thread re-entering for the next phase adds to the fresh
+// `__count` (nobody passes the old generation until after the reset).
+typedef struct {
+  int __gen;   // the futex word — bumped once per released generation
+  int __count; // arrivals in the current generation
+  int __n;     // the release threshold (fixed after init)
+} pthread_barrier_t;
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+
+static int pthread_barrier_init(pthread_barrier_t *b, const void *attr, unsigned count) {
+  (void)attr;
+  if (count == 0)
+    return 22; // EINVAL
+  b->__gen = 0;
+  b->__count = 0;
+  b->__n = (int)count;
+  return 0;
+}
+static int pthread_barrier_destroy(pthread_barrier_t *b) {
+  (void)b;
+  return 0;
+}
+static int pthread_barrier_wait(pthread_barrier_t *b) {
+  int gen = __vm_atomic_load32(&b->__gen);
+  if (__vm_atomic_add32(&b->__count, 1) + 1 == b->__n) {
+    __vm_atomic_store32(&b->__count, 0); // reset before release — see the reuse note above
+    __vm_atomic_add32(&b->__gen, 1);
+    __vm_notify(&b->__gen, 0x7fffffff);
+    return PTHREAD_BARRIER_SERIAL_THREAD; // exactly one caller per generation
+  }
+  while (__vm_atomic_load32(&b->__gen) == gen)
+    __vm_wait32(&b->__gen, gen, -1L); // park until the generation turns
   return 0;
 }
 

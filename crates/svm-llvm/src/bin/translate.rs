@@ -3,18 +3,19 @@
 //! `llvm-dis`); the reader is chosen by the input's file extension.
 //!
 //! ```text
-//! svm-llvm-translate <input.ll|input.bc> -o <out> [--emit-syms <file>] [--binary]
+//! svm-llvm-translate <input.ll|input.bc> -o <out> [--binary]
 //! ```
 //!
 //! This is the **separate-artifact** on-ramp (the scriptable companion to the [`svm_llvm`] library):
-//! a frontend like JACL compiles its runtime once to bitcode, translates it here to a reusable
-//! `.svm`/`.svmb` module, and emits a `.syms` **export sidecar** (one `name idx` line per exported
-//! function). A program module then resolves a `call.import` of those names by pairing the module
-//! with its sidecar into a [`svm_ir::LinkUnit`] and running [`svm_ir::link`] — compile the runtime
-//! once, link many programs against it.
+//! a frontend like JACL compiles its runtime once to bitcode and translates it here to a reusable
+//! module — compile the runtime once, link many programs against it (`svm-run --link`, or
+//! [`svm_ir::link`] over [`svm_ir::LinkUnit`]s built from the module's first-class export tables).
 //!
 //! Output format: text (`svm_text::print_module`) by default, binary (`svm_encode::encode_module`)
-//! when `-o` ends in `.svmb` or `--binary` is given.
+//! when `-o` ends in `.svmb` or `--binary` is given, or a binary **object** / link unit
+//! (`svm_encode::encode_unit`, the v9 object dialect) when `-o` ends in `.svmo`. Exports ride
+//! in-band in every form (the retired `.syms` sidecar is gone) — `.svmo` is the artifact to
+//! produce for anything that links.
 
 use std::path::Path;
 use std::{env, fs, process};
@@ -30,11 +31,11 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: svm-llvm-translate <input.ll|input.bc> -o <out> [--emit-syms <file>] [--binary] [--host-page <bytes>] [--stub-externs]\n\
+            "usage: svm-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs]\n\
              \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an SVM-IR module written to <out>:\n\
-             \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary.\n\
-             \n  --emit-syms <file> writes the export map (one `name idx` line per exported\n\
-             \n  function) so a program can link against the module via svm_ir::link.\n\
+             \n    text (.svm) by default, binary (.svmb) when -o ends in .svmb or --binary,\n\
+             \n    or a binary object/link unit (.svmo, v9 object dialect). Exports ride in-band\n\
+             \n    in every form; emit .svmo for anything that links (svm-run --link).\n\
              \n  --host-page <bytes> sets the powerbox RO/writable page-isolation granularity\n\
              \n  (default 16384). Pass 65536 when the .svmb targets a wasm host (64 KiB pages) —\n\
              \n  e.g. the browser interpreter — so read-only globals never share a host page with\n\
@@ -47,7 +48,6 @@ fn try_main() -> Result<(), String> {
 
     let mut input: Option<String> = None;
     let mut out: Option<String> = None;
-    let mut syms: Option<String> = None;
     let mut binary = false;
     let mut host_page: u64 = svm_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
@@ -55,13 +55,6 @@ fn try_main() -> Result<(), String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" | "--output" => out = Some(it.next().ok_or("-o needs a file argument")?.clone()),
-            "--emit-syms" => {
-                syms = Some(
-                    it.next()
-                        .ok_or("--emit-syms needs a file argument")?
-                        .clone(),
-                )
-            }
             "--binary" => binary = true,
             "--host-page" => {
                 host_page = it
@@ -83,7 +76,10 @@ fn try_main() -> Result<(), String> {
     }
     let input = input.ok_or("no input file")?;
     let out = out.ok_or("no output file (-o <out>)")?;
-    // Binary if asked explicitly or the output names a `.svmb` file; text otherwise.
+    // Binary if asked explicitly or the output names a `.svmb` file; text otherwise. A `.svmo`
+    // output writes the v9 **object dialect** (`encode_unit`): a self-contained binary link unit
+    // whose first-class export tables are its link symbols.
+    let object = Path::new(&out).extension().is_some_and(|e| e == "svmo");
     let binary = binary || Path::new(&out).extension().is_some_and(|e| e == "svmb");
 
     // Translate the input. A `.ll` extension takes the in-house **textual** reader (no `llvm-dis`,
@@ -101,22 +97,14 @@ fn try_main() -> Result<(), String> {
     }
     .map_err(|e| format!("translate `{input}`: {e:?}"))?;
 
-    let module_bytes = if binary {
+    let module_bytes = if object {
+        svm_encode::encode_unit(&translated.module)
+    } else if binary {
         svm_encode::encode_module(&translated.module)
     } else {
         svm_text::print_module(&translated.module).into_bytes()
     };
     fs::write(&out, &module_bytes).map_err(|e| format!("write `{out}`: {e}"))?;
-
-    if let Some(syms) = syms {
-        // One `name idx` line per exported function — the index is the function's slot in
-        // `module.funcs`, which a linker pairs with the module to populate `LinkUnit.exports`.
-        let mut s = String::new();
-        for (name, idx) in &translated.exports {
-            s.push_str(&format!("{name} {idx}\n"));
-        }
-        fs::write(&syms, s).map_err(|e| format!("write `{syms}`: {e}"))?;
-    }
 
     Ok(())
 }

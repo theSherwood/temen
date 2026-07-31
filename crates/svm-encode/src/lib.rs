@@ -2,6 +2,13 @@
 //! bespoke compression. The design goal is that decode and verify *fuse* into one
 //! linear pass; this crate is the decode half (verification lives in `svm-verify`).
 //!
+//! Two dialects share the container (v9), split by a header flags byte: the **runnable
+//! module** (`encode_module`/`decode_module` — the untrusted-input TCB path, `.svmb`) and
+//! the **object / link unit** (`encode_unit`/`decode_unit` — the linker's pre-link form,
+//! `.svmo`), which may additionally carry `data.ptr` relocations, data exports, and the
+//! link-form `data.self`/`data.sym`/`data.top` instructions. `decode_module` rejects an
+//! object at the header, so link scaffolding is unreachable from the runtime load path.
+//!
 //! Opcode map (one byte): families are laid out in contiguous ranges so the encoder
 //! is `base + op.index()` and the decoder is a range match:
 //!   `0x10..` constants · `0x20..` i32 arith · `0x30` i32 eqz · `0x31..` i32 cmp ·
@@ -26,12 +33,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use svm_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DebugInfo, Edge, Encoding, Export,
-    FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx, FuncName, FuncType, IToF, Import,
-    Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering, ProducerBlob, SsaLoc, StoreOp,
-    Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
-    VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DataExport, DataPtr, DataPtrTarget,
+    DebugInfo, Edge, Encoding, Export, FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx,
+    FuncName, FuncType, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering,
+    ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
+    VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
+    VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -114,6 +121,12 @@ mod op {
     pub const CAP_SELF_TYPE_ID: u8 = 0x0C; // v7 §3.5: type idx -> i32 runtime type_id
     pub const CAP_SELF_COVERS: u8 = 0x0D; // v7 §3.5: handle operand, type idx -> i32 covers
     pub const CALL_SYM: u8 = 0x0E; // v8 §7/§22 link-form symbolic call: import idx, sig, handle, arg idx-list
+
+    // v9 link-form data addresses (D-LINK), decodable **only in the object dialect** (header
+    // flag bit 0): a runnable module never carries them — `link` rewrites each to `ConstI64`.
+    pub const DATA_SELF: u8 = 0x07; // uleb offset -> i64 (own-data address)
+    pub const DATA_SYM: u8 = 0x08; // length-prefixed name bytes, sleb addend -> i64 (cross-unit)
+    pub const DATA_TOP: u8 = 0x09; // (no payload) -> i64 (post-link top-of-data)
     pub const FMA: u8 = 0x7D; // scalar fused multiply-add: ty byte (0=f32,1=f64), a, b, c
     pub const CAP_SELF_RESOLVE: u8 = 0x7E; // §7 reflection: (name_ptr, name_len) -> i32 handle|-errno
     pub const CAP_SELF_LABEL: u8 = 0x7F; // §7 reflection: (handle, buf_ptr, buf_cap) -> i32 label len
@@ -227,6 +240,16 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
+// v9 adds the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
+// a serialized *link unit* — the binary twin of a pre-link text unit (named consumer: the external
+// toolchain blocked on format standardization, owner-approved 2026-07-30). An object file may carry
+// the constructs `link` resolves away: the `data.ptr` relocation section (after data), the
+// data-export section (after exports), and the three link-form data-address opcodes
+// (`data.self`/`data.sym`/`data.top`). The runnable dialect (flag 0) is bit-for-bit v8 after the
+// flags byte, and `decode_module` — the untrusted-input TCB path — rejects the object flag at the
+// header, before any section is read: link scaffolding stays unreachable from the runtime load
+// path. Objects decode via `decode_unit` (tooling; held to the same never-panic bar). Reserved
+// flag bits are fail-closed.
 // v3 adds the first-class **export section** (named function entry points: name + funcidx), the
 // runtime-`Module` analogue of a link unit's exports — so an embedder can `call("main")` by name.
 // The decoder accepts only the exact current `VERSION`, so the bump simply retires v2 readers; there
@@ -250,7 +273,11 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
+
+/// Header flags byte, bit 0 (v9): this file is an **object** (a pre-link unit, `decode_unit`
+/// dialect). All other bits are reserved and must be zero (fail-closed).
+const FLAG_OBJECT: u8 = 0x01;
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -258,6 +285,14 @@ pub enum DecodeError {
     UnexpectedEof,
     BadMagic,
     BadVersion(u8),
+    /// The header flags byte (v9) had a reserved (non-object) bit set.
+    BadFlags(u8),
+    /// The input is an **object** (a pre-link unit, header flag bit 0) but was handed to
+    /// [`decode_module`], the runnable-module path. Link it first; objects decode only via
+    /// [`decode_unit`].
+    ObjectInput,
+    /// A `data.ptr` relocation's target tag byte was neither 0 (self) nor 1 (sym).
+    BadDataPtrTag(u8),
     BadType(u8),
     BadOpcode(u8),
     /// A LEB128-encoded integer did not fit its target width.
@@ -329,9 +364,24 @@ pub fn digest256(bytes: &[u8]) -> [u8; 32] {
 }
 
 pub fn encode_module(m: &Module) -> Vec<u8> {
+    encode_impl(m, false)
+}
+
+/// Encode a **link unit** (object dialect, header flag bit 0): a pre-link module that may carry
+/// `data.ptr` relocations, data exports, and the link-form data-address instructions — everything
+/// `link` resolves away. The binary twin of a pre-link text unit. Objects are re-read only by
+/// [`decode_unit`]; the runnable path ([`decode_module`]) rejects them at the header.
+pub fn encode_unit(m: &Module) -> Vec<u8> {
+    encode_impl(m, true)
+}
+
+fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.push(VERSION);
+    // v9 flags byte: bit 0 marks the object dialect; a runnable module writes 0, keeping its wire
+    // bit-for-bit v8 from here on.
+    out.push(if object { FLAG_OBJECT } else { 0 });
     // Memory descriptor: presence flag, then `size_log2` if present.
     match &m.memory {
         None => out.push(0),
@@ -348,6 +398,47 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
         write_uleb(&mut out, d.offset);
         write_uleb(&mut out, d.bytes.len() as u64);
         out.extend_from_slice(&d.bytes);
+    }
+    // Object-only `data.ptr` relocation section (v9, D-LINK), directly after the data image it
+    // patches: count, then each entry's `at` offset and tagged target (0 = self + uleb offset,
+    // 1 = sym + name string + sleb addend). Absent from the runnable dialect entirely — `link`
+    // resolves and clears these, and a runnable survivor is a verify error (`UnlinkedDataPtr`).
+    if object {
+        write_uleb(&mut out, m.data_ptrs.len() as u64);
+        for p in &m.data_ptrs {
+            write_uleb(&mut out, p.at);
+            match &p.target {
+                DataPtrTarget::SelfOff(off) => {
+                    out.push(0);
+                    write_uleb(&mut out, *off);
+                }
+                DataPtrTarget::Sym { name, addend } => {
+                    out.push(1);
+                    write_str(&mut out, name);
+                    write_sleb(&mut out, *addend);
+                }
+            }
+        }
+    } else {
+        assert!(
+            m.data_ptrs.is_empty(),
+            "data.ptr relocations are object-dialect; resolve via link before encode_module"
+        );
+    }
+    // Object-only `data.funcref` relocation section (D-LINK, data→code), next to `data.ptr`: count,
+    // then each entry's `at` offset and target func `name`. Like `data.ptr`, absent from the runnable
+    // dialect — `link` resolves and clears these.
+    if object {
+        write_uleb(&mut out, m.data_funcrefs.len() as u64);
+        for r in &m.data_funcrefs {
+            write_uleb(&mut out, r.at);
+            write_str(&mut out, &r.name);
+        }
+    } else {
+        assert!(
+            m.data_funcrefs.is_empty(),
+            "data.funcref relocations are object-dialect; resolve via link before encode_module"
+        );
     }
     // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
     // import-free module (every prior frontend's output, and any unit whose symbols were already
@@ -381,6 +472,16 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     for e in &m.exports {
         write_str(&mut out, &e.name);
         write_uleb(&mut out, e.func as u64);
+    }
+    // Object-only data-export section (v9), next to the function exports it mirrors: count, then
+    // each `name` and unit-local window `offset`. Link metadata only — backends ignore data
+    // exports, so the runnable dialect does not carry them.
+    if object {
+        write_uleb(&mut out, m.data_exports.len() as u64);
+        for e in &m.data_exports {
+            write_str(&mut out, &e.name);
+            write_uleb(&mut out, e.offset);
+        }
     }
     // Type section (v6, OQ3): count, then each entry tagged — 0 = a function signature
     // (params/results type lists), 1 = an interface (a tuple of uleb indices to Func
@@ -419,7 +520,7 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
-        encode_func(&mut out, f);
+        encode_func(&mut out, f, object);
     }
     // Optional strippable debug section (DEBUGGING.md §6/§2a). Written only when present, so a
     // module without debug info encodes byte-identically to before (snapshot digests, round-trip
@@ -565,7 +666,7 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
     }
 }
 
-fn encode_func(out: &mut Vec<u8>, f: &Func) {
+fn encode_func(out: &mut Vec<u8>, f: &Func, object: bool) {
     write_types(out, &f.params);
     write_types(out, &f.results);
     write_uleb(out, f.blocks.len() as u64);
@@ -573,13 +674,13 @@ fn encode_func(out: &mut Vec<u8>, f: &Func) {
         write_types(out, &b.params);
         write_uleb(out, b.insts.len() as u64);
         for inst in &b.insts {
-            encode_inst(out, inst);
+            encode_inst(out, inst, object);
         }
         encode_term(out, &b.term);
     }
 }
 
-fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
+fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
     match inst {
         // Manifest capability call, mirroring `cap.call` but carrying an import *index* (into
         // the module's import section) instead of a bound `(type_id, op)`: dispatch goes through
@@ -613,6 +714,35 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst) {
             write_types(out, &sig.results);
             write_uleb(out, *handle as u64);
             write_idxs(out, args);
+        }
+        // Link-form data addresses (v9): object-dialect only. In the runnable dialect they remain
+        // a producer bug (link scaffolding that `link` rewrites to `ConstI64` before a module is
+        // finalized) — the panic keeps the old `unreachable!` contract; the "never panic"
+        // discipline governs *decode*.
+        Inst::DataSelf { offset } => {
+            assert!(
+                object,
+                "data.self is link-form; resolve via link before encode_module"
+            );
+            out.push(self::op::DATA_SELF);
+            write_uleb(out, *offset);
+        }
+        Inst::DataSym { name, addend } => {
+            assert!(
+                object,
+                "data.sym is link-form; resolve via link before encode_module"
+            );
+            out.push(self::op::DATA_SYM);
+            write_uleb(out, name.len() as u64);
+            out.extend_from_slice(name);
+            write_sleb(out, *addend);
+        }
+        Inst::DataTop => {
+            assert!(
+                object,
+                "data.top is link-form; resolve via link before encode_module"
+            );
+            out.push(self::op::DATA_TOP);
         }
         // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
         // self-describing sig, runtime handle operand, args.
@@ -1657,6 +1787,17 @@ pub fn write_sleb(out: &mut Vec<u8>, mut v: i64) {
 
 /// Decode a module from bytes. Rejects malformed input; never panics/OOMs.
 pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
+    decode_impl(bytes, false)
+}
+
+/// Decode a **link unit** (object dialect) — or a runnable module; the header flag picks the
+/// dialect. Tooling-facing (the linker's input path), but held to the same fail-closed
+/// never-panic/never-OOM bar as [`decode_module`]: it shares this decoder and fuzzers reach it.
+pub fn decode_unit(bytes: &[u8]) -> Result<Module, DecodeError> {
+    decode_impl(bytes, true)
+}
+
+fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> {
     let mut c = Cursor::new(bytes);
     if c.take(4)? != MAGIC {
         return Err(DecodeError::BadMagic);
@@ -1664,6 +1805,17 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let v = c.byte()?;
     if v != VERSION {
         return Err(DecodeError::BadVersion(v));
+    }
+    // v9 flags byte. Reserved bits fail closed; the object bit is rejected on the runnable path
+    // *here, at the header* — link scaffolding stays unreachable from the runtime load path
+    // without scanning a single section.
+    let flags = c.byte()?;
+    if flags & !FLAG_OBJECT != 0 {
+        return Err(DecodeError::BadFlags(flags));
+    }
+    let object = flags & FLAG_OBJECT != 0;
+    if object && !allow_object {
+        return Err(DecodeError::ObjectInput);
     }
     let memory = match c.byte()? {
         0 => None,
@@ -1691,6 +1843,36 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
             readonly,
             bytes,
         });
+    }
+    // Object-only `data.ptr` relocation section (v9), mirroring the encoder. Well-formedness
+    // beyond byte shape (`at` inside a data segment, resolvable names) is the linker's job —
+    // the decoder stays a pure fail-closed byte reader.
+    let mut data_ptrs = Vec::new();
+    if object {
+        let nptrs = c.count()?;
+        for _ in 0..nptrs {
+            let at = c.uleb()?;
+            let target = match c.byte()? {
+                0 => DataPtrTarget::SelfOff(c.uleb()?),
+                1 => DataPtrTarget::Sym {
+                    name: c.str()?,
+                    addend: c.sleb()?,
+                },
+                b => return Err(DecodeError::BadDataPtrTag(b)),
+            };
+            data_ptrs.push(DataPtr { at, target });
+        }
+    }
+    // Object-only `data.funcref` relocation section, mirroring the encoder. Byte shape only — the
+    // linker resolves `name` and range-checks `at`.
+    let mut data_funcrefs = Vec::new();
+    if object {
+        let nrefs = c.count()?;
+        for _ in 0..nrefs {
+            let at = c.uleb()?;
+            let name = c.str()?;
+            data_funcrefs.push(svm_ir::DataFuncref { at, name });
+        }
     }
     // §7 import section (v2): mirrors the encoder. Grows on demand (the count is attacker-influenced).
     let nimports = c.count()?;
@@ -1721,6 +1903,16 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         let name = c.str()?;
         let func = c.uleb()? as FuncIdx;
         exports.push(Export { name, func });
+    }
+    // Object-only data-export section (v9), mirroring the encoder.
+    let mut data_exports = Vec::new();
+    if object {
+        let ndexports = c.count()?;
+        for _ in 0..ndexports {
+            let name = c.str()?;
+            let offset = c.uleb()?;
+            data_exports.push(DataExport { name, offset });
+        }
     }
     // Type section (v6): mirrors the encoder. Grows on demand (attacker-influenced
     // counts); all cross-reference checks are the verifier's job. An unknown tag fails
@@ -1768,7 +1960,7 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     let nfuncs = c.count()?;
     let mut funcs = Vec::new();
     for _ in 0..nfuncs {
-        funcs.push(decode_func(&mut c)?);
+        funcs.push(decode_func(&mut c, object)?);
     }
     // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
     // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
@@ -1790,11 +1982,14 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
         return Err(DecodeError::TrailingBytes);
     }
     Ok(Module {
+        data_ptrs,
+        data_funcrefs,
         funcs,
         memory,
         data,
         imports,
         exports,
+        data_exports,
         impl_exports,
         types,
         debug_info,
@@ -1961,13 +2156,13 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
     })
 }
 
-fn decode_func(c: &mut Cursor) -> Result<Func, DecodeError> {
+fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
     let params = decode_types(c)?;
     let results = decode_types(c)?;
     let nblocks = c.count()?;
     let mut blocks = Vec::new();
     for _ in 0..nblocks {
-        blocks.push(decode_block(c)?);
+        blocks.push(decode_block(c, object)?);
     }
     Ok(Func {
         params,
@@ -1976,12 +2171,12 @@ fn decode_func(c: &mut Cursor) -> Result<Func, DecodeError> {
     })
 }
 
-fn decode_block(c: &mut Cursor) -> Result<Block, DecodeError> {
+fn decode_block(c: &mut Cursor, object: bool) -> Result<Block, DecodeError> {
     let params = decode_types(c)?;
     let ninsts = c.count()?;
     let mut insts = Vec::new();
     for _ in 0..ninsts {
-        insts.push(decode_inst(c)?);
+        insts.push(decode_inst(c, object)?);
     }
     let term = decode_term(c)?;
     Ok(Block {
@@ -1991,7 +2186,7 @@ fn decode_block(c: &mut Cursor) -> Result<Block, DecodeError> {
     })
 }
 
-fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
+fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
     let b = c.byte()?;
     Ok(match b {
         op::SIMD => decode_simd(c)?,
@@ -2104,6 +2299,18 @@ fn decode_inst(c: &mut Cursor) -> Result<Inst, DecodeError> {
             handle: c.idx()?,
             args: decode_idxs(c)?,
         },
+        // v9 link-form data addresses: object-dialect only — in a runnable module these bytes
+        // fall through to the BadOpcode arm (the guard fails), exactly as under v8.
+        op::DATA_SELF if object => Inst::DataSelf { offset: c.uleb()? },
+        op::DATA_SYM if object => {
+            // The name is raw length-prefixed bytes (`Vec<u8>`, matching the IR — not UTF-8
+            // checked, unlike section name strings; the linker compares bytes).
+            let len = c.count()?;
+            let name = c.take(len)?.to_vec();
+            let addend = c.sleb()?;
+            Inst::DataSym { name, addend }
+        }
+        op::DATA_TOP if object => Inst::DataTop,
         op::CALL_IMPORT_DYN => Inst::CallImportDyn {
             ty: c.idx()?,
             op: c.idx()?,
@@ -2547,6 +2754,136 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
+mod object_tests {
+    use super::*;
+
+    /// A representative link unit: data with placeholder pointer bytes, both `data.ptr` target
+    /// kinds, a data export, and a function body carrying all three link-form instructions.
+    fn unit() -> Module {
+        Module {
+            memory: Some(Memory { size_log2: 16 }),
+            data: vec![Data {
+                offset: 0,
+                readonly: false,
+                bytes: vec![0u8; 24],
+            }],
+            data_ptrs: vec![
+                DataPtr {
+                    at: 0,
+                    target: DataPtrTarget::SelfOff(16),
+                },
+                DataPtr {
+                    at: 8,
+                    target: DataPtrTarget::Sym {
+                        name: "g_table".into(),
+                        addend: -4,
+                    },
+                },
+            ],
+            data_funcrefs: Vec::new(),
+            data_exports: vec![DataExport {
+                name: "g_mine".into(),
+                offset: 16,
+            }],
+            funcs: vec![Func {
+                params: vec![],
+                results: vec![ValType::I64],
+                blocks: vec![Block {
+                    params: vec![],
+                    insts: vec![
+                        Inst::DataSelf { offset: 8 },
+                        Inst::DataSym {
+                            name: b"g_table".to_vec(),
+                            addend: 12,
+                        },
+                        Inst::DataTop,
+                    ],
+                    term: Terminator::Return(vec![2]),
+                }],
+            }],
+            imports: vec![],
+            exports: vec![Export {
+                name: "f".into(),
+                func: 0,
+            }],
+            impl_exports: vec![],
+            types: vec![],
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn object_unit_roundtrips() {
+        let m = unit();
+        let bytes = encode_unit(&m);
+        assert_eq!(decode_unit(&bytes).expect("decode_unit"), m);
+    }
+
+    #[test]
+    fn runnable_path_rejects_object_at_header() {
+        let bytes = encode_unit(&unit());
+        assert_eq!(decode_module(&bytes), Err(DecodeError::ObjectInput));
+    }
+
+    #[test]
+    fn decode_unit_accepts_runnable_dialect() {
+        // A resolved module (flag 0) decodes identically on both entry points.
+        let m = Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            types: vec![],
+            funcs: vec![],
+            memory: None,
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            data_exports: vec![],
+            impl_exports: vec![],
+            debug_info: None,
+        };
+        let bytes = encode_module(&m);
+        assert_eq!(decode_unit(&bytes).expect("decode_unit"), m);
+        assert_eq!(decode_module(&bytes).expect("decode_module"), m);
+    }
+
+    #[test]
+    fn reserved_flag_bits_fail_closed() {
+        // Set a reserved bit in an otherwise-valid header: both entry points reject.
+        let mut bytes = encode_module(&Module::default());
+        assert_eq!(bytes[5] & !FLAG_OBJECT, 0, "flags byte position");
+        bytes[5] |= 0x02;
+        assert_eq!(decode_module(&bytes), Err(DecodeError::BadFlags(0x02)));
+        assert_eq!(decode_unit(&bytes), Err(DecodeError::BadFlags(0x02)));
+    }
+
+    #[test]
+    fn link_opcodes_rejected_outside_object_dialect() {
+        // Craft a flag-0 stream whose single instruction byte is a link-form opcode: the guard
+        // must fall through to BadOpcode, exactly as under v8.
+        let mut m = unit();
+        m.data_ptrs.clear();
+        m.data_exports.clear();
+        let mut bytes = encode_unit(&m);
+        // Flip the dialect to runnable, leaving the body bytes: the stream now desyncs at the
+        // object-only sections/opcodes, so any Err is correct — but it must not decode.
+        bytes[5] &= !FLAG_OBJECT;
+        assert!(
+            decode_module(&bytes).is_err(),
+            "link-form opcodes decoded outside the object dialect"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "link-form")]
+    fn encode_module_panics_on_link_forms() {
+        let mut m = unit();
+        m.data_ptrs.clear(); // reach the instruction assert, not the section assert
+        m.data_exports.clear();
+        let _ = encode_module(&m);
+    }
+}
+
+#[cfg(test)]
 mod debug_tests {
     use super::*;
 
@@ -2714,12 +3051,15 @@ mod debug_tests {
 
     fn module(debug_info: Option<DebugInfo>) -> Module {
         Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,
             data: vec![],
             imports: vec![],
             exports: vec![],
+            data_exports: vec![],
             impl_exports: vec![],
             debug_info,
         }

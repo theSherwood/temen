@@ -1,4 +1,4 @@
-//! **Configurable filesystem capability backends** — §7 embedder-registered `HostFn`s, *not* part of
+//! **Configurable filesystem capability backends** — §7 embedder-registered `HostProc`s, *not* part of
 //! the default powerbox grant. A consumer that wants its guest to see a filesystem offers one
 //! explicitly (wasm-style dependency injection): grant it under a name via
 //! [`Instance::run_with_caps`](crate::Instance::run_with_caps) (or bind it to an import with
@@ -74,7 +74,7 @@
 use crate::HostCap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use svm_interp::{GuestMem, HostFn, HostFnRegion, RegionMinter};
+use svm_interp::{GuestMem, HostProc, HostProcRegion, RegionMinter};
 
 // The shared fs-cap wire protocol, the in-memory backend, and the shippable data-image format live in
 // the wasm-safe `svm-fs` crate — so the browser cdylib can mount a `mem_fs` without the unix-only JIT
@@ -85,7 +85,7 @@ pub use svm_fs::*;
 /// A deterministic **in-memory** filesystem capability (fresh, empty state per host). The hermetic
 /// default for tests and differential runs.
 pub fn mem_fs() -> HostCap {
-    HostCap::host_fn(0, svm_fs::mem_fs_handler(false))
+    HostCap::host_proc(0, svm_fs::mem_fs_handler(false))
 }
 
 /// Like [`mem_fs`] but with the **test-only crash-injection** controller enabled (the [`FS_CRASH_ARM`]
@@ -93,7 +93,7 @@ pub fn mem_fs() -> HostCap {
 /// Never grant this to a real guest: a tripped crash freezes the store (a self-inflicted DoS on the
 /// holder's own fs, no host effect, but pointless outside a test).
 pub fn mem_fs_crashy() -> HostCap {
-    HostCap::host_fn(0, svm_fs::mem_fs_handler(true))
+    HostCap::host_proc(0, svm_fs::mem_fs_handler(true))
 }
 
 /// A **pre-seeded** in-memory filesystem: `files` maps a normalized relative path to its contents, and
@@ -101,7 +101,7 @@ pub fn mem_fs_crashy() -> HostCap {
 /// clone of the seed, so a run's writes never leak back into it — re-runs are deterministic. This is how
 /// a demo with no real filesystem (e.g. the browser) mounts a data-dir image on the `fs` cap.
 pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCap {
-    HostCap::host_fn(0, svm_fs::mem_fs_seeded_handler(files, dirs))
+    HostCap::host_proc(0, svm_fs::mem_fs_seeded_handler(files, dirs))
 }
 
 /// Walk a host directory into a [`mem_fs_seeded`] capability — every regular file's bytes keyed by its
@@ -630,7 +630,7 @@ pub fn host_fs_crashy(root: PathBuf) -> HostCap {
 /// file into its window (zero-copy, page-cache coherent with the same file's `pread`/`pwrite`) instead
 /// of the copy-in emulation. The guest shim falls back to `FS_MMAP` when granted a plain `host_fs`.
 pub fn host_fs_mmap(root: PathBuf) -> HostCap {
-    HostCap::host_fn_region(0, move || {
+    HostCap::host_proc_region(0, move || {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
@@ -645,12 +645,12 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
                   minter: &mut dyn RegionMinter| {
                 Ok(vec![st.handle(op, args, mem, Some(minter))])
             },
-        ) as HostFnRegion
+        ) as HostProcRegion
     })
 }
 
 fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
-    HostCap::host_fn(0, move || {
+    HostCap::host_proc(0, move || {
         let mut st = HostFsState {
             root: root.clone(),
             open: Vec::new(),
@@ -662,17 +662,17 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![st.handle(op, args, mem, None)])
             },
-        ) as HostFn
+        ) as HostProc
     })
 }
 
 #[cfg(test)]
 mod tests {
-    /// `svm-llvm` pins the `HostFn` interface id numerically (it produces `svm-ir` and cannot depend
+    /// `svm-llvm` pins the `HostProc` interface id numerically (it produces `svm-ir` and cannot depend
     /// on the interpreter crate); this locks the pin to the real constant.
     #[test]
-    fn host_fn_type_id_matches() {
-        assert_eq!(svm_interp::cap_id::HOST_FN, 13);
+    fn host_proc_type_id_matches() {
+        assert_eq!(svm_interp::cap_id::HOST_PROC, 13);
     }
 
     /// `svm-llvm` pins `SharedRegion`'s interface id numerically (`SHARED_REGION_TYPE_ID`, for the
@@ -715,12 +715,12 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(cap_id::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_dispatch_slots(cap_id::HOST_PROC, FS_OPEN, fs_h, &open_args, Some(&mut wm))
                 .unwrap()[0];
             assert!(fd >= 0, "open failed: {fd}");
             let region = host
                 .cap_dispatch_slots(
-                    cap_id::HOST_FN,
+                    cap_id::HOST_PROC,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
@@ -745,11 +745,11 @@ mod tests {
             let fs_h = (cap.grant)(&mut host, 0);
             let mut wm = WindowMem::new(&mut win, 4096);
             let fd = host
-                .cap_dispatch_slots(cap_id::HOST_FN, FS_OPEN, fs_h, &open_args, Some(&mut wm))
+                .cap_dispatch_slots(cap_id::HOST_PROC, FS_OPEN, fs_h, &open_args, Some(&mut wm))
                 .unwrap()[0];
             let region = host
                 .cap_dispatch_slots(
-                    cap_id::HOST_FN,
+                    cap_id::HOST_PROC,
                     FS_MAP_REGION,
                     fs_h,
                     &[fd, 0, 8192],
@@ -782,7 +782,7 @@ mod tests {
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
@@ -933,7 +933,7 @@ mod tests {
         let mut wm = WindowMem::new(&mut win, 4096);
         let fd = host
             .cap_dispatch_slots(
-                cap_id::HOST_FN,
+                cap_id::HOST_PROC,
                 FS_OPEN,
                 h,
                 &[0, 10, O_READ, 0],
@@ -942,7 +942,13 @@ mod tests {
             .unwrap()[0];
         assert!(fd >= 0, "open a file from the mounted image");
         let n = host
-            .cap_dispatch_slots(cap_id::HOST_FN, FS_READ, h, &[fd, 512, 8, 0], Some(&mut wm))
+            .cap_dispatch_slots(
+                cap_id::HOST_PROC,
+                FS_READ,
+                h,
+                &[fd, 512, 8, 0],
+                Some(&mut wm),
+            )
             .unwrap()[0];
         assert_eq!(n, 3);
         assert_eq!(&win[512..515], b"17\n", "file contents from the image");
@@ -963,7 +969,7 @@ mod tests {
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
@@ -1055,7 +1061,7 @@ mod tests {
         fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
             let n = win.len();
             let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_FN, op, h, args, Some(&mut wm))
+            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
                 .unwrap()[0]
         }
         fn names(host: &mut Host, h: i32, win: &mut [u8]) -> Vec<String> {

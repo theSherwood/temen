@@ -1,0 +1,136 @@
+(.nif27)
+(.indexat 2416             )
+(stmts@,1,../../../tmp/agg.nim
+ (type@B :Point.0.~6 .~6
+  (object@2 .
+   (fld~B,1 :x.0 .
+    (i@3 64))
+   (fld~B,2 :y.0 .
+    (i@3 64))))
+ (proc@,4 :dot2.0.@5
+  (params@9
+   (param@1 :p.0 . Point.0.@3))
+  (i@C 64)
+  (pragmas
+   (smry
+    (param 0 0 reads)))
+  (stmts@2,1
+   (var@7 :result.0 .
+    (i~4,~4 64).~4,~4)
+   (asgn@7 result.0~7
+    (add@C
+     (i@G,l,../../../tmp/nimony/lib/std/system/arithmetics.nim 64)
+     (mul~6
+      (i@G,x,../../../tmp/nimony/lib/std/system/arithmetics.nim 64)
+      (dot~3 p.0~1 x.0 0)
+      (dot@3 p.0~1 x.0 0))
+     (mul@6
+      (i@G,x,../../../tmp/nimony/lib/std/system/arithmetics.nim 64)
+      (dot~3 p.0~1 y.0 0)
+      (dot@3 p.0~1 y.0 0))))
+   (ret@S result.0)))
+ (proc@,7 :idx.0.@5
+  (params@8
+   (param@1 :a.0 .
+    (ptr@8 `t.0.IAarrayAiS64ZS4.))
+   (param@J :i.0 .
+    (i@3 64)))
+  (i@S 64)
+  (pragmas
+   (smry callsUnknown
+    (param 0 0 reads)
+    (param 1 1 reads writes escapes)result 0))
+  (stmts@2,1
+   (var@7 :result.1 .
+    (i~4,~7 64).~4,~7)
+   (var@9 :`x.0 .
+    (i@D,1T,../../../tmp/nimony/lib/std/system/panics.nim 64)
+    (call nimIcheckB.0.sysvq0asl i.0@2 3@6,~1))
+   (asgn@7 result.1~7
+    (at@2
+     (deref a.0)`x.0))
+   (ret@F,~1 result.1)))
+ (type@H,7 :`t.0.IAarrayAiS64ZS4. .
+  (array
+   (i@4 64)4@4))
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl)))
+ (type :`cchar.0.
+  (pragmas
+   (importc "char")
+   (nodecl))
+  (i 8))
+ (gvar :`cmdCount.0.
+  (pragmas
+   (exportc "cmdCount"))
+  (i 32).)
+ (gvar :`cmdLine.0.
+  (pragmas
+   (exportc "cmdLine"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (gvar :`nimEnviron.0.
+  (pragmas
+   (exportc "nimEnviron"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (proc :`main.0.
+  (params
+   (param :`argc.0. .
+    (i 32))
+   (param :`argv.0. .
+    (ptr
+     (ptr `cchar.0.)))
+   (param :`envp.0. .
+    (ptr
+     (ptr `cchar.0.))))
+  (i 32)
+  (pragmas
+   (exportc "main")
+   (smry callsUnknown
+    (param 0 0 reads)
+    (param 1 1 reads)
+    (param 2 2 reads)))
+  (stmts
+   (asgn `cmdCount.0. `argc.0.)
+   (asgn `cmdLine.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`argv.0.))
+   (asgn `nimEnviron.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`envp.0.))
+   (call `ini.0.)
+   (call nimFlushStdStreams.0.sysvq0asl)
+   (ret 0))))(.index@,1,../../../tmp/agg.nim
+ (h Point.0. 68)
+ (x dot2.0. 107)
+ (x idx.0. 568)
+ (h `t.0.IAarrayAiS64ZS4. 499)
+ (h `iniGuard.0. 62)
+ (x `ini.0. 34)
+ (x `cchar.0. 194)
+ (x `cmdCount.0. 71)
+ (x `cmdLine.0. 68)
+ (x `nimEnviron.0. 84)
+ (x `main.0. 90)
+ (h `argc.0. 27)
+ (h `argv.0. 34)
+ (h `envp.0. 54))

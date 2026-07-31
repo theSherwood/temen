@@ -71,6 +71,13 @@
 
 extern bool opt_g; // -g: emit the debug-info section (DEBUGGING.md §6 waist)
 extern bool opt_child_entry; // --child-entry: emit function 0 with the §14 child ABI (spawnable)
+// --emit-object: emit a *linkable unit* (native `cc -c`), not a whole program. Each non-`static`
+// function is `export`ed by name, and a call to a declared-but-undefined function is lowered to a
+// **function-symbol import** (`call.sym "name"` with the callee's real signature) instead of the
+// generic capability import — so `svm_ir::link` resolves it to a direct cross-unit call. `static`
+// functions stay internal (never exported), so same-named file-local statics across TUs never
+// collide. `_start` is still emitted only for the unit that defines `main` (the entry unit).
+extern bool opt_emit_object;
 
 static FILE *o;
 
@@ -695,9 +702,21 @@ static int gen_addr(Node *node) {
       cg("  v%d = i64.add " SP " v%d\n", r, off);
       return r;
     }
-    // A global lives at a fixed window offset in the data region below the stack.
+    // A global's address. Whole-program (`--emit-ir`): a fixed window offset, known now. Separate
+    // compilation (`--emit-object`): a **link form** the linker relocates once it fixes each unit's
+    // window base — `data.self <off>` for a global defined in *this* unit (its data moves as a
+    // block), `data.sym "name"` for one defined in another TU (resolved to the exporter's window
+    // address, fail-closed if unexported). Never a raw `i64.const` here: the linker would not
+    // relocate it, so it would point into whatever unit happened to land at that base offset.
     int r = nv++;
-    cg("  v%d = i64.const %d\n", r, node->var->offset);
+    if (opt_emit_object) {
+      if (node->var->is_definition)
+        cg("  v%d = data.self %d\n", r, node->var->offset);
+      else
+        cg("  v%d = data.sym \"%s\" 0\n", r, node->var->name);
+    } else {
+      cg("  v%d = i64.const %d\n", r, node->var->offset);
+    }
     return r;
   }
   case ND_DEREF:
@@ -1025,6 +1044,53 @@ static int gen_builtin_page_size(Node *node) {
   int r = nv++;
   cg("  v%d = call.sym \"vm_page_size\" () -> (i64) v%d ()\n", r, h);
   return r;
+}
+
+// Raw powerbox **Stream** primitives for the emit-object os layer (SELFHOST_C.md §7, 2c). An os shim
+// that fd-dispatches file I/O (fd 0/1/2 → stream, fd≥3 → the fs cap) must *define* `write`/`read`, which
+// shadows the fd-less `write`/`read` builtins (§3e) — so it needs a *distinct* name to still reach
+// stdout/stdin without recursing into its own definition. `__vm_stream_write(buf,len)` /
+// `__vm_stream_read(buf,len)` lower to `call.sym "stream_write"/"stream_read"` on the Stream cap (the
+// host binds each name to its `(type_id, op)` — Stream op1/op0 — at load). The on-ramp reaches the same
+// endpoints through the `__vm_stream_*` svm-llvm intrinsics; this is the emit-object equivalent.
+static int gen_builtin_stream_raw(Node *node, const char *name) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_stream_write/read expects (buf, len)");
+  int buf, lenv;
+  eval2(a, a->next, &buf, &lenv);
+  buf = widen_i64(buf, a->ty);
+  int len = widen_i64(lenv, a->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = call.sym \"%s\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, name, h, buf, len);
+  return r; // i64 byte count
+}
+
+// The emit-object **filesystem** seam (SELFHOST_C.md §7, 2c). `--emit-object` doesn't lower the on-ramp's
+// `__vm_cap_resolve`/`__vm_host_call` (so an os shim can't reach an fs cap the on-ramp way), and its
+// generic host-cap lowering (`gen_builtin_import`) is off — so file I/O needs a recognized builtin. This
+// is it: `__vm_fs(op, a, b, c, d)` lowers to `call.sym "vm_fs"` with the **op selected by arg0** (mirroring
+// `__vm_host_call(handle, op, …)` but as a single named import), so the whole fs op protocol
+// (open/read/write/seek/close/stat — `crates/svm-run/src/fs.rs`) rides one manifest slot the host binds to
+// a seeded memfs. Args are simple expressions (like the other `__vm_*` builtins); no branching args.
+static int gen_builtin_fs(Node *node) {
+  int argc = 0;
+  for (Node *p = node->args; p; p = p->next)
+    argc++;
+  if (argc != 5)
+    error_tok(node->tok, "codegen_ir: __vm_fs expects (op, a, b, c, d)");
+  Node *a = node->args;
+  int op = widen_i64(gen_expr(a), a->ty);
+  int a1 = widen_i64(gen_expr(a->next), a->next->ty);
+  int a2 = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int a3 = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
+  int a4 = widen_i64(gen_expr(a->next->next->next->next), a->next->next->next->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = call.sym \"vm_fs\" (i64, i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d, v%d)\n",
+          r, h, op, a1, a2, a3, a4);
+  return r; // i64 result (fd / bytes / 0 / negative errno)
 }
 
 // §9/§12 async I/O ring builtins (iface 9). `__vm_io_submit_async(sq, n, counter)` lowers to
@@ -1683,6 +1749,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_region_page_size(node);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
+        if (!strcmp(fname, "__vm_stream_write"))
+          return gen_builtin_stream_raw(node, "stream_write");
+        if (!strcmp(fname, "__vm_stream_read"))
+          return gen_builtin_stream_raw(node, "stream_read");
+        if (!strcmp(fname, "__vm_fs"))
+          return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
           return gen_builtin_fiber_new(node);
         if (!strcmp(fname, "__vm_fiber_resume"))
@@ -1739,7 +1811,14 @@ static int gen_expr(Node *node) {
         // not a recognized builtin above) is a named host capability — lower it to `call.import`
         // with arg0 as the handle. The host resolves the name at load (fail-closed if unknown), so
         // a new capability needs no frontend change. (Defined functions fall through to `call`.)
-        if (!node->lhs->var->is_definition)
+        //
+        // In `--emit-object` mode this is different: an undefined extern is a **cross-TU function**,
+        // not a capability. Fall through to the normal call path, which emits a `call.sym "name"`
+        // function-symbol import (see the emission below) for `svm_ir::link` to resolve to a direct
+        // call against the defining unit. The intercepted builtins above (`write`/`read`/`exit`,
+        // `__vm_*`) still win in both modes — a personality that needs a raw capability reaches it
+        // through those, exactly as it does today.
+        if (!node->lhs->var->is_definition && !opt_emit_object)
           return gen_builtin_import(node);
       }
     }
@@ -1841,6 +1920,17 @@ static int gen_expr(Node *node) {
       idx32 = nv++;
       cg("  v%d = i32.wrap_i64 v%d\n", idx32, fnval);
     }
+    // A direct call to a declared-but-undefined function is a cross-TU **function-symbol import**
+    // (only reached under `--emit-object` — the gate above returns to `gen_builtin_import`
+    // otherwise). It lowers to `call.sym "name"` with the callee's real signature; the linker's
+    // `Resolved::Func` drops this placeholder handle and rewrites it to a direct `call`. Materialize
+    // the (unused) handle before the result index so block-local value numbering stays monotonic.
+    bool fn_import = direct && !node->lhs->var->is_definition;
+    int imp_handle = -1;
+    if (fn_import) {
+      imp_handle = nv++;
+      cg("  v%d = i32.const 0\n", imp_handle);
+    }
     int sret_addr = 0;
     if (agg_ret) {
       int so = nv++;
@@ -1850,7 +1940,24 @@ static int gen_expr(Node *node) {
     }
     bool ir_void = is_void || agg_ret; // a struct-returning call is void at the IR level
     int r = ir_void ? 0 : nv++;
-    if (direct) {
+    if (fn_import) {
+      // Cross-unit function-symbol import: `call.sym "name" (SIG) -> (RET) <handle> (args)`. SIG is
+      // the callee's static signature, built exactly as the indirect path builds it (leading
+      // data-SP i64, optional sret pointer, params, optional varargs pointer) so it matches the
+      // definition emitted in the other unit. The linker binds "name" to that unit's export.
+      const char *name = node->lhs->var->name;
+      if (ir_void)
+        cg("  call.sym \"%s\" (i64", name);
+      else
+        cg("  v%d = call.sym \"%s\" (i64", r, name);
+      if (agg_ret)
+        cg(", i64"); // the hidden sret pointer
+      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+        cg(", %s", pass_irty(pt));
+      if (variadic)
+        cg(", i64"); // the hidden varargs-buffer pointer
+      cg(") -> (%s) v%d (v%d", ir_void ? "" : irty(node->ty), imp_handle, csp);
+    } else if (direct) {
       int idx = func_index(node->lhs->var);
       if (ir_void)
         cg("  call %d (v%d", idx, csp);
@@ -2529,6 +2636,12 @@ static bool layout_globals(Obj *prog) {
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || is_rodata(g))
       continue;
+    // `--emit-object`: an `extern` global (declared here, defined in another TU) gets **no** local
+    // storage — its references lower to `data.sym` and the linker resolves them to the exporter's
+    // window address. Reserving a slot for it here would waste space and, worse, its `data.self`-
+    // free references would silently read this unit's uninitialized slot.
+    if (opt_emit_object && !g->is_definition)
+      continue;
     off = align_to(off, g->align);
     g->offset = off;
     off += g->ty->size;
@@ -2567,6 +2680,15 @@ static long symbol_value(Obj *prog, char *name) {
   return 0; // unreachable for a well-formed whole-program module (defensive NULL)
 }
 
+// The Obj a relocation names, or NULL if this unit only *declares* it (a cross-TU symbol — under
+// `--emit-object` the linker resolves it). Used to pick the link form for a data→data pointer.
+static Obj *find_symbol(Obj *prog, char *name) {
+  for (Obj *s = prog; s; s = s->next)
+    if (s->name && !strcmp(s->name, name))
+      return s;
+  return NULL;
+}
+
 // Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
 // the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
 // Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
@@ -2574,16 +2696,47 @@ static long symbol_value(Obj *prog, char *name) {
 // window address of its target symbol + addend into the image, computed here since all
 // offsets/indices are known.
 static void emit_data_segments(Obj *prog) {
+  long span_top = 0;    // high-water of every defined global's window extent (`--emit-object` span)
+  long covered_top = 0; // high-water of the bytes an actual `data` segment writes
   for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function || !g->init_data)
+    if (g->is_function)
       continue;
+    // `--emit-object`: an `extern` has no storage in this unit (see `layout_globals`) — skip it.
+    // Otherwise every defined global counts toward the span the linker must reserve so the next
+    // unit's window never overlaps this one's data (including BSS, which emits no segment below).
+    if (opt_emit_object) {
+      if (!g->is_definition)
+        continue;
+      long gt = (long)g->offset + g->ty->size;
+      if (gt > span_top)
+        span_top = gt;
+    }
+    if (!g->init_data)
+      continue; // BSS: the window is zero-filled at instantiation, so no segment is needed
     int size = g->ty->size;
     unsigned char *buf = calloc(size ? size : 1, 1);
     memcpy(buf, g->init_data, size);
+    // Pointer initializers become relocations. Whole-program (`--emit-ir`): bake the target's
+    // absolute window value now — every offset/index is fixed. Separate compilation
+    // (`--emit-object`): leave a zero placeholder and emit a link-form `data.ptr` slot the linker
+    // patches once the window layout is known (below), the data→data twin of `data.self`/`data.sym`.
     for (Relocation *r = g->rel; r; r = r->next) {
-      unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
-      for (int i = 0; i < 8 && r->offset + i < size; i++)
-        buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+      if (opt_emit_object) {
+        Obj *t = find_symbol(prog, *r->label);
+        if (t && t->is_function)
+          // A function pointer baked into static data would need the *reindexed* funcref, which the
+          // linker rewrites only for `ref.func`/`call` operands, not opaque data bytes. No unit in
+          // the chibicc cc1 set does this; fail closed rather than emit a stale index.
+          error("codegen_ir: `--emit-object` cannot relocate a function pointer in static data "
+                "(`%s`); it needs a cross-TU funcref relocation the link model does not carry",
+                *r->label);
+        for (int i = 0; i < 8 && r->offset + i < size; i++)
+          buf[r->offset + i] = 0; // placeholder; the linker overwrites [at, at+8)
+      } else {
+        unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+        for (int i = 0; i < 8 && r->offset + i < size; i++)
+          buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+      }
     }
     cg("data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
     for (int i = 0; i < size; i++) {
@@ -2599,7 +2752,28 @@ static void emit_data_segments(Obj *prog) {
     }
     cg("\"\n");
     free(buf);
+    if (opt_emit_object) {
+      long ct = (long)g->offset + size;
+      if (ct > covered_top)
+        covered_top = ct;
+      // Emit the `data.ptr` slots now that the segment covering `[at, at+8)` exists: `self` for a
+      // target defined in this unit (relocated with our data), `sym` for a cross-TU data symbol.
+      for (Relocation *r = g->rel; r; r = r->next) {
+        Obj *t = find_symbol(prog, *r->label);
+        long at = (long)g->offset + r->offset;
+        if (t && t->is_definition)
+          cg("data.ptr %ld self %ld\n", at, (long)t->offset + r->addend);
+        else
+          cg("data.ptr %ld sym \"%s\" %ld\n", at, *r->label, r->addend);
+      }
+    }
   }
+  // `--emit-object`: if the unit's top-most global is BSS (no segment reached `span_top`), emit a
+  // 1-byte zero sentinel so the linker's data span (max segment end) covers all globals — otherwise
+  // the next unit's window base would overlap this unit's trailing BSS. Whole-program needs none:
+  // nothing is placed after its data.
+  if (opt_emit_object && span_top > covered_top)
+    cg("data %ld \"\\x00\"\n", span_top - 1);
 }
 
 // Which fixed powerbox caps (by `VM_CAP_*`/slot index) does `n`'s subtree actually reach? Sets bit
@@ -2665,6 +2839,19 @@ static unsigned scan_prog_caps(Obj *prog) {
 // placed by module-level `data` segments (§3a, see `emit_data_segments`), not written here. The
 // runtime grants the fixed powerbox and invokes this with **no** arguments (§7 name binding).
 // `cap_mask` (from `scan_prog_caps`) selects which caps to resolve — only the ones the program uses.
+// Emit the program's **data-stack base** into value `vn` — where `_start` builds the argv array and
+// cap-name scratch, and `main`'s initial data-SP. Whole-program (`--emit-ir`): the fixed `data_end`
+// (this module's top-of-data). Separate compilation (`--emit-object`): `data.top`, the link form the
+// linker rewrites to the post-link top of *all* units' data — this unit's own `data_end` is only its
+// own top, but the linker stacks every unit's data into one window and the stack must clear all of
+// it. A single-value producer either way, so it drops into `_start`'s hand-numbered blocks 1:1.
+static void emit_data_base_at(int vn) {
+  if (opt_emit_object)
+    cg("  v%d = data.top\n", vn);
+  else
+    cg("  v%d = i64.const %d\n", vn, data_end);
+}
+
 static void emit_start(Obj *main_fn, unsigned cap_mask) {
   npromo = 0; // _start is hand-written and threads no promoted locals
   Type *mret = main_fn->ty->return_ty;
@@ -2708,13 +2895,26 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     int len = (int)strlen(nm);
     for (int k = 0; k < len; k++) {
       int vp = nv++;
-      cg("  v%d = i64.const %d\n", vp, data_end + k);
+      // The scratch cell base + k. `data.top` (emit-object) is only a base, so add `k`; the
+      // whole-program `data_end + k` folds it into the constant.
+      if (opt_emit_object) {
+        cg("  v%d = data.top\n", vp);
+        if (k) {
+          int vk = nv++;
+          cg("  v%d = i64.const %d\n", vk, k);
+          int vs = nv++;
+          cg("  v%d = i64.add v%d v%d\n", vs, vp, vk);
+          vp = vs;
+        }
+      } else {
+        cg("  v%d = i64.const %d\n", vp, data_end + k);
+      }
       int vc = nv++;
       cg("  v%d = i32.const %d\n", vc, (unsigned char)nm[k]);
       cg("  i32.store8 v%d v%d\n", vp, vc);
     }
     int vptr = nv++;
-    cg("  v%d = i64.const %d\n", vptr, data_end);
+    emit_data_base_at(vptr);
     int vlen = nv++;
     cg("  v%d = i64.const %d\n", vlen, len);
     int vh = nv++;
@@ -2752,7 +2952,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  }\n");
     // body: argv[i] = p, then scan p to the byte past its NUL.
     cg("block 2 (v0: i64, v1: i64, v2: i64) {\n");
-    cg("  v3 = i64.const %d\n", data_end);
+    emit_data_base_at(3); // v3 = argv[] base (data-stack base)
     cg("  v4 = i64.const 8\n");
     cg("  v5 = i64.mul v1 v4\n");
     cg("  v6 = i64.add v3 v5\n");
@@ -2775,7 +2975,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  }\n");
     // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
     cg("block 5 (v0: i64) {\n");
-    cg("  v1 = i64.const %d\n", data_end);
+    emit_data_base_at(1); // v1 = argv[] base (data-stack base)
     cg("  v2 = i64.const 8\n");
     cg("  v3 = i64.mul v0 v2\n");
     cg("  v4 = i64.add v1 v3\n");
@@ -2814,7 +3014,7 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
   }
 
   int sp = nv++;
-  cg("  v%d = i64.const %d\n", sp, data_end);
+  emit_data_base_at(sp);
   // `int main()` (empty parens) is variadic in chibicc, so it expects the hidden va
   // pointer; main never reads it, so any in-window pointer (the sp) does.
   char va[24] = "";
@@ -3152,6 +3352,33 @@ void codegen_ir(Obj *prog, FILE *out) {
     emit_start(funcs[0], scan_prog_caps(prog));
   for (int i = 0; i < nfuncs; i++)
     gen_func(funcs[i]);
+
+  // `--emit-object`: publish this unit's external-linkage symbols so `svm_ir::link` can resolve
+  // another unit's `call.sym` to a direct call. Every non-`static` function is exported by name at
+  // its module index; `static` functions stay internal (unexported), so file-local statics of the
+  // same name in different TUs never collide. `emit_start` already exported `_start` as export 0
+  // when this unit defines `main`, so the numbering continues past it.
+  if (opt_emit_object) {
+    int k = has_main ? 1 : 0; // export 0 is `_start` in the entry unit
+    for (int i = 0; i < nfuncs; i++) {
+      if (funcs[i]->is_static || !funcs[i]->name)
+        continue;
+      cg("export %d func \"%s\" %d\n", k++, funcs[i]->name, start_off + i);
+    }
+    // Data-symbol exports (their own dense index sequence, § dynlink): each externally-visible
+    // global — non-`static`, defined here, source-named (not a compiler-internal `.L..` string
+    // literal or compound-literal temporary) — is published at its window offset so another unit's
+    // `data.sym`/`data.ptr … sym` resolves to it. Internal globals stay unexported: a file-local
+    // `static` global of the same name in two TUs never collides, exactly as for functions.
+    int d = 0;
+    for (Obj *g = prog; g; g = g->next) {
+      if (g->is_function || !g->is_definition || g->is_static)
+        continue;
+      if (!g->name || g->name[0] == '\0' || g->name[0] == '.')
+        continue;
+      cg("export %d data \"%s\" %d\n", d++, g->name, g->offset);
+    }
+  }
 
   // `-g`: the §6 debug-info section, after the functions (module-level, strippable): the source
   // file table, then `debug.loc` source lines (collected during emission), then the structured

@@ -337,6 +337,8 @@ pub fn specialize_with_config(
     };
 
     Ok(Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs,
         memory: module.memory,
         data: module.data.clone(),
@@ -345,6 +347,8 @@ pub fn specialize_with_config(
         // module's name→funcidx exports no longer apply; a residual is addressed by index.
         // Interface offers are dropped for the same reason (their op funcidxs are stale).
         exports: vec![],
+        // A residual is a finished, index-addressed program — no cross-unit data symbols to export.
+        data_exports: vec![],
         impl_exports: vec![],
         types: vec![],
         debug_info: None,

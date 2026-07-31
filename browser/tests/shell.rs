@@ -1,23 +1,50 @@
 //! The **`svm-posix` shell** running in the browser (`posix_shell_exec` / the wasm `svm_run_shell`
 //! export) — STAGE1.md "real posix shell in the playground". The committed fixture
-//! `fixtures/shell.svmb` is the shell's **sequential subset** (`SVM_SHELL_SEQUENTIAL`): the same
-//! `shim.c + shell_main.c` the differential `crates/svm/tests/c_shell.rs` compiles, minus the
-//! external-command spawn and concurrent ring pipelines — so it carries no `Instantiator`/
-//! `SharedRegion` cap.calls and compiles on the browser's bytecode engine. Regenerate with
+//! `fixtures/shell.svmb` is the **full** shell: the same `shim.c + ring.c + shell_main.c` the
+//! differential `crates/svm/tests/c_shell.rs` compiles, *including* external-command spawn (op 13) and
+//! concurrent ring pipelines (op 11 + `SharedRegion` + futex). Those cap.calls now run on the browser's
+//! bytecode cooperative engine (the slices that lowered ops 13/11 + region + futex, plus op-13
+//! child-manifest binding). Regenerate both fixtures with
 //! `cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture`.
 //!
 //! The shell reads its script from the personality's stdin and loops to EOF; its `write(1, …)` lands
 //! in the personality's captured stdout. Run on the **bytecode** engine — the single-threaded,
-//! wasm-safe interpreter tier (the tree-walk/JIT engines that run the full shell use OS threads + a
-//! wall clock, absent under wasm). The Stage-0 surface (builtins, redirects, memfs pipelines, if,
-//! vars, globbing) is bytecode-compilable and byte-checked against the tree-walk oracle by `c_shell`.
+//! wasm-safe interpreter tier (the tree-walk/JIT engines the *native* differential runs use OS threads
+//! + a wall clock, absent under wasm). The whole surface (builtins, redirects, memfs + **ring**
+//! pipelines, external commands, if, vars, globbing) is byte-checked against the tree-walk oracle by
+//! `c_shell`'s three-way interp==JIT==bytecode differential.
 
-use svm_browser::{posix_shell_exec, STATUS_OK};
+use svm_browser::{posix_shell_exec, posix_shell_exec_with, STATUS_OK};
 
 fn run(script: &str) -> String {
     let bytes = include_bytes!("fixtures/shell.svmb");
     let m = svm_encode::decode_module(bytes).expect("decode shell.svmb");
     let out = posix_shell_exec(&m, script.as_bytes());
+    assert_eq!(
+        out.status, STATUS_OK,
+        "the shell should run to EOF cleanly (script: {script:?})",
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// As [`run`], with the full playground PATH registered: the `__stage` ring-filter runner (so
+/// pipelines take the concurrent ring path — op 11 + `SharedRegion` + futex — instead of sequential
+/// memfs staging) and the `primes` external command (an op-13 §14 child). Exactly what the browser's
+/// `svm_run_shell` grants, so these tests mirror the real playground registry.
+fn run_with_stage(script: &str) -> String {
+    let bytes = include_bytes!("fixtures/shell.svmb");
+    let m = svm_encode::decode_module(bytes).expect("decode shell.svmb");
+    let rbytes = include_bytes!("fixtures/stage_runner.svmb");
+    let runner = svm_encode::decode_module(rbytes).expect("decode stage_runner.svmb");
+    let pbytes = include_bytes!("fixtures/primes.svmb");
+    let primes = svm_encode::decode_module(pbytes).expect("decode primes.svmb");
+    let ubytes = include_bytes!("fixtures/upper.svmb");
+    let upper = svm_encode::decode_module(ubytes).expect("decode upper.svmb");
+    let out = posix_shell_exec_with(
+        &m,
+        script.as_bytes(),
+        &[("__stage", &runner), ("primes", &primes), ("upper", &upper)],
+    );
     assert_eq!(
         out.status, STATUS_OK,
         "the shell should run to EOF cleanly (script: {script:?})",
@@ -48,10 +75,47 @@ fn shell_redirect_and_cat() {
 
 #[test]
 fn shell_pipeline_through_memfs_staging() {
-    // A pipeline with no `__stage` runner registered falls back to sequential memfs-temp staging (the
-    // browser grants no external commands this slice) — real `cat | grep | wc` semantics in-process.
+    // With no `__stage` runner registered a pipeline falls back to sequential memfs-temp staging — real
+    // `cat | grep` semantics in-process, no rings. (The ring path is exercised below.)
     let out = run("echo a > f\necho b >> f\necho c >> f\ncat f | grep b\n");
     assert_eq!(out, "b\n");
+}
+
+#[test]
+fn shell_ring_pipeline_sort_uniq() {
+    // The headline browser capability: with `__stage` on PATH, `cat f | sort | uniq` runs as three
+    // **concurrent** stages over shared-memory rings (op 11 + `SharedRegion` + futex) on the bytecode
+    // cooperative engine — the child stages' output unifies into the shell's captured stdout.
+    let out = run_with_stage("echo b > f\necho a >> f\necho b >> f\ncat f | sort | uniq\n");
+    assert_eq!(out, "a\nb\n");
+}
+
+#[test]
+fn shell_ring_pipeline_status_and_early_exit() {
+    // Status threads back through a ring child (`grep` no-match → 1) and `head`'s early exit closes its
+    // input ring (SIGPIPE-lite) so the producer stops instead of wedging — matching the native `c_shell`
+    // ring differential, now on the browser engine.
+    let out = run_with_stage(
+        "echo one > f\necho two >> f\necho one >> f\n\
+         cat f | grep zzz\necho rc $?\ncat f | head -n 1\necho rc $?\n",
+    );
+    assert_eq!(out, "rc 1\none\nrc 0\n");
+}
+
+#[test]
+fn shell_external_command_primes() {
+    // An **external command** (op-13 §14 child): `primes` is a separate compiled-C program on PATH, not
+    // a builtin. The shell spawns it, delivers `argv`, and its stdout streams into the shell's sink.
+    let out = run_with_stage("primes 20\n");
+    assert_eq!(out, "2\n3\n5\n7\n11\n13\n17\n19\n");
+}
+
+#[test]
+fn shell_external_filter_upper() {
+    // A **filter** external command (op-13 child granted both stdin + stdout): the shell drains the
+    // `< file` redirect into `upper`'s granted stdin pipe; `upper`'s `read(0, …)` uppercases to stdout.
+    let out = run_with_stage("echo Hello, Sandbox > f\nupper < f\n");
+    assert_eq!(out, "HELLO, SANDBOX\n");
 }
 
 #[test]

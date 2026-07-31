@@ -809,6 +809,75 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
     assert!(!frames.is_empty(), "a live frame after stepBack");
 }
 
+#[test]
+fn dap_over_bytecode_step_back_after_forward_progress_matches_the_tree_walker() {
+    // Exercises the `step_back` stoppable-position cache across a forward advance that moves the
+    // position *past* the cache's high-water: a first stepBack builds the trace at i=3, two forward
+    // `continue`s advance well beyond it (i=1), then a second stepBack must rebuild the trace to the
+    // new high-water and still land correctly. The observations must match the tree-walker's
+    // time-travel at every landing — the cache is a pure optimization, not a behavior change.
+    fn script(engine: Option<&str>) -> (String, String, String) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/work/sum.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(7))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // hit 1: i=3
+        s.handle(&req(5, "stepBack", Json::obj(vec![]))); // builds the trace (high-water at i=3)
+                                                          // Forward again, well past that high-water: the first `continue` re-hits i=3 (we rewound to
+                                                          // before it), then i=2, then i=1 — the furthest-forward position of the session.
+        s.handle(&req(6, "continue", Json::obj(vec![]))); // hit: i=3 (re-hit)
+        s.handle(&req(7, "continue", Json::obj(vec![]))); // hit: i=2
+        s.handle(&req(8, "continue", Json::obj(vec![]))); // hit: i=1
+        let at1 = read_locals(&mut s, 9); // (i=1, acc=5)
+        let back = s.handle(&req(10, "stepBack", Json::obj(vec![]))); // now > high-water ⇒ rebuild, then seek
+        let reason = event(&back, "stopped")
+            .unwrap()
+            .get("body")
+            .unwrap()
+            .get("reason")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after_back = read_locals(&mut s, 11); // one op before the i=1 stop
+        (
+            format!("{},{}", at1.0, at1.1),
+            reason,
+            format!("{},{}", after_back.0, after_back.1),
+        )
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert_eq!(bytecode.0, "1,5", "furthest-forward hit is i=1, acc=5");
+    assert_eq!(
+        bytecode.1, "step",
+        "the rebuild-then-seek stepBack is a step stop"
+    );
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode step_back across a cache rebuild ≡ tree-walker time-travel",
+    );
+}
+
 // A `thread.spawn` guest (two workers each load/add/store mem[0]; root spawns + joins). Auto debug
 // info makes the worker's `vc = i64.load vaddr` breakpointable — it's on line 18 (leading newline is
 // line 1). Drives the multithreaded scheduled bytecode engine over DAP.
@@ -1381,5 +1450,105 @@ fn dap_over_bytecode_fiber_on_a_spawned_thread() {
     assert!(
         event(&done, "terminated").is_some(),
         "the fiber-on-threads guest finished"
+    );
+}
+
+// ---- W4 blocking stdin: the launch gate is fail-closed --------------------------------------------
+// `blockStdin: true` parks a `read` on exhausted stdin instead of returning EOF — a session mode only
+// the single-vCPU bytecode powerbox path supports. Every unsupported combination must *fail the
+// launch* rather than silently keep EOF semantics (invariant 9: decline, never diverge).
+
+/// Launch `text` with the given extra args; returns the launch response's `success`.
+fn launch_succeeds(text: &str, extra: Vec<(&str, Json)>) -> bool {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let mut args = vec![
+        ("programText", Json::s(text)),
+        ("function", Json::i(0)),
+        ("args", Json::Arr(vec![Json::i(3)])),
+    ];
+    args.extend(extra);
+    let out = s.handle(&req(2, "launch", Json::obj(args)));
+    response(&out).get("success") == Some(&Json::Bool(true))
+}
+
+#[test]
+fn block_stdin_launch_gate_is_fail_closed() {
+    // The tree-walker has no blocking-stdin mode: fail the launch, don't silently EOF.
+    assert!(
+        !launch_succeeds(
+            LOOP_SUM_DBG,
+            vec![
+                ("powerbox", Json::s("onramp")),
+                ("blockStdin", Json::Bool(true)),
+            ],
+        ),
+        "treewalk + blockStdin must fail the launch"
+    );
+    // A deny-all (no powerbox) session has no stdin capability to block on.
+    assert!(
+        !launch_succeeds(
+            LOOP_SUM_DBG,
+            vec![
+                ("engine", Json::s("bytecode")),
+                ("blockStdin", Json::Bool(true)),
+            ],
+        ),
+        "bytecode without the powerbox + blockStdin must fail the launch"
+    );
+    // The multithreaded scheduled engine is out of scope this slice: declined at construction.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            ("blockStdin", Json::Bool(true)),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(false)),
+        "a thread.spawn module + blockStdin must fail the launch"
+    );
+    // And the same launches *without* blockStdin still succeed — the gate rejects only the mode.
+    assert!(
+        launch_succeeds(LOOP_SUM_DBG, vec![("powerbox", Json::s("onramp"))]),
+        "treewalk without blockStdin launches"
+    );
+    assert!(
+        launch_succeeds(LOOP_SUM_DBG, vec![("engine", Json::s("bytecode"))]),
+        "bytecode deny-all without blockStdin launches"
+    );
+}
+
+#[test]
+fn provide_stdin_fails_cleanly_on_a_non_blocking_session() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(LOOP_SUM_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    let out = s.handle(&req(
+        3,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("hello\n"))]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(false)),
+        "provideStdin on a non-blocking session fails cleanly"
     );
 }

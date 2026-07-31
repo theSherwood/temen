@@ -54,7 +54,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `svm-text`, `svm-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `svm-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `svm-ir` `DebugInfo`/`TypeDef`, `svm-text`, `svm-encode`, `svm-interp`, `codegen_ir.c`, `svm-wasm`, `svm-llvm` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `expr` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `svm-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `svm-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -192,8 +192,128 @@ different things depending on which pair you compare:
   by rewinding to the previous real-instruction op, and `clock`, with `supports_reverse` now `true`.
   `dap_over_bytecode_reverse_matches_the_tree_walker` proves a forward-then-`reverseContinue` script
   yields **identical** observations on both engines; the browser debug panel gained Step Back / Reverse
-  controls (Chromium-verified: run forward to i=4, reverse back to i=5). A checkpoint ladder to bound
-  the replay cost is a future optimization — the debugged programs here are small.
+  controls (Chromium-verified: run forward to i=4, reverse back to i=5).
+
+  **Reverse-replay bounded by a checkpoint ladder (slice 4-perf, single-vCPU).** The from-clock-0
+  replay above is O(t) per `seek`, so a `step_back`/`reverseContinue` sweep over a long run (a real
+  chibicc program is hundreds of k ops) was quadratic. Ported the tree-walker `Inspector`'s time-travel
+  ladder to the bytecode `DebugRun`: `Vm` derives `Clone`, and `DebugRun` gained
+  `checkpointable`/`snapshot`/`restore` (`DebugRunSnapshot` = the root `Vm` deep copy + window bytes via
+  `Mem::window_snapshot`/`seed` + the host replay substate — reusing the exact primitives the tree-walker
+  ladder does, so **no new confinement/TCB surface**). `BytecodeBackend` keeps a stride-1024 ladder
+  (`CHECKPOINT_STRIDE`, matching `Inspector`'s): `seek(t)` restarts from the nearest snapshot `clock ≤ t`
+  and replays only the tail, `drive_single_to` lays one down at each boundary, and `maybe_checkpoint`
+  drops the ladder + falls back to replay-from-0 the moment a boundary leaves the checkpointable subset
+  (fibers/coroutines/threads/non-pristine memory/stateful host) — same subset predicate as
+  `VCpu::checkpointable`. Also caches the deterministic stoppable-op timeline (`RevTrace`) so `step_back`
+  finds its target by lookup instead of a redundant probe replay. Gated by the warm≡cold oracle
+  `crates/svm-dap/tests/dap_checkpoints.rs` (a checkpoint-restored `seek` ≡ a from-0 `seek` at every
+  probe, forward and on a full backward sweep, with `checkpoint_count > 0` proving the ladder is
+  exercised) — the bytecode counterpart of `crates/svm/tests/debug_checkpoints.rs`. Measured **~42×** on
+  a 64k-op reverse sweep (an `#[ignore]`d timing bench in the same file).
+
+  **Extended to the multi-vCPU `ScheduledDebugRun` (slice 4-perf, threaded).** The scheduled `seek`
+  (keyed on the global `turn`) got the same ladder, so threaded reverse debugging is bounded too.
+  `ScheduledDebugRun` gained `checkpointable`/`snapshot`/`restore` (`ScheduledSnapshot` = every task's
+  reduced state + the shared window bytes + the host substate + both scheduler clocks; `DbgTaskState`
+  derives `Clone`). The transient `stopped`/`focus`/`last_watch` are **not** captured — `locate`
+  rederives them from the task states after the replay. `BytecodeBackend` carries a second turn-keyed
+  ladder (`sched_checkpoints`); the threaded `seek` restarts from the nearest snapshot and
+  `drive_scheduled_to`/`maybe_sched_checkpoint` mirror the single-vCPU pair. Gated by a threaded
+  warm≡cold oracle (`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero`):
+  a checkpoint-restored `seek` reproduces the global turn, live-thread count, stopped thread, shared
+  counter, and **every** thread's stack (`select_task` each) — forward and on a full backward sweep.
+
+  **Subset extended to §12 fibers + §14 same-module coroutines + `instantiate` children (slice 4-perf,
+  threaded).** The scheduled subset now mirrors the single-vCPU one, applied per task. `DbgTaskSnapshot`
+  carries each task's **full** `VTask` (active `Vm`, `active_id`, resume `chain`, same-module coroutine
+  children, `active_coro`, `root_shadow_sp`) instead of only the root `Vm`, and `ScheduledSnapshot` adds
+  the **run-shared** `fibers` registry (a fiber migrates across vCPUs — D57) and the §14 same-module
+  `instantiate`-child environments (`extra_envs`, as `EnvSnapshot`). On restore each coroutine window
+  (`rebuild_coro`, shared with the single-vCPU path) and each child env (`rebuild_env`: `nested_view` +
+  a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
+  the reseeded shared window. Admitting `instantiate` children is what unlocks **scheduled coroutines**:
+  the bytecode engine rejects `coroutine + thread`, so a scheduled coroutine only ever arises alongside
+  an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
+  **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
+  (`memory.wait`) fibers. Oracles:
+  `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
+  worker vCPUs each driving a fiber body) and
+  `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
+  (`ScheduledDebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every*
+  checkpointable turn, including inside the coroutine body, with a live `instantiate` child env).
+
+  **Subset extended to §14 separate-module coroutines + `instantiate_module` children (slice 5-perf, both
+  engines).** A **separate-module** coroutine/child pushes its compiled program into the shared
+  `ModuleSource` and dispatches by that index, so a fresh restore's source lacked it. The run snapshots
+  (`DebugRunSnapshot` + `ScheduledSnapshot`) now capture the non-primary units (`ModuleSource::extra_units`
+  — cheap `Arc<Compiled>` clones, immutable) and `restore` re-pushes them (`reset_extra`) before rebuilding
+  coroutines/envs, so a `module >= 1` frame resolves; `rebuild_coro`/`rebuild_env` build the dispatch table
+  over the continuation's own module (`build_table_for`), and `CoroSnapshot`/`EnvSnapshot` carry the module
+  index + a separate-module coroutine's own §6 `ModuleDebug` (now `Clone`) so `read_var` keeps resolving
+  its source variables after restore. This required relaxing `Host::checkpoint_safe`, which vetoed any run
+  holding a **module grant**: `Host::modules` is populated *only* by the embedder (`grant_module` — no
+  guest op mints one) and each grant is an immutable `Arc<Module>`, so like the `Instantiator`/`Yielder`
+  grants it already tolerates, a grant is reproducible powerbox state a faithful rebuild re-grants, not
+  dropped residue (the DAP backend grants no modules, so this only affects a direct embedder driving
+  `snapshot`/`restore`). Oracles:
+  `bytecode_debug_coroutine_module.rs::separate_module_coroutine_checkpoint_snapshot_restore_round_trips`
+  (+ `…_restore_reconstructs_source_metadata`, proving `mod_debug` round-trips) and
+  `bytecode_debug_instantiate_module.rs::scheduled_instantiate_module_checkpoint_snapshot_restore_round_trips`
+  (a separate-module child vCPU stepped inside its pushed module).
+
+  **Subset extended to page-mapping *root* windows (slice 6a, both engines).** Before this, a run whose
+  root window had a non-pristine layout — the guest had `map`ped (grown a reserved-tail page), `unmap`ped,
+  or `protect`ed (`Ro`) a page via its `AddressSpace` — fell back to replay-from-clock-0: the old
+  `Mem::snapshot_safe` admitted only a window fully reproduced by reseeding the prefix *bytes*, so any
+  `Ro`/`Unmapped`/grown entry vetoed it. The checkpoint now captures the window's **page-protection map
+  alongside its bytes** (`Mem::layout_snapshot`/`restore_layout`, a new `MemLayout` in both
+  `DebugRunSnapshot` and `ScheduledSnapshot`): the byte range runs to the high-water mark (prefix + any
+  grown tail page — `map`/`unmap` zero on commit, so uncommitted pages read zero and round-trip trivially),
+  and the prot map is reinstalled verbatim on restore. The root gate weakens from `snapshot_safe` to
+  `layout_snapshot_safe`, whose sole disqualifier is §13 region aliasing (a `Backed` page's bytes live in a
+  shared cross-domain `SharedRegion`, not this window's backing). Oracle: `bytecode_debug_page_mapping.rs`
+  — a fixture that grows/protects/unmaps then loads the unmapped page (a terminal `MemoryFault`),
+  round-tripped warm≡cold at **every** checkpointable clock on both the single-vCPU `DebugRun` and the
+  threaded `ScheduledDebugRun`; the forward replay re-executes the grown-page load (would fault if the `Rw`
+  entry were dropped) and the terminal unmapped load (would *not* fault, diverging, if the `Unmapped` entry
+  were dropped), so it pins protection-map fidelity, not just bytes.
+
+  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** The bytes
+  +protmap capture now reaches §14 children too. A **demand** (`fault_yields`) coroutine — its window
+  starts all-`Unmapped`, pages supplied `Rw` by the parent on fault — and a coroutine or `instantiate`
+  child that `map`/`unmap`/`protect`ed its own confined window were the last non-pristine cases still
+  forcing replay-from-0. Now each child's **own page-protection map** rides in its snapshot
+  (`CoroSnapshot.prot` / `EnvSnapshot.prot`, via `Mem::prot_snapshot`/`install_prot`), reinstalled on the
+  rebuilt `nested_view`; the child's *bytes* still ride in the parent/shared window snapshot (they share
+  the backing region), and `CoroSnapshot` now also carries `fault_yields` so a mid-demand coroutine
+  resumes with the right fault semantics. The child gate (`child_checkpointable`, shared by both engines
+  for coroutines and envs) is `layout_snapshot_safe` (no §13 regions) **and** `nested_within_prefix` — the
+  child's extent must lie within the parent's captured prefix, so its bytes are covered by the parent
+  reseed (a child carved into the parent's uncommitted reserved tail stays excluded). Oracles:
+  `bytecode_debug_demand_checkpoint.rs` (a single-vCPU demand coroutine, restored at *every* clock
+  including suspended mid-fault, matching the tree-walker result) and `bytecode_debug_child_page_mapping.rs`
+  (a scheduled `instantiate` child that unmaps a page then faults loading it — exercising `EnvSnapshot.prot`
+  on the multi-vCPU engine). Both assert *every* clock/turn is checkpointable (fails under the old
+  `fault_yields`/bytes-only exclusions). Still excluded (→ replay-from-0): §13 **region-aliased** windows
+  (cross-domain shared bytes) and children carved beyond the parent's captured prefix.
+
+  **Subset extended to §12 fibers + §14 same-module coroutines (slice 4-perf, single-vCPU).** The
+  single-vCPU `DebugRun` checkpointable subset no longer excludes fibers/coroutines. **Fibers**: the
+  snapshot now carries the whole `VTask` continuation — `active_id`, the resume `chain` (each parked
+  resumer `Vm`), and the `fibers` registry (`FiberState` derives `Clone`) — all of which share the one
+  window (snapshotted once), so a checkpoint taken while a fiber is the active continuation (root parked
+  on the chain) restores faithfully; an event-parked (`memory.wait`) fiber stays excluded (non-deterministic
+  wall-clock deadline). **Same-module coroutines**: each `Coro` is captured as a `CoroSnapshot` (its `Vm`,
+  the `nested_view` geometry `win_base`/`size_log2`, and its Yielder host substate); because the view
+  shares the parent's backing region, the coroutine's bytes already ride in the parent window snapshot,
+  and `restore` rebuilds the view over the reseeded parent + a fresh Yielder host. Excluded (→ fall back
+  to replay-from-0): **demand** coroutines (`fault_yields` / non-pristine `nested_view` layout, caught by
+  the coroutine's own `snapshot_safe`) and **separate-module** coroutines (`vm.module != 0` — they push a
+  unit into the shared source, which a fresh restore lacks). Oracles: `dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber`
+  (backend ladder, fiber active across the strides) and `bytecode_debug_coroutines.rs::coroutine_checkpoint_snapshot_restore_round_trips`
+  (`DebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every* checkpointable clock,
+  including inside the coroutine body, replays forward identically to the from-0 run).
 
   **Watchpoints landed on the bytecode engine (slice 5).** `DebugRun` gained a `set_watchpoints`
   replace-API + a per-op check (`watch_hit_before`) that computes the op-about-to-run's effective
@@ -422,9 +542,17 @@ different things depending on which pair you compare:
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
   (slices 14b/14c, 15a/15b/15c, 16), and **source-variable inspection inside a separate-module child body**
   on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
-  (never enabled on the debug engine). Follow-ups: the §3.6 serve/live-call machinery inside a confined
-  child, env teardown / D37 revocation, and a checkpoint ladder to bound reverse-replay cost (perf — today's
-  small debugged programs replay from turn 0 cheaply).
+  (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
+  engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
+  is bounded too), and its checkpointable subset now covers **§12 fibers + §14 coroutines** (same-module
+  *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
+  on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
+  (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
+  page-protection map is captured alongside the bytes. Follow-ups: the §3.6 serve/live-call machinery
+  inside a confined child, env teardown / D37 revocation, and — if a use case demands it — extending the
+  checkpointable subset to §13 **region-aliased** windows (cross-domain shared bytes) and children carved
+  beyond the parent's captured prefix — today those fall back to replay-from-0, which stays correct, just
+  unbounded.
 
 ---
 

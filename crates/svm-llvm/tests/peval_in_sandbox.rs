@@ -20,6 +20,9 @@ mod common;
 fn oracle_module() -> Module {
     Module {
         types: vec![],
+        data_exports: vec![],
+        data_ptrs: vec![],
+        data_funcrefs: vec![],
         impl_exports: vec![],
         funcs: vec![Func {
             params: vec![],

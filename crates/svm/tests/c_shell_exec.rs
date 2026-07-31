@@ -116,7 +116,7 @@ static int __capof(int want) {
   return -1;
 }
 static int __h_hf = -1;
-static int __hf(void) { if (__h_hf < 0) __h_hf = __capof(13); return __h_hf; }   /* HOST_FN = 13 */
+static int __hf(void) { if (__h_hf < 0) __h_hf = __capof(13); return __h_hf; }   /* HOST_PROC = 13 */
 static int __h_inst = -1;
 static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
 /* 384 KiB: room for the grant record/name low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
@@ -150,7 +150,7 @@ int main(int argc, char **argv){
 
 /// The embedder's PATH → `Module` map + stdout handle, as one host fn (op 0 = stdout handle, op 1 =
 /// look a command name up). Returns handle values valid in the shell's own cap table.
-fn exec_host(out_h: i32, echo_h: i32) -> svm_interp::HostFn {
+fn exec_host(out_h: i32, echo_h: i32) -> svm_interp::HostProc {
     Box::new(
         move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| match op {
             0 => Ok(vec![out_h as i64]),
@@ -214,7 +214,7 @@ fn run(shell: &svm_ir::Module, cmd: &svm_ir::Module, argv: &[&str], jit: bool) -
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
-    let _exec_h = host.grant_host_fn(exec_host(out_h, echo_h));
+    let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h));
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
     let m = svm_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");

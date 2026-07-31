@@ -17,12 +17,12 @@ use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use svm_interp::{GuestMem, HostFn, Value};
+use svm_interp::{GuestMem, HostProc, Value};
 
 /// The deterministic **scripted** backend as a [`HostCap`]: a `(argv-prefix → {stdout, stderr,
 /// exit})` table, no host processes. What differential tests and wasm/browser embedders grant.
 pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
-    HostCap::host_fn(0, svm_exec::scripted_exec_handler(table))
+    HostCap::host_proc(0, svm_exec::scripted_exec_handler(table))
 }
 
 /// The **real subprocess** backend: spawn via the host, attenuated by an explicit program
@@ -33,7 +33,7 @@ pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
 /// the POSIX-shell way (0-255; signal death as `128 + signo`).
 pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
-    HostCap::host_fn(0, host_exec_handler(allow))
+    HostCap::host_proc(0, host_exec_handler(allow))
 }
 
 /// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
@@ -60,14 +60,14 @@ pub struct DomainProgram {
 /// `host_exec` blocks on the process — one synchronous op either way.
 pub fn domain_exec(programs: Vec<DomainProgram>) -> HostCap {
     let programs = Arc::new(programs);
-    HostCap::host_fn(0, move || {
+    HostCap::host_proc(0, move || {
         let programs = Arc::clone(&programs);
         let mut jobs = JobTable::default();
         Box::new(
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![domain_dispatch(&programs, &mut jobs, op, args, mem)])
             },
-        ) as HostFn
+        ) as HostProc
     })
 }
 
@@ -117,7 +117,7 @@ fn domain_dispatch(
     }
 }
 
-fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostFn + Send + Sync + 'static {
+fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostProc + Send + Sync + 'static {
     move || {
         let allow = Arc::clone(&allow);
         let mut jobs = JobTable::default();
@@ -125,7 +125,7 @@ fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostFn + Send + Sy
             move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
                 Ok(vec![host_dispatch(&allow, &mut jobs, op, args, mem)])
             },
-        ) as HostFn
+        ) as HostProc
     }
 }
 

@@ -1,10 +1,12 @@
 // Real-browser (V8) end-to-end check for the **playground shell card** (STAGE1.md): load the same
-// `svm_browser.wasm` the page runs, fetch `web/assets/shell.svmb` (the committed shell fixture the
-// build step copies in), and drive the `svm_run_shell` entry the card's Run calls — feeding a script
-// as stdin and asserting the captured stdout. This exercises the actual wasm path the "Shell" card
-// uses (interpreter tier; the shell carries Instantiator cap.calls, so there is no wasm-JIT tier).
+// `svm_browser.wasm` the page runs, fetch `web/assets/shell.svmb` + its PATH registry
+// (`stage_runner.svmb`, `primes.svmb`), and drive the `svm_run_shell` entry the card's Run calls —
+// feeding a script as stdin and asserting the captured stdout. This exercises the actual wasm path the
+// "Shell" card uses: the bytecode cooperative engine, with the `__stage` runner registered so a
+// `cat | sort | uniq` pipeline runs as concurrent stages over shared-memory rings (op 11 +
+// SharedRegion + futex), and the `primes` external command exec'd as an op-13 §14 child.
 //
-// Skipped cleanly if the asset or a Chromium/Playwright install is unavailable (like the other
+// Skipped cleanly if the assets or a Chromium/Playwright install is unavailable (like the other
 // on-ramp browser checks). Run: node browser-shell-test.mjs
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
@@ -12,8 +14,9 @@ import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-if (!existsSync(`${ROOT}/web/assets/shell.svmb`)) {
-  console.log('– shell test skipped (web/assets/shell.svmb absent — run build-onramp-assets.mjs)');
+const ASSETS = ['shell.svmb', 'stage_runner.svmb', 'primes.svmb', 'upper.svmb'];
+if (ASSETS.some((a) => !existsSync(`${ROOT}/web/assets/${a}`))) {
+  console.log(`– shell test skipped (web/assets/{${ASSETS.join(',')}} absent — run build-onramp-assets.mjs)`);
   process.exit(0);
 }
 async function loadChromium() {
@@ -35,30 +38,63 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The script exercises the read-eval loop, $VAR expansion, a redirect+cat over the memfs, a
-// `cat | grep` pipeline, and an if/test conditional — the Stage-0 shell surface the card advertises.
+// `cat | grep` pipeline, a **`cat | sort | uniq` concurrent ring pipeline**, the **`primes` external
+// command** (a generator), the **`upper` filter** (an external command that reads stdin), and an
+// if/test conditional — the shell surface the card advertises.
 const SCRIPT =
   '# a comment line — ignored\n' +
   'echo hello from the sandbox\n' +
   'N=world\n' +
   'echo hi $N   # an inline comment\n' +
-  'echo apple > fruits\n' +
+  'echo -- primes --\n' +
+  'primes 10\n' +
+  'echo -- upper --\n' +
+  'echo shout it | upper\n' +
+  'echo banana > fruits\n' +
+  'echo apple >> fruits\n' +
   'echo banana >> fruits\n' +
   'cat fruits | grep a\n' +
+  'echo -- sorted --\n' +
+  'cat fruits | sort | uniq\n' +
   'if test -f fruits; then echo exists; fi\n';
-const EXPECT = 'hello from the sandbox\nhi world\napple\nbanana\nexists\n';
+// `primes 10` → the generator streams 2 3 5 7; `echo shout it | upper` → the filter reads its stdin
+// and uppercases it; `grep a` matches all three lines (banana, apple, banana all contain 'a'); the
+// ring `sort | uniq` then yields the deduped sorted pair.
+const EXPECT =
+  'hello from the sandbox\nhi world\n-- primes --\n2\n3\n5\n7\n-- upper --\nSHOUT IT\n' +
+  'banana\napple\nbanana\n-- sorted --\napple\nbanana\nexists\n';
 
 const res = await page.evaluate(async (script) => {
   const par = await import('./par.js');
   const eng = await par.loadEngine();
   const dec = (p, n) => new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + n));
-  const bytes = new Uint8Array(await (await fetch('./assets/shell.svmb')).arrayBuffer());
+  const fetchB = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+  const bytes = await fetchB('./assets/shell.svmb');
+  // Build the PATH-registry blob svm_run_shell parses: u32 count, then per entry u32 name-len + UTF-8
+  // name + u32 module-len + module bytes (little-endian) — the __stage runner and the primes command.
+  const reg = [
+    { name: '__stage', bytes: await fetchB('./assets/stage_runner.svmb') },
+    { name: 'primes', bytes: await fetchB('./assets/primes.svmb') },
+    { name: 'upper', bytes: await fetchB('./assets/upper.svmb') },
+  ].map((c) => ({ name: new TextEncoder().encode(c.name), bytes: c.bytes }));
+  let total = 4;
+  for (const c of reg) total += 4 + c.name.length + 4 + c.bytes.length;
+  const blob = new Uint8Array(total);
+  const dv = new DataView(blob.buffer);
+  let o = 0; dv.setUint32(o, reg.length, true); o += 4;
+  for (const c of reg) {
+    dv.setUint32(o, c.name.length, true); o += 4; blob.set(c.name, o); o += c.name.length;
+    dv.setUint32(o, c.bytes.length, true); o += 4; blob.set(c.bytes, o); o += c.bytes.length;
+  }
   const stdinBytes = new TextEncoder().encode(script);
   const mp = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, mp);
   const sp = eng.ex.svm_alloc(stdinBytes.length); new Uint8Array(eng.memory.buffer).set(stdinBytes, sp);
-  eng.ex.svm_run_shell(mp, bytes.length, sp, stdinBytes.length);
+  const gp = eng.ex.svm_alloc(blob.length); new Uint8Array(eng.memory.buffer).set(blob, gp);
+  eng.ex.svm_run_shell(mp, bytes.length, sp, stdinBytes.length, gp, blob.length);
   const status = eng.ex.svm_status();
   const stdout = dec(Number(eng.ex.svm_stdout_ptr()), eng.ex.svm_stdout_len());
   eng.ex.svm_dealloc(mp, bytes.length); eng.ex.svm_dealloc(sp, stdinBytes.length);
+  eng.ex.svm_dealloc(gp, blob.length);
   return { status, stdout };
 }, SCRIPT);
 

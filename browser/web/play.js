@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule } from './wasmjit-module.js';
+import { runJitModule, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -740,7 +740,8 @@ print("squares:", table.concat(sq, " "))
   'C compiler (chibicc → SVM — compile & run)': {
     kind: 'chibicc',
     debug: true, // source-level C debugging: tick "debug info (-g)", then Debug (see the debugger below)
-    jit: false, // chibicc uses floats (the %.17g path) → bytecode engine, not the integer-only wasm-JIT
+    jit: true, // chibicc's _start emits to wasm (333 funcs; cap-call/float helpers bounce cross-tier) —
+    //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by chibicc_jit.rs)
     editable: true,
     lang: 'c',
     url: './assets/chibicc.svmb',
@@ -749,11 +750,13 @@ print("squares:", table.concat(sq, " "))
       'in the sandbox. Edit the C on the left and click Run: the page runs chibicc.svmb over your source ' +
       '(seeded on an fs capability at /in.c), which emits SVM IR; the page then svm_parse-es that IR into ' +
       'a module and runs it. Your program’s output (what printf writes) appears in the pane, with the ' +
-      'emitted SVM IR below it, and main()’s return value as the result. A small libc ships as headers ' +
-      '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h> and printf/puts/malloc/' +
-      'str* work as guest C over the powerbox’s ambient write, including %f/%e/%g float formatting ' +
-      '(correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
-      'exact-tie roundings can differ from glibc). Compile a program and run it, entirely in the browser, on the SVM.',
+      'emitted SVM IR below it, and main()’s return value as the result. A libc ships as headers ' +
+      '(seeded under /include) — #include <stdio.h>/<string.h>/<stdlib.h>/<ctype.h>/<math.h>/<assert.h>/' +
+      '<limits.h>/<stddef.h>/<errno.h> as guest C over the powerbox’s ambient write, including %f/%e/%g float ' +
+      'formatting (correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
+      'exact-tie roundings can differ from glibc). Split the editor into a multi-file project with `//// file: name` ' +
+      'marker lines — the code above the first marker is /in.c, and it can #include "name" the sibling files ' +
+      '(headers or extra .c, unity-build style). Compile a program and run it, entirely in the browser, on the SVM.',
     src: `// Write C here, then click Run. printf output shows in the pane on the
 // right; the emitted SVM IR appears below it, and main()'s return is the result.
 #include <stdio.h>
@@ -777,7 +780,7 @@ int main(void) {
     kind: 'chibicc',
     debug: true,
     gOn: true, // debug info starts ON: this card is ready to Debug (the compiler emits chibicc's -g waist)
-    bp: 7, // pre-place a breakpoint on the `acc += i;` line (0-based editor line 7)
+    bp: 8, // pre-place a breakpoint on the `acc += i;` line (0-based editor line 8)
     jit: false,
     editable: true,
     lang: 'c',
@@ -786,40 +789,70 @@ int main(void) {
     desc: 'Debug a **C program at source level**, entirely in the browser. chibicc compiles this C with ' +
       '`-g` (the DEBUGGING.md §6 debug-info waist — source lines + variable names), and the DAP debugger ' +
       'runs the emitted IR on the bytecode engine: set a breakpoint in the gutter on a C line, press ' +
-      'Debug, and it stops on that C line with the C locals (i, acc) named in the Variables pane. Step / ' +
-      'Continue / reverse all work. A breakpoint is pre-placed on the `acc += i;` line. Note: the ' +
-      'debugger runs the compiled program deny-all (no powerbox), so this demo is compute-only — a ' +
-      '`printf` (which needs the ambient write capability) would trap; powerbox-backed C debugging is a ' +
-      'follow-up. Untick "debug info (-g)" to compile clean, faster IR (and disable the debugger).',
-    src: `// A compute-only C program (no printf → no powerbox needed): sum 3+2+1 = 6.
-// A breakpoint is pre-placed on "acc += i;" — press Debug and step the loop,
-// watching i and acc in the Variables pane. Click the gutter to move it.
+      'Debug, and it stops on that C line with the C locals (i, acc) named in the Variables pane. This ' +
+      'program **`printf`s** — the debugger runs it under the on-ramp **I/O powerbox**, so its output ' +
+      'streams into the stdout pane as you step, and **reverse debugging rewinds the output** (the ' +
+      'capability-input tape replays faithfully). Step / Continue / Step Back / Reverse all work; a ' +
+      'breakpoint is pre-placed on the `acc += i;` line. Untick "debug info (-g)" to compile clean, ' +
+      'faster IR (and disable the debugger).',
+    src: `// Debug a C program with printf — the debugger runs it under the I/O powerbox,
+// so its output streams into the pane and reverse rewinds it. A breakpoint is
+// pre-placed on "acc += i;": press Debug, step, watch i/acc, then Continue.
+#include <stdio.h>
+
 int main(void) {
   int acc = 0;
-  int i = 3;
-  while (i > 0) {
+  for (int i = 3; i > 0; i--) {
     acc += i;
-    i -= 1;
+    printf("i=%d, acc=%d\\n", i, acc);
   }
-  return acc;
+  printf("sum = %d\\n", acc);
+  return 0;
 }
 `,
   },
+  'chibicc compiles its own source (self-host → SVM)': {
+    kind: 'selfhost',
+    jit: true, // chibicc's _start emits to wasm; every cc1 TU (giants included) compiles in a few hundred ms
+    editable: false,
+    url: './assets/chibicc.svmb',
+    image: './assets/chibicc_selfhost.img',
+    // The tractable cc1 TUs (SELFHOST_C.md); the giants (preprocess/parse/codegen_ir) are added next.
+    tus: ['strings.c', 'hashmap.c', 'unicode.c', 'type.c', 'tokenize.c'],
+    mode: 'io',
+    desc: 'The self-host capstone (SELFHOST_C.md): **chibicc compiles its own source, in your browser.** ' +
+      'Pick one of chibicc’s own cc1 translation units — its tokenizer, parser, type system — and click ' +
+      'Run: chibicc.svmb (itself a C compiler, compiled to SVM IR through the LLVM on-ramp) compiles that ' +
+      'file in `--emit-object` mode into a linkable SVM-IR object, reading the ~96-file glibc header ' +
+      'closure `chibicc.h` pulls from an in-memory filesystem seeded into the sandbox — no server, no ' +
+      '/usr/include, all client-side. The emitted object is **byte-identical to a native chibicc build** ' +
+      '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
+      '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
+  },
   'Shell (svm-posix — write & run a script)': {
     kind: 'shell',
-    jit: false, // the shell carries Instantiator cap.calls → tree-walk interpreter, not the wasm-JIT
+    jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
     editable: true,
     lang: 'shell',
     url: './assets/shell.svmb',
+    // The shell's PATH registry: the __stage ring-filter runner (concurrent pipelines) and the `primes`
+    // external command (a separate compiled-C program the shell exec's as an op-13 §14 child).
+    cmds: [
+      { name: '__stage', url: './assets/stage_runner.svmb' },
+      { name: 'primes', url: './assets/primes.svmb' },
+      { name: 'upper', url: './assets/upper.svmb' },
+    ],
     mode: 'io',
     desc: 'A real POSIX-style shell — a command interpreter compiled by the in-tree chibicc C ' +
       'compiler onto the svm-posix personality — running client-side in the sandbox. The same shell ' +
-      'the differential test suite runs (crates/svm/tests/c_shell.rs). Type a script on the left and ' +
-      'click Run: it is fed to the shell as stdin and the output appears below. Builtins include ' +
-      'echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/uniq/ls, test/[ ], redirection ' +
-      '(> >> <), pipelines (cat f | grep x | wc), command lists (; && ||), if/then/else, and ' +
-      'globbing — all over an in-memory filesystem. (External commands and concurrent pipelines are a ' +
-      'later step.)',
+      'the differential test suite runs (crates/svm/tests/c_shell.rs), on the bytecode cooperative ' +
+      'engine. Type a script on the left and click Run: it is fed to the shell as stdin and the ' +
+      'output appears below. Builtins include echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/' +
+      'uniq/ls, test/[ ], redirection (> >> <), command lists (; && ||), if/then/else, and globbing ' +
+      '— all over an in-memory filesystem. Pipelines run as concurrent stages over shared-memory ' +
+      'rings (op 11 + SharedRegion + futex); an unknown name like `primes` (a generator) or `upper` ' +
+      '(a filter that reads stdin) is exec’d as a separate compiled-C program (op 13 §14 child) — all ' +
+      'spawned client-side in the sandbox.',
     src: `# A real shell, running in the sandbox. Type commands, then click Run.
 echo hello from the sandbox
 
@@ -827,14 +860,22 @@ echo hello from the sandbox
 NAME=world
 echo hi $NAME
 
-# a file, a pipeline, and a conditional — all in-process
-echo apple > fruits
+# primes and upper are not builtins — they are separate compiled-C programs
+# the shell exec's as sandboxed children. primes generates; upper is a filter
+# that reads its stdin.
+echo -- primes up to 30 --
+primes 30
+echo -- upper (a stdin filter) --
+echo shout this line | upper
+
+# a file, then a concurrent ring pipeline: sort and dedupe run as separate
+# stages, streaming over shared-memory rings with backpressure.
+echo banana > fruits
+echo apple >> fruits
 echo banana >> fruits
 echo cherry >> fruits
-echo -- matching lines --
-cat fruits | grep a
-echo -- line count --
-cat fruits | wc
+echo -- sorted, deduped --
+cat fruits | sort | uniq
 
 if test -f fruits; then echo fruits exists; fi
 `,
@@ -1067,29 +1108,60 @@ function moduleInterp(bytes, stdinBytes) {
   return { rv, status, stdout };
 }
 
-// Run the `svm-posix` **shell** single-shot on the interpreter: like `moduleInterp`, but through the
-// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality (+ the external-command caps)
-// and runs the module on the tree-walk interpreter, the editor text feeding the shell's stdin as the
-// script. Returns { rv, status, stdout }.
-function shellInterp(bytes, stdinBytes) {
+// Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `svm_run_shell` parses: a u32 entry
+// count, then per entry u32 name-length + UTF-8 name + u32 module-length + module bytes (all
+// little-endian). The `__stage` ring runner and every external command (`primes`, …) travel in one
+// buffer. Returns null for an empty registry (the shell then runs bare).
+function buildCmdsBlob(cmds) {
+  if (!cmds || !cmds.length) return null;
+  const enc = new TextEncoder();
+  const parts = cmds.map((c) => ({ name: enc.encode(c.name), bytes: c.bytes }));
+  let total = 4;
+  for (const p of parts) total += 4 + p.name.length + 4 + p.bytes.length;
+  const blob = new Uint8Array(total);
+  const dv = new DataView(blob.buffer);
+  let o = 0;
+  dv.setUint32(o, parts.length, true); o += 4;
+  for (const p of parts) {
+    dv.setUint32(o, p.name.length, true); o += 4;
+    blob.set(p.name, o); o += p.name.length;
+    dv.setUint32(o, p.bytes.length, true); o += 4;
+    blob.set(p.bytes, o); o += p.bytes.length;
+  }
+  return blob;
+}
+
+// Run the `svm-posix` **shell** single-shot on the bytecode cooperative engine, through the
+// `svm_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `cmdsBlob` is given)
+// the shell's PATH registry: the `__stage` ring-filter runner and any external commands. The editor
+// text feeds the shell's stdin as the script. With `__stage` registered, `cat f | sort | uniq`-style
+// pipelines take the concurrent ring path (op 11 + SharedRegion + futex); external commands (`primes`)
+// spawn as op-13 §14 children. Returns { rv, status, stdout }.
+function shellInterp(bytes, stdinBytes, cmdsBlob) {
   const p = eng.ex.svm_alloc(bytes.length);
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
   if (stdinLen) stdinP = eng.ex.svm_alloc(stdinLen);
+  let cmdsP = 0;
+  const cmdsLen = cmdsBlob ? cmdsBlob.length : 0;
+  if (cmdsLen) cmdsP = eng.ex.svm_alloc(cmdsLen);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(bytes, p);
   if (stdinP) view.set(stdinBytes, stdinP);
-  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen);
+  if (cmdsP) view.set(cmdsBlob, cmdsP);
+  const rv = eng.ex.svm_run_shell(p, bytes.length, stdinP, stdinLen, cmdsP, cmdsLen);
   const status = eng.ex.svm_status();
   const stdout = readModuleStdout();
   eng.ex.svm_dealloc(p, bytes.length);
   if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  if (cmdsP) eng.ex.svm_dealloc(cmdsP, cmdsLen);
   return { rv, status, stdout };
 }
 
-// A card's Run for the shell: fetch the module, feed the editor's script as stdin, run it, show the
-// captured stdout. The shell runs on the tree-walk interpreter (it carries Instantiator cap.calls the
-// wasm-JIT/bytecode paths don't take), so there is no JIT toggle.
+// A card's Run for the shell: fetch the module (+ its PATH registry — the __stage ring runner and any
+// external commands), feed the editor's script as stdin, run it, show the captured stdout. The shell
+// runs on the bytecode cooperative engine (the wasm-safe interpreter tier that lowers its
+// Instantiator/SharedRegion cap.calls), so there is no JIT toggle.
 async function runShell(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching shell…');
@@ -1105,6 +1177,21 @@ async function runShell(c) {
     return;
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B shell`);
+  // The PATH registry (`ex.cmds`: `[{ name, url }]`) — the `__stage` ring runner (concurrent pipelines:
+  // op 11 + SharedRegion + futex) and external commands like `primes`. Each is an optional companion
+  // asset: a fetch failure drops just that command (pipelines fall back to memfs staging; a missing
+  // external command is `not found`), so it is logged, not fatal.
+  const cmds = [];
+  for (const cmd of ex.cmds || []) {
+    try {
+      const cb = await fetchModule(cmd.url, onFetchProgress(c, baseName(cmd.url)));
+      cmds.push({ name: cmd.name, bytes: cb });
+      logTo(c, `fetched ${cmd.url}: ${cb.length}B (${cmd.name})`);
+    } catch (e) {
+      logTo(c, `command '${cmd.name}' unavailable (${e.message})`);
+    }
+  }
+  const cmdsBlob = buildCmdsBlob(cmds);
   // The editor holds the shell script — it is the shell's stdin. Ensure a trailing newline so the last
   // line runs (the read-eval loop acts on a completed line).
   let script = c.editor.getValue();
@@ -1112,7 +1199,7 @@ async function runShell(c) {
   const stdinBytes = new TextEncoder().encode(script);
   setState(c, 'running', 'running…');
   const t0 = performance.now();
-  const { rv, status, stdout } = shellInterp(bytes, stdinBytes);
+  const { rv, status, stdout } = shellInterp(bytes, stdinBytes, cmdsBlob);
   const ms = (performance.now() - t0).toFixed(0);
   c.el.stdout.textContent = stdout;
   c.el.result.textContent = `${rv}`;
@@ -1193,15 +1280,19 @@ async function runModule(c) {
 //      (`svm_run_onramp_fs`), and capture the emitted SVM-IR *text* on stdout;
 //   2. encode + run: `svm_parse` that text into a module, then run it (`moduleInterp`) — the compiled
 //      program's result is its `main` return value.
-// chibicc uses floats (the %.17g path), so it runs on the bytecode interpreter, not the integer-only
-// wasm-JIT tier — hence `jit:false` (no toggle). Header-free sources compile with an empty header
-// image; the demo corpus is return-value programs whose result is the value shown.
+// Pass 1 (running chibicc) is the slow part, so it takes the "wasm-JIT" toggle: chibicc's whole
+// `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
+// several× faster than the bytecode interpreter — with a fallback to `svm_run_onramp_fs` if the emit is
+// ever unavailable. Both tiers share the fixed powerbox + the same seeded memfs, so the emitted IR is
+// byte-identical (gated by `chibicc_jit.rs`). Header-free sources compile with an empty header image;
+// the demo corpus is return-value programs whose result is the value shown.
 async function runChibicc(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching compiler…');
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
   let compiler;
   try {
     compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
@@ -1213,25 +1304,41 @@ async function runChibicc(c) {
   const srcBytes = new TextEncoder().encode(c.editor.getValue());
   if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); return; }
 
-  // Pass 1 — compile. Alloc both buffers before writing (svm_alloc may detach linear memory), pass an
-  // empty header image (0,0), and run chibicc; its emitted IR text is on the stdout stash.
-  setState(c, 'running', 'compiling…');
+  // Pass 1 — compile. On the wasm-JIT, hand the compiler + source to `runJitCompiler` (the cdylib seeds
+  // the memfs + argv and emits `_start`); otherwise run chibicc on the bytecode interpreter. Both leave
+  // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
+  setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
-  const p = eng.ex.svm_alloc(compiler.length);
-  const sp = eng.ex.svm_alloc(srcBytes.length);
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(compiler, p);
-  view.set(srcBytes, sp);
   // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `svm_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
-  eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
-  const cstatus = eng.ex.svm_status();
+  let cstatus, tier = 'interpreter';
+  if (useJit) {
+    try {
+      // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
+      cstatus = undefined;
+    }
+  }
+  if (cstatus === undefined) {
+    // Alloc both buffers before writing (svm_alloc may detach linear memory), pass an empty header
+    // image (0,0), and run chibicc on the interpreter.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    cstatus = eng.ex.svm_status();
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(sp, srcBytes.length);
+  }
   const ir = readModuleStdout();
   const cstderr = readModuleStderr();
-  eng.ex.svm_dealloc(p, compiler.length);
-  eng.ex.svm_dealloc(sp, srcBytes.length);
   c.el.stdout.textContent = ir; // show the emitted SVM IR
-  logTo(c, `compiled: ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
+  logTo(c, `compiled (${tier}): ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
     return;
@@ -1259,12 +1366,82 @@ async function runChibicc(c) {
   const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of SVM IR ${'─'.repeat(18)}\n${ir}`;
   c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
   if (r.status === 0 || r.status === 5) {
-    setState(c, 'done', `compiled & ran · returned ${r.rv} · ${ms}ms`);
+    setState(c, 'done', `compiled (${tier}) & ran · returned ${r.rv} · ${ms}ms`);
     logTo(c, `ran compiled program → ${r.rv} (status ${r.status})`);
   } else {
     setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `compiled program status ${r.status}`);
   }
+}
+
+// The **self-host** card (SELFHOST_C.md §7 step 5 — the capstone): chibicc compiles its *own* source in
+// the browser. Fetch `chibicc.svmb` + the committed closure image (its cc1 TU sources + the ~96-file
+// glibc header closure `chibicc.h` pulls, + the self-host prelude), then run `chibicc.svmb
+// --emit-object <selected TU>` over that memfs — chibicc compiling its own tokenizer / parser / codegen
+// into a linkable SVM-IR object, client-side. On the wasm-JIT every TU (giants included) compiles in a
+// few hundred ms; a bytecode fallback covers a missing emit. The emitted object IR shows in the pane.
+async function runSelfhost(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching compiler + sources…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  let compiler, image;
+  try {
+    compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    image = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`node build-selfhost-assets.mjs\` to generate the closure image`);
+    logTo(c, `fetch failed: ${e.message}`);
+    return;
+  }
+  // The chosen TU (its memfs-relative path) — the dropdown, or the first TU if the control is absent.
+  const tu = c.el.tu ? c.el.tu.value : `frontend/chibicc/${ex.tus[0]}`;
+  const tuBytes = new TextEncoder().encode(tu);
+  const short = tu.split('/').pop();
+  setState(c, 'running', `compiling ${short}…${useJit ? ' [wasm-JIT]' : ''}`);
+  const t0 = performance.now();
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  let cstatus, tier = 'interpreter';
+  if (useJit) {
+    try {
+      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);
+      cstatus = undefined;
+    }
+  }
+  if (cstatus === undefined) {
+    // Alloc all three buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const ip = eng.ex.svm_alloc(image.length);
+    const tp = eng.ex.svm_alloc(tuBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(image, ip);
+    view.set(tuBytes, tp);
+    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    cstatus = eng.ex.svm_status();
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(ip, image.length);
+    eng.ex.svm_dealloc(tp, tuBytes.length);
+  }
+  const obj = readModuleStdout();
+  const cstderr = readModuleStderr();
+  const ms = (performance.now() - t0).toFixed(0);
+  logTo(c, `self-host (${tier}): ${short} → ${obj.length}B object IR (status ${cstatus})`);
+  if ((cstatus !== 0 && cstatus !== 5) || obj.length === 0) {
+    c.el.stdout.textContent = obj;
+    setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
+    return;
+  }
+  const bar = '─'.repeat(12);
+  c.el.stdout.textContent =
+    `${bar} chibicc compiled its own ${short} → ${obj.length} B linkable SVM-IR object (${tier}) ${bar}\n${obj}`;
+  c.el.result.textContent = `${obj.length} B`;
+  setState(c, 'done', `compiled ${short} (${tier}) · ${obj.length} B object · ${ms}ms`);
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
@@ -1816,6 +1993,139 @@ async function proveModuleParity(c) {
   }
 }
 
+// The chibicc-card twin of `proveModuleParity`: run **pass 1** (chibicc compiling the editor's C) on both
+// tiers and assert the emitted SVM-IR text is byte-identical — the compiler is the run-to-completion
+// guest, its stdout is the IR. This is exactly what `chibicc_jit.rs` asserts natively.
+async function proveChibiccParity(c) {
+  if (broken) return;
+  stopReactor();
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let compiler;
+  try {
+    compiler = await fetchModule(ex.url);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  if (srcBytes.length === 0) {
+    setState(c, 'error', 'empty source');
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  // Both tiers must compile with the same `-g` setting for the IR to match (it's a byte differential).
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    // Interpreter pass 1.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const sp = eng.ex.svm_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    eng.ex.svm_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(sp, srcBytes.length);
+    const interpIr = readModuleStdout();
+    // wasm-JIT pass 1.
+    let jitIr;
+    try {
+      await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      jitIr = readModuleStdout();
+    } catch (e) {
+      setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
+      logTo(c, `parity: JIT compile failed: ${e.message}`);
+      return;
+    }
+    if (interpIr === jitIr) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical SVM IR (${jitIr.length}B)`);
+      logTo(c, `parity: ${jitIr.length}B emitted IR byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged (interp ${interpIr.length}B / jit ${jitIr.length}B IR)`);
+      logTo(c, `parity: emitted IR diverged (interp ${interpIr.length}B vs jit ${jitIr.length}B)`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
+// The self-host twin of `proveChibiccParity`: compile the selected chibicc TU to an object on both the
+// bytecode interpreter and the wasm-JIT and assert the emitted object IR is byte-identical — the same
+// interp≡JIT guarantee `chibicc_jit.rs` proves natively, now over chibicc's own source.
+async function proveSelfhostParity(c) {
+  if (broken) return;
+  stopReactor();
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let compiler, image;
+  try {
+    compiler = await fetchModule(ex.url);
+    image = await fetchModule(ex.image);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  const tu = c.el.tu ? c.el.tu.value : `frontend/chibicc/${ex.tus[0]}`;
+  const short = tu.split('/').pop();
+  const tuBytes = new TextEncoder().encode(tu);
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    // Interpreter emit-object.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const ip = eng.ex.svm_alloc(image.length);
+    const tp = eng.ex.svm_alloc(tuBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(image, ip);
+    view.set(tuBytes, tp);
+    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(ip, image.length);
+    eng.ex.svm_dealloc(tp, tuBytes.length);
+    const interpObj = readModuleStdout();
+    // wasm-JIT emit-object.
+    let jitObj;
+    try {
+      await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      jitObj = readModuleStdout();
+    } catch (e) {
+      setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
+      logTo(c, `parity: JIT self-host failed: ${e.message}`);
+      return;
+    }
+    if (interpObj === jitObj && interpObj.length > 0) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical object for ${short} (${jitObj.length}B)`);
+      logTo(c, `parity: ${short} → ${jitObj.length}B object byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged (interp ${interpObj.length}B / jit ${jitObj.length}B)`);
+      logTo(c, `parity: ${short} object diverged (interp ${interpObj.length}B vs jit ${jitObj.length}B)`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
 // ---- the DAP debugger (DEBUGGING.md): breakpoints · stepping · variables, on the bytecode engine --
 // One debug session at a time. The panel drives the `svm-dap` server (bytecode backend) through the
 // `dap.js` client over the wasm FFI: launch the SVM text, run to a breakpoint, highlight the stopped
@@ -1923,6 +2233,11 @@ function dapToggleWatch(c, name) {
 
 // Handle a resume reply: a `terminated` event ends the session; a `stopped` event pauses (show it).
 function dapHandle(c, reply) {
+  // A powerbox session (chibicc under the on-ramp I/O powerbox) streams the guest's captured stdout as
+  // `output` events. The event carries the *full* current output (it rewinds on a reverse step), so
+  // replace the pane with the latest one — the program's own output shows as you step / reverse.
+  const output = reply.events.filter((e) => e.event === 'output').pop();
+  if (output) c.el.stdout.textContent = output.body.output;
   if (reply.events.some((e) => e.event === 'terminated')) {
     endDebug(c, 'program finished');
     return;
@@ -1997,8 +2312,15 @@ async function startDebug(c) {
   dapSource = dapSourceName(programText); // breakpoints target the launched program's `debug.file`
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
+  // Clear the output pane for a chibicc session — the guest's own stdout (its `printf`s under the I/O
+  // powerbox) streams in here as it steps, rather than the compile's emitted IR.
+  if (c.ex.kind === 'chibicc') c.el.stdout.textContent = '';
   dapClient.send('initialize', {});
-  const launch = dapClient.send('launch', { programText, function: 0, args: [], engine: 'bytecode' });
+  // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
+  // output streams back as `output` events instead of trapping; a hand-written SVM card stays deny-all.
+  const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
+  if (c.ex.kind === 'chibicc') launchArgs.powerbox = 'onramp';
+  const launch = dapClient.send('launch', launchArgs);
   if (!launch.response.success) {
     endDebug(c, null);
     setState(c, 'error', 'debug launch failed — does the program parse and verify?');
@@ -2116,6 +2438,7 @@ async function runDemo(c) {
   if (ex.kind === 'reactor') return runReactor(c);
   if (ex.kind === 'pg') return runPg(c);
   if (ex.kind === 'chibicc') return runChibicc(c);
+  if (ex.kind === 'selfhost') return runSelfhost(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
@@ -2254,6 +2577,8 @@ function buildCard(name, ex) {
     section.appendChild(el('pre', 'note',
       ex.kind === 'reactor'
         ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
+        : ex.kind === 'selfhost'
+        ? `chibicc compiling its own source. Pick one of chibicc’s cc1 translation units and click Run — chibicc.svmb compiles that file to a linkable SVM-IR object, reading its ~96-file glibc header closure from the seeded in-memory filesystem, entirely in your browser. The emitted object appears below; "Prove interp ≡ JIT" recompiles it on both engines and checks they’re byte-identical.`
         : `Pre-built on-ramp module (${ex.url}). Click Run — it executes as a real C/C++ guest via svm_run_onramp; its stdout appears below.`));
   }
 
@@ -2269,6 +2594,20 @@ function buildCard(name, ex) {
     modeSel.value = ex.mode;
     const l = el('label', null, 'powerbox ');
     l.appendChild(modeSel);
+    controls.appendChild(l);
+  }
+  // The self-host card picks which of chibicc's own cc1 TUs to compile; the option value is the TU's
+  // memfs-relative path (its key in the seeded closure image), read by `runSelfhost`.
+  let tuSel = null;
+  if (ex.kind === 'selfhost') {
+    tuSel = el('select');
+    for (const tu of ex.tus || []) {
+      const o = el('option', null, tu);
+      o.value = `frontend/chibicc/${tu}`;
+      tuSel.appendChild(o);
+    }
+    const l = el('label', null, 'translation unit ');
+    l.appendChild(tuSel);
     controls.appendChild(l);
   }
   const runBtn = el('button', 'run', 'Run');
@@ -2313,9 +2652,10 @@ function buildCard(name, ex) {
   let jit = null;
   let proveBtn = null;
   if (ex.jit) {
-    // A reactor emits its per-frame tick(); a module emits the whole _start. The parity check compares
-    // the framebuffer (reactor, per frame) or the stdout (module, run-to-completion) accordingly.
-    const isModule = ex.kind === 'module';
+    // A reactor emits its per-frame tick(); a module (and the chibicc compiler) emits the whole _start.
+    // The parity check compares the framebuffer (reactor, per frame) or the stdout / emitted IR
+    // (module / chibicc, run-to-completion) accordingly.
+    const isModule = ex.kind === 'module' || ex.kind === 'chibicc' || ex.kind === 'selfhost';
     const l = el('label', 'jit-label');
     l.title = isModule
       ? 'Run the whole guest (_start) on emitted wasm (wasm-JIT tier) instead of the interpreter'
@@ -2401,7 +2741,7 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
@@ -2422,7 +2762,10 @@ function buildCard(name, ex) {
     if (t) dapSelectThread(c, Number(t.dataset.thread));
   });
   stopBtn.addEventListener('click', () => stopDemo(c));
-  if (proveBtn) proveBtn.addEventListener('click', () => (c.ex.kind === 'module' ? proveModuleParity : proveParity)(c));
+  if (proveBtn) {
+    const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'selfhost' ? proveSelfhostParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
+    proveBtn.addEventListener('click', () => prove(c));
+  }
   if (resetBtn) resetBtn.addEventListener('click', () => {
     editor.setValue(dflt);
     clearSaved(id);

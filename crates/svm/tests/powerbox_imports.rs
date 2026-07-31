@@ -13,7 +13,7 @@ use svm_run::{
 };
 
 /// Two **arbitrary-named** host-function imports — `add_seven` and `triple` — each its own handle but
-/// the same nominal interface (`HOST_FN`), distinguished object-capability-style by which slot the
+/// the same nominal interface (`HOST_PROC`), distinguished object-capability-style by which slot the
 /// call dispatches through (the handle operands are vestigial dummies; the manifest binds slot `i` ↔
 /// import `i` at instantiation). The paramless `_start` threads `5 → add_seven → triple`, and
 /// returns `(5+7)*3 = 36`.
@@ -52,11 +52,11 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     let imports = Imports::new()
         .provide(
             "add_seven",
-            HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] + 7]))),
+            HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] + 7]))),
         )
         .provide(
             "triple",
-            HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] * 3]))),
+            HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] * 3]))),
         );
 
     // Bound by name; runs interp + JIT under identical capabilities (interp == jit asserted inside).
@@ -101,7 +101,7 @@ fn module_bindings_share_one_instance() {
         // One provider, two fields: `set` is op 0, `get` is op 1 — one closure, one cell.
         let imports = Imports::new().provide_module(
             "kv",
-            HostCap::host_fn(0, || {
+            HostCap::host_proc(0, || {
                 let mut cell = 0i64;
                 Box::new(move |op, args, _mem| {
                     Ok(vec![match op {
@@ -135,7 +135,7 @@ fn unbound_name_fails_closed() {
     // Provide only one of the two imports.
     let imports = Imports::new().provide(
         "add_seven",
-        HostCap::host_fn(0, || Box::new(|_op, args, _mem| Ok(vec![args[0]]))),
+        HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0]]))),
     );
     let err = match instantiate_with_imports(module, imports) {
         Ok(_) => panic!("instantiation must fail closed when `triple` is unbound"),

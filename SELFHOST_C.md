@@ -197,14 +197,14 @@ compiler bug is a clean error, never an escape.
    **→ Step-5 slice A done 2026-07-24 — engine parity settled (the prerequisite).** `chibicc_run.rs`
    takes `SVM_CHIBICC_BACKEND`; `run_selfhost_diff.sh` runs every case on **treewalk / bytecode / jit**
    and all three emit **byte-identical IR** vs native. Engine decision for the playground card:
-   **bytecode engine (`jit: false`)**. *(Correction 2026-07-28: the browser wasm-JIT is **no longer**
-   integer-subset only — `svm-wasm-jit` gained f32/f64 support, bit-exact-differential-tested against
-   the interpreter, so the old "chibicc uses floats → can't JIT" reasoning is stale. The one scalar-float
-   op still refused is `fma`; if `chibicc.svmb` still won't whole-module-JIT it's `fma` — likely from its
-   `%.17g`/`__vm_fmt` path — or a non-float op like an un-outlined `cap.call`, not float arithmetic
-   generally. Getting chibicc onto the wasm-JIT tier is the big open speed lever — a separate slice.)*
+   **bytecode engine** originally (`jit: false`). *(Superseded 2026-07-28: chibicc now runs on the
+   **wasm-JIT** — the card's `jit: true` with the toggle default-on, falling back to bytecode only if the
+   emit is unavailable. The old "chibicc uses floats → can't JIT" reasoning was already stale — the
+   emitter gained f32/f64 — and the whole `_start` in fact emits: `compile_module_reactor` at entry 0 puts
+   333/402 funcs on wasm and bounces the rest cross-tier. See the "wasm-JIT tier DONE" block below.)*
    The playground also runs other float guests (QuickJS REPL, the DAP-debugger demos) on bytecode via the
-   per-demo `jit` flag (`browser/web/play.js`). chibicc's compiled *outputs* run on bytecode too.
+   per-demo `jit` flag (`browser/web/play.js`). chibicc's compiled *outputs* run on whichever tier their
+   card selects.
 
    **→ Step 5 DONE 2026-07-24 — the capstone runs in the browser.** The playground has a "C compiler
    (chibicc → SVM)" card (`browser/web/play.js`, `kind: 'chibicc'`): edit C → the page runs
@@ -244,10 +244,353 @@ compiler bug is a clean error, never an escape.
    ~13 unused libc functions (`puts`/`snprintf`/`fgets`/…) into every program, only `printf`'s reachable
    closure; (b) debug info is **off by default** in the guest driver (`cc1_main.c`) — the `debug.*` waist
    is ~a third of the IR, so a plain compile drops it; the playground passes `-g` only when the user opts
-   into source-level C debugging (the Debug button — DEBUGGING.md). The dominant residual cost is that chibicc runs
-   on the **bytecode interpreter** — the on-ramp's stale "integer-subset only" note (below) is wrong:
-   the browser wasm-JIT already supports f64/f32, so getting `chibicc.svmb` onto that tier (the one
-   blocker is scalar `fma`, not float arithmetic) is the big remaining lever — a separate investigation.
+   into source-level C debugging (the Debug button — DEBUGGING.md). The remaining lever was getting chibicc
+   off the bytecode interpreter and onto the wasm-JIT — done next.
+
+   **→ wasm-JIT tier DONE 2026-07-28 — chibicc compiles on emitted wasm.** The card's compile pass (the
+   slow half) now takes the **"wasm-JIT" toggle** (default on): chibicc's whole `_start` emits to wasm
+   via `compile_module_reactor(&m, /*entry*/ 0, …)` — **333/402 functions run on emitted wasm**, and the
+   ~69 reachable non-subset helpers (the `cap.call`/`call.import` wrappers `outline_cap_calls` hoists, all
+   integer-signature) **bounce cross-tier to the interpreter** over the shared window through
+   `env.call_interp`, so `fopen`/`read`/`write`/`exit` resolve against the powerbox and the seeded memfs.
+   This settles the old "chibicc uses floats → can't JIT" worry for good: `_start` **is** in-subset (floats
+   emit; the only refused scalar-float op, `fma`, isn't on chibicc's reachable path), so nothing is
+   integer-only about it. Built on the **pre-existing single-shot JIT runner** (`JitOnrampRun`, the
+   run-to-completion twin of the Doom `JitOnrampReactor`, added for Lua/SQLite): this slice added an
+   **fs+argv opener** (`open_owned_run_fs`/`open_shared_run_fs` + the `svm_onramp_jit_run_open_fs` FFI
+   export) that grants the same headless memfs powerbox the bytecode `onramp_fs_exec` does (shared
+   `chibicc_card_image` + `chibicc_card_argv`, which honours the same `-g` debug-info flag) and seeds argv
+   at `POWERBOX_ARGS_BASE`, plus the `runJitCompiler` JS driver (a sibling of `runJitModule`). **No
+   substrate / TCB change** — the emitter, the interpreter, and the powerbox are all untouched. Gated by:
+   - `browser/tests/chibicc_jit.rs` — a native `wasmi` differential (the `jit_module.rs` pattern): the
+     JIT-emitted IR is **byte-identical** to the interpreter oracle (`onramp_fs_exec`), and the emitted
+     program then parses + runs to its expected stdout.
+   - `browser-play-editor-test.mjs` — Chromium asserts the card compiles-and-runs **on the wasm-JIT**
+     in-browser (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback fails), and
+     the card's **"Prove interp ≡ JIT"** button (`proveChibiccParity`) shows byte-identical emitted IR
+     across both tiers live in the page.
+   A fallback to `svm_run_onramp_fs` (bytecode) remains if the emit is ever unavailable, so the card can
+   never regress to "won't run". Residual: chibicc's compiled *outputs* still run on whichever tier their
+   own card selects; shortest-round-trip floats and larger libc surface stay open (above).
+
+   **→ Measured on V8 (2026-07-28, `browser/bench_chibicc_jit.mjs` — the threads cdylib on Node's
+   WebAssembly, both tiers over the shipped path):** compiling a real program (a `printf` loop, a
+   `string`+`stdlib` program, a nested-loop float program — each ~330 KB of IR) drops from **~1.9–2.2 s
+   on the bytecode interpreter to ~70–80 ms on the wasm-JIT — a ~27× steady-state speedup**; even a
+   trivial return-only program is ~9× (303 ms → 33 ms). The one-time cost is a **~430 ms cold warm-up**
+   (emitting chibicc's `_start` + `WebAssembly.compile` of the ~1.2 MB emitted module) paid **once per
+   page load** — the emitted module is the same for every program (the user's C is *data* in the seeded
+   memfs, not part of the emitted code), so V8 code-caches it and every compile after the first reuses it.
+   The bench also asserts the two tiers emit **byte-identical IR** (a second guard alongside
+   `chibicc_jit.rs`), so it doubles as a perf-and-correctness regression check.
+
+   **→ Larger libc + predefined macros DONE 2026-07-28.** The seeded playground libc grew from "enough
+   for a `printf` demo" to "enough for real programs":
+   - **New headers** (`browser/playground-include/`): `<math.h>` (a demo-quality guest-C libm — exact
+     `fabs`/`floor`/`ceil`/`trunc`/`round`/`fmod`/`sqrt`, range-reduced-series `exp`/`log`/`pow`/`sin`/
+     `cos`/`atan`/…; **not** correctly-rounded, same posture as the float formatter), `<assert.h>`
+     (glibc-shape `file:line: Assertion …` → `abort`), `<limits.h>`, `<stddef.h>` (`offsetof`,
+     `ptrdiff_t`), `<errno.h>` (a guest global — nothing sets it, but programs that read/clear it build).
+   - **Additions**: `<string.h>` — `strncat`, `strspn`/`strcspn`, `strpbrk`, `strtok`, `strcasecmp`/
+     `strncasecmp`, `strdup`/`strndup`; `<stdlib.h>` — `strtoul`/`strtoll`/`strtoull`, `strtod`/`atof`,
+     `bsearch`, `div`/`ldiv`, `atoll`/`llabs`, `getenv` (→ NULL, no sandbox env); `<ctype.h>` —
+     `isgraph`/`isblank`.
+   - **Predefined macros wired** — the guest driver (`cc1_main.c`) now calls chibicc's `init_macros()`
+     before preprocessing, so `__FILE__`/`__LINE__`/`__STDC__`/`__STDC_VERSION__`/`__SIZEOF_*`/
+     `__linux__`/… are defined (real programs and `<assert.h>`'s `__FILE__`/`__LINE__` need them). Safe
+     in-sandbox: `init_macros`' only host deps — `time`/`localtime`/`ctime_r`/`stat` for `__DATE__`/
+     `__TIME__`/`__TIMESTAMP__` — are already stubbed in `chibicc_extra.c` (fixed 1970 epoch). This
+     required a **`chibicc.svmb` rebuild** (still 333 funcs, verifies, byte-identical IR across tiers).
+   Gated by `browser/tests/chibicc_libc.rs` (a real ~90-line stats pipeline over `strtok`/`strtod`/
+   `qsort`/`sqrt`/`assert`, an algebraic-math sweep, and the string/stdlib additions — compiled + run to
+   exact output) plus a `browser-play-editor-test.mjs` Chromium assertion (`<math.h>` + `<assert.h>` +
+   `strdup` → real output in-browser).
+
+   **→ Multi-file guest compile DONE 2026-07-28.** A card program can now span **multiple files**. The
+   compiler side already resolved it — chibicc-the-guest resolves quote-includes (`#include "x.h"`)
+   against the source's own directory (`/`), which the seeded memfs serves — so the only missing piece
+   was *providing* the files: the card has one editor. Added a `//// file: NAME` marker convention
+   (`split_multifile_source`, in the cdylib so both tiers + the native tests share it): the text before
+   the first marker is `/in.c`, and each marker seeds a sibling file the entry `#include`s (headers or
+   extra `.c`, unity-build style; a `NAME` with `/` nests, its parent dirs registered). No marker ⇒ a
+   single `/in.c`, unchanged — and because the card already routes the editor through
+   `chibicc_card_image`, this needed **zero JS/FFI change** and **no `chibicc.svmb` rebuild**. Gated by
+   `browser/tests/chibicc_multifile.rs` (the splitter + a real 3-file project — entry + `.h` + `.c` —
+   and a nested-dir include, compiled + run to exact output) and a `browser-play-editor-test.mjs`
+   Chromium assertion.
+
+   **→ Self-host libc + per-TU self-compile DONE 2026-07-28 — chibicc compiles its own source in the
+   sandbox.** The remaining libc-surface lift landed: the playground `<stdio.h>` gained a **real
+   buffered `FILE*`** — fd-backed *or* memory-backed — with `open_memstream`/`fopen`/`fread`/`fclose`/
+   `fflush` (one `__pg_fwrite_raw` dispatcher behind every output path), modelled on the proven guest
+   libc `chibicc_extra.c`. This is the load-bearing piece: chibicc's `format()` builds **every** string
+   through `open_memstream` → `vfprintf` → `fclose`. Plus `strtold` (= `strtod` under `-mlong-double-64`),
+   `strerror`, and the system-header stubs `chibicc.h` `#include`s — `<stdnoreturn.h>`, `<strings.h>`,
+   `<glob.h>`, `<libgen.h>`, `<unistd.h>`, `<time.h>` (fixed 1970 epoch), `<sys/stat.h>`/`<sys/types.h>`/
+   `<sys/wait.h>` (mostly inert — the sandbox has no processes/globbing/wall-clock; present so `chibicc.h`
+   parses). With those seeded, **chibicc-the-guest compiles real chibicc `-cc1` translation units to
+   valid SVM IR** — gated by `browser/tests/chibicc_selfhost.rs` (tokenize/strings/hashmap/unicode each
+   compile → parse + verify; `strings.c` is the `open_memstream` proof) + an `open_memstream` runtime
+   round-trip and a Chromium assertion.
+
+   **→ Growable guest heap DONE 2026-07-28 (§8's "grow via `__vm_map`" follow-up).** chibicc-the-guest's
+   allocator was a **fixed 24 MiB static arena** (`chibicc_extra.c`) — fine for one source file, but a
+   whole-compiler working set overran it, and because the bump allocator returns `NULL` on overflow (no
+   growth), chibicc kept building on failed allocations → **silently corrupted type nodes** (spurious
+   "not a struct", "invalid operands", traps at nondeterministic points). Fixed by **deleting** the
+   arena and chibicc's `malloc`/`realloc`: the LLVM on-ramp then synthesizes its **`vm_map`-growable**
+   heap for them (the same one Postgres uses to grow a multi-GB heap), which commits reserved-tail pages
+   on demand — an effectively unbounded heap. Side effect: with the 24 MiB arena gone, chibicc.svmb's
+   declared memory dropped from `size_log2` 25 → 21 (the arena *was* the bloat). Rebuilt trap-free (333
+   funcs, verifies); every existing test still passes, and `codegen_ir.c` (chibicc's largest TU, ~1.4 MB
+   IR) now compiles cleanly where the arena silently corrupted (gated, `#[ignore]`d as a ~70 s heavy run).
+
+   **→ Separate-compilation model (native `cc -c` + link) DONE 2026-07-29 — the multi-TU mechanism.**
+   The heap stopped being the wall; the next wall was source *organization*. chibicc's TUs are written
+   for **separate** compilation — the whole-program-per-invocation backend either can't see a cross-TU
+   callee at all, or (a naive unity amalgamation) hits file-local `static` helpers that reuse the same
+   name for different functions across TUs (e.g. `eval2` is `static` in both `parse.c` and
+   `codegen_ir.c`, with incompatible signatures). Rather than rename statics for a unity blob, we chose
+   the honest native model, which the substrate *already* supports: `svm_ir::link` (`LinkUnit` +
+   exports + relocations, proven by `dynlink.rs`) is a real static linker. So `codegen_ir` gained a
+   `--emit-object` mode (native `cc -c`): each non-`static` function is `export`ed by name, and a call
+   to a function *declared but not defined* in the TU lowers to a **function-symbol import**
+   (`call.sym "name"` carrying the callee's real SVM signature) instead of the generic capability
+   import — which `link` resolves to a direct cross-unit call. `static` stays internal per unit, so the
+   name collisions *evaporate* (no renaming). Proven end-to-end (`crates/svm/tests/c_link.rs`): two/three
+   C TUs compiled separately, linked, verified, run on interp+JIT. This generalizes — any multi-TU C
+   program to SVM now links the same way, not just chibicc.
+
+   **→ Cross-TU data + linked `_start` under the powerbox DONE 2026-07-29 — items (a) and (b)'s
+   mechanism.** `--emit-object` now emits the **data** side too: each non-`static` global is published
+   as a data symbol (`export … data`), a global's own address materializes as `data.self` and a
+   cross-TU global's as `data.sym`, and a pointer initializer (`&global`, `char *p = "…"`, `int *p =
+   &extern`) lowers to a `data.ptr … self`/`sym` relocation — so chibicc's shared `ty_int`/`ty_void`
+   (each a `Type *` → an anonymous `Type` body) link across units. Running the *linked* program through
+   `_start` needed one more link form: **`data.top`**, the post-link top-of-data the frontend emits for
+   the `_start` data-SP and argv scaffold where a whole-program build bakes `i64.const data_end` (this
+   unit's own top, wrong once the linker stacks every unit's data above it). Proven end-to-end
+   (`crates/svm/tests/c_link.rs`): crafted units read cross-TU data on interp==JIT; a two-TU program
+   runs through `_start` under the powerbox (return value + argv + stdout); and **real** chibicc source
+   — `type.c` emits its `ty_*` data symbols + 13 `data.ptr` relocations, and `type`+`hashmap`+`unicode`+
+   `strings` link and verify together.
+
+   **What remains for the whole-compiler self-compile** (chibicc compiling its *own* source into one
+   runnable module): (b′) a **self-host libc for the emit-object path** so all ~9 cc1 TUs not only link
+   but *run* — `tokenize.c` wants `strtoul` declared (a header gap, identical in `--emit-ir`), and the
+   runtime needs `malloc`/`printf`/file I/O (the LLVM-on-ramp self-host build synthesizes these; the
+   emit-object path does not yet); (c) the **bootstrap-fixpoint** differential (§5 E). The cross-TU
+   function + data linking, the `data.top` stack base, headers, and heap it all stands on are done.
+
+   **→ Emit-object libc (b′) increment 1 DONE 2026-07-29 — the *mechanism* proven.** A from-scratch
+   libc **designed for chibicc's own frontend** (`crates/svm/tests/fixtures/emit_libc/mini_libc.c`),
+   not the clang-tuned aggregator: a bump `malloc`, the `mem`/`str` family, and a **varargs** `printf`
+   that writes through the powerbox `write` cap. `demo1.c` malloc's an array, copies a string, and
+   prints a deterministic line; the two units link (`link_with_manifest`, `write` a host-bound
+   manifest import) and run through `_start` on interp==JIT with a byte-exact stdout oracle
+   (`c_link.rs::links_and_runs_emit_libc_under_powerbox`). This pins that varargs printf + heap +
+   cross-TU linking + a powerbox cap compose end-to-end through emit-object.
+
+   *Increment 1 surfaced and fixed a real linker confinement bug.* The linker stacked units' data
+   16-byte-tight, so the entry unit's read-only tail (a symbol-name string at the args-region boundary)
+   shared a **host page** with the libc unit's writable arena; the D40 read-only protection (host-page
+   granular) marked the page `PROT_READ` and the arena's first store faulted (`MemoryFault`). Fix:
+   page-align each unit's data base to `POWERBOX_STACK_ALIGN` (64 KiB, the max host page), so units
+   never share a host page and each unit's internal ro/rw page separation survives relocation
+   (`svm-ir::link_impl`; regression `svm-ir::link_layout_tests`). Same class as the Doom read-only-page
+   fault, now for stacked link units.
+
+   **→ Emit-object increment 2a DONE 2026-07-29 — all ~9 cc1 TUs compile + link + verify.** The whole
+   `-cc1` slice (eight upstream TUs + the `cc1_main.c` entry) compiles under `--emit-object` and links
+   into one **verified** module (`c_link.rs::all_cc1_tus_compile_link_and_verify_under_emit_object`).
+   Two things unblocked it:
+   - **`selfhost_prelude.h`** (`-include`d) closes chibicc's own parser gap against modern glibc: when
+     the compiler doesn't define glibc's `__REDIRECT`, `<stdlib.h>` takes its ISO C23 branch that
+     declares `__isoc23_strtoul`/… behind attribute forms chibicc doesn't resolve and then
+     `#define strtoul __isoc23_strtoul`, so `strtoul`/`strtol`/`atoi`/`strtold`/… land *implicitly
+     declared* (fatal). The prelude force-includes plain prototypes. (The on-ramp never hit this —
+     clang defines `__REDIRECT`.) Also fixed the harness's `-I`: chibicc reads `-I<dir>` **joined**
+     (`argv+2`), so a spaced `-I dir` was a silent no-op masked by sibling resolution.
+   - **The only unresolved *data* symbols across the whole cc1 are `stdin`/`stdout`/`stderr`** — a
+     cross-TU data reference must resolve to a concrete address (it can't be a manifest import like a
+     function), so the linker fails closed on them until the libc's stdio globals exist; a stub unit
+     defining the three lets the whole cc1 link. Every `ty_*`/`opt_*`/`include_paths`/`base_file`
+     resolves cross-TU. All remaining unbound names are the libc **function** surface + host caps —
+     the exact increment-2b target: `fopen`/`fwrite`/`vfprintf`/`snprintf`/the `str`/`mem` family/
+     `open_memstream`/`__ctype_b_loc`/… as guest C over the powerbox syscall + memory caps
+     (`write`/`read`/`open`/`close`/`exit`/`stat`/`vm_map`). Note the **heap allocator is *not* on that
+     list**: chibicc's emit-object synthesizes `malloc`/`calloc`/`free` **inline** (a bump heap that
+     grows the window via the `vm_map`/`vm_page_size` builtins), so the libc need not provide them —
+     a real simplification vs the clang-tuned aggregator.
+
+   **→ Emit-object increment 2b (started) — the libc's intrinsic-free core compiles.** `emit_libc.c`
+   is the emit-object twin of `chibicc_libc.c`, aggregating the parts of the guest libc that carry **no**
+   on-ramp dependency: the allocator (from chibicc's *bundled* `<stdlib.h>` — `static`
+   `malloc`/`calloc`/`free`/`realloc` growing the window via `__vm_map`, so `malloc` is never a
+   cross-unit symbol), `mem_shim`/`libc_shim` (mem/str/ctype `__ctype_b_loc`/`strtoul`), `strtod`, and
+   `chibicc_extra.c`'s fd-backed + `open_memstream` stdio — the last with its `free`/`calloc` now
+   `#ifndef __SVM_STDLIB_H`-guarded (the bundled header already defines them under emit-object; the
+   on-ramp's clang, on system headers, still gets them — verified `chibicc_libc.c` still builds under
+   clang). This core compiles under `--emit-object` and is **intrinsic-free** — regression-guarded by
+   `c_link.rs::emit_object_libc_core_compiles_and_is_intrinsic_free`, which also fails if the guard
+   regresses. It defines the real `stdin`/`stdout`/`stderr` the 2a link stubbed.
+
+   **→ Emit-object increment 2b DONE 2026-07-29 — the libc runs, and the whole cc1 links against it.**
+   The two bottom-edge shims that `os_shim.c`/`printf_shim.c` couldn't supply under emit-object (they
+   reach the host through svm-llvm intrinsics `__vm_stream_write`/`__vm_host_call`/`__vm_cap_resolve` and
+   `__vm_fmt_*` that chibicc's own `--emit-object` codegen doesn't lower — its `scan_caps` knows
+   `__vm_map`/`__vm_jit_`/… but not those) now exist:
+   - **`os_emit.c`** — the emit-object os edge. It reaches the powerbox by plain `extern` `write`/`read`
+     (bound by name to the Stream cap), not intrinsics; the fd≥3 filesystem path is stubbed (`open`
+     returns −1) until the 2c fs cap, because the reference `default_cap_resolver` binds
+     `write`/`read`/`exit`/`vm_*` but **not** `open`/`close`/`stat`, and a manifest module refuses to
+     start with an unbindable import — so a real fs name here would make the linked cc1 un-runnable.
+   - **`printf_emit.c`** — the `__vm_fmt_*`-free formatter. It reuses `printf_shim.c`'s pure-C engine
+     verbatim (the whole `%d`/`%s`/`%x`/`%ld`/`%02d`/`%.*s`/`%+ld`/`%*s` surface) and supplies the three
+     float helpers in guest C. The float path is **best-effort, not correctly-rounded** — a program with
+     float literals (chibicc emits them `%.17g`, 58 call sites, all in float-constant codegen) needs the
+     bignum dtoa ported to guest C, the float-input increment; on integer inputs it is never reached.
+
+   Proven two ways (`c_link.rs`): (1) `demo2.c` drives the printf engine — radices, width/precision,
+   flag combinations, `%*d`/`%.*s`, and the `FILE*`/`open_memstream` path — linked against the full
+   `emit_libc.c` and run through `_start` on **interp==JIT** with stdout asserted **byte-for-byte against
+   native glibc**; (2) the **whole cc1 (nine TUs + `emit_libc.c`) links and verifies with every remaining
+   import a default-powerbox cap** (`write`/`read`/`exit`/`vm_map`/`vm_page_size`) — the 2a link's
+   `fopen`/`vfprintf`/`strlen`/… manifest imports are all now supplied, and `stdin`/`stdout`/`stderr`
+   are real definitions, not the 2a stub. The `chibicc_extra.c` allocator stays `__SVM_STDLIB_H`-guarded
+   so the on-ramp `chibicc_libc.c` still builds under clang.
+
+   **→ Emit-object 2c increment 1 DONE 2026-07-29 — the linked compiler *runs* and self-hosts a
+   compile.** The whole cc1 (nine TUs + `emit_libc.c`) now runs through `_start` under the powerbox and
+   **compiles a real C program to SVM IR inside the sandbox**, proven three ways at once
+   (`c_link.rs::whole_cc1_self_compiles_a_program_matching_native_on_interp_and_jit`): the emitted IR is
+   **byte-identical on the interpreter and the JIT** (§18), it **parses** as a real module, and it is
+   **byte-identical to the native reference** (`chibicc_ref` — the same `cc1_main` entry built with
+   system clang + libc, so the guest libc + SVM engine reproduce the native frontend exactly). Source is
+   fed on **stdin** (`chibicc -` → `read_file("-")`) and IR comes back on stdout — the recognized
+   `read`/`write` powerbox builtins already serve fd 0/1, so this needs no filesystem cap.
+
+   *This surfaced and fixed a real multi-TU allocator bug.* chibicc's bundled `<stdlib.h>` keeps its bump
+   pointer in file-scope `static` state; that is self-contained in a whole-program build, but under
+   emit-object **every** cc1 TU `#include`s it and so minted its *own* `static __svm_brk` at the same
+   256 MiB heap base — the per-TU allocators handed out **overlapping** addresses and corrupted each
+   other (the guest's `hashmap` `unreachable()`d on a full-but-never-grown table). 2a/2b only linked +
+   verified, so it surfaced only on this first *run*. Fix: the four allocator-state globals
+   (`__svm_brk`/`__svm_committed`/`__svm_page`/`__svm_grow_lock`) are now **one shared instance** across
+   the linked program — `selfhost_prelude.h` sets `__SVM_LIBC_EXTERN` so each TU sees an `extern`, and
+   `emit_libc.c` sets `__SVM_LIBC_OWNER` to hold the single definition, resolved cross-TU by
+   `svm_ir::link` exactly like chibicc's shared `ty_int` (the allocator *functions* stay `static`
+   per-TU; only the bump pointer is shared). The whole-program on-ramp path is textually unchanged (the
+   `#else static` branch). Subset-link tests that omit the libc gained a tiny `alloc_state_stub()` owner.
+
+   **→ Emit-object 2c increment 2 DONE 2026-07-30 — the `#include`/filesystem path: the running
+   compiler reads a header from an in-sandbox filesystem.** The blocker was real: `gen_builtin_stream`
+   ignores fd (`write`→stdout, `read`→stdin always) and the generic host-cap lowering
+   `gen_builtin_import` is off under `--emit-object`, so an emit-object guest could not reach an fs cap
+   at all. Closed with a small **recognized-builtin** fs seam in the frontend (`codegen_ir.c`, purely
+   additive — no existing emit changes, so **no `chibicc.svmb` rebuild**):
+   - `__vm_fs(op, a, b, c, d)` → `call.sym "vm_fs"` with the **op in arg0** — one manifest slot carrying
+     the whole fs op protocol (open/read/write/seek/close/stat, `crates/svm-run/src/fs.rs`), mirroring
+     `__vm_host_call(handle, op, …)` but as a single named import the on-ramp's `__vm_cap_resolve` path
+     (unlowerable under emit-object) can't express.
+   - `__vm_stream_write`/`__vm_stream_read` → `call.sym "stream_write"/"stream_read"` (the raw fd-less
+     `Stream` primitives) — distinct names from the `write`/`read` builtins so `os_emit.c` can *define*
+     `write`/`read` as fd-dispatchers (0/1/2 → stream, ≥3 → `__vm_fs`) without recursing, exactly like
+     the on-ramp's `os_shim.c` does over its intrinsics. `open`/`close`/`lseek`/`stat` ride `__vm_fs`.
+   The harness binds the six caps by name (`c_link.rs::cc1_imports` via `instantiate_with_imports` + a
+   new `HostCap::memory(op)`): `stream_write`/`stream_read` → `Stream`, `exit` → `Exit`,
+   `vm_map`/`vm_page_size` → `Memory`, and **`vm_fs` → a seeded `mem_fs`** (a thin wrapper forwards
+   `args[0]` as the op). Gated by `whole_cc1_self_compiles…`: the linked compiler compiles a
+   `#include <vec.h>` program **reading the header from the in-sandbox memfs**, byte-identical on
+   interp==JIT and byte-identical to native `chibicc_ref` (which reads the same header from a real `-I`
+   dir). The stdout/stdin edge stays on the `Stream` cap, so the fs cap is only files (fd≥3).
+
+   **→ Emit-object 2c increment 3 DONE 2026-07-30 — the float-input dtoa: `%.17g` is correctly
+   rounded.** `printf_emit.c`'s float path was best-effort double arithmetic; a float-literal source
+   couldn't diff byte-exact because `%.17g` didn't guarantee the 17-significant-digit round-trip. Closed
+   by porting svm-llvm's `synth_dtoa_*` IR reference (`crates/svm-llvm/src/lib.rs`) to guest C: a Steele
+   & White scaled-**bignum** generator (fixed-width 32-bit-limb integers `fbig`/`fbig_*`, namespaced off
+   `strtod.c`'s own `bn`) that emits the nearest half-to-even P-significant-digit decimal with *exact*
+   integer arithmetic — no float ops in the digit loop, so the result is deterministic across
+   interp/JIT/native and `%.17g` re-parses a `double` bit-identically. `__vm_fmt_{gen,sci,fix}` are
+   rewritten around it: `%g` (strip trailing zeros, e-vs-f at exponent −4/P), `%e` (fixed fractional
+   width), `%f` (significant digits down to 10^−fp, incl. the sub-precision rounding corner). Validated
+   two ways: a native fuzz harness diffs the engine against glibc over edge cases + 200k random doubles
+   (both signs, %g/%e/%f at many precisions) — **0 mismatches / 3.2M checks** — and a new guest gate,
+   `emit_object_libc_float_runs_byte_exact_under_powerbox`, runs `demo_float.c`'s `%.17g`/`%g`/`%e`/`%f`
+   battery through the real emit-object compile on interp==JIT, byte-for-byte against glibc's own output.
+
+   **→ Stage-2 conformance slice #1 DONE 2026-07-30 — the guest compiles chibicc's *own* source,
+   byte-matching native.** The linked whole cc1 compiles a real upstream chibicc TU (`hashmap.c`) —
+   pulling chibicc.h's **full system-header closure** (~95 files: `<stdio.h>`/`<stdlib.h>`/`<string.h>`/
+   … resolved through glibc's `bits/`, `sys/`, `asm/` trees, plus chibicc's bundled `include/`) from a
+   seeded memfs — and the emitted IR is **byte-identical to native `chibicc_ref`** on interp==JIT. The
+   hardest input on the path to the fixpoint: the SVM-executed compiler is faithful not just on crafted
+   programs but on the compiler's own code. Mechanics (`whole_cc1_compiles_its_own_tu_matching_native`):
+   the closure is discovered with `chibicc -M`, seeded at **repo-relative** keys (the fs cap refuses
+   absolute paths — `read_path`); the guest searches `frontend/chibicc/include` + `usr/include[...]` in
+   the memfs while native reads the real `/usr/include`, and only the TU's own `__FILE__` reaches the IR
+   (no header paths), so the two stay byte-comparable. `cc1_main.c` gained multi-`-I` support for the
+   multi-root search.
+
+   **→ Widened 2026-07-30 — five real chibicc TUs, and `cc1_main` gained `-include`.** The differential
+   now covers `strings.c`/`hashmap.c`/`unicode.c`/`type.c`/`tokenize.c` — the **tractable** upstream TUs
+   (≤ ~800 lines; the guest runs on the tree-walk interpreter, so runtime scales with TU size, and the
+   giants `preprocess.c`/`codegen_ir.c`/`parse.c` at 1.2k–3.4k lines are left to a future slow lane).
+   `tokenize.c` surfaced the real next gap: it calls `strtoul`, whose modern-glibc ISO-C23
+   `__isoc23_*` redirect chibicc's parser can't ingest — the exact reason `emit_object_real`
+   force-includes `selfhost_prelude.h` when building the guest. `cc1_main.c` didn't support `-include`,
+   so the guest couldn't take the prelude; added it (mirroring `main.c`'s cc1() token-prepend). The
+   prelude is declarations-only ⇒ no IR of its own, and force-including it on **both** sides makes each
+   TU emit the shared-`extern` allocator form (`__SVM_LIBC_EXTERN`) the real linked build uses — still
+   byte-identical guest-vs-native. The heavy `cc1-self-compile` CI job's filter was broadened from
+   `self_compiles` to run every `--ignored` c_link gate, so this test gates too.
+
+   **→ All nine TUs 2026-07-30 — the fixpoint condition is met.** The three giants
+   (`preprocess.c`/`parse.c`/`codegen_ir.c`) also compile guest-vs-native byte-identical on interp==JIT
+   (~8 min for the three under the interpreter). They were faster than feared, but still past the per-PR
+   budget, so they ride an opt-in test (`whole_cc1_compiles_giant_tus…`, gated on `SVM_SELFHOST_GIANTS=1`)
+   run by a **nightly** `cc1-self-compile-giants` CI job (daily `schedule` + `workflow_dispatch`, like
+   `miri`); the always-on job runs it too but it self-skips fast without the env var. With the five
+   tractable TUs this is **per-TU byte-identity across all nine cc1 TUs** — which *is* the fixpoint:
+   the guest deterministically emits the same objects native does, so linking the guest's objects
+   reproduces the native-built guest (`chibicc2 == chibicc1`), and a byte-identical compiler on the same
+   source reproduces its own output (`chibicc2 == chibicc3`). ∎
+
+   **→ Mechanized 2026-07-30 — `chibicc2 == chibicc1` in code.** The `== chibicc1` step is no longer
+   just an argument: `whole_cc1_relinks_from_guest_objects_equals_native` relinks a whole cc1 from the
+   **guest's own emitted objects** — each of the nine cc1 TUs compiled by the running guest into a unit,
+   linked with the same native `emit_libc` — and asserts the result **verifies** and is byte-identical
+   to a native reference built with the *same relative flags* (the only variable is the substrate). One
+   subtlety it flushed out: `link_whole_cc1`'s units embed *absolute* `__FILE__` paths (`emit_object_real`
+   passes an absolute cfile), so the reference is rebuilt from `native_cc1_unit` (relative paths) to match
+   the memfs-relative guest — otherwise the sole diff is `internal error at %s`'s source path. Rides the
+   same opt-in `SVM_SELFHOST_GIANTS=1` nightly lane (it guest-compiles all nine, incl. the giants). With
+   this, the fixpoint is closed both ways — per-TU byte-identity **and** the linked-module equality it
+   implies.
+
+   **→ In the browser 2026-07-31 — the self-host card, slice 1 (tractable TUs).** The self-host reached
+   the **playground**: a new card, *"chibicc compiles its own source (self-host → SVM)"*
+   (`browser/web/play.js`, `kind: 'selfhost'`), runs the shipped `chibicc.svmb` in `--emit-object` mode
+   over chibicc's *own* cc1 TUs, **client-side on the wasm-JIT**, emitting each TU's linkable object. Pick
+   a TU from the dropdown → the page seeds a committed **closure image** (`chibicc_selfhost.img`: the TU
+   sources + the ~96-file glibc header closure `chibicc.h` pulls + `selfhost_prelude.h`, built by
+   `browser/build-selfhost-assets.mjs` via `chibicc -M`) on an `fs` cap and runs
+   `svm_selfhost_jit_emit_object_fs` (a 128 MiB window — `codegen_ir.c`'s ~1.2 MB output overruns the
+   single-file card's 32 MiB and traps `unreachable` mid-emit; measured) with a bytecode fallback. The
+   emitted object is **byte-identical to native `chibicc --emit-object`**, gated in real Chromium
+   (`browser-play-editor-test.mjs`: compiles `tokenize.c` in-browser, diffs the object against the native
+   binary, and the card's "Prove interp ≡ JIT" shows both tiers byte-identical), plus a native
+   `browser/tests/chibicc_selfhost_asset.rs` over all five tractable TUs.
+   - *Surfaced + fixed a real stale-asset regression:* `--emit-object` (added to `cc1_main.c` in the
+     emit-object work) was **never compiled into the shipped `chibicc.svmb`** — the committed asset
+     predated it in content, so `chibicc.svmb --emit-object` broke (the flag fell through to `base_file`).
+     The card would have been dead on arrival; rebuilding the asset (`build_chibicc_svmb.sh`, now 335
+     funcs) fixed it, and the two gates keep it from drifting again.
+   - **Slice 1 scope:** the five tractable TUs (`strings`/`hashmap`/`unicode`/`type`/`tokenize`), each
+     compiling in a few hundred ms on the wasm-JIT. Residual for slice 2: the three giants
+     (`preprocess`/`parse`/`codegen_ir` — the 128 MiB window already handles them, measured) and the
+     N-way **link → run chibicc2** capstone (the browser link FFI over the emitted objects + `emit_libc`).
 6. **(optional) stage-2 conformance** differential (§5 E).
 
 ## 8. Open questions
@@ -257,11 +600,12 @@ compiler bug is a clean error, never an escape.
   caps the in-guest story at layer 1; the encoder is small (the format is a deliberate single-pass
   design) and unlocks `vm_dlopen`. Decide when layer 2 has a consumer.
 - ~~Where the pure-libc bulk lives~~ — **settled by the step-1 audit (Appendix A): guest C**, one
-  small self-host libc translation unit compiled alongside chibicc at the `clang` step. The one
-  remaining allocator sub-question: `realloc` needs the old block size — either a personality
-  `OP_REALLOC` (host allocator owns block metadata, matching the POSIX.md split; personality
-  growth, not substrate) or a guest size-header shim over the existing `malloc` op. Decide at
-  implementation; both are small.
+  small self-host libc translation unit compiled alongside chibicc at the `clang` step. ~~The one
+  remaining allocator sub-question: `realloc` needs the old block size~~ — **settled 2026-07-28: neither
+  a personality op nor a guest shim. chibicc leaves `malloc`/`realloc` undefined and the on-ramp
+  synthesizes its `vm_map`-growable heap for them** (block metadata lives in the synth allocator's
+  own header, so its synth `realloc` copies the right length). This also gave chibicc an unbounded,
+  reserved-tail-growing heap — see the "growable guest heap" as-built in §7.
 - ~~`-g` cost in the guest: always emit debug info, or a flag?~~ **Settled 2026-07-28: a flag, off by
   default.** The `debug.*` waist is ~a third of the emitted IR, so `cc1_main.c` defaults `opt_g` off and
   takes `-g` to turn it on; the playground passes `-g` only for a source-level debug session (the Debug
@@ -269,8 +613,9 @@ compiler bug is a clean error, never an escape.
 
 ## 9. Non-goals
 
-- A general POSIX C toolchain (assembler, linker, `.o`/`ar`). The output is a single SVM IR module;
-  `-cc1 --emit-ir` only.
+- A general POSIX C toolchain (assembler, `.o`/`ar`, an in-guest `ld`). Multi-TU builds use
+  `--emit-object` (SVM text-IR units) linked by the host `svm_ir::link` — the SVM link model, not a
+  POSIX object/archive format. The per-TU output is still `-cc1 --emit-ir`; there is no x86/ELF path.
 - Matching GCC/Clang language breadth. chibicc's C99 + the frontend's proven coverage is the bar;
   heavy C/C++ stays on the AOT on-ramp lane (`LLVM.md`), which is not a runtime guest.
 - Making the chibicc frontend self-compile as the shipping path (§3 — LLVM-built artifact ships).

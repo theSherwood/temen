@@ -731,6 +731,7 @@ dependencies = [
 name = "svm-leng"
 version = "0.0.0"
 dependencies = [
+ "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-jit",
@@ -807,6 +808,7 @@ dependencies = [
  "svm-jit",
  "svm-opt",
  "svm-peval",
+ "svm-posix",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",

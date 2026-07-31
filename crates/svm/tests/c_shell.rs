@@ -6,7 +6,7 @@
 //! into once the fork/exec surface lands. The shell's libc calls reach the personality **by name**:
 //! `write`/`read`/`exit` are *defined* by the guest shim (shadowing chibicc's Stream/Exit builtins,
 //! S15b) and forward — fd preserved — to `__px_`-prefixed generic imports; `getcwd`/`chdir`/`getenv`
-//! are ordinary generic imports. The linker maps each name to its interface `(HOST_FN, op)`
+//! are ordinary generic imports. The linker maps each name to its interface `(HOST_PROC, op)`
 //! (`svm_ir::Resolved::Cap`, link-time symbol resolution); the guest discovers the granted handles
 //! itself via `cap.self` reflection, so there is no positional powerbox anywhere.
 //!
@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use core::ffi::c_void;
-use svm_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap};
+use svm_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap};
 use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 use svm_run::cap_thunk;
 use svm_text::parse_module as parse_module_raw;
@@ -85,6 +85,11 @@ fn c_to_ir_with(src: &str, extra: &[&str]) -> String {
 /// Compile a C source string to text IR with the `--child-entry` spawnable §14 child ABI — how an
 /// external command the shell `exec`s (STAGE1.md §5) is built.
 fn c_to_ir_child(src: &str) -> String {
+    c_to_ir_child_with(src, &[])
+}
+
+/// [`c_to_ir_child`] with extra chibicc `-cc1` flags (e.g. `--data-page 65536` for the browser fixture).
+fn c_to_ir_child_with(src: &str, extra: &[&str]) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -92,17 +97,17 @@ fn c_to_ir_child(src: &str) -> String {
     let cfile = base.with_extension("c");
     let irfile = base.with_extension("svm");
     std::fs::write(&cfile, src).unwrap();
+    let mut args: Vec<&str> = vec!["-cc1", "--emit-ir", "--child-entry"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "-cc1-input",
+        cfile.to_str().unwrap(),
+        "-cc1-output",
+        irfile.to_str().unwrap(),
+        cfile.to_str().unwrap(),
+    ]);
     let status = Command::new(chibicc())
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "--child-entry",
-            "-cc1-input",
-            cfile.to_str().unwrap(),
-            "-cc1-output",
-            irfile.to_str().unwrap(),
-            cfile.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()
         .expect("run chibicc");
     assert!(status.success(), "chibicc --child-entry failed on:\n{src}");
@@ -121,7 +126,7 @@ fn grant_hooks() -> GrantChildHooks {
 
 /// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
-/// through [`svm_posix::resolve`] to `(HOST_FN, op)`; `__spawn`/`__join` are the shell's own
+/// through [`svm_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
 /// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `cap.call`
 /// dispatches on the guest's own handle operand, discovered at run time via
 /// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
@@ -241,11 +246,18 @@ fn run_shell_ex(
         host.set_region_factory(svm_run::new_shared_region);
         let sink = host.shared_stdout();
         let out_h = host.grant_stream(StreamRole::Out);
+        let (in_h, in_fifo) = host.grant_input_pipe();
         let inst_h = host.grant_instantiator(0, win as u64);
         let _as_h = host.grant_address_space(0, win as u64);
-        let cmd_handles: Vec<(&str, i32)> = cmd_mods
+        let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
             .iter()
-            .map(|(n, m)| (*n, host.grant_module(m)))
+            .map(|(n, m)| {
+                (
+                    *n,
+                    host.grant_module(m),
+                    m.memory.map_or(0, |mm| mm.size_log2),
+                )
+            })
             .collect();
         // The shell never `malloc`s, so the personality heap (top 64 KiB) is never touched — it just
         // stays clear of the command carve (inside `pool`, low) and the shell's stack.
@@ -253,8 +265,9 @@ fn run_shell_ex(
             svm_posix::grant(host, (win - (64 << 10)) as u64, win as u64, stdin.to_vec());
         posix.set_stdout_sink(sink);
         posix.set_exec_stdout(out_h);
-        for (n, h) in &cmd_handles {
-            posix.register_command(n, *h);
+        posix.set_exec_stdin(in_h, in_fifo);
+        for (n, h, wl) in &cmd_handles {
+            posix.register_command(n, *h, *wl);
         }
         for (k, v) in env {
             posix.set_env(k, v);
@@ -311,7 +324,88 @@ fn run_shell_ex(
         matches!(jout, JitOutcome::Returned(_) | JitOutcome::Exited(_)),
         "jit ended abnormally: {jout:?}\n--- IR ---\n{ir}"
     );
+
+    // Bytecode cooperative engine — the browser's wasm-safe entry (`posix_shell_exec` runs this exact
+    // path in the playground). External-command spawns (op 13) and concurrent ring pipelines
+    // (op 11 + `SharedRegion` + futex) run single-thread/clockless here; its output must match interp,
+    // making the differential interp==JIT==bytecode across the whole shell surface.
+    let bout = shell_bytecode_stdout(&m, &cmd_mods, win, stdin, env, files, args);
+    assert_eq!(
+        bout,
+        iposix.stdout(),
+        "bytecode (browser engine) output must match interp"
+    );
+
     (iposix.stdout(), jposix.stdout())
+}
+
+/// Run the already-built shell module on the **bytecode cooperative engine** — the browser's wasm-safe
+/// entry ([`bytecode::compile_and_run_with_host`], the same one `posix_shell_exec` drives in the
+/// playground). Unlike [`run_shell_ex`]'s interp/JIT arms (OS threads + a wall clock), this is
+/// single-thread and clockless: external-command spawns (op 13) and concurrent ring pipelines
+/// (op 11 + `SharedRegion` + futex) run cooperatively — the browser-parity path slices 1–2 unblocked,
+/// plus the op-13 child-manifest binding this slice added (a chibicc command's `write` resolves).
+/// Regions use the default software backing (`VecBacking`) — no OS shared memory, exactly as the
+/// browser gets (memfd shm is native-only). Returns the personality's captured stdout.
+#[allow(clippy::too_many_arguments)]
+fn shell_bytecode_stdout(
+    m: &svm_ir::Module,
+    cmd_mods: &[(&str, svm_ir::Module)],
+    win: usize,
+    stdin: &[u8],
+    env: &[(&str, &str)],
+    files: &[&str],
+    args: &[&str],
+) -> Vec<u8> {
+    let mut host = Host::new();
+    // NB: no `set_region_factory` — the cooperative engine uses the reference `VecBacking` (software
+    // aliasing, backing-agnostic), which is what the browser gets.
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let (in_h, in_fifo) = host.grant_input_pipe();
+    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _as_h = host.grant_address_space(0, win as u64);
+    let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
+        .iter()
+        .map(|(n, cm)| {
+            (
+                *n,
+                host.grant_module(cm),
+                cm.memory.map_or(0, |mm| mm.size_log2),
+            )
+        })
+        .collect();
+    let (_px_h, posix) = svm_posix::grant(
+        &mut host,
+        (win - (64 << 10)) as u64,
+        win as u64,
+        stdin.to_vec(),
+    );
+    posix.set_stdout_sink(sink);
+    posix.set_exec_stdout(out_h);
+    posix.set_exec_stdin(in_h, in_fifo);
+    for (n, h, wl) in &cmd_handles {
+        posix.register_command(n, *h, *wl);
+    }
+    for (k, v) in env {
+        posix.set_env(k, v);
+    }
+    for path in files {
+        posix.write_file(path, b"");
+    }
+    if !args.is_empty() {
+        posix.set_args(args);
+    }
+    let mut fuel = 200_000_000u64;
+    match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+        Some(Ok(_)) | Some(Err(Trap::Exit(_))) => {}
+        Some(Err(e)) => panic!(
+            "bytecode trapped: {e:?}\n--- stdout so far ---\n{}",
+            String::from_utf8_lossy(&posix.stdout())
+        ),
+        None => panic!("bytecode engine declined the shell module (fell back to the tree-walker)"),
+    }
+    posix.stdout()
 }
 
 /// The headline milestone: a real script runs through the shell loop end to end on the personality,
@@ -348,6 +442,16 @@ const STAGE_RUNNER_MAIN: &str = include_str!("../../svm-run/demos/shell/stage_ru
 fn stage_runner_src() -> String {
     format!("{RING}\n{STAGE_RUNNER_MAIN}")
 }
+
+/// A demo **external command** (`primes N` → the primes ≤ N) — a `--child-entry` program the shell
+/// `exec`s as an op-13 child, granted only its stdout. The playground registers it on PATH; the
+/// browser fixture is built from this same source.
+const PRIMES_MAIN: &str = include_str!("../../svm-run/demos/shell/primes_main.c");
+
+/// A demo **filter** external command (`upper`) — reads stdin, uppercases, writes stdout. Unlike a
+/// generator it is also granted a `"stdin"` pipe (`exec_stdin`), so `read(0, …)` sees the shell's
+/// input. Registered on PATH in both the differential and the browser.
+const UPPER_MAIN: &str = include_str!("../../svm-run/demos/shell/upper_main.c");
 
 /// An external command: echo every `argv[i]` on its own line, return `argc` (a non-zero status that
 /// tracks the argument count, so `$?` is observable).
@@ -402,6 +506,61 @@ fn stage0_shell_external_command_status_in_control_flow() {
         "interp: `ok`(0)&&echo → yes; `say a`(2, fail)||echo → fallback; `ok`(0)||echo → skipped"
     );
     assert_eq!(jout, iout, "jit: shell output must match interp");
+}
+
+/// The demo external command the browser playground registers (`primes N`) — a `--child-entry`
+/// program that computes, not just echoes: it prints every prime ≤ N to its granted stdout. Proves
+/// a real compiled-C command spawns, runs, and streams into the shell's sink across all three
+/// engines (the `run_shell_ex` differential is interp==JIT==bytecode).
+#[test]
+fn stage0_shell_runs_external_primes() {
+    let (iout, jout) = run_shell_ex(
+        b"primes 10\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("primes", PRIMES_MAIN)],
+    );
+    assert_eq!(iout, b"2\n3\n5\n7\n", "interp: primes \u{2264} 10");
+    assert_eq!(jout, iout, "jit: primes output must match interp");
+}
+
+/// A **filter** external command that reads stdin (`upper < file`): the shell drains the `< file`
+/// redirect, hands the bytes to `exec_stdin` (a read-only pipe granted as the child's `"stdin"`), and
+/// `upper`'s `read(0, …)` uppercases them to its stdout. A separate compiled-C program consuming input
+/// — the op-13 spawn granting **two** streams (stdin + stdout). Differential interp==JIT==bytecode.
+#[test]
+fn stage0_shell_filter_reads_stdin() {
+    let (iout, jout) = run_shell_ex(
+        b"echo Hello, Shell > f\nupper < f\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("upper", UPPER_MAIN)],
+    );
+    assert_eq!(
+        iout, b"HELLO, SHELL\n",
+        "interp: `upper < f` uppercases the file"
+    );
+    assert_eq!(jout, iout, "jit: filter output must match interp");
+}
+
+/// A filter as a **pipe stage** (`echo … | upper`): the sequential pipeline points the filter's
+/// `in_fd` at the previous stage's output, which the shell drains into the granted stdin pipe.
+#[test]
+fn stage0_shell_filter_in_pipeline() {
+    let (iout, jout) = run_shell_ex(
+        b"echo racecar wow | upper\nexit\n",
+        &[],
+        &[],
+        &[],
+        &[("upper", UPPER_MAIN)],
+    );
+    assert_eq!(
+        iout, b"RACECAR WOW\n",
+        "interp: `echo … | upper` uppercases the pipe"
+    );
+    assert_eq!(jout, iout, "jit: filter pipeline output must match interp");
 }
 
 /// EOF (no trailing `exit`) cleanly ends the loop — the personality's `read(0, …)` returns `0` at the
@@ -1006,23 +1165,71 @@ fn stage0_shell_hash_comments() {
 /// because it writes into the tree and needs the chibicc build; regenerate with:
 ///   cargo test -p svm --test c_shell -- --ignored --exact gen_browser_shell_fixture
 #[test]
-#[ignore = "writes browser/tests/fixtures/shell.svmb; run explicitly to (re)generate the fixture"]
+#[ignore = "writes browser/tests/fixtures/{shell,stage_runner}.svmb; run explicitly to regenerate"]
 fn gen_browser_shell_fixture() {
-    // The **sequential** subset (`SVM_SHELL_SEQUENTIAL`): no external-command spawn, no concurrent ring
-    // pipelines — so the module carries no `Instantiator`/`SharedRegion` cap.calls and compiles on the
-    // browser's bytecode engine (`compile_inst` rejects those; the tree-walk/JIT engines that run the
-    // full shell use OS threads + a wall clock, absent under wasm). `RING` is dropped with it.
-    let src = format!("#define SVM_SHELL_SEQUENTIAL 1\n{SHIM}\n{SHELL_MAIN}");
-    // `--data-page 65536`: the playground runs on a 64 KiB wasm page, so the read-only string data
-    // must share no host page with a writable global (else the shell's own write to a global faults
-    // under D40). Native chibicc defaults to 16 KiB, which is why the differential above never hit it.
-    let ir = c_to_ir_with(&src, &["--data-page", "65536"]);
+    // The **full** shell — external-command spawn (op 13) and concurrent ring pipelines (op 11 +
+    // `SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` cap.calls now
+    // compile on the browser's bytecode cooperative engine (the slices that lowered ops 13/11 + region
+    // + futex, plus op-13 child-manifest binding); the differential above proves the module runs there
+    // byte-identically to the tree-walk/JIT oracle. `posix_shell_exec` grants the `__stage` runner
+    // below so `cat f | sort | uniq`-style pipelines take the ring path in the playground.
+    let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
+    // `--data-page 65536`: the playground runs on a 64 KiB wasm host page, so the read-only string
+    // data must share no host page with a writable global (else the shell's own write to a global
+    // faults — D40 host-page RO/RW protection is enforced under wasm). Native chibicc defaults to
+    // 16 KiB, which is why the differential above never hit it. `-D SVM_STAGE_LOG2=19`: under the
+    // 64 KiB page the `__stage` runner's data sections round up so its window is 19 (512 KiB), not the
+    // native 18 — the shell must carve its ring stages to match. (External-command carves are sized
+    // per-command at run time via `exec_win`, so no `-D` is needed for them.) Verified end to end
+    // against a real Chromium run by `browser-shell-test.mjs`.
+    let ir = c_to_ir_with(&src, &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = svm_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");
     let bytes = svm_encode::encode_module(&m);
-    let out = repo_root().join("browser/tests/fixtures/shell.svmb");
-    std::fs::create_dir_all(out.parent().unwrap()).expect("create fixtures dir");
+    let dir = repo_root().join("browser/tests/fixtures");
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let out = dir.join("shell.svmb");
     std::fs::write(&out, &bytes).expect("write shell.svmb");
     eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
+
+    // The `__stage` ring-filter runner (STAGE1.md item 6) — the `--child-entry` command a ring pipeline
+    // spawns once per stage. Same 64 KiB-page data layout; its region ops are chibicc `__vm_region_*`
+    // builtins (no import manifest to link, so `c_to_ir_child`'s encode is self-contained). The browser
+    // grants it under the name `__stage`, exactly as the differential's `run_shell_ex` does.
+    // The `__stage` runner, also 64 KiB-page with `-D SVM_STAGE_LOG2=19` so its ring maps sit at the
+    // right half-window offset (256 KiB) for the 512 KiB window the 64 KiB page rounds it up to. Its
+    // declared memory (19) must equal the shell's ring carve (also 19 here) — a §14 child's carve
+    // equals its declared memory, the invariant the differential's `run_shell_ex` checks at 18.
+    let runner_ir = c_to_ir_child_with(
+        &stage_runner_src(),
+        &["--data-page", "65536", "-D", "SVM_STAGE_LOG2=19"],
+    );
+    let rraw = parse_module_raw(&runner_ir).expect("parse stage runner IR");
+    verify_module(&rraw).expect("verify stage runner");
+    assert_eq!(
+        rraw.memory.map(|mm| mm.size_log2),
+        Some(19),
+        "the 64 KiB-page __stage runner must declare memory 19 (the shell's ring-carve size); \
+         drift breaks the spawn"
+    );
+    let rbytes = svm_encode::encode_module(&rraw);
+    let rout = dir.join("stage_runner.svmb");
+    std::fs::write(&rout, &rbytes).expect("write stage_runner.svmb");
+    eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
+
+    // The demo external commands, 64 KiB-page. Each declares whatever window chibicc lands it at
+    // (`primes` 19, `upper` 18); the shell carves each spawn to that size via `exec_win`, so — unlike
+    // the ring runner — they need no fixed-size pin. `primes` is a generator (argv → stdout); `upper`
+    // is a **filter** — it reads stdin (a `< file` redirect the shell drains into its granted stdin
+    // pipe), uppercases, and writes stdout.
+    for (name, source) in [("primes", PRIMES_MAIN), ("upper", UPPER_MAIN)] {
+        let cir = c_to_ir_child_with(source, &["--data-page", "65536"]);
+        let craw = parse_module_raw(&cir).unwrap_or_else(|e| panic!("parse {name} IR: {e:?}"));
+        verify_module(&craw).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
+        let cbytes = svm_encode::encode_module(&craw);
+        let cout = dir.join(format!("{name}.svmb"));
+        std::fs::write(&cout, &cbytes).unwrap_or_else(|e| panic!("write {name}.svmb: {e:?}"));
+        eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());
+    }
 }

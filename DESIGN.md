@@ -478,6 +478,21 @@ In Phase 1 (§18) chibicc emits text, a tiny assembler produces binary; the text
 is the human/agent debugging interface throughout. Disproportionately valuable for
 an agent-driven build.
 
+**Two binary dialects, one container (wire v9; owner-approved 2026-07-30, unblocking
+an external consumer on format standardization).** A header flags byte after the
+version splits the container: the **runnable module** (`.svmb`, flag 0 — the
+untrusted-input TCB path, `decode_module`) and the **object / link unit** (`.svmo`,
+flag bit 0 — `decode_unit`, the linker's binary input). Only the object dialect
+carries the D-LINK scaffolding: the `data.ptr` relocation section, the data-export
+section, and the link-form `data.self`/`data.sym`/`data.top` opcodes.
+`decode_module` rejects the object flag **at the header**, so link scaffolding stays
+unreachable from the runtime load path — the fused decode+verify pass is unchanged;
+reserved flag bits fail closed. Both dialects are one linear pass with no fixups
+(the link forms ride inline as instructions, position-independent — the retired
+`(func,block,inst)` reloc-table shape stays retired). An object's in-band export
+tables replaced the `.syms` sidecar (retired and removed — exports ride in the
+artifact in every form); `svm-run --link` is the CLI driver.
+
 ---
 
 ## 3b. IR specification (Phase 1)  [SETTLED]
@@ -2555,11 +2570,48 @@ that keeps "no escape-TCB change" true:** trap-confinement (I1) bounds accesses 
 bound against a larger region — an escape, without touching the confinement lowering. The fix lives in the
 authority-TCB `Jit` handler: **reject any submitted module whose declared memory ≠ the parent window**
 (the host then compiles the blob with the parent's base/reserved, so I1 confines it exactly as the main
-module). The handler also rejects data segments and §12 concurrency ops inside a *submitted unit* (a
-JIT'd blob stays single-threaded; the *parent* may be multi-threaded). A per-domain **compile quota**
-(`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB only); B2
-leaves the indirect-call lowering byte-identical and only adds dynamic table population** on top of the
-intern.
+module). The handler also rejects data segments inside a *submitted unit*. A per-domain **compile
+quota** (`-ENOMEM`) bounds a looping guest. Net: **Model A adds no escape-TCB surface (authority-TCB
+only); B2 leaves the indirect-call lowering byte-identical and only adds dynamic table population** on
+top of the intern.
+
+**Concurrency in a submitted unit (renegotiated 2026-07-30).** The original MVP also rejected *all* §12
+ops in a submitted unit ("a JIT'd blob stays single-threaded"). That is now split: a submitted unit may
+host **fibers** (`cont.new`/`cont.resume`/`suspend`) — they switch stacks *within* the domain on the
+caller's thread, so a unit that runs its own scheduler to completion never parks across the synchronous
+`cap.call` it runs inside — while **threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`)
+stay rejected (a spawned vCPU would outlive the `cap.call` and collide with the serialized `Mutex<Host>`
+path). Fibers add **no escape-TCB surface**: the runtime is the same domain-shared fiber table the parent
+already uses, reached through the existing `invoke_extra` seam; the fault confinement (I1), the memory-match
+precondition, and the data-segment rejection are unchanged. Mechanics: the parent stands up its fiber
+runtime even when it uses no fibers itself (`grant_jit_fibers` → `CompiledModule::enable_fiber_hosting`,
+which builds the table/runtime/`cont.*` thunk env post-compile so a submitted unit's `cont.*` resolve
+`CURRENT_RT`); the shared `jit_resolve_and_validate` admits `cont.*` and rejects only threads/futex on both
+backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
+the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
+`fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
+`submitted_unit_threads_still_rejected_with_fiber_hosting`.
+
+**Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
+(module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
+*parent* `fn_table`; so a unit whose own body is a fiber entry (jacl's scheduler running an interpreted
+program as the root job) could not name it. Now, when a submitted unit takes its own functions' addresses,
+it is **auto-installed**: `define_extra` (JIT) / `install_unit_funcs` (interp) reserves one padding slot per
+unit function and `ref.func N` lowers to `iconst(slot[N])` — a real shared slot that resolves to the unit's
+own function through the ordinary masked dispatch. No escape-TCB change (invariant I2): only *which constant*
+`ref.func` emits, plus the existing Model-B2 `install_at` primitive; fails closed on too few reserved slots.
+The same mechanism serves `thread.spawn` entries. Pinned by
+`jit_cap::submitted_unit_fibers_over_its_own_func_agrees` (differential). Threads-in-a-submitted-unit
+remain deferred.
+
+**Powerbox hosts fibers (2026-07-30).** The CLI powerbox (`grant_powerbox_prefix`) is the maximal grant,
+so its `Jit` cap now opts into fiber hosting (`set_jit_hosts_fibers(true)`), and `powerbox_compile_run`
+calls `enable_fiber_hosting` on the top-level module after compile (idempotent when the top-level already
+uses `cont.*`). A submitted unit can therefore run its own cooperative scheduler *even when the top-level
+program uses no fibers of its own* — the concrete consumer is jacl's in-guest `[interpret …]` of concurrent
+source (spawn/await): the bridge codegens a scheduler-entry unit (arity-2, body run on a `cont.*` root fiber)
+whose funcref is a unit-own install (above), and the powerbox stands up the fiber runtime it resolves against.
+Threads/futex in the unit stay rejected; the grant only adds in-domain stack switches, no escape-TCB surface.
 
 ### Code reclaim — whole-module compaction
 

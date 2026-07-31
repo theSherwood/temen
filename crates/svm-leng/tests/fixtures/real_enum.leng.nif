@@ -1,0 +1,171 @@
+(.nif27)
+(.indexat 2952             )
+(stmts@,1,../../../tmp/en.nim
+ (type@B :Color.0.~6 .~6
+  (enum@2
+   (u 8)
+   (efld~B,1 :Red.0. 0)
+   (efld~6,1 :Green.0. 1)
+   (efld@1,1 :Blue.0. 2)))
+ (proc@5 :dollar`.Color.0.
+  (params
+   (param :e.0 . Color.0.))string.0.sysvq0asl
+  (pragmas
+   (smry callsUnknown
+    (param 0 0 reads)))
+  (stmts
+   (var@8 :result.0 . string.0.sysvq0asl .)
+   (call@8 =wasMoved.2.sysvq0asl
+    (addr result.0))
+   (case@8 e.0
+    (of~B,1
+     (ranges 0)
+     (stmts
+      (ret
+       (oconstr string.0.sysvq0asl
+        (kv bytes.0 1684361731u)
+        (kv more.0
+         (nil))))))
+    (of~6,1
+     (ranges 1)
+     (stmts
+      (ret
+       (oconstr string.0.sysvq0asl
+        (kv bytes.0 121381772740357u)
+        (kv more.0
+         (nil))))))
+    (of@1,1
+     (ranges 2)
+     (stmts
+      (ret
+       (oconstr string.0.sysvq0asl
+        (kv bytes.0 435761725956u)
+        (kv more.0
+         (nil)))))))
+   (ret@9,1 result.0)))
+ (proc@,3 :toNum.0.@5
+  (params@A
+   (param@1 :c.0 . Color.0.@3))
+  (i@C 64)
+  (pragmas
+   (smry
+    (param 0 0 reads)))
+  (stmts@2,1
+   (var :result.1 .
+    (i@A,~1 64).@A,~1)
+   (if
+    (elif@3
+     (eq@2 c.0~2 1@,~3)
+     (stmts~1,1
+      (asgn@7 result.1~7 1@2)))
+    (else
+     (stmts
+      (stmts
+       (stmts
+        (if
+         (elif@5,2
+          (eq@2 c.0~2 2@5,~5)
+          (stmts~3,1
+           (asgn@7 result.1~7 2@2)))
+         (else
+          (stmts
+           (stmts
+            (stmts
+             (stmts@2,5
+              (asgn@7 result.1~7 0@2))))))))))))
+   (ret@B,5 result.1)))
+ (proc@,B :roundtrip.0.@5
+  (params@E
+   (param@1 :c.1 . Color.0.@3))Color.0.@C
+  (pragmas
+   (smry
+    (param 0 0 reads)result 0))
+  (stmts@2,1
+   (var@4 :result.2 . Color.0.~1,~C .~1,~C)
+   (var@4 :d.0 . Color.0.@C,~1 c.1@4)
+   (asgn@7,1 result.2~7 d.0@2)
+   (ret@9,1 result.2)))
+ (gvar :`iniGuard.0. .
+  (bool).)
+ (proc :`ini.0.
+  (params).
+  (pragmas
+   (smry callsUnknown))
+  (stmts
+   (if
+    (elif `iniGuard.0.
+     (stmts
+      (ret .))))
+   (asgn `iniGuard.0.
+    (true))
+   (call `ini.0.sysvq0asl)))
+ (type :`cchar.0.
+  (pragmas
+   (importc "char")
+   (nodecl))
+  (i 8))
+ (gvar :`cmdCount.0.
+  (pragmas
+   (exportc "cmdCount"))
+  (i 32).)
+ (gvar :`cmdLine.0.
+  (pragmas
+   (exportc "cmdLine"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (gvar :`nimEnviron.0.
+  (pragmas
+   (exportc "nimEnviron"))
+  (ptr
+   (ptr
+    (c 8))).)
+ (proc :`main.0.
+  (params
+   (param :`argc.0. .
+    (i 32))
+   (param :`argv.0. .
+    (ptr
+     (ptr `cchar.0.)))
+   (param :`envp.0. .
+    (ptr
+     (ptr `cchar.0.))))
+  (i 32)
+  (pragmas
+   (exportc "main")
+   (smry callsUnknown
+    (param 0 0 reads)
+    (param 1 1 reads)
+    (param 2 2 reads)))
+  (stmts
+   (asgn `cmdCount.0. `argc.0.)
+   (asgn `cmdLine.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`argv.0.))
+   (asgn `nimEnviron.0.
+    (cast
+     (ptr
+      (ptr
+       (c 8)))`envp.0.))
+   (call `ini.0.)
+   (call nimFlushStdStreams.0.sysvq0asl)
+   (ret 0))))(.index@,1,../../../tmp/en.nim
+ (h Color.0. 67)
+ (x@D Red.0. 44)
+ (x@D Green.0. 24)
+ (x@D Blue.0. 26)
+ (x dollar`.Color.0. 27)
+ (x toNum.0. 768)
+ (x roundtrip.0. 602)
+ (h `iniGuard.0. 282)
+ (x `ini.0. 34)
+ (x `cchar.0. 194)
+ (x `cmdCount.0. 71)
+ (x `cmdLine.0. 68)
+ (x `nimEnviron.0. 84)
+ (x `main.0. 90)
+ (h `argc.0. 27)
+ (h `argv.0. 34)
+ (h `envp.0. 54))

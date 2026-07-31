@@ -77,6 +77,9 @@ pub fn build_module() -> Module {
         data: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        data_exports: Vec::new(),
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         impl_exports: Vec::new(),
         debug_info: None,
     }

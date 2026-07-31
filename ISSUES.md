@@ -21,6 +21,229 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I57 — `provision-nimony.sh` failed the `nim end-to-end` job with `fatal: destination path 'nimony' already exists and is not an empty directory` on any warm nimony cache (S4, CI break) — surfaced 2026-07-31 on PR #560, **FIXED same day** (`claude/bash-svm-viability-uqj6ts`)
+
+**Symptom.** On PR #560 (fork capstone — touches only `svm-interp`, one new `svm` test, and `FORK.md`,
+nothing in the nim path) the `nim end-to-end (real toolchain → svm)` job failed in the provisioning
+step, immediately after a cache hit restored `nimony/bin`: `scripts/ci/provision-nimony.sh` then did a
+`git clone` into `nimony/` and aborted — `fatal: destination path 'nimony' already exists and is not an
+empty directory` (exit 128). Recurred on every re-trigger (the branch cache stayed warm), confirming it
+is **deterministic on a cache hit**, not a race.
+
+**Root cause.** The `actions/cache` step caches `nimony/bin` + `~/.cache/nim` — the built output, **not**
+`nimony/.git`. So on a warm cache `nimony/` exists (from the restored `bin/`) but is not a git checkout,
+the `if [ ! -d nimony/.git ]` guard passes, and `git clone nimony` aborts on the non-empty target. Cold
+cache = `nimony/` absent = clone into empty dir succeeds; hence it only bit once the key went warm.
+
+**Fix (applied).** `provision-nimony.sh` now inits a repo in place and fetches instead of cloning:
+`mkdir -p nimony; git -C nimony init; git -C nimony remote add origin …; git -C nimony fetch
+--filter=blob:none origin` (all branches, to mirror the old clone's reachability so the pinned SHA is
+present), then the existing `git -C nimony checkout --detach "$NIMONY_REF"`. Works whether `nimony/` is
+absent (cold) or holds a restored `bin/` (warm). Editing the script also rotates the cache key
+(`hashFiles('scripts/ci/provision-nimony.sh')`), so the fix runs cold first, then warm on the new key.
+
+### I56 — `pg-reload-test.mjs` intermittently fails the `real-browser` job at `page.reload` (`Timeout 30000ms exceeded` waiting for `load`) (S4, flaky CI) — surfaced 2026-07-31 on PR #558, hardened same day
+
+**Symptom.** On PR #558 (a `browser/src/lib.rs` rename + a native-test comment + docs — nothing on the
+Postgres/reload path) the `real-browser` job failed **after** every other real-browser check passed
+(`browser-test.mjs`, `browser-jit-reactor-test.mjs`, `browser-play-editor-test.mjs`, the chibicc
+bench): `pg-reload-test.mjs` got through boot + the 41 MB IndexedDB save, then
+`page.reload: Timeout 30000ms exceeded · waiting for navigation until "load"`. Unrelated to the diff.
+
+**Root cause.** The step waited on the `load` event, which doesn't fire until **every** sub-resource
+re-settles — including the ~2.2 MB engine wasm and the ~4.3 MB `qjs_repl.svmb` asset re-fetched from
+the COOP/COEP server after a hard reload. Under CI runner load that occasionally exceeds Playwright's
+30 s default; the app itself was fine (the engine-ready gate and the persistence assertions never ran).
+
+**Hardened here.** `page.reload({ waitUntil: 'load' })` → `{ waitUntil: 'domcontentloaded', timeout:
+60_000 }`. The subsequent `waitEngine` (waits for `engine-state=ready`) plus the `SELECT 919191` /
+"restored" checks remain the real gate, so relaxing the *navigation* wait cannot mask a genuine reload
+or persistence regression — it only drops the over-strict full-`load` dependency. If it still recurs,
+the next lever is a one-shot reload retry, or serving the two big assets with a warm cache across the
+reload.
+
+### I55 — the `browser` crate is a separate workspace, so a cross-crate rename left `main` un-buildable on wasm32 for a day before any gate caught it (S3, build-gate gap) — surfaced 2026-07-31, fixed same day
+
+**Symptom.** `cargo +nightly build -Z build-std … --target wasm32-unknown-unknown` of `browser`
+(`svm-browser` lib) failed to compile on `main`: `browser/src/lib.rs` still called
+`Host::grant_host_fn` / `cap_id::HOST_FN`, both renamed to `grant_host_proc` / `HOST_PROC` by the
+mechanical-rename commit `3f7957b` ("CALLS.md increment 1"). That commit updated `svm-run`,
+`svm-interp`, `svm-posix`, and the standalone `svm-llvm`, but **not** `browser` — the two access-sink
+call sites (added by the concurrent W3-in-the-browser debug work) drifted.
+
+**Root cause — the gate gap, not the rename.** `browser/` is its **own cargo workspace**
+(`browser/Cargo.toml`), so the per-PR `build · test · fmt · clippy` job — which runs
+`cargo build/test --workspace` on the **root** workspace — never compiles it. The only lane that
+builds `svm-browser` is the **nightly `real-browser`** job (`ci.yml`), so a root-workspace rename that
+misses `browser/src` compiles green on the PR and only goes red the next night (or never, if that
+lane is quiet). A path-dependency on the renamed crate means `browser` always resolves the *new*
+source, so the break is guaranteed, not version-masked.
+
+**Fixed here** (mechanical: `grant_host_fn`→`grant_host_proc` ×2, `cap_id::HOST_FN`→`HOST_PROC`);
+verified by a full wasm32 build + the `browser-play-editor-test.mjs` real-Chromium gate (all green).
+**Gap remains (the real S3):** nothing per-PR compiles the `browser` crate. Fix sketch — add a cheap
+`cargo check -p svm-browser --target wasm32-unknown-unknown` (no `build-std` needed for a type-check)
+to the per-PR lane, or a `workspaces-in-sync` guard that greps `browser/src` for renamed symbols. Until
+then, any cross-crate rename must grep `browser/` by hand.
+
+### I54 — `c_shell::stage0_shell_ring_pipeline_status_and_early_exit` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #545
+
+**Symptom.** On PR #545 (a **`crates/svm-leng`-only** change — zero lines in `crates/svm` or the
+shell/pipeline/bytecode-engine path) the `build · test · fmt · clippy` job failed with
+`crates/svm/tests/c_shell.rs:333` — `assertion left == right failed: bytecode (browser engine)
+output must match interp`. The bytecode-engine output carried **two extra leading lines**
+(`one\nthree\n`) versus interp — i.e. a **ring-pipeline output-ordering** difference, not a wrong
+result. **Unrelated to the diff** and **flaky, not deterministic**: the test passed **3/3** locally
+back-to-back on the same commit.
+
+**Family.** Same `build · test · fmt · clippy` gate and the same scheduling-nondeterminism shape as
+I52/I53 — a ring pipeline's stage-completion interleaving is order-sensitive, and under CI load the
+bytecode (browser) engine and the interp can drain the ring in a different order, so the early-exit
+status lines and the piped stdout appear interleaved differently. Fix sketch: make the ring-pipeline
+early-exit drain deterministic (flush/join the pipeline's stages in a fixed order before reading the
+combined output), or have the test compare a set/sorted view of the lines rather than raw byte order.
+Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
+
+### I53 — `clone_caller::clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #539
+
+**Symptom.** On PR #539 (a **docs + `#[ignore]`d-test + `workflows_src` only** change — zero lines in
+`crates/svm-interp`) the `build · test · fmt · clippy` job failed with
+`crates/svm-interp/tests/clone_caller.rs:255` — `assertion left == right failed: two i64 writes
+reached the shared sink, left: 8, right: 16`. The expected single reply-write (8) was doubled (16),
+i.e. the cloned twin's reply landed twice / a dedup lost a race. **Unrelated to the diff** (the PR
+touches nothing in the svc/fiber/clone path) and **flaky, not deterministic**: the same test passed
+**6/6** locally back-to-back on the same commit.
+
+**Family.** Same crate and failure shape as I52 (`svc_serve_chain`) — the fork/serve scheduler path's
+nondeterminism under CI load. Likely the same lost-wakeup/ordering class I52 root-caused; the
+`clone_caller` twin-reply ordering wants the same fail-fast + wakeup-ordering scrutiny. Fix sketch:
+audit `clone_caller`'s out-of-band reply injection for a reply that can be delivered to both the
+original and the twin (or observed twice at the shared sink) when the two resume in the losing order.
+Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
+
+**Sighting 2026-07-31** (local, slice-8 branch `claude/interactive-embedding-review-tqgjri`): one
+failure in a full `cargo test -p svm-interp` sweep, then **6/6 passes** rerunning the suite alone on
+the same commit (a debug-path-only diff — nothing in the svc/fiber/clone path). Recurred, so it's
+climbing the "until it recurs" bar; same shape, no new information beyond load-sensitivity.
+
+**Sighting 2026-07-31 #2 + corrected root cause** (windows-latest, PR #564 — a fork slice-2 diff that
+touches only `bind_child_manifest`, *not* the `clone_caller` path, which uses `cap.self.resolve`/direct
+`cap.call`, no named imports). Same `clone_caller.rs:258` `left: 8, right: 16`. The earlier note read
+this as the reply "doubled" — that is backwards: the assert is `assert_eq!(bytes.len(), 16, …)`, so
+`left = actual = 8` (only **one** i64 write landed) and `right = expected = 16`. **The twin's write is
+missing, not doubled.** Root cause: in *this test* the forking caller **is the root** (task 0), so
+`run_with_host` returns the instant the original resumes past the fork and returns `100` — the orphan
+**twin fiber may not be scheduled to its write before the run ends**, so the sink holds only the
+original's 8 bytes. The manager-topology fork tests (`fork_manager` / `fork_import` / `c_fork`) do **not**
+flake here — a manager `join`s the guest and the scheduler drains the twin before the overall run ends,
+so all three deterministically observe 16 bytes. **Fix sketch (revised):** give this test a parent that
+outlives the twin (the manager shape), or drain ready fibers before `run_with_host` returns, rather than
+the original "dedup a double-delivered reply" guess (there is no double delivery). Still S4 — the real
+fork path is deterministic; this is a root-is-the-forker test artifact.
+
+**Sighting + corrected diagnosis 2026-07-31** (CI, PR #562 — a `svm-dap`-only diff): third
+recurrence, same assert. **The original write-up misread the assert**: in `assert_eq!(bytes.len(),
+16, …)` the failing `left: 8` is the *actual* — the shared sink held **one** reply, not a doubled
+one. This is a **lost write**, the opposite failure: one of the two forked copies (original or
+twin) didn't get its 8-byte reply into the shared stdout before the run finished. Revised
+hypothesis: the twin `fork_parked_caller` creates is **detached** — the fixture's guest joins the
+svc child but nothing joins the twin, so the twin's final `Stream` write races the root's
+run teardown; under CI load the run returns first and the write is dropped with the task. Fix
+direction accordingly: either run teardown drains still-runnable forked twins before returning
+(engine semantics — decide against FORK.md §8), or the fixture joins the twin (its handle is
+delivered to the handler) so the test stops encoding the race. The doubling/dedup sketch above is
+withdrawn.
+
+**Related manifestation 2026-07-31 — the `-EAGAIN`/`-ECHILD` serve-race in fork + wait (FORK.md
+§8.6).** The same enqueue-before-park window has a second face on the servicer side, surfaced building
+`reap` (`wait(pid)`): `svc_enqueue` makes a dispatch visible and wakes the server *before* the caller
+registers its `CapReply` waiter, so a servicer that runs `clone_caller`/`reap` can find **no parked
+caller** (`ticket_waiters` miss). `fork` already answers this with `-EAGAIN` (pid mode); `reap` must
+answer it the same way (`ReapOutcome::Retry` → `-EAGAIN`) and **not** confuse it with a genuine
+unknown-pid `-ECHILD`. The fix is guest-side and realistic: the `fork_then_wait` test retries both
+`fork` and `wait` on `-EAGAIN` (`while ((s = wait(pid)) < 0);`), which converges and makes it **stable
+0/50 under the full parallel `clone_caller` suite** where a one-shot form flaked ~1/15 with `left:
+[-10]` (a raced `wait` mis-reported `-ECHILD`, or a raced `fork` handed the parent a bogus pid). This
+is the same root class as I53 — not a new bug — and the retry idiom is the standing mitigation for the
+serve/park race on **any** handler that needs its parked caller. Fully closing it would require the
+serve protocol to register the caller's waiter before the dispatch is servable (still S4).
+
+**Sighting 2026-07-31** (CI, `build · test (windows-latest)` on PR #571 — a `svm-dap` + browser-only
+diff, nothing in the svc/fork path): `pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child`
+got `left: [I64(-11)]` (a raced `fork` handed the parent `-EAGAIN` instead of the twin's `TaskId 3`) —
+exactly the `-EAGAIN` fork-race face documented above, now on the `pid_mode` test rather than the
+retry-guarded `fork_then_wait`. Unlike `fork_then_wait`, the `pid_mode` fixture does **not** retry on
+`-EAGAIN`, so it flakes directly under Windows CI load; the standing mitigation (guest-side retry) or
+the deterministic-serve fix would cover it. Same I53 root class, unrelated to the diff.
+
+### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
+
+**Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
+`build · test (windows-latest)` were **cancelled** (not failed) after ~45 min: the single test in
+`crates/svm-interp/tests/svc_serve_chain.rs`, `a_handler_forwarding_to_another_server_completes`,
+logged "has been running for over 60 seconds" and never completed (macOS killed an orphan
+`svc_serve_chain` process at cleanup). **Intermittent and unrelated to the diff** — Windows *passed*
+this test in an earlier run of the same PR; the change touches only the debug adapter and browser
+tests, nothing in the svc/fiber path. The Linux `build · test · fmt · clippy` lane (same test) went
+green both times.
+
+**Recurrences.** Same hang on **PR #509** (`windows-latest`, run 30470197189, chibicc `--emit-object`
+cross-TU change — no serve-loop code; cancelled ~35 min) and on **PR #510** (`macos-latest`, the
+posix→LLVM-on-ramp bridge — zero lines in `crates/svm-interp`; see the I50 recurrence note). Every
+other job (Linux gate, `svm-llvm`, all wasm/differential lanes) was green in each run. Definitively a
+base-branch flake, not the PR diff, in every sighting. *(This entry absorbs a duplicate that was also
+filed as "I52" for the PR #509 sighting — the two were the same flake; consolidated 2026-07-29.)*
+
+**Family.** Same svc-handler-forwarding × park surface as **I44** (freeze-on-quiesce, fixed
+2026-07-24) and I40/I41 — a serve-chain rendezvous that can wedge under parallel-test load on the
+slower/serialized CI runners.
+
+**Where.** `crates/svm-interp/tests/svc_serve_chain.rs` (the forwarding-chain rendezvous), exercised
+through the `svm-interp` svc serve loop.
+
+**Root cause (definitive, 2026-07-29) — a lost-wakeup in the `svc.wait` re-park.** The chain is
+`root → C1.fwd → C2.leaf`. A §3.6 handler runs as a **fiber of its serving vCPU** (slice 5b), so
+`C1`'s `fwd` handler calling `leaf` **fiber-parks** and its serve loop moves on. When `C2` replies to
+that handler's ticket, `Scheduler::cap_reply_or_stash` (Fiber arm) does two things under the
+scheduler lock: `registry.wake_blocked(slot)` (marks the handler fiber `ParkedOn { woken: true }`)
+**and** `svc_wake(C1)` (re-admit `C1`'s serve loop so it re-executes `svc.wait` and re-claims the
+woken handler). The serve loop's `svc.wait` re-execution re-claims woken handlers from
+`handler_parks` **before** it decides to park — but the `Blocked::SvcWait` park handler's
+compare-and-park recheck tested **only `svc_queue.is_empty()`**, never "did one of my handler fibers
+just get woken?". So if the reply lands in the window *after* the serve loop's `handler_parks` claim
+saw the handler still-blocked and *before* the vCPU registered in `svc_waiters`, the `svc_wake` finds
+no parked consumer and is **dropped**; the vCPU then parks with a woken-but-unresumed handler and
+nothing left to wake it — `root` and both serve loops strand, and `worker_loop` sleeps on its idle
+condvar forever (hence the 45-min ceiling; the multi-worker driver has no quiescence-deadlock
+detector, unlike the deterministic explorer). Timing-sensitive, which is why it surfaced only on the
+slower/serialized macOS + Windows runners under `cargo test --workspace` load. **Reproduced on Linux**
+this review by widening that exact window with a temporary sleep — a stall-detector then fired
+deterministically (all vCPUs parked, nothing runnable, no timers).
+
+**FIX LANDED (2026-07-29) — observe the woken handler in the re-park.** The `Blocked::SvcWait` park
+handler now parks only when the queue is empty **and** none of this vCPU's `handler_parks` slots is
+already woken (`FiberRegistry::slot_woken`, a non-consuming peek). Because the reply holds the
+scheduler lock across `wake_blocked` + `svc_wake` and this recheck reads under the same lock, the two
+are serialized: either the recheck runs first and parks *before* the reply's `svc_wake` (which then
+finds it in `svc_waiters` and wakes it), or the reply runs first and the recheck observes the woken
+handler and re-admits instead of parking. The window is closed on every architecture (all
+synchronization rides the scheduler `Mutex`, not memory-ordering assumptions). Each vCPU checks only
+its own `handler_parks`, so the guard is correct for a multi-consumer domain too. The common park
+path (empty queue, no woken handler) is unchanged.
+
+**Fail-fast watchdog RETAINED (from PR #512).** The test still runs under a 60 s wall-clock watchdog
+(`run_chain_with_watchdog`), converting any *future* re-strand into a fast red instead of a 45-min
+runner burn. Defense-in-depth behind the real fix, not the fix itself.
+
+**Residual hardening (optional, not blocking).** The multi-worker `drive`/`worker_loop` still lacks a
+genuine quiescence-deadlock detector — if any *other* strand class ever arises it would hang rather
+than `ThreadFault`. The deterministic explorer already does this ("`live > 0` but quiescent: a
+join-deadlock"); generalizing it to the M:N driver (nothing runnable, no timers, no async-ring job in
+flight, every worker simultaneously idle with `live > 0` ⇒ shut down with `ThreadFault`) would make
+the watchdog redundant and cover the whole `svc_serve_chain`/`durable_concurrent_jit`/`serve.rs`
+family. Deferred: it is delicate (false-positive risk of aborting a correct run), and the specific
+bug that caused this flake is now fixed.
+
 ### I51 — bytecode `vcpu.tls` is per-`Vm`, not per-vCPU: a fiber that migrates across workers reads a stale TLS word (S3, multi-worker only) — recorded 2026-07-28 landing the JACL-in-browser `vcpu.tls` lowering
 
 **Symptom.** `vcpu.tls.get` must return the word of the vCPU *currently executing* the op
@@ -76,6 +299,7 @@ a `pages.yml` `--site` step asserts every referenced asset is actually present i
 `_site` before publish (catches a fail-soft build dropping a required asset — the I26/I42 half),
 with a `MAY_BE_ABSENT` carve-out for DOOM's externally-mirrored WAD. New cards are covered
 automatically. This closes the residual guard gap I26 named.
+
 ### I50 — CI flake: the `durable_concurrent_jit` binary fails on macOS in two modes (S4) — seen 2026-07-27, PR #455 runs 30263159591 + 30266760876
 
 **Symptom — two distinct nondeterministic modes on `build · test (macos-latest)`, same binary:**
@@ -101,6 +325,15 @@ unrelated PR. Owner-side follow-up (the durability subsystem, not a Tcl-PR conce
 thaw-time wake-ordering hole the I44 clamp doesn't cover (sibling-notify-on-thaw); Mode A is a macOS
 teardown SIGSEGV in the `durable_concurrent_jit` harness — both want a macOS-hammer repro
 (`stress-ng`-style loop over the full binary) to localize, as I44 needed the full-binary hammer.
+
+**Recurrence 2026-07-29 (PR #510, the posix→LLVM-on-ramp bridge).** `build · test (macos-latest)`
+hung in `svm-interp/tests/svc_serve_chain.rs::a_handler_forwarding_to_another_server_completes`
+("running for over 60 seconds" → job cancelled at the 45-min cap); the other 20 jobs were green
+(Linux `build · test · fmt · clippy`, `svm-llvm`, windows, all differentials). Same I44 family (a
+service-point handler forwarding — the fixed root→C1.fwd→C2.leaf deadlock's macOS scheduling twin,
+now intermittent). Definitively base-branch, not the PR: #510 touches only `svm-posix`/`svm-run`/
+`svm-llvm`/docs — **zero lines in `crates/svm-interp`**, so that test binary is byte-identical to
+main. Re-ran (expect green).
 
 ### I45 — `megabench` example's `chase`/`chase_rand`/`fnv`/`fma`/`vsum` kernels no longer parse (S4) — surfaced 2026-07-25 measuring bytecode-vs-JIT — **FIX LANDED** (PR #444)
 
@@ -439,16 +672,31 @@ diverge). Pinned by `svm/tests/revocation_errno.rs`: revoked → `-9009` on tree
 JIT (the JIT case exercising the fast path), forged → `CapFault` on all three, live-wrong-type
 → still `CapFault`.
 
-### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4)
+### I40 — an unclaimed svc reply outlives a dead caller: `svc_results` entries are never garbage-collected (S4) — **FIX LANDED 2026-07-29** (`claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Where:** a completed dispatch whose caller didn't (or can't) claim the reply parks the value in
 `Host::svc_results` keyed by ticket. If the caller died between enqueue and claim, nothing sweeps
 the entry — a long-lived serving domain accumulates orphaned tickets. Bounded by call volume, not
-by live state.
+by live state. The teardown code named it outright ("the callee's eventual reply finds no waiter and
+stashes, **harmlessly**") — harmless for correctness, but an unbounded slow leak as child callers
+come and go against a surviving server.
 
-**Fix sketch:** sweep a caller's outstanding tickets on its death/revocation (the
-death-is-revocation path already visits the waiter structures), or bound the map with an LRU/TTL.
-Small; suitable as a rider on any §3.6 residue slice.
+**FIX LANDED — drop the reply at its stash site instead of sweeping the callee.** Rather than chase
+`svc_results` (per-callee, keyed by bare ticket, with no caller attribution — nothing to sweep *by*),
+the fix records the *caller's* death and drops the reply when it arrives. A scheduler-side
+`Sched::orphan_tickets: BTreeSet<(callee_id, ticket)>` is populated wherever a caller with an
+in-flight call is reaped — `teardown_domain`'s caller sweep (the parked case, the one the old comment
+described) and the `CapReply` park gate (the rarer enqueue→park-window case) — and consumed at
+`Scheduler::cap_reply_or_stash`'s stash arm: a recorded ticket is dropped, not stashed. Tickets are
+unique per run (monotone `svc_next_ticket`), so a recorded key can **never** collide with a live
+dispatch — the fix cannot drop a live caller's reply. `orphan_tickets` is self-bounded: a callee that
+itself dies sweeps its own entries (their replies can't come), and each entry is removed the moment
+its reply lands. Scheduler-local — **no** change to the public `Host` API or the durability snapshot
+format. Scope is the tree-walker scheduler; the JIT/embedder serve loop has no cross-domain
+ticket-parked callers yet (I36 slice 3), so no orphan arises there. Pinned by
+`svm-interp` unit tests `orphan_reply_tests`: the consume invariant (dead-caller reply dropped, live
+reply stashed, cross-callee key isolation) and the populate + self-GC path (`teardown_domain` records
+a dying caller's outstanding ticket and sweeps orphans awaiting the now-dead domain).
 
 ### I35 — NOT a miscompile: a `--child-entry` `main`'s argv-relocated frame was rounded up to the next 16 KiB page and collided with a SharedRegion the program mapped there; a local array on that frame read back garbage (S3) — seen 2026-07-23, building the c_shell `__stage` ring runner — **FIX LANDED 2026-07-27** (`claude/chibicc-playground-status-7n6eh0`)
 
@@ -515,6 +763,15 @@ fails-fast into a re-run instead of pinning a runner for the 6-hour default; cac
 same job already caches) removes the fetch entirely from the steady state. **Timeouts
 applied** in `.github/workflows_src/ci.yml` (the editable mirror — owner copies over):
 apt mingw ×2 (15 min) + Playwright install (10 min); the cache half remains open.
+
+**Recurred 2026-07-28 (run 30395295933, PR #488):** the `real-browser` "Install Playwright +
+Chromium" step hit its **10-min cap** — this time the stall was the `--with-deps` **apt font
+download** (`Fetched 21.1 MB in 9min 55s (35.4 kB/s)`, a wedged Azure mirror), not the npm/CDN
+half. The timeout-minutes mitigation worked as intended (failed fast into a re-run instead of
+pinning the runner); every other job on the commit was green and the change was a pure
+`svm-interp` scheduler edit with no browser surface. Reinforces the still-open residual: **cache
+or pre-provision the apt font deps** (or split `--with-deps` off the timed step) so a slow distro
+mirror can't eat the budget. Cleared by a re-run.
 
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
@@ -1424,6 +1681,46 @@ when nothing else in the domain is runnable.
 
 ---
 
+### I49 — the **serve chain** deadlock (a handler that calls another server) — ticket-namespace collision, **FIX LANDED 2026-07-28**; grandchild serve-capture also fixed — surfaced building the §13.4 4d follow-up
+
+**What.** Three threads split out of the "nested holder" 4d follow-up (a *child* C1 holding a live
+`child_offer` cap onto a *grandchild* C2, durably frozen and re-linked on thaw):
+
+1. **FIXED — depth-2 serve-state keying.** A live-spawned nested child never stamped its own
+   `parent_task` at the op-0 `instantiate_module` spawn (the field's own destructure comment stated
+   the intent — "a spawned child stamps its own id as the grandchild's parent below" — but the
+   assignment was missing). A **grandchild** therefore defaulted to `parent_task = 0` (the root), so
+   its `FrozenChildState` keyed `(0, slot)` mismatched its `FrozenNested` `(C1, slot)` on thaw, and
+   it restored via the fresh-grant path **without its serve module** (first offer call → `EAGAIN`).
+   One line at the spawn fixes it (direct children unchanged; root id is `0`). Pinned by
+   `svm-durable/tests/serve.rs::a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_real_parent`.
+
+2. **FIXED — the serve-chain deadlock (root cause: a ticket-namespace collision).** The "handler
+   forwards to another server" observable dead-locked, and reproduces with **zero durability** (a
+   general serving-correctness bug, not thaw-specific — a front-end server delegating to a back-end
+   is the common jacl shape). Root cause: `Sched::ticket_waiters` was keyed by the **bare dispatch
+   ticket**, but tickets are per-callee-domain (each host's `svc_next_ticket` starts at 0). In
+   `root → C1.fwd → C2.leaf`, root parked on C1's ticket 0, then C1's handler parked on C2's ticket
+   0 — **overwriting root's waiter at key 0** — so when C1's handler returned, its reply to ticket 0
+   found no waiter and stashed, stranding root forever (traced: `reply … -> STASH (no waiter)`). Fix:
+   key `ticket_waiters` by `(callee domain id, ticket)`; every park/reply/teardown site threads the
+   callee domain (all teardown tickets are dispatches *to* the dying domain, so its key is in scope).
+   Pinned by `svm-interp/tests/svc_serve_chain.rs` (root → C1.fwd → C2.leaf(7) → 107; hung before,
+   passes in 0.00s after).
+
+3. **FIXED — the nested re-link generalization.** With the deadlock gone, the thaw re-link was
+   generalized from root-only to **every holder**, keyed by the `(holder task, join slot)` edge
+   (root-direct children key on `(id, slot)`, a grandchild on `(its parent-child cid, slot)`), so a
+   child C1's durable cap onto a grandchild C2 re-links on thaw. Pinned end to end by
+   `svm-durable/tests/serve.rs::a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked`:
+   freeze the three-level cap-holding subtree, thaw, seed a dispatch into the root's queue, and the
+   root drives `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails
+   with `-11`/`EAGAIN` if the nested edge is not re-linked; the test also confirms the serve chain
+   no longer hangs). Remaining from the same 4d note: the wire/child-regrant **sibling-provenance**
+   durable name (a live cap with no §14 child behind it).
+
+---
+
 ## Platform-coverage skips & caps — inventory (2026-07-08 audit)
 
 Every place the suite deliberately runs *less* on some platform to dodge the failure families
@@ -1500,3 +1797,15 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
   Miri bug); ASan lanes run `detect_leaks=0` (documented intentional leak).
 
 ---
+
+## Standalone workspaces not covered by `cargo build --workspace` (rename hazard)
+
+`browser/` (svm-browser), `bench/`, `browser/wt/`, and `fuzz/` are **separate cargo
+workspaces**, not members of the root workspace (like `crates/svm-llvm/`). A `cargo build
+--workspace` — the usual local pre-push check — does **not** compile them, so a cross-cutting
+rename that touches the `svm-interp`/`svm-run` public API (e.g. `host_fn`→`host_proc`, 2026-07-30)
+builds clean locally yet breaks the four browser-building CI jobs (wasm32/wasm64/cross-engine/
+real-browser). This has recurred 3× on the same rename. **When renaming any public `svm-interp`/
+`svm-run` symbol, also grep + build the standalone trees:** `browser`, `bench`, `browser/wt`,
+`fuzz` (`cargo build --manifest-path <tree>/Cargo.toml`). A CI job that fast-checks these on every
+PR (not only the expensive full browser build) would close the gap.

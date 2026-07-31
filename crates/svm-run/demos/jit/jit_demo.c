@@ -76,8 +76,8 @@ static long interp(Ins *prog, long a, long b) {
 
 // --- the runtime emitter: bytecode -> serialized SVM IR -------------------------------------
 // The binary layout mirrors `crates/svm-encode` (LEB128 + one-byte opcodes): magic "SVM\0" +
-// version (3), a memory descriptor, a data-segment count, a §7 import count (0 here — this unit
-// is self-contained), a function count, then per function its
+// version + flags (v9), a memory descriptor, a data-segment count, a §7 import count (0 here —
+// this unit is self-contained), a function count, then per function its
 // params/results/blocks, each block its params, instruction count, instructions, terminator.
 // Values are block-local indices (params first, then each instruction's result).
 
@@ -128,7 +128,8 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'V');
   eb(buf, 'M');
   eb(buf, 0);
-  eb(buf, 8); // format v8 (single-string import names; call.sym link form)
+  eb(buf, 9); // format v9 (v8 + the header flags byte)
+  eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
   // Memory descriptor: present, size_log2 16. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
   // program like this one at the 64 KiB default (a mismatch is a clean -22, not an escape).

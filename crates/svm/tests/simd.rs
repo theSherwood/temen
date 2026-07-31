@@ -965,6 +965,44 @@ fn diff_i8x16_and_i16x8_min_max() {
     assert_eq!(i16("min_u", 0xFFFF, 1), 1, "min_u(65535, 1)");
 }
 
+/// `i64x2.{min,max}_{s,u}`: x86/aarch64 have no native `i64` vector min/max, so the JIT synthesizes
+/// these (per-lane compare + `bitselect`). `diff1` (interp == JIT) pins that synthesis against the
+/// oracle; the cases straddle the signed/unsigned split and the `i64` extremes.
+fn i64x2_minmax(op: &str, a: i64, b: i64) -> i64 {
+    let s = format!(
+        "func (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v1: i64) {{\n\
+         \x20 v2 = i64x2.splat v0\n  v3 = i64x2.splat v1\n  v4 = i64x2.{op} v2 v3\n\
+         \x20 v5 = i64x2.extract_lane 0 v4\n  return v5\n  }}\n}}\n"
+    );
+    diff1(&s, &[Value::I64(a), Value::I64(b)])
+}
+
+#[test]
+fn diff_i64x2_min_max() {
+    for (a, b) in [
+        (3i64, 7),
+        (-5, 2),
+        (i64::MIN, i64::MAX),
+        (4, 4),
+        (-1, -100),
+        (0, -1), // signed: min=-1; unsigned: -1 is u64::MAX so min_u=0 — pins the s/u split
+    ] {
+        let (ua, ub) = (a as u64, b as u64);
+        assert_eq!(i64x2_minmax("min_s", a, b), a.min(b), "min_s {a} {b}");
+        assert_eq!(i64x2_minmax("max_s", a, b), a.max(b), "max_s {a} {b}");
+        assert_eq!(
+            i64x2_minmax("min_u", a, b),
+            ua.min(ub) as i64,
+            "min_u {a} {b}"
+        );
+        assert_eq!(
+            i64x2_minmax("max_u", a, b),
+            ua.max(ub) as i64,
+            "max_u {a} {b}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Float lane comparisons (VFloatCmp) — ordered (ne unordered) → mask.
 // ---------------------------------------------------------------------------

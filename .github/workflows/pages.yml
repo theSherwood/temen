@@ -81,6 +81,14 @@ jobs:
         working-directory: browser
         run: node build-onramp-assets.mjs
 
+      # The chibicc self-host closure image (chibicc_selfhost.img) — chibicc's own cc1 TU sources + the
+      # glibc header closure chibicc.h pulls, seeded so the "chibicc compiles its own source" card can
+      # run chibicc.svmb --emit-object over them in-browser. Builds a native chibicc for `-M` closure
+      # discovery. Fail-soft (MAY_BE_ABSENT): a build hiccup degrades the card to a build hint, no 404.
+      - name: build self-host closure image
+        working-directory: browser
+        run: node build-selfhost-assets.mjs || echo "self-host image skipped"
+
       # PostgreSQL playground artifacts — regenerated from source so they never drift from the code.
       # The two CODE-INDEPENDENT inputs (whole-program bitcode + initdb'd cluster) are cached, keyed on
       # the Postgres version + the shim/build-script sources; the CODE-COUPLED outputs
@@ -117,6 +125,15 @@ jobs:
           <body><p>Redirecting to the <a href="web/play.html">SVM playground</a>…</p></body></html>
           HTML
           echo "assembled:"; find "$SITE" -type f | sed "s|$SITE|_site|"
+
+      # Reachability gate (ISSUES.md I26/I42/I49): every asset play.js references must actually be
+      # present in the assembled site before it publishes, or the card 404s in production. The asset
+      # builds above are fail-soft (dead mirror / missing toolchain ⇒ skipped), so without this a
+      # dropped asset ships silently. MAY_BE_ABSENT (DOOM's externally-mirrored WAD) is allowed to
+      # degrade to a build-hint card; every other referenced asset missing = red, before deploy.
+      - name: verify playground assets reachable
+        working-directory: browser
+        run: node check-play-assets.mjs --site "$GITHUB_WORKSPACE/_site"
 
       - uses: actions/configure-pages@v5
         with: { enablement: true }

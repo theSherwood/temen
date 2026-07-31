@@ -216,3 +216,92 @@ fn module_child_tick_replays_deterministically() {
         "replay reproduced the granted-module child's position"
     );
 }
+
+/// A per-turn observation of the scheduled instantiate_module run: the global turn, every live task's
+/// call stack (frames as `m{module}f{func}b{block}i{inst}`, so a frame in the pushed child module reads
+/// `m1...`), and the child carve's bytes (its window starts at 64 KiB; the child stores marker 7 there).
+fn sched_full_obs(run: &mut ScheduledDebugRun) -> (u64, String, Vec<u8>) {
+    let turn = run.op_turn();
+    let mut stacks = Vec::new();
+    for tid in run.threads() {
+        run.select_task(tid);
+        let mut frames = Vec::new();
+        for d in 0..run.depth() {
+            if let Some(pc) = run.frame_pc(d) {
+                frames.push(format!(
+                    "m{}f{}b{}i{}",
+                    pc.module, pc.func, pc.block, pc.inst
+                ));
+            }
+        }
+        stacks.push(format!("{tid}=[{}]", frames.join(",")));
+    }
+    let win = run.read_window(65536, 8).unwrap_or_default();
+    (turn, stacks.join(";"), win)
+}
+
+/// Warm≡cold oracle for **§14 separate-module `instantiate_module` child** checkpointing on the multi-vCPU
+/// engine (DEBUGGING.md W1): at every turn where a checkpoint could be taken — including while the child
+/// vCPU steps *inside the pushed module's body* — a `ScheduledDebugRun::restore`d run replays forward
+/// **identically** to the trusted single from-0 run. This exercises the separate-module `DbgEnv`
+/// reconstruction: the pushed source unit is re-pushed (so a `module 1` frame resolves) and each child
+/// env's table is rebuilt over its own module index, alongside the window + powerbox + task set.
+#[test]
+fn scheduled_instantiate_module_checkpoint_snapshot_restore_round_trips() {
+    const FUEL: u64 = 5_000_000;
+
+    let mut refr = module_session();
+    let mut f = FUEL;
+    let mut ref_obs = vec![sched_full_obs(&mut refr)];
+    while refr.tick(&mut f) {
+        ref_obs.push(sched_full_obs(&mut refr));
+    }
+    let total = ref_obs.len() - 1;
+    assert_eq!(
+        refr.result().unwrap().as_ref().unwrap(),
+        &[Value::I64(WANT)]
+    );
+    assert!(
+        ref_obs.iter().any(|(_, s, _)| s.contains("m1f")),
+        "the run steps inside the pushed child module (module 1)"
+    );
+
+    let mut checkpointed_in_child = false;
+    for c in 0..=total {
+        let mut at_c = module_session();
+        let mut f = FUEL;
+        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
+        let Some(snap) = at_c.snapshot() else {
+            continue; // C is outside the checkpointable subset
+        };
+        if ref_obs[c].1.contains("m1f") {
+            checkpointed_in_child = true;
+        }
+        let mut warm = module_session();
+        warm.restore(&snap);
+        let mut i = c;
+        assert_eq!(
+            sched_full_obs(&mut warm),
+            ref_obs[i],
+            "restore at C={c} lands at reference"
+        );
+        let mut f = FUEL;
+        while warm.tick(&mut f) {
+            i += 1;
+            assert_eq!(
+                sched_full_obs(&mut warm),
+                ref_obs[i],
+                "forward replay after restore at C={c}"
+            );
+        }
+        assert_eq!(i, total, "warm run from C={c} reached the same end");
+        assert_eq!(
+            warm.result().unwrap().as_ref().unwrap(),
+            &[Value::I64(WANT)]
+        );
+    }
+    assert!(
+        checkpointed_in_child,
+        "a checkpoint was taken (and restored) while the child vCPU was inside the pushed module"
+    );
+}

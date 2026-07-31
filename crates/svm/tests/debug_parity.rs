@@ -724,6 +724,80 @@ fn stepping_parity_over_and_out_at_a_call() {
     }
 }
 
+// A caller (func 0) that calls a callee (func 1) and then IMMEDIATELY returns the result — the
+// `call` is the last non-terminator op, followed straight by the `return` terminator with no op in
+// between. Contrast `CALL_DBG`, whose caller has a `v3 = add` after the call for step_out to land on.
+const TAILCALL_DBG: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = call 1(v0)
+  return v1
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+  }
+}
+"#;
+
+/// The **legitimate, engine-agnostic** step_out outcome, pinned so it is not mistaken for a debugger
+/// regression: stepping out of a callee whose caller has *no remaining steppable op* — its only
+/// remaining action is its own `return` terminator — runs the guest to completion on **both** engines,
+/// rather than stopping "at the return line" in the caller. Block terminators (`return`/`br`) are
+/// non-stoppable positions by construction (the stop check `DebugCtx::before_op` only fires for
+/// `block.insts`, never the terminator; the bytecode engine mirrors this via `cur_ir_pc` returning
+/// `None` for a `SRC_TERM` op). So there is no op at the caller's depth to land on, and step_out —
+/// which the docstrings describe as running to completion "from the outermost frame" — does the same
+/// here for the general reason: **no caller frame has a remaining steppable op**. The two engines must
+/// agree on this (both finish with the same result), which is exactly what this pins.
+#[test]
+fn stepout_runs_to_completion_when_caller_immediately_returns() {
+    let m = parse_module(TAILCALL_DBG).expect("parse");
+    let args = [Value::I32(5)];
+    let in_callee = IrPc {
+        module: 0,
+        func: 1,
+        block: 0,
+        inst: 1,
+    }; // v2 = mul, inside the callee
+
+    // Tree-walker (reference): stop inside the callee, then step_out.
+    let mut insp = Inspector::attach(&m, 0, &args, 100_000);
+    insp.set_breakpoint(in_callee);
+    assert!(
+        matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == in_callee),
+        "tree-walker stopped inside the callee"
+    );
+    let tw_out = insp.step_out();
+    assert!(
+        matches!(&tw_out, Stop::Finished(Ok(vals)) if vals == &[Value::I32(10)]),
+        "tree-walker step_out runs to completion (no steppable op in the caller), got {tw_out:?}"
+    );
+    assert!(
+        insp.backtrace().is_empty(),
+        "the guest has finished — no frame to stop in"
+    );
+
+    // Bytecode engine: identical outcome (this is the parity claim, not a divergence).
+    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut fuel = 100_000u64;
+    assert_eq!(dbg.run_to(&[in_callee], &mut fuel), Some(in_callee));
+    assert_eq!(dbg.depth(), 2, "stopped inside the callee");
+    assert_eq!(
+        dbg.step_out(&mut fuel),
+        None,
+        "bytecode step_out reports no stop — the run finished"
+    );
+    assert_eq!(
+        dbg.result().cloned(),
+        Some(Ok(vec![Value::I32(10)])),
+        "bytecode run finished with the same result as the tree-walker"
+    );
+}
+
 // Both a window-located var `w` (at v0+0) and an SSA-located var `s` (= v2), live at the breakpoint
 // (block 0, inst 3). Exercises both VarLoc paths of the name-based reader.
 const READVAR_DBG: &str = r#"

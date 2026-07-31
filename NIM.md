@@ -187,6 +187,16 @@ drops the build-time clang/LLVM dependency and shapes SVM-IR straight from Leng,
 supported extension pattern — C/C++/LLVM-IR/arkham already coexist behind Leng, plus the
 shoggoth optimizer.
 
+> **Capstone reached 2026-07-28: whole real modules verify.** `svm-leng` translates **entire**
+> real `hexer` modules — every proc plus globals, type decls, and cross-module imports — for three
+> real Nim programs (`addTwo`+`main`, `maxi`+`sumto`, `dot2`+`idx`), each **parsing and passing
+> `svm-verify`**, and the user `main` (an intra-module call) **runs end-to-end on both engines**
+> (`crates/svm-leng/tests/whole_real_module.rs`). Driving a whole module out turned the "what's
+> left" list into a measured one — the last gaps that blocked real modules were small: `(true)`/
+> `(false)`/`(nil)` literals, `cast`, and coercing a bare-literal `ret` to the proc's result type
+> (an i32 `main` returning `0`). The remaining breadth (below) is genuinely optional for coverage,
+> not structural.
+
 **Placement decision (2026-07-28): a Rust crate `crates/svm-leng` in *this* repo** — the
 **fourth SVM frontend**, beside `svm-wasm` and `svm-llvm` (both Rust, both untrusted, both
 verifier-rechecked). Rationale: it matches the established frontend pattern, reuses
@@ -249,8 +259,147 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
   - **C-ABI struct/union/enum layout** → SVM §3d (x86-64-SysV already pinned — Leng assumes the
     same ABI, so this is a match, not a negotiation).
   - **Memory:** Leng `ptr`/`aptr`/`at`/`pat`/`dot`/`deref`/`addr` → window loads/stores +
-    `ptr.add`; every access confined by the masking lowering (INVARIANTS §2). Address-taken
-    locals move from SSA values onto a data-stack frame (the `codegen_ir.c` model).
+    `ptr.add`; every access confined by the masking lowering (INVARIANTS §2).
+    - **✅ pointer params + `deref`/`store` — DONE 2026-07-28.** Pointer-typed params/vars are
+      `i64` window offsets; `(deref p)` loads and `(asgn (deref p) v)`/`(store v p)` store, at the
+      pointee width tracked per pointer local. The module declares a `memory` window only when a
+      load/store is actually emitted. Tested store→load round-trips on both engines. (No frame
+      yet — the pointer is supplied by the caller as an offset.)
+    - **✅ address-of-local + the data-stack frame — DONE 2026-07-28.** `(addr x)` demotes a local
+      from an SSA slot to a byte offset in a per-call window frame; the proc gains a leading `$sp`
+      stack-pointer param (slot 0), reads/writes the local via `load`/`store` at `sp+off`, and a
+      call to a frame-needing proc passes `sp + frame_size` as the callee's frame. SSA and frame
+      locals coexist (only address-taken ones are framed). Tested with the real nimony loop shape
+      `inc(addr i)` (a frameless pointer helper called from a frame-needing counter) and a mixed
+      SSA-accumulator/framed-counter sum, interp == JIT. Address-taken *params* and recursion
+      depth beyond one frame are the remaining refinements.
+    - **✅ `at`/`dot`/`pat` + type layouts — DONE 2026-07-28.** Named `(type … (object …))` /
+      `(array Elem Count)` layouts are registered (with forward-ref resolution); a unified
+      `lvalue_addr` (the `codegen_ir.c` `gen_addr`) resolves `dot` (field), `at` (array element),
+      `pat` (pointer index), `deref`, and frame/aggregate symbols to `(address, type descriptor)`,
+      then a scalar leaf loads/stores. Object params are passed by address; aggregate `var`s are
+      frame-resident (default-zeroed). Tested on hand fixtures (object field set/get, array `at`,
+      pointer `pat`, a framed local array) **and real nimony object bytes** (`dot2`, `p.x*p.x+…`),
+      interp == JIT. Whole-aggregate copy/`oconstr`/`aconstr` and C-ABI (SysV) field offsets remain.
+    - **✅ whole-module: globals + multi-proc — DONE 2026-07-28.** `gvar`/`tvar` module globals live
+      at fixed window offsets (below the caller-passed stack) and are shared across calls; scalar
+      `const`s inline; `gvar`/`const`/`type` top-levels are accepted, and a module's procs are
+      emitted together so **intra-module calls** resolve by index. Tested end-to-end: a global
+      counter + `const` step + a `main → bumpN → bump` call chain, interp == JIT. Non-zero global
+      initializers fail-close (a `data`-segment init is the refinement).
+    - **✅ cross-module `call` → SVM imports — DONE 2026-07-28.** A call to a callee not defined in
+      the module becomes a declared `import N "name" (params) -> (ret)` + `call.import N`; the
+      signature is fixed from the call site (param types from the args; return arity from position —
+      a stmt-call is void, an expr-call returns a value), cached per symbol (inconsistent arity
+      fail-closes). The runtime binds the import by name at instantiation, exactly like `write`.
+      Tested: a cross-module call translates + verifies, **runs correctly on the interpreter with a
+      bound host fn** (`use_ext(x)=ext_double(x)+1`), a stmt-call declares a void import, and — the
+      payoff — **real nimony `sumto` now translates and verifies**: `while i<=n: (inc(addr i);
+      result+=i)` composes the frame (address-taken counter), `while`, and the cross-module `inc`
+      import all at once. Signature inference is call-site-based (not the `.idx` export map); wiring
+      the real export sigs (and JIT-side import binding in tests) are refinements.
+
+  **State:** `svm-leng` translates whole real-ish modules — integers, floats, control flow (incl.
+  `break`/`continue` and `block` via `jmp`/`lab`), pointers, frames, objects/arrays (incl.
+  constructors, copy, and **sret return**), **object-of-`RootObj` inheritance** (base-inlining +
+  vtable header), enum/distinct scalars, **exceptions** (nimony's error-flag ABI), **seq/string**
+  value layout + operations (as runtime imports), globals, intra- and cross-module calls —
+  fail-closed on the rest, and is validated against genuine `hexer` bytes (`addTwo`, `maxi`, `dot2`,
+  `sumto`, `classify`, `favg`, `mkSum`, `mk`, `firstHit`, `labeled`, `toNum`, `mayFail`, `guarded`,
+  `counter`, `getAt`, `sumSeq`, `makeSeq`, `kindOf`, `mkDerived`). **W1 (Leng totality) is
+  essentially closed** — what's left is genuinely runtime, not translation: dynamic method dispatch
+  and value-object exception payloads fail-close cleanly (both need the vtable/`exc`-threadvar
+  runtime), and the `jtrue`/`mflag`/`vflag` cfvar forms never reach us (hexer's `xelim` lowers them
+  away before the final IR). The remaining lever is **W3** — binding the seq/string (and other
+  stdlib) imports to a real runtime so the lowered code *runs*, not just verifies.
+    - **✅ whole-aggregate copy + `oconstr`/`aconstr` — DONE 2026-07-28.** An aggregate destination
+      (frame var, `deref`/`dot`/`at`, global) is dispatched by a non-emitting `lvalue_type` walk:
+      `(oconstr T (kv F E)*)` and `(aconstr T E*)` construct field/element-by-element in place (with
+      nested aggregates recursing), and any other rhs is a whole-aggregate `mem.copy` of the
+      source's bytes. Aggregate `var`s initialize the same way. Tested: object construct-and-read,
+      an array `aconstr`, a struct copy (`mem.copy`), and **real nimony `mkSum`** (`var p = Pt(x:a,
+      y:b); p.x+p.y`), interp == JIT.
+    - **✅ object-of-`RootObj` inheritance — DONE 2026-07-29.** An inheritable object carries a
+      leading vtable/type-header pointer (the positional slot an `(oconstr T <vtable> …)` fills), then
+      the base's fields, then its own — `resolve_type` inlines a local base's layout at the front, and
+      an external inheritable root (`RootObj`) contributes a single 8-byte header. A `Type.vt` (`Rtti`)
+      const gets a zeroed, addressable placeholder global so `(addr Type.vt)` resolves; the stored
+      vtable pointer is opaque (only *dynamic dispatch* reads through it, and that fail-closes).
+      Tested on hand fixtures (construct-and-read-back a `Derived` — base field before derived field,
+      both past the header — and a base-field read through a pointer, both engines) and **real nimony
+      `kindOf`** (reads `e.value` through a `ptr BaseError`, *runs*) + **`mkDerived`** (constructs the
+      inherited object with its vtable — translates + verifies; running needs the ARC destructor
+      imports, W3). Value-object exception payloads (an object punned into the error tuple's scalar
+      `ErrorCode` slot) stay fail-closed.
+    - **✅ seq/string (value layout + operations as imports) — DONE 2026-07-29.** nimony's `seq[T]`
+      is a `{len, data*}` fat-pointer **object** (`string` analogous), so its value layout and element
+      access already ride the object + pointer machinery — a hand-written seq summed over a
+      caller-provided buffer *runs* on both engines. Its *operations* (`add`/`[]`/`len`/`toOpenArray`/
+      `newSeq`) are stdlib procs that lower to **imports** (the **W3** runtime edge: they verify, and
+      run once bound). Getting real seq bytes to lower needed four fixes: (1) import **names** escaped
+      for svm-text (the `[]` operator mangles to `\5B\5D…`, whose bare backslash the lexer rejected);
+      (2) aggregate **args** to imports passed by address; (3) aggregate-**returning** imports (sret
+      imports, e.g. `toOpenArray`/`newSeqUninit`); (4) structured `break`/`continue` (a `for` lowers
+      to `while (true) { … else break }`). Real nimony `getAt`/`firstLen` (index/len) and
+      `sumSeq`/`makeSeq` (the full `for`-read and `add`-write paths) now **translate and verify**.
+    - **✅ non-zero global initializers — DONE 2026-07-29.** A `gvar` with a non-zero scalar-int
+      initializer becomes a module `data` segment (little-endian bytes at the global's window offset)
+      — the window is otherwise zero, so a zero initializer stays a no-op, and a non-scalar/aggregate
+      initializer fail-closes. Tested on hand fixtures (i32 + i64) and **real nimony `var counter:
+      int = 42`** with `getCounter`/`addCounter`: the data segment seeds the window so `getCounter()`
+      reads 42, interp == JIT.
+    - **✅ enum/distinct scalars — DONE 2026-07-29.** A named type is an aggregate only when it's a
+      locally-declared `(object …)`/`(array …)`; every other named type — an `(enum …)`, a `distinct`
+      int, a `proctype`, or a type external to the module — is an integer scalar (its values are
+      plain integers). `collect_types` records the aggregate names up front, so `tydesc` classifies
+      as it resolves. Also hardened `if`-condition truthiness: a wide (`i64`) condition — e.g. an
+      enum error code — reduces via `!= 0`, not an `i64→i32` wrap that would drop the high word.
+      Tested on hand fixtures and **real nimony `toNum`** (enum compares) + **`roundtrip`** (enum
+      passthrough, a scalar return, not sret).
+    - **✅ exceptions (error-flag ABI) — DONE 2026-07-29.** nimony lowers exceptions with *no new
+      node type*: a `.raises` proc returns an `(object (fld :fld.0 ErrorCode) (fld :fld.1 result))`
+      tuple by **sret** (`fld.0` the error code — an enum, hence scalar — `fld.1` the real result);
+      `raise E` is `ret (oconstr tuple (kv fld.0 <nonzero>) (kv fld.1 <default>))`; the normal return
+      sets `fld.0 = 0`; and `try/except` is `var canRaise = call; if canRaise.fld.0: jmp exlab;
+      result = canRaise.fld.1` with the handler under an `if (false) { lab exlab; … }` guard reached
+      only via the `jmp`. So it falls straight out of sret + objects + `if` + `jmp`/`lab` +
+      enum-scalar error codes — no translator change beyond the enum slice. Tested on a hand-written
+      model and **real nimony `mayFail`/`guarded`** (a `distinct`-int raiser + its `try/except`
+      caller), interp == JIT: the happy path doubles the input, the error path returns the handler's
+      -1. Exception payloads carrying `object`-of-`RootObj` inheritance (vtables) stay fail-closed.
+    - **✅ general `goto` (`jmp`/`lab`) — DONE 2026-07-28.** hexer keeps `if`/`while` structured and
+      emits the low-level jump family only for `break`/`block`-`break`: `(jmp L)` an unconditional
+      branch, `(lab :L)` a label. Both fall straight out of the block-parameter (slot-threading)
+      model — labels are pre-scanned and each assigned a block id, a `(jmp L)` is a `br` to that
+      block passing the live slot set, and a `(lab :L)` opens it (fall-through if the prior block is
+      live, else reached only by jumps). Dead statements after a `jmp` are skipped until the next
+      `lab` reopens a reachable block; forward and backward edges both work. Tested on hand fixtures
+      and **real nimony `firstHit`** (`while`+`break`) and **`labeled`** (`block done:`/`break done`
+      out of a nested loop), interp == JIT. The `jtrue`/`mflag`/`vflag` conditional-jump forms (not
+      emitted by hexer's default lowering) stay fail-closed.
+    - **✅ aggregate return (sret) — DONE 2026-07-28.** A proc whose return type is a named aggregate
+      returns `void` and takes a hidden `$sret` pointer param (after `$sp`, before the Leng params);
+      `(ret aggval)` constructs/copies the result into that pointer (composing with `oconstr`/copy).
+      A caller assigning the call to an aggregate destination (`var`/`asgn`/`ret`) hands that
+      destination's address down as `$sret` — the callee writes in place, no temporary; a scalar or
+      discarded use of an aggregate-returning call fail-closes. Aggregate call *arguments* pass by
+      address to match by-address params. Tested (both engines, incl. the window bytes the callee
+      wrote): a direct sret build, a caller→callee round-trip, return-by-copy, and **real nimony
+      `mk`/`mkSum`** — the genuine `var result; result = Pt(…); ret result` + `var p = mk(a,b)` bytes,
+      lifted out together via the new multi-proc `translate_procs`.
+    - **✅ floats — DONE 2026-07-28.** `(f 32)`/`(f 64)` types; float arithmetic
+      (`fN.add/sub/mul/div`), `neg` (`fN.neg`), and comparisons (`fN.lt/le/eq/ne`); int↔float and
+      f32↔f64 `conv`/`cast` (`convert_iN_s`/`trunc_fN_s`/`promote`/`demote`); float literals
+      (`2.0`, `1e3`) and `(inf)`/`(neginf)`/`(nan)`; float loads/stores follow from the scalar
+      type. Tested on hand fixtures and **real nimony `favg`** (`(a+b)/2.0`) + `toF` (`float(n)*1.5`),
+      interp == JIT (bit-exact).
+    - **✅ `case` → `br_table` — DONE 2026-07-28.** A dense-integer `case` (`(case Disc (of
+      (ranges V+) Body)* (else Body)?)`) lowers to a normalized `br_table`: the discriminant is
+      offset to the value span's minimum, a table entry per value maps to its covering branch, and
+      an out-of-range index (negative or over-large) selects the `else`/continuation via the table
+      default. Single values, multi-value `of`s, and `(range lo hi)` are handled; sparse/huge spans
+      (>256) fail-close (a comparison-chain lowering is the refinement). Tested on hand fixtures and
+      **real nimony `classify`** (`0 / 1,2 / 3 / else`), interp == JIT.
   - **Calls + ARC:** indirect calls; destructor/dup calls pass through as ordinary calls;
     `onerr`/`errv` → branch-on-flag.
   - **Overflow:** `keepovf`/`ovf` → SVM's trapping/checked arithmetic.
@@ -262,6 +411,353 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
 targets (Phase 1 is insulated: it only needs "nimony emits compilable C"; Phase 2 couples to
 the grammar). Effect inference (pipeline phase 3) and parts of CPS are not yet implemented
 *in nimony itself* — a limit of the source compiler, not the backend.
+
+## 3a. Self-hosting roadmap — Path 2a (no C compiler)
+
+The end state we're building toward: **nimony compiles itself on SVM with no C compiler in the
+loop.** nimony is written in Nim, and `svm-leng` is its Leng→svm-ir backend. So the loop closes
+when both the nimony compiler *and* `svm-leng` itself run as svm modules. Two sub-questions —
+"can we translate the Leng nimony emits?" and "can the translator itself run on svm?" — and Path
+2a answers the second by bootstrapping the Rust `svm-leng` onto svm the same way any Rust program
+reaches svm: **Rust → wasm → the svm-wasm on-ramp → svm-ir.** No C compiler anywhere.
+
+**Why not 2b (a Nim backend inside nimony's `lengc`, an arkham analog).** It would let nimony
+emit svm-ir directly, no separate translator. Ruled out: we have **no influence over the nimony
+repo**, so a backend living upstream is not a lever we control. `svm-leng` as an *external* Rust
+translator keeps the whole path in this tree.
+
+**The mapping is largely proven** (§3 above): integers, floats, control flow, pointers, frames,
+objects/arrays + constructors + copy, globals, intra-/cross-module calls — all validated against
+genuine `hexer` bytes, interp == JIT. The remaining work is not "can it be done" but breadth +
+plumbing. Five workstreams, roughly independent:
+
+- **W1 — Leng totality.** Close the Leng subset so *every* construct a real nimony program emits
+  translates or fail-closes cleanly. Load-bearing next slices: **sret (aggregate return)**, then
+  general **`goto`** (the low-level `jmp`/`lab`/`jtrue`/`mflag`/`vflag` jump family), then
+  **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
+  built-in containers). Non-zero global/data initializers land here too.
+- **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
+  module. W2 resolves cross-module symbols, merges globals/data, and lays out one svm module from N
+  Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
+  (2026-07-29): `svm_leng::link_units` links real cross-module nimony code.** nimony references a
+  proc `P.` defined in module `stem` from elsewhere as `P.<stem>`; `link_units` translates each
+  module's procs, exports them under those global names, and resolves every unit's cross-module
+  calls (named imports) against the exports via `svm_ir::link` — one merged, re-verified, import-free
+  module. Proven on a genuine 2-module program (`moda` importing `pkg/modb`: `useit(5)` calls
+  `modb`'s compiled `helper` → 16) and a transitive A→B→C chain, both engines (`tests/link.rs`).
+  This is the same link mechanism the end-to-end shim used, now across *real translated modules* —
+  the shim's stand-in replaced by compiled Nim.
+  - **✅ Relocatable globals — DONE 2026-07-30 (aligned to the new `.svmo` object dialect).** The
+    tree landed a binary link-unit format (`.svmo`) + `svm-run --link`, with first-class export
+    tables and inline data-relocation instructions — `data.self <off>` (this unit's data),
+    `data.sym "<name>" <addend>` (a cross-unit data symbol), `data.top` (top-of-data / heap start) —
+    that `link` resolves to concrete addresses. This filled the data-symbol gap. `svm-leng` is now
+    **dual-mode**: `translate`/`translate_procs` emit a directly *runnable* module (globals at fixed
+    absolute offsets, `.svmb` shape), while `link_units` emits a *link unit* (globals addressed via
+    `data.self`, `.svmo` shape) so `link` relocates each unit's data into disjoint window regions.
+    This was load-bearing: an absolute-offset unit *silently aliased* under linking — two modules'
+    globals both at offset 16, one clobbering the other — a fail-closed violation the `data.self`
+    lowering fixes (regression test: two modules each read their *own* global, `tests/link.rs`).
+  - **✅ Through the `.svmo` narrow waist — DONE 2026-07-30.** `svm-leng` now emits real binary link
+    **objects**: `svm_leng::compile_object(unit)` → a `.svmo` with the unit's procs exported *in-band*
+    (`Module::exports`, stem-suffixed) — the counterpart of `svm-llvm-translate -o out.svmo`.
+    `link_units` routes through the format: compile each module to `.svmo`, `decode_unit` it back
+    through the hardened firewall (a frontend is untrusted), pair a `LinkUnit` from its in-band export
+    tables (the same conversion `svm-run --link` does), then `svm_ir::link`. The linker stays shared;
+    the format is the only added seam. Proven cross-producer (`tests/object.rs`): a nimony `.svmo`
+    (`sumSeq`) links against a **separately produced runtime `.svmo`** — both binary objects, joined
+    only through the format — and runs (Σ = 60, both engines). That composition is the point: the
+    runtime object is the stand-in the real compiled `system` module (or a C-runtime `.svmo`) will
+    replace, and now they meet at a versioned, spec-pinned, fuzzed boundary rather than in-process.
+  - **✅ Cross-module data symbols — DONE 2026-07-30.** A `gvar` referenced across the module
+    boundary — hexer emits it as `counter.0.<defining-stem>`, in lvalue/rvalue position — now links.
+    The *defining* unit exports each of its globals as a `data_export` (stem-suffixed name → data
+    offset, via `Translator::global_exports`); the *referencing* unit, finding an atom that's not a
+    local/own-global/const/literal, emits a relocatable `data.sym "<name>"` the linker binds to that
+    export (an unresolved name is a fail-closed link error, never a wrong address). External data
+    symbols are assumed `i64` scalars — the common `int`/pointer global. Tested: a hand-written
+    writer/reader pair sharing a global defined in a third data-only unit, real nimony
+    `bump`/`store` (`bump()` increments `store.counter` across the boundary → 1), and two
+    fail-closed cases (`tests/link.rs`).
+  - **✅ Short string literals (SSO) — DONE 2026-07-30.** nimony's `string` is a small-string
+    object `{bytes: u64@0, more: ptr@8}` (confirmed from the system module's `basic_types.nim`): a
+    *short* literal packs its chars into the inline `bytes` word with a nil `more`, so it's an
+    ordinary `(oconstr string (kv bytes.0 <packed-u64>) (kv more.0 (nil)))` — no data segment.
+    Lowering it took two things: unsigned literals (`122511465736197u`) now parse (bit-pattern
+    preserved, `u64`-wide), and the external `string` type's layout must be available. That layout
+    normally comes from the `system` module across the link (cross-module *type* resolution — the
+    third symbol kind after funcs and data; Path A); until that's automatic, `translate_proc_with_types`
+    supplies it as a type prelude. Tested: a hand-written SSO construct-and-read (*runs*), an
+    over-`i64::MAX` unsigned literal, and **real nimony `greet(): string = "hello"`** (genuine SSO
+    `oconstr` by sret — translates + verifies given the real `string` def; running needs the ARC
+    `=wasMoved`/`=destroy` imports, W3).
+  - **✅ Automatic cross-module type resolution — DONE 2026-07-30.** The third symbol kind after
+    funcs and data. Proc/data symbols resolve at *link* time, but an aggregate **type**'s layout is
+    needed at *translate* time (field offsets are baked into loads/stores) — so `link_units` first
+    pools every unit's `(type …)` defs under their stem-suffixed global names
+    (`Translator::export_types`, rewriting nested same-module field types to their suffixed forms
+    too) and pre-registers the pool in each unit's translator (`import_types`) before translating
+    any. A module constructing a `string.0.sysvq0asl` now gets the system module's layout
+    automatically; `translate_proc_with_types` remains as the manual escape hatch for
+    single-module entry points. A *standalone* `compile_object` of a unit with an external value
+    type still fail-closes (the layout only exists across the link) — if that ever needs to work
+    without siblings, types would ride in-band in `.svmo`, a format question for later. Tested:
+    hand-written flat + *nested* external value types (both run, both engines), the standalone
+    fail-closed case, and **real nimony `greet(): string = "hello"` running end-to-end** — linked
+    against a stand-in system unit under the real stem, no prelude, the packed SSO word and nil
+    `more` land in the sret slot identically on both engines (`tests/link.rs`).
+  - **✅ Cross-module funcref globals — DONE 2026-07-31.** The fourth cross-module symbol kind. A
+    stdlib `gvar` whose type is a `proctype` (the allocator's `oomHandler`, `gExitFlush`,
+    `scheduler`) is a function-*pointer* **data** symbol, not a proc — so a sibling module's
+    `(call oomHandler.0.<sys> …)` must lower to a `data.sym` load of the `i32` funcref +
+    `call_indirect`, not a proc import (which fail-closes at link as `Unresolved`, since the owning
+    module exports the name as *data*). Like aggregate **types**, the `call_indirect` signature is
+    needed at *translate* time, so `link_selected` now also pools every unit's funcref gvars
+    (`Translator::export_funcrefs`, name+stem → `FnPtrSig`) and pre-registers them
+    (`import_funcrefs`); `lvalue_type`/`lvalue_addr` then treat a pooled name as an `FnPtr` global
+    (address via `data.sym`), and the existing `indirect_callee` path lowers the call unchanged. With
+    this, a real allocating program links with **zero unresolved imports** (`oomHandler` binds). The
+    funcref value itself stays zero-until-`ini` (a symbol-initialized gvar; see the `gExitFlush`
+    note) — this slice is purely the cross-module *call-site* lowering. Tested: two hand-written
+    modules where `w` calls through a `proctype` gvar defined in `s` (setter stores `ref.func`, then
+    dispatch), both engines (`tests/link.rs`).
+  - **✅ Cross-module frame-needing calls — DONE 2026-07-31.** A proc that takes a local's address
+    gets a leading `$sp` param and its callers pass `sp + frame_size`; within a module the translator
+    knows each callee's frame need, but a **cross-module** call (`call alloc.1.<sys>`) lowers through
+    `call_import`, which derives the import's signature from the *args* — blind to the hidden `$sp`
+    (verify: `CallArgCountMismatch`, expected 2 found 1). Because frame-need **propagates
+    transitively across module boundaries** (`program → newSeqUninit → alloc → alloc.0.`), the linker
+    now runs a **whole-program frame fixpoint**: `Translator::proc_frame_nodes` yields each proc's
+    `(global_name, own_frame_need, global_callees)`, `link_selected` seeds the set from the
+    self-framing procs and closes it under "calls a framed proc," and the final set is pre-registered
+    in every unit (`import_proc_frames`). `call_import` then prepends `sp + frame_size` for a pooled
+    callee, and `propagate_frames`/`body_calls_framed` became ext-aware so a proc framed *only* by a
+    cross-module callee still gains its own `$sp` — the two agree because they are the same fixpoint
+    over the same edges. With this the real allocating program **links and verifies with zero
+    imports**. Tested: `w`'s `drive` calls `s`'s frame-needing `count` (which takes `(addr i)`), and
+    the fixpoint frames `drive` too so it hands `$sp` down — both engines (`tests/link.rs`).
+  - **✅ Whole-module link objects — DONE 2026-07-30 (Path A shape).** `link_units` lifts a
+    *hand-picked subset* of a module's procs (the "go deep" mode); a real program instead links
+    *whole compiled modules* — every proc plus the scaffolding nimony emits (`ini`
+    module-initializer, C `main`, exportc gvars). `svm_leng::compile_whole_object`/`link_whole_units`
+    (over a `WholeModule{stem, src}`) do that: `Translator::module_with_names` translates every proc
+    and returns their local names, which become the object's in-band export table (each proc under
+    its global stem-suffixed name), so other modules' cross-module calls resolve. This is `lld` over
+    object files versus the selective lift. Proven on **two genuine `hexer` modules linked in full**
+    (`tests/whole.rs`): real `moda` (main module — `useit`, its `ini`, the C `main` + exportc gvars)
+    + real `modb` (`helper` + `ini`), their cross-module edges resolving against each other
+    (`useit`→`helper`, `moda.ini`→`modb.ini`) and their `sysvq0asl` system edges against a small
+    stand-in system object. The whole program links, verifies, and runs on both engines — including
+    moda's **real C `main` executing the whole init chain** end-to-end (guards, sub-inits, flush) and
+    returning 0. The stand-in system object is the last stub between here and the real compiled
+    `system` module.
+  - **✅ Long string literals (`LongString` data) — DONE 2026-07-30.** A string too long to pack
+    into the SSO `bytes` word: nimony emits it as a `const` `LongString` blob
+    `{fullLen, rc, capImpl, data: uarray char}` and a `string` value whose `more` field points at it
+    (`(addr strlit…)`). Lowering it took **constant-aggregate materialization**: a `const` whose
+    value is an `(oconstr T (kv field val)*)` now materializes its exact little-endian bytes into a
+    data segment (scalar-int fields at their offset; a **string-literal** field — the `uarray` /
+    `UncheckedArray` flexible tail — as raw bytes past the fixed size) and registers the const as an
+    addressable global, so `(addr strlit…)` resolves to it. `resolve_type` gained the `uarray`
+    flexible-array tail (size-0, the object's fixed size stops there). The `LongString` layout comes
+    across the link (cross-module type resolution). Tested: a self-contained `const` blob whose bytes
+    are read back from the window (both engines), and **real nimony
+    `greetLong(): string = "hello, this is a long string!"` running end-to-end** — linked against a
+    stand-in `system` unit (real `string`/`LongString` defs + no-op ARC stubs), the returned
+    `string`'s `more` points at the materialized blob (`fullLen` = 29, data = the literal),
+    identically on both engines (`tests/strings.rs`).
+  - **✅ `exportc` C-name exports — DONE 2026-07-30.** A whole-module object now exposes its
+    `exportc` symbols under their **C** names (the C `main`, and the `cmdCount`/`cmdLine`/`nimEnviron`
+    gvars), alongside the mangled Leng names — `Translator::exportc_exports` scans proc/gvar
+    `(pragmas (exportc "cname") …)` and adds a func/data export under `cname`. So the program's C-ABI
+    surface is findable: a host or `svm-run --link` can enter at `main`. Tested on real `moda`'s whole
+    object (`tests/object.rs`).
+  - **◑ Real `system` module — STARTED 2026-07-30.** The `sysvq0asl` edges now bind to code
+    translated from the **actual nimony `system` module**, not a hand-written stub — first real
+    stdlib code running on SVM (`tests/system.rs`): a driver's cross-module call binds to the real
+    `=wasMoved` (string's ARC "moved-from" reset, `s.bytes = 0` through a `ptr string`, verbatim
+    from `system/stringimpl.nim`), and it runs correctly on both engines. Getting there closed two
+    translator gaps the real module surfaces: **gvar symbol/proc-pointer initializers** (e.g.
+    `gExitFlush = nimNoopFlush` — the pointer value is opaque, an indirect call through it
+    fail-closes, so the slot is reserved zero-initialized and the runtime's `ini` writes it) and
+    **`suf` suffixed literals** (`255'i64`). With those, the *whole* system module's globals, 96
+    types, and 163 `strlit` (`LongString`) consts all collect, and `=wasMoved`,
+    `nimFlushStdStreams`, `nimNoopFlush`, `setExitFlush` translate.
+  - **✅ Coverage grind — 290/324 system procs translate (2026-07-30).** The ARC set
+    (`=wasMoved`/`=destroy`/`=copy`) plus ~180 more procs now lower, after a run of bounded translator
+    slices: bitwise/shift/`not`/`bitnot`, char literals, computed-pointer `deref`/`pat`, `importc`
+    externs → imports, bool `case` values, sub-word (`i8`/`i16`) locals, local scalar+aggregate
+    consts, inline flexible arrays (`LongString.data`), const array tables, aggregate rvalues in
+    argument position, `keepovf`/`ovf`, computed `deref`/`pat` in `lvalue_type` (the `s.more.data[i]`
+    walk), transitive frame propagation, and scalar parameter spill. Whole-module translation of the
+    entire `system` module now runs to a single tail (`[]=`'s call arity).
+  - **✅ End-to-end against real `system` ARC — MET 2026-07-30 (Path A payoff).** A *real* nimony
+    program runs against *real* compiled `system` code, no stub: `greetLong(): string = "hello, this
+    is a long string!"` links against the **real** `=wasMoved`/`=destroy` (verbatim from
+    `system/stringimpl.nim`) and runs end-to-end on both engines, returning the literal. The long
+    string's `LongString` blob is a `const` in greetLong's data; the linker **relocates** the string's
+    `more` pointer to its placed address. This needed **const-to-const data relocations**
+    (`data.ptr <at> self <off>`, svm_ir D-LINK): a pointer stored *inside* one const's bytes to
+    another const (a `string` literal's `more = (addr strlit)`) — placeholder bytes the linker
+    overwrites (`tests/system.rs`, `tests/strings.rs`).
+  - **✅ Whole `system` module compiles — MET 2026-07-30 (Path A capstone).** `compile_whole_object`
+    lowers the **entire** real `system` module to a 129 KB `.svmo` link object — **297 functions**
+    plus exactly the **25 bottom-edge C imports** (`mmap`, `c_memcpy`/`memset`/`memcmp`, the atomics,
+    `bswap64`/`ctz64`/`clz64`, `cWriteErr`, `cExitSys`, `dlopen`/`dlsym`/`dlclose`). Getting the last
+    procs to lower closed a run of translator gaps, each with a synthetic both-engines test
+    (`tests/indirect.rs`): the **char-literal lexer** (a space char `' '` no longer splits, fixing
+    the phantom `[]=` arity), **named pointer-alias types** (`ref` types like `RootRef = (ptr …)`),
+    **indirect calls through function pointers** (`ref.func` + `call_indirect`, scalar and sret —
+    coroutine scheduling: `trivialTick`/`advance`/`setScheduler`), **RTTI virtual dispatch** (the
+    `o.vt.mt[i]` method-table walk, via cast-deref static typing + `i64` slot → `i32` funcref), and
+    `baseobj` base-subobject upcasts. Linking the whole object end-to-end now needs only the 25
+    imports bound (W3, below); the object itself is produced and structurally sound.
+  - **✅ Real Nim source runs on SVM, toolchain-driven — MET 2026-07-31 (W3, the Path A payoff).**
+    The 25 bottom-edge C imports bind to a **20-function SVM runtime shim** (a pure-IR link unit,
+    `tests/fixtures/system_runtime.svm.txt`): `mmap`→a bump allocator (cursor at window offset 8),
+    `c_memcpy`→`mem.copy`, `c_memset`→`mem.fill`, `c_memcmp`→a byte-compare loop, the GCC atomics→
+    plain memory ops (the in-process model is single-threaded), `ctz64`/`clz64`→`i64.ctz`/`clz`,
+    `bswap64`→a shift/or chain, `cWriteErr`→success, `munmap`/`dl*`/`_exit`→inert. `svm-leng` gained
+    `link_whole_with_runtime` (program + `system` + runtime units in one link).
+    The test is **end-to-end from Nim source, not a committed artifact** (`tests/nim_e2e.rs`): it
+    drives the real toolchain (`nimony c` → nifler → nimony → hexer) on small `.nim` programs, links
+    the emitted Leng with the shim into one verified import-free module, and runs on **both engines**
+    (§9 parity) — `addTwo`, a `while`/`if` routine (`sumTo`/`maxOf`), and the real allocator
+    (`osAllocPages`, page-advancing). Because the `.x.nif` is regenerated each run, the test can't rot
+    against a frozen snapshot. The toolchain is built in a dedicated CI job
+    (`scripts/ci/provision-nimony.sh`); when it's absent the tests **skip** (the translator's own
+    logic stays covered by the fast, toolchain-free unit tests).
+  - **Remaining toward a full program:** heap programs (`seq`/`string`) now **link with zero
+    unresolved imports** (the cross-module funcref-gvar slice above bound `oomHandler`), and the
+    generic instantiated `seq[T]` `oconstr` was a red herring — the type *is* registered as an
+    aggregate; the earlier `Unsupported("expression oconstr")` was a harness bug (import discovery
+    compiled a *program* module standalone, which can't resolve a cross-module aggregate type like
+    `string.0.<sys>` — now discovered from the self-contained `system` module only). A real
+    `@[]`/`add` program now **links, verifies, and runs end-to-end through the full C-`main`/init
+    chain** (returns 0) — the cross-module funcref-gvar, frame-fixpoint, and funcref-initializer
+    slices closed every gap between "compiles" and "runs."
+  - **✅ Funcref-gvar static initializers (`data.funcref`) — DONE 2026-07-31.** `var oomHandler =
+    continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush` are funcref gvars whose value is a
+    **static initializer** (a proc pointer). We used to zero-reserve the slot on the assumption the
+    system `ini` writes it — but `ini` is minimal (it only resets an exception global); the
+    initializer *is* the value, and nothing wrote it, so the first `call_indirect` through the gvar
+    trapped (`IndirectCallType` through func 0 — surfacing deep in `cAbort`'s flush). Fixed with a
+    **`data.funcref` relocation** (the funcref twin of `data.ptr`, svm_ir D-LINK): `svm-leng`'s
+    `collect_globals` records a proctype gvar's proc initializer, `translate_object_module` emits a
+    `DataFuncref{at, name}` under the initializer's stem-suffixed name, and `link` resolves it to the
+    merged funcidx and writes it (4-byte `i32`, the value `ref.func` yields) into the gvar's data
+    slot — then clears the list (a survivor is a fail-closed `UnlinkedDataFuncref` verify error, the
+    twin of `UnlinkedDataPtr`). The real `@[]`/`add` program now runs to completion with **no
+    hand-patching**. Tested: a hand-written funcref gvar with a static `= dbl` initializer, called
+    cross-module with *no runtime setter* — the materialized slot dispatches to `dbl`, both engines
+    (`tests/link.rs`).
+  - **✅ First heap program runs correctly, from Nim source — MET 2026-07-31.** `tests/nim_e2e.rs`
+    now drives the toolchain on a real allocating program (`var s: seq[int] = @[]; while … s.add(i*i)`;
+    sum it), links it with the runtime shim, runs its C `main` through the **entire init chain**, and
+    reads the module global `r` back — `sumSquares(4) == 14` on **both engines** (§9 parity). This is
+    the first genuine heap allocation on SVM end-to-end: the allocator, `oomHandler`, the frame
+    handoff, and the funcref-initializer materialization all exercised at once, from source.
+  - **✅ Both earlier follow-ups fixed by adopting the powerbox memory model** (2026-07-31). The
+    root of both was that the linked module had no disciplined window layout: nimony based its
+    globals at offset 16 and the caller seeded `$sp = 0`, so the **data stack collided with the
+    globals, the powerbox heap-brk words (offsets 32/40), and the seq the allocator was growing**.
+    That corruption produced the `+20` phantom element in `for x in s` (an allocator chunk write
+    stomping `s.len`) and the module-order sensitivity (the seq landing on live scratch depended on
+    layout). The fix mirrors svm-llvm's C on-ramp: globals based at `POWERBOX_STACK_PAGE` (16384, so
+    page 0 stays reserved for the heap-brk/args scratch), `$sp = powerbox_entry_sp` (64 KiB-aligned,
+    above all globals), and the heap seeded above the 1 MiB stack reserve via `POWERBOX_HEAP_BRK`.
+    Globals / data stack / heap are now disjoint by construction — no SVM changes, the model the C
+    on-ramp already runs under. `for x in s` now sums correctly (`sumSquares(5)` via `for` == 30 on
+    both engines), and `s.len` is exact for every element count.
+    - **Also fixed (uncovered once the layout stopped masking it): unsigned comparison lowering.**
+      `svm-leng` lowered `(u N)` comparisons as **signed** (`le_s`/`lt_s`); the TLSF allocator's
+      `uint32` bitmaps set bit 31, which a signed compare mis-orders — faulting `msbit`/`lsbit`
+      during any reallocation past 2 elements. `compare` now emits `lt_u`/`le_u` when an operand is
+      unsigned-typed (a `(u N)` slot or a `u`-suffixed/`conv`-typed form).
+  The ARC-heavy string path already links and runs against real `=wasMoved`/`=destroy`.
+- **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
+  POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
+  onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
+  through as ordinary calls. **Key finding (§3b): the bottom edge is only ~15 C functions, and
+  Phase 1 already binds them** — so the lever between "translates real nimony" and "runs it" is
+  mostly W2 (linking the compiled `system` module), or a Phase-1-style host runtime shim.
+- **W4 — Multi-binary architecture (the other long pole).** nimony is not one binary: `nifmake`
+  spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
+  means either driving those phases in-process or giving svm a subprocess/exec personality. This
+  is an architecture question, not a translation one, and it's the biggest unknown.
+- **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
+  the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
+
+**Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
+end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
+answer (a real seq build-and-sum returns `3`). That
+exercises W1 (totality on a whole program) and forces the first slice of W2/W3, and is the
+concrete "it works" we can point at before the long poles. Everything below `## 3a` (W2/W4
+especially) is bounded but real; the backend mapping is the part that's no longer in doubt.
+
+## 3b. W3 scope — the runtime bottom edge (W1 is done; this is the next lever)
+
+With W1 closed, `svm-leng` **translates real nimony modules to verified svm-ir** — but the lowered
+code doesn't yet *run*, because it calls procs that aren't defined in the one module we translate.
+Scoping W3 means answering exactly *what* those calls are and *how* they bind. Two layers, and the
+boundary between them is the whole story:
+
+**Layer 1 — compiled Nim stdlib (this is W2, not W3).** The seq/string/ARC ops a program calls —
+`newSeqUninit`, `add`, `[]`, `len`, `toOpenArray`, `=destroy`, `=wasMoved` — are **ordinary Nim
+code** that nimony compiles into the `system` module's Leng (`sysvq0asl.x.nif`). They look like
+"imports" to us only because we translate one module in isolation. In a whole-program build they're
+*defined*, reached by **linking** the user module with the compiled `system` module — the `Func`/
+`Slot` bindings of `svm_ir::resolve_imports_with`. That's W2 (the linker), and it's the bulk of the
+gap.
+
+**Layer 2 — the true bottom edge (this is W3).** What does the `system` module *itself* bottom out
+at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **entire** external
+(`importc`) surface, minus pure C *type* names, is ~15 functions:
+
+| Group | Symbols | SVM binding |
+| --- | --- | --- |
+| Allocator | `mmap`, `munmap` | the **Memory cap** (Phase 1 seam) |
+| Syscalls / process | `write`, `_exit`, `getpid`, `kill` | the **POSIX personality** (Phase 1 seam) |
+| libc mem | `memcpy`, `memset`, `memcmp` | host cap, or lower to `mem.copy`/`mem.fill` |
+| Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | single-threaded guest → plain loads/stores |
+| Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct svm ops (`bswap`/`clz`/`ctz`) |
+| Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
+
+**The key finding: W3's hard part is already retired.** This is the *same* C bottom edge Phase 1's
+on-ramp already binds — `crates/svm-run/demos/nimony/` runs a nimony-shaped module on all three
+engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
+cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
+already lowers a named import to a host capability (`Cap`) — that's the seam.
+
+**Two paths to the near-term milestone (run one real program):**
+
+- **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
+  bind the *high-level* ops (`newSeqUninit`/`add`/`[]`/`len`/`=destroy`/`=wasMoved` + `memcpy`/
+  `memset`) directly to a small host implementation via capability bindings, exactly as Phase 1's
+  `nimony_runtime_shim.c` did. Gets end-to-end *running* fast, decoupled from the W2 linker. The
+  handful of ops is small and well-understood (a `{len,data*}`/`{len,cap,data}` bump/realloc
+  allocator over the window).
+- **Path A — link the real `system` module (fidelity, needs W2).** Merge `sysvq0asl.x.nif` into the
+  user module so the stdlib ops resolve to *compiled Nim* (`Func`/`Slot`), and only the ~15 C
+  primitives hit the host (`Cap`). Faithful, but gated on the W2 linker.
+
+Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
+end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
+model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
+protocol runs correctly against a real allocator.
+
+**✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
+end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
+`sumSeq`/`makeSeq` to verified svm-ir with their stdlib ops as named imports; a tiny SVM **runtime
+shim** (the pure `toOpenArray`/`len`/`[]`/`inc` ops + a bump/realloc allocator for `newSeqUninit`/
+`add`, `=wasMoved`/`=destroy` as zero/no-op — eight functions, ~90 lines of svm-text) is **linked
+in** via `svm_ir::link`, binding each named import to a shim function. So the whole path — real Nim
+→ `nimony` → `hexer` → `svm-leng` → svm-ir → link → **run** — closes with the right answer:
+`sumSeq([10,20,30]) = 60`, `makeSeq(3)` builds `[0,1,2]` through the allocator, and a driver chaining
+`makeSeq(3)` → `sumSeq` returns `3` in one pass (`tests/end_to_end.rs`). Notably the shim is *SVM
+code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
+and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
+the shim is the placeholder the real compiled `system` module (Path A) will replace.
 
 ## 4. Invariants this must respect
 

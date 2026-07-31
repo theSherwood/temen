@@ -28,6 +28,14 @@ The system is four ideas wearing many names:
 
 ## Core runtime
 
+- **`.svmt` / `.svmb` / `.svmo`** — the three module file forms. `.svmt` is the text IR
+  (dev/debug interface; can carry everything, including link scaffolding; the older
+  `.svm` spelling is deprecated — tools accept it with a rename note). `.svmb` is
+  the **runnable** binary (wire v9 flag 0): the untrusted-input path, decoded by the
+  escape-TCB `decode_module`, never contains link scaffolding. `.svmo` is the binary
+  **object / link unit** (v9 flag bit 0, `decode_unit`): a pre-link unit that may carry
+  `data.ptr` relocations, data exports, and `data.self`/`data.sym`/`data.top`; the
+  linker (`svm_ir::link`, `svm-run --link`) resolves it into a runnable module.
 - **domain** — one isolated unit of execution: a module's code + its window + its
   powerbox. The root program is a domain; every §14 child and every provider instance is
   its own domain.
@@ -183,6 +191,20 @@ The system is four ideas wearing many names:
   expressible. Re-entry (A→B→A) is just a fresh handler fiber; call cycles are
   recursion, bounded by fuel + the fiber quota — they fault, never hang. Isolated
   service state, when wanted, is explicit: spawn a child.
+- **admission** — (CALLS.md §3/§10.1) letting one inbound call mint a handler fiber in a
+  provider's world. Gated per provider *domain*: `single` (default) serializes handlers
+  against each other (run-to-park atomicity; library provider = one try-enter flag,
+  process provider = at a serve point), `threaded` has no gate (the provider synchronizes
+  its own state). Quiesce closes the same gate. Never a whole-domain lock — the domain's
+  other fibers keep running.
+- **direct handoff** — (designed: CALLS.md §10.2) the fast-path transport into a process
+  provider parked at `svc.wait`: the caller claims the serve activation and animates the
+  handler fiber on its own thread — no enqueue, no scheduler round-trips — and the
+  dispatch still counts in the callee's serve accounting. Observably identical to the
+  parked transport; only scheduling differs.
+- **`fuel.remaining`** — (designed: CALLS.md §10.6) authority-neutral self-namespace
+  readout of the domain's remaining fuel; backend-identical by the fuel-unification
+  safepoint rule. Under caller-pays, per-call cost = read-before − read-after.
 
 ## Guest JIT (§22)
 

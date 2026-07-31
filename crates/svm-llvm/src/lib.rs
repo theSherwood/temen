@@ -1140,6 +1140,11 @@ fn translate_impl(
         module: Module {
             types,
             impl_exports: vec![],
+            // The on-ramp bakes pointer-valued globals whole-module (all offsets known at translate
+            // time), so it emits no cross-unit data symbols — nothing to export here.
+            data_exports: vec![],
+            data_ptrs: vec![],
+            data_funcrefs: vec![],
             funcs,
             memory,
             data,
@@ -1148,7 +1153,7 @@ fn translate_impl(
             imports,
             // First-class function exports: each defined function's name → its final `module.funcs`
             // index, so a C-compiled module is name-addressable (`call("main")`) like the wasm path.
-            // Mirrors the out-of-band `Translated::exports` (the `.syms` sidecar source). When a
+            // Mirrors the in-memory `Translated::exports`. When a
             // powerbox `_start` was synthesized, export it at funcidx 0 too — the named-entry marker
             // the runtime keys off (S15 (c): a paramless `_start` is tagged by its export, not params).
             exports: {
@@ -2957,14 +2962,14 @@ fn callee_name(c: &crate::ll::ast::Call) -> Option<String> {
 // vestigial dummy handle operand, and the slot binding is the dispatch. This keeps the translator
 // pure mechanism — it never interprets host semantics, just defers the bind (§2a).
 
-/// The `HostFn` interface id (`svm_interp::cap_id::HOST_FN`) — the **embedder-registered** capability
+/// The `HostProc` interface id (`svm_interp::cap_id::HOST_PROC`) — the **embedder-registered** capability
 /// (§7 "host-defined capabilities"), reached from C via `__vm_host_call`. Pinned here numerically
 /// (svm-llvm produces `svm-ir` and does not depend on the interpreter crate); `svm-run`'s
-/// `host_fn_type_id_matches` test locks the two together.
-const HOST_FN_TYPE_ID: u32 = 13;
+/// `host_proc_type_id_matches` test locks the two together.
+const HOST_PROC_TYPE_ID: u32 = 13;
 /// The `SharedRegion` interface id (`svm_interp::cap_id::SHARED_REGION`) — the §13 window-aliasing
 /// capability, reached from C via `__vm_region_call` (the zero-copy file-mmap bridge, §4b). Pinned
-/// numerically like [`HOST_FN_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
+/// numerically like [`HOST_PROC_TYPE_ID`]; `svm-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 
 /// End of the low reserved region (`[0, 32)`) that held the retired capability-handle stash
@@ -11785,8 +11790,8 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §7 host-defined capability call: `long __vm_host_call(int handle, int op, long a, long b,
-        // long c, long d)` → `cap.call HOST_FN op handle (a,b,c,d)`. The generic bridge to an
-        // **embedder-registered** capability (`Host::grant_host_fn` — the wasm-import analogue): the
+        // long c, long d)` → `cap.call HOST_PROC op handle (a,b,c,d)`. The generic bridge to an
+        // **embedder-registered** capability (`Host::grant_host_proc` — the wasm-import analogue): the
         // handler's semantics live entirely in the host closure, the translator stays pure mechanism.
         // `op` selects the operation and must be a compile-time constant (it is nominal in the IR,
         // like the type id). The fixed `(i64×4) -> i64` shape covers the embedder-cap ABI; unused
@@ -11810,7 +11815,7 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let r = ctx.push(Inst::CapCall {
-                type_id: HOST_FN_TYPE_ID,
+                type_id: HOST_PROC_TYPE_ID,
                 op: op_const,
                 sig,
                 handle,

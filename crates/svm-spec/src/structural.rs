@@ -340,6 +340,40 @@ pub fn struct_rows() -> Vec<StructRow> {
         ),
     });
 
+    // v9 link-form data addresses (D-LINK): **object-dialect only** on the wire — the
+    // conformance harness rides these rows through `encode_unit`/`decode_unit` (the runnable
+    // dialect has no bytes for them; `link` rewrites each to `ConstI64` first). They *verify*:
+    // both verifiers type them as the `i64` they resolve to, so a pre-link unit type-checks.
+    rows.push(StructRow {
+        id: "data_self".into(),
+        encoding: Enc::Byte(0x07),
+        verifies: true,
+        is_term: false,
+        module: inst_module(vec![], Inst::DataSelf { offset: 8 }, false, vec![]),
+    });
+    rows.push(StructRow {
+        id: "data_sym".into(),
+        encoding: Enc::Byte(0x08),
+        verifies: true,
+        is_term: false,
+        module: inst_module(
+            vec![],
+            Inst::DataSym {
+                name: b"g".to_vec(),
+                addend: 4,
+            },
+            false,
+            vec![],
+        ),
+    });
+    rows.push(StructRow {
+        id: "data_top".into(),
+        encoding: Enc::Byte(0x09),
+        verifies: true,
+        is_term: false,
+        module: inst_module(vec![], Inst::DataTop, false, vec![]),
+    });
+
     // Phase-2 `import.attach` (IMPORTS.md): like `call_import`, the row module carries no
     // manifest, so the op fails verification (out-of-range import) — round-trip + byte pin
     // only; the manifest-bearing accept/reject legs are `spec_verify` directed cases.
@@ -701,6 +735,9 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
+        | Inst::DataSym { .. }
+        | Inst::DataSelf { .. }
+        | Inst::DataTop
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfCount
@@ -733,7 +770,7 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 38, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 41, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();

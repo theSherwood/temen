@@ -105,6 +105,7 @@ impl Parser<'_> {
             b'(' => self.list(),
             b')' => Err("unexpected ')'".into()),
             b'"' => self.string(),
+            b'\'' => self.char_lit(),
             _ => self.atom(),
         }
     }
@@ -144,6 +145,36 @@ impl Parser<'_> {
             }
         }
         Err("unterminated string literal".into())
+    }
+
+    /// A NIF **character literal** — `'0'`, `' '` (a literal space), `'\5C'` (a `\HH` hex escape).
+    /// It must be lexed as a unit rather than via `atom()`, because a space char (`' '`) or any
+    /// other delimiter inside the quotes would otherwise split the token. A char literal never
+    /// contains an unescaped `'`, so scanning to the next `'` finds the true close; any trailing
+    /// line-info suffix (`@…`/`~…`) after the close is then discarded like an atom's.
+    fn char_lit(&mut self) -> Result<Node, String> {
+        debug_assert_eq!(self.b[self.i], b'\'');
+        let start = self.i;
+        self.i += 1; // opening '
+        while self.i < self.b.len() && self.b[self.i] != b'\'' {
+            self.i += 1;
+        }
+        if self.i >= self.b.len() {
+            return Err("unterminated char literal".into());
+        }
+        self.i += 1; // closing '
+        let end_lit = self.i;
+        // Skip a trailing line-info suffix (`@…`/`~…`) up to the next delimiter.
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c == b'(' || c == b')' || c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
+                break;
+            }
+            self.i += 1;
+        }
+        Ok(Node::Atom(
+            String::from_utf8_lossy(&self.b[start..end_lit]).into_owned(),
+        ))
     }
 
     fn atom(&mut self) -> Result<Node, String> {
@@ -187,6 +218,23 @@ mod tests {
         let n = parse("(.nif27)(stmts@,1,foo.nim (ret 3))").unwrap();
         assert_eq!(n.tag(), Some("stmts"));
         assert_eq!(n.args()[0].tag(), Some("ret"));
+    }
+
+    #[test]
+    fn space_char_literal_is_one_atom() {
+        // `' '` is a space char; the lexer must not split it on the interior space.
+        let n = parse("(call f x ' ')").unwrap();
+        assert_eq!(n.args().len(), 3);
+        assert_eq!(n.args()[2].as_atom(), Some("' '"));
+    }
+
+    #[test]
+    fn char_literals_with_lineinfo_and_escapes() {
+        let n = parse("(call f '0'@G '\\5C'@4 ' ')").unwrap();
+        assert_eq!(n.args().len(), 4);
+        assert_eq!(n.args()[1].as_atom(), Some("'0'"));
+        assert_eq!(n.args()[2].as_atom(), Some("'\\5C'"));
+        assert_eq!(n.args()[3].as_atom(), Some("' '"));
     }
 
     #[test]

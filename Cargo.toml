@@ -57,6 +57,7 @@ svm-peval = { path = "crates/svm-peval" }
 svm-interp = { path = "crates/svm-interp" }
 svm-exec = { path = "crates/svm-exec" }
 svm-fs = { path = "crates/svm-fs" }
+svm-posix = { path = "crates/svm-posix" }
 svm-snapshot = { path = "crates/svm-snapshot" }
 svm-fiber = { path = "crates/svm-fiber" }
 svm-jit = { path = "crates/svm-jit" }

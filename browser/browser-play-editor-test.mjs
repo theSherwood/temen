@@ -6,7 +6,8 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -16,6 +17,10 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_eval.svmb'));
 const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.svmb'));
+// The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
+// check additionally needs the native `chibicc` (built by that same script) as the reference oracle.
+const selfhostBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc_selfhost.img'));
+const nativeChibicc = join(HERE, '..', 'frontend', 'chibicc', 'chibicc');
 
 const chromium = (await import('playwright')).chromium;
 const { server, port } = await startServer(process.cwd());
@@ -106,12 +111,30 @@ try {
     await runCard(page, ccName, 30_000);
     const cco = await page.evaluate((sel) => ({
       state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
       result: document.querySelector(`${sel} .result`).textContent,
       ir: document.querySelector(`${sel} .stdout`).textContent,
     }), card(ccName));
+    // The card's wasm-JIT toggle defaults on, so this exercises chibicc's compile on the emitted-wasm
+    // tier (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback would fail here).
     cco.state === 'done' && cco.result === '42' && cco.ir.includes('func') && cco.ir.includes('_start')
-      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser)')
-      : fail(`chibicc run: ${JSON.stringify({ state: cco.state, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+    && cco.msg.includes('wasm-JIT')
+      ? ok('chibicc compiled C → SVM IR → ran it → 42 (in-browser, wasm-JIT)')
+      : fail(`chibicc run: ${JSON.stringify({ state: cco.state, msg: cco.msg, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+
+    // "Prove interp ≡ JIT": compile the same C on both tiers and assert the emitted IR is byte-identical.
+    await page.click(`${card(ccName)} button.prove`);
+    await page.waitForFunction(
+      (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+      `${card(ccName)} .state`, { timeout: 60_000 },
+    );
+    const ccp = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+    }), card(ccName));
+    ccp.state === 'done' && ccp.msg.includes('byte-identical')
+      ? ok('chibicc interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
+      : fail(`chibicc parity: ${JSON.stringify(ccp)}`);
 
     // #include + printf: the seeded <stdio.h> makes a text-emitting program actually print (its
     // output shows in the stdout pane, above the emitted IR) instead of trapping on an unresolved call.
@@ -127,8 +150,126 @@ try {
     pf.state === 'done' && pf.out.startsWith('i=1\ni=2\ni=3\npi=3.14 e=2.5\n') && pf.out.includes('SVM IR')
       ? ok('chibicc #include <stdio.h> + printf (incl. %f/%g floats) → real output in-browser')
       : fail(`chibicc printf: ${JSON.stringify({ state: pf.state, out: pf.out.slice(0, 90) })}`);
+
+    // The expanded libc (SELFHOST_C.md §7 "larger libc"): <math.h> algebra + <assert.h> (which needs
+    // the now-wired predefined __FILE__/__LINE__ macros) + <string.h>/<stdlib.h> additions, in-browser.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\n#include <math.h>\n#include <string.h>\n#include <assert.h>\n' +
+      'int main(void){ assert(sizeof(int)==4); char*d=strdup("libc");\n' +
+      'printf("%s sqrt=%g pow=%g\\n", d, sqrt(169.0), pow(2.0,10.0)); return 0; }'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const lc = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    lc.state === 'done' && lc.out.startsWith('libc sqrt=13 pow=1024\n')
+      ? ok('chibicc expanded libc (<math.h> + <assert.h> + strdup) → real output in-browser')
+      : fail(`chibicc libc: ${JSON.stringify({ state: lc.state, out: lc.out.slice(0, 90) })}`);
+
+    // Multi-file project (SELFHOST_C.md §7 stage-2 lever): `//// file: NAME` markers split the editor
+    // into memfs files, and /in.c #includes a sibling header + .c (unity build) — all compiled in-browser.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\n#include "mathx.h"\n#include "mathx.c"\n' +
+      'int main(void){ printf("gcd=%d\\n", gcd(48, 36)); return 0; }\n' +
+      '//// file: mathx.h\nint gcd(int, int);\n' +
+      '//// file: mathx.c\nint gcd(int a, int b){ while(b){ int t=a%b; a=b; b=t; } return a; }\n'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const mf = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    mf.state === 'done' && mf.out.startsWith('gcd=12\n')
+      ? ok('chibicc multi-file project (//// file: markers → #include sibling .h/.c) → ran in-browser')
+      : fail(`chibicc multifile: ${JSON.stringify({ state: mf.state, out: mf.out.slice(0, 90) })}`);
+
+    // open_memstream + buffered FILE* (SELFHOST_C.md §7 stage-2): the <stdio.h> upgrade that lets
+    // chibicc's own format()-style code compile and run — a memory FILE built up with fprintf, read back.
+    await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(
+      '#include <stdio.h>\nint main(void){ char*b; size_t n; FILE*m=open_memstream(&b,&n);\n' +
+      'for(int i=0;i<3;i++) fprintf(m,"[%d]", i*i); fclose(m);\n' +
+      'printf("%s len=%lu\\n", b, (unsigned long)n); return 0; }'),
+      card(ccName));
+    await runCard(page, ccName, 30_000);
+    const ms = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(ccName));
+    ms.state === 'done' && ms.out.startsWith('[0][1][4] len=9\n')
+      ? ok('chibicc open_memstream + buffered FILE* (the self-host stdio) → ran in-browser')
+      : fail(`chibicc memstream: ${JSON.stringify({ state: ms.state, out: ms.out.slice(0, 90) })}`);
   } else {
     console.log('  SKIP: chibicc compile-and-run (chibicc.svmb not built — run build-onramp-assets.mjs)');
+  }
+
+  // The self-host capstone card (SELFHOST_C.md §7 step 5): chibicc.svmb compiles chibicc's *own* cc1
+  // TUs to linkable objects, in-browser, on the wasm-JIT. Pins: (1) it runs and emits a real object;
+  // (2) the object is byte-identical to a native `chibicc --emit-object` (the fixpoint, over the real
+  // glibc header closure seeded from the committed image); (3) the interpreter and JIT tiers agree.
+  if (selfhostBuilt) {
+    const shName = 'chibicc compiles its own source (self-host → SVM)';
+    // Pick a substantial TU (tokenize.c, ~800 lines) via the card's translation-unit dropdown.
+    const tuRel = 'frontend/chibicc/tokenize.c';
+    await page.evaluate(([sel, tu]) => {
+      const s = document.querySelector(`${sel} select`);
+      s.value = tu;
+      s.dispatchEvent(new Event('change'));
+    }, [card(shName), tuRel]);
+    await runCard(page, shName, 60_000);
+    const sh = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+      result: document.querySelector(`${sel} .result`).textContent,
+      pane: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(shName));
+    // The pane is a one-line header (`──── chibicc compiled its own tokenize.c → … ────`) then the object.
+    const guestObj = sh.pane.slice(sh.pane.indexOf('\n') + 1);
+    const wellFormed = sh.state === 'done' && guestObj.includes('func') && guestObj.includes('export')
+      && sh.msg.includes('wasm-JIT');
+    wellFormed
+      ? ok('self-host: chibicc compiled its own tokenize.c → linkable SVM-IR object in-browser (wasm-JIT)')
+      : fail(`self-host run: ${JSON.stringify({ state: sh.state, msg: sh.msg, pane: sh.pane.slice(0, 80) })}`);
+
+    // Byte-identity to native chibicc — the fixpoint, enforced. The native binary is the reference
+    // oracle (built by build-selfhost-assets.mjs); same relative flags as `chibicc_selfhost_argv`
+    // (no --data-page — the object is canonical). Skipped if the native binary isn't present.
+    if (wellFormed && existsSync(nativeChibicc)) {
+      const REPO = join(HERE, '..');
+      const prelude = 'crates/svm-run/demos/chibicc_selfhost/selfhost_prelude.h';
+      const refOut = join(REPO, 'target', 'selfhost_playtest_tokenize.svm');
+      try {
+        execFileSync(nativeChibicc, [
+          '-cc1', '-include', prelude, '-Ifrontend/chibicc', '-Ifrontend/chibicc/include',
+          '-I/usr/include/x86_64-linux-gnu', '-I/usr/include', '--emit-object',
+          '-cc1-input', tuRel, '-cc1-output', refOut, tuRel,
+        ], { cwd: REPO });
+        const nativeObj = readFileSync(refOut, 'utf8');
+        guestObj === nativeObj
+          ? ok(`self-host: in-browser object byte-identical to native chibicc (${nativeObj.length} B)`)
+          : fail(`self-host byte-identity: guest ${guestObj.length} B vs native ${nativeObj.length} B differ`);
+      } catch (e) {
+        console.log(`  SKIP: self-host byte-identity (native chibicc reference failed: ${e.message})`);
+      }
+    } else if (wellFormed) {
+      console.log('  SKIP: self-host byte-identity (native frontend/chibicc/chibicc not built)');
+    }
+
+    // "Prove interp ≡ JIT": recompile the same TU on both engines and assert the objects are identical.
+    await page.click(`${card(shName)} button.prove`);
+    await page.waitForFunction(
+      (sel) => ['done', 'error'].includes(document.querySelector(sel).dataset.state),
+      `${card(shName)} .state`, { timeout: 90_000 },
+    );
+    const shp = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+    }), card(shName));
+    shp.state === 'done' && shp.msg.includes('byte-identical')
+      ? ok('self-host interpreter ≡ wasm-JIT — byte-identical object (in-browser)')
+      : fail(`self-host parity: ${JSON.stringify(shp)}`);
+  } else {
+    console.log('  SKIP: chibicc self-host (chibicc_selfhost.img not built — run build-selfhost-assets.mjs)');
   }
 
   // The SQL card mounted a SQL-mode editor.
@@ -167,8 +308,9 @@ try {
     && jitCards.includes('life (Conway — heap persistence)');
   const hasModuleJit = jitCards.includes('hello (C → SVM)')
     && jitCards.includes('SQLite (:memory: — write & run SQL)');
-  hasReactorJit && hasModuleJit
-    ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite modules)`)
+  const hasChibiccJit = jitCards.includes('C compiler (chibicc → SVM — compile & run)');
+  hasReactorJit && hasModuleJit && hasChibiccJit
+    ? ok(`wasm-JIT toggle on ${jitCards.length} demos (reactors + hello/Lua/SQLite/chibicc modules)`)
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
   // The hello module card runs end-to-end via runModule (JIT toggle default-on): this exercises the
@@ -346,6 +488,38 @@ try {
     /\bi\b/.test(ccPaused.vars) && /\bacc\b/.test(ccPaused.vars) && ccPaused.stopLine
       ? ok('chibicc: debugged C at source level — stopped on a C line, C locals i/acc named')
       : fail(`chibicc debug paused: ${JSON.stringify(ccPaused)}`);
+
+    // Step Over (next) advances forward a source line and stays in the program (the paused frame is still
+    // `main`) — exercising the forward-stepping button end-to-end. Non-disruptive: it lands on the printf
+    // line, so the Continue below still prints "i=3, acc=3".
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="next"]`);
+    await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+      ccDbg, { timeout: 15_000 });
+    /\bmain\b/.test(await page.evaluate((sel) => document.querySelector(`${sel} .dbg-vars`).textContent, ccDbg))
+      ? ok('chibicc: Step Over advanced a source line, staying in main')
+      : fail('chibicc Step Over: frame left main');
+
+    // Continue once: the loop body runs a `printf`, so the guest's output streams into the stdout pane
+    // under the on-ramp I/O powerbox (deny-all would trap the `write`). It stops at the next iteration.
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="continue"]`);
+    await page.waitForFunction((sel) => /i=3, acc=3/.test(document.querySelector(`${sel} .stdout`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: printf output captured under the powerbox while debugging');
+
+    // Reverse back to the earlier breakpoint: the run is rebuilt + replayed, so the captured output
+    // **rewinds** — the first printf hasn't run yet, so the pane no longer shows "i=3".
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="reverseContinue"]`);
+    await page.waitForFunction((sel) => !/i=3/.test(document.querySelector(`${sel} .stdout`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: reverse debugging rewound the captured output');
+
+    // Step Back is **depth-aware** — it rewinds within `main`, not down into the guest libc `printf`
+    // internals. The Variables pane header shows the paused frame's function; before the fix a step-back
+    // from a line that called `printf` descended into `__pf_flush`/stdio.h.
+    await page.click(`${ccDbg} .dbg-controls button[data-cmd="stepBack"]`);
+    await page.waitForFunction((sel) => /main/.test(document.querySelector(`${sel} .dbg-vars`).textContent),
+      ccDbg, { timeout: 15_000 });
+    ok('chibicc: Step Back stayed in main (not the libc printf internals)');
 
     await page.click(`${ccDbg} .dbg-controls button[data-cmd="stop"]`);
   }

@@ -178,11 +178,15 @@ pub fn dead_func_elim(m: &Module) -> Module {
         .collect();
 
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports,
+        // Offset-based (not function indices), untouched by renumbering — carry through unchanged.
+        data_exports: m.data_exports.clone(),
         impl_exports,
         types: m.types.clone(),
         debug_info: None, // positions go stale once functions are renumbered
@@ -613,11 +617,15 @@ pub fn inline_calls(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        // Offset-based (not function indices), untouched by renumbering — carry through unchanged.
+        data_exports: m.data_exports.clone(),
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
         debug_info: None, // instruction positions shift once bodies are spliced
@@ -908,11 +916,15 @@ pub fn const_prop(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        // Offset-based (not function indices), untouched by renumbering — carry through unchanged.
+        data_exports: m.data_exports.clone(),
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
         debug_info: None, // instruction positions shift in a specialized entry block
@@ -1011,11 +1023,15 @@ pub fn devirtualize(m: &Module) -> Module {
         return m.clone();
     }
     Module {
+        data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs,
         memory: m.memory,
         data: m.data.clone(),
         imports: m.imports.clone(),
         exports: m.exports.clone(),
+        // Offset-based (not function indices), untouched by renumbering — carry through unchanged.
+        data_exports: m.data_exports.clone(),
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
         debug_info: None, // an instruction/terminator changed

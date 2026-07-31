@@ -210,6 +210,45 @@ fn alu() {
     diff("alu", ALU, ARGS, FUEL);
 }
 
+/// Pointer provenance ops (off-CHERI, plain `i64`): `ptr.add` is a wrapping add (exercised at
+/// `i64::MAX`/`MIN` in the sweep), and `ptr.to_int`/`ptr.from_int` round-trip the value unchanged.
+/// The wasm-JIT lowers them to `i64.add` / an identity forward.
+const PTR: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 16
+  v2 = ptr.add v0 v1
+  v3 = ptr.to_int v2
+  v4 = ptr.from_int v3
+  return v4
+  }
+}
+"#;
+
+#[test]
+fn ptr_ops() {
+    diff("ptr_ops", PTR, ARGS, FUEL);
+}
+
+/// A standalone `atomic.fence` is a pure ordering barrier — observably a no-op in a single-threaded
+/// guest. It must not perturb the surrounding computation (the result stays `arg + 1`), and the
+/// wasm-JIT emits nothing for it.
+const FENCE: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  atomic.fence
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn atomic_fence() {
+    diff("atomic_fence", FENCE, ARGS, FUEL);
+}
+
 /// Multi-function direct call in the loop body (the env threading + result plumbing).
 const CALL: &str = r#"
 func (i64) -> (i64) {
