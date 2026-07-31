@@ -9723,7 +9723,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, tyv) in results.iter().zip(&sig.results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*tyv, *s)));
+                            frames[top]
+                                .vals
+                                .push(Reg::from_value(slot_to_val(*tyv, *s)));
                         }
                         continue;
                     }
@@ -15124,7 +15126,11 @@ impl Host {
         if !b.bound {
             return None;
         }
-        let eff_op = match self.import_remaps.get(slot as usize).and_then(|r| r.as_ref()) {
+        let eff_op = match self
+            .import_remaps
+            .get(slot as usize)
+            .and_then(|r| r.as_ref())
+        {
             Some(remap) => *remap.get(cop as usize)?,
             None if cop == 0 => b.op,
             None => return None,
@@ -15142,7 +15148,12 @@ impl Host {
     /// `CAP_DYN_TYPE_ID` front-matter (intern the self-module shape `ty` to its runtime id) then
     /// returns `(entry, op)` iff `handle` names an instanced offer of that interface. `None`
     /// otherwise, falling through to the unchanged generic dispatch.
-    fn instanced_offer_for_dyn(&mut self, ty: u32, op: u32, handle: i32) -> Option<(OfferEntry, u32)> {
+    fn instanced_offer_for_dyn(
+        &mut self,
+        ty: u32,
+        op: u32,
+        handle: i32,
+    ) -> Option<(OfferEntry, u32)> {
         // `self_type_id` interns the self shape (mutates the intern table); this is idempotent with
         // the generic dyn path (`cap_dispatch_slots`), so interning here then falling through on a
         // miss re-derives the same id.
