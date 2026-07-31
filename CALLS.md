@@ -204,21 +204,29 @@ plumbing that lands in increments (§8).
    noted. Bindings stay split (`Binding::Offer` vs `Binding::LiveImpl`) through this increment —
    their merge onto one `Offer` binding rides increment 6 with the `drive_arc`/`ProviderState`
    retirement, so 4 re-plumbs the library-provider path without touching the process-provider one.
-   - **4a — Cross-world reified animation, run-to-completion.** Replace the isolated `drive_arc`
-     sub-scheduler (which by construction never parks back into the outer scheduler) with animating
-     the offer handler as a **reified fiber in the caller's own `FiberRegistry`** over the
-     provider's world: the provider's `mem`/`host` (from `ProviderState`) installed for the fiber's
-     run via the durable context-switch shape that `serve_switch` already uses (`shadow_switch`,
-     the §14 nested view — no new window-access path, INVARIANTS.md 2), restored on exit. For a
-     handler that runs to completion this is **byte-identical to 3a**: the same two `cap`-slot
-     translation edges, the same `OFFER_FUEL`/`ProviderState::fuel` drain, the same results. This
-     is the inline animation of old 3b, now landed in the shared scheduler where a park can be
-     filed. The one genuinely new primitive: a fiber in the caller's registry whose world differs
-     from the registry's owner — the security-sensitive seam of the increment, and the unit the
-     confinement fuzzer (AGENTS.md) extends to. Pin: existing
-     `impl_wiring`/`imports_impl`/`bytecode_diff`/`jit_diff` + the narrowed-lock concurrency test
-     unchanged, plus a fuel-parity pin (remaining fuel bit-identical to 3a for the non-parking
-     case).
+   - **4a — Cross-world reified animation, run-to-completion. DONE (2026-07-31, PR #572).** Replace
+     the isolated `drive_arc` sub-scheduler (which by construction never parks back into the outer
+     scheduler) with animating the offer handler as a **reified fiber in the caller's own
+     `FiberRegistry`** over the provider's world, for all four instanced-offer dispatch arms
+     (`cap.call`/`call.import`/`call.sym`/`call.import.dyn`, via one loop-scoped
+     `animate_instanced_offer!`). For a handler that runs to completion this is **byte-identical to
+     3a**: the same two `cap`-slot translation edges, the same `OFFER_FUEL`/`ProviderState::fuel`
+     drain, the same results. This is the inline animation of old 3b, now landed in the shared
+     scheduler where a park can be filed. The one genuinely new primitive: a fiber in the caller's
+     registry whose world differs from the registry's owner — the security-sensitive seam of the
+     increment, and the unit the confinement fuzzer (AGENTS.md) extends to. **As built**, three
+     refinements the design under-specified: (i) the cross-world switch swaps the **full execution
+     context** — not just `mem`/`host` but **`fuel`** (to the provider budget, so provider-pays
+     drains identically — the handler runs on the caller's loop) and **code** (the handler runs
+     `entry.funcs` through the existing invoke seam as `INVOKE_MODULE`); (ii) admission moves from
+     3a's held `try_lock` to a `ProviderState.busy` word (the guard cannot span the handler's loop
+     iterations), a busy instance still answering `-EAGAIN`; (iii) the switch is non-durable — a
+     **durable caller/provider** or a **`ref.func` handler** declines to the unchanged `drive_arc`
+     sub-run (fail-closed, §9), and `shadow_switch` never runs on the animation. The switch mirrors
+     `serve_switch`; the settle rides the `Terminator::Return` fiber-exit keyed on
+     `offer_anim.handler_slot`. A mid-animation park is a `FiberFault` until 4b. Pin: existing
+     `impl_wiring`/`imports_impl` (incl. the all-backends oracle + the narrowed-lock two-vCPU
+     concurrency test) unchanged, the animated path confirmed taken.
    - **4b — Promotion (handler parks mid-animation).** A handler that parks files its reified fiber
      + waiter and the caller parks on the reply — `handler_parks` re-plumbed to the library-provider
      case, **reusing** the built waiter table (`ticket_waiters` keyed `(callee, ticket)`, I49) and
