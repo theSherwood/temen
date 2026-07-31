@@ -781,6 +781,11 @@ static PAR_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 /// and the powerbox grant so guest `install` lands in range (mirrors [`jit_exec`]).
 const PAR_JIT_TABLE_LOG2: u8 = 4;
 
+/// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches svm-run's
+/// `CLI_JIT_TABLE_LOG2`. A self-hosted guest (the JACL compiler) binds a staged unit's `Slot` imports
+/// to its own functions by index, so the table must cover the host program's function count (~800).
+const ONRAMP_JIT_TABLE_LOG2: u8 = 10;
+
 /// Build the **shared powerbox** for a §22-JIT run: grant the `Jit` cap (16-slot table) on a fresh
 /// `Host`, host-compile [`JIT_SERVICE`] into it, then leak it and publish the pointer for every Worker.
 /// `guest`'s declared memory sizes the domain (the validator's memory-match precondition). Returns `1`
@@ -1856,6 +1861,14 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_region_map" => (cap_id::SHARED_REGION, 0),
         "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
         "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
+        // Guest-driven JIT (§22) — the macro-staging on-ramp grants the Jit cap; mirrors
+        // svm-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
@@ -1916,6 +1929,21 @@ fn grant_onramp_caps(
     for (name, handle) in ONRAMP_CAP_NAMES.iter().zip(&handles) {
         host.register_cap_name(name, *handle);
     }
+    // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
+    // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
+    // compiler uses it to expand macros in-guest. Match svm-run's powerbox grant so a self-hosted
+    // guest behaves identically: a 1024-slot dispatch table (a staged unit's `Slot` imports call back
+    // into the host program's ~800 functions by index) and fiber hosting (a staged macro runs on the
+    // compiler's scheduler root, which suspends). `browser_jit_validator` verifies every submitted
+    // unit — the security hinge, so this stays "as secure as wasm".
+    let jit_h: Option<i32> = if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
+        let h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), ONRAMP_JIT_TABLE_LOG2);
+        host.set_jit_validator(browser_jit_validator);
+        host.set_jit_hosts_fibers(true);
+        Some(h)
+    } else {
+        None
+    };
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
@@ -1935,6 +1963,10 @@ fn grant_onramp_caps(
                     (cap_id::EXIT, _) => handles[2],
                     (cap_id::MEMORY, _) => handles[3],
                     (cap_id::ADDRESS_SPACE, _) => handles[4],
+                    (cap_id::JIT, _) => match jit_h {
+                        Some(h) => h,
+                        None => return svm_interp::BoundImport::rebindable(0, 0, None),
+                    },
                     _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -2112,6 +2144,12 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
     let (frame, _keys) = grant_onramp_caps(&mut host, m, None);
     let mut fuel = u64::MAX;
+    // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
+    // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
+    // just like a static `cap.call (JIT, op)`, and multiplexes the guest's scheduler cooperatively
+    // (no OS threads — so this runs on the wasm32 cdylib, unlike the tree-walker's thread pool). A
+    // C guest that grows a large heap with sub-64-KiB `vm_map`s runs unchanged now that the interp's
+    // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
@@ -2132,6 +2170,17 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stderr: host.stderr,
         framebuffer,
     }
+}
+
+/// On-ramp powerbox **with the §22 `Jit` capability granted** — for the self-hosted JACL
+/// compiler-guest (`jacl_compiler.svmb`), which expands macros in-guest by compiling each macro body
+/// with `vm_jit_compile_linked` and running it with `vm_jit_invoke2`. This now delegates to
+/// [`onramp_exec`], which grants the `Jit` cap conditionally (any guest importing `vm_jit_*`) via
+/// [`grant_onramp_caps`] and runs a Jit-importing guest on the tree-walker so its import-bound
+/// `invoke`/`install` reach the driver (see `onramp_exec`). Kept as a named entry for callers that
+/// specifically mean "run the compiler-guest".
+pub fn onramp_jit_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    onramp_exec(m, stdin)
 }
 
 /// Run `m`'s function 0 under the **POSIX personality** (POSIX.md / STAGE1.md) instead of the fixed
@@ -4759,6 +4808,7 @@ pub extern "C" fn svm_onramp_jit_run_open(
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
+    shared: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
@@ -4776,8 +4826,11 @@ pub extern "C" fn svm_onramp_jit_run_open(
             return -STATUS_DECODE_ERR;
         }
     };
-    // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampRun::open_owned_run(&m, JIT_RUN_WIN_LOG2, true, stdin) {
+    // `shared != 0` ⇒ the emitted module imports a **shared** memory (the threads/cross-origin-isolated
+    // build); `0` for the plain single-threaded build (e.g. GitHub Pages, no COOP/COEP), where the host
+    // instantiates the emitted module against a non-shared `WebAssembly.Memory`. The flag must match the
+    // memory the host actually provides — a mismatch fails instantiation.
+    match JitOnrampRun::open_owned_run(&m, JIT_RUN_WIN_LOG2, shared != 0, stdin) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
@@ -5640,48 +5693,120 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
-// A minimal symbol-table wire form for `compile_linked` (the browser embedder's own, since the engine
-// passes the bytes opaquely to the validator — both ends are ours). Each entry: `name_len: u8`,
-// `name` bytes (UTF-8), `type_id: u32` LE, `op: u32` LE — a name → `Cap(type_id, op)` binding. Empty
-// bytes ⇒ no bindings (the closed-blob `compile` op), so a unit with imports fails closed.
+// The **canonical** §22 `compile_linked` symbol-table wire form (mirrors `svm-run::decode_symbol_table`,
+// DESIGN.md §22): a LEB128 stream `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind`
+// byte, and its payload — `0` = `Slot(uleb)` (a shared `call_indirect` table slot: the *dynamic*-link
+// case a guest loader uses to bind a submitted unit's imports to functions of the host program it runs
+// inside — e.g. the JACL self-hosted compiler-guest binding a staged macro's `call.sym` imports to its
+// own `jaclrt` runtime funcs), `1` = `Cap(uleb type_id, uleb op)` (a host capability). Empty bytes ⇒
+// the closed-blob `compile` op (no bindings), so a unit with imports fails closed. This must match the
+// producer (the on-ramp/`svm-llvm` guest loader) byte-for-byte, so it is NOT a browser-private form.
 
-/// Build a `compile_linked` symbol table binding each `name` to a host capability `(type_id, op)`.
-fn encode_symtab(entries: &[(&str, u32, u32)]) -> Vec<u8> {
+/// A minimal fail-closed LEB128 cursor for [`decode_symtab`] (never panics / over-reads).
+struct SymCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SymCursor<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    /// Unsigned LEB128 → `u64` (max 10 bytes; rejects overflow / truncation).
+    fn uleb(&mut self) -> Option<u64> {
+        let (mut result, mut shift) = (0u64, 0u32);
+        loop {
+            let b = self.byte()?;
+            if shift >= 64 || (shift == 63 && b & 0x7f > 1) {
+                return None;
+            }
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+        }
+    }
+    fn u32(&mut self) -> Option<u32> {
+        u32::try_from(self.uleb()?).ok()
+    }
+    fn string(&mut self) -> Option<String> {
+        let n = usize::try_from(self.uleb()?).ok()?;
+        let end = self.pos.checked_add(n)?;
+        let s = core::str::from_utf8(self.bytes.get(self.pos..end)?).ok()?;
+        self.pos = end;
+        Some(s.to_string())
+    }
+}
+
+/// Build a `compile_linked` symbol table (canonical wire form; used by the reference `Jit` tests).
+fn encode_symtab(entries: &[(&str, svm_ir::Resolved)]) -> Vec<u8> {
+    fn uleb(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
     let mut out = Vec::new();
-    for (name, type_id, op) in entries {
-        out.push(name.len() as u8);
+    uleb(&mut out, entries.len() as u64);
+    for (name, r) in entries {
+        uleb(&mut out, name.len() as u64);
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&type_id.to_le_bytes());
-        out.extend_from_slice(&op.to_le_bytes());
+        match r {
+            svm_ir::Resolved::Slot(slot) => {
+                out.push(0);
+                uleb(&mut out, *slot as u64);
+            }
+            svm_ir::Resolved::Cap(cap) => {
+                out.push(1);
+                uleb(&mut out, cap.type_id as u64);
+                uleb(&mut out, cap.op as u64);
+            }
+            svm_ir::Resolved::Func(_) => {
+                unreachable!("Func is not deliverable via the symbol table")
+            }
+        }
     }
     out
 }
 
-/// Decode an [`encode_symtab`] buffer; `None` (fail-closed) on any malformation.
-fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, u32, u32)>> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let len = *bytes.get(i)? as usize;
-        i += 1;
-        let name = core::str::from_utf8(bytes.get(i..i + len)?)
-            .ok()?
-            .to_string();
-        i += len;
-        let type_id = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?);
-        i += 4;
-        let op = u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?);
-        i += 4;
-        out.push((name, type_id, op));
+/// Decode a canonical `compile_linked` symbol table; `None` (fail-closed) on any malformation.
+fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, svm_ir::Resolved)>> {
+    // The closed-blob `compile` op passes no table (`&[]`) — the empty table (resolves nothing).
+    if bytes.is_empty() {
+        return Some(Vec::new());
     }
-    Some(out)
+    let mut c = SymCursor { bytes, pos: 0 };
+    let count = c.uleb()?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let name = c.string()?;
+        let resolved = match c.byte()? {
+            0 => svm_ir::Resolved::Slot(c.u32()?),
+            1 => svm_ir::Resolved::Cap(svm_ir::ResolvedCap {
+                type_id: c.u32()?,
+                op: c.u32()?,
+            }),
+            _ => return None, // unknown kind
+        };
+        out.push((name, resolved));
+    }
+    // Trailing bytes ⇒ a length mismatch — reject rather than silently ignore (fail-closed).
+    (c.pos == bytes.len()).then_some(out)
 }
 
 /// The browser's [`svm_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
 /// cap: decode the symbol table → `decode_module` (fail-closed) → resolve named imports against the
-/// table → `verify_module` (the escape-freedom gate) → the memory-match precondition → reject data
-/// segments and concurrency ops. A pure-Rust replica of `svm-run`'s canonical validator (own symtab
-/// wire form), so it builds for wasm with no Cranelift dep.
+/// table (`Slot`/`Cap`) → `verify_module` (the escape-freedom gate) → the memory-match precondition →
+/// reject data segments and concurrency ops. A pure-Rust replica of `svm-run`'s canonical validator
+/// (same symtab wire form), so it builds for wasm with no Cranelift dep.
 fn browser_jit_validator(
     bytes: &[u8],
     mem_log2: Option<u8>,
@@ -5694,14 +5819,13 @@ fn browser_jit_validator(
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return Err(EINVAL);
     };
-    // Bind named imports to host caps via the table; an unresolved import ⇒ fail closed (re-verified).
+    // Bind named imports via the table (a Slot → `call_indirect`, a Cap → `cap.call`); an unresolved
+    // import ⇒ fail closed (the module is re-verified after the rewrite).
     let resolve = |name: &str| {
-        table.iter().find(|(n, _, _)| n == name).map(|(_, t, o)| {
-            svm_ir::Resolved::Cap(svm_ir::ResolvedCap {
-                type_id: *t,
-                op: *o,
-            })
-        })
+        table
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, r)| r.clone())
     };
     let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
@@ -5797,7 +5921,10 @@ pub fn dynlink_exec(m: &svm_ir::Module, link: bool) -> (i32, i64) {
     let clock = host.grant_clock();
     // Bind "clock" → the Clock cap (iface 2, op 0) iff linking; otherwise an empty table (fail-closed).
     let symtab = if link {
-        encode_symtab(&[("clock", 2, 0)])
+        encode_symtab(&[(
+            "clock",
+            svm_ir::Resolved::Cap(svm_ir::ResolvedCap { type_id: 2, op: 0 }),
+        )])
     } else {
         Vec::new()
     };

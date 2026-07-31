@@ -72,7 +72,9 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes) {
     stdinP = Number(ex.svm_alloc(stdinLen));
     u8().set(stdinBytes, stdinP);
   }
-  const opened = ex.svm_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen);
+  // shared=1: this demo instantiates the emitted module against the cdylib's **shared** memory
+  // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
+  const opened = ex.svm_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
   ex.svm_dealloc(modP, moduleBytes.length);
   if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
   if (opened !== 0) {

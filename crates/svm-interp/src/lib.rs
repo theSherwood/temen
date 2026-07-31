@@ -17944,13 +17944,19 @@ impl Host {
 /// interpreter memory bounded by what a (fuel-limited) run touches, so a huge declared window never
 /// eagerly allocates — safe to fuzz.
 fn host_page_size() -> u64 {
-    // wasm has no host MMU and no `mprotect`: linear-memory pages are a fixed 64 KiB, so report that
-    // (and avoid pulling the `page_size` crate into the wasm dependency graph). On native, query the
-    // real host page so interpreter and JIT agree page-for-page.
+    // This is the **software** protection granularity of the interpreter's `Mem` (the `map`/`unmap`/
+    // `protect` prot-map and the `Paged` chunking) — NOT wasm's 64 KiB linear-memory page. A guest's
+    // `map` calls must align to it, and an on-ramp C guest (svm-llvm-translate) emits 4 KiB-granular
+    // `map`s, so on wasm we report 4 KiB rather than wasm's 64 KiB: a coarser 64 KiB prot page makes a
+    // 4 KiB-granular `map`/access mismatch and faults the guest mid-heap-grow. Nothing on wasm needs
+    // the 64 KiB value — there is no host MMU / `mprotect` (the prot-map is pure software) and no
+    // Cranelift JIT whose OS page tables the interpreter must agree with (the native concern below).
     #[cfg(target_family = "wasm")]
     {
-        65536
+        4096
     }
+    // On native, query the real host page so the interpreter and the (PROT_NONE-page-table) JIT agree
+    // page-for-page — the interp≡JIT differential requires identical fault granularity.
     #[cfg(not(target_family = "wasm"))]
     match page_size::get() as u64 {
         0 => 4096,

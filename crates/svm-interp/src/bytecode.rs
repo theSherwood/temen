@@ -291,6 +291,10 @@ enum Op {
         handle: u32,
         args: Box<[u32]>,
         dst: u32,
+        /// The call's `sig.params` — carried so an **import-bound** call that resolves to a §22 `Jit`
+        /// driver op (`invoke`/`install`/`uninstall`) can be marshalled to the driver like a static
+        /// `cap.call (JIT, op)` (which lowers straight to [`Op::JitInvoke`]). Empty when unused.
+        params: Box<[ValType]>,
         results: Box<[ValType]>,
     },
     /// §3.6 serve-loop core (ISSUES.md I36 slice 1): `svc.poll` (`cap.call CAP_SELF 9`) — drain
@@ -1554,6 +1558,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     type_id: *type_id,
                     op: *op,
                     handle: g(*handle),
+                    params: sig.params.clone().into(),
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
                     results: sig.results.clone().into(),
@@ -1670,6 +1675,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
             op: *import | (*op << 16),
             handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
+            params: sig.params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: sig.results.clone().into(),
@@ -1682,6 +1688,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             type_id: svm_ir::CAP_IMPORT_TYPE_ID,
             op: *import,
             handle: u32::MAX,
+            params: sig.params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: sig.results.clone().into(),
@@ -1698,6 +1705,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             type_id: svm_ir::CAP_DYN_TYPE_ID,
             op: *ty | (*op << 16),
             handle: g(*handle),
+            params: sig.params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
             results: sig.results.clone().into(),
@@ -1724,6 +1732,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             type_id: svm_ir::CAP_IMPORT_ATTACH_TYPE_ID,
             op: *import,
             handle: g(*handle),
+            params: [].into(),
             args: [g(*handle)].into(),
             dst,
             results: [ValType::I32].into(),
@@ -11323,6 +11332,7 @@ impl Vm {
                     type_id,
                     op,
                     handle,
+                    params,
                     args,
                     dst,
                     results,
@@ -11342,6 +11352,55 @@ impl Vm {
                     let mut argv: Vec<i64> = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
+                    }
+                    // §22: an **import-bound** `Jit` driver op (`invoke`/`install`/`uninstall`) can't be
+                    // serviced by the generic `cap_dispatch_slots` — it needs the scheduler-owning
+                    // driver, exactly like a *static* `cap.call (JIT, op)` (which lowers straight to
+                    // `Op::JitInvoke`). Resolve the binding and surface the same driver `Outcome`, so a
+                    // self-hosted guest whose `__vm_jit_*` are lowered to `call.import` (svm-llvm) drives
+                    // the Jit cap on the bytecode engine too (the pure-host `compile`/`compile_linked`
+                    // ops 0/5 stay on `cap_dispatch_slots` below). The submitted unit is re-verified by
+                    // the embedder's `jit_validator` before it runs — the security hinge is unchanged.
+                    if *type_id == svm_ir::CAP_IMPORT_TYPE_ID {
+                        if let Some(b) = host.with(|p| p.import_binding(*op)) {
+                            if b.bound
+                                && b.type_id == super::cap_id::JIT
+                                && matches!(b.op, 1 | 3 | 4)
+                            {
+                                if argv.is_empty() {
+                                    return Err(Trap::CapFault); // invoke/install/uninstall need arg0
+                                }
+                                self.module = module;
+                                self.cur = cur;
+                                self.base = base;
+                                self.pc = pc + 1;
+                                return Ok(match b.op {
+                                    3 => Outcome::JitInstall {
+                                        h: b.handle,
+                                        code: argv[0] as i32,
+                                        dst: *dst,
+                                    },
+                                    4 => Outcome::JitUninstall {
+                                        h: b.handle,
+                                        slot: argv[0],
+                                        dst: *dst,
+                                    },
+                                    _ => Outcome::JitInvoke {
+                                        h: b.handle,
+                                        code: argv[0] as i32,
+                                        argv: argv[1..].to_vec().into_boxed_slice(),
+                                        dst: *dst,
+                                        // The unit entry's params are the call's params minus arg0 (code).
+                                        params: params
+                                            .get(1..)
+                                            .unwrap_or(&[])
+                                            .to_vec()
+                                            .into_boxed_slice(),
+                                        results: results.clone(),
+                                    },
+                                });
+                            }
+                        }
                     }
                     // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
                     // offer never reaches the generic dispatch. It enqueues on the callee's
