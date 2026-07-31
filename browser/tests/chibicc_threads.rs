@@ -94,3 +94,33 @@ int main(void) {
     let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     assert!(!m.funcs.is_empty(), "a non-empty module");
 }
+
+/// The playground's **real** `<stdatomic.h>` (INTERACTIVE_EMBEDDING.md): `atomic_fetch_add` /
+/// `atomic_load` / `atomic_store` lower to the VM's genuine atomic RMW ops (not plain `*p += v`),
+/// so a lock-free counter is correct under any interleaving. Compiled through chibicc-the-guest
+/// against the seeded header, the emitted IR must carry the atomic ops.
+#[test]
+fn stdatomic_lowers_to_real_atomics_in_the_playground() {
+    let Some(chibicc) = chibicc_svmb() else {
+        eprintln!("SKIP: chibicc.svmb absent");
+        return;
+    };
+    let ir = compile(
+        &chibicc,
+        r#"
+#include <stdatomic.h>
+atomic_int counter;
+int main(void) {
+  atomic_store(&counter, 0);
+  for (int i = 0; i < 20; i++) atomic_fetch_add(&counter, 1);
+  return atomic_load(&counter);
+}
+"#,
+    );
+    assert!(
+        ir.contains("atomic.rmw.add"),
+        "atomic_fetch_add lowered to a real atomic RMW (not plain +=):\n{ir:.400}"
+    );
+    let m = svm_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    assert!(!m.funcs.is_empty(), "a non-empty module");
+}

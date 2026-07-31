@@ -2534,6 +2534,14 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/semaphore.h",
             include_str!("../../frontend/chibicc/include/semaphore.h"),
         ),
+        // C11 atomics (INTERACTIVE_EMBEDDING.md): the playground's own `<stdatomic.h>` maps the
+        // atomic ops to the **real** VM atomic builtins (not plain `*p += v` like the frontend's
+        // display header), so a lock-free `atomic_fetch_add` counter stays correct under any
+        // interleaving — the "atomic counter survives chaos mode" lesson.
+        (
+            "include/stdatomic.h",
+            include_str!("../playground-include/stdatomic.h"),
+        ),
         // The system-header surface chibicc's *own* sources #include (SELFHOST_C.md §7, stage-2). Most
         // are thin stubs — the sandbox has no processes/globbing/wall-clock — present so `chibicc.h`
         // parses; `<time.h>` returns a fixed 1970 epoch (for the `__DATE__`/`__TIME__` macros), and the

@@ -168,6 +168,14 @@ is the same root class as I53 — not a new bug — and the retry idiom is the s
 serve/park race on **any** handler that needs its parked caller. Fully closing it would require the
 serve protocol to register the caller's waiter before the dispatch is servable (still S4).
 
+**Sighting 2026-07-31** (CI, `build · test (windows-latest)` on PR #571 — a `svm-dap` + browser-only
+diff, nothing in the svc/fork path): `pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child`
+got `left: [I64(-11)]` (a raced `fork` handed the parent `-EAGAIN` instead of the twin's `TaskId 3`) —
+exactly the `-EAGAIN` fork-race face documented above, now on the `pid_mode` test rather than the
+retry-guarded `fork_then_wait`. Unlike `fork_then_wait`, the `pid_mode` fixture does **not** retry on
+`-EAGAIN`, so it flakes directly under Windows CI load; the standing mitigation (guest-side retry) or
+the deterministic-serve fix would cover it. Same I53 root class, unrelated to the diff.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and

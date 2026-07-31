@@ -168,6 +168,13 @@ fn build_scheduled_run(
         ScheduledDebugRun::new(module, func, args)?
     };
     run.set_sched_seed(seed);
+    // Position the run **stopped at the entry op of the root task**, so the first `step` steps from
+    // there instead of falling through to `run_until_stop` (which — with no breakpoint set — would
+    // run the whole program on the first step). The single-vCPU `DebugRun` is entry-stopped by
+    // construction; the scheduled run needs an explicit `locate()` (the seek path already calls it
+    // after its replay drive; a fresh launch didn't). Without this, a threaded program couldn't be
+    // source-line-stepped at all — `stepIn` ran it to completion.
+    run.locate();
     Some(run)
 }
 
