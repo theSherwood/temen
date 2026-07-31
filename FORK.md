@@ -246,7 +246,21 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
   child-sees-0, both copies doing libc I/O over the shared memfs. interp==JIT differential. The first
   real program forking on svm.
 
-Key refs: `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
+**Status (2026-07-31) — the real-libc capstone has landed; only the chibicc *frontend* remains.**
+`crates/svm/tests/fork_manager.rs` is the end-to-end real-libc fork: the manager spawns the server,
+mints the fork offer with `child_offer`, then spawns a guest via `instantiate_named` re-granting BOTH
+the fork offer *and* the forkable posix libc (slice 3's `regrant_into_child` `HostProc` branch), the
+guest resolves both by name, calls `fork()`, and BOTH copies `write(1, &ret, 8)` through the ONE shared
+libc memfs — parent-sees-pid (3) / child-sees-0, fork-shares-fds. This closes slices 1+3 as a working
+whole and demonstrates the exact wiring a compiled-C `fork()` will use. The guest is **hand-written IR**
+resolving caps by name, which is what lets it sidestep the `__px_` import binder. Landing it also needed
+one extra interp gate: `can_regrant`/`forkable_host_proc` — op-11's grant-list admission must accept a
+forkable `HostProc` as a re-grantable handle (previously only pipes/regions/offers/copyables passed).
+**Remaining for a *compiled-C* program:** slice 2 (`__px_fork` shim binding in `bind_shim`) + slice 4
+(compiled-C `_start` entry ABI over op 11/13). Those two turn the hand-written guest into a chibicc one;
+the substrate underneath them is now proven end to end.
+
+Key refs: `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
 `bind_with_fork` (`svm-posix/src/lib.rs`), `bind_shim` + harness (`crates/svm/tests/c_posix_spawn.rs`),
 op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (svm-interp).
 
