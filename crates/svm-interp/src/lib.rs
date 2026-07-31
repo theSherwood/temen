@@ -7117,6 +7117,11 @@ struct VCpu {
     /// (the op's result). Lives on the vCPU because the activation spans rewind-driven
     /// re-executions (and possibly a `svc.wait` park); reset when the count is delivered.
     serve_count: i64,
+    /// CALLS.md 4a — the in-flight **cross-world offer animation**, set when a `cap.call` (or
+    /// import/sym/dyn) arm switches into an instanced-offer handler over the provider's world and
+    /// consumed when that handler fiber returns (the `Terminator::Return` fiber-exit settle). See
+    /// [`OfferAnim`]. `None` on every non-animating vCPU and outside an animation.
+    offer_anim: Option<OfferAnim>,
 }
 
 /// §3.6 slice 5b — the serve loop's in-flight handler: the registry slot/handle the handler
@@ -7205,6 +7210,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
+            offer_anim: None,
         }
     }
 
@@ -7267,6 +7273,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
+            offer_anim: None,
         })
     }
 
@@ -7351,6 +7358,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
+            offer_anim: None,
         }
     }
 
@@ -7781,6 +7789,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         serve_run,
         handler_parks,
         serve_count,
+        offer_anim,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -7817,6 +7826,159 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // fiber's stack is in `frames` — see the comments on those arms.
     'frames: loop {
         let top = frames.len() - 1;
+        // CALLS.md 4a — switch this vCPU into an **instanced offer's handler** as a reified fiber
+        // over the provider's world, run-to-completion (the `serve_switch` shape, cross-world).
+        // `$entry: &OfferEntry` (`state.is_some()`), `$op: u32` the offer op, `$args: &[i64]` the
+        // caller's raw arg slots. On a clean switch this `continue 'frames` into the handler; on a
+        // busy instance it `continue`s with a probeable `-EAGAIN`; it **falls through** (does
+        // nothing) only when it *declines* the in-loop path — a durable caller/provider or a
+        // `ref.func` handler — leaving the caller to run the byte-identical 3a `drive_arc` sub-run.
+        // The provider's `{mem, host, fuel, code}` are installed on this vCPU for the handler and
+        // restored when it returns (the [`OfferAnim`] settle in `Terminator::Return`). Defined here
+        // — after `let top`, inside the loop — so the `'frames` label and `top` are in scope (the
+        // `serve_switch` pattern). Zero cost: a `macro_rules!` is purely syntactic.
+        macro_rules! animate_instanced_offer {
+            ($entry:expr, $op:expr, $args:expr) => {{
+                let entry_: &OfferEntry = $entry;
+                let op_: u32 = $op;
+                let args_: &[i64] = $args;
+                if !durable && !unit_uses_ref_func(&entry_.funcs) {
+                    if let (Some(&f_), Some(osig_)) =
+                        (entry_.ops.get(op_ as usize), entry_.sigs.get(op_ as usize))
+                    {
+                        if args_.len() == osig_.params.len() {
+                            let state_ = entry_.state.clone().ok_or(Trap::CapFault)?;
+                            // The three admission outcomes, decided under one brief state lock (the
+                            // busy check+set is atomic under it, so concurrent callers serialize).
+                            enum Adm {
+                                Eagain,
+                                // `Host` is large (~1KB); box it so the enum stays small
+                                // (clippy `large_enum_variant`).
+                                Go(Vec<i64>, u64, Option<Mem>, Box<Host>),
+                                Decline,
+                            }
+                            let adm_ = {
+                                let mut guard_ = match state_.try_lock() {
+                                    Ok(g) => g,
+                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                                    // Held only by the 3a fallback (durable providers) or a
+                                    // wiring/introspection API; the animated path releases it and
+                                    // guards with `busy`. A held lock reads as busy: -EAGAIN.
+                                    Err(std::sync::TryLockError::WouldBlock) => {
+                                        frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                        continue;
+                                    }
+                                };
+                                let st_ = &mut *guard_;
+                                if st_.busy {
+                                    Adm::Eagain
+                                } else if st_.fuel == 0 || st_.host.is_durable() {
+                                    // Dry reserve or a durable provider world: the 3a `drive_arc`
+                                    // fallback handles both, byte-identically.
+                                    Adm::Decline
+                                } else {
+                                    // Edge 1 — cap args caller→provider (caller `hg` held only
+                                    // here); a forged/dead cap fails closed as 3a's edge-1 `?`,
+                                    // with no world checked out yet.
+                                    let mut arg_slots_ = args_.to_vec();
+                                    {
+                                        let mut hg =
+                                            host.lock().unwrap_or_else(|e| e.into_inner());
+                                        translate_cap_slots(
+                                            &mut hg,
+                                            &mut st_.host,
+                                            &osig_.params,
+                                            &mut arg_slots_,
+                                        )?;
+                                    }
+                                    let budget_ = st_.fuel.min(OFFER_FUEL);
+                                    st_.busy = true;
+                                    let pm_ = st_.mem.take();
+                                    // `take` leaves a throwaway default in `st_.host`; the real host
+                                    // rides on the vCPU until the settle restores it (busy meanwhile).
+                                    let ph_ = std::mem::take(&mut st_.host);
+                                    Adm::Go(arg_slots_, budget_, pm_, Box::new(ph_))
+                                }
+                                // `guard_` drops — the state lock is not held across the run.
+                            };
+                            match adm_ {
+                                Adm::Eagain => {
+                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                    continue;
+                                }
+                                Adm::Decline => {} // fall through to the caller's 3a sub-run
+                                Adm::Go(arg_slots_, budget_, pm_, ph_) => {
+                                    // Allocate the handler fiber slot; exhaustion is backpressure —
+                                    // undo the checkout, answer -EAGAIN (never a trap).
+                                    let handle_ =
+                                        match registry.create(0, 0, spawn_quota.max_fibers, false) {
+                                            Ok(h_) => h_,
+                                            Err(_) => {
+                                                let mut st_ = state_
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                st_.mem = pm_;
+                                                st_.host = *ph_;
+                                                st_.busy = false;
+                                                frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                                continue;
+                                            }
+                                        };
+                                    let (hslot_, _) = registry.claim(handle_)?;
+                                    // Install the provider world on this vCPU: mem, host (fresh Arc
+                                    // for the handler's cap.calls), fuel (+ the top-level-entry
+                                    // charge mirroring `drive_arc`:1918), and code (invoke seam —
+                                    // `entry.funcs` as `INVOKE_MODULE`). Restored by the settle.
+                                    let saved_mem_ = std::mem::replace(mem, pm_);
+                                    let saved_host_ =
+                                        std::mem::replace(host, Arc::new(Mutex::new(*ph_)));
+                                    let saved_fuel_ = *fuel;
+                                    *fuel = budget_ - 1; // budget_ >= 1 (fuel != 0 above)
+                                    let saved_invoked_ = invoked.replace(entry_.funcs.clone());
+                                    let saved_ref_ = invoked_ref_slots.take();
+                                    let hvals_: Vec<Reg> = osig_
+                                        .params
+                                        .iter()
+                                        .zip(&arg_slots_)
+                                        .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
+                                        .collect();
+                                    *offer_anim = Some(OfferAnim {
+                                        state: state_.clone(),
+                                        handler_slot: hslot_,
+                                        saved_mem: saved_mem_,
+                                        saved_host: saved_host_,
+                                        saved_fuel: saved_fuel_,
+                                        saved_invoked: saved_invoked_,
+                                        saved_ref_slots: saved_ref_,
+                                        budget: budget_,
+                                        results: Arc::from(osig_.results.clone()),
+                                    });
+                                    // Park the caller frames as this handler's resumer and switch
+                                    // in (serve_switch shape; no `shadow_switch` — non-durable).
+                                    let parked_ = std::mem::take(frames);
+                                    *parked_frames += parked_.len();
+                                    if *cur == ROOT_FIBER {
+                                        *root_parked = Some(parked_);
+                                    } else {
+                                        registry.park_resumer(*cur, parked_);
+                                    }
+                                    chain.push(hslot_);
+                                    *cur = hslot_;
+                                    *frames = vec![Frame {
+                                        func: f_,
+                                        module: INVOKE_MODULE,
+                                        block: 0,
+                                        inst: 0,
+                                        vals: hvals_,
+                                    }];
+                                    continue 'frames;
+                                }
+                            }
+                        }
+                    }
+                }
+            }};
+        }
         if frames[top].module != cur_module {
             cur_module = frames[top].module;
             cur_funcs =
@@ -9574,6 +9736,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_of(h, *type_id)
                     };
                     if let Some(entry) = inst_offer {
+                        // CALLS.md 4a — animate the instanced offer's handler as a reified fiber in
+                        // this vCPU's registry over the provider's world (`continue 'frames` on a
+                        // switch, `-EAGAIN` on a busy instance), or fall through to the byte-identical
+                        // 3a `drive_arc` sub-run when it declines (durable caller/provider, `ref.func`).
+                        animate_instanced_offer!(&entry, *op, &argv);
                         let results = drive_instanced_offer(host, &entry, *op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -9747,6 +9914,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_import(*import | (*op << 16))
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -9847,6 +10017,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_import(*import)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, ty) in results.iter().zip(&sig.results) {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -9884,6 +10057,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.instanced_offer_for_dyn(*ty, *op, h)
                     };
                     if let Some((entry, eff_op)) = inst_offer {
+                        // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
+                        // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
+                        animate_instanced_offer!(&entry, eff_op, &argv);
                         let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
                         for (s, tyv) in results.iter().zip(&sig.results) {
                             frames[top]
@@ -10817,10 +10993,69 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
-                    frames[rtop]
-                        .vals
-                        .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
+                    // CALLS.md 4a — a returning **offer-animation** handler settles cross-world here
+                    // instead of the fiber `(status, value)` handoff: its resumer is the original
+                    // caller frame (resuming *past* its cap.call), so restore the caller's world,
+                    // drain the provider reserve, translate the results (edge 2), and push them.
+                    if offer_anim
+                        .as_ref()
+                        .is_some_and(|a| a.handler_slot == leaving)
+                    {
+                        let anim = offer_anim.take().expect("checked is_some");
+                        // Restore the caller's code + fuel; pull the provider's world off this vCPU.
+                        *invoked = anim.saved_invoked;
+                        *invoked_ref_slots = anim.saved_ref_slots;
+                        let spent = anim.budget - *fuel; // entry charge + handler consumption (== 3a)
+                        *fuel = anim.saved_fuel;
+                        let prov_mem = std::mem::replace(mem, anim.saved_mem);
+                        let prov_host_arc = std::mem::replace(host, anim.saved_host);
+                        // Run-to-completion: a handler that parked/spawned would have leaked a clone
+                        // of the provider-host `Arc` (that is 4b's promotion). If one escaped, fail
+                        // closed — a mid-animation park is a 4b capability, never a wrong answer.
+                        let prov_host = match Arc::try_unwrap(prov_host_arc) {
+                            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+                            Err(_) => {
+                                let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.busy = false;
+                                return Err(Trap::FiberFault);
+                            }
+                        };
+                        let mut result_slots: Vec<i64> = anim
+                            .results
+                            .iter()
+                            .zip(ret_buf.iter())
+                            .map(|(ty, r)| val_to_slot(r.to_value(*ty)))
+                            .collect();
+                        // Return the world to the instance, drain the reserve, and reopen admission
+                        // BEFORE the fallible result edge (so an error can't strand `busy`); then
+                        // edge 2 — cap results provider→caller — under the `state → hg` order (3a §phase 3).
+                        {
+                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.mem = prov_mem;
+                            st.host = prov_host;
+                            st.fuel -= spent;
+                            st.busy = false;
+                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            translate_cap_slots(
+                                &mut st.host,
+                                &mut hg,
+                                &anim.results,
+                                &mut result_slots,
+                            )?;
+                        }
+                        // Push the translated results into the caller frame — it resumes past its
+                        // cap.call with them, exactly as the direct-dispatch push would have.
+                        for (s, ty) in result_slots.iter().zip(anim.results.iter()) {
+                            frames[rtop]
+                                .vals
+                                .push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
+                    } else {
+                        frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
+                        frames[rtop]
+                            .vals
+                            .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
+                    }
                 }
             }
             Terminator::Unreachable => return Err(Trap::Unreachable),
@@ -13237,6 +13472,14 @@ pub struct ProviderState {
     /// meters on what you granted" story). A provider worried about a hammering child
     /// rate-limits or kills the child itself; the platform just meters honestly.
     fuel: u64,
+    /// CALLS.md 4a **admission word**: `true` while an in-loop cross-world animation has this
+    /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
+    /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
+    /// `try_lock` did — the animated path cannot hold the state guard across the handler's many
+    /// loop iterations, so this flag serializes admission in its place. The 3a `drive_arc`
+    /// fallback (durable providers) still admits under the held guard and never sets this. (The
+    /// full §10.3 closed bit — freeze/teardown — rides 4b.)
+    busy: bool,
 }
 
 /// The default provider fuel reserve (§5.3 provider-pays): generous — a service is expected
@@ -13248,6 +13491,41 @@ const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 /// fail-closed and identically on every backend. Caller-fuel threading is the designed
 /// follow-up alongside exporter-domain state.
 const OFFER_FUEL: u64 = 1 << 26;
+
+/// CALLS.md 4a — an **in-flight cross-world offer animation** on a vCPU: the record that lets the
+/// handler run as a reified fiber in the caller's registry over the provider's world, and settle
+/// byte-identically to 3a's `drive_arc` when it returns. Carried as `VCpu::offer_anim`, `Some`
+/// only while an animated handler fiber is on the resume chain (run-to-completion in 4a; a mid-run
+/// park is a `FiberFault` until 4b wires promotion).
+///
+/// The handler runs on the caller's own `'frames` loop, so the caller's `{mem, host, fuel}` are
+/// swapped to the provider's for the handler and restored here on its return — `fuel` too, so the
+/// drain lands on the provider's reserve (provider-pays, 3a), not the caller (caller-pays is
+/// increment 5).
+struct OfferAnim {
+    /// The provider instance whose world is checked out (`busy = true`) for this animation.
+    state: Arc<Mutex<ProviderState>>,
+    /// The registry slot of the animated handler fiber — matched against the returning fiber to
+    /// recognize *this* animation's settle in the `Terminator::Return` fiber-exit.
+    handler_slot: usize,
+    /// The caller's `mem`, parked while the provider's window is installed on the vCPU.
+    saved_mem: Option<Mem>,
+    /// The caller's `Arc<Mutex<Host>>`, parked while the provider's host is installed.
+    saved_host: Arc<Mutex<Host>>,
+    /// The caller's remaining fuel, parked while the provider's budget funds the handler.
+    saved_fuel: u64,
+    /// The caller's `invoked` unit (the transient [`INVOKE_MODULE`] code table), parked while the
+    /// provider's `entry.funcs` is installed as the animated handler's code.
+    saved_invoked: Option<Arc<[Func]>>,
+    /// The caller's `invoked_ref_slots`, parked alongside `saved_invoked`.
+    saved_ref_slots: Option<Vec<u32>>,
+    /// The fuel budget handed to the handler (`min(OFFER_FUEL, reserve)`); the settle drains the
+    /// provider reserve by `budget - remaining`, exactly as 3a does.
+    budget: u64,
+    /// The offer op's result types — the result `cap`-slot translation edge (provider→caller) and
+    /// the values to push into the caller frame on settle.
+    results: Arc<[ValType]>,
+}
 
 /// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
 /// re-grant the capability the slot names from `src`'s handle table into `dst`'s, replacing the
@@ -15066,6 +15344,7 @@ impl Host {
                 mem,
                 host: Host::new(),
                 fuel: PROVIDER_FUEL_RESERVE,
+                busy: false,
             }))),
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
@@ -15420,6 +15699,7 @@ impl Host {
                     mem,
                     host: Host::new(),
                     fuel: PROVIDER_FUEL_RESERVE,
+                    busy: false,
                 }))
             })
             .clone();

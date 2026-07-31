@@ -200,6 +200,57 @@ plumbing that lands in increments (§8).
    turn makes queue-on-contention (3c) safe for re-entrant/cyclic calls (a parked holder frees the
    thread). The cross-domain fiber (different `mem`/`host`, the caller's registry) is the piece 3a
    deliberately stopped short of. Fuel is reproduced exactly against 3a's `drive_arc` behavior.
+   Decomposed into slices, smallest verifiable step first; each slice differentially pinned as
+   noted. Bindings stay split (`Binding::Offer` vs `Binding::LiveImpl`) through this increment —
+   their merge onto one `Offer` binding rides increment 6 with the `drive_arc`/`ProviderState`
+   retirement, so 4 re-plumbs the library-provider path without touching the process-provider one.
+   - **4a — Cross-world reified animation, run-to-completion. DONE (2026-07-31, PR #572).** Replace
+     the isolated `drive_arc` sub-scheduler (which by construction never parks back into the outer
+     scheduler) with animating the offer handler as a **reified fiber in the caller's own
+     `FiberRegistry`** over the provider's world, for all four instanced-offer dispatch arms
+     (`cap.call`/`call.import`/`call.sym`/`call.import.dyn`, via one loop-scoped
+     `animate_instanced_offer!`). For a handler that runs to completion this is **byte-identical to
+     3a**: the same two `cap`-slot translation edges, the same `OFFER_FUEL`/`ProviderState::fuel`
+     drain, the same results. This is the inline animation of old 3b, now landed in the shared
+     scheduler where a park can be filed. The one genuinely new primitive: a fiber in the caller's
+     registry whose world differs from the registry's owner — the security-sensitive seam of the
+     increment, and the unit the confinement fuzzer (AGENTS.md) extends to. **As built**, three
+     refinements the design under-specified: (i) the cross-world switch swaps the **full execution
+     context** — not just `mem`/`host` but **`fuel`** (to the provider budget, so provider-pays
+     drains identically — the handler runs on the caller's loop) and **code** (the handler runs
+     `entry.funcs` through the existing invoke seam as `INVOKE_MODULE`); (ii) admission moves from
+     3a's held `try_lock` to a `ProviderState.busy` word (the guard cannot span the handler's loop
+     iterations), a busy instance still answering `-EAGAIN`; (iii) the switch is non-durable — a
+     **durable caller/provider** or a **`ref.func` handler** declines to the unchanged `drive_arc`
+     sub-run (fail-closed, §9), and `shadow_switch` never runs on the animation. The switch mirrors
+     `serve_switch`; the settle rides the `Terminator::Return` fiber-exit keyed on
+     `offer_anim.handler_slot`. A mid-animation park is a `FiberFault` until 4b. Pin: existing
+     `impl_wiring`/`imports_impl` (incl. the all-backends oracle + the narrowed-lock two-vCPU
+     concurrency test) unchanged, the animated path confirmed taken.
+   - **4b — Promotion (handler parks mid-animation).** A handler that parks files its reified fiber
+     + waiter and the caller parks on the reply — `handler_parks` re-plumbed to the library-provider
+     case, **reusing** the built waiter table (`ticket_waiters` keyed `(callee, ticket)`, I49) and
+     reply plumbing (`cap_reply_or_stash`, `Waiter::Fiber`) rather than growing a parallel one
+     (INVARIANTS.md 1/4). The parked handler's `Vec<Frame>` sits `ParkedOn` in the caller's registry
+     carrying its world, re-installed on resume. The `single` admission gate stops being a **held**
+     `state.try_lock()` (which cannot survive a park) and becomes the §10.3 **admission word** — a
+     flag that reopens when the handler parks, closing its run-to-park atomicity window (§10.1). The
+     generation re-check on the phase-3 relock now earns its place (3a explicitly deferred it because
+     `drive_arc` had no suspension point). Pin: a parking library-provider handler completes
+     observably identical to the same handler behind a process provider (the `live_impl` path is the
+     blocking-behavior oracle).
+   - **4c — Queue-on-contention (old 3c).** With a parked holder freeing the thread, the busy
+     `single` path enqueues + parks instead of answering `-EAGAIN`; a re-entrant/cyclic call
+     completes instead of self-deadlocking. The bounded queue still refuses `-EAGAIN` at the rim when
+     full (fail-closed, §9). Pin: the increment-2 test that observed `-EAGAIN` on a busy /
+     self-granted instance flips to observing completion; queue-full still answers `-EAGAIN`.
+   - **4d — Direct handoff (§10.2 arm 4, delta §10.7).** A `single` process provider parked at
+     `svc.wait` is served by **direct handoff**: the caller claims the serve activation and animates
+     the handler on its own thread (no enqueue, no worker wake, no reply round-trip), a mid-handoff
+     park riding 4b's machinery. Settlement (§10.2): the handoff counts in the callee's serve
+     accounting, the parked `svc.wait` completing with the same `serve_count` observation the enqueue
+     path would have delivered. Pin: **handoff-on ≡ handoff-off** on observable results and
+     `serve_count`.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
    here**, uniformly on all backends. Closes the `live_impl` parity gap.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
