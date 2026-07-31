@@ -204,6 +204,8 @@ impl DapServer {
             "forceSwitch" => self.on_force_switch(args),
             "setVariable" => self.on_set_variable(args),
             "writeMemory" => self.on_write_memory(args),
+            "readMemory" => self.on_read_memory(args),
+            "seek" => self.on_seek(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -267,6 +269,7 @@ impl DapServer {
             // tree-walker fails the requests cleanly).
             ("supportsSetVariable", Json::Bool(true)),
             ("supportsWriteMemoryRequest", Json::Bool(true)),
+            ("supportsReadMemoryRequest", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -1087,6 +1090,70 @@ impl DapServer {
         )
     }
 
+    /// The standard `readMemory` request (`writeMemory`'s read twin — the memory-panel poll an
+    /// interactive embedder drives): `count` bytes at `memoryReference` (decimal or `0x` hex)
+    /// + `offset`, base64 in the reply. Fails cleanly on an unreadable range or no session.
+    fn on_read_memory(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let Some(addr) = args
+            .get("memoryReference")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        let Some(count) = args
+            .get("count")
+            .and_then(|v| v.as_i64())
+            .and_then(|c| usize::try_from(c).ok())
+        else {
+            return fail;
+        };
+        let Some(session) = self.session.as_ref() else {
+            return fail;
+        };
+        let target = (addr as u64).wrapping_add(offset as u64);
+        let Ok(bytes) = session.inspector.read_window(target, count) else {
+            return fail;
+        };
+        (
+            true,
+            Json::obj(vec![
+                ("address", Json::s(format!("0x{target:x}"))),
+                ("data", Json::s(base64_encode(&bytes))),
+            ]),
+            vec![],
+        )
+    }
+
+    /// The custom `seek` request (the history slider's verb): jump the session to time
+    /// `arguments.t` — the global scheduler turn multithreaded, the op clock single-threaded,
+    /// the same coordinate `reverseContinue` navigates. Forward or backward; replays through the
+    /// checkpoint ladder and lands as an ordinary stop (a seek past the end terminates). Replies
+    /// with the landed `t`.
+    fn on_seek(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(t) = args
+            .and_then(|a| a.get("t"))
+            .and_then(|v| v.as_i64())
+            .and_then(|t| u64::try_from(t).ok())
+        else {
+            return (false, Json::Null, vec![]);
+        };
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let stop = session.inspector.seek(t);
+        let landed = if session.scheduled {
+            session.inspector.turn()
+        } else {
+            session.inspector.clock()
+        };
+        let events = self.stop_events(stop);
+        (true, Json::obj(vec![("t", Json::i(landed as i64))]), events)
+    }
+
     /// The custom `forceSwitch` request (slice 7): override the schedule's next pick —
     /// `arguments.threadId` names the target DAP thread (task + 1), absent = "switch away" to the
     /// lowest-index other runnable task. The override is recorded at the current turn and survives
@@ -1503,6 +1570,25 @@ fn parse_int(s: &str) -> Option<i64> {
 
 /// Minimal RFC 4648 base64 decoder (the DAP `writeMemory` payload encoding) — standard alphabet,
 /// `=` padding, no line breaks. `None` on any malformed input.
+/// Minimal RFC 4648 base64 encoder (the `readMemory` payload encoding) — standard alphabet, padded.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let acc = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(acc >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {

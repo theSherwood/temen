@@ -99,6 +99,11 @@ territory). `single` providers keep interleaving determinism per admission order
 edges (with a generation re-check on the relock — the ABA machinery exists), never across the
 handler run. No lock crosses a domain boundary.
 
+**Addendum (2026-07-31):** §10 sharpens this section — it pins what "admission" is (§10.1), adds
+the **direct-handoff** arm into a process provider parked at `svc.wait` (§10.2), folds quiesce
+into the admission word (§10.3), bounds JIT crossing depth (§10.4), and adds the `fuel.remaining`
+readout (§10.6).
+
 ## 5. The three views
 
 - **Guest (caller):** unchanged. `cap.call` returns results; a call may block the calling fiber;
@@ -169,6 +174,8 @@ plumbing that lands in increments (§8).
    goal, now reachable without a parity regression).
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
+Addendum deltas to this plan: §10.7.
+
 ## 9. Invariants this must not break
 
 - **Confinement is untouched.** Every transport runs verified guest code over masked windows; the
@@ -179,3 +186,148 @@ plumbing that lands in increments (§8).
   nondeterminism stays quarantined in the deterministic explorer, as today.
 - **Run-to-park atomicity is preserved by default** (`single`): no existing handler's assumptions
   break without that provider opting into `threaded`.
+
+## 10. Addendum — admission, direct handoff, quiesce, and fuel introspection
+
+Settled with the owner 2026-07-31. Nothing here renegotiates an invariant; everything sharpens
+§2–§4 or rides the §8 increments (deltas in §10.7). Status: **design agreed, not yet built**,
+same as the parent design.
+
+### 10.1 What "admission" is
+
+Admission is the act of letting one inbound call mint a handler fiber in a provider's world. Being
+precise about the three things in play kills a recurring confusion:
+
+- **What the gate protects:** the provider *domain's* one world — specifically `single`'s
+  run-to-park atomicity (§3): between a handler's admission and its next park or return, no other
+  handler interleaves. The gate is per **provider domain**, never per fiber.
+- **What is admitted:** one dispatch, which mints one handler fiber.
+- **What the gate is not:** a whole-domain lock. The domain's `main`, its spawned threads, and its
+  previously-admitted handlers parked mid-outbound-call all keep existing and (where runnable)
+  running — blocking stays per-fiber (§2). A handler that parks closes its atomicity window and
+  the gate reopens; that is exactly how the §1 `A[f1] → B[f2] → A[f3] → B[f4]` chain composes.
+
+Consequences worth stating outright:
+
+- `single` serializes handlers **against each other**, never against the domain's own spawned
+  threads. A provider that threads over its handler state has taken the §12 discipline on itself;
+  the gate neither can nor should protect it from itself.
+- `threaded` has **no gate at all** — every call is admitted immediately as a concurrent fiber
+  (the only per-call check left is the quiesce bit, §10.3). The policy is a *declaration by the
+  provider*, never an inference from vCPU count — a domain has no fixed vCPU allotment to infer
+  from (vCPUs and fibers are workers inside the world, INVARIANTS.md 6). The runtime never pays a
+  serialization cost the guest didn't order (host = mechanism, guest = policy, INVARIANTS.md 4).
+- Admission *state* differs by provider kind, which is the whole content of the §3 axis-1 split:
+  a **library** provider's admission state is the one try-enter flag; a **process** provider's is
+  "at a serve point" — parked in `svc.wait`, or draining `svc.poll`. Between serve points its
+  world is its own and calls queue.
+
+### 10.2 The per-call transport decision (adds **direct handoff**)
+
+One decision tree per call, replacing "sync vs async" entirely. After the ordinary §3c use-site
+resolve:
+
+1. **Quiesce bit closed** (§10.3) → contended path: enqueue + park (bounded; `-EAGAIN` at the rim).
+2. **`threaded` provider** → no gate: mint a concurrent handler fiber, animate it inline on the
+   caller's thread.
+3. **`single` library provider, try-enter won** → inline animation (increment 3's arm).
+4. **`single` process provider parked at `svc.wait`** → **direct handoff**: the caller claims the
+   serve activation and animates the handler fiber on its own thread — no enqueue, no
+   wake-a-worker, no reply round-trip. The Doors / L4 direct-process-switch shape.
+5. **Otherwise** (mid-handler, between serve points, queue has priority work) → enqueue + park —
+   today's built transport, unchanged.
+6. **Handler parks mid-animation** (any inline arm) → promotion (increment 4): file the reified
+   fiber + waiter; the caller parks (interp) or thread-blocks (JIT).
+
+**Handoff settlement rule.** A handoff-served dispatch **counts in the callee's serve
+accounting**: the parked `svc.wait` completes with the same served-count observation the enqueue
+path would have delivered (`serve_count`, `svm-interp:9248`). The only degrees of freedom are
+which thread animated the handler and when the provider's `main` is scheduled awake — both already
+quarantined as scheduling (§4). Differential pin: **handoff-on ≡ handoff-off on observable
+results**, same discipline as increment 3's pin against increment 2.
+
+**Topology never gates.** The only "who" check is grant-graph reachability, applied at grant time
+(INVARIANTS.md 3); admission state is the entire call-time condition. A topology restriction
+(parent↔child only, say) could only ever be a transport pessimization — transports may differ,
+observable semantics may not (§4) — and a call-time gate keyed on caller identity is the shape
+INVARIANTS.md 4 forbids. Parent↔child calls get the fast path in practice because that is where
+uncontended admission dominates; a sibling introduced by `regrant_into_child` gets it on the same
+terms.
+
+### 10.3 Quiesce rides the admission word
+
+The admission flag gains a **closed** bit. Freeze and teardown close it, so one CAS answers both
+"busy" and "quiescing" with the same contended path — no second check, no new machinery. For
+`threaded` providers this bit is the only per-call check at all.
+
+- Once closed, no new crossing starts; in-flight handlers drain to completion or park. The
+  mid-handler freeze refusal is unchanged (`STATE_UNWINDING`, `svm-interp:9076`) — the previous
+  snapshot stays the recovery point.
+- A caller parked at the gate across a freeze **re-issues on thaw** — O10 at-least-once,
+  INVARIANTS.md 7. Recovery is re-execution, as everywhere.
+
+### 10.4 Crossing depth (the JIT arm's one new bound)
+
+Interp inline animation switches between **reified** fibers, so re-entrant `A→B→A→B` chains never
+grow the native stack. JIT crossings are real native frames through thunks — so the JIT arm
+carries a per-thread crossing-depth bound; at the bound the call **declines the inline arm and
+takes the parked transport** (declining toward the slower correct transport, never a wrong answer
+— the §9 fail-closed shape). Detached-window children (`instantiate_detached`) inline fine
+in-process; a future separate-process tier must decline handoff to the parked transport.
+
+### 10.5 Caller-pays refinements (deferred, demand-gated)
+
+Increment 5 lands caller-pays uniformly: fuel follows the fiber across the crossing — the counter
+just keeps draining — and the wirer-priced reserve (`impl_fuel_remaining`, `GUEST_IMPL_FUEL`)
+leaves with increment 6. The division of responsibility: the provider owns *what* runs (its code,
+its policy, its refusals); the caller owns *how much* runs (it made the calls), so the caller
+pays. Provider-pays is a drain-DoS against the provider and breaks the amplification bound (total
+computation a domain causes ≤ its budget, D19-attenuating down the grant graph).
+
+Two optional refinements, each **deferred until a named consumer** (INVARIANTS.md 1):
+
+- **Per-call fuel cap** (caller-side attenuation, D19-shaped): bound the caller's exposure to a
+  runaway provider. A cap changes *whose budget bounds the run*, not the trap semantics —
+  mid-handler exhaustion is still `OutOfFuel`, terminal for the provider's world (INVARIANTS.md 6).
+- **Admission fuel floor** (gate-side): refuse admission fail-closed — probeable errno, before any
+  mutation — when the caller's remaining fuel can't plausibly fund a handler. The shared-provider
+  protection against a starving caller. (The same hazard is strictly worse under provider-pays,
+  where deliberate drain is free.)
+
+### 10.6 Fuel introspection: `fuel.remaining`
+
+A new self-namespace op at the next reserved number (12, after `clone_caller` = 11):
+`fuel.remaining() -> i64`, the domain's remaining fuel. Authority-neutral — reports the domain's
+own state, confers nothing — riding `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace:
+no wire change, no new opcode.
+
+- **Deterministic by prior work.** Fuel is a checked cross-engine quantity charged at IR-anchored
+  safepoints (INVARIANTS.md 9, fuel clause; `bytecode_diff` already asserts bit-exact remaining
+  fuel), so the readout returns the identical value on every backend *by construction*. Because it
+  is observable, it lands **on all backends at once, with increment 5** — the same rule that
+  sequenced caller-pays — with its own differential pin.
+- **Call metering by subtraction.** Under caller-pays, the cost of a call is read-before minus
+  read-after. No metering ABI, no provider cooperation. (Provider-pays could never offer this —
+  the cost lands in someone else's reserve.)
+- **Why it earns its place.** `OutOfFuel` is a trap and traps are domain-terminal
+  (INVARIANTS.md 6); a probeable readout is what lets a domain checkpoint, return early, or
+  decline an expensive branch instead of dying mid-mutation — and it is the primitive the §10.5
+  refinements would build on.
+- **Raciness caveat.** In a multi-vCPU domain the readout is a snapshot of one shared,
+  monotonically decreasing counter — interleaving-dependent, quarantined in the deterministic
+  explorer like every other defined race; exact in a single-threaded domain.
+- **End state.** Once §15's live budget charging lands (the `create(module, window, budget)`
+  accounting), `Budget.read` (field 0) becomes the same number read through the quota object; the
+  intrinsic stays as the handle-free spelling or folds into it — decided then, not now.
+
+### 10.7 Increment deltas
+
+- **Direct handoff (interp)** rides increments 3–4 (a mid-handoff park needs the promotion
+  machinery). Pin: handoff-on ≡ handoff-off.
+- **Increment 5 additionally lands:** the JIT crossing-depth bound and `fuel.remaining` — both
+  observable, so both all-backends-at-once.
+- **Deferred, named-consumer-gated:** per-call fuel cap; admission fuel floor.
+
+What §9 gains: *transport choice — inline, handoff, or parked, and any future restriction of
+them — may never change observable results*; and `fuel.remaining` parity joins the differential
+contract.

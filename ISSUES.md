@@ -126,6 +126,34 @@ failure in a full `cargo test -p svm-interp` sweep, then **6/6 passes** rerunnin
 the same commit (a debug-path-only diff — nothing in the svc/fiber/clone path). Recurred, so it's
 climbing the "until it recurs" bar; same shape, no new information beyond load-sensitivity.
 
+**Sighting 2026-07-31 #2 + corrected root cause** (windows-latest, PR #564 — a fork slice-2 diff that
+touches only `bind_child_manifest`, *not* the `clone_caller` path, which uses `cap.self.resolve`/direct
+`cap.call`, no named imports). Same `clone_caller.rs:258` `left: 8, right: 16`. The earlier note read
+this as the reply "doubled" — that is backwards: the assert is `assert_eq!(bytes.len(), 16, …)`, so
+`left = actual = 8` (only **one** i64 write landed) and `right = expected = 16`. **The twin's write is
+missing, not doubled.** Root cause: in *this test* the forking caller **is the root** (task 0), so
+`run_with_host` returns the instant the original resumes past the fork and returns `100` — the orphan
+**twin fiber may not be scheduled to its write before the run ends**, so the sink holds only the
+original's 8 bytes. The manager-topology fork tests (`fork_manager` / `fork_import` / `c_fork`) do **not**
+flake here — a manager `join`s the guest and the scheduler drains the twin before the overall run ends,
+so all three deterministically observe 16 bytes. **Fix sketch (revised):** give this test a parent that
+outlives the twin (the manager shape), or drain ready fibers before `run_with_host` returns, rather than
+the original "dedup a double-delivered reply" guess (there is no double delivery). Still S4 — the real
+fork path is deterministic; this is a root-is-the-forker test artifact.
+
+**Sighting + corrected diagnosis 2026-07-31** (CI, PR #562 — a `svm-dap`-only diff): third
+recurrence, same assert. **The original write-up misread the assert**: in `assert_eq!(bytes.len(),
+16, …)` the failing `left: 8` is the *actual* — the shared sink held **one** reply, not a doubled
+one. This is a **lost write**, the opposite failure: one of the two forked copies (original or
+twin) didn't get its 8-byte reply into the shared stdout before the run finished. Revised
+hypothesis: the twin `fork_parked_caller` creates is **detached** — the fixture's guest joins the
+svc child but nothing joins the twin, so the twin's final `Stream` write races the root's
+run teardown; under CI load the run returns first and the write is dropped with the task. Fix
+direction accordingly: either run teardown drains still-runnable forked twins before returning
+(engine semantics — decide against FORK.md §8), or the fixture joins the twin (its handle is
+delivered to the handler) so the test stops encoding the race. The doubling/dedup sketch above is
+withdrawn.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and

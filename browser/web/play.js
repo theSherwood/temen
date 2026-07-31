@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule, runJitCompiler } from './wasmjit-module.js';
+import { runJitModule, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -811,6 +811,24 @@ int main(void) {
 }
 `,
   },
+  'chibicc compiles its own source (self-host → SVM)': {
+    kind: 'selfhost',
+    jit: true, // chibicc's _start emits to wasm; every cc1 TU (giants included) compiles in a few hundred ms
+    editable: false,
+    url: './assets/chibicc.svmb',
+    image: './assets/chibicc_selfhost.img',
+    // The tractable cc1 TUs (SELFHOST_C.md); the giants (preprocess/parse/codegen_ir) are added next.
+    tus: ['strings.c', 'hashmap.c', 'unicode.c', 'type.c', 'tokenize.c'],
+    mode: 'io',
+    desc: 'The self-host capstone (SELFHOST_C.md): **chibicc compiles its own source, in your browser.** ' +
+      'Pick one of chibicc’s own cc1 translation units — its tokenizer, parser, type system — and click ' +
+      'Run: chibicc.svmb (itself a C compiler, compiled to SVM IR through the LLVM on-ramp) compiles that ' +
+      'file in `--emit-object` mode into a linkable SVM-IR object, reading the ~96-file glibc header ' +
+      'closure `chibicc.h` pulls from an in-memory filesystem seeded into the sandbox — no server, no ' +
+      '/usr/include, all client-side. The emitted object is **byte-identical to a native chibicc build** ' +
+      '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
+      '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
+  },
   'Shell (svm-posix — write & run a script)': {
     kind: 'shell',
     jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
@@ -1354,6 +1372,76 @@ async function runChibicc(c) {
     setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `compiled program status ${r.status}`);
   }
+}
+
+// The **self-host** card (SELFHOST_C.md §7 step 5 — the capstone): chibicc compiles its *own* source in
+// the browser. Fetch `chibicc.svmb` + the committed closure image (its cc1 TU sources + the ~96-file
+// glibc header closure `chibicc.h` pulls, + the self-host prelude), then run `chibicc.svmb
+// --emit-object <selected TU>` over that memfs — chibicc compiling its own tokenizer / parser / codegen
+// into a linkable SVM-IR object, client-side. On the wasm-JIT every TU (giants included) compiles in a
+// few hundred ms; a bytecode fallback covers a missing emit. The emitted object IR shows in the pane.
+async function runSelfhost(c) {
+  const ex = c.ex;
+  setState(c, 'running', 'fetching compiler + sources…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  c.el.canvas.hidden = true;
+  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  let compiler, image;
+  try {
+    compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    image = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+  } catch (e) {
+    setState(c, 'error', `${e.message} — run \`node build-selfhost-assets.mjs\` to generate the closure image`);
+    logTo(c, `fetch failed: ${e.message}`);
+    return;
+  }
+  // The chosen TU (its memfs-relative path) — the dropdown, or the first TU if the control is absent.
+  const tu = c.el.tu ? c.el.tu.value : `frontend/chibicc/${ex.tus[0]}`;
+  const tuBytes = new TextEncoder().encode(tu);
+  const short = tu.split('/').pop();
+  setState(c, 'running', `compiling ${short}…${useJit ? ' [wasm-JIT]' : ''}`);
+  const t0 = performance.now();
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  let cstatus, tier = 'interpreter';
+  if (useJit) {
+    try {
+      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);
+      cstatus = undefined;
+    }
+  }
+  if (cstatus === undefined) {
+    // Alloc all three buffers before writing (svm_alloc may detach linear memory), then run on bytecode.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const ip = eng.ex.svm_alloc(image.length);
+    const tp = eng.ex.svm_alloc(tuBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(image, ip);
+    view.set(tuBytes, tp);
+    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    cstatus = eng.ex.svm_status();
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(ip, image.length);
+    eng.ex.svm_dealloc(tp, tuBytes.length);
+  }
+  const obj = readModuleStdout();
+  const cstderr = readModuleStderr();
+  const ms = (performance.now() - t0).toFixed(0);
+  logTo(c, `self-host (${tier}): ${short} → ${obj.length}B object IR (status ${cstatus})`);
+  if ((cstatus !== 0 && cstatus !== 5) || obj.length === 0) {
+    c.el.stdout.textContent = obj;
+    setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
+    return;
+  }
+  const bar = '─'.repeat(12);
+  c.el.stdout.textContent =
+    `${bar} chibicc compiled its own ${short} → ${obj.length} B linkable SVM-IR object (${tier}) ${bar}\n${obj}`;
+  c.el.result.textContent = `${obj.length} B`;
+  setState(c, 'done', `compiled ${short} (${tier}) · ${obj.length} B object · ${ms}ms`);
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
@@ -1972,6 +2060,72 @@ async function proveChibiccParity(c) {
   }
 }
 
+// The self-host twin of `proveChibiccParity`: compile the selected chibicc TU to an object on both the
+// bytecode interpreter and the wasm-JIT and assert the emitted object IR is byte-identical — the same
+// interp≡JIT guarantee `chibicc_jit.rs` proves natively, now over chibicc's own source.
+async function proveSelfhostParity(c) {
+  if (broken) return;
+  stopReactor();
+  const ex = c.ex;
+  setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
+  c.el.run.disabled = true;
+  c.el.prove.disabled = true;
+  let compiler, image;
+  try {
+    compiler = await fetchModule(ex.url);
+    image = await fetchModule(ex.image);
+  } catch (e) {
+    setState(c, 'error', `${e.message}`);
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+    return;
+  }
+  const tu = c.el.tu ? c.el.tu.value : `frontend/chibicc/${ex.tus[0]}`;
+  const short = tu.split('/').pop();
+  const tuBytes = new TextEncoder().encode(tu);
+  const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  try {
+    // Yield a paint so "proving…" lands before the synchronous interpreter compile blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    // Interpreter emit-object.
+    const p = eng.ex.svm_alloc(compiler.length);
+    const ip = eng.ex.svm_alloc(image.length);
+    const tp = eng.ex.svm_alloc(tuBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(image, ip);
+    view.set(tuBytes, tp);
+    eng.ex.svm_selfhost_emit_object_fs(p, compiler.length, ip, image.length, tp, tuBytes.length, gOn);
+    eng.ex.svm_dealloc(p, compiler.length);
+    eng.ex.svm_dealloc(ip, image.length);
+    eng.ex.svm_dealloc(tp, tuBytes.length);
+    const interpObj = readModuleStdout();
+    // wasm-JIT emit-object.
+    let jitObj;
+    try {
+      await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      jitObj = readModuleStdout();
+    } catch (e) {
+      setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
+      logTo(c, `parity: JIT self-host failed: ${e.message}`);
+      return;
+    }
+    if (interpObj === jitObj && interpObj.length > 0) {
+      setState(c, 'done', `✓ interpreter ≡ wasm-JIT — byte-identical object for ${short} (${jitObj.length}B)`);
+      logTo(c, `parity: ${short} → ${jitObj.length}B object byte-identical on both tiers`);
+    } else {
+      setState(c, 'error', `✗ tiers diverged (interp ${interpObj.length}B / jit ${jitObj.length}B)`);
+      logTo(c, `parity: ${short} object diverged (interp ${interpObj.length}B vs jit ${jitObj.length}B)`);
+    }
+  } catch (e) {
+    setState(c, 'error', `parity run failed: ${e.message}`);
+    logTo(c, `parity run failed: ${e.message}`);
+  } finally {
+    c.el.run.disabled = broken;
+    c.el.prove.disabled = false;
+  }
+}
+
 // ---- the DAP debugger (DEBUGGING.md): breakpoints · stepping · variables, on the bytecode engine --
 // One debug session at a time. The panel drives the `svm-dap` server (bytecode backend) through the
 // `dap.js` client over the wasm FFI: launch the SVM text, run to a breakpoint, highlight the stopped
@@ -2284,6 +2438,7 @@ async function runDemo(c) {
   if (ex.kind === 'reactor') return runReactor(c);
   if (ex.kind === 'pg') return runPg(c);
   if (ex.kind === 'chibicc') return runChibicc(c);
+  if (ex.kind === 'selfhost') return runSelfhost(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
@@ -2422,6 +2577,8 @@ function buildCard(name, ex) {
     section.appendChild(el('pre', 'note',
       ex.kind === 'reactor'
         ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
+        : ex.kind === 'selfhost'
+        ? `chibicc compiling its own source. Pick one of chibicc’s cc1 translation units and click Run — chibicc.svmb compiles that file to a linkable SVM-IR object, reading its ~96-file glibc header closure from the seeded in-memory filesystem, entirely in your browser. The emitted object appears below; "Prove interp ≡ JIT" recompiles it on both engines and checks they’re byte-identical.`
         : `Pre-built on-ramp module (${ex.url}). Click Run — it executes as a real C/C++ guest via svm_run_onramp; its stdout appears below.`));
   }
 
@@ -2437,6 +2594,20 @@ function buildCard(name, ex) {
     modeSel.value = ex.mode;
     const l = el('label', null, 'powerbox ');
     l.appendChild(modeSel);
+    controls.appendChild(l);
+  }
+  // The self-host card picks which of chibicc's own cc1 TUs to compile; the option value is the TU's
+  // memfs-relative path (its key in the seeded closure image), read by `runSelfhost`.
+  let tuSel = null;
+  if (ex.kind === 'selfhost') {
+    tuSel = el('select');
+    for (const tu of ex.tus || []) {
+      const o = el('option', null, tu);
+      o.value = `frontend/chibicc/${tu}`;
+      tuSel.appendChild(o);
+    }
+    const l = el('label', null, 'translation unit ');
+    l.appendChild(tuSel);
     controls.appendChild(l);
   }
   const runBtn = el('button', 'run', 'Run');
@@ -2484,7 +2655,7 @@ function buildCard(name, ex) {
     // A reactor emits its per-frame tick(); a module (and the chibicc compiler) emits the whole _start.
     // The parity check compares the framebuffer (reactor, per frame) or the stdout / emitted IR
     // (module / chibicc, run-to-completion) accordingly.
-    const isModule = ex.kind === 'module' || ex.kind === 'chibicc';
+    const isModule = ex.kind === 'module' || ex.kind === 'chibicc' || ex.kind === 'selfhost';
     const l = el('label', 'jit-label');
     l.title = isModule
       ? 'Run the whole guest (_start) on emitted wasm (wasm-JIT tier) instead of the interpreter'
@@ -2570,7 +2741,7 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars },
   };
   runBtn.addEventListener('click', () => runDemo(c));
   if (debugBtn) debugBtn.addEventListener('click', () => startDebug(c));
@@ -2592,7 +2763,7 @@ function buildCard(name, ex) {
   });
   stopBtn.addEventListener('click', () => stopDemo(c));
   if (proveBtn) {
-    const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
+    const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'selfhost' ? proveSelfhostParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
     proveBtn.addEventListener('click', () => prove(c));
   }
   if (resetBtn) resetBtn.addEventListener('click', () => {
