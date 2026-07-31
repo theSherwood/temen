@@ -85,6 +85,41 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: node browser/check-play-assets.mjs
 
+  # Tier-2 end-to-end: build the real nimony toolchain and run `crates/svm-leng/tests/nim_e2e.rs`,
+  # which compiles small **Nim source** programs through `nimony c` (→ nifler → nimony → hexer) and
+  # runs them on both SVM engines. Nothing mid-pipeline is committed — the toolchain regenerates the
+  # `.x.nif` each run, so the tests can't rot against a stale snapshot. Without this job the same
+  # tests still run in `check` but *skip* (no toolchain); here they actually execute.
+  # NOTE (owner): actions pinned by SHA per repo convention EXCEPT `alaviss/setup-nim` (no vetted SHA
+  # to hand) — pin it when you copy this over. The nimony build is heavy (~10-15 min cold); the cache
+  # makes warm runs cheap.
+  nim-e2e:
+    name: nim end-to-end (real toolchain → svm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Setup Nim (devel)
+        uses: alaviss/setup-nim@0.1.1 # owner: pin by SHA on copy-over
+        with:
+          path: nim
+          version: devel
+      - name: Cache nimony toolchain build
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: |
+            nimony/bin
+            ~/.cache/nim
+          key: nimony-${{ runner.os }}-096de9a-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
+          restore-keys: nimony-${{ runner.os }}-096de9a-
+      - name: Build nimony toolchain
+        run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+      - name: Nim end-to-end tests (both engines)
+        run: cargo test -p svm-leng --test nim_e2e -- --nocapture
+
   # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
   # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
   # (`cp .github/workflows_src/*.yml .github/workflows/`). This guard reds the run when the two drift —
