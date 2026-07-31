@@ -21,6 +21,30 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I55 — the `browser` crate is a separate workspace, so a cross-crate rename left `main` un-buildable on wasm32 for a day before any gate caught it (S3, build-gate gap) — surfaced 2026-07-31, fixed same day
+
+**Symptom.** `cargo +nightly build -Z build-std … --target wasm32-unknown-unknown` of `browser`
+(`svm-browser` lib) failed to compile on `main`: `browser/src/lib.rs` still called
+`Host::grant_host_fn` / `cap_id::HOST_FN`, both renamed to `grant_host_proc` / `HOST_PROC` by the
+mechanical-rename commit `3f7957b` ("CALLS.md increment 1"). That commit updated `svm-run`,
+`svm-interp`, `svm-posix`, and the standalone `svm-llvm`, but **not** `browser` — the two access-sink
+call sites (added by the concurrent W3-in-the-browser debug work) drifted.
+
+**Root cause — the gate gap, not the rename.** `browser/` is its **own cargo workspace**
+(`browser/Cargo.toml`), so the per-PR `build · test · fmt · clippy` job — which runs
+`cargo build/test --workspace` on the **root** workspace — never compiles it. The only lane that
+builds `svm-browser` is the **nightly `real-browser`** job (`ci.yml`), so a root-workspace rename that
+misses `browser/src` compiles green on the PR and only goes red the next night (or never, if that
+lane is quiet). A path-dependency on the renamed crate means `browser` always resolves the *new*
+source, so the break is guaranteed, not version-masked.
+
+**Fixed here** (mechanical: `grant_host_fn`→`grant_host_proc` ×2, `cap_id::HOST_FN`→`HOST_PROC`);
+verified by a full wasm32 build + the `browser-play-editor-test.mjs` real-Chromium gate (all green).
+**Gap remains (the real S3):** nothing per-PR compiles the `browser` crate. Fix sketch — add a cheap
+`cargo check -p svm-browser --target wasm32-unknown-unknown` (no `build-std` needed for a type-check)
+to the per-PR lane, or a `workspaces-in-sync` guard that greps `browser/src` for renamed symbols. Until
+then, any cross-crate rename must grep `browser/` by hand.
+
 ### I54 — `c_shell::stage0_shell_ring_pipeline_status_and_early_exit` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #545
 
 **Symptom.** On PR #545 (a **`crates/svm-leng`-only** change — zero lines in `crates/svm` or the
