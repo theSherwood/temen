@@ -189,6 +189,29 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
   closed on. That closure re-wiring, and a `Waiter::Fiber` (non-root) caller, are what remain for a real
   bash `fork()`.
 
+### 8.4 PR 5 status (2026-07-31) — the endpoint pieces, landed
+
+- **`fork_ctx` (host-cap forkability). DONE.** `HostProcFork = Arc<dyn Fn() -> HostProc>` — the
+  provider's fork factory, the Rust face of a C embedder's `fork_ctx(parent_ctx) → child_ctx`;
+  `grant_host_proc_forkable` registers it; `fork_powerbox` carries host procs iff **every** entry has a
+  factory (one factory-less entry fails the whole fork closed), minting the twin's closures at the same
+  indices and riding the factories along (fork-of-fork). `HostCap::host_proc`'s `make` **is already the
+  factory** (the multi-backend "fresh closure per grant over shared state" contract = fork-shares-state),
+  so every powerbox host cap — including `posix_cap`'s libc (shared fd table/memfs) — is forkable by
+  construction.
+- **Pid mode. DONE.** `clone_caller` arity picks the mode: 2 args = explicit `(reply_orig, reply_twin)`;
+  0/1 args = **pid mode**, what `fork()` desugars to — the original's reply is the twin's `TaskId`
+  (parent sees pid), the twin's is the arg (0); a failed fork replies `-EAGAIN`, POSIX's fork-failure
+  errno. Pinned end-to-end (parent joins pid 3; shared stdout shows `{0, 3}`).
+- **`"fork"` name binding. DONE.** `svm_posix::bind_with_fork(m, host, libc, Some((type_id, handle)))`
+  routes an import named `fork` to the parent-wired live fork offer; every other libc name to the shared
+  `HOST_PROC` handle; no offer supplied → bind fails closed.
+- **Remaining for a real shell fork:** the **manager topology** (a parent module that spawns the guest,
+  serves the fork offer with a pid-mode `clone_caller` handler, and re-grants it via `bind_with_fork`) —
+  built with the real-shell consumer (STAGE1/on-ramp track), where it is exercised for real — and the
+  `Waiter::Fiber` (non-root fiber) caller, which nested-child callers do **not** need (a §14 child parks
+  as `Waiter::VCpu`, so nested-guest fork works without it).
+
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)
 
 **Finding A — the durable transform already lowers `cap.call` as `SuspendKind::Leaf`**

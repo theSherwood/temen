@@ -539,19 +539,36 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
 /// (nothing installed, fail-closed) on a non-POSIX import name. Call **after** [`grant`]
 /// (binding needs the granted handle — the §7 "binding happens once, at instantiation" ordering).
 pub fn bind(m: &svm_ir::Module, host: &mut Host, handle: i32) -> bool {
-    let Some(caps) = m
-        .imports
-        .iter()
-        .map(|i| resolve(&i.name))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    host.set_import_bindings(
-        caps.iter()
-            .map(|c| svm_interp::BoundImport::required(c.type_id, c.op, handle))
-            .collect(),
-    );
+    bind_with_fork(m, host, handle, None)
+}
+
+/// FORK.md PR 5 — [`bind`] plus the **`fork` endpoint**: an import named `fork` (or `posix.fork`)
+/// binds not to the shared libc `HOST_PROC` handle but to the supplied **live fork offer**
+/// `(type_id, handle)` — an offer the domain's personality-provider/parent wired over its own serve
+/// export, whose handler calls `clone_caller(0)` (pid mode: the caller's `fork()` returns the twin's
+/// id in the parent copy and `0` in the child copy; `-EAGAIN` if the domain is not forkable). The
+/// provider-side contract is exactly the interp's pid-mode `clone_caller`; this function is only the
+/// name-binding half. A module importing `fork` with no offer supplied fails the bind closed.
+pub fn bind_with_fork(
+    m: &svm_ir::Module,
+    host: &mut Host,
+    handle: i32,
+    fork: Option<(u32, i32)>,
+) -> bool {
+    let mut binds = Vec::with_capacity(m.imports.len());
+    for i in &m.imports {
+        let bare = i.name.strip_prefix("posix.").unwrap_or(&i.name);
+        if bare == "fork" {
+            let Some((tid, fh)) = fork else { return false };
+            binds.push(svm_interp::BoundImport::required(tid, 0, fh));
+        } else {
+            let Some(c) = resolve(&i.name) else {
+                return false;
+            };
+            binds.push(svm_interp::BoundImport::required(c.type_id, c.op, handle));
+        }
+    }
+    host.set_import_bindings(binds);
     true
 }
 
