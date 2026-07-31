@@ -7852,8 +7852,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // busy check+set is atomic under it, so concurrent callers serialize).
                             enum Adm {
                                 Eagain,
+                                // `Host` is large (~1KB); box it so the enum stays small
+                                // (clippy `large_enum_variant`).
+                                Go(Vec<i64>, u64, Option<Mem>, Box<Host>),
                                 Decline,
-                                Go(Vec<i64>, u64, Option<Mem>, Host),
                             }
                             let adm_ = {
                                 let mut guard_ = match state_.try_lock() {
@@ -7892,8 +7894,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let budget_ = st_.fuel.min(OFFER_FUEL);
                                     st_.busy = true;
                                     let pm_ = st_.mem.take();
-                                    let ph_ = std::mem::replace(&mut st_.host, Host::new());
-                                    Adm::Go(arg_slots_, budget_, pm_, ph_)
+                                    // `take` leaves a throwaway default in `st_.host`; the real host
+                                    // rides on the vCPU until the settle restores it (busy meanwhile).
+                                    let ph_ = std::mem::take(&mut st_.host);
+                                    Adm::Go(arg_slots_, budget_, pm_, Box::new(ph_))
                                 }
                                 // `guard_` drops — the state lock is not held across the run.
                             };
@@ -7914,7 +7918,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     .lock()
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 st_.mem = pm_;
-                                                st_.host = ph_;
+                                                st_.host = *ph_;
                                                 st_.busy = false;
                                                 frames[top].vals.push(Reg::from_i64(EAGAIN));
                                                 continue;
@@ -7927,11 +7931,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // `entry.funcs` as `INVOKE_MODULE`). Restored by the settle.
                                     let saved_mem_ = std::mem::replace(mem, pm_);
                                     let saved_host_ =
-                                        std::mem::replace(host, Arc::new(Mutex::new(ph_)));
+                                        std::mem::replace(host, Arc::new(Mutex::new(*ph_)));
                                     let saved_fuel_ = *fuel;
                                     *fuel = budget_ - 1; // budget_ >= 1 (fuel != 0 above)
-                                    let saved_invoked_ =
-                                        std::mem::replace(invoked, Some(entry_.funcs.clone()));
+                                    let saved_invoked_ = invoked.replace(entry_.funcs.clone());
                                     let saved_ref_ = invoked_ref_slots.take();
                                     let hvals_: Vec<Reg> = osig_
                                         .params
