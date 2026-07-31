@@ -147,7 +147,11 @@ fn a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs()
     // Both copies wrote their 8-byte fork return through the ONE shared libc (the twin's libc is the
     // parent's, re-minted over the same Inner) — so the captured stdout holds both {0, 3}.
     let out = posix.stdout();
-    assert_eq!(out.len(), 16, "two 8-byte writes reached the shared libc stdout");
+    assert_eq!(
+        out.len(),
+        16,
+        "two 8-byte writes reached the shared libc stdout"
+    );
     let mut vals: Vec<i64> = out
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
