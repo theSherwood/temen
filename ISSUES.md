@@ -1677,3 +1677,15 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
   Miri bug); ASan lanes run `detect_leaks=0` (documented intentional leak).
 
 ---
+
+## Standalone workspaces not covered by `cargo build --workspace` (rename hazard)
+
+`browser/` (svm-browser), `bench/`, `browser/wt/`, and `fuzz/` are **separate cargo
+workspaces**, not members of the root workspace (like `crates/svm-llvm/`). A `cargo build
+--workspace` — the usual local pre-push check — does **not** compile them, so a cross-cutting
+rename that touches the `svm-interp`/`svm-run` public API (e.g. `host_fn`→`host_proc`, 2026-07-30)
+builds clean locally yet breaks the four browser-building CI jobs (wasm32/wasm64/cross-engine/
+real-browser). This has recurred 3× on the same rename. **When renaming any public `svm-interp`/
+`svm-run` symbol, also grep + build the standalone trees:** `browser`, `bench`, `browser/wt`,
+`fuzz` (`cargo build --manifest-path <tree>/Cargo.toml`). A CI job that fast-checks these on every
+PR (not only the expensive full browser build) would close the gap.
