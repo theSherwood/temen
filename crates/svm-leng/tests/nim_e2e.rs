@@ -405,7 +405,11 @@ fn nim_for_in_seq_iterator_runs_end_to_end() {
          let r = sumSquares(5)\n",
         |m| {
             // 0 + 1 + 4 + 9 + 16 = 30 — no phantom trailing element.
-            assert_eq!(run_main_read_global(m, "r.0."), 30, "for x in s: sum of squares");
+            assert_eq!(
+                run_main_read_global(m, "r.0."),
+                30,
+                "for x in s: sum of squares"
+            );
         },
     );
 }

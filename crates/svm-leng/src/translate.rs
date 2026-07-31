@@ -3382,8 +3382,8 @@ impl<'a> FuncGen<'a> {
         // operand is unsigned-typed (a `(u N)` slot, or a syntactically-unsigned form): an unsigned
         // value with the high bit set (`>= 2^31` / `2^63`) must order above small values, which the
         // signed op gets backwards. `eq`/`ne` are signedness-agnostic (bit-equality).
-        let unsigned = !is_float(l.ty)
-            && (self.operand_unsigned(&a[0]) || self.operand_unsigned(&a[1]));
+        let unsigned =
+            !is_float(l.ty) && (self.operand_unsigned(&a[0]) || self.operand_unsigned(&a[1]));
         let name = if is_float(l.ty) {
             match op {
                 "eq" => "eq",
