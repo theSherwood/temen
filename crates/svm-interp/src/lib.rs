@@ -15746,6 +15746,20 @@ impl Host {
             let entry = entry.clone();
             return Some(child.adopt_offer(entry));
         }
+        // FORK.md §8.5 slice 3 — a **forkable host proc** (e.g. posix libc): re-mint the handler in
+        // the CHILD over the *same* shared provider state via its fork factory
+        // ([`Host::grant_host_proc_forkable`]), so the child inherits the capability with its fd
+        // table / memfs shared (the manager handing its libc to a spawned guest), and the child's
+        // copy stays forkable itself (nesting / fork-of-child). A **factory-less** host proc is an
+        // opaque closure the runtime cannot carry — the re-grant refuses (`None`, fail-closed); such
+        // a cap the parent keeps. This is the deep-copy path `resolve_copyable` defers for `HostProc`.
+        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
+            return self
+                .host_proc_forks
+                .get(idx as usize)
+                .and_then(|f| f.clone())
+                .map(|factory| child.grant_host_proc_forkable(factory(), factory));
+        }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
             let sink = if r == StreamRole::Out {
@@ -19298,6 +19312,53 @@ mod fork_powerbox_tests {
         assert!(
             twin.fork_powerbox().is_some(),
             "a forked domain is still forkable — nested guests can fork"
+        );
+    }
+
+    /// FORK.md §8.5 slice 3 — a **forkable** host proc re-grants into a spawned child over the SAME
+    /// shared state (the manager handing its libc to a nested fork-guest), and the child's copy stays
+    /// forkable itself. A factory-less host proc cannot be carried (opaque closure) — the re-grant
+    /// fails closed. This is the nested-child libc gap: `resolve_copyable` refuses `HostProc`; the
+    /// forkable factory is its deep-copy path.
+    #[test]
+    fn regrant_into_child_carries_a_forkable_host_proc_sharing_state() {
+        let counter = Arc::new(Mutex::new(0i64));
+        let make = {
+            let counter = Arc::clone(&counter);
+            move || -> HostProc {
+                let counter = Arc::clone(&counter);
+                Box::new(move |_op, _args, _mem| {
+                    let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
+                    *c += 1;
+                    Ok(vec![*c])
+                })
+            }
+        };
+        let mut parent = Host::new();
+        let h = parent.grant_host_proc_forkable(make(), Arc::new(make));
+        let mut child = Host::new();
+        let ch = parent
+            .regrant_into_child(h, &mut child)
+            .expect("a forkable host_proc re-grants into a child");
+        assert_eq!(
+            parent.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+            Ok(vec![1]),
+            "parent's first call"
+        );
+        assert_eq!(
+            child.cap_dispatch_slots(cap_id::HOST_PROC, 0, ch, &[], None),
+            Ok(vec![2]),
+            "the child's re-granted proc shares the parent's state (inherited libc / fd table)"
+        );
+        assert!(
+            child.fork_powerbox().is_some(),
+            "the child's inherited libc is itself forkable — the guest can then fork"
+        );
+        // A factory-less host proc is an opaque closure that cannot be carried into a child.
+        let opaque = parent.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
+        assert!(
+            parent.regrant_into_child(opaque, &mut child).is_none(),
+            "a factory-less host proc fails the re-grant closed"
         );
     }
 }
