@@ -226,10 +226,16 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
 - **Slice 1 — forkable libc. DONE (this PR).** `svm_posix::grant` mints libc via
   `grant_host_proc_forkable` over the shared `Inner`, so a chibicc-world domain's libc carries across a
   twin (was fail-closed). `posix_cap` (on-ramp) was already forkable (§8.4).
-- **Slice 2 — the `__px_` shim fork binding** (blocker A). The compiled-C tests bind through
-  `bind_shim` (`crates/svm/tests/*`), which strips `__px_` and calls `svm_posix::resolve` — no `fork`
-  branch, no offer arg. Add the `__px_fork` analogue of `bind_with_fork` so a compiled-C `__px_fork`
-  import routes to the fork offer `(type_id, handle)`. (The plain-libc `bind_with_fork` already exists.)
+- **Slice 2 — bind a child's named `fork` import to the live fork offer. DONE.** *Refined from the
+  original `__px_`-shim framing.* A compiled-C command is its **own module**, spawned nested via
+  `instantiate_module_named` (op 13) — the `c_shell_exec.rs` shape — where imports resolve through
+  `bind_child_manifest`, **not** the top-level `bind_shim` libc-handle ABI. That binder's named-offer
+  step resolved only wired `offer_func`s (`Binding::Offer`); the fork offer minted by `child_offer` is a
+  **live-callee** offer (`Binding::LiveImpl` — a call parks the caller on the server's serve loop), which
+  `resolve_offer` never returns, so a named `fork` import could not bind to it (that is *why* the
+  hand-written guest used `cap.self.resolve`). The binder now also matches a LiveImpl offer by signature
+  (name-less at that layer) and binds the slot; `call.import` then rides the same caller-parking path.
+  Proven by `fork_import.rs` (a separate-module guest whose `fork` **import** forks-returns-twice).
 - **Slice 3 — libc into a nested child** (blocker D / the real gap). A §14 child spawned by
   `instantiate_named`/op 13 gets an *attenuated* powerbox (instantiator + address space + regranted
   streams/pipes) — **not** posix libc. Existing compiled-C children get libc only because they run as a
@@ -256,11 +262,22 @@ whole and demonstrates the exact wiring a compiled-C `fork()` will use. The gues
 resolving caps by name, which is what lets it sidestep the `__px_` import binder. Landing it also needed
 one extra interp gate: `can_regrant`/`forkable_host_proc` — op-11's grant-list admission must accept a
 forkable `HostProc` as a re-grantable handle (previously only pipes/regions/offers/copyables passed).
-**Remaining for a *compiled-C* program:** slice 2 (`__px_fork` shim binding in `bind_shim`) + slice 4
-(compiled-C `_start` entry ABI over op 11/13). Those two turn the hand-written guest into a chibicc one;
-the substrate underneath them is now proven end to end.
+**Update (slice 2 done) — the fork *binding* is proven; only the chibicc *frontend* remains.**
+`crates/svm/tests/fork_import.rs` swaps the capstone's `cap.self.resolve` fork discovery for a **named
+`fork` import** on a **separate guest module** spawned via op 13, bound to the live fork offer by
+`bind_child_manifest`. This is the exact runtime path a compiled-C `fork()` takes — the guest is now
+hand-written IR only because chibicc hasn't emitted it yet, not because any runtime piece is missing. The
+one interp change was the LiveImpl branch in the child-manifest binder (above). Note this also settles
+the original slice-2 framing: the nested compiled-C path does **not** go through the top-level `__px_`
+`bind_shim` (that is the *same-module top-level* libc-handle ABI); a separate-module command binds
+`write`/`read` by the manifest's reference policy and `fork` by the named-offer step.
 
-Key refs: `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
+**Remaining for a *compiled-C* program:** slice 4 (compiled-C `_start`/entry ABI over op 13 — the
+`c_shell_exec.rs` `--child-entry` convention, plus a `long fork(void){ return __fork(0); }` libc wrapper
+whose `__fork` import matches the offer's `(i64)->(i64)`) + slice 5 (the chibicc end-to-end test). The
+runtime substrate underneath both is now proven end to end (`fork_manager.rs` + `fork_import.rs`).
+
+Key refs: `fork_import.rs` (named-import fork binding), `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
 `bind_with_fork` (`svm-posix/src/lib.rs`), `bind_shim` + harness (`crates/svm/tests/c_posix_spawn.rs`),
 op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (svm-interp).
 

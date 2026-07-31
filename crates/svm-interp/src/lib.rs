@@ -13680,6 +13680,37 @@ impl Host {
                         None => return Err(i as u32),
                     }
                 }
+                // §3.6 / FORK.md §8.5 — the named grant may be a **live-callee** offer
+                // (`child_offer` / a re-granted `regrant_into_child`, a `Binding::LiveImpl`) rather
+                // than a wired `offer_func`. It is name-less at this layer, so coverage matches its
+                // ops by signature; a match binds the slot to the LiveImpl handle, and `call.import`
+                // then rides `import_live_target` (parks the caller on the child's serve loop). This
+                // is what lets a child's *named* `fork` import route to the fork offer — the binding
+                // half a compiled-C `fork()` needs, where the hand-written guest used cap.self.resolve.
+                if let Some(es) = self.resolve_live_impl(h).map(|e| Arc::clone(&e.sigs)) {
+                    let empty: [String; 0] = [];
+                    match coverage_remap(&req_names, &req_sigs, &empty, &es) {
+                        Some(remap) => match self.type_id_of(h) {
+                            Some(tid) => {
+                                let b = if rebindable {
+                                    BoundImport::rebindable(tid, remap[0], Some(h))
+                                } else {
+                                    BoundImport::required(tid, remap[0], h)
+                                };
+                                bindings.push(b);
+                                remaps.push(Some(remap));
+                                continue;
+                            }
+                            None => return Err(i as u32),
+                        },
+                        None if rebindable => {
+                            bindings.push(BoundImport::rebindable(0, 0, None));
+                            remaps.push(None);
+                            continue;
+                        }
+                        None => return Err(i as u32),
+                    }
+                }
             }
             // stdio convention (S15b): `write`→the `"stdout"` grant, `read`→the `"stdin"` grant, so a
             // **filter** granted both streams binds each libc call to the right end. Fall back to the
