@@ -76,8 +76,8 @@ block 0 (vsp: i64, varg: i64) {
 /// Build a threaded backend for `src`, arm the trace, run to completion, return the tape JSON.
 fn traced_run(src: &str) -> (BytecodeBackend, String) {
     let m = parse_module(src).expect("parses");
-    let mut b =
-        BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None).expect("subset");
+    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None, None)
+        .expect("subset");
     assert!(b.is_threaded(), "a thread.spawn guest");
     assert!(Debuggee::set_sched_trace(&mut b, true), "trace armed");
     loop {
@@ -221,7 +221,7 @@ fn trace_tape_is_bit_identical_across_replay() {
 fn contested_words_match_the_oracle() {
     let feed_model = |src: &str| -> Arc<Mutex<MemModel>> {
         let m = parse_module(src).expect("parses");
-        let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None)
+        let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None, None)
             .expect("subset");
         let model = Arc::new(Mutex::new(MemModel::new(MemModelCfg::default())));
         let feed = Arc::clone(&model);

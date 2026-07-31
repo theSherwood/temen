@@ -27,7 +27,7 @@
 
 use svm_interp::bytecode::{
     self, AccessSinkFn, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
-    ScheduledSnapshot,
+    ScheduledSnapshot, ScheduledWrite,
 };
 use svm_interp::MemEvent;
 
@@ -212,6 +212,35 @@ pub trait Debuggee {
     fn sched_trace_json(&self) -> Option<Json> {
         None
     }
+    // --- state writes (slice 8) ------------------------------------------------------------------
+    /// **Write bytes into the guest window** (the DAP `writeMemory` backend). Recorded and
+    /// re-applied on every seek replay so time travel stays truthful. `false` when unsupported
+    /// (tree-walker) or the range is unwritable.
+    fn write_window(&mut self, _addr: u64, _bytes: &[u8]) -> bool {
+        false
+    }
+    /// **Write a source variable by name** in the frame `frame_from_top` (the DAP `setVariable`
+    /// backend): integers only; a memory-located var takes the low `width` bytes. Recorded and
+    /// re-applied like [`write_window`](Debuggee::write_window). `false` when unsupported or
+    /// unresolvable — fail-closed, never a guess.
+    fn write_var(
+        &mut self,
+        _frame_from_top: usize,
+        _name: &str,
+        _value: i64,
+        _width: usize,
+    ) -> bool {
+        false
+    }
+
+    /// **Force a context switch** (slice 7): override the schedule's next pick with `target` (a
+    /// task index; `None` = the lowest-index runnable task other than the default choice). The
+    /// override is recorded as a concrete `(turn, task)` and re-applied on every rebuild, so a
+    /// `seek` replays it at the identical turn. Returns the resolved task, `None` when
+    /// unsupported (tree-walker, single-vCPU) or nothing is runnable.
+    fn force_switch(&mut self, _target: Option<usize>) -> Option<usize> {
+        None
+    }
 
     // --- access sink / models --------------------------------------------------------------------
     /// Install the session's access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3): every
@@ -359,6 +388,19 @@ pub struct BytecodeBackend {
     /// Slice 6: whether the scheduler trace tape is armed (threaded engine only) — re-armed on
     /// every seek rebuild so the replay refills the tape deterministically.
     sched_trace: bool,
+    /// Slice 7: the seeded-pick schedule policy (threaded engine only) — applied at construction
+    /// and re-applied on every rebuild (seek and rev-trace probes: the seed is *semantic* schedule
+    /// policy, unlike the observation-only sink/trace, so every replay must carry it).
+    seed: Option<u64>,
+    /// Slice 7: the recorded forced switches, concrete `(turn, task)` — re-applied on every
+    /// rebuild for the same reason.
+    forced: Vec<(u64, usize)>,
+    /// Slice 8: recorded **debugger state writes** ([`ScheduledWrite`]), keyed by the clock/turn
+    /// they were made at. The engine re-applies each whenever execution passes its clock — on the
+    /// live resume *and* on every seek replay / rev-trace probe (the list is re-installed on each
+    /// rebuild) — so time travel stays truthful: `seek` back before a write shows the original
+    /// state, any path forward past it re-observes the write. The write-side `CapTape`.
+    writes: Vec<(u64, ScheduledWrite)>,
     /// The recorded [`CapTape`] of nondeterministic cap **inputs** (clock / stdin `read` / host-fn) from
     /// the furthest-forward execution — replayed on a reverse `seek` rebuild so re-execution sees
     /// identical inputs (DEBUGGING.md W1). A pure-output program (`write` only) records nothing, so its
@@ -427,16 +469,24 @@ impl BytecodeBackend {
         stdin: Vec<u8>,
         block_stdin: bool,
         mem_limit: Option<u64>,
+        seed: Option<u64>,
     ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let engine = if bytecode::module_spawns_threads(&module) {
             // Blocking stdin is single-vCPU only this slice — decline a threaded module rather
-            // than silently keeping EOF semantics (fail-closed, like the seed on this engine).
+            // than silently keeping EOF semantics (fail-closed).
             if block_stdin {
                 return None;
             }
-            Engine::Threaded(Box::new(ScheduledDebugRun::new(&module, func, args)?))
+            let mut run = ScheduledDebugRun::new(&module, func, args)?;
+            // Slice 7: the seeded pick — adversarial schedule variation, deterministic per seed.
+            run.set_sched_seed(seed);
+            Engine::Threaded(Box::new(run))
         } else {
+            // A seed is meaningless with one vCPU — decline rather than silently ignore it.
+            if seed.is_some() {
+                return None;
+            }
             Engine::Single(Box::new(build_single_run(
                 &module,
                 func,
@@ -468,6 +518,9 @@ impl BytecodeBackend {
             checkpointing: true,
             access_sink: None,
             sched_trace: false,
+            seed,
+            forced: Vec::new(),
+            writes: Vec::new(),
         })
     }
 
@@ -592,6 +645,15 @@ impl BytecodeBackend {
         self.sched_checkpoints.insert(at, snap);
     }
 
+    /// Push the recorded writes into the live engine (slice 8) — its cursor lands past entries at
+    /// clocks already passed, so the just-applied live write isn't double-counted going forward.
+    fn sync_writes(&mut self) {
+        match &mut self.engine {
+            Engine::Single(run) => run.set_scheduled_writes(self.writes.clone()),
+            Engine::Threaded(run) => run.set_scheduled_writes(self.writes.clone()),
+        }
+    }
+
     /// Absorb the live single-vCPU run's recorded cap-input tape if it now reaches further than the one
     /// held — so a later reverse `seek` replays the furthest-forward inputs. Cheap no-op for a
     /// pure-output (`write`-only) program (its tape stays empty) and for deny-all sessions.
@@ -647,6 +709,8 @@ impl BytecodeBackend {
                 let Some(mut probe) = self.fresh_single() else {
                     return false;
                 };
+                // Slice 8: the probe replays the debugger writes too, or its timeline diverges.
+                probe.set_scheduled_writes(self.writes.clone());
                 loop {
                     let c = probe.op_clock();
                     if c >= now {
@@ -665,6 +729,11 @@ impl BytecodeBackend {
                 else {
                     return false;
                 };
+                // The probe must replay the *same schedule* as the session (slice 7 policy) and
+                // the same debugger writes (slice 8), or its timeline diverges.
+                probe.set_sched_seed(self.seed);
+                probe.set_forced_switches(self.forced.clone());
+                probe.set_scheduled_writes(self.writes.clone());
                 loop {
                     let c = probe.op_turn();
                     if c >= now {
@@ -880,6 +949,11 @@ impl Debuggee for BytecodeBackend {
             if self.sched_trace {
                 run.set_sched_trace(true);
             }
+            // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it.
+            run.set_sched_seed(self.seed);
+            run.set_forced_switches(self.forced.clone());
+            // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
+            run.set_scheduled_writes(self.writes.clone());
             // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
             // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
             if self.checkpointing {
@@ -904,6 +978,8 @@ impl Debuggee for BytecodeBackend {
         if let Some(sink) = &self.access_sink {
             run.set_access_sink(wrap_sink(sink));
         }
+        // And the recorded debugger writes (slice 8) — the replay re-applies them at their clocks.
+        run.set_scheduled_writes(self.writes.clone());
         // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
         // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
         if self.checkpointing {
@@ -1184,6 +1260,73 @@ impl Debuggee for BytecodeBackend {
                 })
                 .collect(),
         ))
+    }
+    /// Slice 8: apply + record a window write. The engine re-applies it at this clock on every
+    /// path that passes it — live resume and seek replay alike.
+    fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        let (ok, now) = match &mut self.engine {
+            Engine::Single(run) => (run.write_window(addr, bytes), run.op_clock()),
+            Engine::Threaded(run) => (run.write_window(addr, bytes), run.op_turn()),
+        };
+        if ok {
+            self.writes.push((
+                now,
+                ScheduledWrite::Window {
+                    addr,
+                    bytes: bytes.to_vec(),
+                },
+            ));
+            self.sync_writes();
+        }
+        ok
+    }
+    /// Slice 8: apply + record a variable write (with the focused task on the scheduled engine,
+    /// so replays resolve it in the same thread).
+    fn write_var(&mut self, frame_from_top: usize, name: &str, value: i64, width: usize) -> bool {
+        let (ok, now, task) = match &mut self.engine {
+            Engine::Single(run) => (
+                run.write_var(frame_from_top, name, value, width),
+                run.op_clock(),
+                0,
+            ),
+            Engine::Threaded(run) => (
+                run.write_var(frame_from_top, name, value, width),
+                run.op_turn(),
+                run.focus_task(),
+            ),
+        };
+        if ok {
+            self.writes.push((
+                now,
+                ScheduledWrite::Var {
+                    task,
+                    frame: frame_from_top,
+                    name: name.to_string(),
+                    value,
+                    width,
+                },
+            ));
+            self.sync_writes();
+        }
+        ok
+    }
+    /// Slice 7: resolve + record a forced switch on the threaded engine.
+    fn force_switch(&mut self, target: Option<usize>) -> Option<usize> {
+        let Engine::Threaded(run) = &mut self.engine else {
+            return None;
+        };
+        let runnable = run.runnable_tasks();
+        let chosen = match target {
+            Some(t) if runnable.contains(&t) => t,
+            Some(_) => return None, // the named task isn't runnable — refuse, don't guess
+            // Default: the lowest-index runnable that is *not* the schedule's default choice —
+            // "switch away"; with a single runnable task there is nothing to switch to.
+            None => *runnable.get(1).or_else(|| runnable.first())?,
+        };
+        let turn = run.op_turn();
+        self.forced.push((turn, chosen));
+        run.set_forced_switches(self.forced.clone());
+        Some(chosen)
     }
     /// The engine-level sink installer (both bytecode engines support it).
     fn set_access_sink(&mut self, sink: SharedSink) -> bool {

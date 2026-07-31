@@ -544,7 +544,19 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    a one-token change. Acceptance: the tape is bit-identical across a replay of the same run;
 >    wake edges match wait/notify semantics on a fixture; contested flags match a hand-computed
 >    oracle.
-> 7. **X3 — scheduler policy + forced switch.** Reframed by verification: the bytecode debug
+> 7. ~~**X3 — scheduler policy + forced switch.**~~ **DONE 2026-07-31** — the **seeded pick**:
+>    `splitmix64(seed ^ turn)` chooses uniformly among the runnable set, a pure function of
+>    `(seed, turn)` so every replay (full or from a checkpoint) reproduces the schedule with zero
+>    captured scheduler state (invariant 7); `None` keeps the lowest-index default bit-identically.
+>    **Forced switches** resolve to concrete `(turn, task)` at record time and are re-applied on
+>    every rebuild (seek *and* rev-trace probes — policy is semantic, unlike the observation-only
+>    sink/trace). Precedence: coroutine pin > forced > stepping thread > policy pick. DAP: `seed`
+>    honored on the threaded bytecode engine (single-vCPU + seed fails closed), `forceSwitch`
+>    request (optional `threadId`, replies with the resolved one). Gated by
+>    `crates/svm-dap/tests/sched_policy.rs`: per-seed determinism + genuine variation vs. the
+>    default, seeded schedule and forced switches surviving `seek` bit-identically (via the
+>    slice-6 tape), fail-closed launches/requests, and cross-session tape reproduction over DAP.
+>    Original spec: Reframed by verification: the bytecode debug
 >    scheduler is **hardwired** — lowest-index pick, one op per turn, no seed or quantum anywhere
 >    (`on_launch` documents "seed/schedule ignored" for the bytecode engine; seeding exists only
 >    on the tree-walker's `attach_scheduled_seeded`, seed `u64`, no quantum there either). Since
@@ -557,20 +569,38 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    state and forced switches are **recorded** (tape-shaped, like CapTape) and re-applied at the
 >    same turns on replay. Acceptance: same seed → identical slice-6 tape; a forced switch lands
 >    at a deterministic turn and survives `seek`.
-> 8. **X5 — DAP `setVariable` / `writeMemory`.** Greenfield at all three layers (verified): the
->    `Inspector` has no write methods, the `Debuggee` trait has no write operation, and
->    `DapServer` handles neither request (nor `readMemory`) — so this is a new trait method +
->    engine implementations + new `handle` arms. Debugger writes are recorded on the session
->    input tape (the `CapTape` shape) so replay re-applies them. Acceptance: write → `seek` back
->    → `seek` forward re-observes the write; parity with the tree-walker where both back the
->    same request.
-> 9. **X6 — guest-libc sem/barrier.** Extend `frontend/chibicc/include/pthread.h` — which already
->    builds mutex + condvar on the `__vm_wait32`/`__vm_notify` futex intrinsics and declares
->    sem/barrier out of scope — with `sem_*` (counter + futex) and `pthread_barrier_*`
->    (generation counter + futex) by the same construction; add the headers to the browser
->    playground's seeded set (which today ships **no** threading headers at all). Zero engine
->    surface. Acceptance: producer/consumer and barrier-phase fixtures run on interp + JIT with
->    identical output.
+> 8. ~~**X5 — DAP `setVariable` / `writeMemory`.**~~ **DONE 2026-07-31** — debugger writes live on
+>    the **input tape**: the engines keep a clock-ordered `ScheduledWrite` list (`Window` bytes /
+>    `Var` by name + frame + focused task) applied whenever execution passes the recorded
+>    clock/turn on **any** path — a live continue and a seek replay reach identical states, which
+>    is what keeps the history slider truthful after an edit (seek to *before* the write's clock
+>    reads the original state; driving past it re-observes the write). Engine: `write_var` (typed
+>    SSA-slot coercion, integers only; memory-located vars take low-`width` bytes LE at the
+>    resolved window address; refused mid-coroutine — fail-closed, never a guess) + `write_window`
+>    on both debug engines; the backend records `(op_clock|op_turn, write)` and re-arms the list
+>    on every seek rebuild and rev-trace probe. DAP: standard `setVariable` (scope-ref → frame,
+>    width from the Variables-pane type resolution) and `writeMemory` (base64 at a decimal/hex
+>    `memoryReference` + offset), advertised via `supportsSetVariable` /
+>    `supportsWriteMemoryRequest`; both decline cleanly on the tree-walker (invariant 9 — no
+>    engine divergence, the request just fails). Gated by
+>    `crates/svm-dap/tests/state_writes.rs`: var + window + threaded writes shifting results and
+>    surviving `seek(0)` re-drive bit-identically, pre-write-clock state reading original,
+>    DAP round-trip incl. Variables-pane readback, and fail-closed surfaces.
+> 9. ~~**X6 — guest-libc sem/barrier.**~~ **DONE 2026-07-31** — zero engine surface, as designed:
+>    `pthread_barrier_*` joined mutex/cond in `frontend/chibicc/include/pthread.h` (a
+>    generation-count barrier over the futex — arrivals fetch-add, the last resets + bumps the
+>    `__gen` word + notifies; the atomic re-check in `__vm_wait32` makes it lost-wakeup-free and
+>    the generation turn makes it immediately reusable), and POSIX `sem_*` landed in a new
+>    `frontend/chibicc/include/semaphore.h` (CAS-decrement while positive, park on the exhausted
+>    word, post = add + notify; `init/destroy/wait/trywait/post/getvalue`). Both headers are now
+>    also seeded into the browser playground's `/include` set — from the *frontend copies* via
+>    `include_str!`, one source of truth. Gated by `svm/tests/c_frontend.rs`
+>    (`c_sem_value_semantics`, `c_sem_producer_consumer` — bounded ring, sum 36 + slots restored —
+>    and `c_pthread_barrier_phases` — 4 participants × 3 phases, full-count-after-wait + exactly
+>    one `PTHREAD_BARRIER_SERIAL_THREAD` per phase), all differential interp == JIT via
+>    `run_c_full`; plus `browser/tests/chibicc_threads.rs` compiling the same shapes through
+>    chibicc-the-guest against the seeded headers (native tests can't spin the cross-Worker vCPU
+>    host, so the browser side proves the compile pipeline).
 > 10. **W6 residue** — the `display` frame-query op; compile metrics from the frontend. **W2 v2**
 >    (finite register file) stays demand-driven.
 >

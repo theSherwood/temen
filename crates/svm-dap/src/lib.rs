@@ -201,6 +201,9 @@ impl DapServer {
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
+            "forceSwitch" => self.on_force_switch(args),
+            "setVariable" => self.on_set_variable(args),
+            "writeMemory" => self.on_write_memory(args),
             "disconnect" => self.on_disconnect(),
             // An unrecognized request fails cleanly rather than crashing the session.
             _ => (false, Json::Null, vec![]),
@@ -259,6 +262,11 @@ impl DapServer {
             // source variable's window range, backed by `Inspector::set_watchpoint`. Two-request
             // protocol — `dataBreakpointInfo` mints a `dataId`, `setDataBreakpoints` arms it.
             ("supportsDataBreakpoints", Json::Bool(true)),
+            // State writes (INTERACTIVE_EMBEDDING.md slice 8): edit a variable / raw memory at a
+            // stop, recorded so reverse debugging re-applies them (bytecode backend; the
+            // tree-walker fails the requests cleanly).
+            ("supportsSetVariable", Json::Bool(true)),
+            ("supportsWriteMemoryRequest", Json::Bool(true)),
         ]);
         // The client now sends breakpoints, then `configurationDone`.
         (true, caps, vec![("initialized", Json::obj(vec![]))])
@@ -349,6 +357,9 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         }
         let (inspector, scheduled): (Box<dyn Debuggee>, bool) = if engine == "bytecode" {
+            // Slice 7: the seeded pick is honored on the threaded bytecode engine (a seed with a
+            // single-vCPU module fails the launch inside `new` — fail-closed).
+            let seed = args.get("seed").and_then(|v| v.as_i64()).map(|v| v as u64);
             match BytecodeBackend::new(
                 module,
                 func,
@@ -358,6 +369,7 @@ impl DapServer {
                 stdin,
                 block_stdin,
                 mem_limit,
+                seed,
             ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
@@ -973,6 +985,131 @@ impl DapServer {
         (ok, Json::Null, vec![])
     }
 
+    /// The standard `setVariable` request (slice 8): write an integer value to a named local in
+    /// the scope's frame. The write is recorded by the backend and re-applied on every seek
+    /// replay, so reverse debugging stays truthful. Fails cleanly on the tree-walker, a non-int
+    /// value, or an unresolvable name.
+    fn on_set_variable(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let vref = args
+            .get("variablesReference")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let Some(name) = args.get("name").and_then(|n| n.as_str()).map(String::from) else {
+            return fail;
+        };
+        let Some(value) = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        // Resolve the scope reference to its (thread, frame), like `variables` does.
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        let Some(&(tid, frame_idx)) = vref
+            .checked_sub(1)
+            .and_then(|r| session.frame_refs.get(r as usize))
+        else {
+            return fail;
+        };
+        session.inspector.select_task(tid);
+        // The var's byte width for a memory-located write, resolved like the Variables pane: the
+        // innermost in-scope declaration's scalar width.
+        let frames = session.inspector.backtrace();
+        let Some(frame) = frames.get(frame_idx) else {
+            return fail;
+        };
+        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
+        let func = frame.pc.func;
+        let Some((ty_name, type_id)) = session.debug.as_ref().and_then(|debug| {
+            debug
+                .vars
+                .iter()
+                .filter(|v| {
+                    (v.func == func || v.func == svm_ir::GLOBAL_SCOPE)
+                        && scope_covers(v.scope, line)
+                        && v.name == name
+                })
+                .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
+                .map(|v| (v.ty.clone(), v.type_id))
+        }) else {
+            return fail;
+        };
+        let width = scalar_width(self.types(), type_id, &ty_name);
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        if !session.inspector.write_var(frame_idx, &name, value, width) {
+            return fail;
+        }
+        (
+            true,
+            Json::obj(vec![("value", Json::s(value.to_string()))]),
+            vec![],
+        )
+    }
+
+    /// The standard `writeMemory` request (slice 8): base64 `data` at `memoryReference` (a decimal
+    /// or `0x` window address) + `offset`. Recorded and replay-applied like `setVariable`.
+    fn on_write_memory(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let fail = (false, Json::Null, vec![]);
+        let Some(args) = args else { return fail };
+        let Some(addr) = args
+            .get("memoryReference")
+            .and_then(|v| v.as_str())
+            .and_then(parse_int)
+        else {
+            return fail;
+        };
+        let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        let Some(bytes) = args
+            .get("data")
+            .and_then(|v| v.as_str())
+            .and_then(base64_decode)
+        else {
+            return fail;
+        };
+        let Some(session) = self.session.as_mut() else {
+            return fail;
+        };
+        let target = (addr as u64).wrapping_add(offset as u64);
+        if !session.inspector.write_window(target, &bytes) {
+            return fail;
+        }
+        (
+            true,
+            Json::obj(vec![("bytesWritten", Json::i(bytes.len() as i64))]),
+            vec![],
+        )
+    }
+
+    /// The custom `forceSwitch` request (slice 7): override the schedule's next pick —
+    /// `arguments.threadId` names the target DAP thread (task + 1), absent = "switch away" to the
+    /// lowest-index other runnable task. The override is recorded at the current turn and survives
+    /// `seek` (replays re-apply it). Replies with the resolved `threadId`; fails cleanly when
+    /// unsupported (tree-walker, single-vCPU) or the target isn't runnable.
+    fn on_force_switch(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let target = args
+            .and_then(|a| a.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .map(|tid| (tid - 1).max(0) as usize);
+        let Some(chosen) = session.inspector.force_switch(target) else {
+            return (false, Json::Null, vec![]);
+        };
+        (
+            true,
+            Json::obj(vec![("threadId", Json::i(chosen as i64 + 1))]),
+            vec![],
+        )
+    }
+
     /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
     /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
     fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
@@ -1353,6 +1490,49 @@ fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
 fn parse_data_id(s: &str) -> Option<(u64, u64)> {
     let (addr, len) = s.split_once(':')?;
     Some((addr.parse().ok()?, len.parse().ok()?))
+}
+
+/// Parse a decimal or `0x`-hex integer (the `setVariable` value / `writeMemory` address forms).
+fn parse_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return i64::from_str_radix(h, 16).ok();
+    }
+    t.parse::<i64>().ok()
+}
+
+/// Minimal RFC 4648 base64 decoder (the DAP `writeMemory` payload encoding) — standard alphabet,
+/// `=` padding, no line breaks. `None` on any malformed input.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let raw: &[u8] = s.trim().as_bytes();
+    if !raw.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    for chunk in raw.chunks(4) {
+        let pad = chunk.iter().filter(|&&c| c == b'=').count();
+        if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for &c in &chunk[..4 - pad] {
+            acc = (acc << 6) | val(c)?;
+        }
+        acc <<= 6 * pad as u32;
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - pad]);
+    }
+    Some(out)
 }
 
 fn dap_reason(r: StopReason) -> &'static str {

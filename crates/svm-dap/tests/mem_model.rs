@@ -41,7 +41,7 @@ block 2 () {{
 /// Run `src` to completion on a `BytecodeBackend` with a model-feeding sink; returns the model.
 fn model_run(src: &str) -> Arc<Mutex<MemModel>> {
     let m = parse_module(src).expect("parses");
-    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None)
+    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None, None)
         .expect("in the bytecode debug subset");
     let model = Arc::new(Mutex::new(MemModel::new(MemModelCfg::default())));
     let feed = Arc::clone(&model);
@@ -94,9 +94,18 @@ fn model_state_is_seek_consistent() {
     let m = parse_module(&src).expect("parses");
 
     let mk = |m: &svm_ir::Module| -> (BytecodeBackend, Arc<Mutex<MemModel>>) {
-        let mut b =
-            BytecodeBackend::new(m.clone(), 0, &[], u64::MAX, false, Vec::new(), false, None)
-                .expect("subset");
+        let mut b = BytecodeBackend::new(
+            m.clone(),
+            0,
+            &[],
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("subset");
         let model = Arc::new(Mutex::new(MemModel::new(MemModelCfg::default())));
         let feed = Arc::clone(&model);
         let sink: SharedSink = Arc::new(Mutex::new(

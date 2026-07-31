@@ -100,6 +100,11 @@ audit `clone_caller`'s out-of-band reply injection for a reply that can be deliv
 original and the twin (or observed twice at the shared sink) when the two resume in the losing order.
 Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
 
+**Sighting 2026-07-31** (local, slice-8 branch `claude/interactive-embedding-review-tqgjri`): one
+failure in a full `cargo test -p svm-interp` sweep, then **6/6 passes** rerunning the suite alone on
+the same commit (a debug-path-only diff — nothing in the svc/fiber/clone path). Recurred, so it's
+climbing the "until it recurs" bar; same shape, no new information beyond load-sensitivity.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and

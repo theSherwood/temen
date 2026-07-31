@@ -209,6 +209,7 @@ fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
             Vec::new(),
             false,
             None,
+            None,
         )
         .expect("the bytecode engine accepts the single-vCPU loop")
     };
@@ -272,6 +273,7 @@ fn bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber() {
             false,
             Vec::new(),
             false,
+            None,
             None,
         )
         .expect("the single-vCPU engine accepts the fiber generator")
@@ -349,6 +351,7 @@ fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
             Vec::new(),
             false,
             None,
+            None,
         )
         .expect("the scheduled bytecode engine accepts the thread.spawn loop")
     };
@@ -411,6 +414,7 @@ fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
             false,
             Vec::new(),
             false,
+            None,
             None,
         )
         .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
@@ -475,6 +479,7 @@ fn bytecode_checkpoint_reverse_sweep_is_bounded() {
             false,
             Vec::new(),
             false,
+            None,
             None,
         )
         .unwrap()
