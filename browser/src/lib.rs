@@ -2142,32 +2142,40 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
+    // A `vm_jit_*`-importing guest (the JACL self-hosted compiler) grows a large compile heap. Native
+    // `Mem` mmaps the whole `DEFAULT_RESERVED_LOG2` reservation (demand-paged), so a small declared
+    // window plus `memory.grow` just works; the wasm32 `Paged` backing only maps up to the declared
+    // size, so give such a guest a generous initial window (matching the JIT card's 128 MiB) up front.
+    let bumped;
+    let m: &svm_ir::Module = if m.imports.iter().any(|im| im.name == "vm_map") {
+        let mut mc = m.clone();
+        let want = SELFHOST_WIN_LOG2;
+        match &mut mc.memory {
+            Some(mem) if mem.size_log2 < want => mem.size_log2 = want,
+            _ => {}
+        }
+        bumped = mc;
+        &bumped
+    } else {
+        m
+    };
     let (frame, _keys) = grant_onramp_caps(&mut host, m, None);
     let mut fuel = u64::MAX;
-    // A guest that drives the §22 `Jit` cap **through imports** (the JACL self-hosted compiler:
-    // svm-llvm lowers its `extern __vm_jit_*` to `call.import`) needs the tree-walker: the bytecode
-    // engine lowers a `call.import` to the generic host-dispatch path, which services the pure-host
-    // JIT ops (`compile`/`compile_linked`) but has no route to the driver for `invoke`/`install`/
-    // `uninstall` (those escape to the scheduler-owning driver only from a *statically* resolved
-    // `cap.call (JIT, op)`, per bytecode.rs `CapCall`), so an import-bound invoke `CapFault`s. The
-    // tree-walker special-cases a `CallImport` bound to `(JIT, {1,3,4})` (see `run_with_host`'s
-    // `jit_*_body`), driving the staged unit correctly. Plain guests keep the faster bytecode engine.
-    let uses_jit_imports = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    let outcome = if uses_jit_imports {
-        Some(svm_interp::run_with_host(m, 0, &[], &mut fuel, &mut host))
-    } else {
-        bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host)
-    };
-    let (status, value, exit_code) = match outcome {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-        Some(Err(_)) => (STATUS_TRAP, 0, 0),
-        Some(Ok(vals)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_BAD_RESULT, 0, 0),
-        },
-    };
+    // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
+    // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
+    // just like a static `cap.call (JIT, op)`, and multiplexes the guest's scheduler cooperatively
+    // (no OS threads — so this runs on the wasm32 cdylib, unlike the tree-walker's thread pool).
+    let (status, value, exit_code) =
+        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+            None => (STATUS_UNSUPPORTED, 0, 0),
+            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+                _ => (STATUS_BAD_RESULT, 0, 0),
+            },
+        };
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
         status,
