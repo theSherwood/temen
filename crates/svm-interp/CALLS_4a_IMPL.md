@@ -40,9 +40,21 @@ provider's `ProviderState::fuel`).
 1. Brief state lock: if `busy` → `-EAGAIN`; if `fuel == 0` → `CapFault`; else `busy = true`,
    take `mem`/`host` out of `ProviderState`, budget = `fuel.min(OFFER_FUEL)`. Release lock.
 2. Edge 1 (caller→provider): under the caller `host` lock, `translate_cap_slots` args. (verbatim 3a)
-3. Install provider world: `saved_mem = take(mem)`, `*mem = provider_mem`; `saved_fuel = *fuel`,
-   `*fuel = budget`; wrap provider host `Arc::new(Mutex::new(provider_host))`, swap into `*host`
-   (caller host Arc parked in the OfferAnim host slot).
+3. Install provider world — the **full execution context**, not just mem/host: `saved_mem = take(mem)`,
+   `*mem = provider_mem`; `saved_fuel = *fuel`, `*fuel = budget`; wrap provider host
+   `Arc::new(Mutex::new(provider_host))`, swap into `*host`. **Code too:** the handler runs the
+   *provider's* `entry.funcs`, resolved through the existing **invoke seam** — swap `*invoked =
+   Some(entry.funcs)` (+ `invoked_ref_slots`), and the handler frame uses `module: INVOKE_MODULE`
+   (exactly how the third `VCpu` constructor at lib.rs:7292 runs a foreign unit). `cur_funcs`
+   re-resolves automatically at the loop top on the module change. Charge 1 entry fuel at switch-in
+   to match `drive_arc`'s top-level-entry charge (lib.rs:1918).
+
+**4a in-loop scope (else fall back to `drive_instanced_offer`/`drive_arc`, byte-identical):** the
+in-loop cross-world path handles the **non-durable provider, no-`ref.func` handler** common case
+(every existing test handler). A durable provider world (shadow-SP entanglement) or a handler whose
+code `unit_uses_ref_func` declines to the 3a `drive_arc` path — decline toward the correct slower
+transport, the §9 fail-closed shape. This keeps 4a byte-identical everywhere and confines the new
+machinery to the simple case that sets up 4b.
 4. Park the caller frames as resumer (`park_resumer(*cur, take(frames))` / `root_parked`),
    `chain.push(slot)`, `*cur = slot`, `*frames = handler_entry_frames`, `continue 'frames`.
    Do **not** rewind the caller's cap.call op — on return the caller resumes past it with results
