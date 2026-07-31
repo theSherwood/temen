@@ -634,15 +634,21 @@ plumbing. Five workstreams, roughly independent:
     compiled a *program* module standalone, which can't resolve a cross-module aggregate type like
     `string.0.<sys>` — now discovered from the self-contained `system` module only). A real
     `@[]`/`add` program now **links and verifies with zero imports** — the cross-module funcref-gvar
-    and frame-fixpoint slices above closed the two link/verify gaps. **One gap stands between
-    "verifies" and "runs": the `ini` allocator-init chain.** `alloc`/`rawAlloc` run over a `MemRegion`
-    the system `ini` must set up first, and funcref gvars (`oomHandler`) are zero until `ini` writes
-    them — so calling `build(4)` cold traps (`IndirectCallType`: the allocator hits OOM →
-    `oomHandler`, still 0 → `call_indirect` through func 0). A heap program must enter through its C
-    `main`/init chain, not a cold leaf call; entering at `main` today still traps in the init chain
-    (a funcref reached before `ini` sets it), so the next slice is getting that chain to run
-    (initialize the `MemRegion` + funcref gvars, then the program body). The ARC-heavy string path
-    already links and runs against real `=wasMoved`/`=destroy`.
+    and frame-fixpoint slices above closed the two link/verify gaps. **It also runs end-to-end
+    through the full C-`main`/init chain** (returns 0) — *once the funcref-gvar proc-symbol
+    initializers are materialized.* Root cause, pinned down: `var oomHandler = continueAfterOutOfMem`
+    and `var gExitFlush = nimNoopFlush` are funcref gvars whose value is a **static initializer** (a
+    proc pointer), but we zero-reserve the slot (the `gExitFlush` note) and *nothing* writes it — the
+    system `ini` is minimal (it only resets an exception global), contrary to the old "ini writes it"
+    assumption. So the first `call_indirect` through such a gvar traps (`IndirectCallType` through
+    func 0). Proven: patch the two func indices into the linked module's **data image** and the
+    program runs to completion. So the next slice is a **`data.funcref` relocation** — write a proc's
+    linked func index into a gvar's data slot at link time (the funcref twin of `data.ptr`), emitted
+    for a proc-symbol gvar initializer instead of zero-reserving. One correctness bug remains after
+    that: the sum-of-squares result is off by a constant `+20` (`build(4)`→34 not 14, `build(3)`→25
+    not 5) — a phantom seq element or a non-zero `result` init, isolated to the seq/alloc path, not
+    the linkage/frame work. The ARC-heavy string path already links and runs against real
+    `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass
