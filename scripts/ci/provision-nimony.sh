@@ -12,19 +12,25 @@
 # it deliberately, in lockstep with any svm-leng change the newer frontend would require.
 set -euo pipefail
 
-NIMONY_REF="${NIMONY_REF:-096de9a}"
+# The caller appends our stdout to $GITHUB_ENV, so ONLY the final `KEY=value` lines may go there —
+# send every command's chatter (clone progress, the `hastur` build) to stderr, and emit the two
+# result lines on the saved stdout (fd 3) at the end.
+exec 3>&1 1>&2
+
+# Full 40-char commit SHA (GitHub's fetch/checkout-by-SHA needs the full hash, not an abbreviation).
+NIMONY_REF="${NIMONY_REF:-096de9a3dd479c5865f04cd3d595dfdf42e83ef9}"
 WORK="${1:-${GITHUB_WORKSPACE:-$PWD}}"
 cd "$WORK"
 
 command -v nim >/dev/null || { echo "error: nim (devel) not on PATH" >&2; exit 1; }
 NIM_BIN="$(dirname "$(command -v nim)")"
 
-# nimony + its sibling nativenif (the native backend's nim.cfg reach it via `../nativenif`).
+# nimony + its sibling nativenif (the native backend's nim.cfg reach it via `../nativenif`). Clone
+# master (blob-filtered — all commits, lazy blobs) so the pinned commit is present, then check it out.
 if [ ! -d nimony/.git ]; then
   git clone --filter=blob:none https://github.com/nim-lang/nimony nimony
 fi
-git -C nimony fetch --depth 1 origin "$NIMONY_REF"
-git -C nimony checkout --detach FETCH_HEAD
+git -C nimony checkout --detach "$NIMONY_REF"
 [ -d nativenif/.git ] || git clone --depth 1 https://github.com/nim-lang/nativenif nativenif
 
 # setup-nim installs a *prebuilt* nightly that can lag `devel`; overlay fresh compiler sources so
@@ -45,5 +51,5 @@ ln -sf "$WORK/nimony" "$NIM_ROOT/dist/nimony"
 # Build all the tools (C backend; the E2E harness invokes `nimony c`).
 ( cd nimony && nim c -r src/hastur --release build all )
 
-echo "NIMONY_BIN=$WORK/nimony/bin"
-echo "NIM_BIN=$NIM_BIN"
+echo "NIMONY_BIN=$WORK/nimony/bin" >&3
+echo "NIM_BIN=$NIM_BIN" >&3
