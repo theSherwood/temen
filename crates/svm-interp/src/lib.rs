@@ -9400,6 +9400,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     }
+                    // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
+                    // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
+                    // never held across the provider drive (CALLS.md §1 defect / §4 lock discipline).
+                    // Probe under a brief lock; a miss falls through to the unchanged generic
+                    // dispatch below (byte-identical). Every other capability kind — incl. a *pure*
+                    // offer, a revoked/forged handle — is `None` and takes the fall-through.
+                    let inst_offer = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.instanced_offer_of(h, *type_id)
+                    };
+                    if let Some(entry) = inst_offer {
+                        let results = drive_instanced_offer(host, &entry, *op, &argv)?;
+                        for (s, ty) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
+                        continue;
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
@@ -9559,6 +9576,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     }
+                    // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
+                    // with the narrowed powerbox lock (see the `cap.call` arm). Probe reproduces the
+                    // `CAP_IMPORT_TYPE_ID` op remap; a miss falls through unchanged.
+                    let inst_offer = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.instanced_offer_for_import(*import | (*op << 16))
+                    };
+                    if let Some((entry, eff_op)) = inst_offer {
+                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
+                        for (s, ty) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
+                        continue;
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
@@ -9645,6 +9676,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     }
+                    // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
+                    // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
+                    // so `packed = *import` (consumer_op 0 ⇒ the bound base op). Miss falls through.
+                    let inst_offer = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.instanced_offer_for_import(*import)
+                    };
+                    if let Some((entry, eff_op)) = inst_offer {
+                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
+                        for (s, ty) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
+                        continue;
+                    }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =
@@ -9667,6 +9712,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
+                    }
+                    // CALLS.md increment 3 (slice 1): a dynamic-mode call on an instanced offer runs
+                    // with the narrowed powerbox lock. Probe interns the self shape `ty` (as the
+                    // generic dyn path does) then checks the handle; a miss falls through unchanged.
+                    let inst_offer = {
+                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.instanced_offer_for_dyn(*ty, *op, h)
+                    };
+                    if let Some((entry, eff_op)) = inst_offer {
+                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
+                        for (s, tyv) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*tyv, *s)));
+                        }
+                        continue;
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -13041,6 +13100,88 @@ fn translate_cap_slots(
     Ok(())
 }
 
+/// CALLS.md increment 3, slice 1 (lock-narrowing) — drive an **instanced** offer with the
+/// caller's powerbox lock held ONLY around the two `cap`-slot translation edges, never across the
+/// `drive_arc` sub-run. Behaviorally identical to the `Some(state)` branch of
+/// [`Host::cap_dispatch_slots_inner`] (results / traps / provider-pays fuel drain); the sole
+/// difference is that the caller's whole cap surface no longer halts for the duration of the
+/// sub-run (CALLS.md §1 defect / §4 lock discipline). `entry` is a snapshot the eval-loop arm
+/// resolved under a brief `hg` lock ([`Host::instanced_offer_of`] and friends), so its `state` is
+/// `Some` by construction of the probe.
+///
+/// **Why no generation re-check on the phase-3 relock (yet):** the provider instance is named by
+/// the cloned `state` `Arc`, and `cap` results are minted fresh into whatever the caller table is
+/// at relock — there is no suspension point inside `drive_arc` at which a stale offer handle could
+/// matter (the sub-run runs to completion or trap on its own executor; it never parks a fiber back
+/// into the outer scheduler). The re-check CALLS.md §4 mentions belongs to the promotion slice
+/// (increment 4), where a handler *parks* mid-animation and a reified fiber re-crosses the
+/// boundary.
+///
+/// **Lock discipline:** the provider `state` guard is held continuously from try-enter through
+/// phase 3 (the mutual-exclusion invariant); the caller `hg` lock is acquired inside phase 1 and
+/// phase 3 only, and dropped around `drive_arc`. This introduces a `state → hg` acquisition order;
+/// it cannot cycle with the generic `hg → state.try_lock()` order because the dispatch path's
+/// `try_lock` never blocks. (The only *blocking* `hg → state` edges are the wiring/introspection
+/// APIs — see the invariant note on [`Host::grant_impl_cap`] — which are not called concurrently
+/// with a live run.)
+fn drive_instanced_offer(
+    host: &Arc<Mutex<Host>>,
+    entry: &OfferEntry,
+    op: u32,
+    args: &[i64],
+) -> Result<Vec<i64>, Trap> {
+    let f = *entry.ops.get(op as usize).ok_or(Trap::CapFault)?;
+    let sig = entry.sigs.get(op as usize).ok_or(Trap::CapFault)?;
+    if args.len() != sig.params.len() {
+        return Err(Trap::CapFault);
+    }
+    // The probe guarantees `state.is_some()`; a race that cleared it is fail-closed.
+    let state = entry.state.clone().ok_or(Trap::CapFault)?;
+    // Try-enter admission (verbatim from the inner arm): a busy instance answers a probeable
+    // `-EAGAIN`, never a blocking wait — deadlock-free by construction, a cycle refuses (CALLS.md
+    // increment 2). The guard is held continuously through phase 3.
+    let mut st = match state.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(vec![EAGAIN]),
+    };
+    let st = &mut *st;
+    if st.fuel == 0 {
+        return Err(Trap::CapFault);
+    }
+    // Phase 1 — `cap` args caller→provider. The caller `hg` lock is held ONLY here.
+    let mut arg_slots = args.to_vec();
+    {
+        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+        translate_cap_slots(&mut hg, &mut st.host, &sig.params, &mut arg_slots)?;
+    }
+    let vals: Vec<Value> = sig
+        .params
+        .iter()
+        .zip(&arg_slots)
+        .map(|(ty, &s)| slot_to_val(*ty, s))
+        .collect();
+    // Phase 2 — the provider sub-run, holding NO caller lock (the whole point of the slice).
+    let budget = st.fuel.min(OFFER_FUEL);
+    let mut impl_fuel = budget;
+    let (res, _, _) = drive_arc(
+        entry.funcs.clone(),
+        f,
+        &vals,
+        &mut impl_fuel,
+        &mut st.mem,
+        &mut st.host,
+    );
+    st.fuel -= budget - impl_fuel; // drain what the call used — before `?`, as in the inner arm
+    let mut result_slots: Vec<i64> = res?.iter().map(|v| val_to_slot(*v)).collect();
+    // Phase 3 — `cap` results provider→caller. The caller `hg` lock is re-acquired ONLY here.
+    {
+        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+        translate_cap_slots(&mut st.host, &mut hg, &sig.results, &mut result_slots)?;
+    }
+    Ok(result_slots)
+}
+
 // The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
@@ -14951,6 +15092,70 @@ impl Host {
         }
     }
 
+    /// CALLS.md increment 3, slice 1 — the eval-loop pre-probe (direct `cap.call` form) mirroring
+    /// [`Host::live_impl_of`]: the offer entry iff `handle`/`type_id` resolves to an **instanced**
+    /// offer (a [`Binding::Offer`] whose `state` is `Some`), so the arm can drive it with the
+    /// narrowed powerbox lock ([`drive_instanced_offer`]). `None` for anything else — a *pure*
+    /// offer, a non-offer, a revoked/forged handle — which falls through to the unchanged generic
+    /// dispatch (byte-identical, merely without the lock-narrowing win). The entry is cloned so the
+    /// brief probe lock is released before the sub-run.
+    fn instanced_offer_of(&self, handle: i32, type_id: u32) -> Option<OfferEntry> {
+        match self.resolve(handle, type_id) {
+            Ok(Binding::Offer(idx)) => {
+                let e = self.offers.get(idx as usize)?;
+                e.state.is_some().then(|| e.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// CALLS.md increment 3, slice 1 — the `call.import` / `call.sym` pre-probe. Reproduces the
+    /// [`Host::cap_dispatch_slots`] `CAP_IMPORT_TYPE_ID` front-matter (`packed` = `slot |
+    /// consumer_op << 16`; a flat `call.sym` passes `packed = slot`, so `consumer_op = 0`) to the
+    /// effective `(type_id, op, handle)`, then returns `(entry, eff_op)` iff it names an instanced
+    /// offer. `None` (unbound slot, out-of-range consumer op, non-offer, pure offer, revoked
+    /// handle) falls through to the unchanged generic dispatch. Note this mirrors the *generic*
+    /// op remap (not the LiveImpl `base_op + op` scheme), because it stands in for exactly what
+    /// the generic offer dispatch would compute.
+    fn instanced_offer_for_import(&self, packed: u32) -> Option<(OfferEntry, u32)> {
+        let slot = packed & 0xFFFF;
+        let cop = packed >> 16;
+        let b = self.import_bindings.get(slot as usize).copied()?;
+        if !b.bound {
+            return None;
+        }
+        let eff_op = match self.import_remaps.get(slot as usize).and_then(|r| r.as_ref()) {
+            Some(remap) => *remap.get(cop as usize)?,
+            None if cop == 0 => b.op,
+            None => return None,
+        };
+        match self.resolve(b.handle, b.type_id) {
+            Ok(Binding::Offer(idx)) => {
+                let e = self.offers.get(idx as usize)?;
+                e.state.is_some().then(|| (e.clone(), eff_op))
+            }
+            _ => None,
+        }
+    }
+
+    /// CALLS.md increment 3, slice 1 — the `call.import.dyn` pre-probe. Reproduces the
+    /// `CAP_DYN_TYPE_ID` front-matter (intern the self-module shape `ty` to its runtime id) then
+    /// returns `(entry, op)` iff `handle` names an instanced offer of that interface. `None`
+    /// otherwise, falling through to the unchanged generic dispatch.
+    fn instanced_offer_for_dyn(&mut self, ty: u32, op: u32, handle: i32) -> Option<(OfferEntry, u32)> {
+        // `self_type_id` interns the self shape (mutates the intern table); this is idempotent with
+        // the generic dyn path (`cap_dispatch_slots`), so interning here then falling through on a
+        // miss re-derives the same id.
+        let id = self.self_type_id(ty).ok()?;
+        match self.resolve(handle, id) {
+            Ok(Binding::Offer(idx)) => {
+                let e = self.offers.get(idx as usize)?;
+                e.state.is_some().then(|| (e.clone(), op))
+            }
+            _ => None,
+        }
+    }
+
     /// The function a queued `(export, op)` dispatch runs: the registered self module's
     /// impl-export op table entry, checked in-range against its function table. `None` fails
     /// the enqueue closed — the queue only ever holds servable dispatches.
@@ -15070,6 +15275,16 @@ impl Host {
     /// re-entrant call finds the instance busy and gets a probeable `-EAGAIN`, so the old
     /// "providers never hold offers" acyclicity rule is no longer load-bearing and is lifted.
     /// `None` (nothing granted) for a non-instanced offer or a non-grantable cap.
+    ///
+    /// **Lock invariant (CALLS.md increment 3, slice 1):** this and the other blocking
+    /// `state.lock()` accessors ([`Host::impl_fuel_remaining`], [`Host::set_impl_fuel_reserve`])
+    /// take the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
+    /// acquisition order. The narrowed dispatch path (`drive_instanced_offer`)
+    /// takes them in the opposite order (`state → hg`), but only via a non-blocking `state.try_lock()`,
+    /// so no cycle can form **during a live run**. These wiring/introspection APIs must therefore not
+    /// be called from another thread concurrently with a live scheduler run (they aren't today: they
+    /// are pre-run wiring and single-threaded metering). The clean fix — making them `try_lock` — lands
+    /// when `ProviderState` retires (increment 6).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -15080,7 +15295,8 @@ impl Host {
 
     /// §5.3 provider-pays: the provider's remaining fuel reserve behind `offer` — the wirer's
     /// meter ("read the meters on what you granted", §15). `None` for a forged handle or a
-    /// pure (non-instanced) offer.
+    /// pure (non-instanced) offer. Blocking `state.lock()` — see the lock invariant on
+    /// [`Host::grant_impl_cap`] (not called concurrently with a live run).
     pub fn impl_fuel_remaining(&self, offer: i32) -> Option<u64> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -15089,7 +15305,8 @@ impl Host {
 
     /// §5.3 provider-pays: set the provider's fuel reserve behind `offer` (the wirer pricing
     /// its own service — top-up or clamp). `None` (no change) for a forged handle or a pure
-    /// offer.
+    /// offer. Blocking `state.lock()` — see the lock invariant on [`Host::grant_impl_cap`]
+    /// (not called concurrently with a live run).
     pub fn set_impl_fuel_reserve(&mut self, offer: i32, fuel: u64) -> Option<()> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         state.lock().unwrap_or_else(|e| e.into_inner()).fuel = fuel;
