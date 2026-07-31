@@ -121,7 +121,13 @@ try {
   ok(`data dir persisted to IndexedDB (${size} bytes)`);
 
   // 3) Reload the page — every byte of wasm linear memory is gone. Anything that survives came from IDB.
-  await page.reload({ waitUntil: 'load' });
+  // Wait on `domcontentloaded`, not `load`: the full `load` event blocks until every sub-resource
+  // (the ~2.2 MB engine wasm + ~4.3 MB qjs asset, re-fetched from the COOP/COEP server) has settled,
+  // which under CI runner load intermittently exceeds Playwright's 30 s default and flakes the reload
+  // (ISSUES.md I56). The engine's own readiness is the real gate — `waitEngine` below waits for
+  // `engine-state=ready`, and the persistence assertions (SELECT 919191, "restored") still must pass —
+  // so relaxing the navigation wait hardens the flake without masking any real regression.
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
   await waitEngine(page);
   const r2 = await runSql(page, 'SELECT x FROM reload_probe;');
   if (r2.state !== 'done') fail(`select after reload did not finish cleanly: state=${r2.state}`);

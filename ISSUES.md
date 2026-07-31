@@ -21,6 +21,26 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I56 — `pg-reload-test.mjs` intermittently fails the `real-browser` job at `page.reload` (`Timeout 30000ms exceeded` waiting for `load`) (S4, flaky CI) — surfaced 2026-07-31 on PR #558, hardened same day
+
+**Symptom.** On PR #558 (a `browser/src/lib.rs` rename + a native-test comment + docs — nothing on the
+Postgres/reload path) the `real-browser` job failed **after** every other real-browser check passed
+(`browser-test.mjs`, `browser-jit-reactor-test.mjs`, `browser-play-editor-test.mjs`, the chibicc
+bench): `pg-reload-test.mjs` got through boot + the 41 MB IndexedDB save, then
+`page.reload: Timeout 30000ms exceeded · waiting for navigation until "load"`. Unrelated to the diff.
+
+**Root cause.** The step waited on the `load` event, which doesn't fire until **every** sub-resource
+re-settles — including the ~2.2 MB engine wasm and the ~4.3 MB `qjs_repl.svmb` asset re-fetched from
+the COOP/COEP server after a hard reload. Under CI runner load that occasionally exceeds Playwright's
+30 s default; the app itself was fine (the engine-ready gate and the persistence assertions never ran).
+
+**Hardened here.** `page.reload({ waitUntil: 'load' })` → `{ waitUntil: 'domcontentloaded', timeout:
+60_000 }`. The subsequent `waitEngine` (waits for `engine-state=ready`) plus the `SELECT 919191` /
+"restored" checks remain the real gate, so relaxing the *navigation* wait cannot mask a genuine reload
+or persistence regression — it only drops the over-strict full-`load` dependency. If it still recurs,
+the next lever is a one-shot reload retry, or serving the two big assets with a warm cache across the
+reload.
+
 ### I55 — the `browser` crate is a separate workspace, so a cross-crate rename left `main` un-buildable on wasm32 for a day before any gate caught it (S3, build-gate gap) — surfaced 2026-07-31, fixed same day
 
 **Symptom.** `cargo +nightly build -Z build-std … --target wasm32-unknown-unknown` of `browser`
