@@ -7443,6 +7443,49 @@ enum Outcome {
     StdinPark,
 }
 
+/// Monotonic clock for a fiber's **real** (busy-poll) `memory.wait` timeout. Returns nanoseconds
+/// from an arbitrary process epoch.
+///
+/// - **Native**: real monotonic wall time (a process-global base [`Instant`]). A timed wait polled
+///   in a busy `cont.resume` loop fires after the requested duration elapses, as before.
+/// - **Wasm** (`wasm32-unknown-unknown`): there is **no wall clock** — `Instant::now()` panics
+///   (`std::time::Instant::now` → `unreachable`). The cdylib is deliberately import-free, so we
+///   have no host time either. Instead this returns a monotonic **poll counter** that advances one
+///   tick per observation, and [`sched_wall_deadline`] arms the timeout at a small fixed number of
+///   ticks ([`WASM_WAIT_POLL_TICKS`]). The busy resume-poll loop therefore still terminates (the
+///   sole job of the real deadline; the deterministic *logical* `deadline` remains the idle-time
+///   timer). Wall-clock fidelity is meaningless on this target, so counting polls is the honest
+///   substitute and keeps the confinement/verifier paths untouched.
+#[cfg(not(target_family = "wasm"))]
+fn sched_wall_now() -> u64 {
+    use std::time::Instant;
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+#[cfg(target_family = "wasm")]
+fn sched_wall_now() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    TICKS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Poll-ticks a wasm timed `memory.wait` waits before its busy-poll timeout fires (see
+/// [`sched_wall_now`]). Small so a `sleep` resolves promptly; non-zero so sibling fibers still get
+/// a few turns first rather than the sleeper resolving on its very first poll.
+#[cfg(target_family = "wasm")]
+const WASM_WAIT_POLL_TICKS: u64 = 8;
+
+/// Arm a real (busy-poll) timeout `timeout` nanoseconds out — native uses the real duration; wasm
+/// uses a small fixed tick budget (wall time is meaningless there). See [`sched_wall_now`].
+#[cfg(not(target_family = "wasm"))]
+fn sched_wall_deadline(timeout: u64) -> u64 {
+    sched_wall_now().saturating_add(timeout)
+}
+#[cfg(target_family = "wasm")]
+fn sched_wall_deadline(_timeout: u64) -> u64 {
+    sched_wall_now().saturating_add(WASM_WAIT_POLL_TICKS)
+}
+
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
 /// per-context shadow-SP swap ([`shadow_switch`]) and, on freeze, flattens each `Parked` fiber into its
 /// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`. `Clone` for
@@ -7472,8 +7515,11 @@ enum FiberState {
         key: u64,
         /// Logical-clock deadline (`clock + timeout`), fired when no task is runnable.
         deadline: u64,
-        /// Real-clock deadline, checked at each `cont.resume` poll of this fiber.
-        real_deadline: std::time::Instant,
+        /// Real-clock deadline (nanoseconds from [`sched_wall_now`]'s epoch), checked at each
+        /// `cont.resume` poll of this fiber. Native: monotonic wall time. Wasm: a monotonic
+        /// poll counter (no wall clock on `wasm32-unknown-unknown`), so a busy resume-poll loop
+        /// still terminates — see [`sched_wall_now`].
+        real_deadline: u64,
         /// `Some(status)` once the event fired — the fiber is claimable and the next resume
         /// delivers the status; `None` while still blocked.
         woken: Option<i32>,
@@ -8144,8 +8190,7 @@ fn step_vcpu(
                             unreachable!()
                         };
                         let fired = woken.take().or_else(|| {
-                            (std::time::Instant::now() >= *real_deadline)
-                                .then_some(super::WAIT_TIMED_OUT)
+                            (sched_wall_now() >= *real_deadline).then_some(super::WAIT_TIMED_OUT)
                         });
                         let Some(st) = fired else {
                             vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
@@ -9581,8 +9626,7 @@ fn drive(
                         wait_dst: dst,
                         key: base,
                         deadline: clock.saturating_add(timeout),
-                        real_deadline: std::time::Instant::now()
-                            + std::time::Duration::from_nanos(timeout),
+                        real_deadline: sched_wall_deadline(timeout),
                         woken: (cur != expected).then_some(super::WAIT_NOT_EQUAL),
                     };
                     vt.active_id = rid;
