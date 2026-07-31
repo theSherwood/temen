@@ -1833,6 +1833,14 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_region_map" => (cap_id::SHARED_REGION, 0),
         "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
         "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
+        // Guest-driven JIT (§22) — the macro-staging on-ramp grants the Jit cap; mirrors
+        // svm-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })
@@ -2108,6 +2116,90 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
         stdout: host.stdout,
         stderr: host.stderr,
         framebuffer,
+    }
+}
+
+/// On-ramp powerbox **with the §22 `Jit` capability granted** — for the self-hosted JACL
+/// compiler-guest (`jacl_compiler.svmb`), which expands macros in-guest by compiling each macro
+/// body with `vm_jit_compile_linked` and running it with `vm_jit_invoke2`. The Jit cap is serviced
+/// **in-Rust by the bytecode interpreter** (the same path [`jit_exec`]/[`dynlink_exec`] use — no
+/// native backend, no Worker/SharedArrayBuffer tier). Shape mirrors [`onramp_exec`] (stdin = source,
+/// stdout = emitted IR) plus the Jit grant and the `vm_jit_*` import bindings ([`onramp_cap_resolver`]).
+/// `browser_jit_validator` is the security hinge: every unit the guest submits is verified before it
+/// runs, exactly like any other module — so granting Jit here stays "as secure as wasm".
+pub fn onramp_jit_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
+    let unsupported = || PbOutcome {
+        status: STATUS_UNSUPPORTED,
+        value: 0,
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        framebuffer: None,
+    };
+    if onramp_check(m).is_err() {
+        return unsupported();
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    // §3e on-ramp prefix (same grants/names as `grant_onramp_caps`).
+    let stdout_h = host.grant_stream(StreamRole::Out);
+    let stdin_h = host.grant_stream(StreamRole::In);
+    let exit_h = host.grant_exit();
+    let mem_h = host.grant_memory();
+    let addr_h = host.grant_address_space(0, win);
+    for (name, handle) in ONRAMP_CAP_NAMES
+        .iter()
+        .zip(&[stdout_h, stdin_h, exit_h, mem_h, addr_h])
+    {
+        host.register_cap_name(name, *handle);
+    }
+    // §22 Jit cap for in-guest macro staging + its verifier (the security hinge).
+    let jit_h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
+    host.set_jit_validator(browser_jit_validator);
+    // Bind the guest's manifest imports (write/read/exit/vm_*/vm_jit_*) to the granted handles.
+    if !m.imports.is_empty() {
+        use svm_interp::cap_id;
+        let bindings = m
+            .imports
+            .iter()
+            .map(|im| {
+                let Some(cap) = onramp_cap_resolver(&im.name) else {
+                    return svm_interp::BoundImport::rebindable(0, 0, None);
+                };
+                let handle = match (cap.type_id, cap.op) {
+                    (cap_id::STREAM, 1) => stdout_h,
+                    (cap_id::STREAM, _) => stdin_h,
+                    (cap_id::EXIT, _) => exit_h,
+                    (cap_id::MEMORY, _) => mem_h,
+                    (cap_id::ADDRESS_SPACE, _) => addr_h,
+                    (cap_id::JIT, _) => jit_h,
+                    _ => return svm_interp::BoundImport::rebindable(0, 0, None),
+                };
+                svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            })
+            .collect();
+        host.set_import_bindings(bindings);
+    }
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) =
+        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+            None => (STATUS_UNSUPPORTED, 0, 0),
+            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            Some(Ok(vals)) => match vals.first() {
+                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+                _ => (STATUS_BAD_RESULT, 0, 0),
+            },
+        };
+    PbOutcome {
+        status,
+        value,
+        exit_code,
+        stdout: host.stdout,
+        stderr: host.stderr,
+        framebuffer: None,
     }
 }
 
