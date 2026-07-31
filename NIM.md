@@ -650,10 +650,24 @@ plumbing. Five workstreams, roughly independent:
     twin of `UnlinkedDataPtr`). The real `@[]`/`add` program now runs to completion with **no
     hand-patching**. Tested: a hand-written funcref gvar with a static `= dbl` initializer, called
     cross-module with *no runtime setter* — the materialized slot dispatches to `dbl`, both engines
-    (`tests/link.rs`). **One correctness bug remains**, now isolated: the sum-of-squares result is
-    off by a constant `+20` (`build(4)`→34 not 14, `build(3)`→25 not 5) — a phantom seq element or a
-    non-zero `result` init in the seq/alloc path, unrelated to linkage. The ARC-heavy string path
-    already links and runs against real `=wasMoved`/`=destroy`.
+    (`tests/link.rs`).
+  - **✅ First heap program runs correctly, from Nim source — MET 2026-07-31.** `tests/nim_e2e.rs`
+    now drives the toolchain on a real allocating program (`var s: seq[int] = @[]; while … s.add(i*i)`;
+    sum it), links it with the runtime shim, runs its C `main` through the **entire init chain**, and
+    reads the module global `r` back — `sumSquares(4) == 14` on **both engines** (§9 parity). This is
+    the first genuine heap allocation on SVM end-to-end: the allocator, `oomHandler`, the frame
+    handoff, and the funcref-initializer materialization all exercised at once, from source.
+  - **Two isolated follow-ups** (neither blocks the above; both precisely characterized):
+    - **`for x in s` sums a phantom `+20`.** The openArray `items` iterator over a non-empty seq adds
+      a constant `20` once (`for`-sum of `[100,200]`→320; `build(4)`→34 not 14) — but **direct index
+      iteration** (`while j < s.len: s[j]`), `add`, `s[i]`, and empty-seq iteration are all correct
+      (the E2E test uses explicit indexing for that reason). So the bug is localized to the
+      `toOpenArray`/openArray-`items` lowering (`len` or the accessor), not seqs generally.
+    - **Init-chain runs are module-order-sensitive.** Linking the **program module first** (the
+      convention `link` builds on — first unit's first proc is func 0, the natural entry) runs `main`
+      correctly; a `system`-first layout mislays the entry region and yields garbage. `nim_e2e` pins
+      program-first; worth hardening the entry/layout so order can't corrupt a run.
+  The ARC-heavy string path already links and runs against real `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

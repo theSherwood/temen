@@ -179,7 +179,14 @@ fn link_with_runtime(mods: &[(String, String)]) -> Module {
         ..Default::default()
     };
 
-    let units: Vec<svm_leng::WholeModule> = mods
+    // Order the **program module first** (the `system` module — stem `sysv…` — last), the convention
+    // `link` builds on: the first unit's first proc is func 0, the natural entry, and the C `main`/init
+    // chain lives in the program module. `collect_x_nif`'s directory order is filesystem-dependent, so
+    // pin it here — an init-chain run through `main` is order-sensitive (a `system`-first layout mislays
+    // the entry region). Stable sort keeps any multi-module program's own order.
+    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
+    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    let units: Vec<svm_leng::WholeModule> = ordered
         .iter()
         .map(|(stem, src)| svm_leng::WholeModule { stem, src })
         .collect();
@@ -294,4 +301,71 @@ fn real_allocator_runs_end_to_end() {
         let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &after);
         assert_eq!(second, (1 << 19) + 4096, "second page bumped by one page");
     });
+}
+
+/// Run the program's C `main` — the **full init chain** (nimony's `ini`: guards, the `system`
+/// module's init, the funcref-gvar static initializers the linker materialized, then the program
+/// body) — on both engines, seeding the bump-allocator cursor at window offset 8, and read module
+/// global `global_substr` back from each engine's final window. Asserts `main` returns 0 (runs to
+/// completion) and the two engines agree (§9 parity); returns the global.
+fn run_main_read_global(m: &Module, global_substr: &str) -> i64 {
+    let main = m
+        .exports
+        .iter()
+        .find(|e| e.name == "main")
+        .expect("exportc main")
+        .func;
+    let off = m
+        .data_exports
+        .iter()
+        .find(|e| e.name.starts_with(global_substr))
+        .unwrap_or_else(|| panic!("no data export starting with `{global_substr}`"))
+        .offset as usize;
+    // 1 MiB window, bump cursor seeded to 512 KiB (above the linked globals region).
+    let mut seed = vec![0u8; 1 << 20];
+    seed[8..16].copy_from_slice(&(1i64 << 19).to_le_bytes());
+    // C `main(argc, argv, envp)` with a leading frame `$sp` — all zero for a no-arg program.
+    let ivals = [Value::I64(0), Value::I32(0), Value::I64(0), Value::I64(0)];
+    let mut fuel = 500_000_000u64;
+    let (ir, imem) = svm_interp::run_capture(m, main, &ivals, &mut fuel, &seed);
+    assert!(ir.is_ok(), "interp main: {ir:?}");
+    let iv = i64::from_le_bytes(imem[off..off + 8].try_into().unwrap());
+    let (jout, jmem) =
+        svm_jit::compile_and_run_capture(m, main, &[0, 0, 0, 0], &seed).expect("jit");
+    assert!(
+        matches!(jout, svm_jit::JitOutcome::Returned(_)),
+        "jit main: {jout:?}"
+    );
+    let jv = i64::from_le_bytes(jmem[off..off + 8].try_into().unwrap());
+    assert_eq!(iv, jv, "§9 interp/JIT parity on the computed global");
+    iv
+}
+
+#[test]
+fn nim_heap_seq_program_runs_end_to_end() {
+    // A real allocating program: build `@[i*i]` in a `seq[int]`, then sum it. Exercises the whole
+    // stack from Nim source — the cross-module funcref-gvar calls (`oomHandler`), the whole-program
+    // frame fixpoint (`alloc` takes `$sp`), the `data.funcref`-materialized funcref-gvar initializers
+    // (so the init chain runs without a trap), and the real stdlib allocator over the runtime shim.
+    // Entry is the C `main`, which runs the full init chain then `let r = sumSquares(4)`; we read `r`
+    // back. Uses explicit index iteration (`while j < s.len: s[j]`) — the `for x in s` openArray
+    // iterator has a separate `+20` bug tracked in NIM.md/ISSUES.md.
+    with_program(
+        "proc sumSquares(n: int): int =\n\
+         \x20 var s: seq[int] = @[]\n\
+         \x20 var i = 0\n\
+         \x20 while i < n:\n\
+         \x20   s.add(i * i)\n\
+         \x20   i = i + 1\n\
+         \x20 result = 0\n\
+         \x20 var j = 0\n\
+         \x20 while j < s.len:\n\
+         \x20   result = result + s[j]\n\
+         \x20   j = j + 1\n\
+         let r = sumSquares(4)\n",
+        |m| {
+            // 0*0 + 1*1 + 2*2 + 3*3 = 0 + 1 + 4 + 9 = 14.
+            assert_eq!(run_main_read_global(m, "r.0."), 14, "sumSquares(4)");
+        },
+    );
 }
