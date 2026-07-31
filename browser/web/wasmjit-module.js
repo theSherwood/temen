@@ -101,3 +101,24 @@ export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInf
   }
   return driveJitRun(ex, memory);
 }
+
+// Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.svmb compiles one of
+// its own cc1 TUs (`tuBytes`, a memfs-relative path like `frontend/chibicc/hashmap.c`) to a linkable
+// object, reading the TU + its glibc header closure from `imgBytes` (the committed closure image). Same
+// shape as `runJitCompiler` but through `svm_selfhost_jit_emit_object_fs` (raw image + `--emit-object`
+// argv, 128 MiB window for the giants). The emitted object text comes back on `svm_stdout_*` after finish.
+export async function runJitSelfhost(ex, memory, moduleBytes, imgBytes, tuBytes, debugInfo = 0) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const modP = Number(ex.svm_alloc(moduleBytes.length));
+  const imgP = Number(ex.svm_alloc(imgBytes.length));
+  const tuP = Number(ex.svm_alloc(tuBytes.length));
+  u8().set(moduleBytes, modP); u8().set(imgBytes, imgP); u8().set(tuBytes, tuP);
+  const opened = ex.svm_selfhost_jit_emit_object_fs(modP, moduleBytes.length, imgP, imgBytes.length, tuP, tuBytes.length, debugInfo);
+  ex.svm_dealloc(modP, moduleBytes.length);
+  ex.svm_dealloc(imgP, imgBytes.length);
+  ex.svm_dealloc(tuP, tuBytes.length);
+  if (opened !== 0) {
+    throw new Error(`JIT self-host open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
+  }
+  return driveJitRun(ex, memory);
+}
