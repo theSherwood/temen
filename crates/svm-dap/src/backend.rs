@@ -138,6 +138,39 @@ fn build_single_run(
     DebugRun::new_with_host(module, func, args, host)
 }
 
+/// Build a multi-vCPU [`ScheduledDebugRun`] for `module`'s `func(args)`: the scheduled-engine twin of
+/// [`build_single_run`]. Under the on-ramp I/O powerbox when `powerbox` (so a threaded C guest's
+/// `malloc`/`printf` reach the `memory`/`write` caps instead of `CapFault`ing, and `main`'s return
+/// becomes an `exit` code), else deny-all. The `seed` is the slice-7 schedule variation. `None` if the
+/// module is outside the scheduled engine's subset. Blocking stdin is single-vCPU only, so a threaded
+/// session never sets it — the caller declines a `blockStdin` threaded launch upstream.
+#[allow(clippy::too_many_arguments)]
+fn build_scheduled_run(
+    module: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    powerbox: bool,
+    stdin: &[u8],
+    mem_limit: Option<u64>,
+    seed: Option<u64>,
+    tape: &CapTape,
+) -> Option<ScheduledDebugRun> {
+    let mut run = if powerbox {
+        let mut host = Host::new();
+        grant_io_powerbox(&mut host, module, stdin);
+        host.set_mem_map_limit(mem_limit);
+        host.record_caps();
+        if !tape.records.is_empty() {
+            host.replay_cap_tape(tape.clone());
+        }
+        ScheduledDebugRun::new_with_host(module, func, args, host)?
+    } else {
+        ScheduledDebugRun::new(module, func, args)?
+    };
+    run.set_sched_seed(seed);
+    Some(run)
+}
+
 /// The ~20 `Inspector` operations `DapServer` drives, abstracted so a bytecode-backed session can
 /// serve the same requests. Methods a backend can't honor (reverse/watch) are gated by
 /// [`supports_reverse`](Debuggee::supports_reverse) / [`supports_watch`](Debuggee::supports_watch);
@@ -478,9 +511,11 @@ impl BytecodeBackend {
             if block_stdin {
                 return None;
             }
-            let mut run = ScheduledDebugRun::new(&module, func, args)?;
-            // Slice 7: the seeded pick — adversarial schedule variation, deterministic per seed.
-            run.set_sched_seed(seed);
+            // The powerbox rides the scheduled engine too now, so a threaded C guest's
+            // `malloc`/`printf` work under the debugger (the seed is the slice-7 variation).
+            let run = build_scheduled_run(
+                &module, func, args, powerbox, &stdin, mem_limit, seed, &tape,
+            )?;
             Engine::Threaded(Box::new(run))
         } else {
             // A seed is meaningless with one vCPU — decline rather than silently ignore it.
@@ -556,6 +591,21 @@ impl BytecodeBackend {
             &self.stdin,
             self.block_stdin,
             self.mem_limit,
+            &self.tape,
+        )
+    }
+
+    /// Rebuild a fresh scheduled run with this session's powerbox + seed (the threaded twin of
+    /// [`fresh_single`]) — the base a reverse `seek`/rev-trace probe re-drives from.
+    fn fresh_scheduled(&self) -> Option<ScheduledDebugRun> {
+        build_scheduled_run(
+            &self.module,
+            self.func,
+            &self.args,
+            self.powerbox,
+            &self.stdin,
+            self.mem_limit,
+            self.seed,
             &self.tape,
         )
     }
@@ -661,11 +711,12 @@ impl BytecodeBackend {
         if !self.powerbox {
             return;
         }
-        if let Engine::Single(run) = &self.engine {
-            let live = run.host().cap_tape();
-            if live.records.len() > self.tape.records.len() {
-                self.tape = live;
-            }
+        let live = match &self.engine {
+            Engine::Single(run) => run.host().cap_tape(),
+            Engine::Threaded(run) => run.host().cap_tape(),
+        };
+        if live.records.len() > self.tape.records.len() {
+            self.tape = live;
         }
     }
 
@@ -725,13 +776,12 @@ impl BytecodeBackend {
                 }
             }
             Engine::Threaded(_) => {
-                let Some(mut probe) = ScheduledDebugRun::new(&self.module, self.func, &self.args)
-                else {
+                let Some(mut probe) = self.fresh_scheduled() else {
                     return false;
                 };
-                // The probe must replay the *same schedule* as the session (slice 7 policy) and
-                // the same debugger writes (slice 8), or its timeline diverges.
-                probe.set_sched_seed(self.seed);
+                // The probe must replay the *same schedule* as the session (slice 7 policy; the
+                // seed rides `fresh_scheduled`) and the same debugger writes (slice 8), or its
+                // timeline diverges.
                 probe.set_forced_switches(self.forced.clone());
                 probe.set_scheduled_writes(self.writes.clone());
                 loop {
@@ -930,7 +980,7 @@ impl Debuggee for BytecodeBackend {
         if self.is_threaded() {
             // Rebuild a fresh scheduled run and replay `t` turns — the schedule is deterministic, so
             // this reproduces the exact state at global turn `t` (DEBUGGING.md W1, multithreaded).
-            let Some(mut run) = ScheduledDebugRun::new(&self.module, self.func, &self.args) else {
+            let Some(mut run) = self.fresh_scheduled() else {
                 return Stop::Blocked;
             };
             run.set_breakpoints(self.breakpoints.clone());
@@ -949,8 +999,8 @@ impl Debuggee for BytecodeBackend {
             if self.sched_trace {
                 run.set_sched_trace(true);
             }
-            // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it.
-            run.set_sched_seed(self.seed);
+            // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it (the
+            // seed rides `fresh_scheduled`; forced switches are applied here).
             run.set_forced_switches(self.forced.clone());
             // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
             run.set_scheduled_writes(self.writes.clone());
@@ -1354,7 +1404,7 @@ impl Debuggee for BytecodeBackend {
     fn stdout(&self) -> &[u8] {
         match &self.engine {
             Engine::Single(run) => &run.host().stdout,
-            Engine::Threaded(_) => &[],
+            Engine::Threaded(run) => &run.host().stdout,
         }
     }
 }

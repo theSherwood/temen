@@ -615,6 +615,25 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 > ~0.08 ms per step+poll and ~2 ms `stepBack` through the wasm32 cdylib — the embedder-side
 > latency questions the plan deferred are settled.
 >
+> **Post-plan residue (2026-07-31, driving the embedder's panels + threading tier):** three more
+> gaps the c_interpret panel wiring hit, all DONE:
+> - **Exit code over DAP.** A finished run now precedes `terminated` with a standard `exited`
+>   event carrying the code — `main`'s return through the powerbox `exit` cap (`Trap::Exit`), a
+>   compute session's returned scalar, or `1` for an abnormal trap. Unblocks the consumer's
+>   "exited with N" readout. Gated by `crates/svm-dap/tests/exit_code.rs`.
+> - **The powerbox on the scheduled (multi-vCPU) debug engine.** A `thread.spawn` module launched
+>   with a *deny-all* host, so a threaded C guest's `malloc`/`printf`/`exit` `CapFault`ed and the
+>   debugger couldn't run threading lessons. `ScheduledDebugRun` now takes the same on-ramp
+>   powerbox `DebugRun` does (`build_scheduled_run`/`fresh_scheduled`, re-armed on every seek
+>   rebuild + rev-trace probe; `host()`/`stdout` surfaced, CapTape captured for both engines).
+>   Gated by `crates/svm-dap/tests/threaded_powerbox.rs` (output + exit code + seek).
+> - **The playground allocator grows.** The seeded `browser/playground-include/stdlib.h` shipped a
+>   fixed 64 KiB static arena — too small for a pthread stack (256 KiB), so `pthread_create`
+>   failed in the playground even with the powerbox wired. Replaced with the frontend's
+>   `__vm_map`-growing, thread-safe bump allocator (lock-free fetch-add + spinlock on growth), so
+>   large mallocs and multiple thread stacks commit into the reserved tail on demand. A real
+>   pthreads program now runs to `counter=6` under the debugger with both vCPUs scheduled.
+>
 > Order rationale: 1–2 are small and unblock any embedder spike (interactivity + step latency);
 > 3 is the hinge the model slices stand on; 4–5 close the perf/memory panels; 6–7 close the
 > threading story; 8–10 are an independent tail, land any time.

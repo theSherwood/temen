@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use svm_interp::{Inspector, IrPc, Stop, StopReason, Value, VarValue, WatchId, WatchKind};
+use svm_interp::{Inspector, IrPc, Stop, StopReason, Trap, Value, VarValue, WatchId, WatchKind};
 use svm_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod backend;
@@ -1495,14 +1495,24 @@ impl DapServer {
         }
         let mut events = self.output_events();
         let tid = self.stopped_thread_id();
-        events.push(match stop {
-            Stop::Break { reason, .. } => stopped_event(dap_reason(reason), tid),
-            Stop::Finished(_) => {
+        match stop {
+            Stop::Break { reason, .. } => events.push(stopped_event(dap_reason(reason), tid)),
+            Stop::Finished(result) => {
                 self.terminated = true;
-                ("terminated", Json::obj(vec![]))
+                // Standard DAP: an `exited` event carrying the guest's exit code precedes
+                // `terminated`, so a client can show "exited with N". The on-ramp powerbox turns
+                // `main`'s return into an `exit` capability call (`Trap::Exit(code)`); a deny-all
+                // compute session instead finishes with returned values, whose first scalar is the
+                // result. A non-exit trap (fault/unreachable/…) exits non-zero the way a real
+                // process would on a signal.
+                events.push((
+                    "exited",
+                    Json::obj(vec![("exitCode", Json::i(exit_code_of(&result) as i64))]),
+                ));
+                events.push(("terminated", Json::obj(vec![])));
             }
-            Stop::Blocked => stopped_event("pause", tid),
-        });
+            Stop::Blocked => events.push(stopped_event("pause", tid)),
+        }
         events
     }
 
@@ -1537,6 +1547,23 @@ impl DapServer {
             .and_then(|s| s.inspector.stopped_task())
             .map(|t| t as i64 + 1)
             .unwrap_or(1)
+    }
+}
+
+/// The exit code a finished run reports to the DAP `exited` event. A powerbox guest ends via the
+/// `exit` capability (`Trap::Exit(code)`) — the usual case, carrying `main`'s return. A compute
+/// session returns values directly; its first scalar is the result (truncated to i32, like a
+/// process exit status). Any other trap is a non-zero abnormal exit (1), mirroring a process
+/// killed by a fault.
+fn exit_code_of(result: &Result<Vec<Value>, Trap>) -> i32 {
+    match result {
+        Ok(vals) => match vals.first() {
+            Some(Value::I32(n)) => *n,
+            Some(Value::I64(n)) => *n as i32,
+            _ => 0,
+        },
+        Err(Trap::Exit(code)) => *code,
+        Err(_) => 1,
     }
 }
 
