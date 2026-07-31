@@ -234,9 +234,10 @@ fn with_program(source: &str, check: impl FnOnce(&Module)) {
     check(&m);
 }
 
-/// Run exported proc `export_substr` with `args` on both engines, seeding the bump-allocator cursor
-/// (window offset 8) to `heap_start`; returns the i64 result and the interp's final window (so a
-/// follow-up call can continue from the advanced cursor).
+/// Run exported proc `export_substr` with `args` on both engines over the caller-provided `seed`
+/// (which sets the bump-allocator cursor, the `POWERBOX_HEAP_BRK` word at window offset 32);
+/// returns the i64 result and the interp's final window (so a follow-up call can continue from the
+/// advanced cursor).
 fn run_export_seeded(m: &Module, export_substr: &str, args: &[i64], seed: &[u8]) -> (i64, Vec<u8>) {
     let idx = m
         .exports
@@ -289,13 +290,14 @@ fn nim_arithmetic_and_control_flow_runs_on_svm() {
 #[test]
 fn real_allocator_runs_end_to_end() {
     // The `system` module linked into any program is the real one, so its allocator is exercisable.
-    // `osAllocPages` is the raw page source — it calls the bound `mmap`, which the shim serves from a
-    // bump cursor at window offset 8. Two calls must return the seeded heap start and then one page
-    // past it — real stdlib allocation running on both engines, with the `system` module sourced from
-    // the toolchain (no committed artifact).
+    // `osAllocPages` is the raw page source — it calls the bound `mmap`, which the shim serves from
+    // the `POWERBOX_HEAP_BRK` bump cursor (window offset 32). Two calls must return the seeded heap
+    // start and then one page past it — real stdlib allocation running on both engines, with the
+    // `system` module sourced from the toolchain (no committed artifact).
     with_program("proc noop() = discard\nnoop()\n", |m| {
         let mut window = vec![0u8; 1 << 20];
-        window[8..16].copy_from_slice(&(1i64 << 19).to_le_bytes());
+        let brk = svm_ir::POWERBOX_HEAP_BRK as usize;
+        window[brk..brk + 8].copy_from_slice(&(1i64 << 19).to_le_bytes());
         let (first, after) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &window);
         assert_eq!(first, 1 << 19, "first page is the seeded heap start");
         let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &after);
@@ -321,17 +323,30 @@ fn run_main_read_global(m: &Module, global_substr: &str) -> i64 {
         .find(|e| e.name.starts_with(global_substr))
         .unwrap_or_else(|| panic!("no data export starting with `{global_substr}`"))
         .offset as usize;
-    // 1 MiB window, bump cursor seeded to 512 KiB (above the linked globals region).
+    // Powerbox layout (the model svm-llvm's C on-ramp runs under): the data stack is based at
+    // `powerbox_entry_sp` (page-aligned, above all globals), and the heap lives above the 1 MiB
+    // stack reserve — so globals / data stack / heap are disjoint by construction and the allocator
+    // can never stomp a live frame or the seq it's growing. The heap-brk word (`POWERBOX_HEAP_BRK`,
+    // window offset 32) is the shim bump allocator's cursor; seed it to the heap base.
+    let entry_sp = svm_ir::powerbox_entry_sp(m) as i64;
+    let heap_base = entry_sp + svm_ir::POWERBOX_STACK_RESERVE as i64;
     let mut seed = vec![0u8; 1 << 20];
-    seed[8..16].copy_from_slice(&(1i64 << 19).to_le_bytes());
-    // C `main(argc, argv, envp)` with a leading frame `$sp` — all zero for a no-arg program.
-    let ivals = [Value::I64(0), Value::I32(0), Value::I64(0), Value::I64(0)];
+    let brk = svm_ir::POWERBOX_HEAP_BRK as usize;
+    seed[brk..brk + 8].copy_from_slice(&heap_base.to_le_bytes());
+    // C `main(argc, argv, envp)` with the leading frame `$sp` = the data-stack base; argc/argv/envp
+    // are zero for a no-arg program.
+    let ivals = [
+        Value::I64(entry_sp),
+        Value::I32(0),
+        Value::I64(0),
+        Value::I64(0),
+    ];
     let mut fuel = 500_000_000u64;
     let (ir, imem) = svm_interp::run_capture(m, main, &ivals, &mut fuel, &seed);
     assert!(ir.is_ok(), "interp main: {ir:?}");
     let iv = i64::from_le_bytes(imem[off..off + 8].try_into().unwrap());
     let (jout, jmem) =
-        svm_jit::compile_and_run_capture(m, main, &[0, 0, 0, 0], &seed).expect("jit");
+        svm_jit::compile_and_run_capture(m, main, &[entry_sp, 0, 0, 0], &seed).expect("jit");
     assert!(
         matches!(jout, svm_jit::JitOutcome::Returned(_)),
         "jit main: {jout:?}"
@@ -348,8 +363,7 @@ fn nim_heap_seq_program_runs_end_to_end() {
     // frame fixpoint (`alloc` takes `$sp`), the `data.funcref`-materialized funcref-gvar initializers
     // (so the init chain runs without a trap), and the real stdlib allocator over the runtime shim.
     // Entry is the C `main`, which runs the full init chain then `let r = sumSquares(4)`; we read `r`
-    // back. Uses explicit index iteration (`while j < s.len: s[j]`) — the `for x in s` openArray
-    // iterator has a separate `+20` bug tracked in NIM.md/ISSUES.md.
+    // back. Uses explicit index iteration (`while j < s.len: s[j]`).
     with_program(
         "proc sumSquares(n: int): int =\n\
          \x20 var s: seq[int] = @[]\n\
@@ -366,6 +380,36 @@ fn nim_heap_seq_program_runs_end_to_end() {
         |m| {
             // 0*0 + 1*1 + 2*2 + 3*3 = 0 + 1 + 4 + 9 = 14.
             assert_eq!(run_main_read_global(m, "r.0."), 14, "sumSquares(4)");
+        },
+    );
+}
+
+#[test]
+fn nim_for_in_seq_iterator_runs_end_to_end() {
+    // The idiomatic `for x in s` openArray iterator — the same allocating program as above, but
+    // iterating the seq with `for` instead of an explicit index. This exercises two fixes together:
+    // the powerbox memory layout (data stack based at `powerbox_entry_sp`, heap above the reserve,
+    // so the allocator can never stomp the seq — previously this corrupted `s.len` into a phantom
+    // `+20` extra element), and unsigned-comparison lowering (the TLSF allocator's `uint32` bitmaps,
+    // which a signed `le`/`lt` mis-ordered once the layout stopped masking the reallocation path).
+    with_program(
+        "proc sumSquares(n: int): int =\n\
+         \x20 var s: seq[int] = @[]\n\
+         \x20 var i = 0\n\
+         \x20 while i < n:\n\
+         \x20   s.add(i * i)\n\
+         \x20   i = i + 1\n\
+         \x20 result = 0\n\
+         \x20 for x in s:\n\
+         \x20   result = result + x\n\
+         let r = sumSquares(5)\n",
+        |m| {
+            // 0 + 1 + 4 + 9 + 16 = 30 — no phantom trailing element.
+            assert_eq!(
+                run_main_read_global(m, "r.0."),
+                30,
+                "for x in s: sum of squares"
+            );
         },
     );
 }
