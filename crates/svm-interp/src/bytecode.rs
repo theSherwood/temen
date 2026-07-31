@@ -6878,6 +6878,17 @@ impl ScheduledDebugRun {
         self.turn
     }
 
+    /// The powerbox host backing this run — for reading effects a debugged multithreaded guest
+    /// produced (captured stdout) and its [`CapTape`](Host::cap_tape) so a reverse `seek` rebuild
+    /// replays identical cap inputs. The scheduled-engine twin of [`DebugRun::host`].
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+    /// Mutable powerbox host — e.g. to drain captured stdout between stops.
+    pub fn host_mut(&mut self) -> &mut Host {
+        &mut self.host
+    }
+
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
     /// focused thread becomes the one about to run (lowest-index runnable), or none once the run finished.
     pub fn locate(&mut self) {

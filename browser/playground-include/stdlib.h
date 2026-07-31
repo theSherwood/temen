@@ -1,9 +1,12 @@
 #ifndef __STDLIB_H
 #define __STDLIB_H
 
-// <stdlib.h> for the playground. `malloc` is a bump allocator over a static arena (each block
-// carries an 8-byte size header so `realloc` can copy); `free` is a no-op. That's plenty for a
-// single-shot compile-and-run demo — no authority, all guest C.
+// <stdlib.h> for the playground. `malloc` is a **map-growing, thread-safe** bump allocator: it
+// claims bytes with a lock-free atomic fetch-add on a bump pointer in the reserved window tail and
+// commits fresh host pages on demand with `__vm_map` (the same allocator the frontend's own
+// stdlib.h ships, so a threaded lesson's pthread stacks — 256 KiB each — and any large malloc grow
+// past the modest initial window instead of hitting a fixed arena cap). `free` is a no-op (MVP:
+// no reclamation). No authority beyond the granted Memory capability, all guest C.
 #include <stdarg.h>
 
 typedef unsigned long size_t;
@@ -12,28 +15,70 @@ typedef unsigned long size_t;
 
 void exit(int code);
 
-#define __PG_HEAP_BYTES (1 << 16) // 64 KiB arena (a demo allocator; keeps the guest window modest)
-static char __pg_heap[__PG_HEAP_BYTES];
-static size_t __pg_brk = 0;
+// The Memory-capability builtins (§3e/§4), lowered to `cap.call` on the granted Memory handle.
+// `__vm_map` commits `[off, off+len)` (prot READ|WRITE = 3), returning 0 or a negative errno;
+// `__vm_page_size` is the host MMU granularity `map` rounds to. The atomics make the bump pointer
+// thread-safe (a single-threaded program pays only an uncontended atomic and never pulls in the
+// thread runtime — only `thread.spawn`/`wait`/`notify` mark a module threaded).
+long __vm_map(long off, long len, int prot);
+long __vm_page_size(void);
+long __vm_atomic_add(void *p, long v);                     // fetch-add (i64), returns old
+long __vm_atomic_load(void *p);                            // load (i64)
+void __vm_atomic_store(void *p, long v);                   // store (i64)
+int __vm_atomic_cas32(void *p, int expected, int desired); // CAS (i32), returns old
+void __vm_atomic_store32(void *p, int v);                  // store (i32)
 
+#define __PG_HEAP_BASE 268435456L // 256 MiB: above the backed prefix, in the reserved tail
+#define __PG_HDR 16L              // per-allocation header (holds the payload size; 16-byte aligned)
+static long __pg_brk = __PG_HEAP_BASE;       // next free byte (bump pointer)
+static long __pg_committed = __PG_HEAP_BASE;  // first byte past committed
+static long __pg_page = 0;                     // cached host page granularity
+static int __pg_grow_lock = 0;                 // spinlock for heap *growth* only
+
+static inline long __pg_pagesize(void) {
+  if (__pg_page == 0) {
+    long p = __vm_page_size();
+    __pg_page = p > 0 ? p : 4096L;
+  }
+  return __pg_page;
+}
+
+// Lock-free fast path (atomic fetch-add claims a unique region); only page growth is serialized, so
+// a page is mapped exactly once. `__pg_committed` is published *after* the map, so a caller seeing
+// `committed >= end` knows its region is backed.
 static inline void *malloc(size_t n) {
-  size_t need = ((n + 8) + 15) & ~(size_t)15; // 8-byte header + 16-byte align
-  if (__pg_brk + need > __PG_HEAP_BYTES) return NULL;
-  char *p = __pg_heap + __pg_brk;
-  __pg_brk += need;
-  *(size_t *)p = n;
-  return p + 8;
+  n = (n + 15UL) & ~15UL; // 16-byte align the payload
+  long total = __PG_HDR + (long)n;
+  long hdr = __vm_atomic_add(&__pg_brk, total);
+  long payload = hdr + __PG_HDR;
+  long end = hdr + total;
+  if (end > __vm_atomic_load(&__pg_committed)) {
+    while (__vm_atomic_cas32(&__pg_grow_lock, 0, 1) != 0) {
+    }
+    long cur = __vm_atomic_load(&__pg_committed);
+    if (end > cur) {
+      long pg = __pg_pagesize();
+      long need = (end - cur + (pg - 1)) & ~(pg - 1);
+      if (__vm_map(cur, need, 3) != 0) {
+        __vm_atomic_store32(&__pg_grow_lock, 0);
+        return NULL; // out of memory
+      }
+      __vm_atomic_store(&__pg_committed, cur + need);
+    }
+    __vm_atomic_store32(&__pg_grow_lock, 0);
+  }
+  *(size_t *)hdr = n;
+  return (void *)payload;
 }
 static inline void free(void *p) { (void)p; }
 static inline void *calloc(size_t nm, size_t sz) {
-  size_t n = nm * sz;
-  char *p = malloc(n);
-  if (p) for (size_t i = 0; i < n; i++) p[i] = 0;
-  return p;
+  // Fresh window pages are zero-filled by `map` and the bump allocator never reuses a byte, so the
+  // payload is already zero.
+  return malloc(nm * sz);
 }
 static inline void *realloc(void *old, size_t n) {
   if (!old) return malloc(n);
-  size_t oldn = *(size_t *)((char *)old - 8);
+  size_t oldn = *(size_t *)((char *)old - __PG_HDR);
   char *p = malloc(n);
   if (p) {
     size_t c = oldn < n ? oldn : n;
