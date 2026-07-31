@@ -3662,7 +3662,20 @@ impl HostCap {
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
-            grant: Arc::new(move |h, _| h.grant_host_proc(make())),
+            // FORK.md PR 5: `make` is already the fork factory — the multi-backend grant contract
+            // ("a fresh closure per grant over one shared provider state") is exactly the
+            // fork-shares-state contract, so every `HostCap::host_proc`-wired capability (e.g.
+            // `posix_cap`'s libc: shared fd table/memfs) is forkable by construction. A twin's
+            // powerbox re-mints its closure through this same factory (`Host::fork_powerbox`).
+            grant: Arc::new({
+                let make = Arc::clone(&make);
+                move |h, _| {
+                    h.grant_host_proc_forkable(
+                        make(),
+                        Arc::clone(&make) as svm_interp::HostProcFork,
+                    )
+                }
+            }),
             unbound: false,
             offer: None,
             iface: None,

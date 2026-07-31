@@ -4322,11 +4322,14 @@ impl Scheduler {
     /// when the fork cannot be done: no parked-vCPU caller (a [`Waiter::Fiber`] caller is a follow-up),
     /// the live cap is hit, the domain isn't a simple forkable shape (`fork_powerbox`/`fork_private`
     /// fail closed), or the caller isn't a bare root park (has children/fibers — not yet supported).
+    /// `reply_orig` is `Some(value)` for the explicit two-reply form, or `None` for **pid mode**
+    /// (FORK.md PR 5): the original caller's reply is the twin's `TaskId` — POSIX `fork()`'s
+    /// parent-sees-pid, with `reply_twin` = `0` as the child's return.
     fn fork_parked_caller(
         self: &Arc<Self>,
         callee_id: usize,
         ticket: u64,
-        reply_orig: i64,
+        reply_orig: Option<i64>,
         reply_twin: i64,
     ) -> Option<i64> {
         let mut s = self.lock();
@@ -4388,7 +4391,8 @@ impl Scheduler {
         twin.pending = Some(Pending::CapResult(reply_twin));
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
-        v.pending = Some(Pending::CapResult(reply_orig));
+        // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
+        v.pending = Some(Pending::CapResult(reply_orig.unwrap_or(twin_id as i64)));
         s.runnable.push_back(v);
         self.maybe_spawn_worker(&mut s);
         self.work.notify_all();
@@ -9245,19 +9249,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     *serve_count = 0;
                 }
-                // FORK.md PR 1 — `clone_caller(reply_orig, reply_twin)` (self-namespace op 11): serviced
-                // here because it needs the eval-loop-local `serve_run` (the running handler's dispatch).
-                // Increment 3 — the **targeted clone**: from within a handler, duplicate the caller parked
-                // on this dispatch into a live **twin** (private window + duplicated powerbox, its own
-                // domain), deliver `reply_orig` to the original and `reply_twin` to the twin, and return
-                // the twin's `child_handle`. Both reload their injected reply and resume **past** the fork
-                // `cap.call` — `fork()`'s return-twice, one live run (FORK.md §3/§8.3). The dispatch is
-                // marked replied so the handler's own return does not clobber the original's value.
+                // FORK.md PR 1/PR 5 — `clone_caller` (self-namespace op 11): serviced here because it
+                // needs the eval-loop-local `serve_run` (the running handler's dispatch). The **targeted
+                // clone**: from within a handler, duplicate the caller parked on this dispatch into a
+                // live **twin** (private window + duplicated powerbox, its own domain), deliver each copy
+                // its reply, and return the twin's `child_handle`. Both reload their injected reply and
+                // resume **past** the fork `cap.call` — `fork()`'s return-twice, one live run (FORK.md
+                // §3/§8.3). The dispatch is marked replied so the handler's own return does not clobber
+                // the original's value. Two arities:
+                //   * `clone_caller(reply_orig, reply_twin)` — explicit two-reply form (increment 3).
+                //   * `clone_caller(reply_twin)` / `clone_caller()` — **pid mode** (PR 5, what `fork()`
+                //     desugars to): the original's reply is the twin's `TaskId` (parent sees pid), the
+                //     twin's is `reply_twin` (0 for fork). On a failed fork in pid mode the original
+                //     resumes with `-EAGAIN` — exactly POSIX `fork()`'s failure return — and the same
+                //     errno is returned to the handler.
                 // `-EINVAL` when not called from within a handler (no `serve_run`, or from the serve loop
-                // itself, `*cur == serve_cur`). If the twin can't be built (a non-`Real` scheduler, a
-                // non-forkable domain — `fork_powerbox`/`fork_private` fail closed — or a caller with
-                // children/fibers), it **degrades to a single reply** (increment 2's nucleus): the
-                // original still resumes with `reply_orig`, `0` is returned, no twin. Never hangs.
+                // itself, `*cur == serve_cur`). A failed clone (non-`Real` scheduler, non-forkable
+                // domain, caller with children/fibers) **degrades to a single reply** — never hangs.
                 Inst::CapCall {
                     type_id: svm_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
@@ -9265,13 +9273,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let reply_orig = match args.first() {
-                        Some(a) => get(&frames[top].vals, *a)?.i64(),
-                        None => 0,
-                    };
-                    let reply_twin = match args.get(1) {
-                        Some(a) => get(&frames[top].vals, *a)?.i64(),
-                        None => 0,
+                    // Arity picks the mode: 2 args = explicit (orig, twin); 0/1 args = pid mode.
+                    let (reply_orig, reply_twin) = if args.len() >= 2 {
+                        (
+                            Some(get(&frames[top].vals, args[0])?.i64()),
+                            get(&frames[top].vals, args[1])?.i64(),
+                        )
+                    } else {
+                        let twin = match args.first() {
+                            Some(a) => get(&frames[top].vals, *a)?.i64(),
+                            None => 0,
+                        };
+                        (None, twin)
                     };
                     let r = match serve_run.as_mut() {
                         Some(sr) if *cur != sr.serve_cur => {
@@ -9290,8 +9303,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             match twin {
                                 Some(h) => h,
                                 None => {
-                                    sched.cap_reply_or_stash(ticket, reply_orig, host);
-                                    0
+                                    // Explicit mode: the promised reply. Pid mode: -EAGAIN (POSIX
+                                    // fork failure), to caller and handler alike.
+                                    let fallback = reply_orig.unwrap_or(EAGAIN);
+                                    sched.cap_reply_or_stash(ticket, fallback, host);
+                                    reply_orig.map_or(EAGAIN, |_| 0)
                                 }
                             }
                         }
