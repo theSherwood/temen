@@ -532,6 +532,7 @@ fn verifier_rejects_forward_value_reference() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I32],
@@ -566,6 +567,7 @@ fn verifier_rejects_bad_branch_target() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I32],
@@ -598,6 +600,7 @@ fn verifier_rejects_entry_param_mismatch() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
             results: vec![],
@@ -1094,6 +1097,7 @@ fn verifier_rejects_call_to_missing_function() {
     use svm_ir::{Block, Func, Module, Terminator, ValType};
     let m = Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
             results: vec![ValType::I32],

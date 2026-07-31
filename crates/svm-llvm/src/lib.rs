@@ -1144,6 +1144,7 @@ fn translate_impl(
             // time), so it emits no cross-unit data symbols — nothing to export here.
             data_exports: vec![],
             data_ptrs: vec![],
+            data_funcrefs: vec![],
             funcs,
             memory,
             data,

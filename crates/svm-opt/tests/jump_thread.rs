@@ -12,6 +12,7 @@ use svm_verify::verify_module;
 fn module(f: Func) -> Module {
     Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         types: vec![],
         funcs: vec![f],
         memory: None,
