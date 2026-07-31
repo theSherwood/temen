@@ -21,24 +21,26 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I57 — `provision-nimony.sh` fails the `nim end-to-end` job with `fatal: destination path 'nimony' already exists and is not an empty directory` when the nimony cache is warm (S4, flaky CI) — surfaced 2026-07-31 on PR #560
+### I57 — `provision-nimony.sh` failed the `nim end-to-end` job with `fatal: destination path 'nimony' already exists and is not an empty directory` on any warm nimony cache (S4, CI break) — surfaced 2026-07-31 on PR #560, **FIXED same day** (`claude/bash-svm-viability-uqj6ts`)
 
 **Symptom.** On PR #560 (fork capstone — touches only `svm-interp`, one new `svm` test, and `FORK.md`,
 nothing in the nim path) the `nim end-to-end (real toolchain → svm)` job failed in the provisioning
-step, immediately after a **cache hit** restored `nimony/`: `scripts/ci/provision-nimony.sh` then did a
+step, immediately after a cache hit restored `nimony/bin`: `scripts/ci/provision-nimony.sh` then did a
 `git clone` into `nimony/` and aborted — `fatal: destination path 'nimony' already exists and is not an
-empty directory` (exit 128). Unrelated to the diff; a cache-restore-vs-clone race, not a code failure.
+empty directory` (exit 128). Recurred on every re-trigger (the branch cache stayed warm), confirming it
+is **deterministic on a cache hit**, not a race.
 
-**Root cause (sketch).** The provision script `git clone`s the nimony toolchain unconditionally, but the
-`actions/cache` restore for key `nimony-Linux-…` already populates `nimony/`. On a cache hit the clone
-target is non-empty, so the clone fails. On a cache miss the directory is absent and it succeeds — hence
-intermittent (keyed on cache warmth, not the PR).
+**Root cause.** The `actions/cache` step caches `nimony/bin` + `~/.cache/nim` — the built output, **not**
+`nimony/.git`. So on a warm cache `nimony/` exists (from the restored `bin/`) but is not a git checkout,
+the `if [ ! -d nimony/.git ]` guard passes, and `git clone nimony` aborts on the non-empty target. Cold
+cache = `nimony/` absent = clone into empty dir succeeds; hence it only bit once the key went warm.
 
-**Fix sketch (not yet applied — infra, not this PR's scope).** Make `provision-nimony.sh` idempotent
-w.r.t. a warm cache: skip the clone when `nimony/.git` (or the built toolchain marker) already exists, or
-`git -C nimony fetch` + checkout instead of cloning, or clone into a temp dir and move only on cache
-miss. Until then, re-running the job clears it (a fresh runner or the next key rotation misses the cache).
-Re-triggered on PR #560; the capstone diff is green on every other gate.
+**Fix (applied).** `provision-nimony.sh` now inits a repo in place and fetches instead of cloning:
+`mkdir -p nimony; git -C nimony init; git -C nimony remote add origin …; git -C nimony fetch
+--filter=blob:none origin` (all branches, to mirror the old clone's reachability so the pinned SHA is
+present), then the existing `git -C nimony checkout --detach "$NIMONY_REF"`. Works whether `nimony/` is
+absent (cold) or holds a restored `bin/` (warm). Editing the script also rotates the cache key
+(`hashFiles('scripts/ci/provision-nimony.sh')`), so the fix runs cold first, then warm on the new key.
 
 ### I56 — `pg-reload-test.mjs` intermittently fails the `real-browser` job at `page.reload` (`Timeout 30000ms exceeded` waiting for `load`) (S4, flaky CI) — surfaced 2026-07-31 on PR #558, hardened same day
 
