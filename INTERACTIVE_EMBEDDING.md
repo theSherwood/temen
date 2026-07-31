@@ -311,6 +311,19 @@ is honest about the gap. Acceptance, as elsewhere, is against SVM's own oracles.
   also use **semaphores and barriers** (`sem_*`, `pthread_barrier_*`). These need guest-libc
   equivalents over SVM's threading primitives (a frontend/libc item, not an engine one).
 
+### Cost model (2026-07-30, as-built): everything is opt-in
+
+Every landed X-slice is armed explicitly and pays nothing un-armed (invariant 9b). Concretely:
+the access sink, the memory models, and the scheduler trace tape live on the **debug engines
+only** (`DebugRun`/`ScheduledDebugRun` — the production run loops, the tree-walker's undebugged
+path, and both fast backends are untouched), each gated by an `Option` that defaults `None`; the
+bulk-op watchpoint decode runs only when watchpoints are armed (the pre-existing emptiness
+gates); the run-mode profiler is a separate entry that instruments its own module copy. The one
+addition on a shared production path is the Memory-cap growth limit: **one `Option::is_some`
+branch per `vm_map`/`vm_unmap` capability call** (allocator-growth frequency, not per memory
+access; accounting only runs with a limit set) plus two words on `Host`. No per-op, per-access,
+or per-turn cost exists anywhere for a domain that opts into nothing.
+
 ### Closure sketch (2026-07-30) — mechanisms that stay SVM-shaped
 
 How each X-item closes without new engine surface, without consumer coupling, and with models kept

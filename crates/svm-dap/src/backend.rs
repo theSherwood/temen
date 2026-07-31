@@ -106,6 +106,7 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
 /// `powerbox` (recording cap inputs, and replaying `tape` from a prior forward run so a reverse-`seek`
 /// rebuild re-executes with identical clock/stdin inputs), else deny-all (`DebugRun::new`). `None` if the
 /// module is outside the engine's subset.
+#[allow(clippy::too_many_arguments)]
 fn build_single_run(
     module: &Module,
     func: FuncIdx,
@@ -416,6 +417,7 @@ impl BytecodeBackend {
     /// is outside the bytecode engine's subset (`compile_module` declines it). `powerbox` runs a
     /// spawn-free guest under the on-ramp I/O powerbox (`stdin` preloads `read`); a threaded guest ignores
     /// it (deny-all).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         module: Module,
         func: FuncIdx,

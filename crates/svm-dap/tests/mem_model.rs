@@ -84,7 +84,7 @@ fn fault_counter_counts_first_touch_pages() {
 }
 
 /// **Seek consistency through the real checkpoint ladder** (the slice-4 acceptance): run a
-/// >1024-op guest to completion, `seek` back to a mid-run clock — the engine restores a ladder
+/// guest of more than 1024 ops to completion, `seek` back to a mid-run clock — the engine restores a ladder
 /// checkpoint and replays the tail, the sink feeds the replay, and the model's rollback lands on
 /// its matching snapshot. The result must equal a fresh model observing a from-0 run to the same
 /// clock, stats-for-stats (grids and LRU ticks included).

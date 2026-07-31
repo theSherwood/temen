@@ -3968,6 +3968,10 @@ fn watch_hit_before(
 /// DAP backend.
 pub type AccessSinkFn = Box<dyn FnMut(u64, usize, super::MemEvent) + Send>;
 
+/// The window memory-map introspection tuple — `(page_size, mapped, reserved, explicit-state
+/// pages)`, the shape `Mem::map_info` returns (INTERACTIVE_EMBEDDING.md slice 5).
+pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
+
 /// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
 /// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
 /// scope). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
@@ -4629,9 +4633,9 @@ impl DebugRun {
         self.access_sink = Some(sink);
     }
 
-    /// The run's window memory-map introspection ([`Mem::map_info`](super::Host)): `(page_size,
-    /// mapped, reserved, explicit-state pages)`. `None` for a memory-less module.
-    pub fn mem_map_info(&self) -> Option<(u64, u64, u64, Vec<(u64, u8)>)> {
+    /// The run's window memory-map introspection ([`MemMapInfo`]). `None` for a memory-less
+    /// module.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
     }
 
@@ -5990,7 +5994,7 @@ impl ScheduledDebugRun {
     }
 
     /// The shared window's memory-map introspection — see `DebugRun::mem_map_info`.
-    pub fn mem_map_info(&self) -> Option<(u64, u64, u64, Vec<(u64, u8)>)> {
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
     }
 
