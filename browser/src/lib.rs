@@ -5209,10 +5209,10 @@ pub extern "C" fn svm_mem_profile(
     // grants the hook first, so a scratch first-grant yields the exact baked-in value).
     let handle = {
         let mut scratch = Host::new();
-        scratch.grant_host_fn(Box::new(|_, _, _| Ok(vec![])))
+        scratch.grant_host_proc(Box::new(|_, _, _| Ok(vec![])))
     };
     let spec = svm_opt::instrument::MemHookSpec {
-        type_id: svm_interp::cap_id::HOST_FN,
+        type_id: svm_interp::cap_id::HOST_PROC,
         handle,
     };
     let (im, _stats) = svm_opt::instrument::instrument_mem_hooks(&m, spec);
@@ -5251,7 +5251,7 @@ pub extern "C" fn svm_mem_profile(
     let feed = Arc::clone(&model);
     let mut host = Host::new();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
-    let h = host.grant_host_fn(Box::new(move |op, args, _mem| {
+    let h = host.grant_host_proc(Box::new(move |op, args, _mem| {
         if let Some(ev) = decode_mem_event(op, args) {
             n += 1;
             feed.lock()
