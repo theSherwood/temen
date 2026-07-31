@@ -569,13 +569,23 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    state and forced switches are **recorded** (tape-shaped, like CapTape) and re-applied at the
 >    same turns on replay. Acceptance: same seed → identical slice-6 tape; a forced switch lands
 >    at a deterministic turn and survives `seek`.
-> 8. **X5 — DAP `setVariable` / `writeMemory`.** Greenfield at all three layers (verified): the
->    `Inspector` has no write methods, the `Debuggee` trait has no write operation, and
->    `DapServer` handles neither request (nor `readMemory`) — so this is a new trait method +
->    engine implementations + new `handle` arms. Debugger writes are recorded on the session
->    input tape (the `CapTape` shape) so replay re-applies them. Acceptance: write → `seek` back
->    → `seek` forward re-observes the write; parity with the tree-walker where both back the
->    same request.
+> 8. ~~**X5 — DAP `setVariable` / `writeMemory`.**~~ **DONE 2026-07-31** — debugger writes live on
+>    the **input tape**: the engines keep a clock-ordered `ScheduledWrite` list (`Window` bytes /
+>    `Var` by name + frame + focused task) applied whenever execution passes the recorded
+>    clock/turn on **any** path — a live continue and a seek replay reach identical states, which
+>    is what keeps the history slider truthful after an edit (seek to *before* the write's clock
+>    reads the original state; driving past it re-observes the write). Engine: `write_var` (typed
+>    SSA-slot coercion, integers only; memory-located vars take low-`width` bytes LE at the
+>    resolved window address; refused mid-coroutine — fail-closed, never a guess) + `write_window`
+>    on both debug engines; the backend records `(op_clock|op_turn, write)` and re-arms the list
+>    on every seek rebuild and rev-trace probe. DAP: standard `setVariable` (scope-ref → frame,
+>    width from the Variables-pane type resolution) and `writeMemory` (base64 at a decimal/hex
+>    `memoryReference` + offset), advertised via `supportsSetVariable` /
+>    `supportsWriteMemoryRequest`; both decline cleanly on the tree-walker (invariant 9 — no
+>    engine divergence, the request just fails). Gated by
+>    `crates/svm-dap/tests/state_writes.rs`: var + window + threaded writes shifting results and
+>    surviving `seek(0)` re-drive bit-identically, pre-write-clock state reading original,
+>    DAP round-trip incl. Variables-pane readback, and fail-closed surfaces.
 > 9. **X6 — guest-libc sem/barrier.** Extend `frontend/chibicc/include/pthread.h` — which already
 >    builds mutex + condvar on the `__vm_wait32`/`__vm_notify` futex intrinsics and declares
 >    sem/barrier out of scope — with `sem_*` (counter + futex) and `pthread_barrier_*`

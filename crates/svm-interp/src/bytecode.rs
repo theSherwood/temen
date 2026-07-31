@@ -3915,6 +3915,11 @@ pub struct DebugRun {
     /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
     /// `seek` rebuild (the `watch_specs` pattern) and leaves its rev-trace probes silent.
     access_sink: Option<AccessSinkFn>,
+    /// The session's **scheduled debugger writes** ([`ScheduledWrite`], slice 8), sorted by clock,
+    /// with the cursor of the next un-applied entry. Empty (the default) is one index compare per
+    /// advance; the DAP backend re-installs the list on every rebuild.
+    scheduled_writes: Vec<(u64, ScheduledWrite)>,
+    write_cursor: usize,
     /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
     /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -4394,6 +4399,164 @@ struct FrameReader<'a> {
     coro_debug: Option<&'a ModuleDebug>,
 }
 
+/// A resolved write destination (slice 8): a typed absolute regs slot (a promoted SSA scalar) or
+/// a confined window address (a memory-located variable).
+enum WriteTarget {
+    Ssa { reg: usize, ty: ValType },
+    Win { addr: u64 },
+}
+
+/// A **debugger write scheduled at a clock/turn** (INTERACTIVE_EMBEDDING.md slice 8): re-applied
+/// whenever execution passes that clock on **any** path — a live resume and a seek replay reach
+/// identical states, which is what keeps the history slider truthful after an edit. `task` names
+/// the focused vCPU a `Var` write resolves in on the scheduled engine (ignored single-vCPU).
+#[derive(Clone, Debug)]
+pub enum ScheduledWrite {
+    Window {
+        addr: u64,
+        bytes: Vec<u8>,
+    },
+    Var {
+        task: usize,
+        frame: usize,
+        name: String,
+        value: i64,
+        width: usize,
+    },
+}
+
+/// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
+/// write: an unresolvable or float target is skipped.
+fn apply_target(
+    target: Option<WriteTarget>,
+    value: i64,
+    width: usize,
+    vm_regs: &mut [Reg],
+    mem: &mut Option<Mem>,
+) {
+    match target {
+        Some(WriteTarget::Ssa { reg, ty }) => {
+            let v = match ty {
+                ValType::I32 => Value::I32(value as i32),
+                ValType::I64 => Value::I64(value),
+                _ => return,
+            };
+            if let Some(r) = vm_regs.get_mut(reg) {
+                *r = Reg::from_value(v);
+            }
+        }
+        Some(WriteTarget::Win { addr }) => {
+            let w = width.clamp(1, 8);
+            if let Some(m) = mem.as_mut() {
+                let _ = m.write_bytes(addr, &value.to_le_bytes()[..w]);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Apply every scheduled write due at `clock` to a **single-vCPU** run's pieces; `cursor` advances
+/// past applied and stale entries (entries below `clock` are inside a restored checkpoint already).
+#[allow(clippy::too_many_arguments)]
+fn apply_due_writes(
+    writes: &[(u64, ScheduledWrite)],
+    cursor: &mut usize,
+    clock: u64,
+    vt: &mut VTask,
+    source: &ModuleSource,
+    mem: &mut Option<Mem>,
+    debug: Option<&DebugInfo>,
+    fn_block_base: &[Vec<u32>],
+    fn_block_types: &[Vec<Vec<ValType>>],
+) {
+    while *cursor < writes.len() && writes[*cursor].0 < clock {
+        *cursor += 1;
+    }
+    while *cursor < writes.len() && writes[*cursor].0 == clock {
+        match &writes[*cursor].1 {
+            ScheduledWrite::Window { addr, bytes } => {
+                if let Some(m) = mem.as_mut() {
+                    let _ = m.write_bytes(*addr, bytes);
+                }
+            }
+            ScheduledWrite::Var {
+                frame,
+                name,
+                value,
+                width,
+                ..
+            } => {
+                if vt.active_coro.is_none() {
+                    let target = FrameReader {
+                        vm: &vt.active,
+                        source,
+                        mem: &*mem,
+                        debug,
+                        fn_block_base,
+                        fn_block_types,
+                        coro_debug: None,
+                    }
+                    .write_target(*frame, name);
+                    apply_target(target, *value, *width, &mut vt.active.regs, mem);
+                }
+            }
+        }
+        *cursor += 1;
+    }
+}
+
+/// The scheduled-engine twin of [`apply_due_writes`]: a `Var` write resolves in its recorded
+/// `task`'s frame.
+#[allow(clippy::too_many_arguments)]
+fn apply_due_writes_sched(
+    writes: &[(u64, ScheduledWrite)],
+    cursor: &mut usize,
+    turn: u64,
+    tasks: &mut [DbgTask],
+    source: &ModuleSource,
+    mem: &mut Option<Mem>,
+    debug: Option<&DebugInfo>,
+    fn_block_base: &[Vec<u32>],
+    fn_block_types: &[Vec<Vec<ValType>>],
+) {
+    while *cursor < writes.len() && writes[*cursor].0 < turn {
+        *cursor += 1;
+    }
+    while *cursor < writes.len() && writes[*cursor].0 == turn {
+        match &writes[*cursor].1 {
+            ScheduledWrite::Window { addr, bytes } => {
+                if let Some(m) = mem.as_mut() {
+                    let _ = m.write_bytes(*addr, bytes);
+                }
+            }
+            ScheduledWrite::Var {
+                task,
+                frame,
+                name,
+                value,
+                width,
+            } => {
+                if let Some(t) = tasks.get_mut(*task) {
+                    if t.vt.active_coro.is_none() {
+                        let target = FrameReader {
+                            vm: &t.vt.active,
+                            source,
+                            mem: &*mem,
+                            debug,
+                            fn_block_base,
+                            fn_block_types,
+                            coro_debug: None,
+                        }
+                        .write_target(*frame, name);
+                        apply_target(target, *value, *width, &mut t.vt.active.regs, mem);
+                    }
+                }
+            }
+        }
+        *cursor += 1;
+    }
+}
+
 impl<'a> FrameReader<'a> {
     /// Call-stack depth (running activation + suspended callers).
     fn depth(&self) -> usize {
@@ -4460,6 +4623,42 @@ impl<'a> FrameReader<'a> {
         let off = *fn_block_base.get(func)?.get(block)? as usize;
         let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
         Some(self.vm.regs[base + off + idx].to_value(ty))
+    }
+
+    /// Where a **write** to source variable `name` in frame `depth` lands (slice 8): the absolute
+    /// regs slot + type for a promoted SSA scalar, or the confined window address for a
+    /// memory-located var — the write-side mirror of [`FrameReader::read_var`]'s resolution.
+    fn write_target(&self, depth: usize, name: &str) -> Option<WriteTarget> {
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        let (di, fn_block_base, fn_block_types) = self.md_for(module)?;
+        let var = super::pick_var(di?, func as FuncIdx, name, block, inst)?;
+        let off = *fn_block_base.get(func)?.get(block)? as usize;
+        let slot = |idx: usize| -> Option<WriteTarget> {
+            let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
+            Some(WriteTarget::Ssa {
+                reg: base + off + idx,
+                ty,
+            })
+        };
+        match &var.loc {
+            VarLoc::Ssa { value } => slot(*value as usize),
+            VarLoc::SsaList(locs) => slot(super::loclist_value(locs, block, inst)? as usize),
+            VarLoc::Window { off: o } => Some(WriteTarget::Win {
+                addr: (self.vm.regs[base].i64() as u64).wrapping_add(*o as u64),
+            }),
+            VarLoc::WindowVia { base: locs, off: o } => {
+                let v = super::loclist_value(locs, block, inst)?;
+                let addr = match self.value_in_frame(depth, v as usize)? {
+                    Value::I32(x) => x as i64 as u64,
+                    Value::I64(x) => x as u64,
+                    _ => return None,
+                };
+                Some(WriteTarget::Win {
+                    addr: addr.wrapping_add(*o as u64),
+                })
+            }
+            VarLoc::Fixed { addr } => Some(WriteTarget::Win { addr: *addr }),
+        }
     }
 
     /// Read a source variable by name in the frame `depth` levels from the top, resolving its `VarLoc`
@@ -4590,6 +4789,8 @@ impl DebugRun {
             watchpoints: Vec::new(),
             stdin_parked: false,
             access_sink: None,
+            scheduled_writes: Vec::new(),
+            write_cursor: 0,
             last_watch: None,
         })
     }
@@ -4631,6 +4832,14 @@ impl DebugRun {
     /// cost when never installed. Replaces any prior sink.
     pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
         self.access_sink = Some(sink);
+    }
+
+    /// Install the session's **scheduled debugger writes** (slice 8): sorted by clock; entries at
+    /// clocks already passed are skipped (a rebuilt run applies them during its replay instead).
+    pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
+        writes.sort_by_key(|(c, _)| *c);
+        self.write_cursor = writes.partition_point(|(c, _)| *c < self.op_clock);
+        self.scheduled_writes = writes;
     }
 
     /// The run's window memory-map introspection ([`MemMapInfo`]). `None` for a memory-less
@@ -4759,9 +4968,24 @@ impl DebugRun {
             stdin_parked,
             funcs,
             fn_block_base,
+            fn_block_types,
+            debug,
             access_sink,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
+        apply_due_writes(
+            scheduled_writes,
+            write_cursor,
+            *op_clock,
+            vt,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+        );
         if let Some(sink) = access_sink.as_mut() {
             let (cur_vm, _) = vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
@@ -4812,16 +5036,31 @@ impl DebugRun {
             done,
             op_clock,
             fn_block_base,
+            fn_block_types,
+            debug,
             funcs,
             watchpoints,
             stdin_parked,
             access_sink,
+            scheduled_writes,
+            write_cursor,
             last_watch,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
         if *at_bp {
             *at_bp = false;
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
             if let Some(sink) = access_sink.as_mut() {
                 let (cur_vm, _) = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
@@ -4880,6 +5119,17 @@ impl DebugRun {
                 *at_bp = true;
                 return Some(pc);
             }
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
             if let Some(sink) = access_sink.as_mut() {
                 let (cur_vm, _) = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
@@ -4933,11 +5183,26 @@ impl DebugRun {
             stdin_parked,
             funcs,
             fn_block_base,
+            fn_block_types,
+            debug,
             access_sink,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
         loop {
+            apply_due_writes(
+                scheduled_writes,
+                write_cursor,
+                *op_clock,
+                vt,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
             if let Some(sink) = access_sink.as_mut() {
                 let (cur_vm, _) = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
@@ -5068,6 +5333,50 @@ impl DebugRun {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
+    }
+
+    /// **Write a source variable by name** (slice 8, the DAP `setVariable` backend): a promoted
+    /// SSA scalar takes `value` coerced to its slot type (integers only); a memory-located var
+    /// takes `value`'s low `width` bytes little-endian at its resolved window address. Refused
+    /// (`false`) mid-coroutine-step, for float slots, or for an unresolvable name — fail-closed,
+    /// never a guess. The DAP backend records successful writes and re-applies them at the same
+    /// clock on every seek replay, so time travel stays truthful.
+    pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
+        if self.vt.active_coro.is_some() {
+            return false; // parent-frame writes only this slice
+        }
+        let Some(target) = self.reader().write_target(depth, name) else {
+            return false;
+        };
+        match target {
+            WriteTarget::Ssa { reg, ty } => {
+                let v = match ty {
+                    ValType::I32 => Value::I32(value as i32),
+                    ValType::I64 => Value::I64(value),
+                    _ => return false,
+                };
+                match self.vt.active.regs.get_mut(reg) {
+                    Some(r) => {
+                        *r = Reg::from_value(v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            WriteTarget::Win { addr } => {
+                let w = width.clamp(1, 8);
+                self.write_window(addr, &value.to_le_bytes()[..w])
+            }
+        }
+    }
+
+    /// **Write bytes into the guest window** (slice 8, the DAP `writeMemory` backend). `false` if
+    /// the range is unmapped or the module has no memory.
+    pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        self.mem
+            .as_mut()
+            .and_then(|m| m.write_bytes(addr, bytes))
+            .is_some()
     }
 
     /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
@@ -5317,6 +5626,10 @@ pub struct ScheduledDebugRun {
     /// [`set_sched_trace`](ScheduledDebugRun::set_sched_trace); `None` (the default) is zero-cost.
     /// Re-armed by the DAP backend on `seek` rebuilds (the replay refills it deterministically).
     sched_trace: Option<Vec<SchedTraceEvent>>,
+    /// Scheduled debugger writes ([`ScheduledWrite`], slice 8) + the next-un-applied cursor — the
+    /// scheduled-engine twin of `DebugRun::scheduled_writes`.
+    scheduled_writes: Vec<(u64, ScheduledWrite)>,
+    write_cursor: usize,
     /// The **seeded pick** (slice 7): `Some(seed)` chooses uniformly among the runnable set via
     /// `splitmix64(seed ^ turn)` — an adversarial-variation knob whose choice is a pure function
     /// of `(seed, turn)`, so replay reproduces it with no captured scheduler state. `None` (the
@@ -6018,6 +6331,8 @@ impl ScheduledDebugRun {
             watchpoints: Vec::new(),
             access_sink: None,
             sched_trace: None,
+            scheduled_writes: Vec::new(),
+            write_cursor: 0,
             sched_seed: None,
             forced: Vec::new(),
             last_watch: None,
@@ -6044,6 +6359,19 @@ impl ScheduledDebugRun {
     /// `turn` and the executing task index. Observation only; zero cost when never installed.
     pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
         self.access_sink = Some(sink);
+    }
+
+    /// Install the session's **scheduled debugger writes** — see `DebugRun::set_scheduled_writes`.
+    pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
+        writes.sort_by_key(|(c, _)| *c);
+        self.write_cursor = writes.partition_point(|(c, _)| *c < self.turn);
+        self.scheduled_writes = writes;
+    }
+
+    /// The focused task index (the one a `write_var` resolves in) — the backend records it on a
+    /// scheduled `Var` write so replays resolve in the same task.
+    pub fn focus_task(&self) -> usize {
+        self.focus
     }
 
     /// The shared window's memory-map introspection — see `DebugRun::mem_map_info`.
@@ -6119,8 +6447,12 @@ impl ScheduledDebugRun {
             sched_trace,
             sched_seed,
             forced,
+            scheduled_writes,
+            write_cursor,
             last_watch,
             fn_block_base,
+            fn_block_types,
+            debug,
             stopped,
             focus,
             turn,
@@ -6206,6 +6538,17 @@ impl ScheduledDebugRun {
                     return SchedStop::Break { pc, reason };
                 }
             }
+            apply_due_writes_sched(
+                scheduled_writes,
+                write_cursor,
+                *turn,
+                tasks,
+                source,
+                mem,
+                debug.as_ref(),
+                fn_block_base,
+                fn_block_types,
+            );
             if let Some(sink) = access_sink.as_mut() {
                 let (cur_vm, _) = tasks[ti].vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
@@ -6403,10 +6746,14 @@ impl ScheduledDebugRun {
             clock,
             funcs,
             fn_block_base,
+            fn_block_types,
+            debug,
             access_sink,
             sched_trace,
             sched_seed,
             forced,
+            scheduled_writes,
+            write_cursor,
             ..
         } = self;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
@@ -6421,6 +6768,17 @@ impl ScheduledDebugRun {
         if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
             trace_pick_diff(before, tasks, *turn, trace);
         }
+        apply_due_writes_sched(
+            scheduled_writes,
+            write_cursor,
+            *turn,
+            tasks,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+        );
         if let Some(sink) = access_sink.as_mut() {
             let (cur_vm, _) = tasks[ti].vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
@@ -6773,6 +7131,49 @@ impl ScheduledDebugRun {
     /// The window address of a memory-located source variable in the focused thread's frame `depth`.
     pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
         self.reader().var_addr(depth, name)
+    }
+
+    /// Write a source variable in the **focused** thread's frame — see `DebugRun::write_var`.
+    pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
+        let focus = self.focus;
+        if self
+            .tasks
+            .get(focus)
+            .is_none_or(|t| t.vt.active_coro.is_some())
+        {
+            return false;
+        }
+        let Some(target) = self.reader().write_target(depth, name) else {
+            return false;
+        };
+        match target {
+            WriteTarget::Ssa { reg, ty } => {
+                let v = match ty {
+                    ValType::I32 => Value::I32(value as i32),
+                    ValType::I64 => Value::I64(value),
+                    _ => return false,
+                };
+                match self.tasks[focus].vt.active.regs.get_mut(reg) {
+                    Some(r) => {
+                        *r = Reg::from_value(v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            WriteTarget::Win { addr } => {
+                let w = width.clamp(1, 8);
+                self.write_window(addr, &value.to_le_bytes()[..w])
+            }
+        }
+    }
+
+    /// Write bytes into the shared guest window — see `DebugRun::write_window`.
+    pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        self.mem
+            .as_mut()
+            .and_then(|m| m.write_bytes(addr, bytes))
+            .is_some()
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
