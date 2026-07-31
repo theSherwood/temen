@@ -3049,6 +3049,16 @@ pub struct Module {
     /// (only instruction streams are), so it cannot desync. Empty for a runnable module (a survivor
     /// is a verify error, since nothing would patch the placeholder bytes before they are read).
     pub data_ptrs: Vec<DataPtr>,
+    /// **Data-image funcref relocations** (D-LINK, the data→code case): a **function index** baked
+    /// into a global's initializer whose value the frontend cannot know at emit time because the
+    /// linker assigns each unit's function base — a `proctype` gvar with a static proc initializer
+    /// (`var oomHandler = continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). Each
+    /// [`DataFuncref`] names a byte offset in this module's data image and the exported function it
+    /// refers to; [`link`] resolves the name to the merged funcidx and writes it as a 4-byte
+    /// little-endian `i32` — the value `ref.func` would yield — then clears the list. The funcref
+    /// twin of [`data_ptrs`](Module::data_ptrs): `ref.func` rides the instruction stream, but a
+    /// funcref stored in static data has no instruction to carry it. Empty for a runnable module.
+    pub data_funcrefs: Vec<DataFuncref>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -3459,6 +3469,22 @@ pub struct DataPtr {
     pub at: u64,
     /// The data address the pointer resolves to, once the linker has placed the units' data.
     pub target: DataPtrTarget,
+}
+
+/// A **data-image funcref relocation** ([`Module::data_funcrefs`], D-LINK, data→code): write the
+/// 4-byte little-endian merged **function index** of the exported func `name` into this unit's data
+/// image at byte offset `at`. Models a function pointer stored in a global's static initializer
+/// (`void (*f)() = g;` — nimony's `var oomHandler = continueAfterOutOfMem`). The value written is the
+/// one `ref.func name` would yield after the merge (module-0 funcref = its funcidx, §22), so loading
+/// the slot and `call_indirect`-ing through it dispatches to `name`. The frontend emits placeholder
+/// bytes in a `data` segment covering `[at, at+4)` and one of these to fix them up; [`link`]
+/// overwrites the 4 bytes and fails closed ([`LinkError::Unresolved`]) if no unit exports `name`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DataFuncref {
+    /// Byte offset within this unit's (un-relocated) data image where the 4-byte funcidx sits.
+    pub at: u64,
+    /// The exported function whose merged index is written — resolved via the link func-symbol table.
+    pub name: String,
 }
 
 /// What a [`DataPtr`] points at — the data-image twin of the code→data link forms.
@@ -3907,6 +3933,12 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // covering segment share one coordinate frame; the address written is already absolute
         // (`dbase`-relative for `self`, the symbol's window address for `sym`).
         apply_unit_data_ptrs(&mut m, dbase, &data_tab)?;
+        // Patch this unit's data-image funcrefs (`data.funcref`, the data→code case): overwrite the
+        // 4 placeholder bytes at each slot with the resolved merged funcidx. Like `data.ptr`, this
+        // runs while segment offsets are still unit-local (`at` and its covering segment share a
+        // frame). The funcidx is already global (`funcs_tab` holds `fbase + local`), so it needs no
+        // later shift by this unit's `offset_func_indices`.
+        apply_unit_data_funcrefs(&mut m, &funcs_tab)?;
         // Relocate this unit's data segments into its assigned window region…
         for d in &mut m.data {
             d.offset += dbase;
@@ -3999,6 +4031,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
         // Every unit's `data.ptr` slots were resolved and cleared per-unit above; the linked
         // module is runnable and carries none.
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
@@ -4185,6 +4218,40 @@ fn apply_unit_data_ptrs(
     Ok(())
 }
 
+/// Apply a unit's **data-image funcref relocations** ([`Module::data_funcrefs`], the data→code
+/// case): for each [`DataFuncref`], resolve `name` to its merged funcidx via `funcs_tab` (fail-closed
+/// [`LinkError::Unresolved`] if unexported) and write it as a 4-byte little-endian `i32` into the
+/// covering data segment — the value `ref.func name` yields. A slot not covered by a segment (or one
+/// whose 4 bytes run past a segment end) fails closed ([`LinkError::BadDataPtr`]). Clears
+/// `data_funcrefs` on success — the linked module carries none, mirroring `data_ptrs`.
+fn apply_unit_data_funcrefs(
+    m: &mut Module,
+    funcs_tab: &alloc::collections::BTreeMap<String, FuncIdx>,
+) -> Result<(), LinkError> {
+    for r in &m.data_funcrefs {
+        let func = *funcs_tab
+            .get(r.name.as_str())
+            .ok_or_else(|| LinkError::Unresolved(r.name.clone()))?;
+        let end =
+            r.at.checked_add(4)
+                .ok_or(LinkError::BadDataPtr { at: r.at })?;
+        let seg = m
+            .data
+            .iter_mut()
+            .find(|d| {
+                d.offset <= r.at
+                    && d.offset
+                        .checked_add(d.bytes.len() as u64)
+                        .is_some_and(|seg_end| end <= seg_end)
+            })
+            .ok_or(LinkError::BadDataPtr { at: r.at })?;
+        let lo = (r.at - seg.offset) as usize;
+        seg.bytes[lo..lo + 4].copy_from_slice(&func.to_le_bytes());
+    }
+    m.data_funcrefs.clear();
+    Ok(())
+}
+
 /// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
 /// `ref.func`, `thread.spawn`, and the `return_call` terminator. `call_indirect`/`cont.*` dispatch on
 /// runtime funcref *values*, not static indices, so they are untouched. `call.import` carries an
@@ -4305,6 +4372,7 @@ mod import_tests {
         };
         let mut m = Module {
             data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
@@ -4405,6 +4473,7 @@ mod link_layout_tests {
         LinkUnit {
             module: Module {
                 data_ptrs: Vec::new(),
+                data_funcrefs: Vec::new(),
                 types: vec![],
                 funcs: vec![],
                 memory: Some(Memory { size_log2: 16 }),

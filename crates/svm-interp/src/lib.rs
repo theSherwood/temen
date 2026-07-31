@@ -13380,6 +13380,7 @@ struct ModuleGrant {
 fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
+        data_funcrefs: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
         data: m.data.clone(),

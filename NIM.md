@@ -633,22 +633,27 @@ plumbing. Five workstreams, roughly independent:
     aggregate; the earlier `Unsupported("expression oconstr")` was a harness bug (import discovery
     compiled a *program* module standalone, which can't resolve a cross-module aggregate type like
     `string.0.<sys>` — now discovered from the self-contained `system` module only). A real
-    `@[]`/`add` program now **links and verifies with zero imports** — the cross-module funcref-gvar
-    and frame-fixpoint slices above closed the two link/verify gaps. **It also runs end-to-end
-    through the full C-`main`/init chain** (returns 0) — *once the funcref-gvar proc-symbol
-    initializers are materialized.* Root cause, pinned down: `var oomHandler = continueAfterOutOfMem`
-    and `var gExitFlush = nimNoopFlush` are funcref gvars whose value is a **static initializer** (a
-    proc pointer), but we zero-reserve the slot (the `gExitFlush` note) and *nothing* writes it — the
-    system `ini` is minimal (it only resets an exception global), contrary to the old "ini writes it"
-    assumption. So the first `call_indirect` through such a gvar traps (`IndirectCallType` through
-    func 0). Proven: patch the two func indices into the linked module's **data image** and the
-    program runs to completion. So the next slice is a **`data.funcref` relocation** — write a proc's
-    linked func index into a gvar's data slot at link time (the funcref twin of `data.ptr`), emitted
-    for a proc-symbol gvar initializer instead of zero-reserving. One correctness bug remains after
-    that: the sum-of-squares result is off by a constant `+20` (`build(4)`→34 not 14, `build(3)`→25
-    not 5) — a phantom seq element or a non-zero `result` init, isolated to the seq/alloc path, not
-    the linkage/frame work. The ARC-heavy string path already links and runs against real
-    `=wasMoved`/`=destroy`.
+    `@[]`/`add` program now **links, verifies, and runs end-to-end through the full C-`main`/init
+    chain** (returns 0) — the cross-module funcref-gvar, frame-fixpoint, and funcref-initializer
+    slices closed every gap between "compiles" and "runs."
+  - **✅ Funcref-gvar static initializers (`data.funcref`) — DONE 2026-07-31.** `var oomHandler =
+    continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush` are funcref gvars whose value is a
+    **static initializer** (a proc pointer). We used to zero-reserve the slot on the assumption the
+    system `ini` writes it — but `ini` is minimal (it only resets an exception global); the
+    initializer *is* the value, and nothing wrote it, so the first `call_indirect` through the gvar
+    trapped (`IndirectCallType` through func 0 — surfacing deep in `cAbort`'s flush). Fixed with a
+    **`data.funcref` relocation** (the funcref twin of `data.ptr`, svm_ir D-LINK): `svm-leng`'s
+    `collect_globals` records a proctype gvar's proc initializer, `translate_object_module` emits a
+    `DataFuncref{at, name}` under the initializer's stem-suffixed name, and `link` resolves it to the
+    merged funcidx and writes it (4-byte `i32`, the value `ref.func` yields) into the gvar's data
+    slot — then clears the list (a survivor is a fail-closed `UnlinkedDataFuncref` verify error, the
+    twin of `UnlinkedDataPtr`). The real `@[]`/`add` program now runs to completion with **no
+    hand-patching**. Tested: a hand-written funcref gvar with a static `= dbl` initializer, called
+    cross-module with *no runtime setter* — the materialized slot dispatches to `dbl`, both engines
+    (`tests/link.rs`). **One correctness bug remains**, now isolated: the sum-of-squares result is
+    off by a constant `+20` (`build(4)`→34 not 14, `build(3)`→25 not 5) — a phantom seq element or a
+    non-zero `result` init in the seq/alloc path, unrelated to linkage. The ARC-heavy string path
+    already links and runs against real `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS
   onto svm's model (the on-ramp gap Phase 1 already surfaced). ARC destructors/dup calls pass

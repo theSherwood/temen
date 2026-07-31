@@ -225,6 +225,9 @@ fn translate_object_module(
         })
         .collect();
     module.data_exports = t.global_exports(stem);
+    // Funcref gvars with a static proc initializer (`var oomHandler = continueAfterOutOfMem`) ride a
+    // `data.funcref` reloc the linker resolves to the merged funcidx — the value the gvar holds.
+    module.data_funcrefs = t.funcref_relocs(stem);
     // Also expose `exportc` symbols under their C names (the conventional entry points — the C
     // `main`, `cmdCount`, …), so a host / `svm-run --link` can bind to them by name (Path A).
     let (ec_procs, ec_data) = t.exportc_exports(&root)?;

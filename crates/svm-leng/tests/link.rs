@@ -433,3 +433,46 @@ fn cross_module_frame_needing_call() {
         );
     }
 }
+
+/// A funcref global with a **static proc initializer** — `var hook = dbl` — materialized by the
+/// linker. Module `s` declares `hook: IntFn` initialized to `dbl` and never assigns it at runtime;
+/// module `w`'s `drive` calls through `hook`. A funcref gvar's initial value is a *function index*
+/// the linker only knows once it assigns func bases, so `svm-leng` emits a `data.funcref` relocation
+/// (the funcref twin of `data.ptr`) that `link` resolves into the gvar's data slot — the value
+/// `ref.func dbl` would yield. Unlike `cross_module_funcref_global_call` (which stores the funcref at
+/// runtime), nothing here writes `hook`, so `drive(n) = dbl(n) = 2n` proves the initializer was
+/// materialized statically. This is what lets a real stdlib program's `oomHandler`/`gExitFlush`
+/// funcref gvars work without the system `ini` (which never writes them).
+#[test]
+fn funcref_global_static_initializer() {
+    let mod_s = "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :hook.0. . IntFn.0. dbl.0.)
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))";
+    let mod_w = "\
+(stmts
+ (proc :drive.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call hook.0.mods n.0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["drive.0."],
+        },
+        LengModule {
+            stem: "mods",
+            src: mod_s,
+            names: &["dbl.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // No setter runs — `hook` holds `dbl`'s index purely from the materialized initializer.
+    assert_eq!(
+        run(&linked, 0, &[21]),
+        42,
+        "drive calls the materialized hook = dbl"
+    );
+    assert_eq!(run(&linked, 0, &[-5]), -10);
+}

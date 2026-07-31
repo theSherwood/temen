@@ -73,6 +73,11 @@ pub enum VerifyError {
     /// placeholder bytes would be read unpatched — fail-closed here. `link` clears these; a
     /// module still carrying one was never linked.
     UnlinkedDataPtr { at: u64 },
+    /// A `data.funcref` relocation survived into a would-be-runnable module — the funcref twin of
+    /// [`UnlinkedDataPtr`](VerifyError::UnlinkedDataPtr). Its placeholder bytes (a would-be function
+    /// index) would be loaded and `call_indirect`'d unpatched, so it is fail-closed here. `link`
+    /// resolves and clears these; a survivor was never linked.
+    UnlinkedDataFuncref { at: u64 },
     /// A `call` referenced a function index that does not exist.
     CallFuncOutOfRange { func: u32, block: u32, callee: u32 },
     /// A `call`'s argument count did not match the callee's parameter count.
@@ -197,6 +202,12 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     // site to trap at, unlike the `data.sym`/`data.self` instruction forms).
     if let Some(p) = m.data_ptrs.first() {
         return Err(VerifyError::UnlinkedDataPtr { at: p.at });
+    }
+    // Likewise a runnable module carries no `data.funcref` relocations — `link` resolves each into a
+    // baked function index and clears the list. A survivor was never linked; its placeholder bytes
+    // would be loaded and dispatched unpatched.
+    if let Some(r) = m.data_funcrefs.first() {
+        return Err(VerifyError::UnlinkedDataFuncref { at: r.at });
     }
     // Import manifest (§7 / IMPORTS.md phase 1): names must be uniquely resolvable — the
     // instantiation policy binds by name, so an ambiguous manifest is fail-closed here,

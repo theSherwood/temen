@@ -261,6 +261,12 @@ pub(crate) struct Translator {
     /// `data.ptr <at> self <target_off>` the linker fixes up (svm_ir D-LINK). Runnable mode bakes the
     /// absolute offset directly instead, so this stays empty there.
     data_ptrs: Vec<(u64, u64)>,
+    /// **Data-image funcref relocations** (link mode): a `proctype` gvar whose static initializer is
+    /// a proc (`var oomHandler = continueAfterOutOfMem`). Each `(off, sym)` is the gvar's slot offset
+    /// and the initializer proc's *local* name; `translate_object_module` suffixes `sym` with the
+    /// module stem and emits a `svm_ir::DataFuncref` the linker resolves to the merged funcidx. Empty
+    /// in runnable mode (no linker to fix it up).
+    funcref_inits: Vec<(u64, String)>,
     /// End of the globals region (unit-local). The globals occupy `[16, globals_top)`.
     globals_top: u64,
     /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.svmo`
@@ -299,6 +305,7 @@ impl Translator {
             proctypes: HashMap::new(),
             data_inits: Vec::new(),
             data_ptrs: Vec::new(),
+            funcref_inits: Vec::new(),
             globals_top: 16,
             link_mode: false,
             globals: HashMap::new(),
@@ -431,14 +438,22 @@ impl Translator {
                                 };
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if let (Some(sym), TyDesc::FnPtr(_)) = (init.as_atom(), &desc) {
+                                // A **funcref gvar** with a static proc initializer (`var oomHandler =
+                                // continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). The func
+                                // index isn't known until the linker assigns func bases, so record a
+                                // `data.funcref` reloc: the linker writes `ref.func sym`'s value into
+                                // this slot. Without it the slot stays 0 and the first indirect call
+                                // through the gvar traps — the system `ini` does *not* write it (its
+                                // value *is* this initializer). The name is suffixed with the module
+                                // stem in `translate_object_module` (the linker resolves it there).
+                                self.funcref_inits.push((off, sym.to_string()));
                             } else if init.as_atom().is_some() {
-                                // A **symbol** initializer — a proc pointer (`gExitFlush =
-                                // nimNoopFlush`) or another global's address. Its pointer value is
-                                // opaque in this model: we don't materialize usable proc addresses,
-                                // and an indirect call through it fail-closes. So reserve the scalar
-                                // slot zero-initialized; nimony's `ini`/setup writes the real pointer
-                                // before any use. (Relocating such an initializer to the referenced
-                                // symbol is a later refinement.)
+                                // A **symbol** initializer that is *not* a funcref gvar — another
+                                // global's address (a data pointer). Its value is opaque in this model;
+                                // reserve the slot zero-initialized. (Relocating a data-pointer global
+                                // initializer to its target is a later refinement, the `data.ptr`
+                                // twin of the funcref case above.)
                             } else {
                                 return Err(LengError::Unsupported(format!(
                                     "non-scalar-int global initializer for `{name}`"
@@ -550,6 +565,20 @@ impl Translator {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
         out
+    }
+
+    /// This unit's **funcref data relocations** as `svm_ir::DataFuncref`s: each `proctype` gvar with
+    /// a static proc initializer, at its slot offset, naming the initializer proc under its
+    /// stem-suffixed global name (the form the linker's func-symbol table resolves). See
+    /// [`funcref_inits`](Self::funcref_inits); called after translation (link mode only).
+    pub fn funcref_relocs(&self, stem: &str) -> Vec<svm_ir::DataFuncref> {
+        self.funcref_inits
+            .iter()
+            .map(|(at, sym)| svm_ir::DataFuncref {
+                at: *at,
+                name: format!("{sym}{stem}"),
+            })
+            .collect()
     }
 
     /// The module's **`exportc` symbols** as exports under their *C* names — the conventional entry
