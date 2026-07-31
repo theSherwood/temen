@@ -657,16 +657,23 @@ plumbing. Five workstreams, roughly independent:
     reads the module global `r` back — `sumSquares(4) == 14` on **both engines** (§9 parity). This is
     the first genuine heap allocation on SVM end-to-end: the allocator, `oomHandler`, the frame
     handoff, and the funcref-initializer materialization all exercised at once, from source.
-  - **Two isolated follow-ups** (neither blocks the above; both precisely characterized):
-    - **`for x in s` sums a phantom `+20`.** The openArray `items` iterator over a non-empty seq adds
-      a constant `20` once (`for`-sum of `[100,200]`→320; `build(4)`→34 not 14) — but **direct index
-      iteration** (`while j < s.len: s[j]`), `add`, `s[i]`, and empty-seq iteration are all correct
-      (the E2E test uses explicit indexing for that reason). So the bug is localized to the
-      `toOpenArray`/openArray-`items` lowering (`len` or the accessor), not seqs generally.
-    - **Init-chain runs are module-order-sensitive.** Linking the **program module first** (the
-      convention `link` builds on — first unit's first proc is func 0, the natural entry) runs `main`
-      correctly; a `system`-first layout mislays the entry region and yields garbage. `nim_e2e` pins
-      program-first; worth hardening the entry/layout so order can't corrupt a run.
+  - **✅ Both earlier follow-ups fixed by adopting the powerbox memory model** (2026-07-31). The
+    root of both was that the linked module had no disciplined window layout: nimony based its
+    globals at offset 16 and the caller seeded `$sp = 0`, so the **data stack collided with the
+    globals, the powerbox heap-brk words (offsets 32/40), and the seq the allocator was growing**.
+    That corruption produced the `+20` phantom element in `for x in s` (an allocator chunk write
+    stomping `s.len`) and the module-order sensitivity (the seq landing on live scratch depended on
+    layout). The fix mirrors svm-llvm's C on-ramp: globals based at `POWERBOX_STACK_PAGE` (16384, so
+    page 0 stays reserved for the heap-brk/args scratch), `$sp = powerbox_entry_sp` (64 KiB-aligned,
+    above all globals), and the heap seeded above the 1 MiB stack reserve via `POWERBOX_HEAP_BRK`.
+    Globals / data stack / heap are now disjoint by construction — no SVM changes, the model the C
+    on-ramp already runs under. `for x in s` now sums correctly (`sumSquares(5)` via `for` == 30 on
+    both engines), and `s.len` is exact for every element count.
+    - **Also fixed (uncovered once the layout stopped masking it): unsigned comparison lowering.**
+      `svm-leng` lowered `(u N)` comparisons as **signed** (`le_s`/`lt_s`); the TLSF allocator's
+      `uint32` bitmaps set bit 31, which a signed compare mis-orders — faulting `msbit`/`lsbit`
+      during any reallocation past 2 elements. `compare` now emits `lt_u`/`le_u` when an operand is
+      unsigned-typed (a `(u N)` slot or a `u`-suffixed/`conv`-typed form).
   The ARC-heavy string path already links and runs against real `=wasMoved`/`=destroy`.
 - **W3 — Runtime bottom edge** (scoped in detail in §3b). Raw syscalls / the allocator →
   POSIX-personality named imports + the Memory cap (same seam as Phase 1), and mapping nimony's TLS

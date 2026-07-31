@@ -325,6 +325,21 @@ impl Translator {
         }
     }
 
+    /// The window offset the globals region starts at. A **link unit** (a powerbox program, linked
+    /// with the runtime) bases its globals at [`svm_ir::POWERBOX_STACK_PAGE`] (16384) so page 0
+    /// stays reserved for the powerbox scratch — the heap-brk words (`POWERBOX_HEAP_BRK`/`TOP` at
+    /// 32/40) and the args buffer — and the data stack (`$sp` = `powerbox_entry_sp`, above the
+    /// globals) and heap (above the stack reserve) never collide with globals or that scratch. A
+    /// runnable single module keeps the low base (16, a null sentinel) — it has no allocator/stack
+    /// discipline to collide with.
+    fn globals_base(&self) -> u64 {
+        if self.link_mode {
+            svm_ir::POWERBOX_STACK_PAGE
+        } else {
+            16
+        }
+    }
+
     /// Register (or reuse) an import slot for a cross-module callee. First use fixes its signature;
     /// a later call with a different arg count fail-closes (rather than emit a mismatched
     /// `call.import` the verifier would reject).
@@ -358,7 +373,8 @@ impl Translator {
     /// **link unit** whenever it has globals — its `data.self`/imports resolve at `link` time (a
     /// single-unit link makes a globals-only module runnable).
     fn assemble(&self, used_memory: bool, funcs: String) -> String {
-        let has_globals = self.globals_top > 16;
+        let base = self.globals_base();
+        let has_globals = self.globals_top > base;
         let mut out = String::new();
         // Data segments (globals) and loads/stores write the window, so declare `memory`.
         if used_memory || has_globals {
@@ -390,7 +406,10 @@ impl Translator {
                 let o = *off as usize;
                 image[o..o + bytes.len()].copy_from_slice(bytes);
             }
-            out.push_str(&format!("data 16 \"{}\"\n", escape_bytes(&image[16..])));
+            out.push_str(&format!(
+                "data {base} \"{}\"\n",
+                escape_bytes(&image[base as usize..])
+            ));
             // Pointers stored inside const data (a `string`'s `more = (addr strlit)`) are relocated
             // by the linker; the placeholder bytes above are overwritten with the resolved address.
             for (at, target_off) in &self.data_ptrs {
@@ -414,7 +433,9 @@ impl Translator {
     /// Collect `gvar`/`const` top-levels: globals get fixed window offsets (below the stack the
     /// caller passes in); scalar int consts are recorded for inlining.
     fn collect_globals(&mut self, root: &Node) -> Result<(), LengError> {
-        let mut off = 16u64; // leave the low bytes as a null sentinel region
+        // Globals start at the link-unit base (`POWERBOX_STACK_PAGE` for a powerbox program, so page
+        // 0 stays reserved for the heap-brk words + args buffer; 16 for a runnable single module).
+        let mut off = self.globals_base();
         for item in root.args() {
             match item.tag() {
                 Some("gvar" | "tvar") => {
@@ -1334,8 +1355,9 @@ impl Translator {
         collect_addr_taken(body, &mut addr);
         let mut var_descs = Vec::new();
         let mut pointee = HashMap::new();
+        let mut unsigned = std::collections::HashSet::new();
         if self
-            .collect_var_descs(body, &mut var_descs, &mut pointee)
+            .collect_var_descs(body, &mut var_descs, &mut pointee, &mut unsigned)
             .is_err()
         {
             return true; // be conservative if the body doesn't scan cleanly
@@ -1526,6 +1548,7 @@ impl Translator {
         node: &Node,
         out: &mut Vec<(String, TyDesc)>,
         pointee: &mut HashMap<String, TyDesc>,
+        unsigned: &mut std::collections::HashSet<String>,
     ) -> Result<(), LengError> {
         if let Node::List(_) = node {
             if node.tag() == Some("var") {
@@ -1536,13 +1559,16 @@ impl Translator {
                     if !out.iter().any(|(n, _)| n == &name) {
                         out.push((name.clone(), d));
                     }
+                    if ty_is_unsigned(&a[2]) {
+                        unsigned.insert(name.clone());
+                    }
                     if let Some(pt) = self.pointee_desc(&a[2])? {
                         pointee.insert(name, pt);
                     }
                 }
             }
             for c in node.args() {
-                self.collect_var_descs(c, out, pointee)?;
+                self.collect_var_descs(c, out, pointee, unsigned)?;
             }
         }
         Ok(())
@@ -1589,8 +1615,13 @@ impl Translator {
         // pointer local — for `lvalue_addr` / `deref`.
         let mut local_desc: HashMap<String, TyDesc> = HashMap::new();
         let mut pointee: HashMap<String, TyDesc> = HashMap::new();
+        // Unsigned-typed scalar slots (params + vars): comparisons on these lower to `lt_u`/`le_u`.
+        let mut unsigned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (name, tnode) in self.param_types(&a[1])? {
             local_desc.insert(name.clone(), self.tydesc(tnode)?);
+            if ty_is_unsigned(tnode) {
+                unsigned.insert(name.clone());
+            }
             if let Some(pt) = self.pointee_desc(tnode)? {
                 pointee.insert(name, pt);
             }
@@ -1598,7 +1629,7 @@ impl Translator {
         // Vars, with their type descriptors.
         let mut var_descs: Vec<(String, TyDesc)> = Vec::new();
         if let Some(b) = body {
-            self.collect_var_descs(b, &mut var_descs, &mut pointee)?;
+            self.collect_var_descs(b, &mut var_descs, &mut pointee, &mut unsigned)?;
         }
 
         // Which locals are address-taken (`(addr x)`).
@@ -1712,6 +1743,7 @@ impl Translator {
             temp_base,
             spill_params,
             sret,
+            unsigned,
         );
         // Entry block: params default to their block-param value (slot i = v i); a var not yet
         // assigned reads 0 until its declaration binds it (matches Leng default-init semantics).
@@ -1777,6 +1809,10 @@ struct FuncGen<'a> {
     loop_stack: Vec<(u32, u32)>,
     /// Scalar-int **local `const`s** declared in the body (`(const :name T value)`), inlined at use.
     local_consts: HashMap<String, i64>,
+    /// Slot names (params + vars) whose nimony type is **unsigned** (`(u N)`) — a comparison with an
+    /// operand in this set lowers to the unsigned SVM op (`lt_u`/`le_u`) so a high-bit-set value
+    /// orders correctly (the TLSF allocator's `uint32` bitmaps depend on this).
+    unsigned: std::collections::HashSet<String>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -1805,6 +1841,7 @@ impl<'a> FuncGen<'a> {
         temp_base: u64,
         spill_params: Vec<(String, ValType)>,
         sret: Option<(usize, TyDesc)>,
+        unsigned: std::collections::HashSet<String>,
     ) -> Self {
         let slot_of = slots
             .iter()
@@ -1825,6 +1862,7 @@ impl<'a> FuncGen<'a> {
             spill_params,
             frame_size,
             sret,
+            unsigned,
             label_block: HashMap::new(),
             loop_stack: Vec::new(),
             local_consts: HashMap::new(),
@@ -3340,7 +3378,12 @@ impl<'a> FuncGen<'a> {
         }
         let l = self.expr(&a[0])?;
         let r = self.expr_typed(&a[1], l.ty)?;
-        // Float compares use unsigned-free names (`lt`/`le`); int compares are signed here.
+        // Float compares use unsigned-free names (`lt`/`le`). Int compares are signed **unless** an
+        // operand is unsigned-typed (a `(u N)` slot, or a syntactically-unsigned form): an unsigned
+        // value with the high bit set (`>= 2^31` / `2^63`) must order above small values, which the
+        // signed op gets backwards. `eq`/`ne` are signedness-agnostic (bit-equality).
+        let unsigned = !is_float(l.ty)
+            && (self.operand_unsigned(&a[0]) || self.operand_unsigned(&a[1]));
         let name = if is_float(l.ty) {
             match op {
                 "eq" => "eq",
@@ -3353,6 +3396,8 @@ impl<'a> FuncGen<'a> {
             match op {
                 "eq" => "eq",
                 "neq" => "ne",
+                "lt" if unsigned => "lt_u",
+                "le" if unsigned => "le_u",
                 "lt" => "lt_s",
                 "le" => "le_s",
                 _ => unreachable!(),
@@ -3369,6 +3414,31 @@ impl<'a> FuncGen<'a> {
             id,
             ty: ValType::I32,
         })
+    }
+
+    /// Whether a comparison operand has an **unsigned** integer type — so [`compare`](Self::compare)
+    /// picks `lt_u`/`le_u`. Nimony type-checks both operands to one type, so either being unsigned
+    /// makes the compare unsigned. Recognized: an unsigned-typed slot (a `(u N)` param/var), a
+    /// `u`-suffixed literal (`65535u`), or an explicitly-typed form (`conv`/arith/bitwise) whose
+    /// carried type node is `(u N)`.
+    fn operand_unsigned(&self, node: &Node) -> bool {
+        if let Some(sym) = node.as_atom() {
+            return self.unsigned.contains(sym);
+        }
+        match node.tag() {
+            // `(suf <lit> "u32")` — a suffixed unsigned literal.
+            Some("suf") => node
+                .args()
+                .get(1)
+                .and_then(|n| n.as_atom())
+                .is_some_and(|s| s.contains('u')),
+            // Forms that carry an explicit leading type node.
+            Some(
+                "conv" | "add" | "sub" | "mul" | "div" | "mod" | "bitand" | "bitor" | "bitxor"
+                | "shl" | "shr" | "ashr" | "bitnot",
+            ) => node.args().first().is_some_and(ty_is_unsigned),
+            _ => false,
+        }
     }
 
     /// `(call Callee Expr*)` — a direct call to a module proc, or an SVM `import` for a cross-module
@@ -3989,6 +4059,14 @@ fn int_ty(node: &Node) -> Result<ValType, LengError> {
 }
 
 /// As [`int_ty`], also returning whether the type is signed (`i`/`c`) vs unsigned (`u`/`bool`).
+/// True if `node` is an **unsigned** integer type (`(u N)`), whose comparisons must lower to the
+/// unsigned SVM ops (`lt_u`/`le_u`), not the signed ones — a `uint32` bitmap word with bit 31 set
+/// (the TLSF allocator's second-level bitmap) is `>= 2^31`, which a signed compare mis-orders. `i`
+/// (signed), `bool` (0/1), and `char` (0..255) all compare correctly signed, so only `u` matters.
+fn ty_is_unsigned(node: &Node) -> bool {
+    node.tag() == Some("u")
+}
+
 fn int_ty_signed(node: &Node) -> Result<(ValType, bool), LengError> {
     match node.tag() {
         Some(k @ ("i" | "u" | "c")) => {
