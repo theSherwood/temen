@@ -25,7 +25,7 @@
 use std::alloc::Layout;
 
 #[cfg(feature = "live")]
-use svm_interp::HostFn;
+use svm_interp::HostProc;
 use svm_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
@@ -1881,14 +1881,14 @@ fn onramp_check(m: &svm_ir::Module) -> Result<(), ()> {
 
 /// A shared **keyboard event queue** (the `keyboard` capability's backing): the host pushes packed
 /// key events, the guest drains them via `__vm_cap_resolve("keyboard")` + `poll`. `Arc<Mutex<…>>` so
-/// the cap's `HostFn` closure and the host/reactor driver share one queue. Packed event layout:
+/// the cap's `HostProc` closure and the host/reactor driver share one queue. Packed event layout:
 /// `(pressed << 16) | (keycode & 0xffff)` — `pressed` is 1 (down) / 0 (up); `poll` returns `-1` when
 /// empty (the doomgeneric `DG_GetKey` shape: pump until empty each frame).
 type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `cap.self.resolve` name,
-/// plus the two by-name graphical `HostFn` capabilities every on-ramp run carries — `display` (op 0 =
+/// plus the two by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
 /// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
 /// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
@@ -1947,7 +1947,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     {
         let frame = std::sync::Arc::clone(&frame);
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
             if op != 0 {
                 return Ok(vec![-1]); // only present(0) is defined
             }
@@ -1978,7 +1978,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     {
         let keys = std::sync::Arc::clone(&keys);
-        let handle = host.grant_host_fn(Box::new(move |op, _args, _mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem| {
             if op != 0 {
                 return Ok(vec![-1]); // only poll(0) is defined
             }
@@ -1997,7 +1997,7 @@ fn grant_onramp_caps(
     // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
     #[cfg(target_arch = "wasm32")]
     {
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
             match op {
                 // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
                 0 => {
@@ -2034,7 +2034,7 @@ fn grant_onramp_caps(
     // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
     if let Some((name, data)) = fs {
         let mut cursors: Vec<u64> = Vec::new();
-        let handle = host.grant_host_fn(Box::new(move |op, args, mem| match op {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem| match op {
             0 => {
                 let requested = mem
                     .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
@@ -2092,7 +2092,7 @@ fn grant_onramp_caps(
 /// imports bind at instantiation, taking **no** handle arguments — the positional (slot-order
 /// handle-args) entry form died in phase 4 and an import-bearing module without the manifest entry
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
-/// `files.lua`) is a `host_fn` resolved by name — a Stage-1 follow-on, not part of this prefix.
+/// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
@@ -2136,7 +2136,7 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 
 /// Run `m`'s function 0 under the **POSIX personality** (POSIX.md / STAGE1.md) instead of the fixed
 /// on-ramp powerbox — the seam that lets the real `svm-posix` shell (and any chibicc program linking
-/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostFn` capability
+/// the personality libc) run in the browser. [`svm_posix::grant`] registers one `HostProc` capability
 /// implementing the libc/memfs surface (`read`/`write`/`open`/`opendir`/`getcwd`/…), and
 /// [`svm_posix::bind`] binds the module's manifest imports to it **by name** (IMPORTS.md phase 4 —
 /// slot `i` ↔ import `i`, bound at instantiation; the module bytes are never rewritten). `stdin`
@@ -2149,7 +2149,7 @@ pub fn onramp_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// runs the sequential personality (files, redirects, in-process pipelines) only.
 ///
 /// Runs on the **bytecode** engine (the browser's interpreter tier), the same engine [`onramp_exec`]
-/// uses; the personality's `HostFn` dispatches through the guest window `bytecode` hands it.
+/// uses; the personality's `HostProc` dispatches through the guest window `bytecode` hands it.
 pub fn onramp_posix_exec(m: &svm_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
         status: STATUS_UNSUPPORTED,
@@ -2349,7 +2349,7 @@ fn pg_setup(
     // later ([`svm_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = svm_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = svm_fs::mem_fs_seeded_shared(files, dirs);
-    let fsh = host.grant_host_fn(fs_hostfn);
+    let fsh = host.grant_host_proc(fs_hostfn);
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`).
@@ -5299,7 +5299,7 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     let mut host = Host::new();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
-    let _ = host.grant_host_fn(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
+    let _ = host.grant_host_proc(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: Vec<Value> = if arity >= 1 {
         vec![Value::I32(arg as i32)]
@@ -6172,7 +6172,7 @@ block 0 (v0: i64) {
 //
 // Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead
 // bridges guest capabilities to **real wasm imports**, so a guest's writes reach the live host
-// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_fn`
+// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_proc`
 // (iface 13) — the designed extension point: a closure supplies the capability's semantics, here by
 // calling out to the imported host function. The guest sees only a masked, type-checked handle.
 
@@ -6196,7 +6196,7 @@ pub mod live {
     const EINVAL: i64 = -22;
 
     /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
-    /// `(console, clock)` capabilities (both iface `HOST_FN` = 13) bridged to the imports above.
+    /// `(console, clock)` capabilities (both iface `HOST_PROC` = 13) bridged to the imports above.
     /// The guest calls `cap.call 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
     /// live, and `cap.call 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
     /// `i64` result; sets [`LAST_STATUS`].
@@ -6214,7 +6214,7 @@ pub mod live {
         };
         let mut host = Host::new();
         // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
-        let console: HostFn = Box::new(|op, args, mem| {
+        let console: HostProc = Box::new(|op, args, mem| {
             if op != 1 {
                 return Ok(vec![EINVAL]);
             }
@@ -6235,7 +6235,7 @@ pub mod live {
             }
         });
         // clock (param 2): op 0 = now() → real host time.
-        let clock: HostFn = Box::new(|op, _args, _mem| {
+        let clock: HostProc = Box::new(|op, _args, _mem| {
             if op != 0 {
                 return Ok(vec![EINVAL]);
             }
@@ -6244,10 +6244,10 @@ pub mod live {
         let arity = m.funcs.first().map_or(0, |f| f.params.len());
         let mut slots: Vec<Value> = Vec::new();
         if arity >= 1 {
-            slots.push(Value::I32(host.grant_host_fn(console)));
+            slots.push(Value::I32(host.grant_host_proc(console)));
         }
         if arity >= 2 {
-            slots.push(Value::I32(host.grant_host_fn(clock)));
+            slots.push(Value::I32(host.grant_host_proc(clock)));
         }
         // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
         // `cap.self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
