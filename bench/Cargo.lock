@@ -1348,10 +1348,12 @@ dependencies = [
  "svm-jit",
  "svm-llvm",
  "svm-opt",
+ "svm-peval",
  "svm-run",
  "svm-text",
  "svm-verify",
  "svm-wasm",
+ "svm-wasm-jit",
  "wasmtime",
  "wasmtime-wasi-threads",
  "wat",
@@ -1504,6 +1506,13 @@ version = "0.0.0"
 dependencies = [
  "svm-ir",
  "wasmparser 0.251.0",
+]
+
+[[package]]
+name = "svm-wasm-jit"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
 ]
 
 [[package]]
