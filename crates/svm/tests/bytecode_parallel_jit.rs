@@ -220,12 +220,6 @@ block 0 (vsp: i64, varg: i64) {
 /// A fresh host granted the `Jit` cap (16-slot table) with `SERVICE` host-compiled into it; returns
 /// `(host, jit_handle, code_handle)`. Granting/compiling into a fresh host is deterministic, so both
 /// the parallel run and the oracle get identical handles.
-fn host_with_unit(guest: &svm_ir::Module) -> (Host, i32, i32) {
-    host_with_unit_src(guest, SERVICE)
-}
-
-/// [`host_with_unit`] with the unit source chosen — the spawning-unit differential grants
-/// [`SERVICE_SPAWN`] instead.
 fn host_with_unit_src(guest: &svm_ir::Module, unit_src: &str) -> (Host, i32, i32) {
     let mut host = Host::new();
     let jit = grant_jit(&mut host, guest, 4); // sets the blob validator; 2^4 = 16-slot table
