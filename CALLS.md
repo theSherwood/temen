@@ -478,6 +478,28 @@ plumbing that lands in increments (§8).
        Pin: `svc_parity.rs`'s "Jit" arm — silently TreeWalk today — runs the **real** JIT backend and
        matches. This is the correctness baseline the fast path declines onto, built first exactly as
        the interp built enqueue+park (§3.6) before inline animation.
+       **As mapped (2026-08-04), six blockers, ranked — the slice re-decomposes:** (1) *children
+       have no handler trampolines*: `compile_child` yields `ChildCode` (entry trampoline + fn
+       table only), while `serve_native` needs a `CompiledModule`'s `serve_tramps`/`handler_tramp`
+       — the dominant cost; (2) `serve_native_ctx` is only ever set on the top-level run's Host,
+       never a child's; (3) the production Jit path (`powerbox_compile_run`) compiles without
+       `GrantChildHooks` at all (tests wire them; `Instance::run(Jit)` can't even spawn); (4) no
+       epoch cell is reachable from inside the cap thunk (`epoch_addr` lives on the `Nursery`,
+       baked into code; the thunk has only `trap_out`), so the blocked wait's kill re-check needs a
+       new channel; (5) `Host` has no `Condvar` and `Condvar::wait` needs the guard's own mutex —
+       the 5c.0 shared cell must become `Arc<(Mutex<Host>, Condvar)>`; (6) JIT op-13 children never
+       get `self_module` (op-11/op-8 inherit it via `spawn_granted_child`), so their `svc_handler`
+       misses. Also: the `svc_parity` pin module spawns via **op 0** (an *unshared* child) and exits
+       via `call.import` (a second `svc_park_veto` term beyond `has_instantiate`) — the pin needs
+       op 0 to mint shared powerboxes too, or the module moves to op 11 and a `cap.call` exit.
+       Sub-slices: **5c.1a** serve trampolines for children (extend `ChildCode` or compile children
+       as `CompiledModule`s) + child `serve_native_ctx`; **5c.1b** the shared-cell `Condvar` + the
+       blocking `svc.wait` arm in `cap_thunk_locked` (arm (c) — placed *before* the guard-holding
+       generic delegate, so it owns its lock scope; the `jit_invoke_locked` resolve-drop-reenter
+       pattern) + the caller live-impl enqueue/block arm + a Host-reachable epoch channel;
+       **5c.1c** production `GrantChildHooks` on `powerbox_compile_run` (`_ex` compile), the
+       Jit-only fold relax, op-13 `self_module`, and the pin flips (`svc_parity` on the real JIT;
+       `jit_child_offer` call-through `-EINVAL` → 42 ≡ interp).
      - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
        loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
        inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),
