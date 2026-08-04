@@ -92,18 +92,45 @@ async function worker() {
     jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   }
 
-  // §14 instantiate real codegen: a confined child whose granted-unit entry is in-subset runs it on
-  // emitted wasm here and fills the completion slot the parent joins (no vCPU). Cap-using entries
-  // aren't eligible → interpreter.
+  // §14 instantiate real codegen: a confined child whose granted-unit entry is eligible runs it on
+  // emitted wasm here and fills the completion slot the parent joins (no vCPU). With the nested emit
+  // a cap-using entry is ALSO eligible — its instantiate/join arrive as the env.instantiate/env.join
+  // imports, serviced through the same completion-slot protocol (see web/worker.js, the browser twin).
   if (role === 'confined' && instCodegen && ex.svm_par_enable_inst_codegen() === 1
       && ex.svm_par_inst_eligible(entry) === 1) {
     const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
         trap: () => {},
         call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        instantiate: (cwin, _inst, centry, off, cslog, quota) => {
+          const gsize = 1 << Number(cslog), goff = Number(off);
+          if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize)
+            throw new Error('bad nested carve');
+          const gslot = ex.svm_par_alloc(SLOT);
+          const gstackTop = ex.svm_par_alloc(STACK) + STACK;
+          const gtlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+          const pf = BigInt(fuel);
+          const gfuel = quota > 0n && quota < pf ? quota : pf;
+          parentPort.postMessage({
+            kind: 'spawn', role: 'confined', smod, entry: Number(centry), slog: Number(cslog),
+            fuel: gfuel.toString(), win: cwin + goff, winSize: gsize,
+            slot: gslot, stackTop: gstackTop, tlsBase: gtlsBase,
+          });
+          const h = childSlots.length;
+          childSlots.push(gslot);
+          return h;
+        },
+        join: (_inst, child) => {
+          const gslot = childSlots[child];
+          if (gslot === undefined) throw new Error('join of unknown child');
+          Atomics.wait(i32(), gslot >> 2, 0);
+          if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
+          return i64()[(gslot + 8) >> 3];
+        },
       },
     });
     const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
@@ -170,6 +197,7 @@ async function worker() {
     if (ev === JOIN) {
       const handle = Number(ex.svm_par_ev_a(v));
       const cslot = handles[handle];
+      if (cslot === undefined) { ex.svm_par_deliver_join(v, 0n, 1); continue; } // bad handle -> trap, never wait(0)
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       const result = i64()[(cslot + 8) >> 3];

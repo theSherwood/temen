@@ -297,6 +297,7 @@ self.onmessage = async (e) => {
     }
     if (evc === JOIN) {
       const cslot = handles[Number(ex.svm_par_ev_a(v))];
+      if (cslot === undefined) { ex.svm_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       ex.svm_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
