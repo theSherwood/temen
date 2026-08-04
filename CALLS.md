@@ -649,10 +649,32 @@ plumbing that lands in increments (§8).
        so it lands with its first pin (a durable caller invoking an instanced offer, differentially
        identical to the host-side path). Interp-only; deletes nothing structural, but removes the
        last reason the eval loop ever falls to the host-side arm for an instanced offer.
-     - **6d.2 — tier-native JIT offer arm.** Extend the 5c JIT crossing machinery (the
-       `cap_thunk_locked` shared-cell child call) from `LiveImpl` to instanced offers, so a JIT
-       caller animates the offer natively instead of falling to `cap_dispatch_slots`'s host-side
-       arm. Retires the JIT's `-EINVAL`-for-offers arm (§7). svm-jit codegen; oracle is the interp.
+     - **6d.2 — tier-native JIT offer arm.** A JIT `cap.call` to an offer currently falls through
+       `cap_thunk` to `host.cap_dispatch_slots` (the 6c-narrowed host-side arm, an interp
+       `drive_arc` sub-run); this slice runs the offer handler natively (`define_extra` compiles the
+       offer unit into the run's `CompiledModule`, cached; `invoke_extra` runs its trampoline) so
+       the interp sub-run retires for the JIT tier. The offer is *not* the 5c child crossing — a
+       passive offer has no thread/serve loop; it animates on the caller's thread, closer to
+       `serve_native`'s `invoke_extra` than to `live_impl_call`. **Confinement finding (the hinge):**
+       `invoke_extra` masks with the module's `live_fault_range` — the *in-flight run's* window
+       bounds — while `mem_base` is a separate arg. So it can only run code over the run's **own**
+       window. A **pure** offer is windowless (no masked access, any `mem_base`/range is inert); an
+       **instanced** offer runs over the **provider's** window, whose bounds differ from the run's,
+       so running its unit natively needs a way to invoke over a *foreign* window with **that
+       window's** fault range — new confinement-masking plumbing, the security hinge (AGENTS.md; its
+       own fuzz obligation). Split accordingly:
+       - **6d.2a — pure-offer native arm.** Intercept an offer-typed `cap.call` in `cap_thunk`
+         (a `Binding::Offer`-probe analogous to `live_impl_call`); for a *pure* offer, compile the
+         unit (cached) and `invoke_extra` it, translating `cap` slots at the two edges. Windowless
+         ⇒ **no masking change**; differential-pinned against the interp's pure arm. This lands the
+         compile+cache+translate scaffolding masking-safely.
+       - **6d.2b — instanced-offer native arm (masking hinge).** Invoke the offer unit over the
+         provider's window with the provider window's own `(lo, hi)` fault range — new
+         `invoke_extra`-over-foreign-window plumbing — plus the 6c `busy` checkout and flat
+         `OFFER_FUEL`. Carries a dedicated masking-fuzz obligation (fuzz *invoke-over-foreign-window
+         stays masked to the provider window*, as its own unit). This is the slice that actually
+         retires the host-side arm's instanced branch for the JIT tier; the JIT's `-EINVAL`/host-side
+         fall-through for offers leaves §7's list only once both 6d.2a and 6d.2b land.
      - **6d.3 — bytecode offer arm (fold-or-probe).** Bytecode declines offer ops to the tree-walk
        today, so instanced offers already run correctly via that fallback — this slice is the
        optional native arm (avoid the per-module fallback), lowest value, sequenced last of the
