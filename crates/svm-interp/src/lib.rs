@@ -14623,6 +14623,12 @@ pub struct Host {
     /// `cap.call`s don't race. The interpreter runs `thread.*` in its own scheduler, so it needs no
     /// runtime stand-up — the flag only records the grant for backend parity.
     jit_hosts_threads: bool,
+    /// §4 durability × §22 (DURABILITY.md §12.5): a **durable** `Jit` grant sets it, meaning the injected
+    /// validator instruments each submitted unit for freeze/thaw (`svm_durable::transform_module`) — so
+    /// `jit_compile` in a durable domain **admits** the unit (instrumented) instead of failing closed.
+    /// Without it, a durable domain refuses `compile` (an un-instrumented unit could never unwind). The
+    /// flag only records the grant; the actual instrumentation is host-side (svm-run's durable validator).
+    jit_hosts_durable: bool,
     /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
     /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
     cap_record: Option<Vec<CapRecord>>,
@@ -14918,6 +14924,7 @@ impl Host {
             jit_table_log2: 0,
             jit_hosts_fibers: false,
             jit_hosts_threads: false,
+            jit_hosts_durable: false,
             cap_record: None,
             cap_replay: None,
             durable: false,
@@ -15028,6 +15035,7 @@ impl Host {
         twin.jit_table_log2 = self.jit_table_log2;
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
         twin.jit_hosts_threads = self.jit_hosts_threads;
+        twin.jit_hosts_durable = self.jit_hosts_durable;
         Some(twin)
     }
 
@@ -17065,6 +17073,20 @@ impl Host {
         self.jit_hosts_threads = on;
     }
 
+    /// Mark this run's granted `Jit` domain(s) as **durable-hosting** — the injected validator
+    /// instruments each submitted unit for freeze/thaw (§4, DURABILITY.md §12.5), so `compile` in a
+    /// durable domain admits the (instrumented) unit instead of failing closed. Set by
+    /// [`svm_run::grant_jit_durable`] before the run.
+    pub fn set_jit_hosts_durable(&mut self, on: bool) {
+        self.jit_hosts_durable = on;
+    }
+
+    /// Whether a durable domain admits guest-submitted units (its validator instruments them). See
+    /// [`Host::set_jit_hosts_durable`].
+    pub fn jit_hosts_durable(&self) -> bool {
+        self.jit_hosts_durable
+    }
+
     /// Whether guest-submitted `Jit` units may host threads/futex (see [`Host::set_jit_hosts_threads`]).
     pub fn jit_hosts_threads(&self) -> bool {
         self.jit_hosts_threads
@@ -17125,13 +17147,14 @@ impl Host {
         symtab: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
-        // §4 (DURABILITY.md): *a durable domain admits only freezable modules* — and a §22
-        // guest-submitted unit is a module installation. The durable transform is a host-side
-        // compile pass this crate cannot run (no `svm-durable` dependency), so until an embedder
-        // instrumentation hook exists, a durable domain's `compile` fails closed (`-EINVAL`,
-        // guest-reachable errno like the other refusals here): an un-instrumented unit could
-        // never drain-then-unwind, silently making the domain non-snapshottable.
-        if self.durable {
+        // §4 (DURABILITY.md §12.5): *a durable domain admits only freezable modules* — and a §22
+        // guest-submitted unit is a module installation. A durable domain admits it **only** when the
+        // grant hosts durability (`grant_jit_durable` → `jit_hosts_durable`), which installs the durable
+        // validator that instruments each unit for freeze/thaw (`svm_durable::transform_module`) before
+        // verify — the host-side instrumentation pass this TCB crate cannot run itself (no `svm-durable`
+        // dependency). Without that grant a durable domain still fails closed (`-EINVAL`): an
+        // un-instrumented unit could never drain-then-unwind, silently making the domain non-snapshottable.
+        if self.durable && !self.jit_hosts_durable {
             return Ok(Err(EINVAL));
         }
         let Some(validate) = self.jit_validator else {

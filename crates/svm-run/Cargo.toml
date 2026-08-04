@@ -24,6 +24,9 @@ svm-ir.workspace = true
 svm-text.workspace = true
 svm-encode.workspace = true
 svm-verify.workspace = true
+# §4 durability × §22 guest-JIT: the durable instrumentation pass, run on submitted units in a durable
+# domain (grant_jit_durable). Tooling-tier (svm-durable → svm-ir only), so no TCB layering concern.
+svm-durable.workspace = true
 svm-interp.workspace = true
 svm-exec.workspace = true
 svm-fs.workspace = true

@@ -867,6 +867,22 @@ pub fn jit_blob_validator(
     jit_resolve_and_validate(bytes, mem_log2, |name| table.get(name).copied())
 }
 
+/// The [`jit_blob_validator`] for a **durable** `Jit` domain (installed by [`grant_jit_durable`]):
+/// identical gate, but each submitted unit is instrumented for freeze/thaw before verify (§4,
+/// DURABILITY.md §12.5). A unit outside the durable transform's scope (e.g. a guest-memory op under the
+/// strict path) fails closed with `-EINVAL`, exactly like any other rejected blob.
+pub fn jit_blob_validator_durable(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+) -> Result<Arc<[svm_ir::Func]>, i64> {
+    const EINVAL: i64 = -22;
+    let Some(table) = decode_symbol_table(symtab) else {
+        return Err(EINVAL);
+    };
+    jit_resolve_and_validate_impl(bytes, mem_log2, |name| table.get(name).copied(), true)
+}
+
 /// Decode the guest-provided **symbol table** for `compile_linked` (DESIGN.md §22): a `name →
 /// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
 /// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
@@ -985,6 +1001,21 @@ pub fn jit_resolve_and_validate(
     mem_log2: Option<u8>,
     resolve: impl FnMut(&str) -> Option<Resolved>,
 ) -> Result<Arc<[svm_ir::Func]>, i64> {
+    jit_resolve_and_validate_impl(bytes, mem_log2, resolve, false)
+}
+
+/// The shared body of [`jit_blob_validator`] (non-durable) and [`jit_blob_validator_durable`]. When
+/// `durable`, each submitted unit is instrumented for freeze/thaw (`svm_durable::transform_module`)
+/// **before** verify — the §4 "host runs the pass on submitted IR" composition (DURABILITY.md §12.5,
+/// CONSOLIDATION.md §6). The transform emits ordinary verifier-passing IR (no new TCB surface), so the
+/// verify below is the safety re-check; the strict path fails a memory-touching unit closed (admitting
+/// confined memory use is a later refinement). `durable = false` is byte-for-byte the pre-existing path.
+fn jit_resolve_and_validate_impl(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    resolve: impl FnMut(&str) -> Option<Resolved>,
+    durable: bool,
+) -> Result<Arc<[svm_ir::Func]>, i64> {
     const EINVAL: i64 = -22;
     let Ok(m) = svm_encode::decode_module(bytes) else {
         return Err(EINVAL);
@@ -993,6 +1024,16 @@ pub fn jit_resolve_and_validate(
     // unresolved or ill-typed binding), yielding an import-free module the verifier accepts unchanged.
     let Ok(m) = svm_ir::resolve_imports_with(&m, resolve) else {
         return Err(EINVAL);
+    };
+    // §4 durability: instrument the (import-free) unit for freeze/thaw before verify. A unit outside the
+    // transform's Phase-1 scope (guest-memory op under the strict path, unsupported shape) fails closed.
+    let m = if durable {
+        match svm_durable::transform_module(&m) {
+            Ok(t) => t,
+            Err(_) => return Err(EINVAL),
+        }
+    } else {
+        m
     };
     if svm_verify::verify_module(&m).is_err() {
         return Err(EINVAL);
@@ -1060,6 +1101,19 @@ pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 pub fn grant_jit_threads(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_hosts_threads(true);
     grant_jit(host, m, table_log2)
+}
+
+/// Like [`grant_jit`], but the granted domain **hosts durability** (§4 × §22, DURABILITY.md §12.5):
+/// installs the [`jit_blob_validator_durable`] gate (each submitted unit is instrumented for freeze/thaw
+/// via `svm_durable::transform_module` before verify) and flags the domain so a durable run admits the
+/// unit instead of failing closed. The instrumented unit runs like any durable module (NORMAL-inert; it
+/// can unwind/rewind at a freeze); a unit outside the transform's Phase-1 scope fails closed at compile.
+/// Handles still drain before a snapshot (JIT handles staying non-durable is the Slice-2 follow-on).
+/// Same handle value + memory-match precondition as [`grant_jit`]; the caller sets `host.set_durable(true)`.
+pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    host.set_jit_hosts_durable(true);
+    host.set_jit_validator(jit_blob_validator_durable);
+    host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split

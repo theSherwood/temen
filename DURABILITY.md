@@ -165,10 +165,17 @@ domain's §14 ops then enforce the rule fail-closed (`-EINVAL`, like a bad carve
 stays admissible (it runs the parent's own instrumented funcs); and the admitted child
 **inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
 shadow state and its own nested instantiates re-apply the same admission rule (the subtree
-property, recursively). Guest-driven `Jit.compile` (§22) is a module installation too: a
-durable domain refuses it fail-closed until a host-side instrumentation hook lands (the
-"host runs the pass on submitted IR" composition above; `svm-interp` cannot run the pass —
-no `svm-durable` dependency). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+property, recursively). Guest-driven `Jit.compile` (§22) is a module installation too, and the
+host-side instrumentation hook now **lands (Slice 1)**: a **durable `Jit` grant**
+(`svm_run::grant_jit_durable`) installs a validator that runs `svm_durable::transform_module`
+on each submitted unit before verify — the "host runs the pass on submitted IR" composition —
+so a durable domain **admits** the (instrumented) unit instead of refusing (`svm-interp` still
+runs no pass; the embedder-injected validator does, keeping `svm-durable` out of the TCB). A
+unit outside the strict transform's scope (a guest-memory suspend point) fails closed. Pinned by
+`crates/svm/tests/durable_guest_jit.rs` (admit-vs-refuse gate; end-to-end NORMAL compile+invoke ≡
+non-durable). *Still v1-non-durable:* the `JitCode`/`JitDomain` **handles** — persisting a compiled
+unit *across* a snapshot (freeze/thaw reconstruction) is the Slice-2 follow-on; for now JIT handles
+drain before a checkpoint. The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
