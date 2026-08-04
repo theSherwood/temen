@@ -403,7 +403,7 @@ land in different places):
 | Runtime | ~15 bottom-edge C functions (NIM.md §3b); **no GC** (ARC = ordinary calls), **no scheduler** | conservative GC + cross-vCPU STW, M:N work-stealing scheduler, channels/`select`, maps, itables, partial `reflect` — i.e. all of Route B2 | the dominant delta; Nim's runtime cost was ≈ zero |
 | Stdlib closure to compile the compiler | the `system` module — 324 procs, whole module = a 129 KB object | go/token/parser/types + x/tools/go/ssa + fmt/os/… — order 150k+ lines, interface/map/allocation-heavy (stressing exactly the new runtime) | 1–2 orders of magnitude in lines; the long pole |
 | Program/link shape | W2 linker landed in days, but **W4** (nifler→nimony→hexer→lengc subprocess pipeline) is NIM.md's "biggest unknown", still open | one binary, in-process, whole-program emit over the existing `.svmo`/`svm_ir::link` waist | **Go is easier** — W4 has no analog |
-| Fixpoint strength | not a single-language fixpoint (svm-leng is Rust; reaches svm via the wasm on-ramp) | chibicc-grade stage1==stage2 in one language, parallel and deterministic | stronger result, dearer floor |
+| Fixpoint strength | not a single-language fixpoint — svm-leng is Rust; NIM.md W5 *plans* to bootstrap it via rustc→wasm→svm-wasm (chosen over svm-llvm because full-**std** Rust needs the TLS/std bottom edge svm-llvm lacks, while rustc's wasip1 target solved all that upstream — the Rust lane on svm-llvm is deliberately `no_std`+`alloc`) | chibicc-grade stage1==stage2 in one language, parallel and deterministic | stronger result, dearer floor |
 
 Net: **roughly 3–4× the Nim self-host path in total**, with the excess almost
 entirely in the runtime Nim never needed and the stdlib-closure breadth. The
