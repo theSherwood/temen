@@ -635,13 +635,35 @@ plumbing that lands in increments (§8).
      After 6c, every nested `drive_arc` left in the tree (pure arm + this narrowed arm) runs
      lock-free over its world — the sub-interpreter-under-locks is gone even where the sub-run
      survives for eval-loop-less tiers.
-   - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list, each explicit):
-     durable-caller animation (a DURABILITY.md-scoped slice; unpinned today); tier-native offer
-     arms (extend the 5c JIT crossing machinery from `LiveImpl` to instanced offers; a bytecode
-     fold-or-probe) — these are what let the narrowed host-side arm retire entirely; and the
-     `Offer`/`LiveImpl` **binding merge** with `ProviderState` folding onto the 5c shared-cell
-     shape (`Arc<Mutex<Host>>` + window — a library instance becomes structurally a granted
-     child's powerbox), which is where "`ProviderState` + its mutex" finally leaves §7's list.
+   - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list). These are not
+     quick slices — each is a sizable mini-increment closing one decliner or deleting one structure,
+     and every one is sensitive TCB (the confinement/durability path, the JIT crossing, or the
+     binding split). Decomposed and ordered smallest/most-independent first:
+     - **6d.1 — durable-caller animation.** Close the D1 decliner: a durable caller currently skips
+       the eval-loop probe (`if durable { None }`) and takes the host-side `drive_arc`, because the
+       animation switch-in deliberately omits `shadow_switch` (it runs the handler over the
+       *provider's* window while the caller's per-context shadow-SP bookkeeping lives in the
+       *caller's* window). Animating a durable caller means threading the durable shadow-SP
+       save/restore across the switch-in and the settle (the `serve_switch` durable choreography,
+       adapted to the cross-*window* offer case) — a DURABILITY.md-scoped slice. **Unpinned today**,
+       so it lands with its first pin (a durable caller invoking an instanced offer, differentially
+       identical to the host-side path). Interp-only; deletes nothing structural, but removes the
+       last reason the eval loop ever falls to the host-side arm for an instanced offer.
+     - **6d.2 — tier-native JIT offer arm.** Extend the 5c JIT crossing machinery (the
+       `cap_thunk_locked` shared-cell child call) from `LiveImpl` to instanced offers, so a JIT
+       caller animates the offer natively instead of falling to `cap_dispatch_slots`'s host-side
+       arm. Retires the JIT's `-EINVAL`-for-offers arm (§7). svm-jit codegen; oracle is the interp.
+     - **6d.3 — bytecode offer arm (fold-or-probe).** Bytecode declines offer ops to the tree-walk
+       today, so instanced offers already run correctly via that fallback — this slice is the
+       optional native arm (avoid the per-module fallback), lowest value, sequenced last of the
+       tier work. May be folded into 6d.2 or skipped with a recorded note.
+     - **6d.4 — the `Offer`/`LiveImpl` binding merge.** The endgame: fold `ProviderState`
+       (`{mem, host, busy, admit_parked, busy_owner}`) onto the 5c shared-cell shape
+       (`Arc<Mutex<Host>>` + window) so a library instance is structurally a granted child's
+       powerbox, and unify `Binding::Offer`/`Binding::LiveImpl`. This is where "`ProviderState` +
+       its mutex" and "the `GuestImpl`/`LiveImpl` binding split" finally leave §7's list. Deepest
+       and most invasive (touches every state access + the binding dispatch); gated on 6d.2 so both
+       tiers share one crossing before the shapes merge.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
