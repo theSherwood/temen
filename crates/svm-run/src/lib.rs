@@ -1566,9 +1566,15 @@ pub unsafe extern "C" fn grant_child_build(
     let parent = &mut *(ctx as *mut Host);
     match parent.spawn_granted_child(grant_handle, child_size) {
         Some((child, inst_handle, as_handle, cg)) => {
-            let boxed = Box::into_raw(Box::new(child));
+            // CALLS.md 5c.0 — the child powerbox is **shared**: one ref rides the child thread
+            // (compiled against the lock-taking thunk), one is retained by the nursery so
+            // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
+            // `grant_child_release` (child exit / nursery teardown).
+            let shared = std::sync::Arc::new(Mutex::new(child));
+            let retained = std::sync::Arc::clone(&shared);
             *out = svm_jit::GrantChild {
-                ctx: boxed as *mut c_void,
+                ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
+                retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
                 inst_handle,
                 as_handle,
                 grant_handle: cg,
@@ -1587,7 +1593,9 @@ pub unsafe extern "C" fn grant_child_build(
 /// released.
 pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     if !ctx.is_null() {
-        drop(Box::from_raw(ctx as *mut Host));
+        // CALLS.md 5c.0 — one counted ref of the shared child powerbox (see `grant_child_build`);
+        // the `Host` drops when the last of {child-thread ref, nursery-retained ref} is released.
+        drop(std::sync::Arc::from_raw(ctx as *const Mutex<Host>));
     }
 }
 
@@ -1606,17 +1614,45 @@ pub unsafe extern "C" fn child_bind_imports(
     module: i64,
 ) -> i32 {
     let parent = &*(parent_ctx as *mut Host);
-    let child = &mut *(child_ctx as *mut Host);
+    // 5c.0 — the child powerbox is a shared cell now (`Arc<Mutex<Host>>` raw): lock to bind.
+    let child_cell = &*(child_ctx as *const Mutex<Host>);
     if let Some(imports) = parent.module_imports(module as i32) {
         let types = parent
             .module_types(module as i32)
             .unwrap_or_else(|| Arc::from(Vec::new()));
         // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
+        let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
         if child.bind_child_manifest(&imports, &types).is_err() {
             return -22;
         }
     }
     0
+}
+
+/// CALLS.md 5c.0 — the [`svm_jit::ChildOfferMint`] hook: mint a `child_offer` (op 14) live-impl
+/// in the **parent's** powerbox over a nursery-retained shared child powerbox. The interp op-14
+/// arm's semantics exactly: any miss (no shared child, bad export, unknown interface) is the
+/// probeable `-EINVAL`, never a trap. The child ref is **borrowed, not consumed** (the nursery
+/// keeps its count); the two powerbox locks are never held together (`Host::mint_child_offer`).
+///
+/// # Safety
+/// `parent_ctx` is the run's `cap_ctx` (the parent `Host`, its guest suspended in the thunk);
+/// `child_ctx` is a live [`svm_jit::GrantChild::retained_ctx`] not yet released.
+pub unsafe extern "C" fn child_offer_mint(
+    parent_ctx: *mut c_void,
+    child_ctx: *mut c_void,
+    export: i64,
+) -> i32 {
+    if child_ctx.is_null() {
+        return -22;
+    }
+    let parent = &mut *(parent_ctx as *mut Host);
+    // Borrow the retained Arc without consuming its count.
+    let child =
+        std::mem::ManuallyDrop::new(std::sync::Arc::from_raw(child_ctx as *const Mutex<Host>));
+    parent
+        .mint_child_offer(&child, export as u32)
+        .unwrap_or(-22)
 }
 
 /// PROCESS.md S2 (JIT parity) — the §14 **named-grant-list builder** for `instantiate_named` (op 11):
@@ -1697,9 +1733,12 @@ pub unsafe extern "C" fn grant_named_child_build(
     let parent = &mut *(ctx as *mut Host);
     match parent.spawn_named_child(&grants, child_size) {
         Some((child, inst_handle, as_handle)) => {
-            let boxed = Box::into_raw(Box::new(child));
+            // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
+            let shared = std::sync::Arc::new(Mutex::new(child));
+            let retained = std::sync::Arc::clone(&shared);
             *out = svm_jit::GrantChild {
-                ctx: boxed as *mut c_void,
+                ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
+                retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
                 inst_handle,
                 as_handle,
                 grant_handle: 0,

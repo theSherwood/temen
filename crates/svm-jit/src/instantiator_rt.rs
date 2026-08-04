@@ -72,6 +72,12 @@ struct ChildDone {
 struct Child {
     done: std::sync::Arc<ChildDone>,
     joined: bool,
+    /// CALLS.md 5c.0 — the nursery-retained ref to this child's **shared powerbox**
+    /// (`GrantChild::retained_ctx` as usize; `0` = the builder shared nothing, op 14 answers
+    /// `-EINVAL`). Lets `child_offer` mint a live-impl over the child and keeps the child `Host`
+    /// reachable after its thread exits (the interp's `child_hosts` retention, JIT twin).
+    /// Released exactly once, at [`Nursery::join_children`], via the grant hooks' releaser.
+    retained: usize,
 }
 
 impl Child {
@@ -84,6 +90,7 @@ impl Child {
                 cv: Condvar::new(),
             }),
             joined: false,
+            retained: 0,
         }
     }
 
@@ -93,6 +100,7 @@ impl Child {
         Child {
             done,
             joined: false,
+            retained: 0,
         }
     }
 }
@@ -175,6 +183,7 @@ unsafe fn spawn_granted_child(
     n_results: usize,
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
+    retained_ctx: *mut core::ffi::c_void,
 ) -> i32 {
     struct SendRaw<T>(T);
     // SAFETY: `parent_mem_base` outlives every child (`join_children` runs before it frees) and the
@@ -226,7 +235,10 @@ unsafe fn spawn_granted_child(
         .expect("spawn a §14 granted-child OS thread");
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
-    children.push(Child::pending(done));
+    let mut child = Child::pending(done);
+    // 5c.0 — retain the shared child powerbox for `child_offer` (released at join_children).
+    child.retained = retained_ctx as usize;
+    children.push(child);
     drop(children);
     rt.child_threads
         .lock()
@@ -330,6 +342,12 @@ pub(crate) struct Nursery {
     grant_build_named: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
     grant_bind_imports: std::sync::atomic::AtomicUsize,
+    /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
+    grant_mint: std::sync::atomic::AtomicUsize,
+    /// CALLS.md 5c.0 — the lock-taking cap thunk granted-child compiles run against
+    /// ([`crate::CapThunk`] as usize; 0 ⇒ fall back to the run's `cap_thunk` — pre-5c.0 behavior,
+    /// only correct for a builder that does not share the child `Host`).
+    grant_thunk: std::sync::atomic::AtomicUsize,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -475,6 +493,8 @@ impl Nursery {
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
+            grant_mint: std::sync::atomic::AtomicUsize::new(0),
+            grant_thunk: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -483,19 +503,23 @@ impl Nursery {
     /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
     /// `None` leaves them `0` (both ops stay an inert `CapFault`).
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi) = match hooks {
+        let (b, bn, r, bi, m, t) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
                 h.release as usize,
                 h.bind_imports as usize,
+                h.mint as usize,
+                h.thunk as usize,
             ),
-            None => (0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
+        self.grant_mint.store(m, Ordering::Release);
+        self.grant_thunk.store(t, Ordering::Release);
     }
 
     /// Derive and allocate a child's counted-fuel cell, exactly as the interpreter derives `child_fuel`
@@ -605,6 +629,24 @@ impl Nursery {
         };
         for h in handles {
             let _ = h.join();
+        }
+        // CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted
+        // live-impls hold their own counted refs, so a parent-held offer handle stays valid at the
+        // host layer; the run is over regardless). After the joins above, so no child thread still
+        // runs against the `Host` while its last-but-one ref drops. Exactly once per child: `take`
+        // zeroes the field.
+        let release_addr = self.grant_release.load(Ordering::Acquire);
+        if release_addr != 0 {
+            let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
+            let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+            for c in children.iter_mut() {
+                let retained = std::mem::take(&mut c.retained);
+                if retained != 0 {
+                    // SAFETY: `retained` is a live `GrantChild::retained_ctx` this nursery owns,
+                    // released exactly once here (spawn error paths released theirs before filing).
+                    unsafe { release(retained as *mut core::ffi::c_void) };
+                }
+            }
         }
     }
 
@@ -964,6 +1006,15 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
     }
     let build: crate::GrantChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
+    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
+    // to the run's thunk only for a legacy non-sharing builder.
+    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
+    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
+        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
+    } else {
+        rt.cap_thunk
+    };
 
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
@@ -996,6 +1047,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
     // non-copyable handle fails the whole spawn closed.
     let mut gc = crate::GrantChild {
         ctx: core::ptr::null_mut(),
+        retained_ctx: core::ptr::null_mut(),
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
@@ -1015,7 +1067,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         child_funcs,
         entry as FuncIdx,
         size_log2 as u8,
-        rt.cap_thunk,
+        child_thunk,
         gc.ctx,
         rt.epoch_addr,
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
@@ -1028,6 +1080,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
             // An un-compilable child (fibers/threads/setjmp, or a backend error) is a CapFault, like
             // the plain `instantiate` path. Free the powerbox host it will never run against.
             release(gc.ctx);
+            release(gc.retained_ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -1048,6 +1101,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         n_results,
         release,
         gc.ctx,
+        gc.retained_ctx,
     )
 }
 
@@ -1090,6 +1144,15 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     }
     let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
+    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
+    // to the run's thunk only for a legacy non-sharing builder.
+    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
+    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
+        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
+    } else {
+        rt.cap_thunk
+    };
 
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
@@ -1124,6 +1187,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     // (MemoryFault / CapFault) and fails the whole spawn closed.
     let mut gc = crate::GrantChild {
         ctx: core::ptr::null_mut(),
+        retained_ctx: core::ptr::null_mut(),
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
@@ -1147,7 +1211,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         child_funcs,
         entry as FuncIdx,
         size_log2 as u8,
-        rt.cap_thunk,
+        child_thunk,
         gc.ctx,
         rt.epoch_addr,
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
@@ -1158,6 +1222,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         Ok(code) => code,
         Err(_) => {
             release(gc.ctx);
+            release(gc.retained_ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -1179,6 +1244,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         n_results,
         release,
         gc.ctx,
+        gc.retained_ctx,
     )
 }
 
@@ -1223,6 +1289,15 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     }
     let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
+    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
+    // to the run's thunk only for a legacy non-sharing builder.
+    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
+    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
+        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
+    } else {
+        rt.cap_thunk
+    };
 
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
@@ -1264,6 +1339,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     // `*trap_out` and fails the whole spawn closed.
     let mut gc = crate::GrantChild {
         ctx: core::ptr::null_mut(),
+        retained_ctx: core::ptr::null_mut(),
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
@@ -1293,6 +1369,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         // inline spawn takes the same early exit).
         if bind(rt.cap_ctx, gc.ctx, module) != 0 {
             release(gc.ctx);
+            release(gc.retained_ctx);
             return EINVAL as i32;
         }
     }
@@ -1304,7 +1381,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         child_funcs,
         entry as FuncIdx,
         size_log2 as u8,
-        rt.cap_thunk,
+        child_thunk,
         gc.ctx,
         rt.epoch_addr,
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
@@ -1315,6 +1392,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         Ok(code) => code,
         Err(_) => {
             release(gc.ctx);
+            release(gc.retained_ctx);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -1336,6 +1414,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         n_results,
         release,
         gc.ctx,
+        gc.retained_ctx,
     )
 }
 
@@ -1347,6 +1426,45 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
 ///
 /// # Safety
 /// As [`instantiate`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
+/// CALLS.md 5c.0 — `child_offer` (Instantiator op 14) on the JIT: mint a **live-callee offer**
+/// in the parent's powerbox over a spawned granted child's nursery-retained shared `Host`.
+/// Semantics mirror the interp op-14 arm errno-for-errno: every miss — forged/joined handle, a
+/// plain (non-shared) child, no mint hook, bad export — is the probeable `-EINVAL`, never a trap.
+/// (A call *through* the minted handle still answers the host dispatch's probeable `-EINVAL`
+/// until the 5c.1 transport lands; minting is the 5c.0 slice.)
+///
+/// # Safety
+/// `rt` is the run's live nursery; `trap_out` the live trap cell (untouched — no trap paths).
+pub(crate) unsafe extern "C" fn child_offer(
+    rt: *const Nursery,
+    child: i32,
+    export: i64,
+    _trap_out: *mut i64,
+) -> i32 {
+    const EINVAL: i32 = -22;
+    let rt = &*rt;
+    let mint_addr = rt.grant_mint.load(Ordering::Acquire);
+    if mint_addr == 0 {
+        return EINVAL;
+    }
+    let retained = {
+        let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+        match children.get(child as usize) {
+            // A joined child mirrors the interp's dead thread-slot: nothing to offer.
+            Some(c) if !c.joined => c.retained,
+            _ => 0,
+        }
+        // Lock dropped before the mint (which takes the child + parent powerbox locks in turn).
+        // No release race: the retained ref is freed only at `join_children` (after guest code)
+        // or on a spawn error path (before the child is ever filed).
+    };
+    if retained == 0 {
+        return EINVAL;
+    }
+    let mint: crate::ChildOfferMint = core::mem::transmute(mint_addr);
+    mint(rt.cap_ctx, retained as *mut core::ffi::c_void, export)
+}
+
 pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i64 {
     let rt = &*rt;
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());

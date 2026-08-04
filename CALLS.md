@@ -452,9 +452,25 @@ plumbing that lands in increments (§8).
      fast path = that mechanism pointed at the **callee's** compile + sub-window + Host, with
      admission gating and the two cap-translation edges — the JIT analog of the interp's 4a/4d.
      Decomposed (aligned; smallest-verifiable-first, mirroring the interp's own 2→3→4 staging):
-     - **5c.0 — prerequisite: JIT child/offer registry + `child_offer` (op 14).** Op 14 emits
-       `-EINVAL` on the JIT today ("the JIT runtime has neither [scheduler nor child registry]") — no
-       live-impl handle can even be minted. Needed by *both* transports.
+     - **5c.0 — prerequisite: JIT child/offer registry + `child_offer` (op 14). DONE (2026-08-04).**
+       Op 14 emitted a blanket `-EINVAL` on the JIT ("the JIT runtime has neither [scheduler nor
+       child registry]") — no live-impl handle could even be minted. **As built**, the registry
+       reduced to an **ownership flip plus one retained ref**: a granted child's powerbox is now an
+       `Arc<Mutex<Host>>` shared cell (was an exclusively-owned `Box<Host>`) with two counted refs —
+       the child thread's (released at child exit, as before) and a **nursery-retained** one
+       (`Child.retained`, released at `join_children`; spawn-error paths release both). Because the
+       parent can now reach the same powerbox, granted-child compiles run against the **lock-taking
+       thunk** (`GrantChildHooks.thunk` = `cap_thunk_locked`) — the data-race guard the sharing
+       demands. The mint itself is `Host::mint_child_offer` (the interp op-14 arm minus thread-slot
+       resolution; same lock discipline, `callee_slot: None` ⇒ non-durable), reached via a new
+       `ChildOfferMint` hook from a tiny op-14 thunk (`instantiator_rt::child_offer`: joined child /
+       plain child / no hook ⇒ `-EINVAL`, errno-for-errno with the interp). Shape resolution works
+       because `spawn_granted_child`/`spawn_named_child` now **seed the child's `self_module`** from
+       the holder's (the interp arm re-assigns the same Arc — uniform across backends). Pinned by
+       `crates/svm/tests/jit_child_offer.rs`: op 14 mints ≥ 0 on the real JIT backend (+ interp mint
+       parity); a call **through** the minted handle answers the host dispatch's probeable `-EINVAL`
+       until the 5c.1 transport (documented per backend — the equality pin is 5c.1's flip); op 14 on
+       a plain (op 0) child refuses `-EINVAL` fail-closed (nothing shared, nothing offered).
      - **5c.1 — the parked transport (arm 5 / the decline target):** enqueue onto the callee's
        `svc_queue`, futex-wake its serve loop, caller **thread-blocks** on a reply cell (the
        `instantiator_rt` `join`/`ChildDone` park shape, with the `epoch_addr` re-check so a host

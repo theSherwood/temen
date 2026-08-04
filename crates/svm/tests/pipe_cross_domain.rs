@@ -69,6 +69,8 @@ fn grant_hooks() -> GrantChildHooks {
         build_named: svm_run::grant_named_child_build,
         bind_imports: svm_run::child_bind_imports,
         release: svm_run::grant_child_release,
+        mint: svm_run::child_offer_mint,
+        thunk: svm_run::cap_thunk_locked,
     }
 }
 

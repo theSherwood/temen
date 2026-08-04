@@ -613,6 +613,15 @@ pub type ModuleResolver =
 #[repr(C)]
 pub struct GrantChild {
     pub ctx: *mut core::ffi::c_void,
+    /// CALLS.md 5c.0 — a **second reference** to the same child powerbox, retained by the nursery
+    /// so `child_offer` (op 14) can mint a live-impl over the child and callers can reach its
+    /// world after the child thread exits (the interp's `child_hosts` retention, JIT twin). Null
+    /// for a builder that does not share the child `Host` (then op 14 answers `-EINVAL`,
+    /// fail-closed). When non-null, `ctx` and `retained_ctx` are two counted refs to one shared
+    /// `Host` (host-side an `Arc<Mutex<Host>>`): the child thread's ref is released at child exit
+    /// as before, the retained one by the nursery at teardown — each exactly once, via the same
+    /// [`GrantChildReleaser`].
+    pub retained_ctx: *mut core::ffi::c_void,
     pub inst_handle: i32,
     pub as_handle: i32,
     pub grant_handle: i32,
@@ -682,7 +691,26 @@ pub struct GrantChildHooks {
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
     /// interpreter's inline `Host::bind_child_manifest` at spawn.
     pub bind_imports: ChildManifestBinder,
+    /// CALLS.md 5c.0 — mint a `child_offer` (op 14) live-impl in the **parent's** powerbox over a
+    /// retained child powerbox (`GrantChild::retained_ctx`): `(parent_ctx, child_ctx, export)` →
+    /// the granted handle, or a negative errno (`-EINVAL` for a bad export / unshared child).
+    pub mint: ChildOfferMint,
+    /// CALLS.md 5c.0 — the cap thunk granted-child compiles run against. A shared child `Host`
+    /// (non-null `retained_ctx`) is reachable from the parent while the child runs, so its own
+    /// `cap.call`s must synchronize: this is the lock-taking thunk variant (`ctx` = the shared
+    /// cell), replacing the run's unsynchronized `cap_thunk` for granted children only.
+    pub thunk: CapThunk,
 }
+
+/// Mint a `child_offer` live-impl in the parent powerbox over a retained child powerbox — see
+/// [`GrantChildHooks::mint`]. Host-side it fetches the export shape from the child's registered
+/// module and installs the live-impl entry (the interp op-14 arm's body); the two powerbox locks
+/// are never held together.
+pub type ChildOfferMint = unsafe extern "C" fn(
+    parent_ctx: *mut core::ffi::c_void,
+    child_ctx: *mut core::ffi::c_void,
+    export: i64,
+) -> i32;
 
 /// Bind a child module's import manifest against its built powerbox host — see
 /// [`GrantChildHooks::bind_imports`]. Returns `0` on success, nonzero when a `required` import
@@ -2823,6 +2851,7 @@ impl CompiledModule {
                 instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
                 instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
                     as *const () as i64,
+                child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
             }
         } else {
             InstEnv::null()
@@ -4447,6 +4476,7 @@ pub(crate) unsafe fn compile_child_and_run(
             instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
             instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
                 as i64,
+            child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
         },
         None => InstEnv::null(),
     };
@@ -5329,6 +5359,9 @@ struct InstEnv {
     // STAGE1.md — op 13 (`instantiate_module_named`): run a separate `Module` *and* re-grant caps by
     // name (the shell "exec" primitive — union of op 5 + op 11).
     instantiate_module_named_thunk: i64,
+    // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
+    // child's nursery-retained shared powerbox.
+    child_offer_thunk: i64,
 }
 
 impl InstEnv {
@@ -5345,6 +5378,7 @@ impl InstEnv {
             instantiate_granted_thunk: 0,
             instantiate_named_thunk: 0,
             instantiate_module_named_thunk: 0,
+            child_offer_thunk: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` cap.calls to the nesting runtime (the
@@ -8048,6 +8082,8 @@ fn lower_instantiator(
         // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
         // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL).
+        14 => Some((&[VI32, VI64], &[VI32])),
         _ => None,
     };
     // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
@@ -8061,13 +8097,12 @@ fn lower_instantiator(
     // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
     // unconditional runtime CapFault — never a compile-time rejection of a verified module.
     let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
-    // §3.6 op 14 (`child_offer`) and PROCESS.md §5 op 15 (`instantiate_detached`) are
-    // eval-loop-serviced — op 14 mints a live-callee offer from the tree-walk scheduler's
-    // child registry, op 15 spawns into a fresh interpreter-owned window; the JIT runtime has
-    // neither. Answer a probeable `-EINVAL` result instead of trapping (the oracle's own
-    // bad-input refusal shape), so a guest probes and falls back — parity is refusal, never a
-    // wrong answer.
-    if matches!(op, 14 | 15) && sig.results.iter().all(is_scalar_int) {
+    // PROCESS.md §5 op 15 (`instantiate_detached`) is eval-loop-serviced — it spawns into a
+    // fresh interpreter-owned window, which the JIT runtime does not host. Answer a probeable
+    // `-EINVAL` result instead of trapping (the oracle's own bad-input refusal shape), so a
+    // guest probes and falls back — parity is refusal, never a wrong answer. (Op 14
+    // `child_offer` is JIT-native since CALLS.md 5c.0 — the contract row above.)
+    if op == 15 && sig.results.iter().all(is_scalar_int) {
         for t in &sig.results {
             let v = b.ins().iconst(clif_ty(*t), -22);
             vals.push(v);
@@ -8302,6 +8337,27 @@ fn lower_instantiator(
                     fuel, trap_out,
                 ],
             );
+            emit_trap_propagate(b, lower);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
+        }
+        14 => {
+            // CALLS.md 5c.0 child_offer(nursery, child:i32, export:i64, trap_out) -> handle:i32.
+            // Mint a live-callee offer over a granted child's nursery-retained shared powerbox;
+            // every miss is the probeable -EINVAL (the interp op-14 arm, errno-for-errno). No
+            // window args — the mint reads no guest memory.
+            let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let export = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
+            let mut tsig = module.make_signature();
+            for t in [I64, I32, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.child_offer_thunk);
+            let call = b
+                .ins()
+                .call_indirect(tref, thunk, &[nursery, child, export, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

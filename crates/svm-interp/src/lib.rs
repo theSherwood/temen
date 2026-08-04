@@ -17197,6 +17197,8 @@ impl Host {
             return None;
         }
         let mut ch = Host::new();
+        // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
+        ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
@@ -17315,6 +17317,11 @@ impl Host {
             return None;
         }
         let mut ch = Host::new();
+        // §3.6/5c.0: a named-grant child runs the holder's own program, so its **self module** —
+        // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's
+        // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
+        // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
+        ch.self_module = self.self_module.clone();
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
