@@ -165,6 +165,15 @@ or persistence regression — it only drops the over-strict full-`load` dependen
 the next lever is a one-shot reload retry, or serving the two big assets with a warm cache across the
 reload.
 
+**Recurred 2026-08-04 on PR #588** (another browser-inert diff — `svm-wasm-jit` opt-in paths + docs;
+every other real-browser check passed, again including the full wasm-JIT/§14/§22 suite and the chibicc
+bench): the **hardened** wait also lapsed — `page.reload: Timeout 60000ms exceeded · waiting for
+navigation until "domcontentloaded"` right after the 41 MB IndexedDB save. Applied the next lever named
+above: `pg-reload-test.mjs` now does a **one-shot reload retry** on timeout (safe — the snapshot is
+already durable before the reload, and `waitEngine` + the SELECT/`restored` assertions remain the real
+gate). If it recurs *through the retry*, the remaining lever is warm-caching the two big assets across
+the reload.
+
 ### I55 — the `browser` crate is a separate workspace, so a cross-crate rename left `main` un-buildable on wasm32 for a day before any gate caught it (S3, build-gate gap) — surfaced 2026-07-31, fixed same day
 
 **Symptom.** `cargo +nightly build -Z build-std … --target wasm32-unknown-unknown` of `browser`
