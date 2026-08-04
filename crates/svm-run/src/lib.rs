@@ -1577,6 +1577,20 @@ pub unsafe extern "C" fn module_resolver(
 }
 
 /// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
+/// CALLS.md 5c.1c — the production granted-child hook set (`powerbox_compile_run` installs it on
+/// every JIT run whose module nests): the same callbacks the test harnesses wire by hand.
+pub fn production_grant_hooks() -> svm_jit::GrantChildHooks {
+    svm_jit::GrantChildHooks {
+        build: grant_child_build,
+        build_named: grant_named_child_build,
+        release: grant_child_release,
+        bind_imports: child_bind_imports,
+        mint: child_offer_mint,
+        thunk: cap_thunk_locked,
+        register_serve: child_register_serve,
+    }
+}
+
 /// re-grant one of the parent's coordinate-free capabilities (`Stream`/`Exit`/`Clock`, named by
 /// `grant_handle`) into a fresh child powerbox `Host` confined to `[0, child_size)`, so a JIT child
 /// can do I/O instead of being born destitute. The child `Host` is heap-`Box`ed and returned as the
@@ -3135,6 +3149,13 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
+        cm.set_grant_child_hooks(Some(production_grant_hooks()));
+        if let Some(ip) = interrupt_ptr {
+            m.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_epoch_cell(ip as usize);
+        }
         let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3170,6 +3191,11 @@ unsafe fn powerbox_compile_run(
         cm.enable_fiber_hosting(quota)?;
     }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
+    cm.set_grant_child_hooks(Some(production_grant_hooks()));
+    if let Some(ip) = interrupt_ptr {
+        host.set_epoch_cell(ip as usize);
+    }
     // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
     // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
     // Single-threaded path only: the locked thunk never serves (see `cap_thunk_locked`).
@@ -3462,6 +3488,21 @@ fn diff_outcome(
 /// the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
 /// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
 /// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
+/// CALLS.md 5c.1c — does the module spawn §14 children (any `Instantiator` `cap.call`)? A
+/// serving module that also **nests** is the child-serving shape the JIT now runs natively (the
+/// 5c.1 parked transport: the serve points live in granted children, not the root), so the
+/// serve fold below must not send it to the oracle. A top-level-serving non-nesting module still
+/// folds — the root's own `svc.wait` remains eval-loop territory until 5c.2+.
+fn module_nests(m: &svm_ir::Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, svm_ir::Inst::CapCall { type_id: 6, .. }))
+        })
+    })
+}
+
 fn module_serves(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -4609,6 +4650,7 @@ impl Instance {
         let backend = if matches!(backend, Backend::Jit)
             && module_serves(m)
             && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+            && !module_nests(m)
         {
             Backend::TreeWalk
         } else {
@@ -4918,6 +4960,7 @@ fn run_capture_on(
     let backend = if matches!(backend, Backend::Jit)
         && module_serves(m)
         && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+        && !module_nests(m)
     {
         Backend::TreeWalk
     } else {

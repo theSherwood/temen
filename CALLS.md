@@ -520,10 +520,17 @@ plumbing that lands in increments (§8).
          spawn; the releaser clears the ctx + notifies (idempotent across the two refs). Pinned by
          `jit_child_offer::call_through_minted_offer_completes_on_both_backends` — **the 5c.0
          equality flip: 42 on the real JIT ≡ interp.**
-       - **5c.1c** production `GrantChildHooks` on `powerbox_compile_run` (`_ex` compile), the
-         Jit-only fold relax, op-13 `self_module`, and the `svc_parity` pin on the real JIT (its
-         module moves op 0 → op 11: a plain child is destitute by design on the JIT; a serving
-         child needs a powerbox).
+       - **5c.1c — production wiring + the parity pin. DONE (2026-08-04).** `powerbox_compile_run`
+         installs the production `GrantChildHooks` (via a new `CompiledModule::set_grant_child_hooks`
+         bridge) and arms `Host.epoch_cell` from the run's interrupt cell, on both branches. The
+         serve fold relaxes **Jit-only and shape-scoped**: a serving module that also **nests**
+         (`module_nests`) runs the real JIT (its serve points live in granted children — the 5c.1
+         transport); top-level-serving non-nesting modules still fold. `svc_parity`'s module moves
+         op 0 → op 11 (empty grant list — a plain child is destitute by design on the JIT; a serving
+         child needs the shared powerbox) and now passes on the **real** JIT backend ≡ TreeWalk ≡
+         bytecode-fallback: spawn → mint → parked-transport call → blocking `svc.wait` serve →
+         reply → join → exit 42. *Residue:* op-13 (separate-module) children get no `self_module`
+         on the JIT yet, so their offers don't mint — rides a later slice.
      - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
        loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
        inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),

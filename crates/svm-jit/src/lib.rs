@@ -3421,6 +3421,18 @@ impl CompiledModule {
     /// `(code, n_params, n_results)`, invocable over the live window via
     /// [`Self::invoke_extra`] from the embedder's serve arm. `None` for a funcidx that is not
     /// an impl-export handler of this module.
+    /// CALLS.md 5c.1c — install the granted-child host callbacks into this module's §14 nursery
+    /// (the production twin of the `compile_and_run_*_ex` install; a module with no `Instantiator`
+    /// has no nursery and this is a no-op). `None` leaves the granted spawns inert `CapFault`s.
+    pub fn set_grant_child_hooks(&self, hooks: Option<GrantChildHooks>) {
+        #[cfg(fiber_rt)]
+        if let Some(n) = &self._nursery {
+            n.set_grant_hooks(hooks);
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = hooks;
+    }
+
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
         self.serve_tramps
             .iter()
