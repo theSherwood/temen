@@ -711,6 +711,81 @@ fn is_nested_cap(type_id: u32, op: u32) -> bool {
     type_id == 6 && (op == 0 || op == 1)
 }
 
+/// The §14 ADDRESS_SPACE (iface 5) ops a nested unit may reach as **outlined cross-tier leaves**
+/// (via the one existing `env.call_interp` transport — no new imports, per the CONSOLIDATION.md §0
+/// yardstick): `page_size` (op 3, a pure query) and `sub` (op 4, attenuation-minting — it carves a
+/// child window handle without changing any page state). `map`/`unmap`/`protect` (ops 0/1/2) are
+/// deliberately excluded: they change page state that *subsequent emitted accesses* must honor, and
+/// the wasm tier's confinement is mask-only — an emitted load would sail through an unmapped page the
+/// interpreter traps. They stay out-of-subset (fail-closed to the interpreter), deferred with the
+/// D40/§13 page-enforcement question.
+fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
+    type_id == 5 && (op == 3 || op == 4)
+}
+
+/// Outline each [`is_nested_leaf_cap`] `cap.call` into an appended int-signature wrapper (exactly
+/// [`outline_cap_calls`]'s rewrite, restricted to that allowlist) so a §14 unit's entry that carves
+/// its window (`sub`) or queries `page_size` becomes emittable: the wrapper stays a cross-tier leaf
+/// [`compile_module_nested`] routes through `env.call_interp`. The host's `call_interp` callback must
+/// carry the run's **powerbox** (the reactor-path contract, not the throwaway-window one), so the
+/// wrapper's `cap.call` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
+/// then encodes identically on both tiers. INSTANTIATOR ops stay **inline** (the dedicated
+/// `env.instantiate`/`env.join` bounce); all other cap ops are left inline and fail closed.
+pub fn outline_nested_cap_calls(m: &mut Module) {
+    let base = m.funcs.len() as u32;
+    let mut wrappers: Vec<Func> = Vec::new();
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::CapCall {
+                    type_id,
+                    op,
+                    sig,
+                    handle,
+                    args,
+                } = inst
+                {
+                    if !is_nested_leaf_cap(*type_id, *op) {
+                        continue;
+                    }
+                    let g = base + wrappers.len() as u32;
+                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
+                    let mut params = Vec::with_capacity(1 + sig.params.len());
+                    params.push(ValType::I32);
+                    params.extend(sig.params.iter().copied());
+                    let nparams = params.len() as u32;
+                    let wrapper_args: Vec<u32> = (1..nparams).collect();
+                    let ret: Vec<u32> = (nparams..nparams + sig.results.len() as u32).collect();
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![Inst::CapCall {
+                            type_id: *type_id,
+                            op: *op,
+                            sig: sig.clone(),
+                            handle: 0,
+                            args: wrapper_args,
+                        }],
+                        term: Terminator::Return(ret),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: sig.results.clone(),
+                        blocks: vec![block],
+                    });
+                    let mut call_args = Vec::with_capacity(1 + args.len());
+                    call_args.push(*handle);
+                    call_args.extend(args.iter().copied());
+                    *inst = Inst::Call {
+                        func: g,
+                        args: call_args,
+                    };
+                }
+            }
+        }
+    }
+    m.funcs.extend(wrappers);
+}
+
 fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<ValType>, Error> {
     let mut tys: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
@@ -1114,15 +1189,40 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
 /// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
 /// runs on the wasm tier, the child spawn/join happening host-side exactly as the interpreter surfaces
 /// `VcpuStop::Instantiate`. Two extra func imports precede the emitted functions, so their wasm indices
-/// start at `NESTED_IMPORTED_FUNCS`. `Err` if any function is otherwise outside the subset.
+/// start at `NESTED_IMPORTED_FUNCS`. A function outside the nested subset is kept as a **cross-tier
+/// leaf** via `env.call_interp` iff its signature is all-integer — the [`outline_nested_cap_calls`]
+/// ADDRESS_SPACE wrappers ride this (run them with a powerbox-carrying callback) — else `Err`; the
+/// entry (func 0) must itself be emittable.
 pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     let n = m.funcs.len();
-    let emitted: Vec<usize> = (0..n).collect();
-    let wasm_of: Vec<Option<u32>> = (0..n)
-        .map(|i| Some(NESTED_IMPORTED_FUNCS + i as u32))
-        .collect();
-    // No cross-tier interp leaves in this path (a nested cap-call bounces host-side, not via a leaf).
-    let interp_leaf = vec![false; n];
+    // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
+    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers) reached
+    // via `env.call_interp` — whose host callback must therefore carry the run's powerbox (the
+    // reactor-path contract, not the throwaway-window one). Anything else fails closed.
+    let nested_ok = |f: &Func| {
+        f.blocks.iter().all(|b| {
+            block_value_types(m, b, true)
+                .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        })
+    };
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    let mut interp_leaf = vec![false; n];
+    let mut emitted: Vec<usize> = Vec::new();
+    for (i, f) in m.funcs.iter().enumerate() {
+        if nested_ok(f) {
+            wasm_of[i] = Some(NESTED_IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+        } else if int_sig(f) {
+            interp_leaf[i] = true;
+        } else {
+            return Err(Error::Unsupported(
+                "non-leaf function outside the nested subset",
+            ));
+        }
+    }
+    if wasm_of.first().copied().flatten().is_none() {
+        return Err(Error::Unsupported("nested entry outside the subset"));
+    }
     emit_module(
         m,
         shared_memory,

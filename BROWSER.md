@@ -801,12 +801,24 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    from the interpreter path). Opt-in, so the production paths are byte-identical. Pinned by
    `crates/svm-wasm-jit/tests/nested_vm.rs`: an emitted entry that `instantiate`s + `join`s a child
    returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
-   actually fired). **Deferred:** the **browser driver wiring** (`worker.js`/`par.js` servicing
-   `env.instantiate` by spawning the child on a Worker into the confined-child completion-slot protocol
-   — *browser-verification pending*); ADDRESS_SPACE caps (iface 5 `map`/`unmap`/`protect`/`sub`) and
-   coroutine/yield ops, still out-of-subset. *(All scalar unit signatures — i32/i64/f32/f64 — now
-   marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
-   §17.)*
+   actually fired).
+   **[landed — §14 ADDRESS_SPACE `sub`/`page_size` via the one existing transport]** An entry that
+   *carves its own window* (`sub`, iface 5 op 4) or queries `page_size` (op 3) also emits:
+   [`svm_wasm_jit::outline_nested_cap_calls`] hoists each such `cap.call` into an int-signature
+   wrapper leaf and `compile_module_nested` routes it through **`env.call_interp`** — no new imports
+   or transport (the CONSOLIDATION.md §0 yardstick); the callback must carry the run's **powerbox**
+   (the reactor-path contract), so `sub`'s minted handle encodes identically on both tiers. Pinned by
+   `crates/svm-wasm-jit/tests/nested_addr_space.rs`: the outlined bounce alone, and a composed entry
+   (`sub`-carve + `instantiate`/`join` in one function), each ≡ the **whole-entry** bytecode
+   cooperative oracle over an identically-granted host; and `map`/`unmap`/`protect` (ops 0/1/2)
+   **fail closed** — they change page state that subsequent emitted accesses can't honor under
+   mask-only confinement, so they stay on the interpreter, deferred with the D40/§13 page-enforcement
+   question. Coroutine/`Yielder` ops are deliberately **never** lowered on this tier — CONSOLIDATION.md
+   §2 deletes them onto the unified offer, so any wasm-tier arm would be work queued for deletion.
+   **Deferred:** the **browser driver wiring** (`worker.js`/`par.js` servicing `env.instantiate` by
+   spawning the child on a Worker into the confined-child completion-slot protocol —
+   *browser-verification pending*). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by
+   type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design, §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

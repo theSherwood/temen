@@ -77,7 +77,9 @@ With §2 done, de-proliferate what remains of the op table (~16 ops today):
 **End state:** `Instantiator` at ~6 ops, one resource-accounting object in the system.
 
 **Gates:** §2 first (otherwise the record schema is designed twice); the JIT
-`instantiator_rt` thunks migrate in the same change (no tier-split of the spawn ABI).
+`instantiator_rt` thunks migrate in the same change (no tier-split of the spawn ABI) — that
+set now also includes the wasm-JIT tier's `env.instantiate`/`env.join` imports
+(`svm-wasm-jit::compile_module_nested`), which mirror the current op-0 scalar signature.
 
 ## 4. `Memory` is the degenerate `AddressSpace` — delete it
 
