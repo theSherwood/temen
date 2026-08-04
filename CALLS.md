@@ -426,10 +426,41 @@ plumbing that lands in increments (§8).
      provider-pays). *Scope:* the durable/`ref.func` `drive_arc` fallback still reserves-and-drains
      (provider-pays) — it retires with increment 6; a process provider runs on its own §15 budget by
      construction (a separate domain), so caller-pays here is the inline/library-animation path.
-   - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** The net-new JIT thunk +
-     park-as-thread-block-on-reply paralleling the interp `live_impl` path; plus the §10.4 per-thread
-     crossing-depth bound (declines the inline arm to the parked transport at the bound). Closes the
-     `live_impl` parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`).
+   - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** Closes the `live_impl`
+     parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`). **Scoped
+     (2026-08-04) — this is foundational infrastructure, not a thunk tweak.** The blocker: a JIT run
+     (`svm-run::powerbox_compile_run` → `CompiledModule::run_raw`) executes **one** compiled module on
+     **one** native thread with **no `Scheduler`** — no other-domain vCPUs, no `svc_waiters`, no
+     enqueuer. The interp's cross-domain call works only because the interp carries the full multi-vCPU
+     `Scheduler`. So the JIT arm needs the JIT'd thread to *participate in a scheduler*, and its park
+     is an **OS-thread block** (the design's "park = thread-block on the reply"), not a reified-fiber
+     park. Mechanism:
+     - A cross-domain `cap.call` in JIT'd code reaches the `cap_thunk` (`svm-run`); on
+       `live_impl_of(handle, type_id) == Some((callee, export))` it takes the cross-domain arm instead
+       of `cap_dispatch_slots`: `svc_enqueue` the dispatch (ticket `t`), `svc_wake(callee)`, register
+       the **calling native thread** as a waiter on `(callee, t)`, and **block the thread** (condvar /
+       `park_timeout`) until the reply.
+     - The reply (`cap_reply_or_stash`) learns a new `Waiter::NativeThread { … }` variant that
+       unblocks the parked OS thread (delivering the reply `i64`), alongside the existing
+       `Waiter::VCpu`/`Waiter::Fiber`.
+     - The callee runs on a scheduler **worker** (an interp vCPU for the first tier — a JIT callee is
+       a later tier); so a JIT run that makes cross-domain calls must be stood up **alongside a live
+       `Scheduler`** rather than as a bare `run_raw`.
+     Decomposed:
+     - **5c.1 — Scheduler-participating JIT run + `Waiter::NativeThread` + the cross-domain thunk
+       arm** (enqueue + thread-block + wake), callee on an interp worker. Pin: a JIT'd caller into an
+       interp `live_impl` completes **≡ the interp caller** (`Instance::run_diff` oracle).
+     - **5c.2 — §10.4 crossing-depth bound**: a per-thread crossing counter minted at the cross-domain
+       thunk; at the bound the call **declines the inline arm to the parked transport** (fail-closed
+       toward the slower correct transport, never a wrong answer).
+     - **5c.3 — mid-call park / handler-parks parity**: a callee handler that parks rides the existing
+       serve-loop `handler_parks` machinery; the JIT caller stays thread-blocked on `t` until the
+       eventual reply (the 4d.2 shape, thread-block flavor).
+     **Open design questions (owner review before build):** (a) how `svm-run` stands up a JIT run
+     *with* a scheduler + interp workers for the callees (a new run entry, or fold into the existing
+     scheduler with the root as a JIT-native thread?); (b) is a condvar OS-thread block acceptable as
+     the JIT park (it is one-thread-per-domain, so yes — but confirm vs. a futex on the reply cell);
+     (c) JIT-callee tier — defer to a later slice, or in-scope for 5c?
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
    goal, now reachable without a parity regression).
