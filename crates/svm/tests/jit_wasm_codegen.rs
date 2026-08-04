@@ -258,7 +258,8 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
         BLOB_OFF,
         blob.len() as u64,
     );
-    let guest_m = parse_module(&guest_src).unwrap_or_else(|e| panic!("guest parse: {e}\n{guest_src}"));
+    let guest_m =
+        parse_module(&guest_src).unwrap_or_else(|e| panic!("guest parse: {e}\n{guest_src}"));
     verify_module(&guest_m).expect("verify guest");
 
     let mut host = Host::new();
@@ -273,22 +274,19 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
 
     let prog = bytecode::VcpuProgram::compile_with_jit_table(&guest_m, 4).unwrap();
     let back = window();
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &[Value::I32(jit)],
-        back,
-        &init_mem,
-        host,
-    )
-    .expect("root");
+    let mut vcpu =
+        bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[Value::I32(jit)], back, &init_mem, host)
+            .expect("root");
 
     let mut emitted_ran = false;
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => {
                 if mode == Mode::Wasm {
-                    assert!(emitted_ran, "codegen run never executed emitted wasm (silent interp fallback)");
+                    assert!(
+                        emitted_ran,
+                        "codegen run never executed emitted wasm (silent interp fallback)"
+                    );
                 }
                 return Ok(vals);
             }
@@ -397,7 +395,10 @@ fn compile_stashes_wasm_matching_the_interpreter() {
 
         let want = oracle_unit(&unit_m, &argv);
         let got = run_unit_on_wasm(&unit_m, &wasm, &argv);
-        assert_eq!(want, got, "{name}: emitted wasm diverged from the interpreter");
+        assert_eq!(
+            want, got,
+            "{name}: emitted wasm diverged from the interpreter"
+        );
     }
 }
 
@@ -407,16 +408,30 @@ fn compile_stashes_wasm_matching_the_interpreter() {
 fn runtime_compile_invoke_i64_matches_interp() {
     let want = run_guest(UNIT_I64, Mode::Interp);
     let got = run_guest(UNIT_I64, Mode::Wasm);
-    assert_eq!(want, Ok(vec![Value::I64(17)]), "interp reference: unit(4,5)=17");
-    assert_eq!(got, want, "wasm-emitted runtime-compiled i64 unit diverged from interp");
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(17)]),
+        "interp reference: unit(4,5)=17"
+    );
+    assert_eq!(
+        got, want,
+        "wasm-emitted runtime-compiled i64 unit diverged from interp"
+    );
 }
 
 #[test]
 fn runtime_compile_invoke_i32_matches_interp() {
     let want = run_guest(UNIT_I32, Mode::Interp);
     let got = run_guest(UNIT_I32, Mode::Wasm);
-    assert_eq!(want, Ok(vec![Value::I32(17)]), "interp reference: unit(4,5)=17");
-    assert_eq!(got, want, "wasm-emitted runtime-compiled i32 unit diverged from interp");
+    assert_eq!(
+        want,
+        Ok(vec![Value::I32(17)]),
+        "interp reference: unit(4,5)=17"
+    );
+    assert_eq!(
+        got, want,
+        "wasm-emitted runtime-compiled i32 unit diverged from interp"
+    );
 }
 
 #[test]
@@ -425,7 +440,10 @@ fn runtime_compile_invoke_trap_parity() {
     let want = run_guest(UNIT_TRAP, Mode::Interp);
     let got = run_guest(UNIT_TRAP, Mode::Wasm);
     assert!(want.is_err(), "interp invoke must trap at x=7");
-    assert_eq!(got, want, "codegen trap diverged from interp (want {want:?})");
+    assert_eq!(
+        got, want,
+        "codegen trap diverged from interp (want {want:?})"
+    );
 }
 
 // ---- the shared-`Mutex<Host>` runtime-compile flow (the browser's `ParJitCfg` path) --------------
@@ -446,7 +464,14 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
     let entry = &unit_m.funcs[0];
     let ret = tyname(entry.results[0]);
     let (arg_setup, arg_ops, invoke_sig) = invoke_shape(&entry.params);
-    let guest_src = guest_src(ret, &invoke_sig, &arg_setup, &arg_ops, BLOB_OFF, blob.len() as u64);
+    let guest_src = guest_src(
+        ret,
+        &invoke_sig,
+        &arg_setup,
+        &arg_ops,
+        BLOB_OFF,
+        blob.len() as u64,
+    );
     let guest_m = parse_module(&guest_src).unwrap_or_else(|e| panic!("guest parse: {e}"));
     verify_module(&guest_m).expect("verify guest");
 
@@ -474,7 +499,10 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => {
                 if mode == Mode::Wasm {
-                    assert!(emitted_ran, "codegen run never executed emitted wasm (silent interp fallback)");
+                    assert!(
+                        emitted_ran,
+                        "codegen run never executed emitted wasm (silent interp fallback)"
+                    );
                 }
                 return Ok(vals);
             }
@@ -493,7 +521,8 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                     Mode::Wasm => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),
                         Ok((_funcs, wasm)) => {
-                            let wasm = wasm.expect("emitter must produce wasm for an in-subset unit");
+                            let wasm =
+                                wasm.expect("emitter must produce wasm for an in-subset unit");
                             emitted_ran = true;
                             match run_unit_on_wasm(&unit_m, &wasm, &argv) {
                                 Ok(slots) => vcpu.deliver_jit_invoke_vals(&slots),
@@ -512,8 +541,15 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
 fn shared_host_runtime_compile_matches_interp() {
     let want = run_guest_shared(UNIT_I64, Mode::Interp);
     let got = run_guest_shared(UNIT_I64, Mode::Wasm);
-    assert_eq!(want, Ok(vec![Value::I64(17)]), "interp reference: unit(4,5)=17");
-    assert_eq!(got, want, "shared-host wasm-emitted runtime-compiled unit diverged from interp");
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(17)]),
+        "interp reference: unit(4,5)=17"
+    );
+    assert_eq!(
+        got, want,
+        "shared-host wasm-emitted runtime-compiled unit diverged from interp"
+    );
 }
 
 #[test]
@@ -521,5 +557,8 @@ fn shared_host_runtime_compile_trap_parity() {
     let want = run_guest_shared(UNIT_TRAP, Mode::Interp);
     let got = run_guest_shared(UNIT_TRAP, Mode::Wasm);
     assert!(want.is_err(), "interp invoke must trap");
-    assert_eq!(got, want, "shared-host codegen trap diverged from interp (want {want:?})");
+    assert_eq!(
+        got, want,
+        "shared-host codegen trap diverged from interp (want {want:?})"
+    );
 }

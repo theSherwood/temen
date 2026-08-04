@@ -1837,7 +1837,11 @@ pub extern "C" fn svm_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
 #[no_mangle]
 pub extern "C" fn svm_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
     // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).jit_wasm.as_ref().map_or(core::ptr::null(), |w| w.as_ptr()) }
+    unsafe {
+        (*v).jit_wasm
+            .as_ref()
+            .map_or(core::ptr::null(), |w| w.as_ptr())
+    }
 }
 #[no_mangle]
 pub extern "C" fn svm_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
