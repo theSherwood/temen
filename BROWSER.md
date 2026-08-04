@@ -749,8 +749,11 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
    runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
    `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
-   single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; a multi-Worker Node/Chromium twin is the
-   remaining **end-to-end** verification.
+   single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; the **multi-Worker Chromium twin landed**
+   as the CI-gated `jitruntime` work item (`browser-test.mjs`): 8 worker vCPUs each runtime-compile
+   their own unit through the shared powerbox and invoke it on per-Worker emitted wasm — interp ≡
+   codegen ≡ 56 across 9 Workers, verified in real Chromium (par.js's `jitRuntime`/`jitBlobs` options
+   publish the runtime powerbox + stage the blobs).
    **[landed — §22 Model B2 emitter mechanism + native cross-instance differential]** An installed
    unit can now be a funcref another instance's `call_indirect` reaches through **one shared reserved
    funcref table**. [`svm_wasm_jit::compile_module_b2`] emits a module that *imports*
@@ -785,11 +788,13 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    nulling empty slots so a stale `call_indirect` traps), then runs the invoked unit resolved by its
    code handle; `par.js` sets the toggle + passes `jitB2`. The **mirror design is proven native** by
    `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
-   the same install map, all agreeing with the interpreter oracle). **Pending:** this multi-Worker JS
-   path has no native/CI harness in-repo — it needs a Chromium/Node end-to-end twin, and the
-   multi-Worker runtime-compile powerbox itself is still only driven by the single-Worker
-   `jitcodegen_runtime.mjs` (par.js's `runAcrossWorkers` carries the `jitB2` flag but not yet the
-   runtime-powerbox setup).
+   the same install map, all agreeing with the interpreter oracle). **End-to-end verified:** the CI-gated `jitb2` work item
+   (`browser-test.mjs`) drives the whole story in real Chromium — 8 workers each runtime-compile a
+   leaf, `install` it into the shared table (raced slots), runtime-compile a `call_indirect`
+   dispatcher, and invoke it: on the B2 tier the dispatch goes through each Worker's own table mirror
+   (synced before every invoke) — interp ≡ B2 codegen ≡ 56 across 9 Workers. par.js's `jitRuntime`
+   branch supplies the once-missing runtime-powerbox setup (publish + blob staging + recipe
+   self-cleaning: `powerbox_none` first, the sticky B2 flag set explicitly both ways).
    **[landed — §14 VM-in-VM emitter mechanism + native differential]** A unit whose entry *uses* its
    `Instantiator` cap (spawns a nested confined VM + `join`s it) now emits, where before **any**
    `cap.call` forced the whole entry onto the interpreter (`block_value_types` rejected it).
