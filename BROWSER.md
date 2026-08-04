@@ -775,8 +775,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **Deferred (documented):** **cross-Worker** B2 — wasm funcrefs are *not* transferable across Workers
    (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each Worker must hold its **own**
    `WebAssembly.Table` mirroring the shared slot→unit map (instantiating an installed unit locally and
-   `table.set`ting its own funcref at the shared slot index); wiring `openB2Domain` into the par
-   `Jit.invoke`/`install` path + a Node/Chromium end-to-end twin is the remaining verification. Also
+   `table.set`ting its own funcref at the shared slot index). That **mirror design is proven native** by
+   `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
+   the same install map and every one agrees with the interpreter oracle); wiring `openB2Domain` into
+   the par `Jit.invoke`/`install` path + a Node/Chromium end-to-end twin is the remaining verification. Also
    deferred: §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on
    wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay
    on the interpreter — the cap ABI is scalar-only by design, §17.)*

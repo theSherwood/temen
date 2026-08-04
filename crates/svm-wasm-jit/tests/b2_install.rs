@@ -348,3 +348,32 @@ fn b2_mask_confines_every_index_to_reserved_table() {
         );
     }
 }
+
+/// **The per-Worker table-mirror design** (de-risks cross-Worker B2). wasm funcrefs can't cross
+/// Workers, so cross-Worker B2 gives each Worker its *own* `WebAssembly.Table` materialized from the
+/// shared slot→unit map: each Worker instantiates an installed unit locally and `table.set`s its own
+/// funcref at the shared slot index. This models that — 8 threads each build an **independent** domain
+/// (own engine/store/table) from the *same* install map and dispatch, and every one agrees with the
+/// interpreter oracle. So a domain replicated per Worker dispatches consistently, no funcref sharing
+/// required. (The remaining browser work is wiring this into the par `Jit.invoke`/`install` path.)
+#[test]
+fn b2_per_worker_mirror_is_consistent() {
+    let want = oracle_i32(CALLEE_I32);
+    let installs = [Install {
+        src: CALLEE_I32,
+        slot: 5,
+        b2: false,
+    }];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| b2_run(&installs, &[], 5)))
+            .collect();
+        for h in handles {
+            assert_eq!(
+                h.join().unwrap(),
+                Ok(want),
+                "a per-Worker mirror diverged from the oracle"
+            );
+        }
+    });
+}
