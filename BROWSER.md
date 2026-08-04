@@ -760,9 +760,11 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `install`). The confinement mask stays the compile-time constant `idx & (1<<log2 - 1)` (invariant
    I2 — constant from t=0, so no compiled site holds a stale mask; only *population* is dynamic). Pinned
    by `crates/svm-wasm-jit/tests/b2_install.rs`: a `call_indirect` from one wasmi instance dispatches to
-   an `install`ed unit in the shared table **≡ the interpreter** for that unit, the reserved-size mask
-   wraps an over-range index back in-bounds, and an empty slot / signature mismatch fails **closed**
-   (as `dispatch_indirect` traps on `TABLE_EMPTY` / a type-id mismatch).
+   an `install`ed unit in the shared table **≡ the interpreter** for that unit (old→new), a chained hop
+   proves new→new, `uninstall` (nulling a slot) makes a stale call trap, an empty slot / signature
+   mismatch fails **closed** (as `dispatch_indirect` traps on `TABLE_EMPTY` / a type-id mismatch), and a
+   full-index **mask-confinement sweep** (INVARIANTS.md §4) shows every `call_indirect idx` — including
+   over-range — lands in `idx & (size-1)`, never outside `[0, size)`.
    **Deferred (documented):** the **browser** B2 wiring on top of that seam — a shared
    `WebAssembly.Table` created at `Jit`-grant time and imported by every domain instance, with
    `install`/`uninstall` doing `table.set` (the JS analog of the `b2_install.rs` host); the multi-Worker

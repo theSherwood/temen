@@ -92,9 +92,11 @@ struct Install<'a> {
 }
 
 /// Emit + wire a shared-table domain in one wasmi `Store`: install each unit's `f0` into its slot,
-/// then call the B2 [`CALLER`] with `slot_arg`. Returns the `i32` result, or `Err` on a trap. This is
-/// the host playing the domain — `table.set` per install is the JS `install`/grant analog.
-fn b2_run(installs: &[Install], slot_arg: i32) -> Result<i32, ()> {
+/// then `uninstall` (null out) every slot in `clear`, then call the B2 [`CALLER`] with `slot_arg`.
+/// Returns the `i32` result, or `Err` on a trap. This is the host playing the domain — `table.set`
+/// per install is the JS `install`/grant analog; nulling a slot is `uninstall` (reusable; stale
+/// calls trap).
+fn b2_run(installs: &[Install], clear: &[u32], slot_arg: i32) -> Result<i32, ()> {
     let engine = Engine::default();
     let mut store: Store<i32> = Store::new(&engine, 0);
     let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
@@ -154,6 +156,14 @@ fn b2_run(installs: &[Install], slot_arg: i32) -> Result<i32, ()> {
             .unwrap();
     }
 
+    // `uninstall`: the host nulls the slot back to trapping padding (a later `install` may reuse it;
+    // a stale `call_indirect` to it now traps — DESIGN.md §22).
+    for &slot in clear {
+        table
+            .set(&mut store, slot as u64, Val::FuncRef(FuncRef::null()))
+            .unwrap();
+    }
+
     // Instantiate the top caller (imports the same shared table) and dispatch.
     let caller = parse(CALLER);
     let caller_wasm = compile_module_b2(&caller, false, LOG2).expect("caller emits (B2)");
@@ -182,6 +192,7 @@ fn b2_dispatch(callee_src: &str, slot: u32, slot_arg: i32) -> Result<i32, ()> {
             slot,
             b2: false,
         }],
+        &[],
         slot_arg,
     )
 }
@@ -251,7 +262,7 @@ fn b2_chained_install_dispatch_matches_interp() {
     ];
     // Dispatch the middle unit at slot 6; it re-dispatches slot 5 to the callee.
     assert_eq!(
-        b2_run(&installs, 6),
+        b2_run(&installs, &[], 6),
         Ok(want),
         "chained B2 dispatch != interp"
     );
@@ -279,4 +290,61 @@ fn b2_type_mismatch_traps() {
         Err(()),
         "signature mismatch must trap"
     );
+}
+
+/// `uninstall`: after a unit is installed and dispatchable, nulling its slot makes a stale
+/// `call_indirect` to it trap (DESIGN.md §22 — "clear an installed slot; stale calls trap"), while a
+/// *different* still-installed slot keeps dispatching. Proves the slot is reusable/clearable, not
+/// merely append-only.
+#[test]
+fn b2_uninstall_makes_stale_call_trap() {
+    let want = oracle_i32(CALLEE_I32);
+    let installs = [Install {
+        src: CALLEE_I32,
+        slot: 5,
+        b2: false,
+    }];
+    // Sanity: installed → dispatches.
+    assert_eq!(
+        b2_run(&installs, &[], 5),
+        Ok(want),
+        "installed must dispatch"
+    );
+    // Uninstall slot 5, then dispatch it → trap (the slot is null padding again).
+    assert_eq!(
+        b2_run(&installs, &[5], 5),
+        Err(()),
+        "stale call after uninstall must trap"
+    );
+}
+
+/// **The confinement mask as its own unit** (INVARIANTS.md §4). Install a distinct unit in *every*
+/// reserved slot — each returns its own slot index — then sweep indices across (and past) the table:
+/// a `call_indirect idx` must land in slot `idx & (size - 1)` for every index, i.e. the emitted mask
+/// is exactly `dispatch_indirect`'s and can never address outside `[0, size)`. Over-range indices
+/// (`idx ≥ size`, up to `4·size`) prove the wrap; this is the security hinge the whole tier rests on.
+#[test]
+fn b2_mask_confines_every_index_to_reserved_table() {
+    let size = 1u32 << LOG2; // 16
+                             // A unit per slot: `() -> (i32)` returning the slot's own index (owned Strings kept alive below).
+    let srcs: Vec<String> = (0..size)
+        .map(|s| format!("memory 16\nfunc () -> (i32) {{\nblock 0 () {{\n  vr = i32.const {s}\n  return vr\n  }}\n}}\n"))
+        .collect();
+    let installs: Vec<Install> = (0..size)
+        .map(|s| Install {
+            src: &srcs[s as usize],
+            slot: s,
+            b2: false,
+        })
+        .collect();
+    // Sweep well past the table (0 .. 4·size) — every index must resolve to `idx & (size-1)`.
+    for idx in 0..(4 * size) {
+        let want = (idx & (size - 1)) as i32;
+        assert_eq!(
+            b2_run(&installs, &[], idx as i32),
+            Ok(want),
+            "call_indirect {idx} must land in slot {want} (mask idx & {})",
+            size - 1
+        );
+    }
 }
