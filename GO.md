@@ -152,6 +152,34 @@ Deliverable shape mirrors the repo's asset lanes: a `demos/go/` corpus +
 `build_tinygo.sh`, CI-gated differential tests, toolchain provisioned like nimony's
 (`scripts/ci/provision-*.sh`, tests skip when absent).
 
+**How fibers survive the LLVM transform (recorded because it's the question every
+reviewer asks).** There is no coroutine/CPS/asyncify rewrite anywhere — that
+machinery exists for targets *without* stack switching, and it is what fights the
+optimizer. Here the continuation never enters LLVM at all: `__vm_fiber_suspend`
+et al. are opaque extern declarations, and LLVM's mandatory conservatism about
+unknown calls (no inline, no DCE, no memory motion across, all live state
+preserved per the calling convention — a suspend is indistinguishable from
+`read()`) is exactly the contract a stackful switch needs. svm-llvm recognizes
+the call *by name* and emits the `cont.*`/`suspend` op (slice AC); the backends
+define those ops as call-clobbering (§3d), so Cranelift spills live values to the
+control stack around them; and since a fiber owns its whole stack pair, resuming
+on another OS thread moves the executing thread, not the stack. Empirically
+closed, not just argued: all five concurrency demos — `steal_fibers` included,
+whose 121920 total is specifically a locals-live-across-migration integrity
+check — compile via `clang -O2` → svm-llvm and match the chibicc-frontend build
+(LLVM.md, the concurrency-demos slice). Two runtime-authoring disciplines follow:
+never hold per-vCPU state (a `vcpu.tls` read, a per-P pointer) in a value live
+across a suspend — the compiler will *correctly preserve* the stale value, since
+the fiber may resume on a different vCPU (re-read after resume, Go's own parking
+discipline); and keep panic/recover on the error-flag path, not setjmp (§4.4).
+
+**Multithreading, precisely:** B1 is single-vCPU (stock TinyGo's scheduler shape
+— one OS thread multiplexing tasks). Real parallelism is B2, and the parallel
+scheduler is **runtime code we write**, not something TinyGo brings: `thread.spawn`
+vCPUs are real OS threads, atomics are genuinely atomic (no single-threaded gate),
+the futex is cross-thread, and stolen-fiber migration is proven — but the M:N
+policy over them is guest code by design (Invariant 4).
+
 ### Route C — native `gc` toolchain port (rejected; recorded so it stays rejected)
 
 A new `GOARCH`/`GOOS` backend in the `gc` compiler emitting SVM IR, plus a runtime
