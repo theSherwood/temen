@@ -276,12 +276,23 @@ plumbing that lands in increments (§8).
        timed-wait handler parks and resumes on its timer returning `WAIT_TIMED_OUT`, and a second
        dispatch is admitted after the first promoted (admission reopened); the full `impl_wiring` /
        `imports_impl` / `svc_handler_parks` / `svc_serve_chain` suites unregressed.
-     - **4b.2 — Nested / cross-domain promotion.** A promoted handler that is *itself* a caller
-       getting promoted — the §1 `A[f1] → B[f2] → A[f3] → B[f4]` chain across distinct instances.
-       Generalizes the single `OfferAnim` to a **stack** per resume-chain; `(provider, ticket)`
-       keying keeps the nested parks distinct (I49). Pin: a cross-instance cyclic offer chain
-       completes (the §1 "acyclicity is a lock artifact" claim). *Self-instance* re-entrancy stays
-       4c.
+     - **4b.2 — Nested / cross-domain promotion. DONE (2026-08-04).** An offer handler that is
+       *itself* a caller — the §1 `A → B → A → B` chain across distinct instances — now nests: the
+       single `OfferAnim` slot became a **stack** (`Vec<OfferAnim>`), pushed on each animation
+       switch and popped (strictly LIFO) on each settle/promotion. Under the coupled resumer model
+       (4b.1) the whole chain stays on **one vCPU**, so the `ticket_waiters`/`cap_reply_or_stash`
+       reuse the original sketch reserved for a "caller whose vCPU moved on" turned out
+       **unnecessary** — there is no such caller; a nested promotion parks the one vCPU carrying the
+       whole chain, and each enclosing handler is a suspended resumer on the stack. Enabling nesting
+       surfaced a **latent 4a cache bug**: both handler frames carry `module = INVOKE_MODULE` but
+       point at different `invoked` tables, and the `cur_funcs` cache keyed on the module *id* did
+       not refresh on an `INVOKE_MODULE → INVOKE_MODULE` switch — so a nested handler ran against its
+       *caller's* function table. Fixed by invalidating the cache (`cur_module = u32::MAX`) at each
+       animation switch and settle (an `invoked` change under an unchanged id). Pinned by
+       `offer_promotion.rs`: a non-parking nested offer settles under the outer animation (the
+       cache-bug regression), and an inner handler promotes+resumes while the outer animation stays
+       on the stack. *Self-instance* re-entrancy (a true cycle back to a **busy** instance) stays a
+       probeable `-EAGAIN` until 4c.
      - **4b.3 — Freeze/teardown edges + the §10.3 closed bit.** The admission word gains the
        **closed** bit (freeze/teardown close it; a caller parked at the gate re-issues on thaw, O10);
        teardown sweeps promoted handlers + their tickets (mirroring `wake_dead_tickets` / the

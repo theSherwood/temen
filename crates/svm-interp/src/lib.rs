@@ -7153,18 +7153,22 @@ struct VCpu {
     /// (the op's result). Lives on the vCPU because the activation spans rewind-driven
     /// re-executions (and possibly a `svc.wait` park); reset when the count is delivered.
     serve_count: i64,
-    /// CALLS.md 4a — the in-flight **cross-world offer animation**, set when a `cap.call` (or
-    /// import/sym/dyn) arm switches into an instanced-offer handler over the provider's world and
-    /// consumed when that handler fiber returns (the `Terminator::Return` fiber-exit settle). See
-    /// [`OfferAnim`]. `None` on every non-animating vCPU and outside an animation.
-    offer_anim: Option<OfferAnim>,
+    /// CALLS.md 4a/4b.2 — the **stack** of in-flight cross-world offer animations, pushed when a
+    /// `cap.call` (or import/sym/dyn) arm switches into an instanced-offer handler over the
+    /// provider's world and popped when that handler fiber returns (the `Terminator::Return`
+    /// fiber-exit settle). Empty on a non-animating vCPU. A **stack** (not one slot) because an
+    /// animated handler may itself call another instanced offer — nesting across distinct provider
+    /// domains (the §1 `A → B → A → B` cross-domain chain); the animations are strictly LIFO on a
+    /// vCPU, so the top always names the innermost running handler. See [`OfferAnim`].
+    offer_anim: Vec<OfferAnim>,
     /// CALLS.md 4b — a **promoted** (parked) offer animation: set when the animated handler parked
     /// mid-run, so its provider world was handed back to the instance (`busy` reopened) and this
     /// vCPU parked as the handler's minimal resumer (`Blocked::OfferPark`, filed in
     /// `svc_waiters` keyed on the caller's own domain). The handler's block-wake re-admits this
-    /// vCPU, which re-acquires the world and switches back into the handler (rebuilding
-    /// `offer_anim`). `Some` only while a promoted handler of this vCPU is parked. See
-    /// [`OfferParked`]. Mutually exclusive with `offer_anim` (active vs. parked).
+    /// vCPU, which re-acquires the world and switches back into the handler (pushing an active
+    /// `offer_anim` again). `Some` only while a promoted handler of this vCPU is parked — exactly
+    /// one at a time, since a vCPU parks on a single block event (enclosing animations are
+    /// suspended resumers on the `offer_anim` stack, not parked). See [`OfferParked`].
     offer_parked: Option<OfferParked>,
 }
 
@@ -7254,7 +7258,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
-            offer_anim: None,
+            offer_anim: Vec::new(),
             offer_parked: None,
         }
     }
@@ -7318,7 +7322,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
-            offer_anim: None,
+            offer_anim: Vec::new(),
             offer_parked: None,
         })
     }
@@ -7404,7 +7408,7 @@ impl VCpu {
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
-            offer_anim: None,
+            offer_anim: Vec::new(),
             offer_parked: None,
         }
     }
@@ -7880,7 +7884,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 *fuel = parked.remaining_budget;
                 let saved_invoked = invoked.replace(parked.entry_funcs.clone());
                 let saved_ref = invoked_ref_slots.take();
-                *offer_anim = Some(OfferAnim {
+                // Push (not overwrite): the enclosing animation, if any, stays under this one on
+                // the stack — a nested handler resumes inside its caller-handler's animation.
+                offer_anim.push(OfferAnim {
                     state: parked.state,
                     handler_slot: slot,
                     handler_handle: parked.handler_handle,
@@ -8049,7 +8055,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         .zip(&arg_slots_)
                                         .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
                                         .collect();
-                                    *offer_anim = Some(OfferAnim {
+                                    // Push onto the animation stack: a handler animating another
+                                    // instanced offer nests over its own (4b.2), strictly LIFO.
+                                    offer_anim.push(OfferAnim {
                                         state: state_.clone(),
                                         handler_slot: hslot_,
                                         handler_handle: handle_,
@@ -8080,6 +8088,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         inst: 0,
                                         vals: hvals_,
                                     }];
+                                    // CALLS.md 4b.2 — invalidate the `cur_funcs` cache: the handler
+                                    // frame is `INVOKE_MODULE` but `invoked` just changed to the
+                                    // provider's `entry.funcs`. A *nested* animation switches
+                                    // `INVOKE_MODULE → INVOKE_MODULE` (id unchanged), so the id-keyed
+                                    // cache would otherwise run the handler against the caller's table.
+                                    cur_module = u32::MAX;
                                     continue 'frames;
                                 }
                             }
@@ -8211,8 +8225,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (`Blocked::OfferPark`, keyed on the provider domain so the handler's block-wake
                     // re-admits it). Non-durable (a durable animation declined to `drive_arc` in 4a),
                     // so no `shadow_switch` — the 4a switch shape, reversed.
-                    if offer_anim.as_ref().is_some_and(|a| a.handler_slot == leaving) {
-                        let anim = offer_anim.take().expect("checked is_some");
+                    if offer_anim.last().is_some_and(|a| a.handler_slot == leaving) {
+                        let anim = offer_anim.pop().expect("checked is_some");
                         let resume_key =
                             host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
                         let remaining = *fuel; // provider reserve left this segment
@@ -11164,10 +11178,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // caller frame (resuming *past* its cap.call), so restore the caller's world,
                     // drain the provider reserve, translate the results (edge 2), and push them.
                     if offer_anim
-                        .as_ref()
+                        .last()
                         .is_some_and(|a| a.handler_slot == leaving)
                     {
-                        let anim = offer_anim.take().expect("checked is_some");
+                        // Pop the top animation (strictly LIFO — the innermost handler returns
+                        // first); an enclosing caller-handler's animation stays under it.
+                        let anim = offer_anim.pop().expect("checked is_some");
                         // Restore the caller's code + fuel; pull the provider's world off this vCPU.
                         *invoked = anim.saved_invoked;
                         *invoked_ref_slots = anim.saved_ref_slots;
@@ -11216,6 +11232,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .vals
                                 .push(Reg::from_value(slot_to_val(*ty, *s)));
                         }
+                        // CALLS.md 4b.2 — invalidate the `cur_funcs` cache: `invoked` was just
+                        // restored to the caller's. When the caller is itself a nested handler
+                        // (its frame is also `INVOKE_MODULE`), the id is unchanged but the table
+                        // differs, so the id-keyed cache must be forced to re-resolve.
+                        cur_module = u32::MAX;
                     } else {
                         frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
                         frames[rtop]

@@ -99,3 +99,90 @@ fn a_promoted_dispatch_reopens_admission_for_the_next_call() {
         "both dispatches promoted, resumed, and returned 2 — admission reopened between them"
     );
 }
+
+/// A provider whose single op just returns a constant — a handler that never parks.
+fn const_provider(value: i64) -> svm_ir::Module {
+    module(&format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vc = i64.const {value}\n\
+           return vc\n\
+           }}\n\
+         }}\n"
+    ))
+}
+
+/// A provider whose single op **calls another instanced offer** (granted into its own domain as
+/// `inner`) and returns that result + 100 — an offer handler that is itself a caller, so the
+/// animation nests over its own. `inner_tid` is the interned interface type id of the inner op.
+fn outer_provider(inner_tid: u32) -> svm_ir::Module {
+    module(&format!(
+        "memory 16\n\
+         data 0 \"inner\"\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vp = i64.const 0\n\
+           vn = i64.const 5\n\
+           vh = cap.self.resolve vp vn\n\
+           vr = cap.call {inner_tid} 0 () -> (i64) vh ()\n\
+           v100 = i64.const 100\n\
+           vsum = i64.add vr v100\n\
+           return vsum\n\
+           }}\n\
+         }}\n"
+    ))
+}
+
+/// Wire `inner` and `outer` as instanced offers, grant `inner` into `outer`'s domain as `inner`,
+/// and drive one consumer `cap.call` into `outer`. Returns the run result.
+fn run_nested(inner: &svm_ir::Module, outer_of: impl Fn(u32) -> svm_ir::Module) -> Result<Vec<Value>, svm_interp::Trap> {
+    let mut h = Host::new();
+    let inner_offer = h.wire_offer_proc(inner, &[0]).expect("inner offer");
+    let inner_tid = h.resolve_offer(inner_offer).unwrap().type_id;
+    let outer = outer_of(inner_tid);
+    let outer_offer = h.wire_offer_proc(&outer, &[0]).expect("outer offer");
+    let outer_tid = h.resolve_offer(outer_offer).unwrap().type_id;
+    h.grant_impl_cap(outer_offer, inner_offer, "inner")
+        .expect("inner offer re-grants into the outer provider");
+
+    let consumer_src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vh = i32.const {outer_offer}\n\
+           vr = cap.call {outer_tid} 0 () -> (i64) vh ()\n\
+           return vr\n\
+           }}\n\
+         }}\n"
+    );
+    let consumer = module(&consumer_src);
+    let mut fuel = 100_000_000u64;
+    run_with_host(&consumer, 0, &[], &mut fuel, &mut h)
+}
+
+/// **Nested run-to-completion**: an offer handler that calls another offer (neither parks). The
+/// animation stack must nest — with the pre-4b.2 single-slot `offer_anim` the inner animation
+/// clobbered the outer's, so the outer's return was mis-settled. Outer returns inner(7) + 100.
+#[test]
+fn a_handler_that_calls_another_offer_nests_the_animation() {
+    let r = run_nested(&const_provider(7), outer_provider);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(107)]),
+        "the nested (non-parking) inner offer settled under the outer animation"
+    );
+}
+
+/// **Nested promotion** (the §1 cross-domain chain): the outer handler calls an inner offer whose
+/// handler parks (timed wait) and promotes while the outer animation is still on the stack. The
+/// inner resumes on its timer, returns, the outer continues and returns inner(2) + 100.
+#[test]
+fn a_nested_inner_handler_promotes_under_its_caller_handlers_animation() {
+    let r = run_nested(&timed_wait_provider(), outer_provider);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(102)]),
+        "the inner handler promoted+resumed while the outer animation stayed on the stack"
+    );
+}
