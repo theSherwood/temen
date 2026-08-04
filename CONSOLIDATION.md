@@ -156,12 +156,46 @@ their subjects settle: `CALLS.md` (post-increments), the superseded parts of `IM
 - **`Exit` and `Clock` as capabilities** — authority-shaped on purpose: a sandboxer can
   withhold or interpose them, which a syscall never offers.
 - **`Jit.invoke` (Model A) vs `install` (Model B2)** — both shipped and pinned; invoke gives
-  signature-checked entry without consuming table slots. Touching it is churn.
+  signature-checked entry without consuming table slots. Touching it is churn. The split now also
+  carries the **unit concurrency contract** (§11): invoked units stay seam-free leaves
+  (`run_invoke`'s CapFault contract, unchanged); installed units join the caller's concurrency
+  model.
 - **`SharedRegion` / `WindowMinter`** — distinct authorities (shareable backing; detached
   windows), not mechanism duplication.
 - **The fine-grained authority zoo generally** — see §0.
 
-## 11. Sequencing
+## 11. Installed units join the caller's concurrency model (owner-directed, 2026-08-04)
+
+Not a deletion — an ability, wanted by the owner: **§22 `install`ed units may use the thread and
+concurrency primitives freely** (`thread.spawn`/`join`, `memory.wait`/`notify`, atomics). The door
+is `install`, on principle: installed code runs **in the calling vCPU's own frames** (module-aware
+`Frame.module` dispatch) on the caller's scheduler seam — unlike `invoke`, whose sealed nested
+`run_invoke` stays seam-free (that CapFault contract is unchanged; the §10 invoke/install split does
+the contractual work). Today this is *unexercised*, not supported: `VcpuEvent::Spawn` carries no
+module, so a spawn from an installed frame would resolve the func index in module 0 — the same
+frame-module hole class as the `event_instantiate` fix (PR #590).
+
+Slices (each differential-pinned; the natural sequel to the §22/§14 wasm-tier arc):
+1. **Module-aware spawn** (TCB): thread the spawning frame's module through
+   `Op::ThreadSpawn → VcpuStop/VcpuEvent::Spawn` and into the spawned vCPU's root frame, across all
+   three drivers (cooperative, native parallel, resumable/browser). Audit `wait`/`notify`/atomics
+   (address-based — expected already module-agnostic, pinned not assumed).
+2. **JS drivers**: the spawn relay carries the module (the confined-child path's `smod` pattern).
+3. **Emitted units**: `env.thread_spawn`/`env.thread_join`/`env.mem_wait`/`env.mem_notify` imports
+   in the nested-caps emit (the PR #587/#590 bounce pattern; blocking inside an import *is* the
+   Worker model — every vCPU is a real thread on the par tiers). Consequence: concurrency-using
+   units emit, so the B2 per-Worker table mirror stays total (no interp-only null slots beyond
+   v128).
+
+**Scope guard (§2):** coroutines/`Yielder` in units are NOT built bespoke — they arrive when §2
+collapses the family onto the unified offer; unit-side coroutine plumbing now would be work queued
+for deletion.
+
+**Gates:** per-driver differential pins (an installed unit that spawns its own module's funcs ≡
+oracle on every driver); `run_invoke`'s contract byte-identical; the §22 masking/typing invariants
+untouched (spawn is scheduler plumbing, not the confinement hinge).
+
+## 12. Sequencing
 
 | item | depends on | gate |
 |---|---|---|
@@ -173,6 +207,7 @@ their subjects settle: `CALLS.md` (post-increments), the superseded parts of `IM
 | §3 config-record spawn + Budget | §2 | JIT thunk parity in-change |
 | §5b IoRing re-measure | §1 (incr. 5) | benchmark; delete only on measured redundancy |
 | §6 one code handle | — | **named consumer** |
+| §11 installed-unit concurrency | — (slice 3 after the slice-1/2 pins) | per-driver differential pins |
 | §9 doc folding | each subject settling | owner sign-off per fold |
 
 **End state:** the `Binding` enum at roughly a dozen variants, `Instantiator` at ~6 ops, one
