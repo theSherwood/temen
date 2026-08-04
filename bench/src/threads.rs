@@ -78,6 +78,7 @@ fn run_svm(wasm: &[u8], reps: usize) -> (i64, Duration) {
         None,
         None,
         None,
+        None, // fast_resolver
         Quota::default(),
         0,
     )
