@@ -124,27 +124,57 @@ fn find_site(f: &Func, module: &Module, cap: usize) -> Option<Site> {
     None
 }
 
+/// Assemble a residual module carrying `funcs`, preserving only what specialization and the
+/// residual's own verification need and can copy without a `String`: the memory declaration and the
+/// data image. All name-bearing / symbol-bearing metadata (imports, exports, data-pointer and
+/// data-funcref relocs, impl offers, the type section) is dropped — function indices and signatures
+/// are unchanged, so a consumer that needs it can restore it from the source. **This crate must
+/// never clone a `String`** — it is itself
+/// translated to svm-IR through the Rust on-ramp (DESIGN.md §20c), where `String::clone` is an
+/// untranslatable external, so a full `Module::clone` (which clones the name strings) would break the
+/// guest-side build. Cloning only the string-free fields keeps the pass translatable.
+fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
+    Module {
+        funcs,
+        memory: module.memory,
+        data: module.data.clone(),
+        // `data_ptrs` (a `DataPtrTarget`) carries a symbol name, so cloning it would reach
+        // `String::clone` — untranslatable here. A runnable module has none (the linker resolves
+        // them; a survivor is a verify error), so dropping them is a no-op for any real input, and
+        // matches the specializer's own output.
+        data_ptrs: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        data_exports: Vec::new(),
+        data_funcrefs: Vec::new(),
+        impl_exports: Vec::new(),
+        types: Vec::new(),
+        debug_info: None,
+    }
+}
+
 /// Rewrite a module so every eligible dynamic-index body `call_indirect` becomes an explicit
 /// bounded dispatch (see the module docs). `cap` bounds the target fan-out a site may have to be
 /// lowered. `cap == 0` is a no-op. Function *signatures* are unchanged, so `call_indirect` target
-/// indices — and every other reference — stay valid.
+/// indices — and every other reference — stay valid. Name-bearing link metadata is dropped (see
+/// [`carry_funcs`]); the residual is addressed by index, like the specializer's own output.
 pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
     if cap == 0 {
-        return module.clone();
+        return carry_funcs(module, module.funcs.clone());
     }
     let mask = table_mask(module.funcs.len());
     let fn_results: Vec<usize> = module.funcs.iter().map(|f| f.results.len()).collect();
     let has_memory = module.memory.is_some();
-    let mut out = module.clone();
-    for fi in 0..out.funcs.len() {
+    let mut funcs = module.funcs.clone();
+    for f in &mut funcs {
         // Rewrite one eligible site per pass, re-typing the (growing) function each time; a lowered
         // site becomes direct calls and is never re-found, so this drains in finitely many passes.
-        while let Some(site) = find_site(&out.funcs[fi], module, cap) {
-            let types = func_value_types(&out.funcs[fi], &module.funcs, has_memory);
-            split_site(&mut out.funcs[fi], site, &types, mask, &fn_results);
+        while let Some(site) = find_site(f, module, cap) {
+            let types = func_value_types(f, &module.funcs, has_memory);
+            split_site(f, site, &types, mask, &fn_results);
         }
     }
-    out
+    carry_funcs(module, funcs)
 }
 
 /// Split block `site.block` at the `call_indirect` (inst `site.k`) into a masked dispatch, one
@@ -207,11 +237,14 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
         });
     }
     let live: Vec<u32> = refs.into_iter().collect();
-    let live_pos: BTreeMap<u32, u32> = live
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (v, i as u32))
-        .collect();
+    // Build the address→slot map by insertion, not `collect()`: `BTreeMap`'s `FromIterator`
+    // bulk-builds via a **stable slice sort**, which the Rust→svm on-ramp can't translate
+    // (`slice::sort::stable` pulls in an untranslatable `sqrt_approx`); this crate is itself
+    // translated in-sandbox (DESIGN.md §20c). Insertion uses B-tree splits — no slice sort.
+    let mut live_pos: BTreeMap<u32, u32> = BTreeMap::new();
+    for (i, &v) in live.iter().enumerate() {
+        live_pos.insert(v, i as u32);
+    }
     let nl = live.len() as u32;
     let live_types: Vec<ValType> = live.iter().map(|&v| btypes[v as usize]).collect();
 

@@ -199,7 +199,16 @@ fn lua_approach_a_fires_and_verifies() {
     }
     for cap in [4usize, 8, 16, 32] {
         let (funcs_hit, sites_hit) = functions_with_eligible_site(&m, cap);
-        let low = svm_peval::lower_indirect_dispatch(&m, cap);
+        let mut low = svm_peval::lower_indirect_dispatch(&m, cap);
+        // The lowering strips name-bearing link metadata (it must not clone a `String`, being itself
+        // translated to svm-IR). Restore it from the source — function indices are unchanged, so the
+        // exports/imports still resolve — for a faithful re-verify and an apples-to-apples size cost.
+        low.imports = m.imports.clone();
+        low.exports = m.exports.clone();
+        low.data_exports = m.data_exports.clone();
+        low.data_funcrefs = m.data_funcrefs.clone();
+        low.impl_exports = m.impl_exports.clone();
+        low.types = m.types.clone();
         svm_verify::verify_module(&low)
             .unwrap_or_else(|e| panic!("lowered lua (cap={cap}) must re-verify: {e:?}"));
         let bytes = svm_encode::encode_module(&low).len();
