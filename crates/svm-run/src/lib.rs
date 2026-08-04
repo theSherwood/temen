@@ -451,6 +451,12 @@ unsafe fn jit_invoke_locked(
             if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
                 return None;
             }
+            // Seam-free-leaf gate (CONSOLIDATION.md §11): a threaded/futex unit cannot be invoked
+            // (the interp's `run_invoke` CapFaults any scheduler event) — `None` here ⇒ `cap_fault`
+            // below, mirroring [`jit_native_op`]'s op-1 arm. Install + dispatch is its path.
+            if funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
+                return None;
+            }
             Some((code, cm))
         })()
     };
@@ -681,6 +687,16 @@ unsafe fn jit_native_op(
             // args are the cap.call args minus the code handle; results must match exactly.
             let entry = &funcs[0];
             if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
+                return cap_fault(trap_out);
+            }
+            // `invoke` is a **seam-free leaf** (CONSOLIDATION.md §11): a unit that uses §12 threads
+            // or the futex cannot run here — the interpreter's `run_invoke` CapFaults any scheduler
+            // event (spawn/join/wait/notify), so the native tier matches by refusing before it
+            // trampolines. Such a unit's supported path is **install** + dispatch: it then runs in
+            // the caller's own frames on the scheduler seam, where its `thread.*` are ordinary
+            // module-aware ops. (The unit still *compiles* — `define_extra` admits it — so it can be
+            // installed; only the seam-free invoke entry is refused.)
+            if funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
                 return cap_fault(trap_out);
             }
             let out: &mut [i64] = if n_results == 0 {
@@ -1033,6 +1049,19 @@ pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     grant_jit(host, m, table_log2)
 }
 
+/// Like [`grant_jit`], but the granted domain may host §12 **threads** (`thread.spawn`/`join`) and
+/// the **futex** (`memory.wait`/`notify`) in an **installed** submitted unit (CONSOLIDATION.md §11 —
+/// installed units join the caller's concurrency model). [`jit_cap_run`] stands up the parent's
+/// thread scheduler (`CompiledModule::enable_thread_hosting`) and runs the serialized cap path so
+/// spawned vCPUs' concurrent `cap.call`s don't race; the interpreter drives `thread.*` in its own
+/// scheduler, so the backends stay in differential lockstep. `invoke` of a threaded unit still
+/// refuses (seam-free leaf); `install` + `call_indirect` runs it. Table room (`table_log2 > 0`) is
+/// required for `install`. Same handle value + memory-match precondition as [`grant_jit`].
+pub fn grant_jit_threads(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    host.set_jit_hosts_threads(true);
+    grant_jit(host, m, table_log2)
+}
+
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
 /// ([`CompiledModule`]), with the module pointer registered in `host` so [`cap_thunk`]'s
 /// native `Jit` ops can re-enter it mid-run (`define_extra` / `invoke_extra` while the guest
@@ -1052,12 +1081,19 @@ pub fn jit_cap_run(
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
     // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
     let hosts_fibers = host.jit_hosts_fibers();
+    // Thread-hosting grant (`grant_jit_threads`, CONSOLIDATION.md §11): the parent stands up its
+    // thread scheduler so an installed unit's `thread.*` / futex resolve. A hosted unit spawns real
+    // vCPU threads that make **concurrent** `cap.call`s, so — like a top-level concurrent module — it
+    // must run the serialized (locked-`Host`) thunk, even if the top-level module itself uses no
+    // concurrency op. Read before any `mem::take`.
+    let hosts_threads = host.jit_hosts_threads();
     // A guest whose workers make concurrent `cap.call`s (threaded `Jit.compile`, DESIGN.md §22) runs
     // the **serialized** thunk over a per-domain `Mutex<Host>`; a single-threaded guest keeps the
     // unlocked `cap_thunk` + raw `Host` path verbatim (zero lock cost). The guest-facing iface is
     // identical either way — the serialization is an internal detail that can be made finer-grained
-    // later without changing guest software.
-    if m.funcs.iter().any(|f| f.uses_concurrency()) {
+    // later without changing guest software. Thread-hosting forces the serialized path (a hosted
+    // unit's spawned vCPUs are the concurrent callers, even when the top-level module is sequential).
+    if hosts_threads || m.funcs.iter().any(|f| f.uses_concurrency()) {
         let host_mutex = Mutex::new(std::mem::take(host));
         let ctx = &host_mutex as *const Mutex<Host> as *mut c_void;
         let mut cm = CompiledModule::compile(
@@ -1076,6 +1112,9 @@ pub fn jit_cap_run(
         )?;
         if hosts_fibers {
             cm.enable_fiber_hosting(svm_jit::Quota::default())?;
+        }
+        if hosts_threads {
+            cm.enable_thread_hosting(svm_jit::Quota::default())?;
         }
         host_mutex
             .lock()
@@ -3251,6 +3290,16 @@ unsafe fn powerbox_compile_run(
             .jit_hosts_fibers()
         {
             cm.enable_fiber_hosting(quota)?;
+        }
+        // Thread-hosting grant (`set_jit_hosts_threads`, CONSOLIDATION.md §11): stand up the thread
+        // scheduler so an installed unit's `thread.*` / futex resolve. Only the **locked** powerbox
+        // path hosts threads — a hosted unit's spawned vCPUs are concurrent `cap.call`ers, so the
+        // serialized `Host` is required. Idempotent when the top-level already built the scheduler.
+        if m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jit_hosts_threads()
+        {
+            cm.enable_thread_hosting(quota)?;
         }
         m.lock()
             .unwrap_or_else(|e| e.into_inner())

@@ -1516,11 +1516,20 @@ pub extern "C" fn svm_par_child(
     if !par_vcpu_admit() {
         return core::ptr::null_mut();
     }
+    // A thread shares its SPAWNER's window — which for a §14 confined spawner is its carve, not the
+    // root window — so the mask derives from the passed window size (a power of two by construction:
+    // the root window or a carve), not the guest module's declared memory. Equal for root-window
+    // spawns; the confinement fix for carve spawns (CONSOLIDATION.md §11 slice 3).
+    if !win_size.is_power_of_two() {
+        par_vcpu_retire();
+        return core::ptr::null_mut();
+    }
+    let sl = win_size.trailing_zeros() as u8;
     // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_child_in(unsafe { prog_ref(prog) }, module, func, &args, back) {
+    match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl) {
         Ok(inner) => {
             // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
             // the root, `svm_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /

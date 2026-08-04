@@ -11064,6 +11064,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::Malformed);
                     }
                     let entry = *func;
+                    // Module-aware spawn (CONSOLIDATION.md §11): `func` resolves in the SPAWNING
+                    // FRAME's module — an installed §22 unit spawns its OWN function, not module 0's.
+                    // The child runs `entry` in this module over the shared domain view (its `funcs`
+                    // primary stays module 0, so the domain numbering is consistent; the unit is
+                    // reached through the shared `dt` via `resolve_module`, exactly as the bytecode
+                    // engine's `VcpuEvent::Spawn { module }` starts the child in the unit's module).
+                    let cmodule = frames[top].module;
                     let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
                     let av = get_i64(&frames[top].vals, *arg)?;
                     // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): a child inherits the *current*
@@ -11119,6 +11126,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             spawn_quota, // spawned vCPU inherits the domain's spawn quota
                             cdt,
                         );
+                        // Start the child in the spawning frame's module (an installed §22 unit's own
+                        // module; `0` for a plain guest) so `entry` resolves there, not in module 0.
+                        child.frames[0].module = cmodule;
                         child.registry = creg;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
@@ -14539,6 +14549,13 @@ pub struct Host {
     /// interpreter's `INVOKE_MODULE` already runs `cont.*` in its eval loop, so it needs no runtime
     /// stand-up — the flag only records the grant for backend parity.
     jit_hosts_fibers: bool,
+    /// Twin of [`jit_hosts_fibers`](Host::jit_hosts_fibers) for §12 **threads**/futex (CONSOLIDATION.md
+    /// §11): a thread-hosting grant sets it, and the JIT run entry stands up the parent's thread
+    /// scheduler (`CompiledModule::enable_thread_hosting`) so a submitted unit's `thread.*` / futex
+    /// resolve, and forces the serialized (locked-`Host`) cap path so spawned vCPUs' concurrent
+    /// `cap.call`s don't race. The interpreter runs `thread.*` in its own scheduler, so it needs no
+    /// runtime stand-up — the flag only records the grant for backend parity.
+    jit_hosts_threads: bool,
     /// W1 record/replay (DEBUGGING.md): when `Some`, every nondeterministic-input `cap.call`
     /// ([`is_recorded_input`]) is appended here as it crosses, so a later re-execution can replay it.
     cap_record: Option<Vec<CapRecord>>,
@@ -14833,6 +14850,7 @@ impl Host {
             jit_wasm_emitter: None,
             jit_table_log2: 0,
             jit_hosts_fibers: false,
+            jit_hosts_threads: false,
             cap_record: None,
             cap_replay: None,
             durable: false,
@@ -14942,6 +14960,7 @@ impl Host {
         twin.clock_ns = self.clock_ns;
         twin.jit_table_log2 = self.jit_table_log2;
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
+        twin.jit_hosts_threads = self.jit_hosts_threads;
         Some(twin)
     }
 
@@ -16969,6 +16988,20 @@ impl Host {
     /// Whether guest-submitted `Jit` units may host fibers (see [`Host::set_jit_hosts_fibers`]).
     pub fn jit_hosts_fibers(&self) -> bool {
         self.jit_hosts_fibers
+    }
+
+    /// Mark this run's granted `Jit` domain(s) as **thread-hosting** — a submitted unit may use §12
+    /// threads (`thread.spawn`/`join`) and the futex (`memory.wait`/`notify`) once **installed**
+    /// (CONSOLIDATION.md §11; `invoke` stays a seam-free leaf and still refuses them). The JIT run
+    /// entry then stands up the parent's thread scheduler (`enable_thread_hosting`) and takes the
+    /// serialized cap path; the interpreter needs no setup. Set before the run.
+    pub fn set_jit_hosts_threads(&mut self, on: bool) {
+        self.jit_hosts_threads = on;
+    }
+
+    /// Whether guest-submitted `Jit` units may host threads/futex (see [`Host::set_jit_hosts_threads`]).
+    pub fn jit_hosts_threads(&self) -> bool {
+        self.jit_hosts_threads
     }
 
     /// Tighten (or widen) every granted `Jit` domain's compile quota — the §15-style resource

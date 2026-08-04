@@ -235,6 +235,42 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
     linker
         .func_wrap(
             "env",
+            "thread_spawn",
+            |_: Caller<'_, HostState>, _f: i32, _sp: i64, _a: i64| -> i32 {
+                unreachable!("no thread op in this unit")
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "thread_join",
+            |_: Caller<'_, HostState>, _h: i32| -> i64 {
+                unreachable!("no thread op in this unit")
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "mem_wait",
+            |_: Caller<'_, HostState>, _w: i32, _a: i64, _e: i64, _t: i64, _is64: i32| -> i32 {
+                unreachable!("no futex op in this unit")
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "mem_notify",
+            |_: Caller<'_, HostState>, _w: i32, _a: i64, _c: i32| -> i32 {
+                unreachable!("no futex op in this unit")
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
             "join",
             |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> i64 {
                 caller.data().children[child as usize]

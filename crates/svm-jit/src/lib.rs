@@ -4027,11 +4027,14 @@ impl CompiledModule {
         }
         for f in funcs {
             ensure_supported(f)?;
-            // Threads/futex in a submitted unit stay unsupported (a spawned vCPU would outlive the
-            // `cap.call` this unit runs inside; DESIGN.md §22 "Concurrency").
-            if f.uses_threads() || f.uses_futex() {
+            // Threads/futex ARE hosted (CONSOLIDATION.md §11) — but only when the domain stood up a
+            // thread scheduler (`enable_thread_hosting`, driven by a thread-hosting `Jit` grant, or a
+            // parent that itself uses threads). Without it the thunk addresses are null, so a
+            // thread/futex-using unit fails closed rather than `call_indirect` through null — exactly
+            // the fiber gate below.
+            if (f.uses_threads() || f.uses_futex()) && self.thread.is_null() {
                 return Err(JitError::Unsupported(
-                    "an incrementally defined function using threads/futex is not supported yet",
+                    "a submitted unit using threads/futex requires a thread-hosting Jit domain",
                 ));
             }
             // Fibers ARE hosted — but only when the domain stood up a fiber runtime
@@ -4062,17 +4065,22 @@ impl CompiledModule {
             })
             .collect::<Result<_, _>>()?;
 
-        // Auto-install for unit-own funcrefs (DESIGN.md §22 "unit-own funcref"): if the unit takes
-        // its OWN functions' addresses (`ref.func`), each such funcref must be a real shared-table
-        // slot or it would resolve against the *parent's* table. Reserve one padding slot per unit
-        // function up front, so `ref.func N` lowers to `ref_slots[N]` (below); the finalized code is
-        // published into these slots after the build. `None` when the unit takes no funcref — then
-        // `ref.func` never fires and no slots are consumed. Single `cap.call`, so the picked padding
-        // slots stay free until we `install_at` them (no concurrent install races within a compile).
+        // Auto-install for unit-own funcrefs (DESIGN.md §22 "unit-own funcref"): if the unit names
+        // its OWN functions by index — `ref.func`, **or** `thread.spawn` (whose entry `func` is a
+        // module-relative index resolved through the shared `fn_table`, CONSOLIDATION.md §11) — each
+        // such reference must land on a real shared-table slot or it would resolve against the
+        // *parent's* table (a confused-deputy spawn of the parent's function N instead of the unit's).
+        // Reserve one padding slot per unit function up front, so `ref.func N` / `thread.spawn N`
+        // lower to `ref_slots[N]` (below); the finalized code is published into these slots after the
+        // build. `None` when the unit names no own function — then no slots are consumed. Single
+        // `cap.call`, so the picked padding slots stay free until we `install_at` them (no concurrent
+        // install races within a compile).
         let uses_ref_func = funcs.iter().any(|f| {
-            f.blocks
-                .iter()
-                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::RefFunc { .. })))
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::RefFunc { .. } | Inst::ThreadSpawn { .. }))
+            })
         });
         let ref_slots: Option<Vec<u32>> = if uses_ref_func {
             let free: Vec<u32> = self
@@ -4284,6 +4292,97 @@ impl CompiledModule {
     /// a fiber-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
     #[cfg(not(fiber_rt))]
     pub fn enable_fiber_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
+        Ok(())
+    }
+
+    /// Stand up the §12 **thread scheduler** on an already-compiled module so guest-submitted units
+    /// (`define_extra` / `install`) may host `thread.spawn`/`thread.join` and the `memory.wait`/
+    /// `notify` futex (CONSOLIDATION.md §11 — installed units join the caller's concurrency model).
+    /// The twin of [`Self::enable_fiber_hosting`]: a `Jit`-granting parent that itself uses no threads
+    /// left `self.thread` null at `compile`, so a thread-using submitted unit would lower `thread.*`
+    /// through null thunks (`define_extra` rejects it via [`ThreadEnv::is_null`]). This installs the
+    /// **same** runtime `compile` builds for a threaded module: the 1:1 OS-thread executor `Domain`
+    /// (its stable address baked into the unit's `thread.*` sites), the domain-shared fiber table the
+    /// spawned vCPUs allocate their durable contexts over (D57 3b-ii — created even for a fiber-free
+    /// threaded module), and the generic call-trampoline vCPU entries run through.
+    ///
+    /// Called by the `Jit` run entries between `compile` and `run` for a **thread-hosting** grant. The
+    /// subsequent `run` seeds the `Domain`'s per-run `Env` (window / fn-table / trap cell / trampoline)
+    /// via [`os_thread_rt::Domain::set_env`], exactly as a natively-threaded run does. A submitted
+    /// unit's `thread.spawn N` dispatches its entry through the shared `fn_table`; the unit's own
+    /// functions are auto-installed there (`define_extra`'s `ref_slots`), so the spawn resolves to the
+    /// unit's function, not the parent's slot `N`.
+    ///
+    /// **Idempotent** and behavior-preserving: a no-op if threads are already hosted (the parent used
+    /// `thread.*`, or a nesting parent stood up the `Domain` for its children's futex), reusing the
+    /// existing `Domain`/table/trampoline. `fiber_cfg` is left untouched — `None` for a pure-thread
+    /// host (matching a normally-compiled fiber-free threaded module), already `Some` if fibers are
+    /// also hosted, so the two `enable_*` calls compose in either order.
+    #[cfg(fiber_rt)]
+    pub fn enable_thread_hosting(&mut self, quota: Quota) -> Result<(), JitError> {
+        if !self.thread.is_null() {
+            return Ok(()); // already hosting threads (parent used thread.*, or a nesting Domain exists)
+        }
+        let quota = quota.clamped();
+        // The domain-shared fiber table (D57 3b-ii): every spawned vCPU builds its `FiberRuntime` /
+        // durable vCPU-context over it. `compile` creates it for *any* threaded module (even a
+        // fiber-free one — the durable-context allocator needs it), so create it here too. Reuse an
+        // existing table if a fiber-hosting parent already built one (unified handle namespace). The
+        // `Domain` reads it via `set_env`'s `fiber_table.clone()` at run time, so populating the field
+        // is all that's needed here.
+        if self.fiber_table.is_none() {
+            self.fiber_table = Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                quota.max_fibers,
+            )));
+        }
+        // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). Spawned
+        // vCPUs call their entry through it; a fiber-hosting parent already built it, else build it now
+        // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`
+        // (W^X-safe: only the fresh trampoline page is mprotected; running code is untouched).
+        let tramp = match self.call_tramp {
+            Some(t) => t,
+            None => {
+                let mut ctx = self.module.make_context();
+                build_fiber_call_trampoline(&mut self.module, &mut ctx.func);
+                let id = self
+                    .module
+                    .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module
+                    .define_function(id, &mut ctx)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                self.module.clear_context(&mut ctx);
+                self.module
+                    .finalize_definitions()
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                let addr = self.module.get_finalized_function(id);
+                // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the ABI its builder
+                // emitted — the same `transmute` `compile`/`enable_fiber_hosting` do for their own.
+                unsafe { std::mem::transmute::<*const u8, fiber_rt::FiberCallTramp>(addr) }
+            }
+        };
+        // Stand up the executor `Domain` whose stable address is baked into the unit's `thread.*` sites.
+        // Its per-run `Env` (window / fn-table / trap cell / this trampoline) is supplied later by the
+        // run entry's `set_env`; the address is stable now, which is all the baked constant needs.
+        let domain = Box::new(os_thread_rt::Domain::new(quota.max_vcpus));
+        self.thread = ThreadEnv {
+            sched_addr: (&*domain as *const os_thread_rt::Domain) as i64,
+            spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
+            join_thunk: os_thread_rt::thread_join as *const () as i64,
+            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
+            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
+        };
+        self.domain = Some(domain);
+        self.call_tramp = Some(tramp);
+        // `fiber_table` set above; `fiber_cfg` left as-is (None ⇒ pure-thread host, matching a
+        // fiber-free threaded module — spawned vCPUs then build no per-vCPU fiber runtime).
+        Ok(())
+    }
+
+    /// Thread hosting on a target without the fiber/thread runtime: a no-op — threads stay unsupported,
+    /// so a thread-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
+    #[cfg(not(fiber_rt))]
+    pub fn enable_thread_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
         Ok(())
     }
 
@@ -5481,6 +5580,13 @@ impl ThreadEnv {
             notify_thunk: 0,
         }
     }
+    /// No thread scheduler is stood up for this module (the `thread.*`/futex thunk addresses are
+    /// unbaked). A submitted unit that uses threads/futex must be rejected in this state — else its
+    /// `thread.spawn` would `call_indirect` through a null thunk. `enable_thread_hosting` clears this
+    /// (CONSOLIDATION.md §11) — the twin of [`FiberEnv::is_null`] / `enable_fiber_hosting`.
+    fn is_null(&self) -> bool {
+        self.sched_addr == 0
+    }
 }
 
 /// The §14 nesting runtime address + the `instantiate`/`join` thunk addresses, baked into the
@@ -6614,7 +6720,17 @@ fn lower_block(
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
             let trap_out = b.use_var(lower.trap_var);
-            let func_idx = b.ins().iconst(I32, *func as i64);
+            // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
+            // into the table like any `call_indirect`). A submitted unit's own functions live in
+            // auto-installed padding slots, not at their module-relative indices — so remap `func`
+            // through `ref_slots` exactly like `ref.func` (DESIGN.md §22 "unit-own funcref"). Without
+            // this a unit's `thread.spawn N` would launch the *parent's* function N. Top-level
+            // compiles have no remap: `func` is module-0 slot N verbatim.
+            let entry = match lower.ref_slots {
+                Some(slots) => *slots.get(*func as usize).unwrap_or(func),
+                None => *func,
+            };
+            let func_idx = b.ins().iconst(I32, entry as i64);
             let spv = get(&vals, *sp)?;
             let av = get(&vals, *arg)?;
             let mut tsig = module.make_signature();

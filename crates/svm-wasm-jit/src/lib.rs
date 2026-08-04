@@ -798,6 +798,12 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
                     tys.push(*r);
                 }
             }
+            // §11 slice 3: thread/futex ops in a nested unit lower to host bounces (below) —
+            // typed here so a spawning unit is in-subset. Gated on `nested_caps` like the cap arm.
+            Inst::ThreadSpawn { .. } if nested_caps => tys.push(ValType::I32),
+            Inst::ThreadJoin { .. } if nested_caps => tys.push(ValType::I64),
+            Inst::MemoryWait { .. } if nested_caps => tys.push(ValType::I32),
+            Inst::MemoryNotify { .. } if nested_caps => tys.push(ValType::I32),
             Inst::ConstI32(_) => tys.push(ValType::I32),
             Inst::ConstI64(_) => tys.push(ValType::I64),
             Inst::IntBin { ty, .. } => tys.push(ty.val()),
@@ -1146,9 +1152,17 @@ const IMPORTED_FUNCS: u32 = 2;
 /// valid only in that mode (the caller sizes `wasm_of` with the matching base).
 const INSTANTIATE_IMPORT_IDX: u32 = 2;
 const JOIN_IMPORT_IDX: u32 = 3;
+/// §11 thread/futex host bounces (CONSOLIDATION.md §11 slice 3): func imports 4-7 in nested mode.
+/// The servicer supplies the unit's module context (it knows which module it instantiated), so the
+/// imports carry none. `thread_join`/`mem_wait` block the calling thread — legal on the par tiers,
+/// where every vCPU is a real thread (the Worker model; `worker.js` already blocks in `Atomics.wait`).
+const THREAD_SPAWN_IMPORT_IDX: u32 = 4;
+const THREAD_JOIN_IMPORT_IDX: u32 = 5;
+const MEM_WAIT_IMPORT_IDX: u32 = 6;
+const MEM_NOTIFY_IMPORT_IDX: u32 = 7;
 /// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.instantiate`,
-/// `env.join`).
-const NESTED_IMPORTED_FUNCS: u32 = 4;
+/// `env.join`, `env.thread_spawn`, `env.thread_join`, `env.mem_wait`, `env.mem_notify`).
+const NESTED_IMPORTED_FUNCS: u32 = 8;
 /// `env.call_interp` scratch: the cross-tier call marshals its i64 arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1720,11 +1734,26 @@ fn emit_module(
     //   env.instantiate: (i32 win, i32 inst, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32
     //   env.join:        (i32 inst, i32 child) -> i64
     let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
+    let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
+        (0u32, 0u32, 0u32, 0u32);
     if nested_caps {
         instantiate_ty = types.len() as u32;
         types.push((vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e], vec![0x7f]));
         join_ty = types.len() as u32;
         types.push((vec![0x7f, 0x7f], vec![0x7e]));
+        // §11 thread/futex bounces:
+        //   env.thread_spawn: (i32 func, i64 sp, i64 arg) -> i32 handle
+        //   env.thread_join:  (i32 handle) -> i64 result
+        //   env.mem_wait:     (i32 win, i64 addr, i64 expected, i64 timeout, i32 is64) -> i32 status
+        //   env.mem_notify:   (i32 win, i64 addr, i32 count) -> i32 woken
+        thread_spawn_ty = types.len() as u32;
+        types.push((vec![0x7f, 0x7e, 0x7e], vec![0x7f]));
+        thread_join_ty = types.len() as u32;
+        types.push((vec![0x7f], vec![0x7e]));
+        mem_wait_ty = types.len() as u32;
+        types.push((vec![0x7f, 0x7e, 0x7e, 0x7e, 0x7f], vec![0x7f]));
+        mem_notify_ty = types.len() as u32;
+        types.push((vec![0x7f, 0x7e, 0x7f], vec![0x7f]));
     }
     let mut fn_type_idx: Vec<u32> = Vec::with_capacity(emitted.len());
     for &fi in emitted {
@@ -1891,7 +1920,7 @@ fn emit_module(
     // shared-reserved (B2) mode — the shared funcref table, and — in §14 `nested_caps` mode —
     // env.instantiate + env.join (the VM-in-VM host bounce).
     let mut sec = Vec::new();
-    let n_imports = 3 + reserved_table_log2.is_some() as u64 + if nested_caps { 2 } else { 0 };
+    let n_imports = 3 + reserved_table_log2.is_some() as u64 + if nested_caps { 6 } else { 0 };
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
@@ -1921,6 +1950,18 @@ fn emit_module(
         import_name(&mut sec, "env", "join");
         sec.push(0x00); // func
         uleb(&mut sec, join_ty as u64);
+        import_name(&mut sec, "env", "thread_spawn");
+        sec.push(0x00); // func
+        uleb(&mut sec, thread_spawn_ty as u64);
+        import_name(&mut sec, "env", "thread_join");
+        sec.push(0x00); // func
+        uleb(&mut sec, thread_join_ty as u64);
+        import_name(&mut sec, "env", "mem_wait");
+        sec.push(0x00); // func
+        uleb(&mut sec, mem_wait_ty as u64);
+        import_name(&mut sec, "env", "mem_notify");
+        sec.push(0x00); // func
+        uleb(&mut sec, mem_notify_ty as u64);
     }
     if reserved_table_log2.is_some() {
         // The shared reserved funcref table (§22 Model B2). Imported (not declared), so every
@@ -2856,6 +2897,55 @@ fn emit_block_body(
             Inst::Cast { op, a } => {
                 get(code, cx, *a);
                 code.push(cast_opcode(*op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            // §11 thread/futex bounces (opt-in `nested_caps`, CONSOLIDATION.md §11 slice 3): the
+            // four ops marshal their operands to host imports; the servicer supplies the unit's
+            // module (it knows which module it instantiated), so a spawn from an emitted unit is the
+            // same module-aware spawn the interpreter does. `thread_join`/`mem_wait` block the
+            // calling thread — the Worker/par-tier model (each vCPU is a real thread).
+            Inst::ThreadSpawn { func, sp, arg } if nested_caps => {
+                code.push(OP_I32_CONST);
+                sleb32(code, *func as i32);
+                get(code, cx, *sp);
+                get(code, cx, *arg);
+                code.push(OP_CALL);
+                uleb(code, THREAD_SPAWN_IMPORT_IDX as u64);
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::ThreadJoin { handle } if nested_caps => {
+                get(code, cx, *handle);
+                code.push(OP_CALL);
+                uleb(code, THREAD_JOIN_IMPORT_IDX as u64);
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            } if nested_caps => {
+                code.push(OP_LOCAL_GET);
+                uleb(code, 0); // win — the servicer confines addr into the window
+                get(code, cx, *addr);
+                get(code, cx, *expected);
+                if matches!(ty, IntTy::I32) {
+                    code.push(0xad); // i64.extend_i32_u — uniform i64 expected slot
+                }
+                get(code, cx, *timeout);
+                code.push(OP_I32_CONST);
+                sleb32(code, matches!(ty, IntTy::I64) as i32);
+                code.push(OP_CALL);
+                uleb(code, MEM_WAIT_IMPORT_IDX as u64);
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::MemoryNotify { addr, count } if nested_caps => {
+                code.push(OP_LOCAL_GET);
+                uleb(code, 0); // win
+                get(code, cx, *addr);
+                get(code, cx, *count);
+                code.push(OP_CALL);
+                uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
                 set_result(cx, code, k, &mut next_val);
             }
             // §14 VM-in-VM bounce (opt-in `nested_caps`): a `cap.call` to INSTANTIATOR
