@@ -1501,11 +1501,14 @@ pub extern "C" fn svm_par_root(
 
 /// Build a `thread.spawn`ed **child** vCPU (`func(sp, arg)`) over the **same** shared window — it does
 /// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func.
+/// `module` is the spawning frame's module from the `PAR_SPAWN` event (`ev_a >> 32`) — `func`
+/// resolves there and the child's root frame starts there (module-0 for plain guests).
 #[no_mangle]
 pub extern "C" fn svm_par_child(
     prog: *mut bytecode::VcpuProgram,
     win_ptr: *mut u8,
     win_size: usize,
+    module: u32,
     func: u32,
     sp: i64,
     arg: i64,
@@ -1517,7 +1520,7 @@ pub extern "C" fn svm_par_child(
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_child(unsafe { prog_ref(prog) }, func, &args, back) {
+    match bytecode::Vcpu::new_child_in(unsafe { prog_ref(prog) }, module, func, &args, back) {
         Ok(inner) => {
             // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
             // the root, `svm_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
@@ -1681,8 +1684,16 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 v.tierup_argv = argv.into_vec();
                 return PAR_TIERUP;
             }
-            bytecode::VcpuEvent::Spawn { func, sp, arg } => {
-                v.a = func as i64;
+            bytecode::VcpuEvent::Spawn {
+                func,
+                sp,
+                arg,
+                module,
+            } => {
+                // Pack `(module << 32) | func` exactly as the INSTANTIATE event does: the spawning
+                // frame's module rides to the child Worker so the child resolves `func` there (an
+                // installed §22 unit spawning its own functions — CONSOLIDATION.md §11).
+                v.a = ((module as i64) << 32) | func as i64;
                 v.b = sp;
                 v.c = arg;
                 return PAR_SPAWN;

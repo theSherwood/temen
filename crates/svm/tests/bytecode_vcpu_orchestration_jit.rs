@@ -255,10 +255,16 @@ fn drive<'s, 'e>(
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => return Ok(vals),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::Spawn { func, sp, arg } => {
+            bytecode::VcpuEvent::Spawn {
+                func,
+                sp,
+                arg,
+                module,
+            } => {
                 let id = orch.fresh_id();
-                let child = bytecode::Vcpu::new_child(
+                let child = bytecode::Vcpu::new_child_in(
                     prog,
+                    module,
                     func,
                     &[Value::I64(sp), Value::I64(arg)],
                     Arc::clone(&back),

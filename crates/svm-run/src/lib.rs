@@ -959,10 +959,15 @@ pub fn jit_resolve_and_validate(
     // the caller's thread, so a unit running its own scheduler to completion never parks across the
     // synchronous `cap.call` it runs inside; the parent domain stands up the fiber runtime (see
     // `CompiledModule::enable_fiber_hosting`, and the interpreter's `INVOKE_MODULE` fiber support).
-    // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) stay rejected: a
-    // spawned vCPU would outlive this `cap.call` and collide with the serialized `Mutex<Host>`
-    // model. (Renegotiated 2026-07-30 — DESIGN.md §22 "Concurrency"; was: all §12 rejected.)
-    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
+    // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) are admitted too
+    // (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11; was: rejected here since
+    // 2026-07-30). The old compile-time veto guarded an *invoke*-shaped hazard — a spawned vCPU
+    // outliving the synchronous `cap.call` — and that hazard is enforced where it is real:
+    // `invoke` of a unit that spawns/parks still fails at runtime (the nested `run_invoke` is
+    // seam-free, CapFault). The supported path for a threaded unit is **install** + dispatch:
+    // installed code runs in the calling vCPU's own frames, where a spawn is an ordinary
+    // module-aware `thread.spawn` (the spawned root frame lives in the unit's module).
+    if m.funcs.is_empty() {
         return Err(EINVAL);
     }
     // A submitted unit's `call_indirect` (the new→old path) is now allowed: on the JIT it
@@ -988,8 +993,9 @@ pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 /// (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): [`jit_cap_run`] stands up the parent's
 /// fiber runtime (`CompiledModule::enable_fiber_hosting`) so a unit's `cont.*` resolve, and the
 /// interpreter runs them in its eval loop — so the backends stay in differential lockstep.
-/// **Threads/futex** in a submitted unit stay rejected (they would outlive the `cap.call`). Same
-/// handle value + memory-match precondition as [`grant_jit`].
+/// **Threads/futex** in a submitted unit are admitted at compile (CONSOLIDATION.md §11); `invoke`
+/// still refuses them at runtime (seam-free), `install` + dispatch runs them. Same handle value +
+/// memory-match precondition as [`grant_jit`].
 pub fn grant_jit_fibers(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_hosts_fibers(true);
     grant_jit(host, m, table_log2)

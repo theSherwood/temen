@@ -201,18 +201,21 @@ func () -> (i64) {\nblock 0 () {\n  v0 = i32.const 1\n  v1 = i64.const 32768\n  
     );
 }
 
-/// **Threads stay rejected** in a submitted unit even with fiber-hosting granted (only fibers were
-/// lifted): a blob using `thread.spawn` fails the shared validator `-EINVAL` on both backends.
+/// **Threads now compile** in a submitted unit (CONSOLIDATION.md §11, renegotiated 2026-08-04 —
+/// was: `-EINVAL` at the shared validator). The runtime contract does the guarding instead:
+/// `invoke` of a spawning unit still fails (the nested run is seam-free), and `install` + dispatch
+/// is the supported path (module-aware spawn in the caller's vCPU —
+/// `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`).
 #[test]
-fn submitted_unit_threads_still_rejected_with_fiber_hosting() {
-    // A unit whose entry spawns a real vCPU (func 1) — `uses_threads()` → rejected by
-    // `jit_resolve_and_validate` before any compilation, identically on both backends.
+fn submitted_unit_threads_compile_ok() {
+    // A unit whose entry spawns a real vCPU (func 1) — compiles on both backends; only running it
+    // via `invoke` is refused (at runtime, not here).
     let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
     let guest = with_len(COMPILE_ONLY, b.len());
     let (out, _) = diff_run_fibers(&guest, &b, &[]);
     assert!(
-        matches!(out, JitOutcome::Returned(ref s) if s == &[-22]),
-        "threads in a submitted unit must be rejected -EINVAL, got {out:?}"
+        matches!(out, JitOutcome::Returned(ref s) if s[0] >= 0),
+        "threads in a submitted unit must now compile (a code handle), got {out:?}"
     );
 }
 

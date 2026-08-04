@@ -2385,7 +2385,14 @@ pub enum VcpuEvent {
     TierUp { func: u32, argv: Box<[i64]> },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
     /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
-    Spawn { func: u32, sp: i64, arg: i64 },
+    /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
+    /// when its code spawns) — build the child with [`Vcpu::new_child_in`] so `func` resolves there.
+    Spawn {
+        func: u32,
+        sp: i64,
+        arg: i64,
+        module: u32,
+    },
     /// `thread.join`: obtain child `handle`'s result, then call [`Vcpu::deliver_join`].
     Join { handle: i32 },
     /// `memory.wait`: run the futex wait on `addr`, then call [`Vcpu::deliver_code`] with the wasm code
@@ -2591,9 +2598,24 @@ impl<'p> Vcpu<'p> {
     }
 
     /// A `thread.spawn`ed **child** vCPU: shares `back` but does **not** re-seed (the window is already
-    /// live with the root's image + every vCPU's writes).
+    /// live with the root's image + every vCPU's writes). Module-0 shorthand for [`new_child_in`].
     pub fn new_child(
         prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+    ) -> Result<Vcpu<'p>, Trap> {
+        Vcpu::new_child_in(prog, 0, func, args, back)
+    }
+
+    /// [`new_child`], but `func` resolves in `module` of the shared source and the child's root frame
+    /// starts there — the constructor for a spawn issued by an **installed §22 unit's** code
+    /// ([`VcpuEvent::Spawn`] carries the spawning frame's module; CONSOLIDATION.md §11). The child
+    /// keeps `own_dom: None`: a thread shares its spawner's dispatch table, whichever module its
+    /// frames start in.
+    pub fn new_child_in(
+        prog: &'p VcpuProgram,
+        module: u32,
         func: u32,
         args: &[Value],
         back: std::sync::Arc<super::Region>,
@@ -2601,7 +2623,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog
             .mem_size_log2
             .map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
-        Vcpu::with_mem(prog, func, args, mem, Host::new())
+        Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 
     fn with_mem(
@@ -2611,11 +2633,30 @@ impl<'p> Vcpu<'p> {
         mem: Option<Mem>,
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        if func as usize >= prog.dom.source.primary().progs.len() {
+        Vcpu::with_mem_in(prog, 0, func, args, mem, host)
+    }
+
+    fn with_mem_in(
+        prog: &'p VcpuProgram,
+        module: u32,
+        func: u32,
+        args: &[Value],
+        mem: Option<Mem>,
+        host: Host,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let cm = prog
+            .dom
+            .source
+            .get(module as usize)
+            .ok_or(Trap::Malformed)?;
+        if func as usize >= cm.progs.len() {
             return Err(Trap::Malformed);
         }
+        let mut vt = VTask::new(&cm, func as usize, args)?;
+        vt.active.module = module as usize;
+        vt.active.home = module as usize;
         Ok(Vcpu {
-            vt: VTask::new(&prog.dom.source.primary(), func as usize, args)?,
+            vt,
             fibers: Vec::new(),
             fiber_sp: Vec::new(),
             fiber_meta: Vec::new(),
@@ -2815,12 +2856,29 @@ impl<'p> Vcpu<'p> {
                     self.pending_tierup = Some((dst, results));
                     return VcpuEvent::TierUp { func, argv };
                 }
-                Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                    if func as usize >= dom.source.primary().progs.len() {
+                Ok(VcpuStop::Spawn {
+                    func,
+                    sp,
+                    arg,
+                    dst,
+                    module,
+                }) => {
+                    // Bound-check `func` in the SPAWNING FRAME's module (an installed §22 unit spawns
+                    // its own functions — CONSOLIDATION.md §11), not module 0.
+                    let ok = dom
+                        .source
+                        .get(module as usize)
+                        .is_some_and(|c| (func as usize) < c.progs.len());
+                    if !ok {
                         return VcpuEvent::Trapped(Trap::Malformed);
                     }
                     self.pending = Some(dst);
-                    return VcpuEvent::Spawn { func, sp, arg };
+                    return VcpuEvent::Spawn {
+                        func,
+                        sp,
+                        arg,
+                        module,
+                    };
                 }
                 Ok(VcpuStop::Join { handle, dst }) => {
                     self.pending = Some(dst);
@@ -5835,6 +5893,7 @@ fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>)
 
 /// `thread.spawn`: add a child vCPU running `func(sp, arg)` (sharing the domain), write its handle to
 /// the spawner's `dst`. Mirrors the production `drive`'s `Spawn` arm for the debuggable subset.
+#[allow(clippy::too_many_arguments)]
 fn dbg_spawn(
     tasks: &mut Vec<DbgTask>,
     ti: usize,
@@ -5842,10 +5901,12 @@ fn dbg_spawn(
     sp: i64,
     arg: i64,
     dst: u32,
+    module: usize,
     source: &ModuleSource,
 ) -> Result<(), Trap> {
-    let primary = source.primary();
-    if func as usize >= primary.progs.len() {
+    // Module-aware, as the drive arms: `func` is the spawning frame's module's index.
+    let cm = source.get(module).ok_or(Trap::Malformed)?;
+    if func as usize >= cm.progs.len() {
         return Err(Trap::Malformed);
     }
     let live = tasks
@@ -5855,7 +5916,9 @@ fn dbg_spawn(
     if live >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
-    let vt = VTask::new(&primary, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+    let mut vt = VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+    vt.active.module = module;
+    vt.active.home = module;
     let env = tasks[ti].env; // a thread inherits its spawner's environment (shares its window)
     let cidx = tasks.len();
     tasks.push(DbgTask {
@@ -6615,9 +6678,15 @@ impl ScheduledDebugRun {
                 }
                 // A scheduler seam: the ones this engine dispatches, else `Declined`.
                 FiberStep::Other(outcome) => match outcome {
-                    Outcome::ThreadSpawn { func, sp, arg, dst } => {
+                    Outcome::ThreadSpawn {
+                        func,
+                        sp,
+                        arg,
+                        dst,
+                        module,
+                    } => {
                         *turn += 1;
-                        if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                        if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
                             dbg_complete(tasks, ti, Err(t));
                         }
                     }
@@ -6837,8 +6906,14 @@ impl ScheduledDebugRun {
             FiberStep::Finished(vals) => dbg_complete(tasks, ti, Ok(vals)),
             FiberStep::Trapped(t) => dbg_complete(tasks, ti, Err(t)),
             FiberStep::Other(outcome) => match outcome {
-                Outcome::ThreadSpawn { func, sp, arg, dst } => {
-                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, source) {
+                Outcome::ThreadSpawn {
+                    func,
+                    sp,
+                    arg,
+                    dst,
+                    module,
+                } => {
+                    if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
                         dbg_complete(tasks, ti, Err(t));
                     }
                 }
@@ -7315,12 +7390,16 @@ enum Outcome {
         value: i64,
         dst: u32,
     },
-    /// `thread.spawn`: spawn a vCPU running `func(sp, arg)`; its handle lands at `dst`.
+    /// `thread.spawn`: spawn a vCPU running `func(sp, arg)`; its handle lands at `dst`. `module` is
+    /// the **spawning frame's** module — `func` resolves there, so an installed §22 unit's code
+    /// spawns the *unit's own* functions (CONSOLIDATION.md §11), and the child's root frame starts
+    /// in that module.
     ThreadSpawn {
         func: u32,
         sp: i64,
         arg: i64,
         dst: u32,
+        module: usize,
     },
     /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst`.
     ThreadJoin {
@@ -7964,6 +8043,8 @@ enum VcpuStop {
         sp: i64,
         arg: i64,
         dst: u32,
+        /// The spawning frame's module — `func` resolves there (CONSOLIDATION.md §11).
+        module: u32,
     },
     Join {
         handle: i32,
@@ -8284,8 +8365,20 @@ fn step_vcpu(
                     results,
                 })
             }
-            Outcome::ThreadSpawn { func, sp, arg, dst } => {
-                return Ok(VcpuStop::Spawn { func, sp, arg, dst })
+            Outcome::ThreadSpawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            } => {
+                return Ok(VcpuStop::Spawn {
+                    func,
+                    sp,
+                    arg,
+                    dst,
+                    module: module as u32,
+                })
             }
             Outcome::ThreadJoin { handle, dst } => return Ok(VcpuStop::Join { handle, dst }),
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
@@ -9061,8 +9154,20 @@ fn drive(
                     .active
                     .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
             }
-            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= dom.source.primary().progs.len() {
+            Ok(VcpuStop::Spawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            }) => {
+                // `func` resolves in the SPAWNING FRAME's module (an installed §22 unit spawns its
+                // own functions — CONSOLIDATION.md §11); the child's root frame starts there too.
+                let Some(cm) = dom.source.get(module as usize) else {
+                    complete(&mut tasks, ti, Err(Trap::Malformed));
+                    continue;
+                };
+                if func as usize >= cm.progs.len() {
                     complete(&mut tasks, ti, Err(Trap::Malformed));
                     continue;
                 }
@@ -9074,11 +9179,9 @@ fn drive(
                     complete(&mut tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                     continue;
                 }
-                let mut child = VTask::new(
-                    &dom.source.primary(),
-                    func as usize,
-                    &[Value::I64(sp), Value::I64(arg)],
-                )?;
+                let mut child = VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
+                child.active.module = module as usize;
+                child.active.home = module as usize;
                 let cidx = tasks.len();
                 // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
                 // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
@@ -10074,8 +10177,18 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::StdinPark) => {
                 unreachable!("blocking stdin not enabled on the native driver")
             }
-            Ok(VcpuStop::Spawn { func, sp, arg, dst }) => {
-                if func as usize >= dom.source.primary().progs.len() {
+            Ok(VcpuStop::Spawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            }) => {
+                // Module-aware, as the cooperative arm: `func` is the spawning frame's module's index.
+                let Some(cm) = dom.source.get(module as usize) else {
+                    return (Err(Trap::Malformed), mem);
+                };
+                if func as usize >= cm.progs.len() {
                     return (Err(Trap::Malformed), mem);
                 }
                 // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
@@ -10088,14 +10201,15 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let child_vt = match VTask::new(
-                    &dom.source.primary(),
-                    func as usize,
-                    &[Value::I64(sp), Value::I64(arg)],
-                ) {
-                    Ok(v) => v,
-                    Err(t) => return (Err(t), mem),
-                };
+                let child_vt =
+                    match VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)]) {
+                        Ok(mut v) => {
+                            v.active.module = module as usize;
+                            v.active.home = module as usize;
+                            v
+                        }
+                        Err(t) => return (Err(t), mem),
+                    };
                 // The child runs over its own `Mem` view of the **same** shared backing (real atomics).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                 scope.spawn(move || {
@@ -11720,7 +11834,15 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadSpawn { func, sp, arg, dst });
+                    // `module` is the executing frame's module: an installed unit's spawn resolves
+                    // `func` in the unit, not module 0 (the verifier checked it there).
+                    return Ok(Outcome::ThreadSpawn {
+                        func,
+                        sp,
+                        arg,
+                        dst,
+                        module,
+                    });
                 }
                 Op::ThreadJoin { handle, dst } => {
                     let handle = r!(*handle).i32();
