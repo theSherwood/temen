@@ -427,43 +427,56 @@ plumbing that lands in increments (§8).
      (provider-pays) — it retires with increment 6; a process provider runs on its own §15 budget by
      construction (a separate domain), so caller-pays here is the inline/library-animation path.
    - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** Closes the `live_impl`
-     parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`). **Scoped
-     (2026-08-04), then re-scoped after a deeper map — the first sketch was wrong.** The blocker is
-     real: a JIT run (`svm-run::powerbox_compile_run` → `CompiledModule::run_raw`) executes one module
-     on one native thread with **no interp `Scheduler`** and no way to reach one. But the corrected
-     finding is that the JIT does **not** want the interp `Scheduler` at all — its concurrency
-     substrate is a *separate, policy-free* runtime: `svm-jit::os_thread_rt::Domain` (a futex table +
-     condvar completion cells) with §14 children spawned as **JIT'd code on their own `std::thread`s**
-     (`instantiator_rt`). So the cross-domain arm must be built on the **JIT's own runtime**, not by
-     bolting the JIT thread onto the interp scheduler:
-     - The callee is a **JIT'd child on its OS thread** running the existing native serve loop
-       (`svm-run::serve_native`, the JIT's `svc.poll`/`svc.wait` path) — not an interp vCPU.
-     - `child_offer` (op 14) is **currently unimplemented on the JIT** (`svm-jit/src/lib.rs`:8064 emits
-       `-EINVAL`, "the JIT runtime has neither [scheduler nor child registry]"). **Prerequisite:** a
-       JIT-side child/offer registry so a live-impl handle can be minted over a JIT child.
-     - A cross-domain `cap.call` then enqueues onto the child's `svc_queue`, wakes its serve loop via
-       the JIT `Domain`'s futex/condvar, and **blocks the caller OS thread** on a reply completion
-       cell — mirroring the existing `instantiator_rt` `join` park (`ChildDone { Mutex<Option<..>>,
-       Condvar }`, with the same bounded `epoch_addr` re-check so a host interrupt still unwinds). No
-       interp `Scheduler`, no `Waiter::NativeThread` on it — that variant belonged to the wrong sketch.
-     Decomposed (revised):
-     - **5c.1 — JIT child/offer registry + `child_offer` (op 14) + the cross-domain call over
-       `os_thread_rt`** (enqueue → futex-wake the child serve loop → condvar-block the caller → reply).
-       Also relax the `run_with_caps` force-fold (`module_serves && !serve_qualifies`; the
-       `has_instantiate` veto term) for the now-JIT-capable shape. Pin: `svc_parity.rs` — whose "Jit"
-       arm is silently TreeWalk today via the fold — actually runs the **JIT** backend and matches.
-     - **5c.2 — §10.4 crossing-depth bound**: a per-thread crossing counter at the cross-domain call;
-       at the bound, **decline to the parked transport** (fail-closed toward the slower correct
-       transport, never a wrong answer). Native JIT frames make this bound load-bearing (unlike the
-       interp's reified fibers).
-     - **5c.3 — mid-call park parity**: a callee handler that parks mid-serve rides the JIT serve
-       loop's own handler-park path; the JIT caller stays condvar-blocked on the reply cell until the
-       eventual reply (the 4d.2 shape, thread-block flavor).
-     This is a **substantial JIT-runtime build** (a child/offer registry + op-14 lowering + a
-     cross-domain futex/condvar protocol in `instantiator_rt`/`os_thread_rt`), materially larger than
-     the interp increments — the JIT's separate concurrency model means little of the interp
-     cross-domain code is reusable. Owner review point: confirm the callee stays a **JIT'd child**
-     (this design) vs. any interp-callee tier; the JIT-child design is the architecture-consistent one.
+     parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`). **Design history
+     (2026-08-04, owner + verification):** two wrong sketches preceded the aligned one. Sketch 1
+     (bolt the JIT thread onto the interp `Scheduler`, callee on an interp vCPU) — dead: a JIT run has
+     no `Scheduler` in scope, and an interp-vCPU callee is a second execution model per crossing,
+     exactly what the CONSOLIDATION.md §0 yardstick calls expensive. Sketch 2 (make the
+     `os_thread_rt` **enqueue → futex-wake → condvar-block** protocol *the* transport) — misreads this
+     document: that protocol is §10.2 **arm 5**, the *parked fallback transport*, not the arm. The
+     original design here is explicit and stands: §8.5 "the **thunk fast path**; park = thread-block
+     on the reply"; §10.4 "JIT crossings are **real native frames through thunks**… at the bound the
+     call **declines the inline arm and takes the parked transport**"; §10.2 arm 6 "the caller parks
+     (interp) or **thread-blocks (JIT)**" — thread-block is the *park half*, never the primary
+     transport. CONSOLIDATION.md §2 depends on this ordering: the coroutine-collapse's fault-service
+     path stays fast *because* it is the direct-handoff shape — a per-call futex/thread round-trip
+     would fail its lazy-paging-latency gate.
+     **Verified feasibility of the fast path (all in-tree today):** the JIT's natural CLIF ABI
+     threads `(mem_base, fn_table_base, …)` per call and the masking lowering adds a **runtime**
+     `base` (nothing window-specific is baked into code — `svm-jit/lib.rs:57,810,1090,2568`; D65
+     measured the threaded ABI as not a perf liability); `svm-run::serve_native` already has the thunk
+     **synchronously invoking compiled handler trampolines on the calling thread**
+     (`svc_handler(export,op) → handler_tramp(fidx) → CompiledModule::invoke_extra` over `mem_base`) —
+     same-domain today, but it is the exact inline-handoff mechanism; §14 children each carry their own
+     compile (`ChildCode`) and granted children their own ctx (`instantiator_rt`). The cross-domain
+     fast path = that mechanism pointed at the **callee's** compile + sub-window + Host, with
+     admission gating and the two cap-translation edges — the JIT analog of the interp's 4a/4d.
+     Decomposed (aligned; smallest-verifiable-first, mirroring the interp's own 2→3→4 staging):
+     - **5c.0 — prerequisite: JIT child/offer registry + `child_offer` (op 14).** Op 14 emits
+       `-EINVAL` on the JIT today ("the JIT runtime has neither [scheduler nor child registry]") — no
+       live-impl handle can even be minted. Needed by *both* transports.
+     - **5c.1 — the parked transport (arm 5 / the decline target):** enqueue onto the callee's
+       `svc_queue`, futex-wake its serve loop, caller **thread-blocks** on a reply cell (the
+       `instantiator_rt` `join`/`ChildDone` park shape, with the `epoch_addr` re-check so a host
+       interrupt still unwinds). Relax the `run_with_caps` force-fold (`has_instantiate` veto term).
+       Pin: `svc_parity.rs`'s "Jit" arm — silently TreeWalk today — runs the **real** JIT backend and
+       matches. This is the correctness baseline the fast path declines onto, built first exactly as
+       the interp built enqueue+park (§3.6) before inline animation.
+     - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
+       loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
+       inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),
+       run-to-completion first — a mid-handler park fails over to the parked transport (the 4a
+       staging; promotion parity is 5c.4). Pin: fast-path-on ≡ fast-path-off on results and
+       `serve_count` (the §10.2 handoff settlement rule, the 4d pin's JIT twin).
+     - **5c.3 — §10.4 crossing-depth bound:** a per-thread crossing counter minted at the fast path;
+       at the bound, decline to 5c.1's parked transport (fail-closed toward the slower correct
+       transport). Load-bearing on the JIT — inline crossings are real native frames.
+     - **5c.4 — mid-handoff park parity (arm 6):** a fast-path handler that parks mid-run promotes
+       (file the reified fiber + waiter, `fiber_rt`) and the caller **thread-blocks on the reply** —
+       the 4b/4d.2 shape, thread-block flavor.
+     Still a substantial JIT-runtime build (registry + op-14 + both transports + the bound), but the
+     fast path reuses the proven `serve_native` invoke mechanism rather than inventing a cross-thread
+     protocol as the primary — one execution model, per the consolidation yardstick.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
    goal, now reachable without a parity regression).
