@@ -734,6 +734,34 @@ plumbing that lands in increments (§8).
        arm, so 6d.4 rewrites that arm's *representation* and all four tiers keep working through it
        unchanged. The deletion is tier-independent, which is exactly why it is the right increment-6
        finale to build now while the native arms stay deferred.
+
+       **Scope (settled by §7/§8's own words):** this is a *storage fold + binding-variant unify*,
+       **not** a transport merge. The two transports genuinely differ — a `LiveImpl` is an active
+       callee served by its own `svc.wait` loop over its own run's window (the 5c crossing:
+       enqueue + park), while an instanced offer is a passive library animated on the *caller's*
+       thread over a window carried in its state (4a). Making the offer grow a serve loop would
+       *reverse* the 4a decision (animate-on-caller was chosen precisely to avoid a per-instance
+       thread), so 6d.4 keeps both transports and merges only the **representation**: the offer's
+       `{host, window}` becomes an `Arc<Mutex<Host>>` shared cell like a child's, the bespoke
+       `ProviderState` struct + its mutex are deleted, and the two `Binding` variants collapse into
+       one that carries an internal passive-vs-live discriminant (the transport chosen at call
+       time, exactly as today). Decomposed smallest-first:
+       - **6d.4.1 — the offer powerbox becomes a shared `Arc<Mutex<Host>>` cell.** Split
+         `ProviderState` so the powerbox `host` lives in the same `Arc<Mutex<Host>>` shape a child
+         uses, with the window + the 6c admission word (`busy`/`admit_parked`/`busy_owner`)
+         alongside it. Behaviour-identical; differential-pinned by the existing offer suite
+         (`impl_wiring`, `imports_impl`, the 4a–4d animation/promotion/handoff pins).
+       - **6d.4.2 — unify the side tables + the `Binding` variant.** Fold `OfferEntry` and
+         `LiveImplEntry` into one `ImplEntry` (passive fields `Option`al, live fields `Option`al),
+         and `Binding::Offer`/`Binding::LiveImpl` into one `Binding::Impl(u32)`; the dispatch probe
+         branches on the discriminant to pick animation vs crossing. Pure representation change;
+         every existing offer/live-impl pin is the oracle.
+       - **6d.4.3 — delete `ProviderState` + its mutex.** With its parts relocated (6d.4.1) and the
+         binding unified (6d.4.2), the struct and its `Mutex` retire from the tree — the headline
+         §7 deletion. `grant_impl_cap`'s residual blocking `state.lock()` (noted at 6b) dissolves
+         here.
+       - **6d.4.4 — collapse the dispatch arms.** One `cap_dispatch_slots` impl arm branching
+         internally, replacing the two; the `GuestImpl`/`LiveImpl` split leaves §7's list.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
