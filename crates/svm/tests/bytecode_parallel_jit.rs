@@ -193,14 +193,38 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
     (back, base, layout)
 }
 
+/// A **spawning** installed unit (CONSOLIDATION.md §11 — installed units join the caller's
+/// concurrency model): `f0() -> i32` `thread.spawn`s the unit's OWN `f1` (module-aware — before the
+/// fix this resolved func 1 in module 0, the guest's worker, and mis-ran), joins it, and returns its
+/// value (7). Dispatched via `call_indirect` from the [`INSTALL`] guest's workers: 8 × 7 = 56, with
+/// every worker's dispatch spawning a further vCPU whose root frame lives in the unit's module.
+const SERVICE_SPAWN: &str = r#"memory 16
+func () -> (i32) {
+block 0 () {
+  vsp = i64.const 0
+  varg = i64.const 0
+  vt = thread.spawn 1 vsp varg
+  vr = thread.join vt
+  vr32 = i32.wrap_i64 vr
+  return vr32
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+"#;
+
 /// A fresh host granted the `Jit` cap (16-slot table) with `SERVICE` host-compiled into it; returns
 /// `(host, jit_handle, code_handle)`. Granting/compiling into a fresh host is deterministic, so both
 /// the parallel run and the oracle get identical handles.
-fn host_with_unit(guest: &svm_ir::Module) -> (Host, i32, i32) {
+fn host_with_unit_src(guest: &svm_ir::Module, unit_src: &str) -> (Host, i32, i32) {
     let mut host = Host::new();
     let jit = grant_jit(&mut host, guest, 4); // sets the blob validator; 2^4 = 16-slot table
     let svc = {
-        let m = parse_module(SERVICE).expect("parse service");
+        let m = parse_module(unit_src).expect("parse service");
         verify_module(&m).expect("verify service");
         svm_encode::encode_module(&m)
     };
@@ -214,9 +238,13 @@ fn host_with_unit(guest: &svm_ir::Module) -> (Host, i32, i32) {
 
 /// Cooperative oracle: one shared host across all vCPUs (deterministic).
 fn run_cooperative(src: &str) -> Result<Vec<Value>, svm_interp::Trap> {
+    run_cooperative_unit(src, SERVICE)
+}
+
+fn run_cooperative_unit(src: &str, unit_src: &str) -> Result<Vec<Value>, svm_interp::Trap> {
     let m = parse_module(src).unwrap();
     verify_module(&m).expect("verify guest");
-    let (mut host, jit, code) = host_with_unit(&m);
+    let (mut host, jit, code) = host_with_unit_src(&m, unit_src);
     let mut f = 50_000_000u64;
     bytecode::compile_and_run_with_host(
         &m,
@@ -230,9 +258,13 @@ fn run_cooperative(src: &str) -> Result<Vec<Value>, svm_interp::Trap> {
 
 /// Parallel: the same kernel over real OS threads sharing one `Domain` + powerbox.
 fn run_parallel(src: &str) -> Result<Vec<Value>, svm_interp::Trap> {
+    run_parallel_unit(src, SERVICE)
+}
+
+fn run_parallel_unit(src: &str, unit_src: &str) -> Result<Vec<Value>, svm_interp::Trap> {
     let m = parse_module(src).unwrap();
     verify_module(&m).expect("verify guest");
-    let (mut host, jit, code) = host_with_unit(&m);
+    let (mut host, jit, code) = host_with_unit_src(&m, unit_src);
     let (back, base, layout) = shared_window(1 << 16);
     let mut f = 50_000_000u64;
     let r = bytecode::compile_and_run_capture_over_parallel_with_host(
@@ -284,6 +316,47 @@ fn parallel_install_call_indirect_matches_oracle() {
             "parallel install/call_indirect != oracle (run {i})"
         );
     }
+}
+
+/// **Module-aware spawn** (CONSOLIDATION.md §11): the installed unit itself `thread.spawn`s — its
+/// `func 1` must resolve in the UNIT's module, and the spawned vCPU's root frame must start there.
+/// Same [`INSTALL`] guest, [`SERVICE_SPAWN`] unit: each of the 8 workers' `call_indirect` dispatches
+/// into the unit, whose `f0` spawns the unit's own `f1` (→ 7) and joins it — 8 dispatches, 8 nested
+/// spawns, folded to 56 on BOTH drivers. Before the fix, `VcpuEvent::Spawn` carried no module and
+/// every driver resolved `func` against `primary()` — the unit's spawn ran the *guest's* func 1
+/// (its install/dispatch worker), double-installing and folding garbage.
+#[test]
+fn installed_unit_spawns_its_own_module() {
+    let want = run_cooperative_unit(INSTALL, SERVICE_SPAWN);
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(56)]),
+        "oracle: 8 × dispatch(spawn→join→7) = 56"
+    );
+    for i in 0..50 {
+        assert_eq!(
+            run_parallel_unit(INSTALL, SERVICE_SPAWN),
+            want,
+            "parallel spawning-unit != oracle (run {i})"
+        );
+    }
+}
+
+/// The other half of the CONSOLIDATION.md §11 contract: `invoke` of a spawning unit **still fails**
+/// — the nested `run_invoke` is seam-free (a spawn is an inert `CapFault`), on both drivers. Only
+/// `install` + dispatch runs threaded units.
+#[test]
+fn invoked_spawning_unit_stays_capfault() {
+    assert_eq!(
+        run_cooperative_unit(INVOKE, SERVICE_SPAWN),
+        Err(svm_interp::Trap::CapFault),
+        "cooperative invoke of a spawning unit must CapFault"
+    );
+    assert_eq!(
+        run_parallel_unit(INVOKE, SERVICE_SPAWN),
+        Err(svm_interp::Trap::CapFault),
+        "parallel invoke of a spawning unit must CapFault"
+    );
 }
 
 // ---- concurrent **runtime** compile (the browser's cross-Worker slice) ---------------------------

@@ -229,7 +229,7 @@ self.onmessage = async (e) => {
     ? ex.svm_par_root(prog, win, winSize, func)
     : role === 'confined'
       ? ex.svm_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
-      : ex.svm_par_child(prog, win, winSize, func, BigInt(sp), BigInt(arg));
+      : ex.svm_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -281,13 +281,17 @@ self.onmessage = async (e) => {
       return;
     }
     if (evc === SPAWN) {
-      const cfunc = Number(ex.svm_par_ev_a(v)), csp = ex.svm_par_ev_b(v), carg = ex.svm_par_ev_c(v);
+      // ev_a packs (spawning frame's module << 32) | func, as the INSTANTIATE event does — the
+      // child resolves `func` in that module (an installed §22 unit spawns its own functions).
+      const cam = ex.svm_par_ev_a(v);
+      const csmod = Number(cam >> 32n), cfunc = Number(BigInt.asUintN(32, cam));
+      const csp = ex.svm_par_ev_b(v), carg = ex.svm_par_ev_c(v);
       // Allocate the child's completion slot + stack + TLS, then ask the page to start its Worker.
       const cslot = ex.svm_par_alloc(SLOT);
       const cstackTop = ex.svm_par_alloc(STACK) + STACK;
       const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
-        kind: 'spawn', func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
       const handle = handles.length;

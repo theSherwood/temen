@@ -2645,7 +2645,22 @@ which builds the table/runtime/`cont.*` thunk env post-compile so a submitted un
 backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
 `fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
-`submitted_unit_threads_still_rejected_with_fiber_hosting`.
+`submitted_unit_threads_compile_split_by_tier`.
+
+**Threads in a submitted unit (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11).** The
+compile-time threads/futex veto above is lifted: the hazard it guarded — a spawned vCPU outliving the
+synchronous `cap.call` — is *invoke*-shaped, and is enforced where it is real: `invoke` of a unit that
+spawns/parks still fails at runtime (the nested run is seam-free — anything but a plain return is an
+inert `CapFault`). The supported path is **`install` + `call_indirect`**: installed code executes in
+the calling vCPU's own frames, where `thread.spawn` is an ordinary **module-aware** spawn — the func
+index resolves in the spawning frame's module and the spawned vCPU's root frame starts there
+(`VcpuEvent::Spawn` carries the module; every driver constructs the child from
+`source.get(module)`, the `event_instantiate` pattern). `wait`/`notify`/atomics are window-global and
+module-agnostic. Pinned by `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`
+(cooperative ≡ parallel, 8 dispatches each spawning the unit's own worker). The **native-Cranelift**
+tier's threaded-unit dispatch and the **wasm tier's** spawn-in-emitted-unit imports are the next
+slices (CONSOLIDATION.md §11 items 2–3) — until pinned there, only the interp/bytecode tiers claim
+this support.
 
 **Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
 (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
