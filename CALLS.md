@@ -231,14 +231,47 @@ plumbing that lands in increments (§8).
      + waiter and the caller parks on the reply — `handler_parks` re-plumbed to the library-provider
      case, **reusing** the built waiter table (`ticket_waiters` keyed `(callee, ticket)`, I49) and
      reply plumbing (`cap_reply_or_stash`, `Waiter::Fiber`) rather than growing a parallel one
-     (INVARIANTS.md 1/4). The parked handler's `Vec<Frame>` sits `ParkedOn` in the caller's registry
-     carrying its world, re-installed on resume. The `single` admission gate stops being a **held**
-     `state.try_lock()` (which cannot survive a park) and becomes the §10.3 **admission word** — a
-     flag that reopens when the handler parks, closing its run-to-park atomicity window (§10.1). The
-     generation re-check on the phase-3 relock now earns its place (3a explicitly deferred it because
-     `drive_arc` had no suspension point). Pin: a parking library-provider handler completes
-     observably identical to the same handler behind a process provider (the `live_impl` path is the
-     blocking-behavior oracle).
+     (INVARIANTS.md 1/4). A promoted handler converges onto the exact shape the process-provider
+     path already runs (`serve_run`/`handler_parks`): a handler fiber `ParkedOn` in the caller's
+     registry, its caller parked on `(provider, ticket)`, its return replying via
+     `cap_reply_or_stash`. Two deltas vs. that path: **(world)** the handler's world is the provider
+     *instance's*, so at park the provider's `{mem, host, fuel}` are handed **back to the
+     `ProviderState`** and re-acquired from it on resume — the parked fiber carries only its code +
+     fuel-accounting + results + ticket, never `mem`/`host` by value, because a second caller may
+     legally have animated the instance meanwhile; **(no serve loop)** the caller is re-plumbed onto
+     `ticket_waiters` exactly like `Blocked::CapReply`, and the promoted settle recognizes a promoted
+     slot and `cap_reply_or_stash`es the reply instead of pushing into a same-vCPU resumer. The
+     `single` admission gate stops being a **held** `state.try_lock()` (which cannot survive a park)
+     and becomes the §10.3 **admission word** — a flag that reopens (`busy = false`) when the handler
+     parks, closing its run-to-park atomicity window (§10.1). The generation re-check on the phase-3
+     relock now earns its place (3a explicitly deferred it because `drive_arc` had no suspension
+     point). Two decisions, both fail-closed and oracle-matching: a **multi-result** offer whose
+     handler parks declines to `drive_arc` (`cap_reply_or_stash` carries one `i64`, the oracle's
+     reply width — no parallel table); a **resuming** handler has priority over new callers for the
+     world (the process path's "woken parked handler resumes before new admissions"), a racing new
+     caller getting the unchanged probeable `-EAGAIN` until 4c. Pin: a parking library-provider
+     handler completes observably identical to the same handler behind a process provider (the
+     `live_impl` path is the blocking-behavior oracle). Decomposed smallest-verifiable-first:
+     - **4b.1 — Single-level promotion (the full vertical).** A handler that parks on a simple
+       primitive (futex `wait`) is woken externally, resumes with its provider world re-acquired
+       (generation-checked), returns, and replies to the parked caller. Lands `OfferAnim.ticket`, the
+       promotion branch off `fiber_park!`, the world hand-back + `busy = false`, the promoted-handler
+       park store, world re-acquire on resume, and the promoted settle. Pin: differential against the
+       process/`live_impl` handler doing the same futex park (the `svc_handler_parks` PARK_THEN_WAKE
+       shape behind a *library* offer) — identical result + fuel; `busy` observed reopening while the
+       handler is parked.
+     - **4b.2 — Nested / cross-domain promotion.** A promoted handler that is *itself* a caller
+       getting promoted — the §1 `A[f1] → B[f2] → A[f3] → B[f4]` chain across distinct instances.
+       Generalizes the single `OfferAnim` to a **stack** per resume-chain; `(provider, ticket)`
+       keying keeps the nested parks distinct (I49). Pin: a cross-instance cyclic offer chain
+       completes (the §1 "acyclicity is a lock artifact" claim). *Self-instance* re-entrancy stays
+       4c.
+     - **4b.3 — Freeze/teardown edges + the §10.3 closed bit.** The admission word gains the
+       **closed** bit (freeze/teardown close it; a caller parked at the gate re-issues on thaw, O10);
+       teardown sweeps promoted handlers + their tickets (mirroring `wake_dead_tickets` / the
+       `own_tickets` sweep). A durable provider keeps declining to `drive_arc` (fail-closed, as 4a).
+       Pin: a freeze landing mid-promoted-handler fails closed like the existing `handler_parks`
+       freeze gate; teardown wakes the parked caller with the probeable errno.
    - **4c — Queue-on-contention (old 3c).** With a parked holder freeing the thread, the busy
      `single` path enqueues + parks instead of answering `-EAGAIN`; a re-entrant/cyclic call
      completes instead of self-deadlocking. The bounded queue still refuses `-EAGAIN` at the rim when
