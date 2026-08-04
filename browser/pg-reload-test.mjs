@@ -127,7 +127,16 @@ try {
   // (ISSUES.md I56). The engine's own readiness is the real gate — `waitEngine` below waits for
   // `engine-state=ready`, and the persistence assertions (SELECT 919191, "restored") still must pass —
   // so relaxing the navigation wait hardens the flake without masking any real regression.
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+  } catch (e) {
+    // One-shot retry (ISSUES.md I56, second lever): even the relaxed 60 s `domcontentloaded` wait can
+    // lapse under CI runner load. The snapshot is already durable in IndexedDB (step 2 asserted it),
+    // so a second reload loses nothing — and the real gates below (`waitEngine` + the SELECT 919191 /
+    // "restored" assertions) still must pass, so the retry cannot mask a genuine regression.
+    console.log(`  reload timed out once (I56) — retrying: ${String(e.message).split('\n')[0]}`);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+  }
   await waitEngine(page);
   const r2 = await runSql(page, 'SELECT x FROM reload_probe;');
   if (r2.state !== 'done') fail(`select after reload did not finish cleanly: state=${r2.state}`);
