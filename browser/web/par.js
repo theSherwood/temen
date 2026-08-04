@@ -73,8 +73,8 @@ export function makeRunner({ module, memory, ex }) {
     if (jitCodegen) ex.svm_par_jit_codegen_service(jitService);
     // §22 Model B2 cross-Worker: emit runtime-compiled units importing the shared reserved funcref
     // table (a shared static, so setting it on this instance sets it for every Worker); each Worker
-    // provides its own `WebAssembly.Table` mirror (`jitB2` in the cfg → worker.js). Browser-
-    // verification pending — see BROWSER.md § "wasm-JIT tier".
+    // provides its own `WebAssembly.Table` mirror (`jitB2` in the cfg → worker.js). Verified by the
+    // CI-gated `jitb2` work item — see BROWSER.md § "wasm-JIT tier".
     if (jitB2) ex.svm_par_jit_set_b2(1);
     // §22 runtime-`Jit.compile` across Workers: publish the shared Mutex<Host> powerbox every vCPU
     // dispatches its cap.calls through (the guest compiles its OWN units at runtime); with
