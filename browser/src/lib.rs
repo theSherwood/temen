@@ -1413,6 +1413,14 @@ pub extern "C" fn svm_par_child(
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_child(unsafe { prog_ref(prog) }, func, &args, back) {
         Ok(inner) => {
+            // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
+            // the root, `svm_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
+            // `invoke` against the *same* domain: a unit compiled on any Worker is invokable here, and
+            // its emitted bytes (in the shared host's heap = shared linear memory) are read locally and
+            // instantiated per-Worker. Concurrent `compile`s serialize on the `Mutex` (DESIGN.md §22).
+            if let Some(cfg) = par_jit_rt() {
+                return par_box(inner.with_shared_host(&cfg.host));
+            }
             // A 4d I/O run shares one powerbox across every vCPU (worker `cap.call` = host I/O).
             let inner = match par_io() {
                 Some(io) => inner.with_shared_host(&io.host),

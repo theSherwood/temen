@@ -736,13 +736,26 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (value + trap, i32/i64 sigs; the `emitted_ran` guard rejects a silent interp fallback). Zero cost
    when unset — every non-browser run leaves the emitter `None`, and `compile_linked` units are not
    emitted yet (interpreter-only invoke).
-   **Deferred (documented):** the **browser wiring** on top of the seam above — the JS host
-   instantiating each runtime-emitted unit keyed by its code handle (single-Worker), then the
-   **cross-Worker registry** carrying the emitted bytes + handle between Workers with synchronization;
-   §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a funcref old code dispatches to;
-   needs cross-instance wasm-table population); and §14 units whose entry **uses** its
-   instantiator/address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures —
-   i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay on the interpreter.)*
+   **[landed — the browser wiring, single-Worker *and* cross-Worker]** A `Jit` grant (+ validator +
+   emitter) lives in a shared `Mutex<Host>` (`ParJitCfg` / `svm_par_powerbox_jit_runtime`) that the root
+   vCPU dispatches its `cap.call`s through (`Vcpu::with_shared_host`), so the guest's runtime
+   `cap.call 11 0` mints **and** emits into that host and a later `invoke` resolves it; the JS host reads
+   each unit's bytes (`svm_par_jit_code_wasm_ptr`/`_len`) and instantiates it once, keyed by the code
+   handle. **That shared `Mutex<Host>` *is* the cross-Worker registry:** `svm_par_child` shares the same
+   host, so a unit compiled on any Worker is invokable on another, its emitted bytes (in the shared
+   host's heap = shared linear memory) read locally and instantiated per-Worker; concurrent runtime
+   `compile`s serialise on the `Mutex` (the same lock-per-`cap.call` the native parallel driver's
+   `HostCell::Shared` uses, DESIGN.md §22). Pinned natively by
+   `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
+   runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
+   `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
+   single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; a multi-Worker Node/Chromium twin is the
+   remaining **end-to-end** verification.
+   **Deferred (documented):** the multi-Worker Node/Chromium end-to-end twin; §22 `install` +
+   `call_indirect` (Model B2 — an installed unit *is* a funcref old code dispatches to; needs
+   cross-instance wasm-table population); and §14 units whose entry **uses** its instantiator/
+   address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   marshal by type; **v128** unit sigs stay on the interpreter.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
