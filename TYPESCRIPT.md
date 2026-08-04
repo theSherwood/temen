@@ -20,6 +20,12 @@ lands — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
   fast path; the dynamic tail (`any`, unions, dictionaries) gets one boxed slow
   path. AOT, type-directed: **no runtime respecialization** — no hidden classes,
   no inline caches, no shape-transition trees, no adaptive machinery.
+- **Branded numeric types** (§2a, owner 2026-08-04): `i32`/`u8`/`f32`/… exist as
+  branded subtypes of `number` (`number & { __i32 }`) — valid stock TS, erased
+  everywhere else. A brand is a **checked promise about range, never a change to
+  arithmetic**: guards fire only at brand seams; in-range programs compute
+  bit-identically to the same file under Node/QuickJS. This closes most of the
+  declared-integer gap vs. AssemblyScript without forking the language.
 - **The one big cut is the sealed object model** (§2): object shape is fixed at
   allocation — mutate field *values* freely, never the field *set*. This deletes
   the expensive part of a JS engine (shapes/ICs/megamorphic dispatch), which is
@@ -55,10 +61,15 @@ AssemblyScript (speed, but a different language — loses `number`, loses the
 ecosystem). We keep TS's types *and* its numeric semantics, and spend the
 compatibility budget only on the dynamism that actually costs machinery.
 
-**`number` stays f64.** No `i32`/`i64` dialect types at the language level —
-that forks the language. Integer-level speed comes from analysis: a `number`
-proven to be a bounded integer (array index, loop counter) may be unboxed to i32
-internally, guarded where the proof is conditional. Same source, same semantics.
+**`number` stays f64.** No `i32`/`i64` dialect *primitives* with their own
+arithmetic — that forks the language (AssemblyScript's actual sin was not having
+`i32`, it was making it **wrap**, so the same source computes different answers
+under AS and under Node). Integer-level speed comes from two
+semantics-preserving sources: analysis — a `number` proven to be a bounded
+integer (array index, loop counter) may be unboxed to i32 internally, guarded
+where the proof is conditional — and *declaration* via branded subtypes of
+`number` (§2a). Same source, same semantics, either way. The fork line, stated
+once: **new types are fine; new observable semantics are not.**
 
 **AOT only; open to a guest JIT.** Types are the static replacement for runtime
 type feedback — analyze once, emit specialized IR, done. Guards are *emitted*,
@@ -109,6 +120,66 @@ chain*, exceptions, generators/async (lower to svm fibers/continuations —
 detail deferred), strings, arrays, `Map`/`Set`, JSON, structural typing,
 generics, unions, `any`.
 
+## 2a. Branded numeric types (owner, 2026-08-04)
+
+Declared `i32`/`u8`/`i16`/`f32`/`i64` — without a dialect. Shipped as a tiny
+`.d.ts` of **branded subtypes of `number`**:
+
+```ts
+type i32 = number & { readonly __i32: unique symbol };
+type u8  = number & { readonly __u8:  unique symbol };
+type f32 = number & { readonly __f32: unique symbol };
+declare function i32(x: number): i32;   // checked coercion
+```
+
+This is valid stock TypeScript: `tsc` typechecks it today, the brand erases to
+`number` for every other tool, and the file runs unchanged under Node or
+QuickJS (the coercion is a runtime range check there). Our compiler is the only
+consumer of the brand — as a **representation directive**.
+
+**The semantics rule (invariant — this is what keeps it from being a fork):**
+*a branded value is still a `number`; the brand is a checked promise about its
+range, never a change to arithmetic.*
+
+- Storage declared branded (fields, arrays, locals, params) is held unboxed and
+  narrow (`u8[]` is a byte array; a `u8` struct field packs — §4).
+- Arithmetic between branded values computes **exact** results (f64 or i64
+  intermediates; within i32 range, integer and f64 add/mul agree bit-for-bit,
+  so exactness is free).
+- **Guards fire only at brand seams**: at `i32(x)` coercions and at stores back
+  into branded slots — never on the arithmetic in between. In range → results
+  bit-identical to running the raw file under Node. Out of range → a thrown
+  range error: the program lied in its annotation, the same moral status as a
+  failed `as` cast, and the *only* point of divergence, confined to erroneous
+  programs. Guard placement is a stated rule, not an optimization heuristic —
+  "guards only at brand seams" is exactly the kind of line that erodes by
+  accident, so treat additions of guard sites (or elisions) as design changes.
+- **Wrapping is spelled in standard JS**, not by the brand: `|0`, `>>> 0`,
+  `Math.imul` lower to bare int ops with no guard (the asm.js lesson). `f32`
+  rides `Math.fround` (JS's own f32 hook): a branded `f32` means every result
+  is fround-ed — expressible and identical under Node. `i64` rides BigInt
+  (exact semantics, so range-check-and-narrow preserves meaning).
+
+**Why it pays** (this is what closes most of the declared-integer gap vs.
+AssemblyScript):
+
+- **Signatures carry representation.** `hash(data: u8[], seed: i32): i32`
+  needs no interprocedural range proof — the annotation is the proof
+  obligation, guarded at the boundary; everything inside is int-register code.
+  Declaration converts the inference weakness into a boundary check.
+- **Memory density.** Branded fields pack sealed structs; branded arrays are
+  genuinely narrow. For cache-bound code this outweighs ALU width.
+- **Pay-as-you-go.** Ecosystem code has no brands and is untouched; only
+  annotated kernels change representation — and an annotated file still runs
+  (and can be developed/tested) on Node.
+- **The oracle survives untouched** (Invariant 9): the same source runs under
+  QuickJS; any disagreement outside a guard failure is a compiler bug. Brands
+  never make the oracle's answer different.
+
+Cost: small (order +1–2k lines, not a subsystem) — guard insertion and
+narrowing already exist for the inference path; brands add a second, cheaper
+source of the same facts plus brand-aware layout.
+
 ## 3. Two worlds, one explicit seam
 
 Representation follows the **static type** — decided at compile time, never
@@ -157,7 +228,8 @@ so interface-typed access needs a plan. The settled plan:
 **(1) Canonical per-type layout, stateless and deterministic.** A concrete
 type's layout is a pure function of its structural shape: fields sorted
 **lexicographically by property name** (UTF-8 byte order), each field one
-8-byte slot (MVP; packing is a later, measured optimization). No registry, no
+8-byte slot, except branded-narrow fields (§2a) which pack to their declared
+width (packing of *unbranded* fields is a later, measured optimization). No registry, no
 load-order dependence, no shared state: any compiler — the AOT frontend today, a
 guest JIT later — computes the same layout from the type alone. This is also
 Invariant-10-shaped: layout identity is the structural shape, never a name or a
@@ -237,8 +309,11 @@ monotonic and dumb, safe for a guest JIT to extend.
   offsets. The `GC.md` payload mask constrains tags to the top byte — leaning
   tagged-offset; needs a concrete tag map (f64, i32, struct-ref, dict-ref,
   string, null/undefined, bool).
-2. **Struct field slots.** Uniform 8-byte slots is the MVP call above; when to
-  pack (f32 arrays, bools), and whether `number`-proven-i32 fields narrow.
+2. **Struct field slots.** Mostly resolved by §2a: uniform 8-byte
+  slots, except branded fields pack to declared width. Remaining: whether
+  *unbranded* proven-narrow fields (bools, `number`-proven-i32) ever auto-pack,
+  or whether packing stays declaration-only (leaning declaration-only — layout
+  stays a pure function of the *written* type, not of analysis results).
 3. **Strings.** Immutable, but representation (flat UTF-8 vs. rope vs. interned)
   and the `string` ↔ dynamic-world story.
 4. **Generics.** Erased-with-boxing vs. reachable-set specialization (the local,
@@ -260,6 +335,9 @@ monotonic and dumb, safe for a guest JIT to extend.
 - A resident optimizing runtime: no ICs, no tiering, no deopt. If a guest JIT
   arrives later it compiles *new code* under the same static rules; it does not
   respecialize old code.
+- Numeric types with their own observable arithmetic (wrapping `i32`, etc.) —
+  §2a brands are the sanctioned form: range promises over `number`, checked at
+  seams, semantics-preserving. Wrap is spelled `|0`/`Math.imul`, as in JS.
 - Beating a tuned adaptive JIT (V8) on dynamic code. The bar is beating
   interpreted engines decisively on typed code while running the dynamic tail
   correctly.
