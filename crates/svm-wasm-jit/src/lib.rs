@@ -1072,7 +1072,39 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     let n = m.funcs.len();
     let emitted: Vec<usize> = (0..n).collect();
     let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
-    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf)
+    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf, None)
+}
+
+/// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a
+/// private table the module fills itself, it *imports* the domain's one shared funcref table
+/// (`env.__indirect_function_table`, sized `1 << table_log2` = `Host::jit_table_log2`) and populates
+/// nothing — the host writes every slot (own funcs + `install`ed units) via `table.set`, exactly as
+/// the interpreter's `DomainTable` is host-populated. This is what makes an installed unit a funcref
+/// another instance's `call_indirect` can reach (old→new) at native speed. The confinement mask stays
+/// a compile-time constant `1<<table_log2` (invariant I2). `table_log2` must match the reservation the
+/// domain was granted with (`grant_jit_with_table` / `DomainTable::new(_, table_log2)`).
+pub fn compile_module_b2(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        Some(table_log2),
+    )
 }
 
 /// **Cap-call outlining** — hoist every inline `cap.call` into a synthetic single-block wrapper
@@ -1305,7 +1337,7 @@ pub fn compile_module_reactor(
             emitted_bitmap[i] = true;
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross)?;
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross, None)?;
     Ok((wasm, emitted_bitmap))
 }
 
@@ -1377,7 +1409,7 @@ pub fn compile_module_tierup(
             emitted.push(i);
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf)?;
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf, None)?;
     Ok((wasm, emit))
 }
 
@@ -1482,6 +1514,7 @@ fn emit_module(
     emitted: &[usize],
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
+    reserved_table_log2: Option<u32>,
 ) -> Result<Vec<u8>, Error> {
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
@@ -1558,11 +1591,25 @@ fn emit_module(
             }
         }
     }
-    // The identity funcref table (`RefFunc`/`dispatch_indirect` semantics): slot `s` = SVM function
-    // `s`, power-of-two length, trapping (null) padding — matching the interpreter's `DomainTable`
-    // (`funcs.len().next_power_of_two()`, `reserve_log2 = 0`). Masking `idx & (table_size - 1)` in
-    // the lowering reproduces `dispatch_indirect`'s `idx & (len - 1)`.
-    let table_size = m.funcs.len().next_power_of_two().max(1) as u32;
+    // The funcref table (`RefFunc`/`dispatch_indirect` semantics): masking `idx & (table_size - 1)`
+    // in the lowering reproduces `dispatch_indirect`'s `idx & (len - 1)`.
+    //
+    // Two shapes, one lowering:
+    // * **Local (default, `reserved_table_log2 = None`).** Slot `s` = SVM function `s`, power-of-two
+    //   length, trapping (null) padding — matching the interpreter's `DomainTable`
+    //   (`funcs.len().next_power_of_two()`, `reserve_log2 = 0`). The module declares its own table and
+    //   fills `[0, funcs.len())` with an active element segment (below).
+    // * **Shared reserved (Model B2, `reserved_table_log2 = Some(log2)`).** The module *imports* one
+    //   shared `env.__indirect_function_table` sized to the domain's reservation (`1 << log2`, exactly
+    //   `Host::jit_table_log2` / `DomainTable::new(_, log2)`), and populates *no* slots itself — the
+    //   host writes every slot (its own funcs and any `install`ed unit) via `table.set`, exactly as
+    //   `DomainTable` is host-populated. So an `install`ed unit becomes a funcref that another
+    //   instance's `call_indirect` reaches through the one shared table (§22 old→new). The mask is a
+    //   constant `1<<log2` from t=0 (invariant I2), so no compiled site holds a stale mask.
+    let table_size = match reserved_table_log2 {
+        Some(log2) => 1u32 << log2,
+        None => m.funcs.len().next_power_of_two().max(1) as u32,
+    };
 
     // Cross-tier indirect trampolines. A function whose address is taken (`RefFunc`) but which is
     // *not* emitted still occupies an identity-table slot; an indirect call to it must reach the
@@ -1575,7 +1622,10 @@ fn emit_module(
     let mut extra_type_idx: Vec<u32> = Vec::new();
     let mut extra_bodies: Vec<Vec<u8>> = Vec::new();
     let mut trap_stub_widx: Option<u32> = None;
-    if needs_table {
+    // Trampolines/trap-stub + the active element that references them only exist for the *local*
+    // table the module fills itself. In shared-reserved (B2) mode the host owns every slot, so the
+    // module emits no element segment and needs none of these fillers.
+    if needs_table && reserved_table_log2.is_none() {
         // **Every** cross-tier function needs a trampoline slot — not just the `RefFunc`
         // address-taken ones. A function pointer can be an indirect-call target without any `RefFunc`
         // instruction: the frontend bakes static function-pointer tables (e.g. Doom's `states[]` /
@@ -1652,8 +1702,10 @@ fn emit_module(
     }
     section(&mut out, 1, &sec);
 
-    let mut sec = Vec::new(); // import section (2): env.memory, env.trap (type 0), env.call_interp (type 1)
-    uleb(&mut sec, 3);
+    // Import section (2): env.memory, env.trap (type 0), env.call_interp (type 1), and — in
+    // shared-reserved (B2) mode — the shared funcref table the whole domain dispatches through.
+    let mut sec = Vec::new();
+    uleb(&mut sec, if reserved_table_log2.is_some() { 4 } else { 3 });
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
     if shared_memory {
@@ -1674,6 +1726,16 @@ fn emit_module(
     import_name(&mut sec, "env", "call_interp");
     sec.push(0x00); // func
     uleb(&mut sec, 1); // type index 1
+    if reserved_table_log2.is_some() {
+        // The shared reserved funcref table (§22 Model B2). Imported (not declared), so every
+        // instance in the domain dispatches through the *same* table; the host sizes it to the
+        // reservation and populates it (`table.set` on grant + `install`). `table_size == 1<<log2`.
+        import_name(&mut sec, "env", "__indirect_function_table");
+        sec.push(0x01); // table
+        sec.push(0x70); // funcref elemtype
+        sec.push(0x00); // limits flag 0x00 = min only
+        uleb(&mut sec, table_size as u64);
+    }
     section(&mut out, 2, &sec);
 
     let mut sec = Vec::new(); // function section (3): emitted, then trampolines + trap stub
@@ -1683,7 +1745,7 @@ fn emit_module(
     }
     section(&mut out, 3, &sec);
 
-    if needs_table {
+    if needs_table && reserved_table_log2.is_none() {
         let mut sec = Vec::new(); // table section (4): one funcref table, min = table_size
         uleb(&mut sec, 1);
         sec.push(0x70); // funcref elemtype
@@ -1703,7 +1765,7 @@ fn emit_module(
     }
     section(&mut out, 7, &sec);
 
-    if needs_table {
+    if needs_table && reserved_table_log2.is_none() {
         // Element section (9): one active segment filling the identity table `[0, funcs.len())`.
         // Each real slot resolves to the function's wasm index: an emitted function (`wasm_of`), a
         // cross-tier **trampoline** (`tramp_of`, an address-taken interp-leaf), or the `()->()` trap

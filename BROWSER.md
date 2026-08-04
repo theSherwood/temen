@@ -751,11 +751,24 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
    single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; a multi-Worker Node/Chromium twin is the
    remaining **end-to-end** verification.
-   **Deferred (documented):** the multi-Worker Node/Chromium end-to-end twin; §22 `install` +
-   `call_indirect` (Model B2 — an installed unit *is* a funcref old code dispatches to; needs
-   cross-instance wasm-table population); and §14 units whose entry **uses** its instantiator/
-   address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now
-   marshal by type; **v128** unit sigs stay on the interpreter.)*
+   **[landed — §22 Model B2 emitter mechanism + native cross-instance differential]** An installed
+   unit can now be a funcref another instance's `call_indirect` reaches through **one shared reserved
+   funcref table**. [`svm_wasm_jit::compile_module_b2`] emits a module that *imports*
+   `env.__indirect_function_table` (sized to the domain reservation `1<<log2` = `Host::jit_table_log2`)
+   instead of declaring a private one, and populates **nothing** — the host writes every slot
+   (`table.set`), exactly as the interpreter's `DomainTable` is host-populated (`DomainTable::new` +
+   `install`). The confinement mask stays the compile-time constant `idx & (1<<log2 - 1)` (invariant
+   I2 — constant from t=0, so no compiled site holds a stale mask; only *population* is dynamic). Pinned
+   by `crates/svm-wasm-jit/tests/b2_install.rs`: a `call_indirect` from one wasmi instance dispatches to
+   an `install`ed unit in the shared table **≡ the interpreter** for that unit, the reserved-size mask
+   wraps an over-range index back in-bounds, and an empty slot / signature mismatch fails **closed**
+   (as `dispatch_indirect` traps on `TABLE_EMPTY` / a type-id mismatch).
+   **Deferred (documented):** the **browser** B2 wiring on top of that seam — a shared
+   `WebAssembly.Table` created at `Jit`-grant time and imported by every domain instance, with
+   `install`/`uninstall` doing `table.set` (the JS analog of the `b2_install.rs` host); the multi-Worker
+   Node/Chromium end-to-end twin; and §14 units whose entry **uses** its instantiator/address-space caps
+   (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type;
+   **v128** unit sigs stay on the interpreter.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
