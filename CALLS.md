@@ -398,7 +398,85 @@ plumbing that lands in increments (§8).
        loops (the common shape) are the tested path; a timed-serve-loop handoff gate is a later
        refinement if a consumer needs it.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
-   here**, uniformly on all backends. Closes the `live_impl` parity gap.
+   here**, uniformly on all backends. Closes the `live_impl` parity gap. Decomposed
+   smallest-verifiable-first:
+   - **5a — `fuel.remaining` (self-op 13), all backends. DONE (2026-08-04).** §10.6 — an
+     authority-neutral readout of the domain's remaining fuel. **Interp** services it in the eval loop
+     (pushes `*fuel`, charging none of its own). **JIT** lowers it inline in `lower_block` to a
+     `load(I64, fuel_addr)` — the same host-owned cell `emit_fuel_check` charges — so it returns the
+     identical value under the differential oracle (which arms counted fuel on the JIT); when a
+     compile has no counted fuel armed (`fuel_addr == 0`, the production CLI path) it reports
+     `i64::MAX` ("unmetered"). **Bytecode** can't see the vCPU counter from host-side dispatch, so it
+     declines op 13 (`compile_module → None`) and the module falls back to the tree-walker, which
+     services it. The design reserved op "12"; `reap` took it, so this is **13**. Pinned by
+     `crates/svm/tests/fuel_remaining.rs`: interp ≡ JIT on the raw readback (`budget − 1` at entry)
+     and on the read-before/read-after **call-metering** idiom.
+   - **5b — caller-pays fuel across the crossing. DONE (2026-08-04).** §10.5 — an animated offer
+     handler now runs on the **caller's own `*fuel`** counter (it made the call, it pays), not the
+     provider reserve. **As built** this simplified the 4a/4b machinery rather than adding to it: the
+     checkout stops swapping `*fuel` to a provider budget (`budget_ = *fuel`, the caller's whole
+     remaining fuel — no reserve draw, no per-call `OFFER_FUEL` cap, that cap being the deferred
+     §10.5 refinement), charging only the one function-entry fuel; both settles stop restoring
+     `*fuel` and stop draining `st.fuel` (the reserve is left untouched — vestigial until increment
+     6); and `OfferAnim` sheds its now-dead `saved_fuel`/`budget` fields (the promotion telescoping
+     collapses — the caller's counter simply persists across the park at `remaining_budget`). A
+     caller with no fuel to fund the crossing traps `OutOfFuel` **before** any checkout
+     (`Adm::OutOfFuel`, nothing to undo). Pinned by `crates/svm-interp/tests/caller_pays.rs`: a
+     caller's `fuel.remaining` drops by the handler's ~100-back-edge loop (≈0 under the old
+     provider-pays). *Scope:* the durable/`ref.func` `drive_arc` fallback still reserves-and-drains
+     (provider-pays) — it retires with increment 6; a process provider runs on its own §15 budget by
+     construction (a separate domain), so caller-pays here is the inline/library-animation path.
+   - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** Closes the `live_impl`
+     parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`). **Design history
+     (2026-08-04, owner + verification):** two wrong sketches preceded the aligned one. Sketch 1
+     (bolt the JIT thread onto the interp `Scheduler`, callee on an interp vCPU) — dead: a JIT run has
+     no `Scheduler` in scope, and an interp-vCPU callee is a second execution model per crossing,
+     exactly what the CONSOLIDATION.md §0 yardstick calls expensive. Sketch 2 (make the
+     `os_thread_rt` **enqueue → futex-wake → condvar-block** protocol *the* transport) — misreads this
+     document: that protocol is §10.2 **arm 5**, the *parked fallback transport*, not the arm. The
+     original design here is explicit and stands: §8.5 "the **thunk fast path**; park = thread-block
+     on the reply"; §10.4 "JIT crossings are **real native frames through thunks**… at the bound the
+     call **declines the inline arm and takes the parked transport**"; §10.2 arm 6 "the caller parks
+     (interp) or **thread-blocks (JIT)**" — thread-block is the *park half*, never the primary
+     transport. CONSOLIDATION.md §2 depends on this ordering: the coroutine-collapse's fault-service
+     path stays fast *because* it is the direct-handoff shape — a per-call futex/thread round-trip
+     would fail its lazy-paging-latency gate.
+     **Verified feasibility of the fast path (all in-tree today):** the JIT's natural CLIF ABI
+     threads `(mem_base, fn_table_base, …)` per call and the masking lowering adds a **runtime**
+     `base` (nothing window-specific is baked into code — `svm-jit/lib.rs:57,810,1090,2568`; D65
+     measured the threaded ABI as not a perf liability); `svm-run::serve_native` already has the thunk
+     **synchronously invoking compiled handler trampolines on the calling thread**
+     (`svc_handler(export,op) → handler_tramp(fidx) → CompiledModule::invoke_extra` over `mem_base`) —
+     same-domain today, but it is the exact inline-handoff mechanism; §14 children each carry their own
+     compile (`ChildCode`) and granted children their own ctx (`instantiator_rt`). The cross-domain
+     fast path = that mechanism pointed at the **callee's** compile + sub-window + Host, with
+     admission gating and the two cap-translation edges — the JIT analog of the interp's 4a/4d.
+     Decomposed (aligned; smallest-verifiable-first, mirroring the interp's own 2→3→4 staging):
+     - **5c.0 — prerequisite: JIT child/offer registry + `child_offer` (op 14).** Op 14 emits
+       `-EINVAL` on the JIT today ("the JIT runtime has neither [scheduler nor child registry]") — no
+       live-impl handle can even be minted. Needed by *both* transports.
+     - **5c.1 — the parked transport (arm 5 / the decline target):** enqueue onto the callee's
+       `svc_queue`, futex-wake its serve loop, caller **thread-blocks** on a reply cell (the
+       `instantiator_rt` `join`/`ChildDone` park shape, with the `epoch_addr` re-check so a host
+       interrupt still unwinds). Relax the `run_with_caps` force-fold (`has_instantiate` veto term).
+       Pin: `svc_parity.rs`'s "Jit" arm — silently TreeWalk today — runs the **real** JIT backend and
+       matches. This is the correctness baseline the fast path declines onto, built first exactly as
+       the interp built enqueue+park (§3.6) before inline animation.
+     - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
+       loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
+       inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),
+       run-to-completion first — a mid-handler park fails over to the parked transport (the 4a
+       staging; promotion parity is 5c.4). Pin: fast-path-on ≡ fast-path-off on results and
+       `serve_count` (the §10.2 handoff settlement rule, the 4d pin's JIT twin).
+     - **5c.3 — §10.4 crossing-depth bound:** a per-thread crossing counter minted at the fast path;
+       at the bound, decline to 5c.1's parked transport (fail-closed toward the slower correct
+       transport). Load-bearing on the JIT — inline crossings are real native frames.
+     - **5c.4 — mid-handoff park parity (arm 6):** a fast-path handler that parks mid-run promotes
+       (file the reified fiber + waiter, `fiber_rt`) and the caller **thread-blocks on the reply** —
+       the 4b/4d.2 shape, thread-block flavor.
+     Still a substantial JIT-runtime build (registry + op-14 + both transports + the bound), but the
+     fast path reuses the proven `serve_native` invoke mechanism rather than inventing a cross-thread
+     protocol as the primary — one execution model, per the consolidation yardstick.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
    goal, now reachable without a parity regression).

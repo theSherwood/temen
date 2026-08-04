@@ -5912,6 +5912,27 @@ fn lower_block(
             args,
         } = inst
         {
+            // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
+            // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
+            // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
+            // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
+            // value the tree-walker does under the differential oracle (which arms counted fuel on
+            // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
+            // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
+            // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
+            if *type_id == svm_ir::CAP_SELF_TYPE_ID && *op == 13 {
+                if !sig.results.is_empty() {
+                    let v = if lower.fuel_addr != 0 {
+                        let addr = b.ins().iconst(I64, lower.fuel_addr);
+                        b.ins().load(I64, MemFlags::trusted(), addr, 0)
+                    } else {
+                        b.ins().iconst(I64, i64::MAX)
+                    };
+                    vals.push(v);
+                }
+                ubs.resize(vals.len(), UB_TOP);
+                continue;
+            }
             // §14 `Instantiator` (iface 6): when this (parent) compile has a live `Nursery`, lower
             // `instantiate`/`join` to its thunks instead of the generic `cap.call` — spawning a child
             // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child

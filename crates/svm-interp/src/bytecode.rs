@@ -1553,6 +1553,11 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     }
                 }
                 (svm_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
+                // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
+                // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
+                // decline the module so it falls back to the tree-walker, which services op 13
+                // directly. (The JIT does lower it inline — it owns the fuel cell's address.)
+                (svm_ir::CAP_SELF_TYPE_ID, 13) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
