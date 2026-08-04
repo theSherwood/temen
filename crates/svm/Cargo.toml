@@ -50,3 +50,8 @@ svm-posix = { path = "../svm-posix" }
 # For the JIT-side `mprotect`-backed Memory-capability test harness (real page protection on
 # the guest window, mirroring the interpreter's page-protection model). Unix-only test.
 libc = "0.2"
+# The wasm-JIT emitter (backend 4): the §22 "guest-compiled units on the wasm tier" differential
+# (`jit_wasm_codegen.rs`) emits a runtime-compiled unit and runs it under `wasmi`, the same
+# escape-TCB-adjacent correctness contract the `svm-wasm-jit` crate's own differentials hold.
+svm-wasm-jit = { path = "../svm-wasm-jit" }
+wasmi = "0.47"
