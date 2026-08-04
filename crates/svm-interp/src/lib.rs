@@ -14430,6 +14430,29 @@ pub struct Host {
     /// `0` on interpreter runs. Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`]
     /// (which requires a granted `Jit` capability a serving module need not hold).
     serve_native_ctx: usize,
+    /// CALLS.md 5c.1a — a **JIT granted child's** serve context: the address of the child's live
+    /// `ChildCode` (its serve trampolines + fn table), registered at spawn and cleared by the
+    /// powerbox release hook. Distinct from [`Host::serve_native_ctx`] (a top-level run's
+    /// `*mut CompiledModule`) so the two interpretations can never be confused: this one is read
+    /// only by the locked cap thunk's child serve arm, and only while the child executes (the
+    /// `ChildCode` outlives every in-child `cap.call` by construction; stale reads are prevented
+    /// by the clear-on-release). `0` ⇒ none.
+    child_serve_ctx: usize,
+    /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
+    /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
+    /// thunk** (the parked transport's caller wait / the child serve loop's empty-queue wait) can
+    /// poll it in its bounded re-check — the same cell `emit_epoch_check` polls from compiled code
+    /// and the `instantiator_rt` join park polls natively. Set alongside the nursery at run start,
+    /// inherited by granted children at spawn (one stable host cell per run).
+    epoch_cell: usize,
+    /// CALLS.md 5c.1b — the shared-cell **wake signal** for the JIT parked transport: a `Condvar`
+    /// deliberately paired with the ONE `Mutex<Host>` cell this Host lives in (every waiter passes
+    /// that cell's guard to `wait_timeout`, so the pairing is consistent by construction). Cloned
+    /// out under the lock, waited on with the guard. Notified by `svc_enqueue` (wakes the child's
+    /// empty-queue `svc.wait`) and `svc_settle` (wakes a caller blocked on its ticket). `None` for
+    /// hosts that are not shared granted-child cells (interp domains, top-level runs) — their
+    /// transports have their own wakers.
+    svc_cv: Option<Arc<Condvar>>,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
@@ -14768,6 +14791,9 @@ impl Host {
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
+            child_serve_ctx: 0,
+            epoch_cell: 0,
+            svc_cv: None,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -16054,6 +16080,10 @@ impl Host {
             args,
             ticket,
         });
+        // CALLS.md 5c.1b — wake a child serve loop blocked on the empty queue (no-op elsewhere).
+        if let Some(cv) = &self.svc_cv {
+            cv.notify_all();
+        }
         Some(ticket)
     }
 
@@ -16103,6 +16133,10 @@ impl Host {
     /// [`Host::svc_result`]).
     pub fn svc_settle(&mut self, ticket: u64, v: i64) {
         self.svc_results.insert(ticket, v);
+        // CALLS.md 5c.1b — wake a caller thread-blocked on this ticket (no-op elsewhere).
+        if let Some(cv) = &self.svc_cv {
+            cv.notify_all();
+        }
     }
 
     /// I36 slice 3 — the handler [`FuncIdx`] a queued `(export, op)` dispatch runs, for the
@@ -16120,6 +16154,40 @@ impl Host {
     /// The registered serve-loop native context (`0` ⇒ interpreter run / none registered).
     pub fn serve_native_ctx(&self) -> usize {
         self.serve_native_ctx
+    }
+
+    /// CALLS.md 5c.1a — register / clear this (child) domain's `ChildCode` serve context; see
+    /// [`Host::child_serve_ctx`].
+    pub fn set_child_serve_ctx(&mut self, ctx: usize) {
+        self.child_serve_ctx = ctx;
+    }
+
+    /// The registered JIT-child serve context (`0` ⇒ none / already released).
+    pub fn child_serve_ctx(&self) -> usize {
+        self.child_serve_ctx
+    }
+
+    /// CALLS.md 5c.1b — arm / read the kill-path epoch cell a thunk-blocked thread polls; see
+    /// [`Host::epoch_cell`].
+    pub fn set_epoch_cell(&mut self, addr: usize) {
+        self.epoch_cell = addr;
+    }
+
+    /// The armed epoch cell (`0` ⇒ none — an un-killable embedder run; waits still bound on the
+    /// trap cell and timeout).
+    pub fn epoch_cell(&self) -> usize {
+        self.epoch_cell
+    }
+
+    /// CALLS.md 5c.1b — arm the shared-cell wake signal (a fresh `Condvar`) on this (child) Host;
+    /// see [`Host::svc_cv`]. Called by the granted-child builders at spawn.
+    pub fn arm_svc_cv(&mut self) {
+        self.svc_cv = Some(Arc::new(Condvar::new()));
+    }
+
+    /// The shared-cell wake signal, cloned out under the cell's lock (`None` ⇒ not a shared cell).
+    pub fn svc_cv(&self) -> Option<Arc<Condvar>> {
+        self.svc_cv.clone()
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op
@@ -16236,7 +16304,7 @@ impl Host {
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
     /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
     /// `None` and flows to the ordinary dispatch).
-    fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<(Arc<Mutex<Host>>, u32)> {
+    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<(Arc<Mutex<Host>>, u32)> {
         match self.resolve(handle, type_id) {
             Ok(Binding::LiveImpl(i)) => self
                 .live_impls

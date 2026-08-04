@@ -274,6 +274,20 @@ pub unsafe extern "C" fn cap_thunk(
         );
         return;
     }
+    // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `cap.call`
+    // whose handle resolves to a minted live-impl enqueues on the callee child's shared cell and
+    // **thread-blocks** on the reply, instead of falling to the generic dispatch (whose LiveImpl
+    // arm answers `-EINVAL`). The `host` borrow above is dead on this path; `live_impl_call`
+    // re-derives from `ctx` in its own short scope before any callee lock is taken.
+    if let Some(r) = live_impl_call(ctx as *mut Host, type_id, op, handle, arg_slots, trap_out) {
+        if *trap_out == 0 {
+            if n_results != 0 {
+                *results = r;
+            }
+            *trap_out = 0;
+        }
+        return;
+    }
     match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
         Ok(res) => {
             if n_results != 0 {
@@ -342,11 +356,16 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // reaches the concurrent path keeps the pre-slice answer: the generic dispatch's probeable
     // `-EINVAL` (fail closed, never a self-deadlock).
     if type_id == svm_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
-        const EINVAL: i64 = -22;
-        if n_results != 0 {
-            *results = EINVAL;
-        }
-        *trap_out = 0;
+        serve_locked_child(
+            m,
+            op == 10,
+            n_args,
+            mem_base,
+            mem_size,
+            results,
+            n_results,
+            trap_out,
+        );
         return;
     }
     // `Jit.invoke` (iface 11 op 1) re-enters guest code → never hold the lock across it.
@@ -364,6 +383,19 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // registry + the live module; the generic ops mutate `Host` state). The guard is released on
     // return.
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    // CALLS.md 5c.1b — a **locked-domain caller** (itself a granted child) does not take the
+    // parked transport yet: the delegate below holds this domain's own guard, so blocking on a
+    // sibling's reply while a sibling blocks on ours would deadlock (A holds A waiting B; B
+    // blocked on A's lock). Refuse probeably (`-EINVAL`, the pre-5c.1 answer) — the child-caller
+    // tier is a recorded 5c residue; the root caller (unlocked thunk) covers the transport.
+    if guard.live_impl_of(handle, type_id).is_some() {
+        const EINVAL: i64 = -22;
+        if n_results != 0 {
+            *results = EINVAL;
+        }
+        *trap_out = 0;
+        return;
+    }
     let host_ptr = &mut *guard as *mut Host as *mut c_void;
     cap_thunk(
         host_ptr,
@@ -1545,6 +1577,20 @@ pub unsafe extern "C" fn module_resolver(
 }
 
 /// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
+/// CALLS.md 5c.1c — the production granted-child hook set (`powerbox_compile_run` installs it on
+/// every JIT run whose module nests): the same callbacks the test harnesses wire by hand.
+pub fn production_grant_hooks() -> svm_jit::GrantChildHooks {
+    svm_jit::GrantChildHooks {
+        build: grant_child_build,
+        build_named: grant_named_child_build,
+        release: grant_child_release,
+        bind_imports: child_bind_imports,
+        mint: child_offer_mint,
+        thunk: cap_thunk_locked,
+        register_serve: child_register_serve,
+    }
+}
+
 /// re-grant one of the parent's coordinate-free capabilities (`Stream`/`Exit`/`Clock`, named by
 /// `grant_handle`) into a fresh child powerbox `Host` confined to `[0, child_size)`, so a JIT child
 /// can do I/O instead of being born destitute. The child `Host` is heap-`Box`ed and returned as the
@@ -1570,6 +1616,11 @@ pub unsafe extern "C" fn grant_child_build(
             // (compiled against the lock-taking thunk), one is retained by the nursery so
             // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
             // `grant_child_release` (child exit / nursery teardown).
+            let mut child = child;
+            // CALLS.md 5c.1b — arm the shared-cell wake signal (the parked transport's Condvar)
+            // and inherit the run's kill-path cell so thunk-blocked waits stay boundable.
+            child.arm_svc_cv();
+            child.set_epoch_cell(parent.epoch_cell());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = svm_jit::GrantChild {
@@ -1593,9 +1644,208 @@ pub unsafe extern "C" fn grant_child_build(
 /// released.
 pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     if !ctx.is_null() {
+        // CALLS.md 5c.1b — clear the serve context first (idempotent across the two releases): the
+        // child's `ChildCode` dies with the child thread, so no reader may see the pointer after
+        // either ref is released. A caller mid-wait observes ctx==0 as the dead-callee signal.
+        {
+            let cell = &*(ctx as *const Mutex<Host>);
+            let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+            g.set_child_serve_ctx(0);
+            if let Some(cv) = g.svc_cv() {
+                cv.notify_all();
+            }
+        }
         // CALLS.md 5c.0 — one counted ref of the shared child powerbox (see `grant_child_build`);
         // the `Host` drops when the last of {child-thread ref, nursery-retained ref} is released.
         drop(std::sync::Arc::from_raw(ctx as *const Mutex<Host>));
+    }
+}
+
+/// CALLS.md 5c.1b — the [`svm_jit::ChildServeRegistrar`]: record a spawned granted child's live
+/// `ChildCode` address on its shared powerbox, so the locked thunk's serve arm can resolve and
+/// invoke its handlers. Cleared by [`grant_child_release`].
+///
+/// # Safety
+/// `child_ctx` is a live shared-cell ref a builder returned; `serve_ctx` is the child's
+/// `ChildCode` address, valid until the releaser clears it.
+pub unsafe extern "C" fn child_register_serve(child_ctx: *mut c_void, serve_ctx: usize) {
+    if !child_ctx.is_null() {
+        let cell = &*(child_ctx as *const Mutex<Host>);
+        cell.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_child_serve_ctx(serve_ctx);
+    }
+}
+
+/// CALLS.md 5c.1b — the kill-path re-check a thunk-blocked wait polls (the `instantiator_rt`
+/// join-park discipline): the run's epoch cell (host-written, nonzero ⇒ fired) and the in-flight
+/// trap cell (a concurrent detect-and-kill / domain teardown).
+unsafe fn blocked_wait_interrupted(epoch_cell: usize, trap_out: *mut i64) -> bool {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    if epoch_cell != 0 && (*(epoch_cell as *const AtomicU64)).load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    (*(trap_out as *const AtomicI64)).load(Ordering::Relaxed) != 0
+}
+
+/// CALLS.md 5c.1b — the **child side** of the JIT parked transport: a granted child's
+/// `svc.poll`/`svc.wait`, serviced on the child's own thread over its shared powerbox cell. Pops
+/// and serves queued dispatches through the child's registered serve context
+/// ([`svm_jit::child_handler_tramp`] / [`svm_jit::child_invoke_handler`] — the guard is **dropped**
+/// around every handler invoke, so the handler's own `cap.call`s relock freely and an enqueuing
+/// caller is never blocked out); each settle notifies the cell's Condvar (waking a thread-blocked
+/// caller). An empty-queue `svc.wait` **block-waits** on the same Condvar (the arm 5 park),
+/// bounded by 20ms re-checks of the epoch/trap cells — where the pre-5c.1 stub answered `-EINVAL`
+/// and `serve_native`'s wait arm `ThreadFault`ed. Non-child locked domains (no serve ctx / no
+/// Condvar) keep the old probeable `-EINVAL`: a multi-threaded top-level still never serves here.
+/// The timed `svc.wait` form (a timeout arg) stays `-EINVAL` on this tier, and a **nested** serve
+/// under a handler is refused the same way the interp refuses it (see the in-body guard).
+#[allow(clippy::too_many_arguments)]
+unsafe fn serve_locked_child(
+    m: &Mutex<Host>,
+    wait: bool,
+    n_args: u64,
+    mem_base: *mut u8,
+    mem_size: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    const EINVAL: i64 = -22;
+    let put = |v: i64, trap_out: *mut i64| {
+        if n_results != 0 {
+            *results = v;
+        }
+        *trap_out = 0;
+    };
+    if n_args != 0 {
+        // Timed `svc.wait`: oracle-only (needs deadline machinery this tier doesn't host).
+        return put(EINVAL, trap_out);
+    }
+    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    let (serve_ctx, cv, epoch) = (guard.child_serve_ctx(), guard.svc_cv(), guard.epoch_cell());
+    let (serve_ctx, cv) = match (serve_ctx, cv) {
+        (ctx, Some(cv)) if ctx != 0 => (ctx, cv),
+        // Not a serving child cell (a multi-threaded top-level, or the ctx already cleared):
+        // the pre-5c.1 probeable answer, never a block.
+        _ => return put(EINVAL, trap_out),
+    };
+    let mut count: i64 = 0;
+    loop {
+        while let Some((export, dop, args, ticket)) = guard.svc_pop() {
+            let Some(fidx) = guard.svc_handler(export, dop) else {
+                *trap_out = svm_jit::TrapKind::CapFault as i64;
+                return;
+            };
+            let Some((code, n_params, n_res)) =
+                svm_jit::child_handler_tramp(serve_ctx as *const c_void, fidx)
+            else {
+                *trap_out = svm_jit::TrapKind::CapFault as i64;
+                return;
+            };
+            if args.len() != n_params {
+                guard.svc_settle(ticket, EINVAL);
+                continue;
+            }
+            let mut res = vec![0i64; n_res];
+            // Run the handler with the cell UNLOCKED (its own cap.calls relock; an enqueuer
+            // never blocks behind a running handler). SAFETY: `serve_ctx` is the live
+            // `ChildCode` (cleared only at release, which runs after the child's guest code —
+            // including this serve — has returned); `[mem_base, +mem_size)` is this child's
+            // live window, handed to this very thunk call.
+            drop(guard);
+            let faulted = svm_jit::child_invoke_handler(
+                serve_ctx as *const c_void,
+                code,
+                &args,
+                &mut res,
+                mem_base,
+                mem_size,
+                trap_out,
+            );
+            if faulted {
+                return; // detect-and-kill: the fault trap is already in the cell
+            }
+            if *trap_out != 0 {
+                return; // handler trap (incl. Exit) — terminal for the domain, like the oracle
+            }
+            guard = m.lock().unwrap_or_else(|e| e.into_inner());
+            guard.svc_settle(ticket, res.first().copied().unwrap_or(0));
+            count += 1;
+        }
+        if !wait || count != 0 {
+            break;
+        }
+        // Empty queue on `svc.wait` and nothing served yet: the arm-5 park — block on the
+        // cell's Condvar (released while waiting, so enqueuers get in), bounded re-checks.
+        if blocked_wait_interrupted(epoch, trap_out) {
+            if *trap_out == 0 {
+                *trap_out = svm_jit::TrapKind::OutOfFuel as i64;
+            }
+            return;
+        }
+        let (g, _) = cv
+            .wait_timeout(guard, std::time::Duration::from_millis(20))
+            .unwrap_or_else(|e| e.into_inner());
+        guard = g;
+    }
+    drop(guard);
+    put(count, trap_out);
+}
+
+/// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `cap.call`
+/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then
+/// **thread-block** on the cell's Condvar until the child's serve loop settles `t` — the §10.2
+/// arm-5 transport, caller half. Fail-closed edges: full callee queue ⇒ `-EAGAIN` (probeable
+/// backpressure, the interp's exact answer); a callee cell with no Condvar (not a shared JIT
+/// child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
+/// exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
+/// unwind via the trap cell. Returns `Some(reply)` when this WAS a live-impl call (the caller
+/// pushes it and returns), `None` to fall through to the generic dispatch.
+unsafe fn live_impl_call(
+    host_ptr: *mut Host,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: &[i64],
+    trap_out: *mut i64,
+) -> Option<i64> {
+    const EAGAIN: i64 = -11;
+    const EINVAL: i64 = -22;
+    const CAP_REVOKED: i64 = -9;
+    let (callee, export) = (*host_ptr).live_impl_of(handle, type_id)?;
+    // The parent-host borrow above is dead; only the callee cell is locked from here on.
+    let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ticket) = guard.svc_enqueue(export, op, args.to_vec()) else {
+        return Some(EAGAIN); // full queue / unservable op: probeable backpressure
+    };
+    let Some(cv) = guard.svc_cv() else {
+        // Not a shared JIT-child cell (e.g. an interp-tier callee reached from a JIT run):
+        // this transport cannot wake, so keep the pre-5c.1 probeable answer. The dispatch
+        // was enqueued but never served; drop it to keep the queue honest.
+        let _ = guard.svc_result(ticket);
+        return Some(EINVAL);
+    };
+    let epoch = guard.epoch_cell();
+    loop {
+        if let Some(r) = guard.svc_result(ticket) {
+            return Some(r);
+        }
+        if guard.child_serve_ctx() == 0 {
+            // The child exited (release cleared the ctx) with our dispatch unserved — the
+            // dead-callee edge, probeable, never a hang (D37 death-is-revocation).
+            return Some(CAP_REVOKED);
+        }
+        if blocked_wait_interrupted(epoch, trap_out) {
+            if *trap_out == 0 {
+                *trap_out = svm_jit::TrapKind::OutOfFuel as i64;
+            }
+            return Some(0); // value unused: the trap cell unwinds the caller
+        }
+        let (g, _) = cv
+            .wait_timeout(guard, std::time::Duration::from_millis(20))
+            .unwrap_or_else(|e| e.into_inner());
+        guard = g;
     }
 }
 
@@ -1734,6 +1984,10 @@ pub unsafe extern "C" fn grant_named_child_build(
     match parent.spawn_named_child(&grants, child_size) {
         Some((child, inst_handle, as_handle)) => {
             // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
+            let mut child = child;
+            // CALLS.md 5c.1b — as `grant_child_build`: arm the wake signal, inherit the kill cell.
+            child.arm_svc_cv();
+            child.set_epoch_cell(parent.epoch_cell());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = svm_jit::GrantChild {
@@ -2895,6 +3149,13 @@ unsafe fn powerbox_compile_run(
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
+        cm.set_grant_child_hooks(Some(production_grant_hooks()));
+        if let Some(ip) = interrupt_ptr {
+            m.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_epoch_cell(ip as usize);
+        }
         let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2930,6 +3191,11 @@ unsafe fn powerbox_compile_run(
         cm.enable_fiber_hosting(quota)?;
     }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
+    cm.set_grant_child_hooks(Some(production_grant_hooks()));
+    if let Some(ip) = interrupt_ptr {
+        host.set_epoch_cell(ip as usize);
+    }
     // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
     // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
     // Single-threaded path only: the locked thunk never serves (see `cap_thunk_locked`).
@@ -3222,6 +3488,21 @@ fn diff_outcome(
 /// the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
 /// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
 /// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
+/// CALLS.md 5c.1c — does the module spawn §14 children (any `Instantiator` `cap.call`)? A
+/// serving module that also **nests** is the child-serving shape the JIT now runs natively (the
+/// 5c.1 parked transport: the serve points live in granted children, not the root), so the
+/// serve fold below must not send it to the oracle. A top-level-serving non-nesting module still
+/// folds — the root's own `svc.wait` remains eval-loop territory until 5c.2+.
+fn module_nests(m: &svm_ir::Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, svm_ir::Inst::CapCall { type_id: 6, .. }))
+        })
+    })
+}
+
 fn module_serves(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -4369,6 +4650,7 @@ impl Instance {
         let backend = if matches!(backend, Backend::Jit)
             && module_serves(m)
             && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+            && !module_nests(m)
         {
             Backend::TreeWalk
         } else {
@@ -4678,6 +4960,7 @@ fn run_capture_on(
     let backend = if matches!(backend, Backend::Jit)
         && module_serves(m)
         && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+        && !module_nests(m)
     {
         Backend::TreeWalk
     } else {

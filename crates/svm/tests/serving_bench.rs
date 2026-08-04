@@ -32,7 +32,9 @@ use svm_text::parse_module;
 /// A caller `_start` that spawns a serving child (func 1), mints a live offer over its `adder`
 /// export (op 14), then calls `add(i, 1)` through the offer `n` times — parking on each call until
 /// the child serves it — accumulating the replies, joins the child, and exits with the low 32 bits
-/// of the sum. The child serves exactly `n` requests in a `svc.wait` loop, then returns. The sum is
+/// of the sum. (CALLS.md 5c.1c: the spawn is op 11 with an empty grant list — a plain op-0
+/// child is destitute by design on the JIT, and a serving child needs the shared granted
+/// powerbox the parked transport rides; interp/bytecode semantics unchanged.) The child serves exactly `n` requests in a `svc.wait` loop, then returns. The sum is
 /// `Σ_{i=0}^{n-1} (i + 1) = n(n+1)/2` (wrapped to i32 at exit) — deterministic across backends.
 fn serving_program(n: u64) -> String {
     format!(
@@ -49,11 +51,13 @@ block 0 () {{
   vp = i64.const 0
   vl = i64.const 2
   vh = cap.self.resolve vp vl
+  vgp = i64.const 0
+  vgn = i64.const 0
   ventry = i64.const 1
   voff = i64.const 65536
   vsl = i64.const 12
   vq = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
+  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vh (vgp, vgn, ventry, voff, vsl, vq)
   vexp = i64.const 0
   voffer = cap.call 6 14 (i32, i64) -> (i32) vh (vch, vexp)
   vi0 = i64.const 0

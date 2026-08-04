@@ -12,6 +12,11 @@ use svm_text::parse_module;
 /// `_start`: resolve the granted `"vm"` Instantiator by name, spawn the serving child
 /// (func 1), mint `child_offer(child, export 0)`, call `add(40, 2)` through the live cap
 /// (parking until the child's `svc.wait` serves it), join, and exit with the reply — 42.
+// CALLS.md 5c.1c — the spawn moved op 0 → op 11 (an empty named-grant list): a **plain** child is
+// destitute by design on the JIT (no powerbox of its own), while a serving child needs the shared
+// granted powerbox the 5c transport rides. Interp/bytecode semantics are unchanged (op 11 with
+// zero grants ≡ op 0 plus a powerbox), and the Jit arm below now runs the REAL JIT backend — the
+// serve fold no longer applies to nesting modules (`module_nests`).
 const SERVING_PROGRAM: &str = "\
 memory 17
 data 0 \"vm\"
@@ -25,11 +30,13 @@ block 0 () {
   vp = i64.const 0
   vl = i64.const 2
   vh = cap.self.resolve vp vl
+  vgp = i64.const 0
+  vgn = i64.const 0
   v1 = i64.const 1
   v2 = i64.const 65536
   v3 = i64.const 12
   v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vh (v1, v2, v3, v4)
+  v5 = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vh (vgp, vgn, v1, v2, v3, v4)
   v6 = i64.const 0
   v7 = cap.call 6 14 (i32, i64) -> (i32) vh (v5, v6)
   va = i64.const 40
