@@ -360,6 +360,43 @@ plumbing that lands in increments (§8).
      accounting, the parked `svc.wait` completing with the same `serve_count` observation the enqueue
      path would have delivered. Pin: **handoff-on ≡ handoff-off** on observable results and
      `serve_count`.
+
+     **As mapped (2026-08-04)** the process-provider path is a `Binding::LiveImpl` — a §14-child
+     serve loop parked at `Blocked::SvcWait`, served today by `svc_enqueue` + `svc_wake(callee)` +
+     caller park on `Blocked::CapReply { ticket }`; the provider's serve loop pops the queue,
+     `serve_switch`es the handler, and settles (`serve_count += 1`, `cap_reply_or_stash(ticket)`
+     wakes the caller). Crucially, unlike a library provider (whose world is a detachable
+     `ProviderState` the caller checks out onto its *own* vCPU), a process provider's world lives **on
+     its own parked vCPU** — so handoff is a cross-**domain** switch (the Doors/L4 shape), not the
+     cross-world switch 4a/4b/4c animate. And no `handoff` toggle or `handoff-on ≡ handoff-off`
+     harness exists yet — both are net-new. Decomposed smallest-verifiable-first:
+     - **4d.0 — Transport toggle + differential harness. DONE (2026-08-04).** A `handoff` switch
+       (`Host::set_handoff`, default **off** ⇒ today's enqueue+park, byte-identical), copied at
+       `drive_arc` into a run-global `Scheduler::handoff` (read, never written — no lock), plus a
+       `direct_handoff.rs` harness driving a process-provider call both ways and asserting identical
+       results. De-risks the behavioral slices: any divergence from the enqueue oracle trips the pin.
+     - **4d.1 — Run-to-completion handoff. DONE (2026-08-04).** Built as **(A)**, and simpler than the
+       sketch: the caller enqueues the dispatch **once** (the existing `svc_enqueue`, ticket `t`),
+       then — if handoff is on and the provider's own serve loop is parked at `svc.wait`
+       (`Scheduler::take_parked_serve_loop`, identified by its own domain id in `svc_waiters`) —
+       **donates its thread** by calling the worker's own `dispatch()` on that vCPU. `dispatch()` runs
+       the serve loop to its next park/finish and re-files it, running `serve_switch`/settle/
+       `serve_count` **unchanged**; the reply, with no ticket-waiter registered yet, stashes in
+       `svc_results`, which the caller drains and returns. Any non-served outcome falls through to the
+       **unchanged** enqueue+`svc_wake`+park path on the same ticket `t` — so ineligibility (provider
+       busy / not parked / multi-consumer) and a full queue both stay byte-identical. Pinned by
+       `direct_handoff_matches_enqueue_park_run_to_completion` (verified the handoff arm actually
+       engages on the second call, then equivalence to handoff-off).
+     - **4d.2 — Mid-handoff park. DONE (2026-08-04).** Falls out of 4d.1's structure for free: if the
+       handoff-served handler parks mid-run, the serve loop's existing `handler_parks` machinery files
+       it and re-parks the loop, so `dispatch()` returns with **no reply stashed** — the caller sees
+       `served == None` and falls through to park on ticket `t` exactly as the enqueue path would; the
+       handler resumes later (its own block-wake) and replies via `t`. Pinned by
+       `direct_handoff_matches_enqueue_park_with_a_parking_handler` (a timed-wait handler; handoff-on ≡
+       handoff-off). *Not yet done:* handoff for a **timed** serve loop (a stale `svc_timer` after a
+       re-park) is conservatively avoided by the fall-through only implicitly — infinite-wait serve
+       loops (the common shape) are the tested path; a timed-serve-loop handoff gate is a later
+       refinement if a consumer needs it.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
    here**, uniformly on all backends. Closes the `live_impl` parity gap.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested

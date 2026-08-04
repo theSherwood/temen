@@ -1960,7 +1960,12 @@ fn drive_arc(
     // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
     // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
     let thaw_root_sp = host.frozen_root_sp.take();
-    let sched = Arc::new(Scheduler::new(quota.max_vcpus, workers));
+    // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
+    let sched = {
+        let mut s = Scheduler::new(quota.max_vcpus, workers);
+        s.handoff = host.handoff();
+        Arc::new(s)
+    };
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
     // each child), then unwrap it back into the caller after every vCPU is gone. The root still owns
@@ -4001,6 +4006,11 @@ struct Scheduler {
     /// Max concurrently-live vCPUs (anti-bomb) and max worker threads.
     cap: usize,
     max_workers: usize,
+    /// CALLS.md 4d — run-global **direct-handoff** mode, copied from the root domain's
+    /// [`Host::handoff`] at [`drive_arc`]. Read (never written) after construction, so it needs no
+    /// lock: a caller resolving a `single` process provider parked at `svc.wait` serves the dispatch
+    /// inline instead of enqueue + `svc_wake` + park. Off ⇒ today's transport, byte-identical.
+    handoff: bool,
 }
 
 /// §3.6 slice 5a — one parked entity in a scheduler waiter map: a whole **vCPU** (the fiberless
@@ -4160,6 +4170,7 @@ impl Scheduler {
             work: Condvar::new(),
             cap,
             max_workers,
+            handoff: false,
         }
     }
 
@@ -4347,6 +4358,24 @@ impl Scheduler {
         } else {
             false
         }
+    }
+
+    /// CALLS.md 4d — direct handoff: if domain `callee_id`'s **own serve loop** is currently parked
+    /// at `svc.wait` (filed in `svc_waiters[callee_id]` with its own domain id == `callee_id`),
+    /// remove and return it so a caller can serve a just-enqueued dispatch inline by donating its
+    /// thread ([`dispatch`]). `None` when no such serve loop is parked — busy mid-handler, running,
+    /// or only cross-domain resumers (whose own domain differs) are filed here — and the caller falls
+    /// back to the enqueue + `svc_wake` + park transport, byte-identical. Takes exactly one serve-loop
+    /// vCPU; a second parked consumer (multi-consumer serve) is left for the wake path.
+    fn take_parked_serve_loop(&self, callee_id: usize) -> Option<Box<VCpu>> {
+        let mut s = self.lock();
+        let q = s.svc_waiters.get_mut(&callee_id)?;
+        let pos = q.iter().position(|v| domain_key_of(v) == callee_id)?;
+        let v = q.remove(pos);
+        if q.is_empty() {
+            s.svc_waiters.remove(&callee_id);
+        }
+        Some(v)
     }
 
     /// CALLS.md 4c.1 — a `single` instance (`ProviderState` pointer `key`) just cleared `busy`:
@@ -10094,6 +10123,36 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         match ticket {
                             Some(t) => {
+                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
+                                // the provider's own serve loop is parked at `svc.wait`, donate this
+                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
+                                // runs it to its next park/finish and re-files it) instead of waking a
+                                // worker and parking. If it serves to completion the reply is stashed
+                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
+                                // continue. If the handler parks mid-handoff (no reply) or the
+                                // provider is ineligible, fall through to the unchanged
+                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
+                                // completes later and replies via `t`).
+                                if let SchedRef::Real(sr) = sched {
+                                    if sr.handoff {
+                                        if let Some(provider) =
+                                            sr.take_parked_serve_loop(callee_id as usize)
+                                        {
+                                            dispatch(sr, provider);
+                                            let served = callee
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .svc_results
+                                                .remove(&t);
+                                            if let Some(rv) = served {
+                                                if !sig.results.is_empty() {
+                                                    frames[top].vals.push(Reg::from_i64(rv));
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 sched.svc_wake(callee_id as usize);
                                 if *cur != ROOT_FIBER {
                                     if let SchedRef::Real(sr) = sched {
@@ -10275,6 +10334,36 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         match ticket {
                             Some(t) => {
+                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
+                                // the provider's own serve loop is parked at `svc.wait`, donate this
+                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
+                                // runs it to its next park/finish and re-files it) instead of waking a
+                                // worker and parking. If it serves to completion the reply is stashed
+                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
+                                // continue. If the handler parks mid-handoff (no reply) or the
+                                // provider is ineligible, fall through to the unchanged
+                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
+                                // completes later and replies via `t`).
+                                if let SchedRef::Real(sr) = sched {
+                                    if sr.handoff {
+                                        if let Some(provider) =
+                                            sr.take_parked_serve_loop(callee_id as usize)
+                                        {
+                                            dispatch(sr, provider);
+                                            let served = callee
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .svc_results
+                                                .remove(&t);
+                                            if let Some(rv) = served {
+                                                if !sig.results.is_empty() {
+                                                    frames[top].vals.push(Reg::from_i64(rv));
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 sched.svc_wake(callee_id as usize);
                                 if *cur != ROOT_FIBER {
                                     if let SchedRef::Real(sr) = sched {
@@ -10382,6 +10471,36 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         match ticket {
                             Some(t) => {
+                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
+                                // the provider's own serve loop is parked at `svc.wait`, donate this
+                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
+                                // runs it to its next park/finish and re-files it) instead of waking a
+                                // worker and parking. If it serves to completion the reply is stashed
+                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
+                                // continue. If the handler parks mid-handoff (no reply) or the
+                                // provider is ineligible, fall through to the unchanged
+                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
+                                // completes later and replies via `t`).
+                                if let SchedRef::Real(sr) = sched {
+                                    if sr.handoff {
+                                        if let Some(provider) =
+                                            sr.take_parked_serve_loop(callee_id as usize)
+                                        {
+                                            dispatch(sr, provider);
+                                            let served = callee
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .svc_results
+                                                .remove(&t);
+                                            if let Some(rv) = served {
+                                                if !sig.results.is_empty() {
+                                                    frames[top].vals.push(Reg::from_i64(rv));
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 sched.svc_wake(callee_id as usize);
                                 if *cur != ROOT_FIBER {
                                     if let SchedRef::Real(sr) = sched {
@@ -14253,6 +14372,13 @@ pub struct Host {
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
     svc_next_ticket: u64,
+    /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
+    /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
+    /// [`Scheduler::handoff`]; a caller finding a `single` process provider parked at `svc.wait` then
+    /// serves the dispatch inline on its own thread instead of enqueue + wake-a-worker + park. Off by
+    /// default ⇒ today's enqueue+park transport, byte-identical. The `handoff-on ≡ handoff-off`
+    /// differential pin toggles exactly this.
+    handoff: bool,
     /// DURABILITY.md §13.3 — this domain's **stable identity** for every serve-path key
     /// (`svc_waiters`/`svc_timers` keys, fiber waiters' domain field, `svc_wake` targets):
     /// process-unique, minted at construction. The `Arc` pointer it replaces was
@@ -14601,6 +14727,7 @@ impl Host {
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
             svc_next_ticket: 0,
+            handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
             live_impls: Vec::new(),
@@ -15165,6 +15292,17 @@ impl Host {
     /// This domain's spawn quota (the clamped value in effect).
     pub fn quota(&self) -> Quota {
         self.quota
+    }
+
+    /// CALLS.md 4d — enable **direct handoff** for a run rooted at this domain (see [`Host::handoff`]).
+    /// Read once at run start ([`drive_arc`]) into the run-global scheduler flag. Off by default; the
+    /// `handoff-on ≡ handoff-off` differential pin sets it on one arm only.
+    pub fn set_handoff(&mut self, on: bool) {
+        self.handoff = on;
+    }
+    /// Whether direct handoff is enabled on this domain (the knob [`drive_arc`] reads).
+    pub fn handoff(&self) -> bool {
+        self.handoff
     }
 
     /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
