@@ -1189,3 +1189,20 @@ fn transpile_fails_closed_on_malformed_input() {
         }
     }
 }
+
+/// Regression (nightly fuzz `wasm_transpile`, ISSUES.md): a module whose type section declares a GC
+/// composite type — here a zero-field `struct` (`0x5f`) — passes wasmparser's default-feature
+/// validator, then used to hit `SubType::unwrap_func()` and panic ("not a func"). We lower only
+/// function types, so this must fail *closed* with a clean `Unsupported`, never abort.
+#[test]
+fn gc_struct_type_is_unsupported_not_panic() {
+    // \0asm + version, then type section (len 3): 1 rec, 0x5f = struct, 0 fields.
+    let wasm: &[u8] = &[0, 97, 115, 109, 1, 0, 0, 0, 1, 3, 1, 0x5f, 0];
+    match svm_wasm::transpile(wasm) {
+        Err(svm_wasm::Error::Unsupported(_)) => {}
+        Err(e) => panic!("expected Unsupported for GC struct type, got other error {e:?}"),
+        Ok(_) => {
+            panic!("expected Unsupported for GC struct type, transpile unexpectedly succeeded")
+        }
+    }
+}
