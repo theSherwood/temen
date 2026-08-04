@@ -102,7 +102,9 @@ fn jacl_compiler_wasmjit_reactor_open_is_well_formed() {
         )
     };
     match opened {
-        Ok(_) => eprintln!("OK: wasm-JIT reactor emits the compiler-guest (wasm-drivable `_start`)"),
+        Ok(_) => {
+            eprintln!("OK: wasm-JIT reactor emits the compiler-guest (wasm-drivable `_start`)")
+        }
         Err(status) => {
             assert_eq!(
                 status, STATUS_UNSUPPORTED,

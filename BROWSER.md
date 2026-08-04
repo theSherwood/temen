@@ -751,11 +751,37 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
    single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; a multi-Worker Node/Chromium twin is the
    remaining **end-to-end** verification.
-   **Deferred (documented):** the multi-Worker Node/Chromium end-to-end twin; §22 `install` +
-   `call_indirect` (Model B2 — an installed unit *is* a funcref old code dispatches to; needs
-   cross-instance wasm-table population); and §14 units whose entry **uses** its instantiator/
-   address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now
-   marshal by type; **v128** unit sigs stay on the interpreter.)*
+   **[landed — §22 Model B2 emitter mechanism + native cross-instance differential]** An installed
+   unit can now be a funcref another instance's `call_indirect` reaches through **one shared reserved
+   funcref table**. [`svm_wasm_jit::compile_module_b2`] emits a module that *imports*
+   `env.__indirect_function_table` (sized to the domain reservation `1<<log2` = `Host::jit_table_log2`)
+   instead of declaring a private one, and populates **nothing** — the host writes every slot
+   (`table.set`), exactly as the interpreter's `DomainTable` is host-populated (`DomainTable::new` +
+   `install`). The confinement mask stays the compile-time constant `idx & (1<<log2 - 1)` (invariant
+   I2 — constant from t=0, so no compiled site holds a stale mask; only *population* is dynamic). Pinned
+   by `crates/svm-wasm-jit/tests/b2_install.rs`: a `call_indirect` from one wasmi instance dispatches to
+   an `install`ed unit in the shared table **≡ the interpreter** for that unit (old→new), a chained hop
+   proves new→new, `uninstall` (nulling a slot) makes a stale call trap, an empty slot / signature
+   mismatch fails **closed** (as `dispatch_indirect` traps on `TABLE_EMPTY` / a type-id mismatch), and a
+   full-index **mask-confinement sweep** (INVARIANTS.md §4) shows every `call_indirect idx` — including
+   over-range — lands in `idx & (size-1)`, never outside `[0, size)`.
+   **[landed — the browser B2 wiring, one instance-domain]** `svm_wasmjit_compile_b2` (browser cdylib)
+   emits a B2 unit via `compile_module_b2`, and `browser/web/wasmjit_b2.js` (`openB2Domain`) owns one
+   shared `WebAssembly.Table` sized to the reservation: `compile` instantiates each unit importing that
+   table + the cdylib memory; `install(inst, slot)` does `table.set(slot, inst.exports.f0)` and
+   `uninstall(slot)` nulls it — the JS analog of `DomainTable::install` / the `b2_install.rs` host, so a
+   unit's `call_indirect` dispatches at native wasm speed to whatever is installed. The cdylib export
+   compiles; the shared-table dispatch it drives is the exact shape proven native in `b2_install.rs`.
+   **Deferred (documented):** **cross-Worker** B2 — wasm funcrefs are *not* transferable across Workers
+   (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each Worker must hold its **own**
+   `WebAssembly.Table` mirroring the shared slot→unit map (instantiating an installed unit locally and
+   `table.set`ting its own funcref at the shared slot index). That **mirror design is proven native** by
+   `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
+   the same install map and every one agrees with the interpreter oracle); wiring `openB2Domain` into
+   the par `Jit.invoke`/`install` path + a Node/Chromium end-to-end twin is the remaining verification. Also
+   deferred: §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on
+   wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay
+   on the interpreter — the cap ABI is scalar-only by design, §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
