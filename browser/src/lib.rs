@@ -536,6 +536,12 @@ pub struct ParVcpu {
     /// [`svm_par_jit_result_types_ptr`] — a §22 unit need not be all-i64.
     jit_param_types: Vec<u8>,
     jit_result_types: Vec<u8>,
+    /// The emitted wasm of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit (the shared-host
+    /// path, [`svm_par_powerbox_jit_runtime`]): the JS host reads its bytes via
+    /// [`svm_par_jit_code_wasm_ptr`]/[`svm_par_jit_code_wasm_len`] to instantiate the unit once,
+    /// caching the instance by [`jit_code`](ParVcpu::jit_code). `None` for the fixed-unit codegen path
+    /// (that reads the run-wide [`JIT_UNIT_WASM`] stash). The `Arc` keeps the bytes alive for the read.
+    jit_wasm: Option<std::sync::Arc<[u8]>>,
 }
 
 /// SVM scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
@@ -563,6 +569,7 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         jit_code: 0,
         jit_param_types: Vec::new(),
         jit_result_types: Vec::new(),
+        jit_wasm: None,
     }))
 }
 
@@ -815,6 +822,7 @@ pub extern "C" fn svm_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i3
     // Last-published run recipe wins (a page runs several kinds back to back).
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
     PAR_JIT_CODEGEN.store(false, std::sync::atomic::Ordering::Release); // this is the interp JIT path
     1
 }
@@ -949,6 +957,7 @@ pub extern "C" fn svm_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: 
     PAR_PB.store(pb as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -1025,6 +1034,7 @@ pub extern "C" fn svm_par_powerbox_inst(win_size: u64, mod_ptr: *const u8, mod_l
     // Last-published run recipe wins (a page runs several kinds back to back).
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -1159,6 +1169,7 @@ pub extern "C" fn svm_par_powerbox_io() -> i32 {
     PAR_IO.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -1172,6 +1183,7 @@ pub extern "C" fn svm_par_powerbox_none() {
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
     PAR_JIT_CODEGEN.store(false, std::sync::atomic::Ordering::Release);
 }
 
@@ -1181,6 +1193,79 @@ fn par_io() -> Option<&'static ParIoCfg> {
     let p = PAR_IO.load(std::sync::atomic::Ordering::Acquire) as *const ParIoCfg;
     // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
     unsafe { p.as_ref() }
+}
+
+// ---- §22 runtime `Jit.compile` on the wasm tier (single-Worker) ----------------------------------
+// Unlike `ParPowerbox` (a *fixed* unit host-compiled at setup, its code handle handed to the guest),
+// this powerbox lets the guest build an IR blob **at runtime**, `compile` it — minting a unit **and
+// emitting its wasm** in this host, because the `Jit` grant carries the browser validator + emitter and
+// the vCPU dispatches its `cap.call`s through this shared `Mutex<Host>` (`with_shared_host`) — then
+// `invoke` it on that emitted wasm. The shared `Mutex` is also the seam threaded compile will serialize
+// on (DESIGN.md §22), so this is the single-Worker step of the same design, not a throwaway.
+
+/// The runtime-`Jit.compile` powerbox recipe: the shared host (grant + validator + emitter) and the
+/// `Jit` domain handle the root is seeded with.
+struct ParJitCfg {
+    host: std::sync::Mutex<Host>,
+    /// The `Jit` domain handle (the root's single entry arg).
+    jit: i32,
+}
+
+/// The leaked [`ParJitCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+static PAR_JIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Publish the runtime-`Jit.compile` powerbox: a fresh `Host` granted `Jit` (memory-match precondition
+/// from the guest's declared memory) with [`browser_jit_validator`] + [`browser_jit_wasm_emitter`]
+/// installed, wrapped in the shared `Mutex` the vCPU dispatches `cap.call` through. The root is seeded
+/// `[jit]` ([`svm_par_root`]); the guest builds an IR blob, `compile`s it (emitting wasm), and
+/// `invoke`s it on the emitted region. Codegen on by default (flip with [`svm_par_jit_set_codegen`] to
+/// run the interpreter path for a differential). Call once (on the main thread) before the run; the
+/// other run recipes are cleared (last-published-wins). Returns `1`, or `0` on a bad guest module.
+#[no_mangle]
+pub extern "C" fn svm_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: usize) -> i32 {
+    par_run_gen_bump(); // I22: one bump per run
+                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return 0;
+    };
+    let mut host = Host::new();
+    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
+    let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
+    let cfg = Box::into_raw(Box::new(ParJitCfg {
+        host: std::sync::Mutex::new(host),
+        jit,
+    }));
+    PAR_JIT.store(cfg as usize, std::sync::atomic::Ordering::Release);
+    PAR_PB.store(0, std::sync::atomic::Ordering::Release);
+    PAR_INST.store(0, std::sync::atomic::Ordering::Release);
+    PAR_IO.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT_CODEGEN.store(true, std::sync::atomic::Ordering::Release);
+    1
+}
+
+/// Borrow the published runtime-`Jit.compile` powerbox (`None` until [`svm_par_powerbox_jit_runtime`]).
+fn par_jit_rt() -> Option<&'static ParJitCfg> {
+    let p = PAR_JIT.load(std::sync::atomic::Ordering::Acquire) as *const ParJitCfg;
+    // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
+    unsafe { p.as_ref() }
+}
+
+/// Resolve a `JitInvoke` event's authority against the shared runtime-compile host (mirrors
+/// [`par_resolve_unit`]) and hand back the unit's funcs + its emitted wasm.
+fn par_resolve_unit_rt(
+    h: &Host,
+    handle: i32,
+    code: i32,
+) -> Result<(std::sync::Arc<[svm_ir::Func]>, Option<std::sync::Arc<[u8]>>), Trap> {
+    let domain = h.resolve_jit_domain(handle)?;
+    let (cd, cu) = h.resolve_jit_code(code)?;
+    if cd != domain {
+        return Err(Trap::CapFault);
+    }
+    let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
+    Ok((funcs, h.jit_unit_wasm(cd, cu)))
 }
 
 /// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
@@ -1262,6 +1347,25 @@ pub extern "C" fn svm_par_root(
             host,
         ) {
             Ok(inner) => par_box(inner),
+            Err(_) => {
+                par_vcpu_retire();
+                core::ptr::null_mut()
+            }
+        };
+    }
+    // A §22 **runtime-compile** run: the guest's `Jit` authority + validator + emitter live in the
+    // shared `Mutex<Host>` it dispatches `cap.call`s through (`with_shared_host`), so its runtime
+    // `compile` mints + emits into that host. Seed `[jit]` only — the guest compiles its own unit.
+    if let Some(cfg) = par_jit_rt() {
+        // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+        return match bytecode::Vcpu::new_root(
+            unsafe { prog_ref(prog) },
+            func,
+            &[Value::I32(cfg.jit)],
+            back,
+            &[],
+        ) {
+            Ok(inner) => par_box(inner.with_shared_host(&cfg.host)),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -1512,45 +1616,73 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 argv,
                 params,
                 results,
-            } => match par_pb() {
-                None => return PAR_TRAP,
-                Some(pb) => {
-                    // Real-codegen path (slice 5): codegen mode on, the unit is emitted, and every
-                    // arg/result is a **scalar** (i32/i64/f32/f64) — the Worker marshals each i64 slot
-                    // to/from the wasm type the emitted `f{entry}` uses (the type codes travel via
-                    // `jit_param_types`/`jit_result_types`). Authority still resolves through the
-                    // powerbox — a forged / cross-domain handle must trap identically — then the invoke
-                    // surfaces to JS. Anything else (codegen off, a v128 unit sig, no emitted wasm)
-                    // stays on the interpreter.
-                    let codes = |ts: &[svm_ir::ValType]| {
-                        ts.iter()
-                            .map(|t| scalar_type_code(*t))
-                            .collect::<Option<Vec<u8>>>()
+            } => {
+                // Scalar arg/result type codes (i32/i64/f32/f64) the JS host marshals each i64 slot
+                // by; `None` if any operand is v128 (no lane marshalling — the unit stays on interp).
+                let codes = |ts: &[svm_ir::ValType]| {
+                    ts.iter()
+                        .map(|t| scalar_type_code(*t))
+                        .collect::<Option<Vec<u8>>>()
+                };
+                let (ptypes, rtypes) = (codes(&params), codes(&results));
+                if let Some(cfg) = par_jit_rt() {
+                    // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared
+                    // host, its wasm emitted there; run it on that per-unit wasm (JS instantiates it
+                    // keyed by the code handle, reading `svm_par_jit_code_wasm_ptr`/`_len`). Authority
+                    // resolves through the same host — a forged / cross-domain handle traps identically.
+                    // Codegen off / v128 / a unit outside the emitter subset ⇒ the interpreter services it.
+                    let resolved = {
+                        let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                        par_resolve_unit_rt(&g, handle, code)
                     };
-                    let (ptypes, rtypes) = (codes(&params), codes(&results));
-                    let codegen = par_jit_codegen()
-                        && svm_par_jit_unit_wasm_len() > 0
-                        && ptypes.is_some()
-                        && rtypes.is_some();
-                    if codegen {
-                        match par_resolve_unit(pb, handle, code) {
-                            Ok(_) => {
+                    match resolved {
+                        Err(t) => v.inner.deliver_jit_invoke(Err(t)),
+                        Ok((funcs, wasm)) => {
+                            let codegen = par_jit_codegen()
+                                && wasm.is_some()
+                                && ptypes.is_some()
+                                && rtypes.is_some();
+                            if codegen {
                                 v.jit_argv = argv.into_vec();
                                 v.jit_code = code;
                                 v.jit_param_types = ptypes.unwrap();
                                 v.jit_result_types = rtypes.unwrap();
+                                v.jit_wasm = wasm;
                                 return PAR_JIT_INVOKE;
                             }
-                            // Forged/cross-domain handle: deliver the trap on the interpreter path
-                            // (Err ⇒ the vCPU traps on its next run), identical to interp servicing.
-                            Err(t) => v.inner.deliver_jit_invoke(Err(t)),
+                            v.inner.deliver_jit_invoke(Ok(funcs));
                         }
-                    } else {
-                        v.inner
-                            .deliver_jit_invoke(par_resolve_unit(pb, handle, code));
+                    }
+                } else {
+                    // Fixed-unit codegen path (slice 5): the run's single unit was host-compiled at
+                    // setup and emitted to the run-wide `JIT_UNIT_WASM` stash. Authority still resolves
+                    // through the powerbox — a forged / cross-domain handle must trap identically.
+                    match par_pb() {
+                        None => return PAR_TRAP,
+                        Some(pb) => {
+                            let codegen = par_jit_codegen()
+                                && svm_par_jit_unit_wasm_len() > 0
+                                && ptypes.is_some()
+                                && rtypes.is_some();
+                            if codegen {
+                                match par_resolve_unit(pb, handle, code) {
+                                    Ok(_) => {
+                                        v.jit_argv = argv.into_vec();
+                                        v.jit_code = code;
+                                        v.jit_param_types = ptypes.unwrap();
+                                        v.jit_result_types = rtypes.unwrap();
+                                        return PAR_JIT_INVOKE;
+                                    }
+                                    Err(t) => v.inner.deliver_jit_invoke(Err(t)),
+                                }
+                            } else {
+                                v.inner
+                                    .deliver_jit_invoke(par_resolve_unit(pb, handle, code));
+                            }
+                        }
                     }
                 }
-            },
+            }
             // §14 confined executor child (THREADS.md 4c-domain §14-D2): all authority-bearing work
             // already happened in-Vm — the operands are inert integers the JS host shuttles into a
             // new Worker running `svm_par_child_confined` over `[win + carve, +2^size_log2)`, joined
@@ -1696,6 +1828,25 @@ pub extern "C" fn svm_par_jit_result_types_ptr(v: *mut ParVcpu) -> *const u8 {
 pub extern "C" fn svm_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).jit_result_types.len() }
+}
+
+/// Pointer / length of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit wasm (the shared-host
+/// path, [`svm_par_powerbox_jit_runtime`]): the JS host instantiates it once and caches the instance by
+/// [`jit_code`](ParVcpu::jit_code). `(null, 0)` for the fixed-unit codegen path (that reads the run-wide
+/// [`svm_par_jit_unit_wasm_ptr`] stash instead). The bytes stay valid until the next `svm_par_run`.
+#[no_mangle]
+pub extern "C" fn svm_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe {
+        (*v).jit_wasm
+            .as_ref()
+            .map_or(core::ptr::null(), |w| w.as_ptr())
+    }
+}
+#[no_mangle]
+pub extern "C" fn svm_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe { (*v).jit_wasm.as_ref().map_or(0, |w| w.len()) }
 }
 
 /// Deliver the results of a §22 unit run on emitted wasm (after `PAR_JIT_INVOKE`): `[results_ptr, n)`
@@ -5840,6 +5991,25 @@ fn browser_jit_validator(
         return Err(EINVAL);
     }
     Ok(m.funcs.into())
+}
+
+/// The wasm-JIT emitter the runtime-`Jit.compile` path installs ([`svm_par_powerbox_jit_runtime`],
+/// via [`Host::set_jit_wasm_emitter`]): emit a **validated closed unit**'s entry as `f0(win, env,
+/// args…)` against **shared** memory (the browser's `SharedArrayBuffer`), or `None` if it is outside
+/// the emitter subset — then `invoke` runs on the interpreter, fail-closed. A bare `fn`
+/// (`svm_interp::JitWasmEmitter`), so the core stores only the opaque bytes. The unit was already
+/// decode+verify+precondition-gated by [`browser_jit_validator`]; this re-decodes those same bytes.
+fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
+    let m = svm_encode::decode_module(blob).ok()?;
+    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry: 0 }, true) {
+        Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) => Some(wasm),
+        // Interp-driven / unsupported ⇒ nothing to run as `f0`; the unit invokes on the interpreter.
+        _ => None,
+    }
 }
 
 /// A unit the guest-JIT path installs and calls: `service(a, b) = a*b + 100`. Host-compiled (the

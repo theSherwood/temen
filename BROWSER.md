@@ -725,10 +725,22 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    Workers, 8 children on wasm). Correctness rests on the emitter's existing load-op differential
    (`differential.rs`) plus this end-to-end orchestration differential — §14's established proof mode
    (ground truths asserted in the JS host).
-   **Deferred (documented):** §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a
-   funcref old code dispatches to; needs cross-instance wasm-table population), guest-**compiled**
-   units (the guest builds IR at runtime — needs the emitted bytes to cross Workers with the code
-   handle, a shared registry with synchronization) and §14 units whose entry **uses** its
+   **[landed — the runtime-compile→emit mechanism, native differential]** The dynamic loop's core is
+   in the TCB-side seam, not the JS host: `Host` now carries an injected wasm emitter
+   (`set_jit_wasm_emitter`, a bare `fn` like the `JitValidator`), so a closed-blob `Jit.compile` — the
+   guest building IR at runtime and running the shared decode→verify→memory-match gate — also emits the
+   unit's wasm and stashes it on the `JitUnit` (`Host::jit_unit_wasm`); a later `invoke` runs that
+   guest-own unit's `f0(win, env, args…)` instead of a fixed setup unit. The mechanism is pinned by
+   `crates/svm/tests/jit_wasm_codegen.rs`: a resumable `Vcpu` guest `compile`s a unit at runtime then
+   `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
+   (value + trap, i32/i64 sigs; the `emitted_ran` guard rejects a silent interp fallback). Zero cost
+   when unset — every non-browser run leaves the emitter `None`, and `compile_linked` units are not
+   emitted yet (interpreter-only invoke).
+   **Deferred (documented):** the **browser wiring** on top of the seam above — the JS host
+   instantiating each runtime-emitted unit keyed by its code handle (single-Worker), then the
+   **cross-Worker registry** carrying the emitted bytes + handle between Workers with synchronization;
+   §22 `install` + `call_indirect` (Model B2 — an installed unit *is* a funcref old code dispatches to;
+   needs cross-instance wasm-table population); and §14 units whose entry **uses** its
    instantiator/address-space caps (nested VM-in-VM on wasm). *(All scalar unit signatures —
    i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay on the interpreter.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench

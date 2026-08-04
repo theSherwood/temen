@@ -629,6 +629,8 @@ dependencies = [
  "svm-text",
  "svm-verify",
  "svm-wasm",
+ "svm-wasm-jit",
+ "wasmi",
 ]
 
 [[package]]
