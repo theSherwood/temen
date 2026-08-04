@@ -30,7 +30,8 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen } = e.data;
+    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    jitB2 } = e.data;
   // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
   // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -102,6 +103,54 @@ self.onmessage = async (e) => {
     jitUnit = uinst.exports;
     jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   }
+
+  // §22 Model B2 cross-Worker (BROWSER.md § "wasm-JIT tier"): a runtime-`Jit.compile`d unit's
+  // `call_indirect` must reach units another Worker `install`ed. wasm funcrefs can't cross Workers,
+  // so this Worker holds its OWN funcref table mirroring the shared interpreter `Domain`'s slot→unit
+  // map, and instantiates each installed unit locally (the emitted units import this table — the Rust
+  // emitter runs in B2 mode, `svm_par_jit_set_b2`). Enabled by `jitB2` (the page sets both).
+  //   NOTE: this whole B2 cross-Worker path is written to-pattern but is *browser-verification
+  //   pending* — it has no native/CI harness in this repo yet (the mirror design itself is proven
+  //   native by `crates/svm-wasm-jit/tests/b2_install.rs::b2_per_worker_mirror_is_consistent`).
+  let jitTable = null;
+  const jitInstCache = new Map(); // code handle → instance.exports (per-Worker instantiation)
+  if (jitB2) {
+    const size = 1 << ex.svm_par_jit_table_log2();
+    jitTable = new WebAssembly.Table({ initial: size, maximum: size, element: 'anyfunc' });
+    if (!jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
+  }
+  // Instantiate a unit's emitted bytes importing this Worker's shared table, or null if not emitted.
+  const jitInstantiate = (bytes) =>
+    new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        __indirect_function_table: jitTable,
+      },
+    }).exports;
+  // Get-or-instantiate the unit for a code handle (cached per Worker); null if it has no emitted wasm.
+  const jitUnitFor = (code) => {
+    let inst = jitInstCache.get(code);
+    if (inst) return inst;
+    const len = ex.svm_par_jit_code_wasm_by_handle_len(code);
+    if (len === 0) return null;
+    const ptr = Number(ex.svm_par_jit_code_wasm_by_handle_ptr(code));
+    inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
+    jitInstCache.set(code, inst);
+    return inst;
+  };
+  // Mirror the shared `Domain` slot→unit map into this Worker's table: `f0` of the installed unit, or
+  // null for an empty/uninstalled slot (so a stale `call_indirect` traps). Called before each invoke.
+  const jitSyncTable = () => {
+    const size = 1 << ex.svm_par_jit_table_log2();
+    for (let slot = 0; slot < size; slot++) {
+      const code = ex.svm_par_jit_slot_code(slot);
+      if (code < 0) { jitTable.set(slot, null); continue; }
+      const inst = jitUnitFor(code);
+      jitTable.set(slot, inst ? inst['f0'] : null);
+    }
+  };
 
   // §14 instantiate real codegen (BROWSER.md slice 5): a confined child whose granted-unit entry is
   // fully in-subset runs it on EMITTED WASM here and fills the completion slot the parent joins — no
@@ -280,8 +329,17 @@ self.onmessage = async (e) => {
       for (let i = 0; i < n; i++) args.push(jitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
       new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted invokes (non-vacuity)
+      // Model B2: mirror the shared dispatch table into this Worker's table, then run the *invoked*
+      // unit (resolved by its code handle) — whose `call_indirect`s now reach installed units locally.
+      // Otherwise the fixed-unit codegen path runs the run's single pre-instantiated `jitUnit`.
+      let unit = jitUnit;
+      if (jitB2) {
+        jitSyncTable();
+        unit = jitUnitFor(ex.svm_par_jit_code(v));
+        if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      }
       try {
-        const ret = jitUnit['f0'](win, jitEnvCell, ...args);
+        const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rn = Number(ex.svm_par_jit_result_types_len(v));
         const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_result_types_ptr(v)), rn);

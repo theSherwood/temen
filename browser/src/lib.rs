@@ -1268,6 +1268,95 @@ fn par_resolve_unit_rt(
     Ok((funcs, h.jit_unit_wasm(cd, cu)))
 }
 
+/// §22 **Model B2 cross-Worker** mirror registry: `slot → the code handle installed there` (or `-1`
+/// empty), shared across every Worker (one arena / one set of statics behind the shared memory). The
+/// shared interpreter `Domain` dispatch table is atomics-in-memory but has no slot→emitted-wasm link;
+/// this records it at the (Rust-serviced) `install`/`uninstall` sites so a Worker can rebuild its own
+/// `WebAssembly.Table` from `(slot → code → svm_par_jit_code_wasm_by_handle)`. Sized lazily to the
+/// grant reservation `1 << PAR_JIT_TABLE_LOG2`.
+static PAR_JIT_SLOT_CODE: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+fn par_jit_slot_record(slot: usize, code: i32) {
+    let mut v = PAR_JIT_SLOT_CODE.lock().unwrap_or_else(|e| e.into_inner());
+    let need = 1usize << PAR_JIT_TABLE_LOG2;
+    if v.len() < need {
+        v.resize(need, -1);
+    }
+    if let Some(e) = v.get_mut(slot) {
+        *e = code;
+    }
+}
+
+fn par_jit_slot_clear(slot: usize) {
+    let mut v = PAR_JIT_SLOT_CODE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = v.get_mut(slot) {
+        *e = -1;
+    }
+}
+
+/// When on, the runtime-`Jit.compile` emitter emits **Model B2** units (importing the shared reserved
+/// funcref table) instead of local-table units — so an installed unit's `call_indirect` dispatches to
+/// other installed units through the per-Worker table mirror. Off by default (the emitted-unit shape
+/// changes, so the JS host must provide `env.__indirect_function_table`).
+static PAR_JIT_B2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn par_jit_b2() -> bool {
+    PAR_JIT_B2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Toggle Model-B2 emission for the runtime-compile tier (see [`PAR_JIT_B2`]). The JS host sets this
+/// on iff it provides each Worker a shared `WebAssembly.Table` import.
+#[no_mangle]
+pub extern "C" fn svm_par_jit_set_b2(on: i32) {
+    PAR_JIT_B2.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The §22 `Jit` dispatch-table reservation (`log2` of the slot count) — the size the JS host makes
+/// each per-Worker `WebAssembly.Table`, matching the emitted `call_indirect` mask `idx & (2^n - 1)`.
+#[no_mangle]
+pub extern "C" fn svm_par_jit_table_log2() -> u32 {
+    PAR_JIT_TABLE_LOG2 as u32
+}
+
+/// The code handle installed at dispatch-table `slot` (or `-1` if empty) — the mirror map a Worker
+/// reads to rebuild its per-Worker `WebAssembly.Table` (§22 B2 cross-Worker).
+#[no_mangle]
+pub extern "C" fn svm_par_jit_slot_code(slot: u32) -> i32 {
+    let v = PAR_JIT_SLOT_CODE.lock().unwrap_or_else(|e| e.into_inner());
+    v.get(slot as usize).copied().unwrap_or(-1)
+}
+
+/// Emitted-wasm length for **any** code handle in the runtime domain (not just the pending invoke's),
+/// so a Worker can instantiate a slot's unit it hasn't itself invoked. `0` if none. The bytes (via
+/// [`svm_par_jit_code_wasm_by_handle_ptr`]) live in the shared host's heap = shared linear memory,
+/// held for the process, so the returned pointer stays valid.
+#[no_mangle]
+pub extern "C" fn svm_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
+    par_jit_rt()
+        .and_then(|cfg| {
+            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            g.resolve_jit_code(handle)
+                .ok()
+                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .map(|w| w.len())
+        })
+        .unwrap_or(0)
+}
+
+/// Pointer to the emitted-wasm for `handle` (see [`svm_par_jit_code_wasm_by_handle_len`]).
+#[no_mangle]
+pub extern "C" fn svm_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 {
+    par_jit_rt()
+        .and_then(|cfg| {
+            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            g.resolve_jit_code(handle)
+                .ok()
+                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .map(|w| w.as_ptr())
+        })
+        .unwrap_or(core::ptr::null())
+}
+
 /// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
 /// give the spawner a clean `ThreadFault`; here a construction past the cap returns null and the JS
 /// host fails the run — cruder, but it bounds Worker creation). Incremented by the `svm_par_*` vCPU
@@ -1606,18 +1695,37 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             // 4c-domain C2): resolve the unit (the powerbox holds authority) and deliver it; the vCPU
             // installs / invokes against the shared `Domain`, then we loop. Without a powerbox (a
             // non-JIT run) a JIT op is fail-closed, exactly as before this seam existed.
-            bytecode::VcpuEvent::JitInstall { handle, code } => match par_pb() {
-                Some(pb) => v
-                    .inner
-                    .deliver_jit_install(par_resolve_unit(pb, handle, code)),
-                None => return PAR_TRAP,
-            },
-            bytecode::VcpuEvent::JitUninstall { handle, .. } => match par_pb() {
-                Some(pb) => v
-                    .inner
-                    .deliver_jit_uninstall(pb.host.resolve_jit_domain(handle).map(|_| ())),
-                None => return PAR_TRAP,
-            },
+            bytecode::VcpuEvent::JitInstall { handle, code } => {
+                // Resolve the unit via whichever powerbox this run holds — fixed-unit (`par_pb`) or
+                // runtime-compile (`par_jit_rt`). Both surface a `JitInstall` event; the runtime path
+                // was previously unwired here (it would trap). The filled slot is recorded per code
+                // handle so each Worker can mirror the shared `Domain` into its own `WebAssembly.Table`
+                // (§22 Model B2 cross-Worker — funcrefs can't cross Workers).
+                let resolved = if let Some(pb) = par_pb() {
+                    par_resolve_unit(pb, handle, code)
+                } else if let Some(cfg) = par_jit_rt() {
+                    let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                    par_resolve_unit_rt(&g, handle, code).map(|(f, _)| f)
+                } else {
+                    return PAR_TRAP;
+                };
+                if let Some(slot) = v.inner.deliver_jit_install(resolved) {
+                    par_jit_slot_record(slot, code);
+                }
+            }
+            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
+                let authorized = if let Some(pb) = par_pb() {
+                    pb.host.resolve_jit_domain(handle).map(|_| ())
+                } else if let Some(cfg) = par_jit_rt() {
+                    let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                    g.resolve_jit_domain(handle).map(|_| ())
+                } else {
+                    return PAR_TRAP;
+                };
+                if let Some(slot) = v.inner.deliver_jit_uninstall(authorized) {
+                    par_jit_slot_clear(slot); // keep each Worker's table mirror exact (stale call traps)
+                }
+            }
             bytecode::VcpuEvent::JitInvoke {
                 handle,
                 code,
@@ -6047,6 +6155,12 @@ fn browser_jit_validator(
 /// decode+verify+precondition-gated by [`browser_jit_validator`]; this re-decodes those same bytes.
 fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let m = svm_encode::decode_module(blob).ok()?;
+    if par_jit_b2() {
+        // §22 Model B2 cross-Worker: emit a unit that imports the shared reserved funcref table, so its
+        // `call_indirect` dispatches (at native wasm speed) to units installed in the per-Worker table
+        // mirror. Whole-module in-subset only; otherwise fail-closed to the interpreter (`.ok()`).
+        return svm_wasm_jit::compile_module_b2(&m, true, PAR_JIT_TABLE_LOG2 as u32).ok();
+    }
     match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry: 0 }, true) {
         Ok(svm_wasm_jit::Artifact {
             wasm,

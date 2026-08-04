@@ -3230,7 +3230,16 @@ impl<'p> Vcpu<'p> {
     /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call_indirect` it), the
     /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
     /// written to the awaiting dst.
-    pub fn deliver_jit_install(&mut self, funcs: Result<std::sync::Arc<[Func]>, Trap>) {
+    ///
+    /// Returns `Some(slot)` iff the unit was actually installed (the slot the guest received), else
+    /// `None` (trap / `-ENOSPC`). A wasm-tier host uses this to mirror the shared `Domain` slot into a
+    /// per-Worker `WebAssembly.Table` (§22 Model B2 cross-Worker) — funcrefs can't cross Workers, so
+    /// each Worker learns *which slot* an install filled and populates its own table. The `Domain`
+    /// itself stays wasm-agnostic; the slot→code-handle→emitted-wasm mapping lives in the host.
+    pub fn deliver_jit_install(
+        &mut self,
+        funcs: Result<std::sync::Arc<[Func]>, Trap>,
+    ) -> Option<usize> {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
         };
@@ -3238,10 +3247,10 @@ impl<'p> Vcpu<'p> {
             Ok(f) => f,
             Err(t) => {
                 self.trap = Some(t);
-                return;
+                return None;
             }
         };
-        let res = match compile_module(&funcs) {
+        let (res, slot) = match compile_module(&funcs) {
             // Install into THIS vCPU's domain (== the shared one for a root; a §14 confined child —
             // which can't hold a Jit cap anyway — would only ever fill its own table).
             Some(unit) => match self
@@ -3250,35 +3259,39 @@ impl<'p> Vcpu<'p> {
                 .unwrap_or(&self.prog.dom)
                 .install(unit)
             {
-                Some(slot) => slot as i64,
-                None => super::ENOSPC,
+                Some(slot) => (slot as i64, Some(slot)),
+                None => (super::ENOSPC, None),
             },
             None => {
                 self.trap = Some(Trap::Malformed); // unit op outside coverage
-                return;
+                return None;
             }
         };
         self.vt.active.set(dst, Reg::from_i64(res));
+        slot
     }
 
     /// Deliver the authority check for a `JitUninstall`: `Err` propagates as a trap; `Ok(())` clears the
     /// shared table `slot` (`0` on success, `EINVAL` for a real-func / out-of-range / already-empty slot).
-    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) {
+    ///
+    /// Returns `Some(slot)` iff a slot was actually cleared, so a wasm-tier host can null the matching
+    /// per-Worker `WebAssembly.Table` slot (the `deliver_jit_install` counterpart) — keeping each
+    /// Worker's mirror exact so a stale `call_indirect` traps.
+    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) -> Option<usize> {
         let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_uninstall with no pending uninstall");
         };
         if let Err(t) = authorized {
             self.trap = Some(t);
-            return;
+            return None;
         }
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let n_real = dom.source.primary().progs.len();
-        let res = if dom.uninstall(slot as usize, n_real) {
-            0
-        } else {
-            super::EINVAL
-        };
-        self.vt.active.set(dst, Reg::from_i64(res));
+        let cleared = dom.uninstall(slot as usize, n_real);
+        self.vt
+            .active
+            .set(dst, Reg::from_i64(if cleared { 0 } else { super::EINVAL }));
+        cleared.then_some(slot as usize)
     }
 
     /// Deliver the resolved unit funcs for a `JitInvoke`: `Err` propagates as a trap; `Ok(funcs)` is

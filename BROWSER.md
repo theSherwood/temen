@@ -772,16 +772,26 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `uninstall(slot)` nulls it — the JS analog of `DomainTable::install` / the `b2_install.rs` host, so a
    unit's `call_indirect` dispatches at native wasm speed to whatever is installed. The cdylib export
    compiles; the shared-table dispatch it drives is the exact shape proven native in `b2_install.rs`.
-   **Deferred (documented):** **cross-Worker** B2 — wasm funcrefs are *not* transferable across Workers
-   (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each Worker must hold its **own**
-   `WebAssembly.Table` mirroring the shared slot→unit map (instantiating an installed unit locally and
-   `table.set`ting its own funcref at the shared slot index). That **mirror design is proven native** by
+   **[landed — cross-Worker B2 mirror wiring, *browser-verification pending*]** wasm funcrefs are *not*
+   transferable across Workers (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each
+   Worker holds its **own** `WebAssembly.Table` mirroring the shared slot→unit map. The plumbing:
+   *(Rust, compiles + regression-tested)* `deliver_jit_install`/`deliver_jit_uninstall` now return the
+   filled/cleared **slot**; the browser records `slot → code-handle` in a shared registry
+   (`PAR_JIT_SLOT_CODE`) at the (now runtime-path-wired) install/uninstall sites; FFI exposes
+   `svm_par_jit_table_log2`, `svm_par_jit_slot_code`, `svm_par_jit_code_wasm_by_handle_{ptr,len}`, and a
+   `svm_par_jit_set_b2` toggle routes the runtime emitter through `compile_module_b2`. *(JS, to-pattern)*
+   `worker.js` gives each Worker a per-Worker `WebAssembly.Table` + a per-code instance cache, and
+   before each `JIT_INVOKE` mirrors the shared map (`slot_code` → instantiate-by-handle → `table.set`,
+   nulling empty slots so a stale `call_indirect` traps), then runs the invoked unit resolved by its
+   code handle; `par.js` sets the toggle + passes `jitB2`. The **mirror design is proven native** by
    `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
-   the same install map and every one agrees with the interpreter oracle); wiring `openB2Domain` into
-   the par `Jit.invoke`/`install` path + a Node/Chromium end-to-end twin is the remaining verification. Also
-   deferred: §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on
-   wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay
-   on the interpreter — the cap ABI is scalar-only by design, §17.)*
+   the same install map, all agreeing with the interpreter oracle). **Pending:** this multi-Worker JS
+   path has no native/CI harness in-repo — it needs a Chromium/Node end-to-end twin, and the
+   multi-Worker runtime-compile powerbox itself is still only driven by the single-Worker
+   `jitcodegen_runtime.mjs` (par.js's `runAcrossWorkers` carries the `jitB2` flag but not yet the
+   runtime-powerbox setup). Also deferred: §14 units whose entry **uses** its instantiator/address-space
+   caps (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type;
+   **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design, §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
