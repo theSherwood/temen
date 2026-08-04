@@ -19,4 +19,5 @@ svm-ir.workspace = true
 svm-text.workspace = true
 svm-verify.workspace = true
 svm-interp.workspace = true
+svm-jit.workspace = true
 wasmi = { version = "0.47", features = ["simd"] }

@@ -116,7 +116,9 @@ async function main() {
         const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
         const args = [];
         for (let i = 0; i < n; i++) args.push(jitArg(new BigInt64Array(memory.buffer)[(argvPtr >> 3) + i], ptypes[i]));
-        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        // fuel now lives in the emitted `fuel` global (register-allocatable, see WASM.md);
+        // re-arm the per-region budget on the exported global (the old env-cell write was here).
+        f.fuel.value = 1n << 61n;
         try {
           const ret = f['f0'](win, envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];

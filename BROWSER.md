@@ -980,6 +980,43 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    with a proof the confinement invariant holds) or **function splitting** are the real targets;
    stackification is not.
 
+### Fuel in a global (LANDED — the highest-ROI emitter win measured so far)
+
+The per-dispatch fuel debit was an `i64` load+store against a **linear-memory** cell (`env` offset 0),
+run once per dispatcher iteration. V8 cannot keep that cell in a register across a hot loop: the guest's
+own memory stores (`win + (addr & mask)`) may-alias `env`, so TurboFan must reload fuel from memory
+every iteration. Moving the counter to a **mutable wasm `i64` global** (exported `"fuel"`) removes the
+aliasing — a global is a distinct storage class no memory store can touch — so V8 register-allocates it.
+Semantics are unchanged: same debit (once per dispatch), same `< 0` trap, so the `OutOfFuel` differential
+holds bit-for-bit (`tests/differential.rs` seeds and asserts against the global). The global
+self-initializes to the standard `1<<61` region budget, so every existing host seed site (which wrote
+exactly `1<<61` to the `env` cell) is a byte-identical no-op — a drop-in.
+
+Measured, this machine class (per-loop-iteration ns; `crates/svm-wasm-jit/examples/fuelbench.{rs,mjs}`,
+min-over-reps, large/small-`n` subtraction, TurboFan-warmed). `mem` = old linear-memory fuel, `global`
+= this change, `nofuel` = the fuel debit removed entirely (the upper bound):
+
+| kernel (hot loop) | wasm-JIT `mem` | wasm-JIT `global` | speedup | `nofuel` bound | for scale: bytecode / cranelift(native) |
+| --- | --: | --: | --: | --: | --: |
+| `alu_lcg` (pure LCG, 1 block) | 4.36 | **1.55** | **2.81×** | 1.24 | 30.6 / 1.24 |
+| `xorshift` (scalar hash, 1 block) | 4.42 | **2.02** | **2.19×** | 1.87 | 48.2 / 1.88 |
+| `mem_fwd` (store→load fixed cell) | 4.53 | **2.80** | **1.62×** | 2.79 | 92.0 / 1.24 |
+| `mem_scatter` (rolling-addr store) | 4.34 | **2.82** | **1.54×** | 2.80 | 102 / 1.24 |
+| `branchy` (if/else, multi-block/trip) | 7.54 | 7.57 | 1.00× | ~2–5 (noisy) | 44.2 / 0.62 |
+
+Readings: (1) on straight-line integer loops the global captures **90–100 % of the entire fuel cost**
+(`global` ≈ `nofuel`), taking the wasm-JIT from ~20–50× slower than the native Cranelift JIT to **within
+~1.2–1.6×** on scalar kernels (`alu` 1.55 vs 1.24; `xorshift` 2.02 vs 1.88); the memory kernels stay ~2.3×
+off native, the structural double-sandbox indirection §"Why, and how much" predicts, not fuel. (2) `branchy`
+is the one non-win and it is *informative*: a loop whose trip crosses several blocks re-enters the
+dispatcher (and its fuel check) multiple times per iteration, and that round-trip **also defeats the
+global's register allocation** — so fuel placement can't help it. This is exactly the shape a
+**relooper** would fix (fallthrough/loop edges wouldn't round-trip the dispatcher), and it is the
+*only* measured case where the relooper's structural win survives — the giant-reducible-function case
+(Lua) already showed no V8 benefit above. So the relooper stays deferred, now with a precise trigger
+condition (multi-block-per-trip hot loops) instead of a blanket "later", and the far cheaper fuel-global
+change banks the win the dispatcher-tax actually had.
+
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
 whether `gc.roots`-bearing functions bail at function or module granularity (function, if the

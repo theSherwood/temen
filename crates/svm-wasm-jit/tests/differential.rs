@@ -100,6 +100,12 @@ fn wasm_run(m: &svm_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Outco
         .unwrap()
         .start(&mut store)
         .unwrap();
+    // Fuel lives in the exported `"fuel"` global (the register-allocatable placement). Seed it to
+    // this run's budget so the OutOfFuel differential bounds at the same point as the oracle; the
+    // legacy `env`-cell write above is now moot (kept so the cross-tier scratch layout is intact).
+    if let Some(g) = instance.get_global(&store, "fuel") {
+        g.set(&mut store, Val::I64(fuel as i64)).unwrap();
+    }
     let f = instance.get_func(&store, "f0").expect("f0 exported");
 
     let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];

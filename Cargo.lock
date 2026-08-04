@@ -883,6 +883,7 @@ version = "0.0.0"
 dependencies = [
  "svm-interp",
  "svm-ir",
+ "svm-jit",
  "svm-text",
  "svm-verify",
  "wasmi",

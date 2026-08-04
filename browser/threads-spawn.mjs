@@ -172,7 +172,7 @@ async function worker() {
       },
     });
     const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
-    new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+    uinst.exports.fuel.value = 1n << 61n; // fuel now lives in the emitted `fuel` global
     const args = new Array(Number(ex.svm_par_inst_nparams(entry))).fill(0n);
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1);
     try {
@@ -290,7 +290,7 @@ async function worker() {
       const argvPtr = Number(ex.svm_par_tierup_argv_ptr(v)), n = Number(ex.svm_par_tierup_argv_len(v));
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
-      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel
+      emitted.fuel.value = 1n << 61n; // ample fuel (emitted `fuel` global)
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
         const ret = emitted['f' + tfunc](win, envCell, ...args);
@@ -310,7 +310,7 @@ async function worker() {
       const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_par_jit_param_types_ptr(v)), n);
       const args = [];
       for (let i = 0; i < n; i++) args.push(jitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
-      new DataView(memory.buffer).setBigInt64(jitEnvCell, 1n << 61n, true); // ample fuel
+      jitUnit.fuel.value = 1n << 61n; // ample fuel (emitted `fuel` global)
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // reuse the counter (non-vacuity)
       try {
         const ret = jitUnit['f0'](win, jitEnvCell, ...args);

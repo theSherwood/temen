@@ -135,7 +135,9 @@ async function main() {
         const argvPtr = Number(ex.svm_par_tierup_argv_ptr(v)), an = Number(ex.svm_par_tierup_argv_len(v));
         const args = [];
         for (let i = 0; i < an; i++) args.push(new BigInt64Array(memory.buffer)[(argvPtr >> 3) + i]);
-        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        // fuel now lives in the emitted `fuel` global (register-allocatable, see WASM.md);
+        // re-arm the per-region budget on the exported global (the old env-cell write was here).
+        emitted.fuel.value = 1n << 61n;
         try {
           const ret = emitted['f' + func](win, envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
