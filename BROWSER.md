@@ -775,14 +775,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `uninstall(slot)` nulls it — the JS analog of `DomainTable::install` / the `b2_install.rs` host, so a
    unit's `call_indirect` dispatches at native wasm speed to whatever is installed. The cdylib export
    compiles; the shared-table dispatch it drives is the exact shape proven native in `b2_install.rs`.
-   **[landed — cross-Worker B2 mirror wiring, *browser-verification pending*]** wasm funcrefs are *not*
+   **[landed — cross-Worker B2 mirror wiring, CI-gated in real Chromium]** wasm funcrefs are *not*
    transferable across Workers (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each
    Worker holds its **own** `WebAssembly.Table` mirroring the shared slot→unit map. The plumbing:
    *(Rust, compiles + regression-tested)* `deliver_jit_install`/`deliver_jit_uninstall` now return the
    filled/cleared **slot**; the browser records `slot → code-handle` in a shared registry
    (`PAR_JIT_SLOT_CODE`) at the (now runtime-path-wired) install/uninstall sites; FFI exposes
    `svm_par_jit_table_log2`, `svm_par_jit_slot_code`, `svm_par_jit_code_wasm_by_handle_{ptr,len}`, and a
-   `svm_par_jit_set_b2` toggle routes the runtime emitter through `compile_module_b2`. *(JS, to-pattern)*
+   `svm_par_jit_set_b2` toggle routes the runtime emitter through `compile_module_b2`. *(JS)*
    `worker.js` gives each Worker a per-Worker `WebAssembly.Table` + a per-code instance cache, and
    before each `JIT_INVOKE` mirrors the shared map (`slot_code` → instantiate-by-handle → `table.set`,
    nulling empty slots so a stale `call_indirect` traps), then runs the invoked unit resolved by its

@@ -109,9 +109,10 @@ self.onmessage = async (e) => {
   // so this Worker holds its OWN funcref table mirroring the shared interpreter `Domain`'s slot→unit
   // map, and instantiates each installed unit locally (the emitted units import this table — the Rust
   // emitter runs in B2 mode, `svm_par_jit_set_b2`). Enabled by `jitB2` (the page sets both).
-  //   NOTE: this whole B2 cross-Worker path is written to-pattern but is *browser-verification
-  //   pending* — it has no native/CI harness in this repo yet (the mirror design itself is proven
-  //   native by `crates/svm-wasm-jit/tests/b2_install.rs::b2_per_worker_mirror_is_consistent`).
+  //   Verified end-to-end by the CI-gated `jitb2` work item (main.js item 12): 8 Workers each
+  //   runtime-compile + `install` a unit into the shared table (raced slots) and dispatch it on
+  //   B2-emitted wasm through this mirror, interp ≡ B2 codegen ≡ 56. The emitter-level cross-instance
+  //   semantics are pinned native by `crates/svm-wasm-jit/tests/b2_install.rs`.
   let jitTable = null;
   const jitInstCache = new Map(); // code handle → instance.exports (per-Worker instantiation)
   if (jitB2) {

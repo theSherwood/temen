@@ -541,8 +541,17 @@ different things depending on which pair you compare:
   separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
   (slices 14b/14c, 15a/15b/15c, 16), and **source-variable inspection inside a separate-module child body**
-  on both the single-vCPU and scheduled engines (slice 17). The only remaining `Declined` op is JIT tier-up
-  (never enabled on the debug engine). The **reverse-replay checkpoint ladder** is built on **both**
+  on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
+  (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
+  program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the
+  oracle (`bytecode_debug_jit.rs`). Two §22 boundaries are deliberately forward-first (as every seam
+  landed): `invoke` runs the submitted unit as a **seam-free leaf** (step *over*, not into — the invoke
+  child carries no debug ctx yet, matching production `run_invoke`; `install` + `call_indirect` *does*
+  step into module-≥1 frames, with no named locals), and **reverse-replay across a §22 op** is
+  out-of-subset (an `install` mutates the shared dispatch table, external to the vCPU checkpoint — a
+  reverse-step across it would need to un-install). The only remaining forward-`Declined` op is native/
+  wasm **JIT tier-up** (never enabled on the debug engine — the interpreter *is* the debug engine).
+  The **reverse-replay checkpoint ladder** is built on **both**
   engines (slice 4-perf above, ~42× on a long single-vCPU sweep; the multi-vCPU `ScheduledDebugRun` seek
   is bounded too), and its checkpointable subset now covers **§12 fibers + §14 coroutines** (same-module
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**

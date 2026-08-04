@@ -784,39 +784,58 @@ impl Domain {
 
     /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
     /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
-    /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. The whole op serializes
-    /// under the source lock, and the slot store is `Release`, so a reader that observes the slot also
-    /// observes the pushed unit.
+    /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. See [`jit_install_into`].
     fn install(&self, unit: Compiled) -> Option<usize> {
-        use std::sync::atomic::Ordering;
-        let mut mods = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = self
-            .table
-            .slots
-            .iter()
-            .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
-        mods.push(std::sync::Arc::new(unit));
-        let module = (mods.len() - 1) as u32;
-        self.table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
-        Some(slot)
+        jit_install_into(&self.source, &self.table, unit)
     }
 
-    /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping, returning success.
-    /// A real-function slot (`< n_real`), out-of-range, or already-empty slot is rejected. The unit
-    /// stays in `source` (append-only); only the slot is reclaimed. Serialized under the source lock.
+    /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping. See
+    /// [`jit_uninstall_from`].
     fn uninstall(&self, slot: usize, n_real: usize) -> bool {
-        use std::sync::atomic::Ordering;
-        let _g = self.source.mods.lock().unwrap_or_else(|e| e.into_inner());
-        if slot >= n_real
-            && slot < self.table.slots.len()
-            && (self.table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
-        {
-            self.table.slots[slot]
-                .store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
-            true
-        } else {
-            false
-        }
+        jit_uninstall_from(&self.source, &self.table, slot, n_real)
+    }
+}
+
+/// `Jit.install` over a raw `(source, table)` pair — the shared body of [`Domain::install`] and the
+/// debug engines' `dbg_jit_install` (`DebugRun`/`ScheduledDebugRun` hold `source`/`table` as separate
+/// fields, not a wrapped [`Domain`]). Append `unit` to the shared source and fill the first padding
+/// slot with `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit
+/// is not appended). The whole op serializes under the source lock, and the slot store is `Release`,
+/// so a reader that observes the slot also observes the pushed unit.
+fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    let mut mods = source.mods.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = table
+        .slots
+        .iter()
+        .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
+    mods.push(std::sync::Arc::new(unit));
+    let module = (mods.len() - 1) as u32;
+    table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
+    Some(slot)
+}
+
+/// `Jit.uninstall` over a raw `(source, table)` pair — the shared body of [`Domain::uninstall`] and
+/// the debug engines' `dbg_jit_uninstall`. Clear a filled padding slot (`≥ n_real`) back to trapping,
+/// returning success. A real-function slot (`< n_real`), out-of-range, or already-empty slot is
+/// rejected. The unit stays in `source` (append-only); only the slot is reclaimed. Serialized under
+/// the source lock.
+fn jit_uninstall_from(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    slot: usize,
+    n_real: usize,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let _g = source.mods.lock().unwrap_or_else(|e| e.into_inner());
+    if slot >= n_real
+        && slot < table.slots.len()
+        && (table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
+    {
+        table.slots[slot].store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
+        true
+    } else {
+        false
     }
 }
 
@@ -3444,7 +3463,8 @@ impl<'p> Vcpu<'p> {
             None => HostCell::Excl(&mut self.host),
         };
         match run_invoke(
-            dom,
+            &dom.source,
+            &dom.table,
             umod,
             &child_args,
             &mut self.fuel,
@@ -4372,6 +4392,38 @@ fn debug_advance_fiber(
                 Err(t) => FiberStep::Trapped(t),
             }
         }
+        // §22 guest-JIT install / uninstall / invoke: self-contained host-side ops (they mutate only
+        // `vt.active` + the shared dispatch table, spawning no scheduler task), so — like the coroutine
+        // arms above — they are serviced **inline** here, which is why BOTH the single-vCPU `DebugRun`
+        // and the `ScheduledDebugRun` reach them (the `FiberStep::Other` decline sites never see a Jit
+        // outcome). `invoke` runs the unit to completion as a seam-free leaf (stepping *over* it, not
+        // into it — matching production `run_invoke`). A forged handle / out-of-coverage unit traps the
+        // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
+        Ok(Outcome::JitInstall { h, code, dst }) => {
+            match dbg_jit_install(vt, host, source, table, h, code, dst) {
+                Ok(()) => FiberStep::Stepped,
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
+        Ok(Outcome::JitUninstall { h, slot, dst }) => {
+            match dbg_jit_uninstall(vt, host, source, table, h, slot, dst) {
+                Ok(()) => FiberStep::Stepped,
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
+        Ok(Outcome::JitInvoke {
+            h,
+            code,
+            argv,
+            dst,
+            params,
+            results,
+        }) => match dbg_jit_invoke(
+            vt, host, source, table, fuel, mem, h, code, &argv, dst, &params, &results,
+        ) {
+            Ok(()) => FiberStep::Stepped,
+            Err(t) => FiberStep::Trapped(t),
+        },
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
         // dispatches its subset).
@@ -6269,6 +6321,124 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
     }
 }
 
+/// §22 `Jit.install` (op 3) under the debug engine: resolve authority + the unit's funcs from the host
+/// (a forged/cross-domain handle is an inert `CapFault` → trap), compile the unit to bytecode, and
+/// install it into the debug run's shared `(source, table)` — the debug-engine counterpart of the
+/// production `drive`'s `JitInstall` arm. Serviced inline in [`debug_advance_fiber`] (it mutates only
+/// `vt.active` + the shared table, spawning no scheduler task), so both the single-vCPU `DebugRun` and
+/// the `ScheduledDebugRun` reach it. Writes the slot (or `-ENOSPC`, an ordinary value) to `dst`; `Err`
+/// traps the vCPU (`CapFault` forged handle, `Malformed` unit outside bytecode coverage — the one place
+/// a guest-provided unit can outrun coverage, with no tree-walker fallback mid-run).
+fn dbg_jit_install(
+    vt: &mut VTask,
+    host: &mut Host,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    h: i32,
+    code: i32,
+    dst: u32,
+) -> Result<(), Trap> {
+    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
+        let (cd, cu) = host.resolve_jit_code(code)?;
+        if cd != domain {
+            return Err(Trap::CapFault);
+        }
+        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+    })?;
+    let res = match compile_module(&funcs) {
+        Some(unit) => match jit_install_into(source, table, unit) {
+            Some(slot) => slot as i64,
+            None => super::ENOSPC,
+        },
+        None => return Err(Trap::Malformed), // unit op outside coverage
+    };
+    vt.active.set(dst, Reg::from_i64(res));
+    Ok(())
+}
+
+/// §22 `Jit.uninstall` (op 4) under the debug engine: authority-check the domain handle, then clear the
+/// installed table slot (`0`/`-EINVAL` to `dst`). Mirrors `drive`'s `JitUninstall` arm; serviced inline
+/// in [`debug_advance_fiber`].
+fn dbg_jit_uninstall(
+    vt: &mut VTask,
+    host: &mut Host,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    h: i32,
+    slot: i64,
+    dst: u32,
+) -> Result<(), Trap> {
+    host.resolve_jit_domain(h)?; // authority (forged handle → CapFault)
+    let n_real = source.primary().progs.len();
+    let res = if jit_uninstall_from(source, table, slot as usize, n_real) {
+        0
+    } else {
+        super::EINVAL
+    };
+    vt.active.set(dst, Reg::from_i64(res));
+    Ok(())
+}
+
+/// §22 `Jit.invoke` (op 1) under the debug engine: resolve + compile the unit (as for install), then
+/// run it **to completion as a seam-free leaf** over the shared `(source, table)` — its `call_indirect`
+/// reaches installed units, and a spawn/park/re-install inside it is an inert `CapFault`, exactly as
+/// the production `drive`'s `JitInvoke` arm and the tree-walker's `run_invoke`. The invoked unit runs
+/// atomically (no step-into: the debug seam does not fire inside it — stepping *over* `Jit.invoke`
+/// executes the whole unit), matching production semantics. Results marshal to `dst…` through the
+/// i64-slot ABI. Serviced inline in [`debug_advance_fiber`].
+#[allow(clippy::too_many_arguments)]
+fn dbg_jit_invoke(
+    vt: &mut VTask,
+    host: &mut Host,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    h: i32,
+    code: i32,
+    argv: &[i64],
+    dst: u32,
+    params: &[ValType],
+    results: &[ValType],
+) -> Result<(), Trap> {
+    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
+        let (cd, cu) = host.resolve_jit_code(code)?;
+        if cd != domain {
+            return Err(Trap::CapFault);
+        }
+        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+    })?;
+    let unit = compile_module(&funcs).ok_or(Trap::Malformed)?;
+    // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
+    let arity_ok = unit
+        .sigs
+        .first()
+        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+    if !arity_ok {
+        return Err(Trap::CapFault);
+    }
+    let child_args: Vec<Value> = params
+        .iter()
+        .zip(argv.iter())
+        .map(|(ty, s)| slot_to_val(*ty, *s))
+        .collect();
+    let umod = source.push(unit);
+    let vals = run_invoke(
+        source,
+        table,
+        umod,
+        &child_args,
+        fuel,
+        mem,
+        &mut HostCell::Excl(host),
+    )?;
+    for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+        let re = slot_to_val(*ty, val_to_slot(*v));
+        vt.active.set(dst + i as u32, Reg::from_value(re));
+    }
+    Ok(())
+}
+
 /// `memory.wait`: park the caller on futex key `base` until a `notify` or the deadline, unless the
 /// value already changed (the compare-under-lock analogue). Mirrors `drive`'s `Wait`.
 #[allow(clippy::too_many_arguments)]
@@ -8015,18 +8185,19 @@ fn gc_write(
 /// tree-walker `CapFault`s if it parks, spawns, yields, or re-installs — so anything but a plain
 /// return is an inert `CapFault`; a trap propagates to the invoker.
 fn run_invoke(
-    dom: &Domain,
+    source: &ModuleSource,
+    table: &SharedSlots,
     module: usize,
     args: &[Value],
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
 ) -> Result<Vec<Value>, Trap> {
-    let unit = dom.source.get(module).ok_or(Trap::Malformed)?;
+    let unit = source.get(module).ok_or(Trap::Malformed)?;
     let mut vm = Vm::new(&unit, 0, args)?;
     vm.module = module;
     loop {
-        match vm.resume(&dom.source, &dom.table, fuel, mem, host, u64::MAX)? {
+        match vm.resume(source, table, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => {}
             _ => return Err(Trap::CapFault),
@@ -9963,7 +10134,8 @@ fn drive(
                     .collect();
                 let umod = dom.source.push(unit);
                 match run_invoke(
-                    &dom,
+                    &dom.source,
+                    &dom.table,
                     umod,
                     &child_args,
                     fuel,
@@ -10371,7 +10543,8 @@ fn run_vcpu_parallel<'scope, 'env>(
                     .collect();
                 let umod = dom.source.push(unit);
                 match run_invoke(
-                    dom,
+                    &dom.source,
+                    &dom.table,
                     umod,
                     &child_args,
                     &mut fuel,
