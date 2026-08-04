@@ -28,8 +28,16 @@
 //! Each arm is now a **direct** call to a constant function, which the specializer already inlines /
 //! outlines and folds through. The dynamic branch on `m` survives as a residual branch — dispatch is
 //! kept, but everything *around* it (and inside each target) still specializes. When `idx` turns out
-//! constant in context, the specializer folds `m` and the compare chain, collapsing back to the
-//! single resolved arm, so lowering never pessimizes the constant-index case.
+//! constant in context, the specializer folds `m` and the dispatch, collapsing back to the single
+//! resolved arm, so lowering never pessimizes the constant-index case.
+//!
+//! **Dispatch shape.** The `if m == sᵢ` selection is emitted as a **`br_table`** indexed by `m`
+//! (one jump table: a non-candidate or out-of-range slot lands on the default) whenever the top
+//! candidate slot is small enough to size a table; a linear compare **chain** is the fallback for
+//! pathologically sparse high-index candidates. The br_table matters: Wasmtime, Cranelift, and the
+//! bytecode engine all lower it to a single indexed jump, where the chain is up to `k` sequential
+//! branches — measured, the chain regressed the interpreters and the wasm-JIT tier while the
+//! br_table turns them into wins (`bench/src/bin/peval_indirect`).
 //!
 //! **Soundness of the masked compare.** The interpreter dispatches `slot = idx & (next_pow2(n)-1)`
 //! then checks the target's signature, trapping `IndirectCallType` on a mismatch or empty slot
@@ -200,15 +208,35 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
     let nl = live.len() as u32;
     let live_types: Vec<ValType> = live.iter().map(|&v| btypes[v as usize]).collect();
 
-    // --- block index layout (all new blocks appended in this exact order) ---
+    // --- dispatch shape ---
+    // A `br_table` indexed by `m - lo` (the masked slot, offset by the lowest candidate slot) — one
+    // indexed jump — when the candidates' *relative* span is small; a non-candidate slot lands on the
+    // `unreachable` default (and `m < lo` underflows to a large u32, also out of range → default).
+    // Wasm / Cranelift and the bytecode engine lower a br_table to a single jump table, where the
+    // linear compare chain (the fallback, for candidates scattered across the index space) is up to
+    // `k` branches. Offsetting by `lo` sizes the table to the candidate cluster, so handlers defined
+    // together fold to a jump table wherever they sit in the index space, not only near zero.
     let s = cands.len() as u32;
-    let base = f.blocks.len() as u32;
-    let d_base = base; // dispatch chain D_0..D_{s-1}
-    let c_base = d_base + s; // call arms  C_0..C_{s-1}
-    let default_blk = c_base + s; // unreachable default
-    let cont_blk = default_blk + 1; // continuation (original tail)
+    let lo = *cands.iter().min().expect("non-empty candidate set");
+    let hi = *cands.iter().max().expect("non-empty candidate set");
+    let span = hi - lo + 1;
+    /// Largest `br_table` (candidate relative span) worth emitting; above it, the sparse table would
+    /// bloat the module, so fall back to the compare chain.
+    const SPAN_LIMIT: u32 = 256;
+    let use_table = span <= SPAN_LIMIT;
+    // Index the table by `m` directly when the absolute table fits (`table_lo == 0`, no subtraction);
+    // only offset by `lo` when the candidates cluster at high indices the absolute table can't reach.
+    let table_lo = if hi < SPAN_LIMIT { 0 } else { lo };
 
-    // --- head block (reuses index `bi`): run insts[0..k], mask the index, branch to D_0 ---
+    // --- block index layout (all new blocks appended in this exact order) ---
+    let base = f.blocks.len() as u32;
+    let (d_base, c_base, default_blk, cont_blk) = if use_table {
+        (base, base, base + s, base + s + 1) // no dispatch blocks: head br_tables straight to arms
+    } else {
+        (base, base + s, base + 2 * s, base + 2 * s + 1)
+    };
+
+    // --- head block (reuses index `bi`): run insts[0..k], mask the index, then dispatch ---
     let mut head_insts = head_insts_src;
     head_insts.push(Inst::ConstI32(mask));
     let mask_val = head_count; // ConstI32 result
@@ -218,53 +246,86 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
         a: idx,
         b: mask_val,
     });
-    let m_val = head_count + 1; // masked index
-    let mut d0_args = live.clone();
-    d0_args.push(m_val);
+    let m_val = head_count + 1; // masked slot index
+
+    let head_term = if use_table {
+        // `sel = m - table_lo` selects the table (subtraction elided when `table_lo == 0`).
+        // targets[slot - table_lo] = C_j for a candidate, else the default; out of range → default
+        // (and `m < table_lo` underflows to a large u32, also out of range). Each arm edge passes the
+        // live values (C_j's params); the default none.
+        let sel_val = if table_lo == 0 {
+            m_val
+        } else {
+            head_insts.push(Inst::ConstI32(table_lo as i32));
+            head_insts.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Sub,
+                a: m_val,
+                b: head_count + 2,
+            });
+            head_count + 3 // sel = m - table_lo
+        };
+        let default_edge = (default_blk, Vec::new());
+        let mut targets = vec![default_edge.clone(); (hi + 1 - table_lo) as usize];
+        for (j, &slot) in cands.iter().enumerate() {
+            targets[(slot - table_lo) as usize] = (c_base + j as u32, live.clone());
+        }
+        Terminator::BrTable {
+            idx: sel_val,
+            targets,
+            default: default_edge,
+        }
+    } else {
+        let mut d0_args = live.clone();
+        d0_args.push(m_val);
+        Terminator::Br {
+            target: d_base,
+            args: d0_args,
+        }
+    };
     f.blocks[bi] = Block {
         params: b_params,
         insts: head_insts,
-        term: Terminator::Br {
-            target: d_base,
-            args: d0_args,
-        },
+        term: head_term,
     };
 
     let mut new_blocks: Vec<Block> = Vec::with_capacity((s * 2 + 2) as usize);
 
-    // --- dispatch chain: D_j tests `m == cands[j]`, branch to C_j else D_{j+1} (last → default) ---
-    // Params of every D_j: live values, then the masked index `m` (at index nl).
-    for (j, &target) in cands.iter().enumerate() {
-        let insts = vec![
-            Inst::ConstI32(target as i32), // @ nl+1
-            Inst::IntCmp {
-                ty: IntTy::I32,
-                op: CmpOp::Eq,
-                a: nl,     // m
-                b: nl + 1, // the candidate const
-            },
-        ];
-        let eq_val = nl + 2;
-        // then → C_j with the live values (C_j's params are exactly `live`).
-        let then_args: Vec<u32> = (0..nl).collect();
-        let (else_blk, else_args): (u32, Vec<u32>) = if (j as u32) + 1 < s {
-            (d_base + j as u32 + 1, (0..=nl).collect()) // forward live ++ m
-        } else {
-            (default_blk, Vec::new())
-        };
-        let mut params = live_types.clone();
-        params.push(ValType::I32); // m
-        new_blocks.push(Block {
-            params,
-            insts,
-            term: Terminator::BrIf {
-                cond: eq_val,
-                then_blk: c_base + j as u32,
-                then_args,
-                else_blk,
-                else_args,
-            },
-        });
+    // --- dispatch chain (fallback only): D_j tests `m == cands[j]`, branch to C_j else D_{j+1}
+    // (last → default). Params of every D_j: live values, then the masked index `m` (at index nl). ---
+    if !use_table {
+        for (j, &target) in cands.iter().enumerate() {
+            let insts = vec![
+                Inst::ConstI32(target as i32), // @ nl+1
+                Inst::IntCmp {
+                    ty: IntTy::I32,
+                    op: CmpOp::Eq,
+                    a: nl,     // m
+                    b: nl + 1, // the candidate const
+                },
+            ];
+            let eq_val = nl + 2;
+            // then → C_j with the live values (C_j's params are exactly `live`).
+            let then_args: Vec<u32> = (0..nl).collect();
+            let (else_blk, else_args): (u32, Vec<u32>) = if (j as u32) + 1 < s {
+                (d_base + j as u32 + 1, (0..=nl).collect()) // forward live ++ m
+            } else {
+                (default_blk, Vec::new())
+            };
+            let mut params = live_types.clone();
+            params.push(ValType::I32); // m
+            new_blocks.push(Block {
+                params,
+                insts,
+                term: Terminator::BrIf {
+                    cond: eq_val,
+                    then_blk: c_base + j as u32,
+                    then_args,
+                    else_blk,
+                    else_args,
+                },
+            });
+        }
     }
 
     // --- call arms: C_j = direct call to cands[j], then branch to the continuation ---

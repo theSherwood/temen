@@ -296,3 +296,131 @@ fn branchy_tail_lowers_and_specializes_faithfully() {
         }
     }
 }
+
+/// Force the compare-chain fallback: two candidates whose slot span exceeds the br_table limit
+/// (a low- and a high-index function of the same signature, with differently-typed fillers
+/// between). Exercises the non-table dispatch path end to end.
+#[test]
+fn wide_span_uses_chain_fallback_and_stays_faithful() {
+    let hty = FuncType {
+        params: vec![I64, I64],
+        results: vec![I64],
+    };
+    // entry(idx: i32, x: i64) = call_indirect[I64,I64->I64](idx)(x, x)
+    let entry = Func {
+        params: vec![I32, I64],
+        results: vec![I64],
+        blocks: vec![Block {
+            params: vec![I32, I64],
+            insts: vec![Inst::CallIndirect {
+                ty: hty,
+                idx: 0,
+                args: vec![1, 1],
+            }],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let mut funcs = vec![entry, unary2(BinOp::Add, 10)]; // index 1: candidate A (x+10)
+    for _ in 0..298 {
+        funcs.push(unary(BinOp::Add, 0)); // fillers, sig [I64]->[I64] (not candidates)
+    }
+    funcs.push(unary2(BinOp::Mul, 7)); // index 300: candidate B (x*7)
+    let m = Module {
+        funcs,
+        memory: None,
+        data: vec![],
+        imports: vec![],
+        exports: vec![],
+        data_exports: vec![],
+        data_ptrs: vec![],
+        data_funcrefs: vec![],
+        impl_exports: vec![],
+        types: vec![],
+        debug_info: None,
+    };
+    verify_module(&m).expect("source verifies");
+    let low = lower_indirect_dispatch(&m, 8);
+    verify_module(&low).expect("chain-lowered verifies");
+    for (idx, x) in [(1i32, 5i64), (1, -3), (300, 5), (300, 9)] {
+        let a = &[Value::I32(idx), Value::I64(x)];
+        assert_eq!(
+            run(&m, a),
+            run(&low, a),
+            "chain diverged at idx={idx}, x={x}"
+        );
+    }
+}
+
+/// A two-arg `i64,i64 -> i64` leaf `a <op> imm` (ignores the second arg).
+fn unary2(op: BinOp, imm: i64) -> Func {
+    Func {
+        params: vec![I64, I64],
+        results: vec![I64],
+        blocks: vec![Block {
+            params: vec![I64, I64],
+            insts: vec![
+                Inst::ConstI64(imm),
+                Inst::IntBin {
+                    ty: IntTy::I64,
+                    op,
+                    a: 0,
+                    b: 2,
+                },
+            ],
+            term: Terminator::Return(vec![3]),
+        }],
+    }
+}
+
+/// Candidates clustered at *high* indices (small relative span, but above the absolute br_table
+/// limit) must take the offset-by-min br_table path — exercises `table_lo = lo` and `sel = m - lo`.
+#[test]
+fn high_index_cluster_uses_offset_table() {
+    let hty = FuncType {
+        params: vec![I64, I64],
+        results: vec![I64],
+    };
+    let entry = Func {
+        params: vec![I32, I64],
+        results: vec![I64],
+        blocks: vec![Block {
+            params: vec![I32, I64],
+            insts: vec![Inst::CallIndirect {
+                ty: hty,
+                idx: 0,
+                args: vec![1, 1],
+            }],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let mut funcs = vec![entry];
+    for _ in 0..297 {
+        funcs.push(unary(BinOp::Add, 0)); // fillers 1..=297, sig [I64]->[I64]
+    }
+    funcs.push(unary2(BinOp::Add, 11)); // index 298: candidate A (x+11)
+    funcs.push(unary2(BinOp::Mul, 5)); //  index 299: candidate B (x*5)
+    let m = Module {
+        funcs,
+        memory: None,
+        data: vec![],
+        imports: vec![],
+        exports: vec![],
+        data_exports: vec![],
+        data_ptrs: vec![],
+        data_funcrefs: vec![],
+        impl_exports: vec![],
+        types: vec![],
+        debug_info: None,
+    };
+    verify_module(&m).expect("source verifies");
+    let low = lower_indirect_dispatch(&m, 8);
+    verify_module(&low).expect("offset-table-lowered verifies");
+    for (idx, x) in [(298i32, 4i64), (298, -7), (299, 4), (299, 3)] {
+        let a = &[Value::I32(idx), Value::I64(x)];
+        assert_eq!(
+            run(&m, a),
+            run(&low, a),
+            "offset table diverged idx={idx} x={x}"
+        );
+    }
+}

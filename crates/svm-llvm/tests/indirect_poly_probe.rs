@@ -72,7 +72,13 @@ fn report(name: &str, m: &Module) {
     println!("  (sites whose signature matches NO function: {unmatched})");
 
     println!("\nsite fan-out histogram (targets per site -> #sites):");
-    let cum_le = |thresh: usize| buckets.iter().filter(|(k, _)| **k <= thresh).map(|(_, v)| *v).sum::<usize>();
+    let cum_le = |thresh: usize| {
+        buckets
+            .iter()
+            .filter(|(k, _)| **k <= thresh)
+            .map(|(_, v)| *v)
+            .sum::<usize>()
+    };
     for (fanout, count) in &buckets {
         println!("  {fanout:>5} targets : {count} site(s)");
     }
@@ -106,6 +112,32 @@ fn lua_indirect_polymorphism() {
     }
 }
 
+/// For each eligible site, the candidate functions' **relative slot span** (max index − min index)
+/// — the size an offset-by-min `br_table` would need. A small span means the same-signature targets
+/// cluster in the function index space, so a jump table is cheap even at high absolute indices.
+fn candidate_spans(m: &Module, cap: usize) -> Vec<usize> {
+    let mut by_sig: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, f) in m.funcs.iter().enumerate() {
+        by_sig.entry(func_sig_key(f)).or_default().push(i);
+    }
+    let mut spans = Vec::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::CallIndirect { ty, .. } = inst {
+                    let key = sig_key(&ty.params, &ty.results);
+                    if let Some(idxs) = by_sig.get(&key) {
+                        if (1..=cap).contains(&idxs.len()) {
+                            spans.push(idxs.last().unwrap() - idxs.first().unwrap());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    spans
+}
+
 /// How many functions contain at least one dynamic-index `call_indirect` site whose signature
 /// fan-out is within `cap` (i.e. approach A would rewrite it).
 fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
@@ -117,7 +149,10 @@ fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::CallIndirect { ty, .. } = inst {
-                    let n = pop.get(&sig_key(&ty.params, &ty.results)).copied().unwrap_or(0);
+                    let n = pop
+                        .get(&sig_key(&ty.params, &ty.results))
+                        .copied()
+                        .unwrap_or(0);
                     if (1..=cap).contains(&n) {
                         sites_hit += 1;
                         hit = true;
@@ -138,14 +173,30 @@ fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
 /// program-as-constant harness, which does not exist yet).
 #[test]
 fn lua_approach_a_fires_and_verifies() {
-    let path = format!("{}/tests/fixtures/lua/lua_eval.ll", env!("CARGO_MANIFEST_DIR"));
-    let m = svm_llvm::translate_ll_path(&path).expect("translate").module;
+    let path = format!(
+        "{}/tests/fixtures/lua/lua_eval.ll",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let m = svm_llvm::translate_ll_path(&path)
+        .expect("translate")
+        .module;
     svm_verify::verify_module(&m).expect("source lua module verifies");
     let base_bytes = svm_encode::encode_module(&m).len();
     let base_blocks: usize = m.funcs.iter().map(|f| f.blocks.len()).sum();
 
     println!("\n=== approach A on lua_eval.ll ===");
-    println!("baseline: {} funcs, {base_blocks} blocks, {base_bytes} encoded bytes", m.funcs.len());
+    println!(
+        "baseline: {} funcs, {base_blocks} blocks, {base_bytes} encoded bytes",
+        m.funcs.len()
+    );
+    for cap in [4usize, 8, 16] {
+        let spans = candidate_spans(&m, cap);
+        let le = |t: usize| spans.iter().filter(|&&s| s <= t).count();
+        println!(
+            "cap={cap:>2} candidate relative-span: {} sites | span<=32: {} | <=256: {} | max span {:?}",
+            spans.len(), le(32), le(256), spans.iter().max()
+        );
+    }
     for cap in [4usize, 8, 16, 32] {
         let (funcs_hit, sites_hit) = functions_with_eligible_site(&m, cap);
         let low = svm_peval::lower_indirect_dispatch(&m, cap);
