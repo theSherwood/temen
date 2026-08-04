@@ -1201,6 +1201,8 @@ fn gc_struct_type_is_unsupported_not_panic() {
     match svm_wasm::transpile(wasm) {
         Err(svm_wasm::Error::Unsupported(_)) => {}
         Err(e) => panic!("expected Unsupported for GC struct type, got other error {e:?}"),
-        Ok(_) => panic!("expected Unsupported for GC struct type, transpile unexpectedly succeeded"),
+        Ok(_) => {
+            panic!("expected Unsupported for GC struct type, transpile unexpectedly succeeded")
+        }
     }
 }
