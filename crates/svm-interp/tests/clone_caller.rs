@@ -142,16 +142,32 @@ fn clone_caller_injects_the_callers_reply_out_of_band() {
 ///
 /// The **correct fork topology**: the *caller* is a spawned child with no children of its own (the
 /// only shape the targeted clone duplicates faithfully). func 0 (root) spawns server `S` (func 1),
-/// mints an offer over its `svc` export, then spawns caller `C` (func 3) re-granting that offer (as
+/// mints an offer over its `svc` export, then spawns caller `C` (func 4) re-granting that offer (as
 /// `"svc"`) and stdout (as `"o"`) into it; root joins `C` and returns its result. `C` resolves both
-/// caps by name, calls the fork offer, writes its reply to stdout, and returns it. func 2 (S's
-/// handler): `clone_caller(100, 200)`. Root returns `C`'s `reply_orig` (100); the shared stdout
+/// caps by name, calls the `fork` verb, writes its reply to stdout, and returns it. func 2 (S's
+/// `fork` handler): `clone_caller(100, 200)`. Root returns `C`'s `reply_orig` (100); the shared stdout
 /// carries BOTH 100 and 200 — the twin ran `C`'s continuation with `reply_twin`.
+///
+/// **Determinism / ISSUES.md I53.** Two serve/park races made the one-shot form flaky, and this test
+/// closes both with the FORK.md §8.6 `reap` idiom (which is what makes `fork_then_wait` stable). The
+/// parent reaps the twin's deterministic `TaskId` (root = 0, S = 1, C = 2, twin = 3 — the fixed
+/// assignment failed forks never consume, so the winning fork always mints id 3):
+///   1. **Teardown-drain.** A fork twin is minted straight onto `runnable` with no handle in anyone's
+///      table — a *detached daemon*, which INVARIANT #6 says root completion abandons (post-teardown
+///      effects unspecified). A bare `join C`-only fixture thus lets the twin's stdout write lose to
+///      teardown (`left: 8, right: 16`). The parent reaping the twin (`wait`, op 1 → `reap`, func 3)
+///      keeps the run alive until the twin has finished — and thus written.
+///   2. **Fork-park.** The two-reply `clone_caller(reply_orig, reply_twin)` **silently degrades to a
+///      single reply with no twin** when the server drains the dispatch before `C` registers its
+///      `CapReply` waiter — unlike pid mode there is no `-EAGAIN` on the return to retry. `C` instead
+///      detects it: after a `reply_orig` (100) return, `reap(3)` answers `-ECHILD` (no such twin), and
+///      `C` **re-forks**. A live twin makes `reap` retryable-`-EAGAIN` (serve/park race) or deliver its
+///      status, never `-ECHILD`, so the re-fork fires only on a genuinely lost fork. Interp only.
 const SRC_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
-type 1 interface { op: 0 }
-export 0 interface "svc" 1 { op: 2 }
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 300 "svc"
 data 310 "o"
 func (i32, i32) -> (i64) {
@@ -181,18 +197,21 @@ block 0 (v0: i32, vout: i32) {
   i32.store va5 vout
   vgp = i64.const 256
   vgn = i64.const 2
-  ve3 = i64.const 3
+  ve4 = i64.const 4
   voffc = i64.const 135168
-  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve3, voffc, vlog, vq)
+  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve4, voffc, vlog, vq)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
   vz = i32.const 0
   vn = cap.call 4294967295 10 () -> (i64) vz ()
-  return vn
+  br 1()
   }
 }
 func (i64) -> (i64) {
@@ -205,21 +224,48 @@ block 0 (vx: i64) {
   }
 }
 func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
 block 0 (v0: i64) {
   vsvc = i64.const 6518387
   vzero = i64.const 0
   i64.store vzero vsvc
-  vp0 = i64.const 0
-  vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
   voname = i64.const 111
   va8 = i64.const 8
   i64.store va8 voname
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = cap.self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
   vho = cap.self.resolve vp8 vl1
+  br 1(vhsvc, vho)
+  }
+block 1 (vhsvc: i32, vho: i32) {
   varg = i64.const 7
   vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  v200 = i64.const 200
+  vistwin = i64.eq vr v200
+  br_if vistwin 4(vr, vho) 2(vr, vhsvc, vho)
+  }
+block 2 (vr: i64, vhsvc: i32, vho: i32) {
+  vpid3 = i64.const 3
+  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid3)
+  veagain = i64.const -11
+  viseagain = i64.eq vstatus veagain
+  br_if viseagain 2(vr, vhsvc, vho) 3(vr, vstatus, vhsvc, vho)
+  }
+block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
+  vechild = i64.const -10
+  visechild = i64.eq vstatus vechild
+  br_if visechild 1(vhsvc, vho) 4(vr, vho)
+  }
+block 4 (vr: i64, vho: i32) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vlen = i64.const 8
@@ -253,7 +299,8 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
         "the original caller resumes past the fork call with reply_orig (100)"
     );
     // The shared stdout carries BOTH replies — the twin resumed the same continuation with reply_twin
-    // (200) over its own private window and duplicated powerbox. Order is scheduler-dependent.
+    // (200) over its own private window and duplicated powerbox. The original reaped the twin before
+    // returning (I53), so both writes are on the sink deterministically; order is scheduler-dependent.
     let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(bytes.len(), 16, "two i64 writes reached the shared sink");
     let mut vals: Vec<i64> = bytes
@@ -270,14 +317,22 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 
 /// FORK.md PR 5 — **pid mode**, the exact `fork()` shape: `clone_caller(0)` (one arg) replies the
 /// twin's `TaskId` to the original (parent sees pid) and `0` to the twin (child sees 0). Same
-/// topology as the two-reply test; only the handler changes. Task ids are deterministic here
+/// topology as the two-reply test; only the `fork` handler changes. Task ids are deterministic here
 /// (root = 0, server S = 1, caller C = 2, twin = 3), so the original C returns 3 and the twin
 /// returns 0 — both observed on the shared stdout sink, and C's 3 joined back through the root.
+///
+/// **Determinism / ISSUES.md I53.** Two serve/park races made the one-shot form flaky. (1) `fork`
+/// itself can lose the enqueue-before-park window — the server drains the dispatch before C registers
+/// its `CapReply` waiter — and pid mode answers that with `-EAGAIN` (POSIX fork-failure); C **retries**
+/// `while ((pid = fork()) < 0)`, the realistic shell idiom (this is the historical `left: [-11]`
+/// flake). (2) The twin is a detached daemon whose stdout write races the run's teardown (INVARIANT
+/// #6), so C **reaps** it (`wait`, op 1 → `reap`, func 3) before returning, forcing the run to outlive
+/// the twin's write. Both are the `fork_then_wait` idioms that make that test stable. Interp only.
 const SRC_FORK_PID: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
-type 1 interface { op: 0 }
-export 0 interface "svc" 1 { op: 2 }
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 300 "svc"
 data 310 "o"
 func (i32, i32) -> (i64) {
@@ -307,18 +362,21 @@ block 0 (v0: i32, vout: i32) {
   i32.store va5 vout
   vgp = i64.const 256
   vgn = i64.const 2
-  ve3 = i64.const 3
+  ve4 = i64.const 4
   voffc = i64.const 135168
-  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve3, voffc, vlog, vq)
+  vc = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgp, vgn, ve4, voffc, vlog, vq)
   vjc = cap.call 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
   vz = i32.const 0
   vn = cap.call 4294967295 10 () -> (i64) vz ()
-  return vn
+  br 1()
   }
 }
 func (i64) -> (i64) {
@@ -330,26 +388,55 @@ block 0 (vx: i64) {
   }
 }
 func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+func (i64) -> (i64) {
 block 0 (v0: i64) {
   vsvc = i64.const 6518387
   vzero = i64.const 0
   i64.store vzero vsvc
-  vp0 = i64.const 0
-  vl3 = i64.const 3
-  vhsvc = cap.self.resolve vp0 vl3
   voname = i64.const 111
   va8 = i64.const 8
   i64.store va8 voname
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vhsvc = cap.self.resolve vp0 vl3
   vp8 = i64.const 8
   vl1 = i64.const 1
   vho = cap.self.resolve vp8 vl1
-  varg = i64.const 7
-  vr = cap.call 268435456 0 (i64) -> (i64) vhsvc (varg)
+  br 1(vhsvc, vho)
+  }
+block 1 (vhsvc: i32, vho: i32) {
+  vc0 = i64.const 0
+  vpid = cap.call 268435456 0 (i64) -> (i64) vhsvc (vc0)
+  vz1 = i64.const 0
+  vforkfail = i64.lt_s vpid vz1
+  br_if vforkfail 1(vhsvc, vho) 2(vpid, vhsvc, vho)
+  }
+block 2 (vpid: i64, vhsvc: i32, vho: i32) {
   vp16 = i64.const 16
-  i64.store vp16 vr
+  i64.store vp16 vpid
   vlen = i64.const 8
   vw = cap.call 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
-  return vr
+  vz2 = i64.const 0
+  vparent = i64.ne vpid vz2
+  br_if vparent 3(vpid, vhsvc) 5(vpid)
+  }
+block 3 (vpid: i64, vhsvc: i32) {
+  vstatus = cap.call 268435456 1 (i64) -> (i64) vhsvc (vpid)
+  vz3 = i64.const 0
+  vwaitfail = i64.lt_s vstatus vz3
+  br_if vwaitfail 3(vpid, vhsvc) 4(vpid)
+  }
+block 4 (vpid: i64) {
+  return vpid
+  }
+block 5 (vpid: i64) {
+  return vpid
   }
 }
 "#;
@@ -378,6 +465,8 @@ fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
         vec![Value::I64(3)],
         "the original caller's fork() returns the twin's pid (TaskId 3)"
     );
+    // Both copies wrote their fork() return (parent 3, child 0). The parent reaped the twin before
+    // returning (I53), so the child's write is on the sink deterministically before teardown.
     let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(bytes.len(), 16, "both copies wrote their fork() return");
     let mut vals: Vec<i64> = bytes
