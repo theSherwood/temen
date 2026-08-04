@@ -453,6 +453,29 @@ block 0 (v0: i64) {
   } catch (e) {
     set('jitb2', 'fail', `jitb2: error ${e}`);
   }
+
+  // --- 13) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3) -------------------
+  // The granted unit's entry thread.spawns its OWN f1 (→7), joins it, and does a mismatching
+  // i32.atomic.wait (→1) → 71; 8 confined children → 568. Interp: module-aware spawn through the
+  // relay (each unit thread a real Worker over the child's carve). Codegen: the entry runs on
+  // EMITTED WASM, its thread/futex ops arriving as env.thread_spawn/join + env.mem_wait imports —
+  // serviced through the same completion-slot protocol. Both tiers must agree.
+  try {
+    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
+    const unit = await fetchBytes('/corpus/threads_inst_threads_unit.svmbc');
+    const opt = { unit, winSize: 1 << 20 };
+    const t0 = performance.now();
+    const interp = await run(guest, { ...opt, inst: true });
+    const codegen = await run(guest, { ...opt, instCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 568n && codegen.value === 568n && codegen.tierups > 0;
+    set('instthreads', ok ? 'pass' : 'fail',
+      `instthreads: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
+      `(want 568, ${codegen.tierups} emitted incl. threading units) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`instthreads → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('instthreads', 'fail', `instthreads: error ${e}`);
+  }
 }
 
 main().catch((e) => { log(`fatal: ${e}\n${e.stack ?? ''}`); set('threads', 'fail', `fatal: ${e}`); });

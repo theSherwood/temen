@@ -1384,6 +1384,37 @@ block 6 () {
 }
 "#;
 
+// §11 slice 3: the granted unit's entry uses the THREAD + FUTEX primitives — spawn its own f1
+// (→ 7), join, and a mismatching i32.atomic.wait (mem[64] = 0 ≠ 99 → 1) → 71; with the same
+// [`THREADS_INST_MOD`] root: 8 × 71 = 568. On the codegen tier the entry runs on emitted wasm, its
+// ops bounced through env.thread_spawn/env.thread_join/env.mem_wait — each spawned thread a real
+// Worker over the child's own carve (worker.js services them via the spawn relay + completion slot).
+const THREADS_INST_THREADS_UNIT: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsp = i64.const 0
+  varg = i64.const 0
+  vt = thread.spawn 1 vsp varg
+  vj = thread.join vt
+  vaddr = i64.const 64
+  vexp = i32.const 99
+  vtmo = i64.const 0
+  vw = i32.atomic.wait vaddr vexp vtmo
+  vw64 = i64.extend_i32_u vw
+  vten = i64.const 10
+  vjs = i64.mul vj vten
+  vr = i64.add vjs vw64
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+"#;
+
 // Root `(instantiator, module) -> sum`: `instantiate_module` the granted module 8 times, join, sum —
 // compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
 const THREADS_INST_MOD: &str = r#"memory 20
@@ -2146,6 +2177,7 @@ fn main() {
     emit("threads_inst_mod", THREADS_INST_MOD);
     emit("threads_inst_unit", THREADS_INST_UNIT);
     emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
+    emit("threads_inst_threads_unit", THREADS_INST_THREADS_UNIT);
     // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them
     // (blob offsets/lengths baked into the guest's `compile (ptr, len)` sites; the harness stages
     // the encoded unit files at those window offsets).

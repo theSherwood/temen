@@ -166,6 +166,7 @@ self.onmessage = async (e) => {
     const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
+    const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
@@ -206,6 +207,43 @@ self.onmessage = async (e) => {
           Atomics.wait(i32(), gslot >> 2, 0);
           if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
           return i64()[(gslot + 8) >> 3];
+        },
+        // §11 slice 3 — thread/futex ops from an EMITTED unit, serviced through the same spawn
+        // relay + completion-slot protocol as the interpreter's SPAWN/JOIN arms. The spawned vCPU
+        // runs the granted unit's own `func` (smod — this Worker knows its module), over THIS
+        // child's window (a thread shares its spawner's window = the carve).
+        thread_spawn: (func, sp, arg) => {
+          const tslot = ex.svm_par_alloc(SLOT);
+          const tstackTop = ex.svm_par_alloc(STACK) + STACK;
+          const ttlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+          self.postMessage({
+            kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
+            win, winSize, fuel,
+            slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
+          });
+          const h = threadSlots.length;
+          threadSlots.push(tslot);
+          return h;
+        },
+        thread_join: (h) => {
+          const tslot = threadSlots[h];
+          if (tslot === undefined) throw new Error('join of unknown thread');
+          Atomics.wait(i32(), tslot >> 2, 0);
+          if (Atomics.load(i32(), tslot >> 2) === 2) throw new Error('unit thread trapped');
+          return i64()[(tslot + 8) >> 3];
+        },
+        // Futex over the shared window (addr confined by the window mask, as the engine does).
+        mem_wait: (cwin, addr, expected, timeout, is64) => {
+          const a = cwin + (Number(addr) & (winSize - 1));
+          const ms = timeout <= 0n ? Infinity : Number(timeout) / 1e6;
+          const r = is64
+            ? Atomics.wait(i64(), a >> 3, expected, ms)
+            : Atomics.wait(i32(), a >> 2, Number(BigInt.asIntN(32, expected)), ms);
+          return r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2;
+        },
+        mem_notify: (cwin, addr, count) => {
+          const a = cwin + (Number(addr) & (winSize - 1));
+          return Atomics.notify(i32(), a >> 2, count >>> 0);
         },
       },
     });
@@ -292,6 +330,7 @@ self.onmessage = async (e) => {
       const ctlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
       const handle = handles.length;

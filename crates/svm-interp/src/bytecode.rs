@@ -2620,9 +2620,34 @@ impl<'p> Vcpu<'p> {
         args: &[Value],
         back: std::sync::Arc<super::Region>,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = prog
-            .mem_size_log2
-            .map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
+        let sl = prog.mem_size_log2;
+        Self::new_child_with(prog, module, func, args, back, sl)
+    }
+
+    /// [`new_child_in`] with the window mask chosen by the caller: a thread shares its **spawner's**
+    /// window, which for a §14 confined spawner is its carve — smaller than the guest module's
+    /// declared memory — so the driver passes the actual window's `size_log2` (CONSOLIDATION.md §11).
+    pub fn new_child_sized(
+        prog: &'p VcpuProgram,
+        module: u32,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+        size_log2: u8,
+    ) -> Result<Vcpu<'p>, Trap> {
+        Self::new_child_with(prog, module, func, args, back, Some(size_log2))
+    }
+
+    fn new_child_with(
+        prog: &'p VcpuProgram,
+        module: u32,
+        func: u32,
+        args: &[Value],
+        back: std::sync::Arc<super::Region>,
+        size_log2: Option<u8>,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem =
+            size_log2.map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 
