@@ -252,14 +252,30 @@ plumbing that lands in increments (§8).
      caller getting the unchanged probeable `-EAGAIN` until 4c. Pin: a parking library-provider
      handler completes observably identical to the same handler behind a process provider (the
      `live_impl` path is the blocking-behavior oracle). Decomposed smallest-verifiable-first:
-     - **4b.1 — Single-level promotion (the full vertical).** A handler that parks on a simple
-       primitive (futex `wait`) is woken externally, resumes with its provider world re-acquired
-       (generation-checked), returns, and replies to the parked caller. Lands `OfferAnim.ticket`, the
-       promotion branch off `fiber_park!`, the world hand-back + `busy = false`, the promoted-handler
-       park store, world re-acquire on resume, and the promoted settle. Pin: differential against the
-       process/`live_impl` handler doing the same futex park (the `svc_handler_parks` PARK_THEN_WAKE
-       shape behind a *library* offer) — identical result + fuel; `busy` observed reopening while the
-       handler is parked.
+     - **4b.1 — Single-level promotion (the full vertical). DONE (2026-08-04).** A handler that
+       parks on a blocking primitive (futex `wait`) promotes, is woken, resumes with its provider
+       world re-acquired, and returns to the caller. **As built**, the resumer model is a refinement
+       of the sketch above: nothing but a claimant can resume a `ParkedOn` fiber, and a passive
+       library provider has no serve loop, so **the caller's own vCPU is the handler's resumer**. On
+       promotion (a new branch in `fiber_park!`, taken when the parking fiber is
+       `offer_anim.handler_slot`) the provider `{mem, host, fuel}` are drained back to the
+       `ProviderState` and `busy` cleared, the caller's world is restored, an `OfferParked` record is
+       filed, and the vCPU parks on a new `Blocked::OfferPark { key }` — filed in **`svc_waiters`
+       keyed on the provider domain** (the `svc` the handler's block-waiter already targets), so the
+       handler's block-wake (`wake_blocked` + `svc_wake`) re-admits it exactly as it re-admits a
+       serve loop. (The `ticket_waiters`/`cap_reply_or_stash`/`Waiter::Fiber` reuse the sketch named
+       is for the *nested* caller — a caller that is itself a fiber whose vCPU has moved on — which
+       lands in 4b.2; the top-level caller needs no ticket.) On resume the vCPU re-`claim`s the
+       woken handler (`Claimed::LiveWoken`), **re-acquires the world from the live instance** (not
+       carried by value — a second caller may have animated it meanwhile; `busy` re-set, the
+       generation re-check), rebuilds an active `offer_anim`, and switches back in; the handler's
+       eventual return rides the **unchanged 4a settle** (the resumed segment is an ordinary active
+       animation), with the per-segment reserve drains telescoping to `initial - final`. A
+       lost-wakeup recheck on the park (the I52 shape) and a fail-closed `FiberFault` if a handler
+       leaked the provider-host `Arc` (spawned) round it out. Pinned by `offer_promotion.rs`: a
+       timed-wait handler parks and resumes on its timer returning `WAIT_TIMED_OUT`, and a second
+       dispatch is admitted after the first promoted (admission reopened); the full `impl_wiring` /
+       `imports_impl` / `svc_handler_parks` / `svc_serve_chain` suites unregressed.
      - **4b.2 — Nested / cross-domain promotion.** A promoted handler that is *itself* a caller
        getting promoted — the §1 `A[f1] → B[f2] → A[f3] → B[f4]` chain across distinct instances.
        Generalizes the single `OfferAnim` to a **stack** per resume-chain; `(provider, ticket)`

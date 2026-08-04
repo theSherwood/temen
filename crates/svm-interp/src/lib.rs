@@ -3908,6 +3908,14 @@ enum Blocked {
     /// wind-down primitive (a spare consumer can otherwise never exit: any sibling may
     /// work-steal every dispatch).
     SvcWait { key: usize, deadline_ns: i64 },
+    /// CALLS.md 4b — the caller of an instanced offer whose **animated handler parked mid-run**.
+    /// The provider world was handed back to the instance (`busy` reopened) and the handler fiber
+    /// filed `ParkedOn`; this vCPU parks as the handler's resumer, keyed on its **own** domain
+    /// (`key`) so the handler's block-wake (`wake_blocked` + `svc_wake`) re-admits it exactly as a
+    /// serve loop is re-admitted. On resume the vCPU re-acquires the provider world and switches
+    /// back into the handler ([`OfferParked`]). Filed in `svc_waiters` (reusing that map + its
+    /// wake), with the same park-vs-wake recheck the [`Blocked::SvcWait`] handler uses.
+    OfferPark { key: usize },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -5340,6 +5348,31 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 sched.work.notify_one();
             }
         }
+        Step::Park(Blocked::OfferPark { key }) => {
+            // CALLS.md 4b — park the caller of a **promoted** offer handler as that handler's
+            // resumer, keyed on the provider domain so the handler's block-wake (`wake_blocked` +
+            // `svc_wake`) re-admits it (reusing `svc_waiters` + its wake). Lost-wakeup guard, the
+            // same shape as `SvcWait`'s (ISSUES.md I52): a block-event that fired in the
+            // enqueue→park window `svc_wake`d before this vCPU registered, so its wake was dropped
+            // — observe the woken handler under the scheduler lock and re-admit instead of parking
+            // (the run_inner resume re-claim then switches back in).
+            let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
+            let woken = v
+                .offer_parked
+                .as_ref()
+                .is_some_and(|p| v.registry.slot_woken(p.handler_slot));
+            if woken {
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            } else {
+                s.svc_waiters.entry(key).or_default().push(v);
+            }
+        }
         Step::Yield => {
             // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
             let mut s = sched.lock();
@@ -5959,11 +5992,14 @@ impl SchedDriver {
                         });
                     }
                 }
-                // Blocking stream reads, live-callee calls, and svc.wait are not part of the
-                // explored model (the same restriction as the other non-resumable drivers).
-                // Fail closed rather than wedge.
+                // Blocking stream reads, live-callee calls, svc.wait, and promoted offer parks
+                // (CALLS.md 4b) are not part of the explored model (the same restriction as the
+                // other non-resumable drivers). Fail closed rather than wedge.
                 Step::Park(
-                    Blocked::CapRead { .. } | Blocked::CapReply { .. } | Blocked::SvcWait { .. },
+                    Blocked::CapRead { .. }
+                    | Blocked::CapReply { .. }
+                    | Blocked::SvcWait { .. }
+                    | Blocked::OfferPark { .. },
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -7122,6 +7158,14 @@ struct VCpu {
     /// consumed when that handler fiber returns (the `Terminator::Return` fiber-exit settle). See
     /// [`OfferAnim`]. `None` on every non-animating vCPU and outside an animation.
     offer_anim: Option<OfferAnim>,
+    /// CALLS.md 4b — a **promoted** (parked) offer animation: set when the animated handler parked
+    /// mid-run, so its provider world was handed back to the instance (`busy` reopened) and this
+    /// vCPU parked as the handler's minimal resumer (`Blocked::OfferPark`, filed in
+    /// `svc_waiters` keyed on the caller's own domain). The handler's block-wake re-admits this
+    /// vCPU, which re-acquires the world and switches back into the handler (rebuilding
+    /// `offer_anim`). `Some` only while a promoted handler of this vCPU is parked. See
+    /// [`OfferParked`]. Mutually exclusive with `offer_anim` (active vs. parked).
+    offer_parked: Option<OfferParked>,
 }
 
 /// §3.6 slice 5b — the serve loop's in-flight handler: the registry slot/handle the handler
@@ -7211,6 +7255,7 @@ impl VCpu {
             handler_parks: BTreeMap::new(),
             serve_count: 0,
             offer_anim: None,
+            offer_parked: None,
         }
     }
 
@@ -7274,6 +7319,7 @@ impl VCpu {
             handler_parks: BTreeMap::new(),
             serve_count: 0,
             offer_anim: None,
+            offer_parked: None,
         })
     }
 
@@ -7359,6 +7405,7 @@ impl VCpu {
             handler_parks: BTreeMap::new(),
             serve_count: 0,
             offer_anim: None,
+            offer_parked: None,
         }
     }
 
@@ -7790,6 +7837,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         handler_parks,
         serve_count,
         offer_anim,
+        offer_parked,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -7807,6 +7855,65 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
     // root/fiber exits read out of the same buffer.
     let mut ret_buf: Vec<Reg> = Vec::new();
+
+    // CALLS.md 4b — resume a **promoted** offer animation. This vCPU parked as the resumer of a
+    // handler that parked mid-run (`Blocked::OfferPark`); a `svc_wake` on the provider domain
+    // re-admitted it. Re-`claim` the handler: a woken claim re-acquires the provider world and
+    // switches back into the handler (rebuilding `offer_anim`, the animation switch replayed); a
+    // still-blocked claim is a spurious wake (an unrelated enqueue on the provider domain) —
+    // re-park unchanged. Runs before the module resolve below, so `cur_module` picks up the
+    // handler's `INVOKE_MODULE` frame.
+    if let Some(parked) = offer_parked.take() {
+        match registry.claim(parked.handler_handle)? {
+            (slot, Claimed::LiveWoken(hframes)) => {
+                // Re-acquire the provider world (resume priority: a promoted handler wins the
+                // instance over new callers, so it is free here — the generation re-check the 3a
+                // phase-3 relock deferred). `busy` set again for the resumed segment.
+                let (pm, ph) = {
+                    let mut st = parked.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.busy = true;
+                    (st.mem.take(), std::mem::take(&mut st.host))
+                };
+                let saved_mem = std::mem::replace(mem, pm);
+                let saved_host = std::mem::replace(host, Arc::new(Mutex::new(ph)));
+                let saved_fuel = *fuel;
+                *fuel = parked.remaining_budget;
+                let saved_invoked = invoked.replace(parked.entry_funcs.clone());
+                let saved_ref = invoked_ref_slots.take();
+                *offer_anim = Some(OfferAnim {
+                    state: parked.state,
+                    handler_slot: slot,
+                    handler_handle: parked.handler_handle,
+                    saved_mem,
+                    saved_host,
+                    saved_fuel,
+                    saved_invoked,
+                    saved_ref_slots: saved_ref,
+                    budget: parked.remaining_budget,
+                    results: parked.results,
+                    entry_funcs: parked.entry_funcs,
+                });
+                // Park the caller frames (currently on this vCPU) as the handler's resumer and
+                // switch into the handler — the 4a animation switch, replayed on resume.
+                let caller_frames = std::mem::take(frames);
+                *parked_frames += caller_frames.len();
+                if *cur == ROOT_FIBER {
+                    *root_parked = Some(caller_frames);
+                } else {
+                    registry.park_resumer(*cur, caller_frames);
+                }
+                chain.push(slot);
+                *cur = slot;
+                *frames = hframes;
+            }
+            (_, Claimed::StillParked) => {
+                let key = parked.resume_key;
+                *offer_parked = Some(parked);
+                return Ok(Inner::Park(Blocked::OfferPark { key }));
+            }
+            _ => return Err(Trap::FiberFault),
+        }
+    }
 
     // Resolve the running frame against *its* module (module 0 = this vCPU's program;
     // `INVOKE_MODULE` = the invoked unit; ≥ 1 = an installed Jit unit), cloning the module's `Arc`
@@ -7945,6 +8052,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     *offer_anim = Some(OfferAnim {
                                         state: state_.clone(),
                                         handler_slot: hslot_,
+                                        handler_handle: handle_,
                                         saved_mem: saved_mem_,
                                         saved_host: saved_host_,
                                         saved_fuel: saved_fuel_,
@@ -7952,6 +8060,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         saved_ref_slots: saved_ref_,
                                         budget: budget_,
                                         results: Arc::from(osig_.results.clone()),
+                                        entry_funcs: entry_.funcs.clone(),
                                     });
                                     // Park the caller frames as this handler's resumer and switch
                                     // in (serve_switch shape; no `shadow_switch` — non-durable).
@@ -8093,6 +8202,63 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let leaving = *cur;
                     registry.park_blocked(leaving, std::mem::take(frames));
                     ($register_and_recheck)(leaving);
+                    // CALLS.md 4b — if the fiber that just parked is an **animated offer handler**,
+                    // promote instead of unwinding `(FIBER_PARKED, 0)` to the caller. Its frames are
+                    // already filed (`park_blocked` above) and its block-waiter registered
+                    // (`register_and_recheck`, keyed on the provider domain). Hand the provider world
+                    // back to the instance (`busy` reopens — §10.1 atomicity window closes), restore
+                    // the caller's world, and park this vCPU as the handler's resumer
+                    // (`Blocked::OfferPark`, keyed on the provider domain so the handler's block-wake
+                    // re-admits it). Non-durable (a durable animation declined to `drive_arc` in 4a),
+                    // so no `shadow_switch` — the 4a switch shape, reversed.
+                    if offer_anim.as_ref().is_some_and(|a| a.handler_slot == leaving) {
+                        let anim = offer_anim.take().expect("checked is_some");
+                        let resume_key =
+                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                        let remaining = *fuel; // provider reserve left this segment
+                        let spent = anim.budget - remaining;
+                        // Pull the provider world off this vCPU, restoring the caller's.
+                        let prov_mem = std::mem::replace(mem, anim.saved_mem);
+                        let prov_host_arc = std::mem::replace(host, anim.saved_host);
+                        *fuel = anim.saved_fuel;
+                        *invoked = anim.saved_invoked;
+                        *invoked_ref_slots = anim.saved_ref_slots;
+                        // A handler that leaked the provider-host `Arc` (spawned a fiber holding it)
+                        // can't hand the world back cleanly: fail closed, terminal for this run (a
+                        // spawning handler declines to `drive_arc` in a later slice). Fuel/world are
+                        // never surrendered on this path, so the errno is a wrong-shape guard, never
+                        // a wrong answer.
+                        let prov_host = match Arc::try_unwrap(prov_host_arc) {
+                            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+                            Err(_) => return Err(Trap::FiberFault),
+                        };
+                        {
+                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.mem = prov_mem;
+                            st.host = prov_host;
+                            st.fuel -= spent;
+                            st.busy = false;
+                        }
+                        *offer_parked = Some(OfferParked {
+                            state: anim.state,
+                            handler_handle: anim.handler_handle,
+                            handler_slot: leaving,
+                            results: anim.results,
+                            entry_funcs: anim.entry_funcs,
+                            remaining_budget: remaining,
+                            resume_key,
+                        });
+                        // Unwind to the caller (the handler's resumer) and park the whole vCPU.
+                        chain.pop();
+                        *cur = *chain.last().expect("chain keeps the root");
+                        *frames = if *cur == ROOT_FIBER {
+                            root_parked.take().ok_or(Trap::Malformed)?
+                        } else {
+                            registry.unpark_resumer(*cur)?
+                        };
+                        *parked_frames -= frames.len();
+                        return Ok(Inner::Park(Blocked::OfferPark { key: resume_key }));
+                    }
                     chain.pop();
                     *cur = *chain.last().expect("chain keeps the root");
                     shadow_switch(
@@ -13508,6 +13674,9 @@ struct OfferAnim {
     /// The registry slot of the animated handler fiber — matched against the returning fiber to
     /// recognize *this* animation's settle in the `Terminator::Return` fiber-exit.
     handler_slot: usize,
+    /// CALLS.md 4b — the handler fiber's registry **handle** (slot + generation), needed to
+    /// re-`claim` it (`Claimed::LiveWoken`) after a promotion+park; carried unused on the 4a path.
+    handler_handle: i64,
     /// The caller's `mem`, parked while the provider's window is installed on the vCPU.
     saved_mem: Option<Mem>,
     /// The caller's `Arc<Mutex<Host>>`, parked while the provider's host is installed.
@@ -13519,12 +13688,46 @@ struct OfferAnim {
     saved_invoked: Option<Arc<[Func]>>,
     /// The caller's `invoked_ref_slots`, parked alongside `saved_invoked`.
     saved_ref_slots: Option<Vec<u32>>,
-    /// The fuel budget handed to the handler (`min(OFFER_FUEL, reserve)`); the settle drains the
-    /// provider reserve by `budget - remaining`, exactly as 3a does.
+    /// The fuel budget handed to the handler for the current run segment. Initially
+    /// `min(OFFER_FUEL, reserve)`; after a 4b promotion+resume it is the reserve left when the
+    /// handler last parked (the segment budgets telescope, so the total reserve drain across
+    /// parks is `initial_budget - final_remaining`, matching a single uninterrupted 3a run).
     budget: u64,
     /// The offer op's result types — the result `cap`-slot translation edge (provider→caller) and
     /// the values to push into the caller frame on settle.
     results: Arc<[ValType]>,
+    /// CALLS.md 4b — the provider's `entry.funcs`, retained so a **promoted** handler can
+    /// re-install the provider code (`invoked = entry_funcs`) when its parked animation resumes on
+    /// this (or any) vCPU. On the run-to-completion 4a path it is simply carried and dropped.
+    entry_funcs: Arc<[Func]>,
+}
+
+/// CALLS.md 4b — a **parked** cross-world offer animation: the handler fiber parked mid-run, so
+/// the provider's `{mem, host, fuel}` were handed back to the instance (`busy` reopened, §10.1)
+/// and this vCPU parked as the handler's resumer ([`Blocked::OfferPark`]). This record is the
+/// minimum needed to re-acquire the provider world and switch back into the handler when its
+/// block-event wakes it — deliberately **not** carrying `mem`/`host` by value: a second caller
+/// may legally have animated the instance meanwhile, so the world is re-taken from the live
+/// [`ProviderState`] on resume (the generation re-check the 3a phase-3 relock deferred).
+struct OfferParked {
+    /// The provider instance to re-acquire on resume (`busy` set again, world re-taken).
+    state: Arc<Mutex<ProviderState>>,
+    /// The parked handler fiber's registry **handle** (slot + generation) — re-`claim`ed
+    /// (`Claimed::LiveWoken`) on resume.
+    handler_handle: i64,
+    /// The parked handler fiber's registry **slot** — the `slot_woken` probe the park handler's
+    /// lost-wakeup recheck uses (a block-wake that fired in the enqueue→park window).
+    handler_slot: usize,
+    /// The offer op's result types, carried through to the eventual settle.
+    results: Arc<[ValType]>,
+    /// The provider's `entry.funcs`, re-installed as the handler's code on resume.
+    entry_funcs: Arc<[Func]>,
+    /// The reserve left when the handler parked — the resumed segment's fuel budget (see
+    /// [`OfferAnim::budget`]).
+    remaining_budget: u64,
+    /// The provider domain id this vCPU is parked under in `svc_waiters` — the key the handler's
+    /// block-wake `svc_wake`s, and the key to re-park under on a spurious wake.
+    resume_key: usize,
 }
 
 /// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
