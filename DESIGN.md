@@ -2645,7 +2645,7 @@ which builds the table/runtime/`cont.*` thunk env post-compile so a submitted un
 backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
 `fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
-`submitted_unit_threads_compile_ok`.
+`submitted_unit_threads_compile_split_by_tier`.
 
 **Threads in a submitted unit (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11).** The
 compile-time threads/futex veto above is lifted: the hazard it guarded — a spawned vCPU outliving the

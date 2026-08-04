@@ -201,21 +201,59 @@ func () -> (i64) {\nblock 0 () {\n  v0 = i32.const 1\n  v1 = i64.const 32768\n  
     );
 }
 
-/// **Threads now compile** in a submitted unit (CONSOLIDATION.md §11, renegotiated 2026-08-04 —
-/// was: `-EINVAL` at the shared validator). The runtime contract does the guarding instead:
-/// `invoke` of a spawning unit still fails (the nested run is seam-free), and `install` + dispatch
-/// is the supported path (module-aware spawn in the caller's vCPU —
-/// `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`).
+/// **Threads in a submitted unit — split by tier** (CONSOLIDATION.md §11, renegotiated 2026-08-04;
+/// was: `-EINVAL` at the shared validator on both backends). The interp/bytecode tier now compiles a
+/// spawning unit — `install` + dispatch is the supported path (module-aware spawn,
+/// `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`) and `invoke` still refuses at
+/// runtime (seam-free). The **native Cranelift tier's own unit-compile pipeline still fail-closes**
+/// (`-EINVAL`) — admitting threaded units there is the §11 next slice — so the two tiers
+/// *deliberately* diverge at compile until that lands; this pin holds each tier to its contract.
 #[test]
-fn submitted_unit_threads_compile_ok() {
-    // A unit whose entry spawns a real vCPU (func 1) — compiles on both backends; only running it
-    // via `invoke` is refused (at runtime, not here).
+fn submitted_unit_threads_compile_split_by_tier() {
     let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
     let guest = with_len(COMPILE_ONLY, b.len());
-    let (out, _) = diff_run_fibers(&guest, &b, &[]);
+    let m = parse_module(&guest).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let mut init = vec![0u8; BLOB_OFF + b.len()];
+    init[BLOB_OFF..].copy_from_slice(&b);
+
+    // Interp tier: the shared validator admits the unit — compile returns a code handle (>= 0).
+    let mut host_i = Host::new();
+    let h_i = grant_jit_fibers(&mut host_i, &m, 0);
+    let mut fuel = 50_000_000u64;
+    let (ires, _) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(h_i)],
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    );
+    match ires {
+        Ok(v) => assert!(
+            matches!(v.first(), Some(Value::I64(h)) if *h >= 0),
+            "interp tier must compile a spawning unit (code handle), got {v:?}"
+        ),
+        other => panic!("interp compile run: {other:?}"),
+    }
+
+    // Native tier: fail-closed at its own unit compile until the §11 native slice lands.
+    let mut host_j = Host::new();
+    let h_j = grant_jit_fibers(&mut host_j, &m, 0);
+    let (jout, _) = jit_cap_run(
+        &m,
+        0,
+        &[h_j as i64],
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host_j,
+    )
+    .expect("jit run");
     assert!(
-        matches!(out, JitOutcome::Returned(ref s) if s[0] >= 0),
-        "threads in a submitted unit must now compile (a code handle), got {out:?}"
+        matches!(jout, JitOutcome::Returned(ref s) if s == &[-22]),
+        "native tier must stay fail-closed (-EINVAL) until its slice, got {jout:?}"
     );
 }
 
