@@ -186,3 +186,58 @@ fn debug_invoke_leaf_agrees() {
     let mut fuel2 = 50_000_000u64;
     assert_eq!(sched_to_end(&mut sched, &mut fuel2), want);
 }
+
+/// **Fail-closed under the debugger.** A `Jit.install` / `Jit.invoke` of a **forged** code handle
+/// (never minted by `compile`) resolves no unit — the authority arm in `dbg_jit_install`/`dbg_jit_invoke`
+/// returns a trap, exactly as the production `drive`. The debug engines must trap identically to the
+/// tree-walker oracle (not decline, not diverge). Pins the error path the happy-path tests don't reach.
+#[test]
+fn debug_forged_handle_traps_identically() {
+    // A staged blob is irrelevant here (the forged handle is never resolved), but keep the shape.
+    let b = blob(
+        "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i32.const 1\n  return v0\n  }\n}\n",
+    );
+
+    // `(jit) -> i32`: install a bogus code handle (7777) — the cap.call traps; the run never returns.
+    let install_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  \
+         v1 = i64.const 7777\n  v2 = cap.call 11 3 (i64) -> (i64) v0 (v1)\n  \
+         v3 = i32.wrap_i64 v2\n  return v3\n  }\n}\n";
+    // …and the same for invoke (op 1).
+    let invoke_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  \
+         v1 = i64.const 7777\n  v2 = cap.call 11 1 (i64) -> (i32) v0 (v1)\n  return v2\n  }\n}\n";
+
+    for src in [install_src, invoke_src] {
+        let m = guest_module(src, &b);
+        let (host, jit) = jit_host(&m, 4);
+        let args = [Value::I32(jit)];
+
+        let want = oracle(&m, &args);
+        assert!(
+            want.is_err(),
+            "forged handle must trap on the oracle, got {want:?}"
+        );
+
+        let mut run = DebugRun::new_with_host(&m, 0, &args, host).expect("debug engine builds");
+        let mut fuel = 50_000_000u64;
+        assert_eq!(
+            run.run_to(&[], &mut fuel),
+            None,
+            "trapping run reaches no breakpoint"
+        );
+        assert_eq!(
+            run.result().cloned(),
+            Some(want.clone()),
+            "single-vCPU DebugRun must trap identically to the oracle (forged handle)"
+        );
+
+        let (host2, _) = jit_host(&m, 4);
+        let mut sched =
+            ScheduledDebugRun::new_with_host(&m, 0, &args, host2).expect("scheduled engine builds");
+        let mut fuel2 = 50_000_000u64;
+        assert_eq!(
+            sched_to_end(&mut sched, &mut fuel2),
+            want,
+            "ScheduledDebugRun must trap identically to the oracle (forged handle)"
+        );
+    }
+}
