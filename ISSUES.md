@@ -1449,6 +1449,18 @@ so I17's *actual* signal (the same-run compute ratios) resumes gating, and the c
 drift resumes printing. The remaining I17 item is unchanged: regenerate `baseline.txt` so the five
 MISSING kernels regain rows.
 
+**Follow-up (2026-08-04): the bench lane was red for yet another *deterministic* reason — the harness
+no longer compiled, so the perf signal has been dead again (not drift).** The nightly `bench` job
+failed at `cargo build` with `error[E0061]: this function takes 12 arguments but 11 were supplied`
+at `bench/src/threads.rs:71` — `svm_jit::CompiledModule::compile` gained a 10th parameter
+`fast_resolver: Option<FastCapResolver>` (the §9/D45 hot-`cap.call` specializer), but the bench
+caller was never updated. Same root class as the "standalone workspaces" section below: `bench/` is
+its own cargo workspace, so `cargo build --workspace` (the usual pre-push check) never compiles it and
+the break sailed through — this time from an **svm-jit** API change, not svm-interp/svm-run. **Fixed:**
+added the missing `None, // fast_resolver` argument (the in-tree idiom at 7 other call sites); verified
+the bench workspace builds clean (`cargo build --release`, 4m09s). The lane's `--check` compare is once
+again reachable. Baseline-regen for the five MISSING kernels remains the one open I17 item.
+
 ---
 
 ### I18 — CI transients: crates.io network resets and rolling-nightly toolchain breakage (S4)
@@ -1913,9 +1925,10 @@ should be lifted; until then this is what Windows/macOS are **not** testing.
 `browser/` (svm-browser), `bench/`, `browser/wt/`, and `fuzz/` are **separate cargo
 workspaces**, not members of the root workspace (like `crates/svm-llvm/`). A `cargo build
 --workspace` — the usual local pre-push check — does **not** compile them, so a cross-cutting
-rename that touches the `svm-interp`/`svm-run` public API (e.g. `host_fn`→`host_proc`, 2026-07-30)
-builds clean locally yet breaks the four browser-building CI jobs (wasm32/wasm64/cross-engine/
-real-browser). This has recurred 3× on the same rename. **When renaming any public `svm-interp`/
-`svm-run` symbol, also grep + build the standalone trees:** `browser`, `bench`, `browser/wt`,
-`fuzz` (`cargo build --manifest-path <tree>/Cargo.toml`). A CI job that fast-checks these on every
-PR (not only the expensive full browser build) would close the gap.
+change to any public API they consume — `svm-interp`/`svm-run` (e.g. `host_fn`→`host_proc`,
+2026-07-30) **or `svm-jit`** (e.g. the `CompiledModule::compile` `fast_resolver` param, 2026-08-04,
+which broke `bench/`) — builds clean locally yet breaks a CI lane that only compiles the standalone
+tree. This has recurred 4× now. **When changing any public `svm-interp`/`svm-run`/`svm-jit` signature,
+also grep + build the standalone trees:** `browser`, `bench`, `browser/wt`, `fuzz`
+(`cargo build --manifest-path <tree>/Cargo.toml`). A CI job that fast-checks these on every PR (not
+only the expensive full browser build / non-gating nightly bench) would close the gap.
