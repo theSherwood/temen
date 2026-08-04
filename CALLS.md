@@ -760,17 +760,32 @@ plumbing that lands in increments (§8).
          before, at both the 4a and 4d settles. Behaviour-identical; the existing offer suite is the
          oracle (`impl_wiring` 25, `offer_promotion` 8 incl. the 4a–4d settles, `imports_impl`
          three-backend).
-       - **6d.4.2 — unify the side tables + the `Binding` variant.** Fold `OfferEntry` and
-         `LiveImplEntry` into one `ImplEntry` (passive fields `Option`al, live fields `Option`al),
-         and `Binding::Offer`/`Binding::LiveImpl` into one `Binding::Impl(u32)`; the dispatch probe
-         branches on the discriminant to pick animation vs crossing. Pure representation change;
-         every existing offer/live-impl pin is the oracle.
-       - **6d.4.3 — delete `ProviderState` + its mutex.** With its parts relocated (6d.4.1) and the
-         binding unified (6d.4.2), the struct and its `Mutex` retire from the tree — the headline
-         §7 deletion. `grant_impl_cap`'s residual blocking `state.lock()` (noted at 6b) dissolves
-         here.
-       - **6d.4.4 — collapse the dispatch arms.** One `cap_dispatch_slots` impl arm branching
-         internally, replacing the two; the `GuestImpl`/`LiveImpl` split leaves §7's list.
+       - **6d.4.2 / 6d.4.3 / 6d.4.4 — NOT RECOMMENDED (finding, owner decision needed).** Building
+         6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and partly not achievable given the
+         4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
+         `Binding::LiveImpl` (16 sites) are handled *separately* at ~35 sites with **opposite**
+         semantics — `Offer` is non-durable (freeze errors) while `LiveImpl` is durably capturable
+         via `callee_slot`; `Offer` animates in `cap_dispatch_slots` while `LiveImpl` answers
+         `-EINVAL` there and crosses via `live_impl_call`; their payloads share nothing
+         (`funcs`/`ops`/`state` vs `callee`/`export`/`callee_slot`). Folding them into one
+         discriminated `ImplEntry` would **relocate** the passive-vs-live split from the enum to a
+         field without deleting logic, and add `Option`-heavy union fields — a net complexity
+         *increase* on the TCB (AGENTS.md prime directive: don't add abstraction until something
+         concrete demands it). Worse, **`ProviderState` cannot actually be deleted while the passive
+         transport is kept**: its `busy`/`admit_parked`/`busy_owner` admission word and its window
+         must live *outside* the `Host` that the sub-run takes by value (else a contender reads a
+         stale `busy=false` and double-checks-out the instance), and the passive-animation transport
+         (4a) genuinely needs them. So §7's "delete `ProviderState` + its mutex" and "the
+         `GuestImpl`/`LiveImpl` binding split" presuppose the **transport merge** (give a library
+         instance its own serve loop) that 6d.4's scope note explicitly rejected for reversing 4a.
+         The two goals are in tension inside this doc. **Recommendation: 6d.4 concludes at 6d.4.1.**
+         The clean structural win is banked (the offer powerbox is now the granted-child shared-cell
+         shape; the per-call `Arc::new` is gone); the residual is one uncontended nested lock
+         (`Mutex<Host>` inside `Mutex<ProviderState>`), inherent to a passive instance needing
+         checkout atomicity over {admission word, window} separate from its takeable powerbox. To
+         actually retire `ProviderState`, the owner would first have to renegotiate the 4a
+         passive-transport decision (or accept `LiveImpl` carrying inert admission/window fields —
+         bloat, not simplification). Left as an explicit owner call, not built.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
