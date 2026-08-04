@@ -1221,6 +1221,39 @@ block 0 (v0: i64) {
 }
 "#;
 
+// The **§14 VM-in-VM** granted module: like [`THREADS_INST_UNIT`] but the entry *uses* its
+// `Instantiator` — it reads its own data byte ("K" = 75), `instantiate`s func 1 (a pure grandchild →
+// 9) into a **narrowed** 1 KiB sub-carve of its own window, `join`s it, and returns 75 + 9 = 84. With
+// the same [`THREADS_INST_MOD`] root: 8 × 84 = 672. On the codegen tier the entry emits via
+// `compile_module_nested` — its `cap.call 6 0/1` become `env.instantiate`/`env.join` serviced by the
+// Worker through the confined-child completion-slot protocol (grandchildren spawn on their own
+// Workers), differential against the interpreter's driver servicing the same ops.
+const THREADS_INST_NESTED_UNIT: &str = r#"memory 16
+data 0 "K"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vinst = i32.wrap_i64 v0
+  vz = i64.const 0
+  vk32 = i32.load8_u vz
+  vk = i64.extend_i32_u vk32
+  ventry = i64.const 1
+  voff = i64.const 0
+  vslog = i64.const 10
+  vquota = i64.const 0
+  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vg = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vr = i64.add vk vg
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 9
+  return v1
+  }
+}
+"#;
+
 // Root `(instantiator, module) -> sum`: `instantiate_module` the granted module 8 times, join, sum —
 // compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
 const THREADS_INST_MOD: &str = r#"memory 20
@@ -1982,6 +2015,7 @@ fn main() {
     emit("threads_inst_nested", THREADS_INST_NESTED);
     emit("threads_inst_mod", THREADS_INST_MOD);
     emit("threads_inst_unit", THREADS_INST_UNIT);
+    emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000

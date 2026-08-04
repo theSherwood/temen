@@ -380,6 +380,31 @@ block 0 (v0: i64) {
   } catch (e) {
     set('instcodegen', 'fail', `instcodegen: error ${e}`);
   }
+
+  // --- 10) §14 **VM-in-VM real codegen** (nested instantiate on emitted wasm) -----------------------
+  // Same root, but the granted unit's entry USES its Instantiator: it reads its "K"=75, spawns a pure
+  // grandchild (→ 9) into a narrowed 1 KiB sub-carve of its own window, joins it, returns 84 →
+  // 8 × 84 = 672. With codegen the cap-using entry itself runs on EMITTED WASM (`compile_module_nested`
+  // — the browser's last §14 gap): its instantiate/join arrive as `env.instantiate`/`env.join` imports,
+  // serviced by the Worker through the same completion-slot protocol, the grandchildren spawning on
+  // their own Workers (17 total). Both tiers must agree, and codegen must actually emit (tierups —
+  // children AND their emitted grandchildren bump it).
+  try {
+    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
+    const unit = await fetchBytes('/corpus/threads_inst_nested_unit.svmbc');
+    const opt = { unit, winSize: 1 << 20 };
+    const t0 = performance.now();
+    const interp = await run(guest, { ...opt, inst: true });
+    const codegen = await run(guest, { ...opt, instCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups > 0;
+    set('instnested', ok ? 'pass' : 'fail',
+      `instnested: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
+      `(want 672, ${codegen.tierups} emitted incl. VM-in-VM parents) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`instnested → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('instnested', 'fail', `instnested: error ${e}`);
+  }
 }
 
 main().catch((e) => { log(`fatal: ${e}\n${e.stack ?? ''}`); set('threads', 'fail', `fatal: ${e}`); });

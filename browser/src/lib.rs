@@ -1081,8 +1081,24 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         let Some(m) = &cfg.module else {
             return 0;
         };
-        // A §14 instantiator child runs interpreter-driven on its own Worker (the `Threaded` shape),
-        // tiering up its in-subset functions.
+        // §14 VM-in-VM first: the nested emit (`compile_module_nested`) subsumes the plain one — pure
+        // functions emit identically, and a cap-using entry (`cap.call 6 0/1` instantiate/join) *also*
+        // emits, its spawn/join bounced to the Worker via the `env.instantiate`/`env.join` imports
+        // (worker.js services them through the same confined-child completion-slot protocol the
+        // interpreter path uses; providing the extra imports is harmless for a 2-import module).
+        // ADDRESS_SPACE wrappers are NOT outlined here: the browser's `call_interp` callback carries
+        // no powerbox yet, so a `sub`/`page_size`-using entry fails `compile_module_nested` closed and
+        // falls through to the tier-up shape (interpreter entry).
+        if let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_nested_with_eligibility(m, true) {
+            // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
+                *core::ptr::addr_of_mut!(INST_ELIGIBLE) = Some(eligible);
+            }
+            return 1;
+        }
+        // Fallback: a §14 instantiator child runs interpreter-driven on its own Worker (the `Threaded`
+        // shape), tiering up its in-subset functions.
         let Ok(svm_wasm_jit::Artifact {
             wasm,
             emitted: eligible,
