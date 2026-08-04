@@ -5,10 +5,9 @@
 //! same live-impl handle the interp's op-14 arm mints (shape from the child's `self_module`,
 //! structurally interned — D59 gives both backends the identical type id).
 //!
-//! Scope pin: a call **through** the minted handle still answers the host dispatch's probeable
-//! `-EINVAL` on the JIT — the cross-domain transport is 5c.1; minting is this slice. The interp
-//! call-through completes (42), asserted here as each backend's *documented* value, not equality —
-//! the equality pin flips in 5c.1.
+//! With 5c.1b the call **through** the minted handle completes on both backends (the JIT via the
+//! parked transport: enqueue on the child's shared cell, the child's blocking `svc.wait` serves,
+//! the thread-blocked caller wakes with the reply) — the equality flip 5c.0 promised.
 
 use std::sync::Arc;
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
@@ -24,6 +23,7 @@ fn grant_hooks() -> GrantChildHooks {
         release: svm_run::grant_child_release,
         mint: svm_run::child_offer_mint,
         thunk: svm_run::cap_thunk_locked,
+        register_serve: svm_run::child_register_serve,
     }
 }
 
@@ -196,11 +196,12 @@ fn child_offer_mints_on_the_jit_and_matches_interp() {
     assert!(interp >= 0, "interp op 14 mints, got {interp}");
 }
 
-/// A call **through** the minted handle: completes on the interp (the eval-loop transport), and
-/// answers the host dispatch's probeable `-EINVAL` on the JIT until the 5c.1 transport lands.
-/// Each backend's documented value — the equality pin is 5c.1's flip.
+/// **The 5c.1 equality flip** (promised in the 5c.0 PR): a call **through** the minted handle now
+/// completes on BOTH backends — the interp via its eval-loop transport, the JIT via the 5c.1b
+/// parked transport (enqueue on the child's shared cell → the child's `svc.wait` block-waits,
+/// serves, settles → the thread-blocked caller wakes with the reply).
 #[test]
-fn call_through_minted_offer_documented_per_backend() {
+fn call_through_minted_offer_completes_on_both_backends() {
     assert_eq!(
         run_interp_i64(CALL_SRC),
         42,
@@ -208,8 +209,8 @@ fn call_through_minted_offer_documented_per_backend() {
     );
     assert_eq!(
         run_jit_i64(CALL_SRC),
-        -22,
-        "JIT: minted but untransportable until 5c.1 — probeable, never a trap"
+        42,
+        "JIT: the parked transport — enqueue, child serves, thread-blocked caller wakes"
     );
 }
 

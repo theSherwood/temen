@@ -117,6 +117,7 @@ fn grant_hooks() -> GrantChildHooks {
         release: svm_run::grant_child_release,
         mint: svm_run::child_offer_mint,
         thunk: svm_run::cap_thunk_locked,
+        register_serve: svm_run::child_register_serve,
     }
 }
 

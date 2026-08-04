@@ -700,7 +700,18 @@ pub struct GrantChildHooks {
     /// `cap.call`s must synchronize: this is the lock-taking thunk variant (`ctx` = the shared
     /// cell), replacing the run's unsynchronized `cap_thunk` for granted children only.
     pub thunk: CapThunk,
+    /// CALLS.md 5c.1b — register a spawned granted child's **serve context** on its shared
+    /// powerbox: `(child_ctx, serve_ctx)` where `serve_ctx` is the live `ChildCode` address
+    /// (resolve handlers via [`child_handler_tramp`], invoke via [`child_invoke_handler`]).
+    /// Called after compile, before the child thread starts; cleared by the releaser (host-side
+    /// `Host::set_child_serve_ctx(0)`) so a stale pointer is never read after child exit.
+    pub register_serve: ChildServeRegistrar,
 }
+
+/// Register / clear a granted child's serve context on its shared powerbox — see
+/// [`GrantChildHooks::register_serve`].
+pub type ChildServeRegistrar =
+    unsafe extern "C" fn(child_ctx: *mut core::ffi::c_void, serve_ctx: usize);
 
 /// Mint a `child_offer` live-impl in the parent powerbox over a retained child powerbox — see
 /// [`GrantChildHooks::mint`]. Host-side it fetches the export shape from the child's registered

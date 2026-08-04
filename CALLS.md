@@ -492,14 +492,38 @@ plumbing that lands in increments (§8).
        misses. Also: the `svc_parity` pin module spawns via **op 0** (an *unshared* child) and exits
        via `call.import` (a second `svc_park_veto` term beyond `has_instantiate`) — the pin needs
        op 0 to mint shared powerboxes too, or the module moves to op 11 and a `cap.call` exit.
-       Sub-slices: **5c.1a** serve trampolines for children (extend `ChildCode` or compile children
-       as `CompiledModule`s) + child `serve_native_ctx`; **5c.1b** the shared-cell `Condvar` + the
-       blocking `svc.wait` arm in `cap_thunk_locked` (arm (c) — placed *before* the guard-holding
-       generic delegate, so it owns its lock scope; the `jit_invoke_locked` resolve-drop-reenter
-       pattern) + the caller live-impl enqueue/block arm + a Host-reachable epoch channel;
-       **5c.1c** production `GrantChildHooks` on `powerbox_compile_run` (`_ex` compile), the
-       Jit-only fold relax, op-13 `self_module`, and the pin flips (`svc_parity` on the real JIT;
-       `jit_child_offer` call-through `-EINVAL` → 42 ≡ interp).
+       Sub-slices:
+       - **5c.1a — serve trampolines for children. DONE (2026-08-04).** `compile_child` builds a
+         buffer-ABI serve trampoline per impl-export handler (the `CompiledModule::compile`
+         `serve_ids` block, child twin) onto `ChildCode.serve_tramps`; the handler set
+         (`Nursery.serve_handlers`) comes from `m.impl_exports` at root-nursery construction (no
+         external plumbing; co-fiber/durable/plain children pass empty). Opaque consumption API
+         (`child_handler_tramp` / `child_invoke_handler`) — the fault range comes free from the
+         thunk's own `mem_base`/`mem_size` (the serve arm runs inside the child's in-flight guarded
+         entry call). `Host.child_serve_ctx` is the registration slot, distinct from
+         `serve_native_ctx` by design.
+       - **5c.1b — the blocking transport. DONE (2026-08-04).** **As built**, no cell-type change:
+         the `Condvar` lives *inside* `Host` (`svc_cv: Option<Arc<Condvar>>`, armed by the granted
+         builders), cloned out under the cell's lock and always paired with that one mutex —
+         `Condvar::wait(guard)` is sound and the 5c.0 `Arc<Mutex<Host>>` ABI is untouched.
+         `svc_enqueue`/`svc_settle` notify; `Host.epoch_cell` mirrors the kill cell for
+         thunk-blocked re-checks (20ms `wait_timeout` + trap-cell poll, the join-park discipline).
+         Child side: `serve_locked_child` replaces the locked thunk's `-EINVAL` stub — pops via the
+         registered serve ctx, **drops the guard around every handler invoke**, settles+notifies;
+         an empty-queue `svc.wait` block-waits (non-child locked domains keep `-EINVAL`; timed form
+         stays `-EINVAL`; a *nested* serve under a handler is a recorded residue). Caller side:
+         `live_impl_call` in the unlocked thunk — enqueue (full queue ⇒ `-EAGAIN`), thread-block on
+         the ticket; dead callee (release cleared the serve ctx with the dispatch unserved) ⇒
+         `CAP_REVOKED`, the D37 shape. A **locked-domain caller** (child→sibling) refuses `-EINVAL`
+         before the guard-holding delegate — the A↔B cyclic-call deadlock is structurally excluded
+         until a later slice unlocks that tier. Registration: `GrantChildHooks.register_serve` at
+         spawn; the releaser clears the ctx + notifies (idempotent across the two refs). Pinned by
+         `jit_child_offer::call_through_minted_offer_completes_on_both_backends` — **the 5c.0
+         equality flip: 42 on the real JIT ≡ interp.**
+       - **5c.1c** production `GrantChildHooks` on `powerbox_compile_run` (`_ex` compile), the
+         Jit-only fold relax, op-13 `self_module`, and the `svc_parity` pin on the real JIT (its
+         module moves op 0 → op 11: a plain child is destitute by design on the JIT; a serving
+         child needs a powerbox).
      - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
        loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
        inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),

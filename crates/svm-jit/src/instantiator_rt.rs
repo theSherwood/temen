@@ -194,6 +194,17 @@ unsafe fn spawn_granted_child(
     let base = SendRaw(parent_mem_base);
     let ctx = SendRaw(gc_ctx);
     let code = std::sync::Arc::new(code);
+    // CALLS.md 5c.1b — register the child's serve context on its shared powerbox before the child
+    // thread starts (so a dispatch enqueued at any point of the child's life finds it). The
+    // `ChildCode` Arc lives until the child thread ends, and the releaser clears the ctx before
+    // that Arc drops (the teardown hook runs `release` first) — no stale read window.
+    {
+        let rs = rt.grant_register_serve.load(Ordering::Acquire);
+        if rs != 0 {
+            let rs: crate::ChildServeRegistrar = unsafe { core::mem::transmute(rs) };
+            unsafe { rs(gc_ctx, std::sync::Arc::as_ptr(&code) as usize) };
+        }
+    }
     let done = std::sync::Arc::new(ChildDone {
         state: Mutex::new(None),
         cv: Condvar::new(),
@@ -353,6 +364,10 @@ pub(crate) struct Nursery {
     /// ([`crate::CapThunk`] as usize; 0 ⇒ fall back to the run's `cap_thunk` — pre-5c.0 behavior,
     /// only correct for a builder that does not share the child `Host`).
     grant_thunk: std::sync::atomic::AtomicUsize,
+    /// CALLS.md 5c.1b — the [`crate::ChildServeRegistrar`] hook (0 ⇒ none): registers a spawned
+    /// granted child's `ChildCode` address on its shared powerbox so the locked thunk's serve arm
+    /// can resolve + invoke handlers.
+    grant_register_serve: std::sync::atomic::AtomicUsize,
 }
 
 /// The slice of a coroutine's state its **child-side** thunks need (`coro_cap_thunk` — the `Yielder`),
@@ -500,6 +515,7 @@ impl Nursery {
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
+            grant_register_serve: std::sync::atomic::AtomicUsize::new(0),
             grant_mint: std::sync::atomic::AtomicUsize::new(0),
             grant_thunk: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -510,7 +526,7 @@ impl Nursery {
     /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
     /// `None` leaves them `0` (both ops stay an inert `CapFault`).
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t) = match hooks {
+        let (b, bn, r, bi, m, t, rs) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
@@ -518,11 +534,13 @@ impl Nursery {
                 h.bind_imports as usize,
                 h.mint as usize,
                 h.thunk as usize,
+                h.register_serve as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
+        self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
         self.grant_mint.store(m, Ordering::Release);
