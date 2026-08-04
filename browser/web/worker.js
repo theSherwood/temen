@@ -31,7 +31,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2 } = e.data;
+    jitB2, jitRuntime } = e.data;
   // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
   // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -117,8 +117,8 @@ self.onmessage = async (e) => {
   if (jitB2) {
     const size = 1 << ex.svm_par_jit_table_log2();
     jitTable = new WebAssembly.Table({ initial: size, maximum: size, element: 'anyfunc' });
-    if (!jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   }
+  if ((jitB2 || jitRuntime) && !jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   // Instantiate a unit's emitted bytes importing this Worker's shared table, or null if not emitted.
   const jitInstantiate = (bytes) =>
     new WebAssembly.Instance(new WebAssembly.Module(bytes), {
@@ -378,8 +378,12 @@ self.onmessage = async (e) => {
       if (jitB2) {
         jitSyncTable();
         unit = jitUnitFor(ex.svm_par_jit_code(v));
-        if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      } else if (!unit) {
+        // Runtime-`Jit.compile` path without B2: resolve the invoked unit by its code handle (each
+        // Worker instantiates + caches per handle; the emitted bytes live on the shared host).
+        unit = jitUnitFor(ex.svm_par_jit_code(v));
       }
+      if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
