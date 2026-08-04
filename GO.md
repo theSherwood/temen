@@ -392,7 +392,25 @@ verbatim). Then, in dependency order:
 By conventional accounting this is person-quarters, not person-weeks — the
 largest language project in the tree so far, sized roughly **3–5× svm-leng**
 (which went from empty crate to linking real cross-module nimony programs in
-about a week of slices, per NIM.md §3). It decomposes into the same
+about a week of slices, per NIM.md §3).
+
+**Calibration against the Nim self-host path** (the closest prior, and the costs
+land in different places):
+
+| Dimension | Nim (NIM.md) | Go (Route D) | Delta |
+|---|---|---|---|
+| Lowering already done upstream | hexer dissolves ARC, exceptions→error-flags, closures, iterators *before* the backend sees anything — Leng is a ~450-line-grammar codegen IR, mostly 1:1 | go/ssa is mid-level: interfaces, maps, channels, `go`/`defer`/`select`, generics instantiation are still semantic constructs the backend + runtime must lower | backend ~2–3× svm-leng — hexer was doing for Nim what we build ourselves for Go |
+| Runtime | ~15 bottom-edge C functions (NIM.md §3b); **no GC** (ARC = ordinary calls), **no scheduler** | conservative GC + cross-vCPU STW, M:N work-stealing scheduler, channels/`select`, maps, itables, partial `reflect` — i.e. all of Route B2 | the dominant delta; Nim's runtime cost was ≈ zero |
+| Stdlib closure to compile the compiler | the `system` module — 324 procs, whole module = a 129 KB object | go/token/parser/types + x/tools/go/ssa + fmt/os/… — order 150k+ lines, interface/map/allocation-heavy (stressing exactly the new runtime) | 1–2 orders of magnitude in lines; the long pole |
+| Program/link shape | W2 linker landed in days, but **W4** (nifler→nimony→hexer→lengc subprocess pipeline) is NIM.md's "biggest unknown", still open | one binary, in-process, whole-program emit over the existing `.svmo`/`svm_ir::link` waist | **Go is easier** — W4 has no analog |
+| Fixpoint strength | not a single-language fixpoint (svm-leng is Rust; reaches svm via the wasm on-ramp) | chibicc-grade stage1==stage2 in one language, parallel and deterministic | stronger result, dearer floor |
+
+Net: **roughly 3–4× the Nim self-host path in total**, with the excess almost
+entirely in the runtime Nim never needed and the stdlib-closure breadth. The
+flip side: the *marginal* cost of self-hosting once the backend runs Go well is
+**lower** than Nim's — pure-Go one-binary architecture means no W4, no
+cross-language bootstrap; the fixpoint is plumbing plus the go/types grind,
+exactly as chibicc's fixpoint was plumbing once the frontend was faithful. It decomposes into the same
 fail-closed, differential-gated slices as every frontend before it, with no
 single high-risk unknown: the runtime substrate is proven (B2/`steal_fibers`),
 the GC contract is proven (JACL), the frontend pattern is proven three times
