@@ -24,7 +24,9 @@
 
 extern crate alloc;
 
+mod lower_indirect;
 mod specialize;
+pub use lower_indirect::lower_indirect_dispatch;
 pub use specialize::{
     specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig, SpecError,
 };

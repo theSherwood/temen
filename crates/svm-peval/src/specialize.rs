@@ -256,6 +256,15 @@ pub struct SpecConfig {
     /// outlined back-edge) and implies outlining is enabled (no need to also set `outline_calls`). Off
     /// by default.
     pub selective_outline: bool,
+    /// **Bounded-target dynamic `call_indirect` (approach A).** When `Some(cap)`, a pre-pass
+    /// ([`crate::lower_indirect_dispatch`]) rewrites every dynamic-index `call_indirect` whose
+    /// demanded signature is matched by at most `cap` module functions into an explicit masked
+    /// dispatch over direct calls (one arm per target), so the specializer folds through it instead
+    /// of returning [`SpecError::Unsupported`]. Sites with more than `cap` matching targets
+    /// (megamorphic dispatch) are left untouched. `None` (default) keeps the constant-index-only
+    /// behavior. See `lower_indirect` for the masked-compare soundness and the one known trap-kind
+    /// gap on an out-of-signature index.
+    pub indirect_targets_cap: Option<usize>,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -292,6 +301,19 @@ pub fn specialize_with_config(
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
+    // Approach A: optionally rewrite dynamic-index `call_indirect`s into bounded direct-call
+    // dispatch before specializing, so the engine folds through them (see `lower_indirect`). The
+    // rewrite preserves function signatures/indices, so `func` and `args` still refer to the same
+    // entry.
+    let lowered;
+    let module = match config.indirect_targets_cap {
+        Some(cap) => {
+            lowered = crate::lower_indirect_dispatch(module, cap);
+            &lowered
+        }
+        None => module,
+    };
+
     let f = module.funcs.get(func as usize).ok_or(SpecError::BadFunc)?;
     if args.len() != f.params.len() {
         return Err(SpecError::ArityMismatch);
