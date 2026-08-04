@@ -663,18 +663,44 @@ plumbing that lands in increments (§8).
        so running its unit natively needs a way to invoke over a *foreign* window with **that
        window's** fault range — new confinement-masking plumbing, the security hinge (AGENTS.md; its
        own fuzz obligation). Split accordingly:
-       - **6d.2a — pure-offer native arm.** Intercept an offer-typed `cap.call` in `cap_thunk`
-         (a `Binding::Offer`-probe analogous to `live_impl_call`); for a *pure* offer, compile the
-         unit (cached) and `invoke_extra` it, translating `cap` slots at the two edges. Windowless
-         ⇒ **no masking change**; differential-pinned against the interp's pure arm. This lands the
-         compile+cache+translate scaffolding masking-safely.
-       - **6d.2b — instanced-offer native arm (masking hinge).** Invoke the offer unit over the
-         provider's window with the provider window's own `(lo, hi)` fault range — new
-         `invoke_extra`-over-foreign-window plumbing — plus the 6c `busy` checkout and flat
-         `OFFER_FUEL`. Carries a dedicated masking-fuzz obligation (fuzz *invoke-over-foreign-window
-         stays masked to the provider window*, as its own unit). This is the slice that actually
-         retires the host-side arm's instanced branch for the JIT tier; the JIT's `-EINVAL`/host-side
-         fall-through for offers leaves §7's list only once both 6d.2a and 6d.2b land.
+       - **6d.2a — no-memory pure-offer native arm (masking-safe scaffolding).** A new
+         `offer_call` probe in `cap_thunk` (analogous to `live_impl_call`) resolves the handle to a
+         `Binding::Offer`; it handles natively **only** a pure offer (`state=None`) whose unit
+         **declares no memory** (and no threads/futex/fibers), else returns `None` to fall through
+         to `cap_dispatch_slots` unchanged. No memory decl ⇒ the lowering emits **zero masked
+         accesses** ⇒ the baked mask (`reserved−1`) and the fault range are never consulted, so the
+         `mem_base` is inert and the native run is masking-safe over any base. Mechanism:
+         `define_extra(entry.funcs)` into the run's `CompiledModule`, cached per `(domain, unit)` by
+         `Arc::as_ptr`; `invoke_extra` the op's handler trampoline; `cap` slots translated at the
+         two edges against an ephemeral `Host` (the interp pure arm's shape). **Fuel wrinkle (must
+         resolve first):** the interp pure arm runs under a flat `OFFER_FUEL` (`drive_arc`), but
+         `invoke_extra` shares the run's fuel counter (caller-pays) — so native parity needs a
+         scoped `OFFER_FUEL` budget around the invoke (save/set/restore the counter, or a
+         fuel-bearing invoke variant), or a looping pure offer would trap `OutOfFuel` at a different
+         point than the interp. Differential-pinned (a no-memory pure offer, result **and** fuel
+         parity, three backends). Retires only the pure/no-memory branch of the host-side arm.
+       - **6d.2b — instanced-offer native arm over the provider window (the masking hinge).** Three
+         sensitive sub-problems: **(A) foreign-window invoke** — a new
+         `invoke_extra_window(cm, code, args, results, win_base, win_lo, win_hi, trap_out)` that
+         masks/attributes to an **explicit** provider window instead of `self.live_fault_range`, so
+         a masking-bug escape lands in the provider window's guard range (caught + unwound), never a
+         crash; **(B) the baked-mask/reservation-match invariant** — the offer unit is compiled with
+         the run's reservation `R` (baked mask `R−1`), so the provider window **must** be a
+         reservation of size `R` or the arm **fails closed** (falls through) — a smaller provider
+         window would let a masked access in `[prov_size, R)` hit its unmapped tail; this invariant
+         is the whole confinement argument; **(C) window bridging** — `ProviderState.mem` is an
+         interp `Mem`, a different representation from the JIT `GuestWindow`, so its underlying
+         `svm-mem` reservation base/total must be exposed and asserted `== R` (both wrap `svm-mem`,
+         so the raw reservation is compatible; `mem=None` degenerates to the 6d.2a inert case). Plus
+         the 6c `busy` checkout (already on `ProviderState`), flat `OFFER_FUEL` (the 6d.2a wrinkle),
+         and `cap` translation across the provider `Host`. **Mandatory masking-fuzz obligation**
+         (AGENTS.md — the security hinge gets its own fuzz unit): a target that fuzzes access
+         patterns in an offer unit run over a provider window of reservation `R` and asserts every
+         access stays in `[0, R)` / faults into the provider guard, never the caller's window. Only
+         once 6d.2a **and** 6d.2b land does the JIT's host-side/`-EINVAL` fall-through for offers
+         leave §7's list. **Open question for the owner:** whether native offer animation earns this
+         hinge plumbing + fuzz target, given the host-side arm is correct and no benchmark yet
+         motivates it — 6d.2a is cheap but narrow; 6d.2b is the valuable, sensitive half.
      - **6d.3 — bytecode offer arm (fold-or-probe).** Bytecode declines offer ops to the tree-walk
        today, so instanced offers already run correctly via that fallback — this slice is the
        optional native arm (avoid the per-module fallback), lowest value, sequenced last of the
