@@ -8,6 +8,7 @@
 //! completion. 4a stopped short of this (a mid-animation park was fail-closed until 4b), so these
 //! tests exercise the piece the promotion machinery adds.
 
+use std::time::{Duration, Instant};
 use svm_interp::{run_with_host, Host, Value};
 
 fn module(text: &str) -> svm_ir::Module {
@@ -97,6 +98,78 @@ fn a_promoted_dispatch_reopens_admission_for_the_next_call() {
         r,
         Ok(vec![Value::I64(4)]),
         "both dispatches promoted, resumed, and returned 2 — admission reopened between them"
+    );
+}
+
+/// A provider whose single op waits on a zero cell **forever** (timeout `-1`, never notified) —
+/// its handler promotes and stays parked until the run tears down.
+fn forever_wait_provider() -> svm_ir::Module {
+    module(
+        "memory 16\n\
+         func () -> (i64) {\n\
+         block 0 () {\n\
+           vaddr = i64.const 0\n\
+           vexp = i32.const 0\n\
+           vto = i64.const -1\n\
+           vst = i32.atomic.wait vaddr vexp vto\n\
+           vst64 = i64.extend_i32_s vst\n\
+           return vst64\n\
+           }\n\
+         }\n",
+    )
+}
+
+/// CALLS.md 4b.3 — **teardown abandons a promoted daemon.** The root spawns a daemon thread that
+/// calls an offer whose handler waits forever; the daemon promotes and parks (its provider world
+/// handed back, itself filed in `svc_waiters` under the provider domain). The root then returns,
+/// which tears the whole run down — the parked daemon must be reaped and the run must end
+/// **promptly**, never waiting out the daemon's (infinite) block. Exercises `reap` on a vCPU
+/// carrying an `OfferParked` record and the run-teardown `svc_waiters` drain.
+#[test]
+fn teardown_abandons_a_promoted_daemon() {
+    let provider = forever_wait_provider();
+    let mut h = Host::new();
+    let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+
+    // Root (func 0): spawn the daemon (func 1), briefly wait so it can promote+park, then return
+    // 42 — the C rule (`main` returning is `exit`), ending the run with the daemon still parked.
+    // Daemon (func 1): `cap.call` the forever-waiting offer, which animates and promotes.
+    let src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           v0 = i64.const 0\n\
+           v1 = thread.spawn 1 v0 v0\n\
+           v2 = i64.const 8\n\
+           v3 = i32.const 0\n\
+           v4 = i64.const 5000000\n\
+           v5 = i32.atomic.wait v2 v3 v4\n\
+           v6 = i64.const 42\n\
+           return v6\n\
+           }}\n\
+         }}\n\
+         func (i64, i64) -> (i64) {{\n\
+         block 0 (vsp: i64, varg: i64) {{\n\
+           vh = i32.const {offer}\n\
+           vr = cap.call {tid} 0 () -> (i64) vh ()\n\
+           return vr\n\
+           }}\n\
+         }}\n"
+    );
+    let m = module(&src);
+    let mut fuel = 100_000_000u64;
+    let t0 = Instant::now();
+    let r = run_with_host(&m, 0, &[], &mut fuel, &mut h);
+    let took = t0.elapsed();
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(42)]),
+        "the root returns; the promoted daemon is abandoned, not awaited"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "teardown must not wait out the promoted daemon's infinite block (took {took:?})"
     );
 }
 

@@ -4578,6 +4578,15 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     for flag in v.child_kill.values() {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // CALLS.md 4b.3 — a reaped caller that was mid-animation holds a provider instance checked out
+    // (`busy = true`, its world on this vCPU). Reopen admission on each so a *reused* `Host` never
+    // sees a permanently-busy instance (the run is ending or the domain is dead, so the provider
+    // world itself is not restored — only the admission flag is cleared, fail-closed to `-EAGAIN`
+    // never a wrong answer). A promoted-but-parked handler already handed its world back at the
+    // park (`offer_parked` ⇒ `busy` already clear), so only the active stack needs clearing.
+    for anim in &v.offer_anim {
+        anim.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+    }
     if v.vcpu_ctx > 0 {
         v.registry.free_vcpu_context(v.vcpu_ctx);
     }
@@ -4708,9 +4717,21 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             s.ticket_waiters.insert(k, w);
         }
     }
-    if let Some(vs) = s.svc_waiters.remove(&key) {
-        victims.extend(vs);
+    // Serve loops of the dying domain park under their own key; a CALLS.md 4b promoted-offer
+    // caller parks under the **provider** domain's key (its handler's block-wake `svc_wake`s
+    // there). So scan every queue for member vCPUs by identity, not just `svc_waiters[key]` —
+    // otherwise a dying domain's caller stranded under a live provider's key is missed.
+    for q in s.svc_waiters.values_mut() {
+        let mut i = 0;
+        while i < q.len() {
+            if domain_key_of(&q[i]) == key {
+                victims.push(q.remove(i));
+            } else {
+                i += 1;
+            }
+        }
     }
+    s.svc_waiters.retain(|_, q| !q.is_empty());
     let mut tickets: Vec<u64> = Vec::new();
     for v in victims {
         tickets.extend(reap(s, v, reason.clone()));

@@ -293,12 +293,24 @@ plumbing that lands in increments (§8).
        cache-bug regression), and an inner handler promotes+resumes while the outer animation stays
        on the stack. *Self-instance* re-entrancy (a true cycle back to a **busy** instance) stays a
        probeable `-EAGAIN` until 4c.
-     - **4b.3 — Freeze/teardown edges + the §10.3 closed bit.** The admission word gains the
-       **closed** bit (freeze/teardown close it; a caller parked at the gate re-issues on thaw, O10);
-       teardown sweeps promoted handlers + their tickets (mirroring `wake_dead_tickets` / the
-       `own_tickets` sweep). A durable provider keeps declining to `drive_arc` (fail-closed, as 4a).
-       Pin: a freeze landing mid-promoted-handler fails closed like the existing `handler_parks`
-       freeze gate; teardown wakes the parked caller with the probeable errno.
+     - **4b.3 — Teardown hardening. DONE (2026-08-04).** Two teardown gaps the coupled resumer
+       model (4b.1) opened, both closed: **(i)** a reaped caller that was *mid-animation* held a
+       provider instance checked out (`busy = true`, its world on the dying vCPU) — `reap` now
+       reopens `busy` on each `offer_anim` state, so a **reused** `Host` never sees a
+       permanently-busy instance (fail-closed to `-EAGAIN`, never a wrong answer; a
+       promoted-but-parked handler already handed its world back, so only the active stack needs
+       clearing); **(ii)** an `OfferPark` caller parks in `svc_waiters` under the **provider**
+       domain's key, not its own, so `teardown_domain` (which removed only `svc_waiters[dying_key]`)
+       would strand a dying domain's caller under a live provider's key — the sweep now scans every
+       `svc_waiters` queue for member vCPUs by identity (mirroring the `ticket_waiters` sweep).
+       `teardown_run` already drained all `svc_waiters`, so the root-exit path was covered; a durable
+       provider keeps declining to `drive_arc` (fail-closed, unchanged from 4a). Pinned by
+       `offer_promotion.rs`: the root abandons a promoted daemon on exit and the run ends promptly,
+       never awaiting the daemon's infinite block. **Deferred:** the §10.3 **closed** bit (freeze +
+       quiesce) has no library-path trigger yet — a library provider is non-durable (declines
+       freeze) and teardown is handled by domain-death + the `reap` reset above — so adding a
+       `closed` word now would be speculative machinery (prime directive); it rides the
+       quiesce/process-provider work where a serve loop actually freezes mid-handler.
    - **4c — Queue-on-contention (old 3c).** With a parked holder freeing the thread, the busy
      `single` path enqueues + parks instead of answering `-EAGAIN`; a re-entrant/cyclic call
      completes instead of self-deadlocking. The bounded queue still refuses `-EAGAIN` at the rim when
