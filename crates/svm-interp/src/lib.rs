@@ -14430,6 +14430,14 @@ pub struct Host {
     /// `0` on interpreter runs. Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`]
     /// (which requires a granted `Jit` capability a serving module need not hold).
     serve_native_ctx: usize,
+    /// CALLS.md 5c.1a — a **JIT granted child's** serve context: the address of the child's live
+    /// `ChildCode` (its serve trampolines + fn table), registered at spawn and cleared by the
+    /// powerbox release hook. Distinct from [`Host::serve_native_ctx`] (a top-level run's
+    /// `*mut CompiledModule`) so the two interpretations can never be confused: this one is read
+    /// only by the locked cap thunk's child serve arm, and only while the child executes (the
+    /// `ChildCode` outlives every in-child `cap.call` by construction; stale reads are prevented
+    /// by the clear-on-release). `0` ⇒ none.
+    child_serve_ctx: usize,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
@@ -14768,6 +14776,7 @@ impl Host {
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
+            child_serve_ctx: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -16120,6 +16129,17 @@ impl Host {
     /// The registered serve-loop native context (`0` ⇒ interpreter run / none registered).
     pub fn serve_native_ctx(&self) -> usize {
         self.serve_native_ctx
+    }
+
+    /// CALLS.md 5c.1a — register / clear this (child) domain's `ChildCode` serve context; see
+    /// [`Host::child_serve_ctx`].
+    pub fn set_child_serve_ctx(&mut self, ctx: usize) {
+        self.child_serve_ctx = ctx;
+    }
+
+    /// The registered JIT-child serve context (`0` ⇒ none / already released).
+    pub fn child_serve_ctx(&self) -> usize {
+        self.child_serve_ctx
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op

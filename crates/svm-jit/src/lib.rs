@@ -2832,6 +2832,13 @@ impl CompiledModule {
                 0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
+                // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
+                // (same module) compiles with serve trampolines and can be a child_offer target.
+                m.impl_exports
+                    .iter()
+                    .flat_map(|e| e.ops.iter().copied())
+                    .collect::<Vec<u32>>()
+                    .into_boxed_slice(),
             )))
         } else {
             None
@@ -4454,6 +4461,7 @@ pub(crate) unsafe fn compile_child_and_run(
             my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
             std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
             std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
+            Box::new([]), // durable grandchildren are not offer targets (a later slice)
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
         Some(n)
@@ -4492,6 +4500,7 @@ pub(crate) unsafe fn compile_child_and_run(
         fuel_addr,  // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
         0,          // durable path: no shared futex domain — child futex ops stay rejected
         child_inst,
+        &[], // the durable/sync nested child is never an offer target — no serve trampolines
     )?;
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.code;
@@ -4657,10 +4666,77 @@ pub(crate) struct ChildCode {
     pub(crate) fn_table: Box<[FnEntry]>,
     /// The entry trampoline (buffer ABI, [`mem::run_guarded`]-compatible).
     pub(crate) code: *const u8,
+    /// CALLS.md 5c.1a — one buffer-ABI trampoline per impl-export handler `(funcidx, code,
+    /// n_params, n_results)`, the `CompiledModule::serve_tramps` child twin. Read by the locked
+    /// thunk's child serve arm through [`Host::child_serve_ctx`]; valid exactly as long as this
+    /// `ChildCode` (the registering spawn clears the ctx at release).
+    pub(crate) serve_tramps: Vec<(u32, *const u8, usize, usize)>,
     /// Owns the executable memory; dropped last, and the drop **releases** the code arena back to
     /// the OS (see [`OwnedJit`] — a bare `JITModule` would leak 256 MiB of reservation per child,
     /// eagerly commit-charged on Windows).
     module: OwnedJit,
+}
+
+#[cfg(fiber_rt)]
+impl ChildCode {
+    /// CALLS.md 5c.1a — the serve trampoline for handler `func`, `(code, n_params, n_results)`;
+    /// the [`CompiledModule::handler_tramp`] child twin. `None` for a non-handler funcidx.
+    pub(crate) fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
+        self.serve_tramps
+            .iter()
+            .find(|&&(f, _, _, _)| f == func)
+            .map(|&(_, code, np, nr)| (code, np, nr))
+    }
+}
+
+/// CALLS.md 5c.1a — invoke a [`ChildCode`] serve trampoline over the child's **live** window: the
+/// [`CompiledModule::invoke_extra`] child twin, with the detect-and-kill fault range taken from the
+/// caller's own thunk parameters (`[mem_base, mem_base+mem_size)`) instead of a stored
+/// `live_fault_range` — the child serve arm runs *inside* the child's in-flight guarded entry call
+/// on the child's own thread, and the thunk was handed exactly that window. Returns `true` if the
+/// handler faulted (the caller reports `FAULT_TRAP`, the outer run's detect-and-kill shape).
+///
+/// # Safety
+/// `cc` is the live `ChildCode` the in-flight child was compiled from (registered at spawn,
+/// cleared at release); `code` is one of its finalized serve trampolines; `args`/`results` match
+/// the trampoline's arity; `[mem_base, mem_base+mem_size)` is the child's live mapped window;
+/// `trap_out` is the run's trap cell.
+#[cfg(fiber_rt)]
+pub unsafe fn child_invoke_handler(
+    cc: *const core::ffi::c_void,
+    code: *const u8,
+    args: &[i64],
+    results: &mut [i64],
+    mem_base: *mut u8,
+    mem_size: u64,
+    trap_out: *mut i64,
+) -> bool {
+    let cc = cc as *const ChildCode;
+    let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
+    let lo = mem_base as usize;
+    mem::run_guarded_range(
+        code,
+        args.as_ptr(),
+        results.as_mut_ptr(),
+        mem_base,
+        fn_table_ptr,
+        trap_out,
+        lo,
+        lo + mem_size as usize,
+    )
+}
+
+/// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw [`ChildCode`] (the
+/// `Host::child_serve_ctx` registration, opaque outside this crate).
+///
+/// # Safety
+/// `cc` is a live registered `ChildCode` (see [`child_invoke_handler`]).
+#[cfg(fiber_rt)]
+pub unsafe fn child_handler_tramp(
+    cc: *const core::ffi::c_void,
+    func: u32,
+) -> Option<(*const u8, usize, usize)> {
+    (*(cc as *const ChildCode)).handler_tramp(func)
 }
 
 #[cfg(fiber_rt)]
@@ -4721,6 +4797,11 @@ fn compile_child(
     // Zero (the coroutine / durable paths) keeps futex ops rejected as before.
     futex_sched: usize,
     inst_env: InstEnv,
+    // CALLS.md 5c.1a — the child module's impl-export **handler** funcidxs (deduped by the
+    // caller or not — deduped again here), each of which gets a buffer-ABI serve trampoline so
+    // a cross-domain dispatch can invoke it over the child's live window (the `serve_tramps`
+    // block of `CompiledModule::compile`, child twin). Empty ⇒ a child that offers nothing.
+    serve_handlers: &[u32],
 ) -> Result<ChildCode, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
@@ -4853,6 +4934,35 @@ fn compile_child(
         .define_function(tramp, &mut ctx)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module.clear_context(&mut ctx);
+    // CALLS.md 5c.1a — a serve trampoline per impl-export handler (the `CompiledModule::compile`
+    // serve_ids block, child twin), so the locked thunk's child serve arm can invoke a handler of
+    // any signature over the child's live window.
+    let mut serve_ids: Vec<(u32, cranelift_module::FuncId)> = Vec::new();
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for &f in serve_handlers {
+            if (f as usize) < funcs.len() && seen.insert(f) {
+                build_trampoline(
+                    &mut module,
+                    &mut ctx.func,
+                    ids[f as usize],
+                    &funcs[f as usize],
+                );
+                let id = module
+                    .declare_function(
+                        &format!("child_serve_tramp_{f}"),
+                        Linkage::Export,
+                        &ctx.func.signature,
+                    )
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                module
+                    .define_function(id, &mut ctx)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                module.clear_context(&mut ctx);
+                serve_ids.push((f, id));
+            }
+        }
+    }
     module
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -4875,12 +4985,25 @@ fn compile_child(
         .collect();
 
     let code = module.get_finalized_function(tramp);
+    let serve_tramps: Vec<(u32, *const u8, usize, usize)> = serve_ids
+        .iter()
+        .map(|&(f, id)| {
+            let fu = &funcs[f as usize];
+            (
+                f,
+                module.get_finalized_function(id),
+                fu.params.len(),
+                fu.results.len(),
+            )
+        })
+        .collect();
     // PROCESS.md S1: a child module was actually JIT-compiled (as opposed to served from the
     // per-carve cache). Counting successful compiles is what lets a test prove the cache hits.
     CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
     Ok(ChildCode {
         fn_table,
         code,
+        serve_tramps,
         module: OwnedJit::new(module),
     })
 }
@@ -4933,6 +5056,7 @@ pub(crate) fn compile_nondurable_child(
         fuel_addr,
         futex_sched,
         InstEnv::null(),
+        &[], // a plain (ungranted) child is never an offer target — no serve trampolines
     )
 }
 

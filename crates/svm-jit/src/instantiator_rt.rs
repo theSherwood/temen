@@ -254,6 +254,11 @@ unsafe fn spawn_granted_child(
 /// **asynchronously** on their own OS threads; outcomes land in per-child completion cells `join`
 /// parks on. Only durable children still run synchronously at `instantiate`.
 pub(crate) struct Nursery {
+    /// CALLS.md 5c.1a — the parent module's impl-export **handler** funcidxs, threaded into every
+    /// granted-child compile so the child gets serve trampolines (same-module children, ops 8/11;
+    /// op-13 separate-module children pass their own — a later slice). Computed from
+    /// `m.impl_exports` at construction.
+    pub(crate) serve_handlers: Box<[u32]>,
     funcs: std::sync::Arc<[Func]>,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
@@ -471,9 +476,11 @@ impl Nursery {
         my_task: usize,
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
+        serve_handlers: Box<[u32]>,
     ) -> Nursery {
         Nursery {
             funcs,
+            serve_handlers,
             cap_thunk,
             cap_ctx,
             resolve_module,
@@ -1073,6 +1080,7 @@ pub(crate) unsafe extern "C" fn instantiate_granted(
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
+        &rt.serve_handlers,
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1217,6 +1225,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
+        &rt.serve_handlers,
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1387,6 +1396,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
+        &rt.serve_handlers,
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1784,6 +1794,7 @@ pub(crate) unsafe extern "C" fn coro_spawn(
         child_fuel_addr, // §5 fuel: the co-fiber decrements its own clamped budget cell
         0, // a co-fiber runs inline on the parent's thread — no futex sharing (waits stay rejected)
         crate::InstEnv::null(), // a co-fiber child cannot itself nest (its Instantiator → CapFault)
+        &[], // a co-fiber child is never an offer target — no serve trampolines
     ) {
         Ok(c) => c,
         Err(_) => {
