@@ -427,3 +427,99 @@ fn runtime_compile_invoke_trap_parity() {
     assert!(want.is_err(), "interp invoke must trap at x=7");
     assert_eq!(got, want, "codegen trap diverged from interp (want {want:?})");
 }
+
+// ---- the shared-`Mutex<Host>` runtime-compile flow (the browser's `ParJitCfg` path) --------------
+// The browser's runtime-`Jit.compile` powerbox grants `Jit` (+ validator + emitter) on a shared
+// `Mutex<Host>` that the root vCPU dispatches its `cap.call`s through (`with_shared_host`) — so the
+// guest's runtime `compile` mints + emits into that shared host and a later `invoke` resolves the same
+// host. `run_guest` above uses the vCPU's *own* host; this exercises the shared-host dispatch the
+// browser actually uses (also the seam threaded compile will serialize on, DESIGN.md §22).
+
+/// Like [`run_guest`], but the `Jit` grant + emitter live in a shared `Mutex<Host>` the vCPU
+/// dispatches through (`with_shared_host`), and the invoke resolves against that shared host —
+/// mirroring the browser's `svm_par_powerbox_jit_runtime` + `par_resolve_unit_rt`.
+fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
+    let unit_m = parse_module(unit_src).unwrap();
+    verify_module(&unit_m).expect("verify unit");
+    let blob = svm_encode::encode_module(&unit_m);
+
+    let entry = &unit_m.funcs[0];
+    let ret = tyname(entry.results[0]);
+    let (arg_setup, arg_ops, invoke_sig) = invoke_shape(&entry.params);
+    let guest_src = guest_src(ret, &invoke_sig, &arg_setup, &arg_ops, BLOB_OFF, blob.len() as u64);
+    let guest_m = parse_module(&guest_src).unwrap_or_else(|e| panic!("guest parse: {e}"));
+    verify_module(&guest_m).expect("verify guest");
+
+    // The shared powerbox host (the browser's `ParJitCfg.host`): `Jit` granted, validator + emitter set.
+    let mut host = Host::new();
+    let jit = grant_jit(&mut host, &guest_m, 4);
+    if mode == Mode::Wasm {
+        host.set_jit_wasm_emitter(emit_unit);
+    }
+    let shared = std::sync::Mutex::new(host);
+
+    let mut init_mem = vec![0u8; BLOB_OFF as usize];
+    init_mem.extend_from_slice(&blob);
+
+    let prog = bytecode::VcpuProgram::compile_with_jit_table(&guest_m, 4).unwrap();
+    let back = window();
+    // `new_root` builds an empty *own* host; the shared host services generic `cap.call`s — including
+    // the guest's runtime `compile` (op 0), which mints + emits into it.
+    let mut vcpu = bytecode::Vcpu::new_root(&prog, 0, &[Value::I32(jit)], back, &init_mem)
+        .expect("root")
+        .with_shared_host(&shared);
+
+    let mut emitted_ran = false;
+    loop {
+        match vcpu.run() {
+            bytecode::VcpuEvent::Done(vals) => {
+                if mode == Mode::Wasm {
+                    assert!(emitted_ran, "codegen run never executed emitted wasm (silent interp fallback)");
+                }
+                return Ok(vals);
+            }
+            bytecode::VcpuEvent::Trapped(t) => return Err(t),
+            bytecode::VcpuEvent::JitInvoke {
+                handle, code, argv, ..
+            } => {
+                // Resolve against the shared host (browser `par_resolve_unit_rt`); drop the lock before
+                // delivering — the interpreter path re-locks it to run the unit.
+                let resolved = {
+                    let g = shared.lock().unwrap();
+                    resolve(&g, handle, code)
+                };
+                match mode {
+                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(f, _)| f)),
+                    Mode::Wasm => match resolved {
+                        Err(t) => vcpu.deliver_jit_invoke_trap(t),
+                        Ok((_funcs, wasm)) => {
+                            let wasm = wasm.expect("emitter must produce wasm for an in-subset unit");
+                            emitted_ran = true;
+                            match run_unit_on_wasm(&unit_m, &wasm, &argv) {
+                                Ok(slots) => vcpu.deliver_jit_invoke_vals(&slots),
+                                Err(t) => vcpu.deliver_jit_invoke_trap(t),
+                            }
+                        }
+                    },
+                }
+            }
+            _ => panic!("unexpected event (this guest only compiles + invokes)"),
+        }
+    }
+}
+
+#[test]
+fn shared_host_runtime_compile_matches_interp() {
+    let want = run_guest_shared(UNIT_I64, Mode::Interp);
+    let got = run_guest_shared(UNIT_I64, Mode::Wasm);
+    assert_eq!(want, Ok(vec![Value::I64(17)]), "interp reference: unit(4,5)=17");
+    assert_eq!(got, want, "shared-host wasm-emitted runtime-compiled unit diverged from interp");
+}
+
+#[test]
+fn shared_host_runtime_compile_trap_parity() {
+    let want = run_guest_shared(UNIT_TRAP, Mode::Interp);
+    let got = run_guest_shared(UNIT_TRAP, Mode::Wasm);
+    assert!(want.is_err(), "interp invoke must trap");
+    assert_eq!(got, want, "shared-host codegen trap diverged from interp (want {want:?})");
+}
