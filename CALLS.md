@@ -316,6 +316,43 @@ plumbing that lands in increments (§8).
      completes instead of self-deadlocking. The bounded queue still refuses `-EAGAIN` at the rim when
      full (fail-closed, §9). Pin: the increment-2 test that observed `-EAGAIN` on a busy /
      self-granted instance flips to observing completion; queue-full still answers `-EAGAIN`.
+     Decomposed by **who** holds the instance busy — the two cases have genuinely different
+     mechanisms:
+     - **4c.1 — Contention between distinct vCPUs (park + wake-to-retry). DONE (2026-08-04).** The
+       busy holder is a *different* vCPU (two threads of a domain contending on one `single`
+       instance). The loser, in the `animate_instanced_offer!` busy arm, **rewinds its offer op and
+       parks** as an admission-waiter (a new `Blocked::OfferAdmit { key }`) instead of pushing
+       `-EAGAIN`; when the holder clears `busy` (the 4a settle, a 4b promotion-park, or the
+       fiber-exhaustion undo), an `admit_wake` re-admits it and the rewound op re-attempts (winning,
+       or re-parking on a lost race — the ordinary futex-retry shape). **As built**, admission-waiters
+       live in a **dedicated `Sched::admit_waiters` map keyed by the `ProviderState` pointer**, not
+       `svc_waiters`: a busy instance has its world *checked out on the holder*, so its domain id is
+       unreadable and the two wake kinds (promoted-handler resumers vs. would-be starters) never
+       cross. The bound is a per-`ProviderState` `admit_parked` count, checked under the state lock
+       the busy decision already holds (rim → `-EAGAIN`, fail-closed); it is decremented on the
+       re-attempt (or at `reap`) via a per-vCPU `admit_retry` handle carried across the park. A
+       lost-wakeup recheck in the park handler (the I52 shape) re-reads `busy` under the scheduler
+       lock and re-admits if the instance already freed. Leaves the self-call case (instance on this
+       vCPU's own `offer_anim` stack) untouched — that is 4c.2. Pinned by
+       `concurrent_callers_park_and_retry_instead_of_eagain` (two single-shot callers both observe the
+       real result, never `-EAGAIN`) and the unchanged
+       `concurrent_instanced_offer_calls_are_safe_under_the_narrowed_lock`.
+     - **4c.2 — Re-entrant / cyclic completion. DONE (2026-08-04).** The busy holder is *this vCPU's
+       own* animation of the instance (the self-call; `offer_anim` already carries its `state`).
+       Parking to wait for a distinct holder would self-deadlock — there is none. **As built**, the
+       **direct** self-call (the instance is the *top* of the animation stack, so its world is already
+       installed on the vCPU) turned out far simpler than the sketched baton-pass: it is not a
+       cross-world dispatch at all, just an **ordinary recursive call** over the provider's own world
+       (a frame push to the op's handler, no checkout, no `busy` change, no `cap` translation — same
+       domain). Bounded recursion completes; unbounded hits `OutOfFuel`/`StackOverflow` and traps,
+       fail-closed — never the old `-EAGAIN`. The **general buried cycle** (`A → B → A` where the
+       re-entrant `A` is called from a deeper `B`, so `A`'s world sits in the stack's saved state, not
+       the instance) is detected (instance on the stack but not the top) and still answers `-EAGAIN` —
+       the harder residue, a later step. Pinned by `a_self_reentrant_offer_completes_instead_of_eagain`
+       (a depth-3 self-recursive offer returns 3). The legacy `cap_dispatch_slots`/`drive_arc` cyclic
+       path (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock`) is unchanged — it holds the
+       state guard across its sub-run, so its inner self-call still reads `-EAGAIN`; that path retires
+       with `drive_arc` in increment 6.
    - **4d — Direct handoff (§10.2 arm 4, delta §10.7).** A `single` process provider parked at
      `svc.wait` is served by **direct handoff**: the caller claims the serve activation and animates
      the handler on its own thread (no enqueue, no worker wake, no reply round-trip), a mid-handoff

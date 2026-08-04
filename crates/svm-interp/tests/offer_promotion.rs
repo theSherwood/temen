@@ -262,3 +262,151 @@ fn a_nested_inner_handler_promotes_under_its_caller_handlers_animation() {
         "the inner handler promoted+resumed while the outer animation stayed on the stack"
     );
 }
+
+// ---- CALLS.md 4c: queue-on-contention ----
+
+/// A provider whose op `rec(depth)` **calls its own offer** (granted into itself as `me`) with
+/// `depth - 1` until `depth == 0`, returning `depth` (each frame adds 1 to the base 0). A bounded
+/// **self-re-entrant** handler: pre-4c the inner self-call found the instance busy and answered
+/// `-EAGAIN`; with 4c.2 it runs as an ordinary recursive call over the provider's own world and
+/// completes. `tid` is the interned `(i64) -> (i64)` interface id (embedded in the self-call).
+fn self_recursive_provider(tid: u32) -> svm_ir::Module {
+    module(&format!(
+        "memory 16\n\
+         data 0 \"me\"\n\
+         func (i64) -> (i64) {{\n\
+         block 0 (vd: i64) {{\n\
+           vzero = i64.const 0\n\
+           vcond = i64.ne vd vzero\n\
+           br_if vcond 1(vd) 2()\n\
+         }}\n\
+         block 1 (vd: i64) {{\n\
+           vone = i64.const 1\n\
+           vd1 = i64.sub vd vone\n\
+           vp = i64.const 0\n\
+           vn = i64.const 2\n\
+           vh = cap.self.resolve vp vn\n\
+           vr = cap.call {tid} 0 (i64) -> (i64) vh (vd1)\n\
+           vres = i64.add vr vone\n\
+           return vres\n\
+           }}\n\
+         block 2 () {{\n\
+           vzero = i64.const 0\n\
+           return vzero\n\
+           }}\n\
+         }}\n"
+    ))
+}
+
+/// **4c.2 — cyclic completion.** A guest `cap.call`s an offer whose handler re-enters its own
+/// instance to a bounded depth. The direct self-call is no longer a `-EAGAIN` deadlock artifact:
+/// it recurses over the provider's own world and completes, returning the depth (3).
+#[test]
+fn a_self_reentrant_offer_completes_instead_of_eagain() {
+    // Wire once to learn the interned type id, embed it in the self-call, re-wire the real module.
+    let mut h = Host::new();
+    let probe = h
+        .wire_offer_proc(&self_recursive_provider(0), &[0])
+        .expect("probe offer");
+    let tid = h.resolve_offer(probe).unwrap().type_id;
+
+    let mut h = Host::new();
+    let offer = h
+        .wire_offer_proc(&self_recursive_provider(tid), &[0])
+        .expect("self-recursive offer");
+    let otid = h.resolve_offer(offer).unwrap().type_id;
+    assert_eq!(
+        otid, tid,
+        "the interned (i64)->(i64) interface id is stable"
+    );
+    h.grant_impl_cap(offer, offer, "me")
+        .expect("the offer re-grants into its own provider");
+
+    let consumer_src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vh = i32.const {offer}\n\
+           vd = i64.const 3\n\
+           vr = cap.call {tid} 0 (i64) -> (i64) vh (vd)\n\
+           return vr\n\
+           }}\n\
+         }}\n"
+    );
+    let consumer = module(&consumer_src);
+    let mut fuel = 100_000_000u64;
+    let r = run_with_host(&consumer, 0, &[], &mut fuel, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(3)]),
+        "the self-re-entrant offer recursed to depth 3 and completed (no -EAGAIN, no deadlock)"
+    );
+}
+
+/// A provider whose op spins a bounded compute loop (holding the instance `busy` without parking),
+/// then returns 1 — long enough that a concurrent second caller reliably contends.
+fn busy_loop_provider() -> svm_ir::Module {
+    module(
+        "memory 16\n\
+         func () -> (i64) {\n\
+         block 0 () {\n\
+           vk0 = i32.const 2000000\n\
+           br 1(vk0)\n\
+         }\n\
+         block 1 (vk: i32) {\n\
+           vone = i32.const 1\n\
+           vk2 = i32.sub vk vone\n\
+           br_if vk2 1(vk2) 2()\n\
+         }\n\
+         block 2 () {\n\
+           vr = i64.const 1\n\
+           return vr\n\
+           }\n\
+         }\n",
+    )
+}
+
+/// **4c.1 — distinct-vCPU contention.** Two threads of one domain call the same `single` instance;
+/// while one holds it `busy` (a compute loop), the other must **park + wake-retry** rather than
+/// receive `-EAGAIN`. Each thread makes a *single* call (no `-EAGAIN` retry loop), so a `-11`
+/// anywhere would surface as a wrong sum — both must observe the real result `1`. The root sums
+/// its own call with the spawned thread's joined result: 1 + 1 = 2.
+#[test]
+fn concurrent_callers_park_and_retry_instead_of_eagain() {
+    let provider = busy_loop_provider();
+    let mut h = Host::new();
+    let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+
+    // Root (func 0): spawn a sibling (func 1) that calls the offer, then call it itself, join the
+    // sibling, and return the sum of both results. Sibling (func 1): one call, return its result.
+    let src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           v0 = i64.const 0\n\
+           vt = thread.spawn 1 v0 v0\n\
+           vh = i32.const {offer}\n\
+           vmine = cap.call {tid} 0 () -> (i64) vh ()\n\
+           vjoined = thread.join vt\n\
+           vsum = i64.add vmine vjoined\n\
+           return vsum\n\
+           }}\n\
+         }}\n\
+         func (i64, i64) -> (i64) {{\n\
+         block 0 (vsp: i64, varg: i64) {{\n\
+           vh = i32.const {offer}\n\
+           vr = cap.call {tid} 0 () -> (i64) vh ()\n\
+           return vr\n\
+           }}\n\
+         }}\n"
+    );
+    let m = module(&src);
+    let mut fuel = 1_000_000_000u64;
+    let r = run_with_host(&m, 0, &[], &mut fuel, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(2)]),
+        "both concurrent callers completed with the real result (parked+retried, never -EAGAIN)"
+    );
+}
