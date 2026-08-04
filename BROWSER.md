@@ -815,10 +815,25 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    mask-only confinement, so they stay on the interpreter, deferred with the D40/§13 page-enforcement
    question. Coroutine/`Yielder` ops are deliberately **never** lowered on this tier — CONSOLIDATION.md
    §2 deletes them onto the unified offer, so any wasm-tier arm would be work queued for deletion.
-   **Deferred:** the **browser driver wiring** (`worker.js`/`par.js` servicing `env.instantiate` by
-   spawning the child on a Worker into the confined-child completion-slot protocol —
-   *browser-verification pending*). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by
-   type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design, §17.)*
+   **[landed — the browser driver wiring, real-browser-verified]** A confined child whose granted-unit
+   entry *uses* its `Instantiator` now runs on emitted wasm in the browser: `svm_par_enable_inst_codegen`
+   emits the granted module via `compile_module_nested` first (falling back to the tier-up shape — an
+   ADDRESS_SPACE-using entry fails closed to the interpreter until the browser's `call_interp` carries a
+   powerbox), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
+   through the *same* confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms
+   — the grandchild spawns on its own Worker via the page relay; `env.join` `Atomics.wait`s its slot;
+   the carve checks (power-of-two, aligned, inside the child's own window) replicate the engine's, so a
+   violation traps exactly as the interpreter does. Wiring this surfaced two pre-existing depth-2 bugs,
+   both fixed: `event_instantiate` validated against `primary()` and stamped `module: 0` (an op-0
+   instantiate from an `instantiate_module` child got `-EINVAL`; it now uses the calling frame's
+   module), and the JS JOIN arms hung on a bad handle (`Atomics.wait` on address 0; they now deliver a
+   trap). Pinned by the `instnested` work item (`threads_inst_nested_unit`: entry reads its "K"=75,
+   spawns a pure grandchild → 9 into a narrowed 1 KiB sub-carve, joins → 84; root sums 8 × 84 = 672) —
+   interp ≡ codegen ≡ 672 across **17 Workers** with **16 on emitted wasm** (the cap-using parents
+   themselves + their grandchildren), verified in Node (`threads-spawn.mjs`, ported in parity) and in
+   real Chromium (`browser-test.mjs`, CI-gated). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
+   §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

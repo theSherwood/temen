@@ -1089,7 +1089,8 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         // ADDRESS_SPACE wrappers are NOT outlined here: the browser's `call_interp` callback carries
         // no powerbox yet, so a `sub`/`page_size`-using entry fails `compile_module_nested` closed and
         // falls through to the tier-up shape (interpreter entry).
-        if let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_nested_with_eligibility(m, true) {
+        if let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_nested_with_eligibility(m, true)
+        {
             // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
             unsafe {
                 stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
