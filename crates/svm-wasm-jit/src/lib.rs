@@ -701,10 +701,28 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// The types of one block's value list: params first, then each instruction's results in order.
 /// Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the module was
 /// verified, so no `unwrap` here can be reached by a malformed operand index).
-fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
+/// The §14 capability ops the wasm tier lowers to a **host-driver bounce** (instead of failing
+/// out-of-subset): INSTANTIATOR (iface 6) `instantiate` (op 0) and `join` (op 1) — the VM-in-VM
+/// primitive (`DESIGN.md` §14; `crates/svm-interp/src/lib.rs` `cap_id::INSTANTIATOR = 6`). The child
+/// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::Instantiate`), so the
+/// emitted code just marshals the args to an `env.instantiate`/`env.join` import. Other §14 ops
+/// (address-space, coroutines) are not lowered yet — they stay out-of-subset (fail-closed).
+fn is_nested_cap(type_id: u32, op: u32) -> bool {
+    type_id == 6 && (op == 0 || op == 1)
+}
+
+fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<ValType>, Error> {
     let mut tys: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
         match inst {
+            // §14 instantiator bounce (opt-in): typed by the cap-call's declared results so the entry
+            // that spawns a nested VM is in-subset. Gated to the lowerable ops; any other cap-call
+            // still hits the catch-all below (out-of-subset).
+            Inst::CapCall { type_id, op, sig, .. } if nested_caps && is_nested_cap(*type_id, *op) => {
+                for r in &sig.results {
+                    tys.push(*r);
+                }
+            }
             Inst::ConstI32(_) => tys.push(ValType::I32),
             Inst::ConstI64(_) => tys.push(ValType::I64),
             Inst::IntBin { ty, .. } => tys.push(ty.val()),
@@ -861,7 +879,7 @@ fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
         return false;
     }
     f.blocks.iter().all(|b| {
-        block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        block_value_types(m, b, false).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
 }
@@ -1048,6 +1066,14 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
 /// `IMPORTED_FUNCS + its position among the emitted functions`.
 const IMPORTED_FUNCS: u32 = 2;
+/// In §14 `nested_caps` mode two more func imports follow `env.call_interp` — `env.instantiate` (2)
+/// and `env.join` (3) — so emitted functions start at `IMPORTED_FUNCS + 2 = 4`. These indices are
+/// valid only in that mode (the caller sizes `wasm_of` with the matching base).
+const INSTANTIATE_IMPORT_IDX: u32 = 2;
+const JOIN_IMPORT_IDX: u32 = 3;
+/// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.instantiate`,
+/// `env.join`).
+const NESTED_IMPORTED_FUNCS: u32 = 4;
 /// `env.call_interp` scratch: the cross-tier call marshals its i64 arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1072,7 +1098,40 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
     let n = m.funcs.len();
     let emitted: Vec<usize> = (0..n).collect();
     let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
-    emit_module(m, shared_memory, &emitted, &wasm_of, &a.interp_leaf, None)
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        None,
+        false,
+    )
+}
+
+/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `cap.call` to INSTANTIATOR
+/// `instantiate` (op 0) / `join` (op 1) is lowered to a host-driver bounce (`env.instantiate` /
+/// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
+/// runs on the wasm tier, the child spawn/join happening host-side exactly as the interpreter surfaces
+/// `VcpuStop::Instantiate`. Two extra func imports precede the emitted functions, so their wasm indices
+/// start at `NESTED_IMPORTED_FUNCS`. `Err` if any function is otherwise outside the subset.
+pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
+    let n = m.funcs.len();
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n)
+        .map(|i| Some(NESTED_IMPORTED_FUNCS + i as u32))
+        .collect();
+    // No cross-tier interp leaves in this path (a nested cap-call bounces host-side, not via a leaf).
+    let interp_leaf = vec![false; n];
+    emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &interp_leaf,
+        None,
+        true,
+    )
 }
 
 /// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a
@@ -1104,6 +1163,7 @@ pub fn compile_module_b2(
         &wasm_of,
         &a.interp_leaf,
         Some(table_log2),
+        false,
     )
 }
 
@@ -1337,7 +1397,7 @@ pub fn compile_module_reactor(
             emitted_bitmap[i] = true;
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross, None)?;
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross, None, false)?;
     Ok((wasm, emitted_bitmap))
 }
 
@@ -1409,7 +1469,7 @@ pub fn compile_module_tierup(
             emitted.push(i);
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf, None)?;
+    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf, None, false)?;
     Ok((wasm, emit))
 }
 
@@ -1515,6 +1575,7 @@ fn emit_module(
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
     reserved_table_log2: Option<u32>,
+    nested_caps: bool,
 ) -> Result<Vec<u8>, Error> {
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
@@ -1542,6 +1603,16 @@ fn emit_module(
     // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
     // one per emitted function (dedup'd).
     let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
+    // §14 host-bounce import types (added up front so the import section can reference them):
+    //   env.instantiate: (i32 win, i32 inst, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32
+    //   env.join:        (i32 inst, i32 child) -> i64
+    let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
+    if nested_caps {
+        instantiate_ty = types.len() as u32;
+        types.push((vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e], vec![0x7f]));
+        join_ty = types.len() as u32;
+        types.push((vec![0x7f, 0x7f], vec![0x7e]));
+    }
     let mut fn_type_idx: Vec<u32> = Vec::with_capacity(emitted.len());
     for &fi in emitted {
         let f = &m.funcs[fi];
@@ -1684,6 +1755,7 @@ fn emit_module(
             interp_leaf,
             &types,
             table_size,
+            nested_caps,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -1702,10 +1774,12 @@ fn emit_module(
     }
     section(&mut out, 1, &sec);
 
-    // Import section (2): env.memory, env.trap (type 0), env.call_interp (type 1), and — in
-    // shared-reserved (B2) mode — the shared funcref table the whole domain dispatches through.
+    // Import section (2): env.memory, env.trap (type 0), env.call_interp (type 1); plus — in
+    // shared-reserved (B2) mode — the shared funcref table, and — in §14 `nested_caps` mode —
+    // env.instantiate + env.join (the VM-in-VM host bounce).
     let mut sec = Vec::new();
-    uleb(&mut sec, if reserved_table_log2.is_some() { 4 } else { 3 });
+    let n_imports = 3 + reserved_table_log2.is_some() as u64 + if nested_caps { 2 } else { 0 };
+    uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
     if shared_memory {
@@ -1726,6 +1800,15 @@ fn emit_module(
     import_name(&mut sec, "env", "call_interp");
     sec.push(0x00); // func
     uleb(&mut sec, 1); // type index 1
+    if nested_caps {
+        // §14 VM-in-VM host bounces (func imports 2 and 3, see INSTANTIATE_IMPORT_IDX / JOIN_IMPORT_IDX).
+        import_name(&mut sec, "env", "instantiate");
+        sec.push(0x00); // func
+        uleb(&mut sec, instantiate_ty as u64);
+        import_name(&mut sec, "env", "join");
+        sec.push(0x00); // func
+        uleb(&mut sec, join_ty as u64);
+    }
     if reserved_table_log2.is_some() {
         // The shared reserved funcref table (§22 Model B2). Imported (not declared), so every
         // instance in the domain dispatches through the *same* table; the host sizes it to the
@@ -1936,6 +2019,7 @@ fn emit_func(
     interp_leaf: &[bool],
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
+    nested_caps: bool,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -1956,7 +2040,7 @@ fn emit_func(
     let per_block_types: Vec<Vec<ValType>> = f
         .blocks
         .iter()
-        .map(|b| block_value_types(m, b))
+        .map(|b| block_value_types(m, b, nested_caps))
         .collect::<Result<_, _>>()?;
     // Pool size per type = the max count of that type in any single block.
     const NTYPES: usize = 7; // I32, I64, F32, F64, V128, Ref, Cap (the ValType variants)
@@ -2084,6 +2168,7 @@ fn emit_func(
             interp_leaf,
             types,
             table_size,
+            nested_caps,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -2337,6 +2422,7 @@ fn emit_block_body(
     interp_leaf: &[bool],
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
+    nested_caps: bool,
 ) -> Result<(), Error> {
     let mut next_val = b.params.len(); // where the next instruction's results land
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: svm_ir::ValIdx| {
@@ -2658,6 +2744,45 @@ fn emit_block_body(
                 get(code, cx, *a);
                 code.push(cast_opcode(*op));
                 set_result(cx, code, k, &mut next_val);
+            }
+            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `cap.call` to INSTANTIATOR
+            // `instantiate`/`join` marshals its operands to a host import (`env.instantiate` /
+            // `env.join`, the funcref-table-free analog of `env.call_interp`) that spawns/joins the
+            // confined child vCPU host-side — exactly as the interpreter surfaces `VcpuStop::Instantiate`
+            // to its driver. The emitted parent does no confinement itself; the child's window carve +
+            // attenuated powerbox are the host's job (unchanged from the interpreter path).
+            Inst::CapCall {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            } if nested_caps && is_nested_cap(*type_id, *op) => {
+                let n_results = sig.results.len();
+                if *op == 0 {
+                    // env.instantiate(win, inst, entry, off, size_log2, quota) -> i32 child handle
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win — the carve base is window-relative
+                    get(code, cx, *handle); // the Instantiator capability handle (i32)
+                    for a in args {
+                        get(code, cx, *a); // entry, off, size_log2, quota
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, INSTANTIATE_IMPORT_IDX as u64);
+                } else {
+                    // env.join(inst, child) -> i64 result
+                    get(code, cx, *handle); // the Instantiator handle
+                    for a in args {
+                        get(code, cx, *a); // the child handle
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, JOIN_IMPORT_IDX as u64);
+                }
+                for i in (0..n_results).rev() {
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, cx.local_of[k][next_val + i] as u64);
+                }
+                next_val += n_results;
             }
             Inst::Call { func, args } => {
                 let callee = &m.funcs[*func as usize];

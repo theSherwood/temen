@@ -789,9 +789,24 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    path has no native/CI harness in-repo — it needs a Chromium/Node end-to-end twin, and the
    multi-Worker runtime-compile powerbox itself is still only driven by the single-Worker
    `jitcodegen_runtime.mjs` (par.js's `runAcrossWorkers` carries the `jitB2` flag but not yet the
-   runtime-powerbox setup). Also deferred: §14 units whose entry **uses** its instantiator/address-space
-   caps (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type;
-   **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design, §17.)*
+   runtime-powerbox setup).
+   **[landed — §14 VM-in-VM emitter mechanism + native differential]** A unit whose entry *uses* its
+   `Instantiator` cap (spawns a nested confined VM + `join`s it) now emits, where before **any**
+   `cap.call` forced the whole entry onto the interpreter (`block_value_types` rejected it).
+   [`svm_wasm_jit::compile_module_nested`] lowers `cap.call 6` INSTANTIATOR `instantiate` (op 0) /
+   `join` (op 1) to a host-driver bounce — `env.instantiate` / `env.join` imports, the
+   funcref-table-free analog of `env.call_interp` — so the child vCPU spawn + join happen host-side,
+   exactly as the interpreter surfaces `VcpuStop::Instantiate` to its driver; the emitted parent does
+   no confinement itself (the child's window carve + attenuated powerbox stay the host's job, unchanged
+   from the interpreter path). Opt-in, so the production paths are byte-identical. Pinned by
+   `crates/svm-wasm-jit/tests/nested_vm.rs`: an emitted entry that `instantiate`s + `join`s a child
+   returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
+   actually fired). **Deferred:** the **browser driver wiring** (`worker.js`/`par.js` servicing
+   `env.instantiate` by spawning the child on a Worker into the confined-child completion-slot protocol
+   — *browser-verification pending*); ADDRESS_SPACE caps (iface 5 `map`/`unmap`/`protect`/`sub`) and
+   coroutine/yield ops, still out-of-subset. *(All scalar unit signatures — i32/i64/f32/f64 — now
+   marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
+   §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),
