@@ -5566,6 +5566,17 @@ impl SchedRef {
             SchedRef::Det(d) => d.spawn(make),
         }
     }
+    /// CALLS.md 6c — the run's stable identity: the scheduler `Arc`'s address. Used as the
+    /// **owning-run token** on an instanced offer's `busy` checkout ([`ProviderState::busy_owner`])
+    /// — a caller parks on a busy instance only when the holder is its own run (which will
+    /// `admit_wake` it), else `-EAGAIN`. Non-zero for any live scheduler (an `Arc` data pointer is
+    /// never null), so it never collides with the host-side tier's `0` sentinel.
+    fn run_id(&self) -> usize {
+        match self {
+            SchedRef::Real(s) => Arc::as_ptr(s) as usize,
+            SchedRef::Det(d) => Arc::as_ptr(d) as usize,
+        }
+    }
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         match self {
             SchedRef::Real(s) => s.notify(key, count),
@@ -8109,6 +8120,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 let (pm, ph) = {
                     let mut st = parked.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.busy = true;
+                    // CALLS.md 6c — the resumed segment runs on this vCPU's run; re-stamp the
+                    // owning-run token so a same-run peer may park on the re-held instance.
+                    st.busy_owner = sched.run_id();
                     (st.mem.take(), std::mem::take(&mut st.host))
                 };
                 let saved_mem = std::mem::replace(mem, pm);
@@ -8276,6 +8290,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // admission-waiter — at the rim, `-EAGAIN` (fail-closed, §9).
                                     if offer_anim.iter().any(|a| Arc::ptr_eq(&a.state, &state_)) {
                                         Adm::Eagain
+                                    } else if st_.busy_owner != sched.run_id() {
+                                        // CALLS.md 6c — the holder is a **foreign run** (the
+                                        // host-side `drive_arc` tier's `0`, or another run sharing
+                                        // this instance via regrant). Only the owning run's holder
+                                        // `admit_wake`s parkers, so parking here strands us — answer
+                                        // a probeable `-EAGAIN` (exactly the `-11` the held-lock's
+                                        // `WouldBlock` gave before 6c released that lock). Inert on
+                                        // same-run 4c.1 contention (`busy_owner == run_id`).
+                                        Adm::Eagain
                                     } else if st_.admit_parked >= ADMIT_QUEUE_MAX {
                                         Adm::Eagain
                                     } else {
@@ -8310,6 +8333,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // with 6b.
                                     let budget_ = *fuel;
                                     st_.busy = true;
+                                    // CALLS.md 6c — stamp the owning-run token so a same-run peer
+                                    // may park (4c.1) while a foreign run / the host-side tier
+                                    // `-EAGAIN`s. Cleared with `busy` at every settle.
+                                    st_.busy_owner = sched.run_id();
                                     let pm_ = st_.mem.take();
                                     // `take` leaves a throwaway default in `st_.host`; the real host
                                     // rides on the vCPU until the settle restores it (busy meanwhile).
@@ -14177,6 +14204,18 @@ pub struct ProviderState {
     /// re-attempts admission (via its carried [`VCpu::admit_retry`]). Bounds the queue: a caller
     /// finding it at [`ADMIT_QUEUE_MAX`] gets `-EAGAIN` at the rim (fail-closed, §9).
     admit_parked: u32,
+    /// CALLS.md 6c — the **owning-run token** of the current `busy` checkout: the holder's
+    /// scheduler identity ([`SchedRef::run_id`]), or `0` for the host-side `drive_arc` tier
+    /// (which has no eval loop and no scheduler). A contender may only *park* as an
+    /// admission-waiter on a busy instance whose owner is **its own run** — that run's holder is
+    /// the one entity that will [`Sched::admit_wake`] it. A foreign owner (another run, or the
+    /// host-side `0`) is un-parkable from here — nothing in the parker's run will free it — so it
+    /// answers a probeable `-EAGAIN` instead. This is what lets the host-side arm release the
+    /// state lock across its `drive_arc` (busy word, not held `try_lock`): a cyclic host-side
+    /// self-call now sees `busy` with a foreign owner and errnos, exactly as the held lock's
+    /// `WouldBlock` did — without the held-locks deadlock. Read only while `busy`; a live `Arc`
+    /// address is never `0`, so `0` is a safe "no cooperative owner" sentinel.
+    busy_owner: usize,
 }
 
 /// CALLS.md 4c.1 — the bounded depth of the per-instance admission-waiter queue. A busy `single`
@@ -16095,6 +16134,7 @@ impl Host {
                 host: Host::new(),
                 busy: false,
                 admit_parked: 0,
+                busy_owner: 0,
             }))),
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
@@ -16558,6 +16598,7 @@ impl Host {
                     host: Host::new(),
                     busy: false,
                     admit_parked: 0,
+                    busy_owner: 0,
                 }))
             })
             .clone();
@@ -17878,52 +17919,93 @@ impl Host {
                 // caller's call traps, fail-closed, identically on every backend.
                 match &entry.state {
                     // §3.2 v2 **instanced** offer: run over the provider's persistent window +
-                    // powerbox (exporter-domain state). CALLS.md increment 2: admission is
-                    // **try-enter** — a busy provider answers a probeable `-EAGAIN` (the caller
-                    // retries), never a blocking wait. This makes deadlock impossible
-                    // *structurally* (a cyclic or re-entrant call finds the instance busy and
-                    // errnos), so the old acyclicity rule — "providers never hold offers" — is
-                    // lifted: a provider may consume offers, and a cycle is a probeable refusal,
-                    // not a hang. The queue-on-contention upgrade is CALLS.md increment 3+.
+                    // powerbox (exporter-domain state). A busy provider answers a probeable
+                    // `-EAGAIN` (the caller retries), never a blocking wait — so a cyclic or
+                    // re-entrant call finds the instance busy and errnos rather than deadlocking,
+                    // and the old acyclicity rule ("providers never hold offers") stays lifted.
+                    //
+                    // CALLS.md 6c — the two-lock discipline leaves this tier: the world is checked
+                    // out under a **brief** guard with the §10.1 `busy` admission word, then the
+                    // nested `drive_arc` runs with **no provider guard held** (world carried on
+                    // locals). The cyclic `-EAGAIN` now comes from the admission word (a foreign
+                    // `busy_owner` — this host-side tier stamps `0`, and no eval-loop parker adopts
+                    // a foreign owner: §10.1's `busy_owner` check), not a held `try_lock`, so the
+                    // held-locks deadlock argument genuinely dies. Every nested `drive_arc` left in
+                    // the tree now runs lock-free over its world.
                     //
                     // CALLS.md 6b — provider-pays is retired: each call runs on the flat
                     // deterministic `OFFER_FUEL` budget (the pure arm's price), no reserve, no
                     // drain. The eval-loop tier is caller-pays (5b); this host-side tier keeps
                     // the flat bounded price until the arm itself retires (6d residues).
                     Some(state) => {
-                        let mut st = match state.try_lock() {
-                            Ok(g) => g,
-                            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                            Err(std::sync::TryLockError::WouldBlock) => {
+                        // Checkout: reserve the instance under one brief lock, then release it. A
+                        // busy instance (any owner) or a momentarily-held short critical section is
+                        // a probeable `-EAGAIN`. The world moves onto locals so the guard drops.
+                        let (mut mem_local, mut host_local) = {
+                            let mut st = match state.try_lock() {
+                                Ok(g) => g,
+                                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                                Err(std::sync::TryLockError::WouldBlock) => {
+                                    return Ok(vec![EAGAIN]);
+                                }
+                            };
+                            if st.busy {
                                 return Ok(vec![EAGAIN]);
                             }
+                            st.busy = true;
+                            // Host-side tier: no cooperative owner. An eval-loop peer sharing this
+                            // instance (via regrant) sees the foreign `0` and `-EAGAIN`s rather
+                            // than parking on a holder that would never `admit_wake` it.
+                            st.busy_owner = 0;
+                            (st.mem.take(), std::mem::take(&mut st.host))
                         };
-                        let st = &mut *st;
-                        let mut arg_slots = args.to_vec();
-                        translate_cap_slots(self, &mut st.host, &sig.params, &mut arg_slots)?;
-                        let vals: Vec<Value> = sig
-                            .params
-                            .iter()
-                            .zip(&arg_slots)
-                            .map(|(ty, &s)| slot_to_val(*ty, s))
-                            .collect();
-                        // CALLS.md 6b — provider-pays retired: the flat deterministic per-call
-                        // budget the pure arm always had (no reserve, no drain; caller-pays on
-                        // the eval-loop tier since 5b — this host-side tier keeps the bounded
-                        // flat price until it retires entirely).
-                        let mut impl_fuel = OFFER_FUEL;
-                        let (res, _, _) = drive_arc(
-                            entry.funcs.clone(),
-                            f,
-                            &vals,
-                            &mut impl_fuel,
-                            &mut st.mem,
-                            &mut st.host,
-                        );
-                        let mut result_slots: Vec<i64> =
-                            res?.iter().map(|v| val_to_slot(*v)).collect();
-                        translate_cap_slots(&mut st.host, self, &sig.results, &mut result_slots)?;
-                        Ok(result_slots)
+                        // The crossing runs with the state lock released. `?` inside stays local so
+                        // the check-in below always restores the world and reopens the instance —
+                        // an un-restored trap would strand it `busy` with an empty world.
+                        let outcome: Result<Vec<i64>, Trap> = (|| {
+                            let mut arg_slots = args.to_vec();
+                            translate_cap_slots(
+                                self,
+                                &mut host_local,
+                                &sig.params,
+                                &mut arg_slots,
+                            )?;
+                            let vals: Vec<Value> = sig
+                                .params
+                                .iter()
+                                .zip(&arg_slots)
+                                .map(|(ty, &s)| slot_to_val(*ty, s))
+                                .collect();
+                            // CALLS.md 6b — flat deterministic per-call budget (no reserve/drain).
+                            let mut impl_fuel = OFFER_FUEL;
+                            let (res, _, _) = drive_arc(
+                                entry.funcs.clone(),
+                                f,
+                                &vals,
+                                &mut impl_fuel,
+                                &mut mem_local,
+                                &mut host_local,
+                            );
+                            let mut result_slots: Vec<i64> =
+                                res?.iter().map(|v| val_to_slot(*v)).collect();
+                            translate_cap_slots(
+                                &mut host_local,
+                                self,
+                                &sig.results,
+                                &mut result_slots,
+                            )?;
+                            Ok(result_slots)
+                        })();
+                        // Check-in: restore the provider world and reopen the instance, whatever
+                        // the outcome (the single settle point, mirroring the animation's).
+                        {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.mem = mem_local;
+                            st.host = host_local;
+                            st.busy = false;
+                            st.busy_owner = 0;
+                        }
+                        outcome
                     }
                     // v1 **pure** offer: windowless, empty powerbox — arguments in, results out,
                     // capped at the flat per-call budget (there is no provider domain to drain;

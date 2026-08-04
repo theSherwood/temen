@@ -610,15 +610,31 @@ plumbing that lands in increments (§8).
      `an_instanced_offer_runs_on_a_flat_deterministic_budget`; `grant_impl_cap` is now the one
      blocking `state.lock()` accessor (its caveat narrowed accordingly — it dissolves with the 6d
      binding merge).
-   - **6c — the two-lock discipline leaves.** The host-side instanced arm adopts the checkout shape
-     the animation proved: world checked out under a **brief** guard with the §10.1 `busy`
-     admission word, the nested `drive_arc` runs with **no provider guard held**, settle reopens.
-     A cyclic host-side call still answers `-EAGAIN` — but via the admission word, not a held
-     `try_lock`, so the held-locks deadlock argument (and the acyclicity rule) genuinely dies.
-     (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock` keeps its `-11` on this tier; the
-     eval-loop flip already happened in 4c.2.) After 6c, every nested `drive_arc` left in the tree
-     (pure arm + this narrowed arm) runs lock-free over its world — the sub-interpreter-under-locks
-     is gone even where the sub-run survives for eval-loop-less tiers.
+   - **6c — the two-lock discipline leaves. DONE (2026-08-04).** The host-side instanced arm
+     adopts the checkout shape the animation proved: the world is checked out under a **brief**
+     guard with the §10.1 `busy` admission word, the nested `drive_arc` runs with **no provider
+     guard held** (world carried on locals), and a single check-in restores the world + reopens the
+     instance on every exit — trap or success alike (an un-restored trap would strand the instance
+     `busy` with an empty world). A cyclic host-side call still answers `-EAGAIN`, but via the
+     admission word, not a held `try_lock`, so the held-locks deadlock argument (and the acyclicity
+     rule) genuinely dies. **As built, one subtlety surfaced that the map missed:** releasing the
+     host-side lock makes a foreign `busy` holder *park-observable* to an eval-loop caller for the
+     first time — pre-6c, cross-run contention always saw a **held** `try_lock` (`WouldBlock →
+     -EAGAIN`), so a 4c.1 admission-park only ever happened *within one run* (a peer vCPU the
+     holder's own scheduler will `admit_wake`). A naive busy-word release would let a cyclic
+     host-side self-call **park** in the nested `drive_arc`'s scheduler (its `offer_anim` is empty,
+     so the 4c.2 self-detect misses) and hang — the outer arm can't clear `busy` until that nested
+     run returns. Fix: an **owning-run token** — `ProviderState.busy_owner` records the holder's
+     scheduler identity (`SchedRef::run_id`, the `Arc` address; `0` for this host-side tier). A
+     caller may only *park* on a busy instance owned by **its own run**; a foreign owner (`0`, or
+     another run sharing the instance via regrant) answers a probeable `-EAGAIN`. Inert on the
+     pre-6c behavior (no cross-run park existed) and exactly the `-11` the held lock gave — no
+     waker, no `drive_arc` run-wiring. (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock`
+     keeps its `-11` on this tier; the cap-translation quartet and `imports_impl` — three backends
+     — exercise the new checkout/check-in edges; the eval-loop flip already happened in 4c.2.)
+     After 6c, every nested `drive_arc` left in the tree (pure arm + this narrowed arm) runs
+     lock-free over its world — the sub-interpreter-under-locks is gone even where the sub-run
+     survives for eval-loop-less tiers.
    - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list, each explicit):
      durable-caller animation (a DURABILITY.md-scoped slice; unpinned today); tier-native offer
      arms (extend the 5c JIT crossing machinery from `LiveImpl` to instanced offers; a bytecode

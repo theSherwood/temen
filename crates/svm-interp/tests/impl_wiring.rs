@@ -736,11 +736,16 @@ fn grant_impl_cap_accepts_offers_and_refuses_pure_targets() {
 
 #[test]
 fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
-    // The structural deadlock-freedom the try-enter admission buys (CALLS.md increment 2),
-    // pinned end to end: a provider granted ITS OWN offer calls it from inside its handler.
-    // The nested dispatch finds the instance busy (the outer call holds it) and answers a
-    // probeable `-EAGAIN` — under the old blocking lock this exact shape was the deadlock the
-    // acyclicity rule existed to forbid. The handler returns the errno; the caller observes it.
+    // The structural deadlock-freedom the admission word buys, pinned end to end: a provider
+    // granted ITS OWN offer calls it from inside its handler. The nested dispatch finds the
+    // instance busy (the outer call holds it) and answers a probeable `-EAGAIN` — under the old
+    // blocking lock this exact shape was the deadlock the acyclicity rule existed to forbid. The
+    // handler returns the errno; the caller observes it.
+    //
+    // CALLS.md 6c — the outer host-side call now checks the instance out under a *brief* guard
+    // (the §10.1 `busy` word) and releases the state lock across its `drive_arc`; the nested
+    // self-call re-acquires the free mutex, reads `busy` with a foreign `busy_owner` (this tier's
+    // `0`), and `-EAGAIN`s — the same `-11`, but via the admission word, not a held `try_lock`.
     let provider = svm_text::parse_module(
         "memory 16\n\
          data 0 \"me\"\n\
