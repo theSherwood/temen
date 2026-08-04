@@ -1738,6 +1738,26 @@ unsafe fn serve_locked_child(
     };
     let mut count: i64 = 0;
     loop {
+        // CALLS.md 5c.2 — fold handoff settlements (§10.2: a handoff-served dispatch counts in
+        // THIS serve loop's accounting), and a handler trap under handoff is this child's own
+        // death, exactly as if it had served the dispatch itself on the enqueue path.
+        count += guard.take_handoff_served();
+        let handoff_trap = guard.take_handoff_trap();
+        if handoff_trap != 0 {
+            guard.set_serve_activation(None);
+            drop(guard);
+            *trap_out = handoff_trap;
+            return;
+        }
+        if guard.handoff_claimed() {
+            // A claimer is running a handler inline over this child's window: neither pop nor
+            // exit (the window must stay alive under it) — wait for the release.
+            let (g, _) = cv
+                .wait_timeout(guard, std::time::Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+            continue;
+        }
         while let Some((export, dop, args, ticket)) = guard.svc_pop() {
             let Some(fidx) = guard.svc_handler(export, dop) else {
                 *trap_out = svm_jit::TrapKind::CapFault as i64;
@@ -1785,18 +1805,41 @@ unsafe fn serve_locked_child(
         // Empty queue on `svc.wait` and nothing served yet: the arm-5 park — block on the
         // cell's Condvar (released while waiting, so enqueuers get in), bounded re-checks.
         if blocked_wait_interrupted(epoch, trap_out) {
+            guard.set_serve_activation(None);
+            drop(guard);
             if *trap_out == 0 {
                 *trap_out = svm_jit::TrapKind::OutOfFuel as i64;
             }
             return;
         }
+        // CALLS.md 5c.2 — publish the activation for the wait's duration: a caller finding it
+        // (under this same lock) may claim and serve inline over `[mem_base, +mem_size)`, which
+        // stays alive exactly because this frame sits in `wait_timeout` until the release (the
+        // claimed-wait arm above). Cleared on every wake — the activation never outlives the park.
+        guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_size)));
         let (g, _) = cv
             .wait_timeout(guard, std::time::Duration::from_millis(20))
             .unwrap_or_else(|e| e.into_inner());
         guard = g;
+        guard.set_serve_activation(None);
     }
+    guard.set_serve_activation(None);
     drop(guard);
     put(count, trap_out);
+}
+
+/// CALLS.md 5c.3 / §10.4 — the per-thread **crossing-depth bound**: inline handoff crossings are
+/// real native frames on the claiming thread, so re-entrant chains must bound and **decline to
+/// the parked transport** at the rim (fail-closed toward the slower correct transport, never a
+/// wrong answer). Structurally the depth cannot exceed 1 today — a granted child (locked-domain
+/// caller) refuses live-impl calls before its guard-holding delegate — but the bound is the
+/// §10.4 contract for when that tier unlocks.
+const CROSSING_DEPTH_MAX: u32 = 64;
+thread_local! {
+    static CROSSING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+fn crossing_depth_ok() -> bool {
+    CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
 }
 
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `cap.call`
@@ -1820,8 +1863,65 @@ unsafe fn live_impl_call(
     const EINVAL: i64 = -22;
     const CAP_REVOKED: i64 = -9;
     let (callee, export) = (*host_ptr).live_impl_of(handle, type_id)?;
+    let fast = (*host_ptr).handoff();
     // The parent-host borrow above is dead; only the callee cell is locked from here on.
     let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
+    // CALLS.md 5c.2 — the thunk fast path (§10.2 arm 4): the callee's serve loop is parked at an
+    // empty-queue `svc.wait` (activation published) and unclaimed — claim it (atomic with the
+    // check, under the cell's lock) and run the handler INLINE on this thread over the child's
+    // live window: no enqueue, no wake, no reply round-trip. Gated by the run's handoff knob
+    // (`Host::set_handoff`, the 4d toggle now spanning both tiers) and the §10.4 crossing-depth
+    // bound (5c.3); every miss releases and declines to the parked transport below — toward the
+    // slower correct transport, never a wrong answer (§9).
+    if fast && crossing_depth_ok() {
+        if let Some((sctx, cbase, csize)) = guard.try_claim_handoff() {
+            let tramp = guard
+                .svc_handler(export, op)
+                .and_then(|f| svm_jit::child_handler_tramp(sctx as *const c_void, f));
+            match tramp {
+                Some((code, n_params, n_res)) if args.len() == n_params => {
+                    drop(guard);
+                    let mut res = vec![0i64; n_res];
+                    // A handler trap/fault under handoff is the CHILD's outcome (on the enqueue
+                    // path the child would have died serving this dispatch): capture into a
+                    // local cell, never the caller's trap cell.
+                    let mut child_trap: i64 = 0;
+                    CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
+                    let _faulted = svm_jit::child_invoke_handler(
+                        sctx as *const c_void,
+                        code,
+                        args,
+                        &mut res,
+                        cbase as *mut u8,
+                        csize,
+                        &mut child_trap,
+                    );
+                    CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
+                    let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
+                    if child_trap != 0 {
+                        // Route the trap to the child (it folds + dies on wake) and answer the
+                        // dying-callee errno — the enqueue path's exact observables.
+                        g2.set_handoff_trap(child_trap);
+                        g2.release_handoff(0);
+                        if let Some(cv) = g2.svc_cv() {
+                            cv.notify_all();
+                        }
+                        return Some(CAP_REVOKED);
+                    }
+                    g2.release_handoff(1);
+                    if let Some(cv) = g2.svc_cv() {
+                        cv.notify_all();
+                    }
+                    return Some(res.first().copied().unwrap_or(0));
+                }
+                _ => {
+                    // Unknown handler / arity mismatch: decline to the parked transport (the
+                    // enqueue below answers exactly as the oracle would).
+                    guard.release_handoff(0);
+                }
+            }
+        }
+    }
     let Some(ticket) = guard.svc_enqueue(export, op, args.to_vec()) else {
         return Some(EAGAIN); // full queue / unservable op: probeable backpressure
     };

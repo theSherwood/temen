@@ -14469,6 +14469,12 @@ pub struct Host {
     /// accounting") — the child's parked `svc.wait` completes with the same served-count
     /// observation the enqueue path would have delivered.
     handoff_served: i64,
+    /// CALLS.md 5c.2 — a trap raised by a handoff-served handler (`0` ⇒ none). The inline invoke
+    /// runs child code on the **claimer's** thread, but a handler trap is the *child's* outcome
+    /// (under the enqueue path the child's own serve loop would have died with it): the claimer
+    /// records it here and answers `CAP_REVOKED` (the dying-callee errno); the child's serve loop
+    /// folds it on wake and exits with it as its own trap — same observables on both transports.
+    handoff_trap: i64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
@@ -14813,6 +14819,7 @@ impl Host {
             serve_activation: None,
             handoff_claimed: false,
             handoff_served: 0,
+            handoff_trap: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -16245,6 +16252,17 @@ impl Host {
     /// CALLS.md 5c.2 — fold and reset the handoff-served count (the child's serve loop, on wake).
     pub fn take_handoff_served(&mut self) -> i64 {
         std::mem::take(&mut self.handoff_served)
+    }
+
+    /// CALLS.md 5c.2 — record a handoff-served handler's trap as the **child's** outcome; see
+    /// [`Host::handoff_trap`].
+    pub fn set_handoff_trap(&mut self, t: i64) {
+        self.handoff_trap = t;
+    }
+
+    /// Fold and reset the handoff trap (the child's serve loop, on wake; nonzero ⇒ exit with it).
+    pub fn take_handoff_trap(&mut self) -> i64 {
+        std::mem::take(&mut self.handoff_trap)
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op

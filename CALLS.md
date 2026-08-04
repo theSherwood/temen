@@ -531,21 +531,43 @@ plumbing that lands in increments (§8).
          bytecode-fallback: spawn → mint → parked-transport call → blocking `svc.wait` serve →
          reply → join → exit 42. *Residue:* op-13 (separate-module) children get no `self_module`
          on the JIT yet, so their offers don't mint — rides a later slice.
-     - **5c.2 — the thunk fast path (arm 4, the §8.5 headline):** a caller finding the callee's serve
-       loop parked at `svc.wait` claims the activation and **invokes the callee's handler trampoline
-       inline on its own thread** over the callee's world (`serve_native` mechanism, cross-domain),
-       run-to-completion first — a mid-handler park fails over to the parked transport (the 4a
-       staging; promotion parity is 5c.4). Pin: fast-path-on ≡ fast-path-off on results and
-       `serve_count` (the §10.2 handoff settlement rule, the 4d pin's JIT twin).
-     - **5c.3 — §10.4 crossing-depth bound:** a per-thread crossing counter minted at the fast path;
-       at the bound, decline to 5c.1's parked transport (fail-closed toward the slower correct
-       transport). Load-bearing on the JIT — inline crossings are real native frames.
-     - **5c.4 — mid-handoff park parity (arm 6):** a fast-path handler that parks mid-run promotes
-       (file the reified fiber + waiter, `fiber_rt`) and the caller **thread-blocks on the reply** —
-       the 4b/4d.2 shape, thread-block flavor.
-     Still a substantial JIT-runtime build (registry + op-14 + both transports + the bound), but the
-     fast path reuses the proven `serve_native` invoke mechanism rather than inventing a cross-thread
-     protocol as the primary — one execution model, per the consolidation yardstick.
+     - **5c.2 — the thunk fast path (arm 4, the §8.5 headline). DONE (2026-08-04).** **As built:**
+       the child's serve loop, entering its empty-queue wait, **publishes the activation**
+       (`Host.serve_activation = (serve_ctx, mem_base, mem_size)`) for exactly the wait's duration —
+       the window stays alive precisely because that frame sits in `wait_timeout` until release. A
+       caller (gated by the run's `Host::set_handoff` knob — the 4d toggle now spans both tiers)
+       **claims it atomically with the check** under the cell's lock (`try_claim_handoff`) and
+       invokes the handler inline via the 5c.1a `child_invoke_handler` — no enqueue, no wake, no
+       reply round-trip. While claimed the child neither pops, exits, nor honors interrupts (the
+       claimer runs over its window). **Settlement (§10.2):** the claimer's `release_handoff(1)`
+       lands in `Host.handoff_served`, which the child folds into its `svc.wait` return — the callee
+       observes the same served count either transport. **Trap parity:** a handler trap/fault under
+       handoff is captured in a *local* cell, routed to the child (`handoff_trap` — it folds and
+       dies with it on wake, as if it had served the dispatch itself) and the caller answers
+       `CAP_REVOKED` — the enqueue path's exact observables, never the caller's death. Every miss
+       (no activation, second claimer, unknown handler, arity, depth rim) releases and declines to
+       the 5c.1 parked transport. Pinned by
+       `jit_child_offer::direct_handoff_matches_parked_and_settles` (`call*100 + join(served)` =
+       4201 on interp ≡ JIT-parked ≡ JIT-handoff; claim engagement verified non-vacuous, 2/2 per
+       run).
+     - **5c.3 — §10.4 crossing-depth bound. DONE (2026-08-04).** A per-thread counter
+       (`CROSSING_DEPTH`, rim 64) at the claim gate; at the bound the call declines to the parked
+       transport (fail-closed toward the slower correct transport). Structurally depth cannot
+       exceed 1 today — a locked-domain (child) caller refuses live-impl calls before its
+       guard-holding delegate — so the bound is the §10.4 contract for when that tier unlocks.
+     - **5c.4 — mid-handoff park parity (arm 6). DONE (2026-08-04).** On the JIT this needed **no
+       promotion machinery**: a handler that parks under handoff simply blocks the **claimer's**
+       thread inside the inline invoke (§10.2 arm 6's "thread-blocks (JIT)" — the caller waiting is
+       the semantics), the claim holding admission closed throughout (run-to-park atomicity for
+       `single`, §10.1). Pinned by `direct_handoff_with_parking_handler_matches` (a timed-futex
+       handler; interp ≡ JIT-parked ≡ JIT-handoff).
+     **Recorded 5c residues** (each fail-closed probeable today, each a deliberate later slice):
+     the locked-domain caller tier (child→sibling live calls answer `-EINVAL` — unlocking it is
+     what makes the 5c.3 bound bite); nested serve under a handler; the timed `svc.wait` form on
+     the JIT tier; op-13 separate-module children as offer targets (need their module's
+     `self_module` + handler set threaded through `ResolvedModule`). The fast path reuses the proven
+     `serve_native` invoke mechanism rather than inventing a cross-thread protocol as the primary —
+     one execution model, per the consolidation yardstick.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
    goal, now reachable without a parity regression).
