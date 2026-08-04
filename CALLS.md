@@ -360,6 +360,40 @@ plumbing that lands in increments (§8).
      accounting, the parked `svc.wait` completing with the same `serve_count` observation the enqueue
      path would have delivered. Pin: **handoff-on ≡ handoff-off** on observable results and
      `serve_count`.
+
+     **As mapped (2026-08-04)** the process-provider path is a `Binding::LiveImpl` — a §14-child
+     serve loop parked at `Blocked::SvcWait`, served today by `svc_enqueue` + `svc_wake(callee)` +
+     caller park on `Blocked::CapReply { ticket }`; the provider's serve loop pops the queue,
+     `serve_switch`es the handler, and settles (`serve_count += 1`, `cap_reply_or_stash(ticket)`
+     wakes the caller). Crucially, unlike a library provider (whose world is a detachable
+     `ProviderState` the caller checks out onto its *own* vCPU), a process provider's world lives **on
+     its own parked vCPU** — so handoff is a cross-**domain** switch (the Doors/L4 shape), not the
+     cross-world switch 4a/4b/4c animate. And no `handoff` toggle or `handoff-on ≡ handoff-off`
+     harness exists yet — both are net-new. Decomposed smallest-verifiable-first:
+     - **4d.0 — Transport toggle + differential harness.** A `handoff` switch (default **off** ⇒
+       today's enqueue+park, byte-identical) plus a test driving a process-provider call both ways and
+       asserting identical results + `serve_count`. De-risks the behavioral slices: any divergence
+       from the enqueue oracle trips the pin.
+     - **4d.1 — Run-to-completion handoff.** The caller, resolving a `LiveImpl` whose serve loop is
+       parked at `svc.wait`, serves the dispatch inline on its own thread instead of waking the
+       provider. **Execution-model fork (owner steer wanted):**
+       - *(A) Nested drive of the provider vCPU* — take the parked provider vCPU, `svc_enqueue` the
+         dispatch, and run its serve loop via a `drive_arc`-shaped nested sub-run on the caller's
+         thread until it serves the one dispatch and re-parks; read the reply back. Maximal reuse of
+         the *proven* serve machinery (`serve_switch`/settle/`serve_count` run unchanged), so the
+         lowest chance of diverging from the enqueue oracle; cost is a new re-entrancy of the runner
+         over a *second* domain's vCPU (drive_arc precedent exists, but only for a fresh sub-run).
+       - *(B) Claim + animate the handler directly* — the caller claims the provider's serve
+         activation and animates the handler fiber over the provider's world *borrowed off its parked
+         vCPU* (the 4a/4b shape, sourcing the world from the vCPU instead of a `ProviderState`),
+         settling `serve_count` on the provider and delivering the result to the caller directly.
+         Lighter (no nested run, true "no reply round-trip"), but has to borrow/replace the provider's
+         world on its parked vCPU — more bespoke, more divergence surface.
+       - *Recommendation: (A)* — the equivalence pin is the whole point of the slice, and (A) reuses
+         the exact code the oracle path runs, minimizing where results could drift.
+     - **4d.2 — Mid-handoff park.** A handoff-served handler that parks mid-run rides the existing
+       serve-loop park machinery (`handler_parks`) under (A), or 4b promotion under (B). Pin: a
+       parking handler completes under handoff; `serve_count` settlement unchanged.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
    here**, uniformly on all backends. Closes the `live_impl` parity gap.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
