@@ -649,7 +649,26 @@ plumbing that lands in increments (§8).
        so it lands with its first pin (a durable caller invoking an instanced offer, differentially
        identical to the host-side path). Interp-only; deletes nothing structural, but removes the
        last reason the eval loop ever falls to the host-side arm for an instanced offer.
-     - **6d.2 — tier-native JIT offer arm.** A JIT `cap.call` to an offer currently falls through
+     - **6d.2 — tier-native JIT offer arm — DEFERRED (owner decision 2026-08-04).** We are
+       **leaving the host-side interp arm in place as the shared offer path for every tier** and not
+       building the native offer arms (6d.2/6d.3) now. Rationale: there are four execution tiers —
+       interp (which *is* the host-side arm), bytecode (folds offers to interp), `svm-jit` (Cranelift,
+       falls through `cap_thunk` to the host-side arm), and `svm-wasm-jit` (folds `cap.call`s to
+       interp) — and **all four already reach an offer through the one correct host-side arm.**
+       Retiring it means writing a native arm *per tier*, each against a **different confinement
+       model** — `svm-jit`'s guard-page + baked fault-range (the hinge below), `svm-wasm-jit`'s
+       base-as-param + baked size — i.e. N× hinge-sensitive work for a speedup **no benchmark has
+       asked for**. Across four tiers the host-side arm is an asset (one correct path, not four), not
+       debt. **The limitation we accept:** a `svm-jit`/`svm-wasm-jit` caller invoking an offer drops
+       into the interp for the sub-run rather than running the handler natively (a dispatch-cost
+       overhead on that specific crossing; correctness and confinement are unaffected — every tier
+       gets the oracle's exact answer). **Revisit trigger:** a benchmark showing offer dispatch hot
+       on a specific tier — then build a native arm for *that* tier only, from its own confinement
+       model (prefer `svm-wasm-jit`'s base-as-param shape over `svm-jit`'s guard-page range if the
+       choice is open). Critically, **6d.4's deletion does not depend on this** (see 6d.4). The full
+       design is retained below for whoever picks it up.
+
+       A JIT `cap.call` to an offer currently falls through
        `cap_thunk` to `host.cap_dispatch_slots` (the 6c-narrowed host-side arm, an interp
        `drive_arc` sub-run); this slice runs the offer handler natively (`define_extra` compiles the
        offer unit into the run's `CompiledModule`, cached; `invoke_extra` runs its trampoline) so
@@ -710,8 +729,11 @@ plumbing that lands in increments (§8).
        (`Arc<Mutex<Host>>` + window) so a library instance is structurally a granted child's
        powerbox, and unify `Binding::Offer`/`Binding::LiveImpl`. This is where "`ProviderState` +
        its mutex" and "the `GuestImpl`/`LiveImpl` binding split" finally leave §7's list. Deepest
-       and most invasive (touches every state access + the binding dispatch); gated on 6d.2 so both
-       tiers share one crossing before the shapes merge.
+       and most invasive (touches every state access + the binding dispatch). **Not gated on 6d.2**
+       (an earlier note said it was — corrected): every tier reaches offers through the host-side
+       arm, so 6d.4 rewrites that arm's *representation* and all four tiers keep working through it
+       unchanged. The deletion is tier-independent, which is exactly why it is the right increment-6
+       finale to build now while the native arms stay deferred.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
