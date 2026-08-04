@@ -601,11 +601,15 @@ plumbing that lands in increments (§8).
      Pin: `a_ref_func_offer_handler_animates_with_the_unit_remap` (handler `call_indirect`s its own
      helper through `ref.func`, called twice — the cache path; the first coverage that path ever
      had).
-   - **6b — provider-pays leaves.** Delete `ProviderState.fuel`, `PROVIDER_FUEL_RESERVE`, and the
-     `impl_fuel_remaining`/`set_impl_fuel_reserve` API (callers: one test); the host-side instanced
-     dispatch gets the **pure arm's flat deterministic `OFFER_FUEL` budget** (no reserve, no drain).
-     `provider_pays_from_a_drainable_reserve` flips to pin the new model; the `grant_impl_cap`
-     lock-order caveat dissolves with the blocking accessors.
+   - **6b — provider-pays leaves. DONE (2026-08-04).** `ProviderState.fuel`,
+     `PROVIDER_FUEL_RESERVE`, and the `impl_fuel_remaining`/`set_impl_fuel_reserve` API are
+     deleted; the host-side instanced dispatch runs on the **pure arm's flat deterministic
+     `OFFER_FUEL` budget** (no reserve, no dry-check, no drain — a service serves indefinitely,
+     each call identically priced; a runaway handler still traps `OutOfFuel` at the flat cap).
+     `provider_pays_from_a_drainable_reserve` flipped to
+     `an_instanced_offer_runs_on_a_flat_deterministic_budget`; `grant_impl_cap` is now the one
+     blocking `state.lock()` accessor (its caveat narrowed accordingly — it dissolves with the 6d
+     binding merge).
    - **6c — the two-lock discipline leaves.** The host-side instanced arm adopts the checkout shape
      the animation proved: world checked out under a **brief** guard with the §10.1 `busy`
      admission word, the nested `drive_arc` runs with **no provider guard held**, settle reopens.

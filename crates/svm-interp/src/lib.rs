@@ -8305,9 +8305,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         )?;
                                     }
                                     // CALLS.md 5b caller-pays: the handler runs on the caller's whole
-                                    // remaining fuel (no reserve draw, no per-call `OFFER_FUEL` cap —
-                                    // that cap is the deferred §10.5 refinement). The provider reserve
-                                    // (`st_.fuel`) is left untouched — vestigial until increment 6.
+                                    // remaining fuel (no per-call `OFFER_FUEL` cap — that cap is the
+                                    // deferred §10.5 refinement). The provider-pays reserve left
+                                    // with 6b.
                                     let budget_ = *fuel;
                                     st_.busy = true;
                                     let pm_ = st_.mem.take();
@@ -14163,14 +14163,6 @@ struct LiveImplEntry {
 pub struct ProviderState {
     mem: Option<Mem>,
     host: Host,
-    /// §5.3 **provider-pays metering** (resolved 2026-07-20): the provider funds its own
-    /// dispatch compute out of this drainable reserve — its code, its choice to offer.
-    /// Each op call is capped by `min(OFFER_FUEL, remaining)` and drains what it
-    /// used; a dry reserve makes further calls an inert `CapFault` (probeable by the
-    /// caller, visible to the wirer via [`Host::impl_fuel_remaining`] — the §15 "read the
-    /// meters on what you granted" story). A provider worried about a hammering child
-    /// rate-limits or kills the child itself; the platform just meters honestly.
-    fuel: u64,
     /// CALLS.md 4a **admission word**: `true` while an in-loop cross-world animation has this
     /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
     /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
@@ -14191,10 +14183,6 @@ pub struct ProviderState {
 /// instance parks contending callers up to this many; beyond it a caller gets a probeable
 /// `-EAGAIN` (backpressure is the caller's problem — §9, the same rim the `svc_queue` enforces).
 const ADMIT_QUEUE_MAX: u32 = 64;
-
-/// The default provider fuel reserve (§5.3 provider-pays): generous — a service is expected
-/// to live for many calls — and wirer-adjustable via [`Host::set_impl_fuel_reserve`].
-const PROVIDER_FUEL_RESERVE: u64 = 1 << 32;
 
 /// The fixed, deterministic fuel budget for one wired-offer op dispatch (v1 pure dispatch —
 /// see [`Binding::Offer`]). A looping impl hits `OutOfFuel` and the caller's call traps,
@@ -16105,7 +16093,6 @@ impl Host {
             state: Some(Arc::new(Mutex::new(ProviderState {
                 mem,
                 host: Host::new(),
-                fuel: PROVIDER_FUEL_RESERVE,
                 busy: false,
                 admit_parked: 0,
             }))),
@@ -16569,7 +16556,6 @@ impl Host {
                 Arc::new(Mutex::new(ProviderState {
                     mem,
                     host: Host::new(),
-                    fuel: PROVIDER_FUEL_RESERVE,
                     busy: false,
                     admit_parked: 0,
                 }))
@@ -16616,41 +16602,18 @@ impl Host {
     /// "providers never hold offers" acyclicity rule is no longer load-bearing and is lifted.
     /// `None` (nothing granted) for a non-instanced offer or a non-grantable cap.
     ///
-    /// **Lock invariant (CALLS.md increment 3, slice 1):** this and the other blocking
-    /// `state.lock()` accessors ([`Host::impl_fuel_remaining`], [`Host::set_impl_fuel_reserve`])
-    /// take the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
-    /// acquisition order. The narrowed dispatch path (`drive_instanced_offer`)
-    /// takes them in the opposite order (`state → hg`), but only via a non-blocking `state.try_lock()`,
-    /// so no cycle can form **during a live run**. These wiring/introspection APIs must therefore not
-    /// be called from another thread concurrently with a live scheduler run (they aren't today: they
-    /// are pre-run wiring and single-threaded metering). The clean fix — making them `try_lock` — lands
-    /// when `ProviderState` retires (increment 6).
+    /// **Lock invariant (CALLS.md increment 3, slice 1; narrowed by 6b):** this is now the one
+    /// blocking `state.lock()` accessor (the provider-pays metering pair left with 6b). It takes
+    /// the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
+    /// acquisition order; every dispatch-path acquisition is a non-blocking `state.try_lock()`,
+    /// so no cycle can form **during a live run**. Pre-run wiring only (as today); the caveat
+    /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         let h = self.regrant_into_child(cap, &mut st.host)?;
         st.host.register_cap_name(name, h);
         Some(h)
-    }
-
-    /// §5.3 provider-pays: the provider's remaining fuel reserve behind `offer` — the wirer's
-    /// meter ("read the meters on what you granted", §15). `None` for a forged handle or a
-    /// pure (non-instanced) offer. Blocking `state.lock()` — see the lock invariant on
-    /// [`Host::grant_impl_cap`] (not called concurrently with a live run).
-    pub fn impl_fuel_remaining(&self, offer: i32) -> Option<u64> {
-        let state = self.resolve_offer(offer).ok()?.state.clone()?;
-        let st = state.lock().unwrap_or_else(|e| e.into_inner());
-        Some(st.fuel)
-    }
-
-    /// §5.3 provider-pays: set the provider's fuel reserve behind `offer` (the wirer pricing
-    /// its own service — top-up or clamp). `None` (no change) for a forged handle or a pure
-    /// offer. Blocking `state.lock()` — see the lock invariant on [`Host::grant_impl_cap`]
-    /// (not called concurrently with a live run).
-    pub fn set_impl_fuel_reserve(&mut self, offer: i32, fuel: u64) -> Option<()> {
-        let state = self.resolve_offer(offer).ok()?.state.clone()?;
-        state.lock().unwrap_or_else(|e| e.into_inner()).fuel = fuel;
-        Some(())
     }
 
     /// Adopt a wired offer re-granted from a parent domain (IMPORTS.md §3.3 — the wrap/override
@@ -17923,12 +17886,10 @@ impl Host {
                     // lifted: a provider may consume offers, and a cycle is a probeable refusal,
                     // not a hang. The queue-on-contention upgrade is CALLS.md increment 3+.
                     //
-                    // §5.3 **provider pays**: each call is funded from the provider's drainable
-                    // reserve (capped per-call by OFFER_FUEL); a dry reserve is an inert
-                    // CapFault the caller can probe and the wirer can meter
-                    // ([`Host::impl_fuel_remaining`]) — its code, its choice to offer, its
-                    // budget. (Caller-pays unification is deferred to the JIT-arm increment:
-                    // fuel is observable, so it must switch on every backend at once.)
+                    // CALLS.md 6b — provider-pays is retired: each call runs on the flat
+                    // deterministic `OFFER_FUEL` budget (the pure arm's price), no reserve, no
+                    // drain. The eval-loop tier is caller-pays (5b); this host-side tier keeps
+                    // the flat bounded price until the arm itself retires (6d residues).
                     Some(state) => {
                         let mut st = match state.try_lock() {
                             Ok(g) => g,
@@ -17938,9 +17899,6 @@ impl Host {
                             }
                         };
                         let st = &mut *st;
-                        if st.fuel == 0 {
-                            return Err(Trap::CapFault);
-                        }
                         let mut arg_slots = args.to_vec();
                         translate_cap_slots(self, &mut st.host, &sig.params, &mut arg_slots)?;
                         let vals: Vec<Value> = sig
@@ -17949,8 +17907,11 @@ impl Host {
                             .zip(&arg_slots)
                             .map(|(ty, &s)| slot_to_val(*ty, s))
                             .collect();
-                        let budget = st.fuel.min(OFFER_FUEL);
-                        let mut impl_fuel = budget;
+                        // CALLS.md 6b — provider-pays retired: the flat deterministic per-call
+                        // budget the pure arm always had (no reserve, no drain; caller-pays on
+                        // the eval-loop tier since 5b — this host-side tier keeps the bounded
+                        // flat price until it retires entirely).
+                        let mut impl_fuel = OFFER_FUEL;
                         let (res, _, _) = drive_arc(
                             entry.funcs.clone(),
                             f,
@@ -17959,7 +17920,6 @@ impl Host {
                             &mut st.mem,
                             &mut st.host,
                         );
-                        st.fuel -= budget - impl_fuel; // drain what the call actually used
                         let mut result_slots: Vec<i64> =
                             res?.iter().map(|v| val_to_slot(*v)).collect();
                         translate_cap_slots(&mut st.host, self, &sig.results, &mut result_slots)?;
