@@ -746,11 +746,20 @@ plumbing that lands in increments (§8).
        `ProviderState` struct + its mutex are deleted, and the two `Binding` variants collapse into
        one that carries an internal passive-vs-live discriminant (the transport chosen at call
        time, exactly as today). Decomposed smallest-first:
-       - **6d.4.1 — the offer powerbox becomes a shared `Arc<Mutex<Host>>` cell.** Split
-         `ProviderState` so the powerbox `host` lives in the same `Arc<Mutex<Host>>` shape a child
-         uses, with the window + the 6c admission word (`busy`/`admit_parked`/`busy_owner`)
-         alongside it. Behaviour-identical; differential-pinned by the existing offer suite
-         (`impl_wiring`, `imports_impl`, the 4a–4d animation/promotion/handoff pins).
+       - **6d.4.1 — the offer powerbox becomes a shared `Arc<Mutex<Host>>` cell. DONE.**
+         `ProviderState.host: Host` → `Arc<Mutex<Host>>` (the window + the 6c admission word stay
+         alongside in `ProviderState`, exactly as a child's window is separate from its powerbox
+         cell). The animation now **clones** the cell onto the vCPU (deleting the per-call
+         `Arc::new(Mutex::new(..))` at every checkout/resume) and its mutations land through the
+         shared `Arc`, so the settle needs no host restore; the host-side `drive_arc` arm briefly
+         locks the cell to take/restore the inner `Host` by value, preserving 6c's no-lock-across-
+         the-sub-run. The world-handback **leak guard** (a handler that leaked the provider world by
+         spawning a fiber that still holds it) is re-expressed from `Arc::try_unwrap`
+         (unique-ownership) to `Arc::strong_count == 2` (the instance's own ref + the one checkout
+         clone; `busy` serializes admission so nothing races the count) — fail-closed exactly as
+         before, at both the 4a and 4d settles. Behaviour-identical; the existing offer suite is the
+         oracle (`impl_wiring` 25, `offer_promotion` 8 incl. the 4a–4d settles, `imports_impl`
+         three-backend).
        - **6d.4.2 — unify the side tables + the `Binding` variant.** Fold `OfferEntry` and
          `LiveImplEntry` into one `ImplEntry` (passive fields `Option`al, live fields `Option`al),
          and `Binding::Offer`/`Binding::LiveImpl` into one `Binding::Impl(u32)`; the dispatch probe
