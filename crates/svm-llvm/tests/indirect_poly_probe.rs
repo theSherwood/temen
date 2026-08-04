@@ -72,7 +72,7 @@ fn report(name: &str, m: &Module) {
     println!("  (sites whose signature matches NO function: {unmatched})");
 
     println!("\nsite fan-out histogram (targets per site -> #sites):");
-    let mut cum_le = |thresh: usize| buckets.iter().filter(|(k, _)| **k <= thresh).map(|(_, v)| *v).sum::<usize>();
+    let cum_le = |thresh: usize| buckets.iter().filter(|(k, _)| **k <= thresh).map(|(_, v)| *v).sum::<usize>();
     for (fanout, count) in &buckets {
         println!("  {fanout:>5} targets : {count} site(s)");
     }
@@ -98,14 +98,66 @@ fn report(name: &str, m: &Module) {
 
 #[test]
 fn lua_indirect_polymorphism() {
-    let fixtures = [
-        "lua_eval.ll",
-        "lua_all.ll",
-        "lua_testsuite.ll",
-    ];
+    let fixtures = ["lua_eval.ll", "lua_all.ll", "lua_testsuite.ll"];
     for fx in fixtures {
         let path = format!("{}/tests/fixtures/lua/{fx}", env!("CARGO_MANIFEST_DIR"));
         let t = svm_llvm::translate_ll_path(&path).expect("translate lua fixture");
         report(fx, &t.module);
+    }
+}
+
+/// How many functions contain at least one dynamic-index `call_indirect` site whose signature
+/// fan-out is within `cap` (i.e. approach A would rewrite it).
+fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
+    let pop = signature_population(m);
+    let mut funcs_hit = 0usize;
+    let mut sites_hit = 0usize;
+    for f in &m.funcs {
+        let mut hit = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::CallIndirect { ty, .. } = inst {
+                    let n = pop.get(&sig_key(&ty.params, &ty.results)).copied().unwrap_or(0);
+                    if (1..=cap).contains(&n) {
+                        sites_hit += 1;
+                        hit = true;
+                    }
+                }
+            }
+        }
+        if hit {
+            funcs_hit += 1;
+        }
+    }
+    (funcs_hit, sites_hit)
+}
+
+/// Approach A on the *real* Lua module: at several caps, rewrite every eligible dynamic
+/// `call_indirect`, re-verify, and report how many sites fire and the code-size cost. This measures
+/// feasibility + blowup on real on-ramp code (the full Futamura *speedup* additionally needs a
+/// program-as-constant harness, which does not exist yet).
+#[test]
+fn lua_approach_a_fires_and_verifies() {
+    let path = format!("{}/tests/fixtures/lua/lua_eval.ll", env!("CARGO_MANIFEST_DIR"));
+    let m = svm_llvm::translate_ll_path(&path).expect("translate").module;
+    svm_verify::verify_module(&m).expect("source lua module verifies");
+    let base_bytes = svm_encode::encode_module(&m).len();
+    let base_blocks: usize = m.funcs.iter().map(|f| f.blocks.len()).sum();
+
+    println!("\n=== approach A on lua_eval.ll ===");
+    println!("baseline: {} funcs, {base_blocks} blocks, {base_bytes} encoded bytes", m.funcs.len());
+    for cap in [4usize, 8, 16, 32] {
+        let (funcs_hit, sites_hit) = functions_with_eligible_site(&m, cap);
+        let low = svm_peval::lower_indirect_dispatch(&m, cap);
+        svm_verify::verify_module(&low)
+            .unwrap_or_else(|e| panic!("lowered lua (cap={cap}) must re-verify: {e:?}"));
+        let bytes = svm_encode::encode_module(&low).len();
+        let blocks: usize = low.funcs.iter().map(|f| f.blocks.len()).sum();
+        println!(
+            "cap={cap:>2}: {sites_hit:>3} sites in {funcs_hit:>3} funcs fire | \
+             blocks {base_blocks}->{blocks} (+{:.1}%) | bytes {base_bytes}->{bytes} (+{:.1}%)",
+            100.0 * (blocks as f64 - base_blocks as f64) / base_blocks as f64,
+            100.0 * (bytes as f64 - base_bytes as f64) / base_bytes as f64,
+        );
     }
 }
