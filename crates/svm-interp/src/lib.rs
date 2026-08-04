@@ -8073,7 +8073,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 };
                 let saved_mem = std::mem::replace(mem, pm);
                 let saved_host = std::mem::replace(host, Arc::new(Mutex::new(ph)));
-                let saved_fuel = *fuel;
+                // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter and persisted on this
+                // vCPU across the park at exactly `remaining_budget`; set it explicitly so the
+                // resumed handler continues draining the caller's fuel from where it parked.
                 *fuel = parked.remaining_budget;
                 let saved_invoked = invoked.replace(parked.entry_funcs.clone());
                 let saved_ref = invoked_ref_slots.take();
@@ -8085,10 +8087,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     handler_handle: parked.handler_handle,
                     saved_mem,
                     saved_host,
-                    saved_fuel,
                     saved_invoked,
                     saved_ref_slots: saved_ref,
-                    budget: parked.remaining_budget,
                     results: parked.results,
                     entry_funcs: parked.entry_funcs,
                 });
@@ -8196,6 +8196,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // CALLS.md 4c.1 — contention on a busy instance held by a *different*
                                 // vCPU: rewind + park as an admission-waiter, keyed by this state.
                                 ParkAdmit(Arc<Mutex<ProviderState>>, usize),
+                                // CALLS.md 5b — caller-pays: the caller has no fuel to fund the
+                                // crossing. Decided before checkout (nothing to undo) ⇒ clean trap.
+                                OutOfFuel,
                                 Decline,
                             }
                             let adm_ = {
@@ -8228,10 +8231,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let key_ = Arc::as_ptr(&state_) as usize;
                                         Adm::ParkAdmit(state_.clone(), key_)
                                     }
-                                } else if st_.fuel == 0 || st_.host.is_durable() {
-                                    // Dry reserve or a durable provider world: the 3a `drive_arc`
-                                    // fallback handles both, byte-identically.
+                                } else if st_.host.is_durable() {
+                                    // A durable provider world: the 3a `drive_arc` fallback handles
+                                    // it, byte-identically.
                                     Adm::Decline
+                                } else if *fuel == 0 {
+                                    // CALLS.md 5b caller-pays: the handler runs on the **caller's**
+                                    // fuel; a caller with none can't fund the crossing. Decided here,
+                                    // before any checkout (`busy`/world untouched), so the trap is
+                                    // clean.
+                                    Adm::OutOfFuel
                                 } else {
                                     // Edge 1 — cap args caller→provider (caller `hg` held only
                                     // here); a forged/dead cap fails closed as 3a's edge-1 `?`,
@@ -8247,7 +8256,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             &mut arg_slots_,
                                         )?;
                                     }
-                                    let budget_ = st_.fuel.min(OFFER_FUEL);
+                                    // CALLS.md 5b caller-pays: the handler runs on the caller's whole
+                                    // remaining fuel (no reserve draw, no per-call `OFFER_FUEL` cap —
+                                    // that cap is the deferred §10.5 refinement). The provider reserve
+                                    // (`st_.fuel`) is left untouched — vestigial until increment 6.
+                                    let budget_ = *fuel;
                                     st_.busy = true;
                                     let pm_ = st_.mem.take();
                                     // `take` leaves a throwaway default in `st_.host`; the real host
@@ -8274,6 +8287,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     *admit_retry = Some(state_arc_);
                                     return Ok(Inner::Park(Blocked::OfferAdmit { key: key_ }));
                                 }
+                                Adm::OutOfFuel => return Err(Trap::OutOfFuel),
                                 Adm::Decline => {} // fall through to the caller's 3a sub-run
                                 Adm::Go(arg_slots_, budget_, pm_, ph_) => {
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
@@ -8304,14 +8318,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         };
                                     let (hslot_, _) = registry.claim(handle_)?;
                                     // Install the provider world on this vCPU: mem, host (fresh Arc
-                                    // for the handler's cap.calls), fuel (+ the top-level-entry
-                                    // charge mirroring `drive_arc`:1918), and code (invoke seam —
+                                    // for the handler's cap.calls), and code (invoke seam —
                                     // `entry.funcs` as `INVOKE_MODULE`). Restored by the settle.
+                                    // CALLS.md 5b caller-pays: `*fuel` is NOT swapped — the handler
+                                    // runs on the caller's own counter. Charge the one function-entry
+                                    // fuel here (mirroring `drive_arc`:1918 and a `call` prologue);
+                                    // `budget_ == *fuel >= 1` (the `*fuel == 0` case became
+                                    // `Adm::OutOfFuel` before checkout), so this cannot underflow.
                                     let saved_mem_ = std::mem::replace(mem, pm_);
                                     let saved_host_ =
                                         std::mem::replace(host, Arc::new(Mutex::new(*ph_)));
-                                    let saved_fuel_ = *fuel;
-                                    *fuel = budget_ - 1; // budget_ >= 1 (fuel != 0 above)
+                                    *fuel = budget_ - 1;
                                     let saved_invoked_ = invoked.replace(entry_.funcs.clone());
                                     let saved_ref_ = invoked_ref_slots.take();
                                     let hvals_: Vec<Reg> = osig_
@@ -8328,10 +8345,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         handler_handle: handle_,
                                         saved_mem: saved_mem_,
                                         saved_host: saved_host_,
-                                        saved_fuel: saved_fuel_,
                                         saved_invoked: saved_invoked_,
                                         saved_ref_slots: saved_ref_,
-                                        budget: budget_,
                                         results: Arc::from(osig_.results.clone()),
                                         entry_funcs: entry_.funcs.clone(),
                                     });
@@ -8493,12 +8508,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
                         let resume_key =
                             host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
-                        let remaining = *fuel; // provider reserve left this segment
-                        let spent = anim.budget - remaining;
+                        // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter, drained by
+                        // the handler up to this park. Leave it (do NOT restore `anim.saved_fuel`) so
+                        // the caller carries the paid-down fuel across the park; `remaining_budget`
+                        // records it for the resume, and the provider reserve is untouched.
+                        let remaining = *fuel;
                         // Pull the provider world off this vCPU, restoring the caller's.
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
                         let prov_host_arc = std::mem::replace(host, anim.saved_host);
-                        *fuel = anim.saved_fuel;
                         *invoked = anim.saved_invoked;
                         *invoked_ref_slots = anim.saved_ref_slots;
                         // A handler that leaked the provider-host `Arc` (spawned a fiber holding it)
@@ -8514,7 +8531,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.mem = prov_mem;
                             st.host = prov_host;
-                            st.fuel -= spent;
                             st.busy = false;
                         }
                         // CALLS.md 4c.1 — the promotion freed the instance (`busy` cleared); re-admit
@@ -11557,11 +11573,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // iff it names the returning handler; an enclosing caller-handler's animation
                     // stays under it. `pop_if` keeps the check and the pop atomic.
                     if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
-                        // Restore the caller's code + fuel; pull the provider's world off this vCPU.
+                        // Restore the caller's code; pull the provider's world off this vCPU.
+                        // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter, drained in
+                        // place by the handler — leave it (do NOT restore `anim.saved_fuel`), so the
+                        // caller has paid for what its call ran. The provider reserve is untouched.
                         *invoked = anim.saved_invoked;
                         *invoked_ref_slots = anim.saved_ref_slots;
-                        let spent = anim.budget - *fuel; // entry charge + handler consumption (== 3a)
-                        *fuel = anim.saved_fuel;
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
                         let prov_host_arc = std::mem::replace(host, anim.saved_host);
                         // Run-to-completion: a handler that parked/spawned would have leaked a clone
@@ -11581,14 +11598,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             .zip(ret_buf.iter())
                             .map(|(ty, r)| val_to_slot(r.to_value(*ty)))
                             .collect();
-                        // Return the world to the instance, drain the reserve, and reopen admission
-                        // BEFORE the fallible result edge (so an error can't strand `busy`); then
-                        // edge 2 — cap results provider→caller — under the `state → hg` order (3a §phase 3).
+                        // Return the world to the instance and reopen admission BEFORE the fallible
+                        // result edge (so an error can't strand `busy`); then edge 2 — cap results
+                        // provider→caller — under the `state → hg` order (3a §phase 3). CALLS.md 5b:
+                        // no reserve drain (caller-pays — the caller's `*fuel` already paid).
                         {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.mem = prov_mem;
                             st.host = prov_host;
-                            st.fuel -= spent;
                             st.busy = false;
                             let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                             translate_cap_slots(
@@ -14103,18 +14120,11 @@ struct OfferAnim {
     saved_mem: Option<Mem>,
     /// The caller's `Arc<Mutex<Host>>`, parked while the provider's host is installed.
     saved_host: Arc<Mutex<Host>>,
-    /// The caller's remaining fuel, parked while the provider's budget funds the handler.
-    saved_fuel: u64,
     /// The caller's `invoked` unit (the transient [`INVOKE_MODULE`] code table), parked while the
     /// provider's `entry.funcs` is installed as the animated handler's code.
     saved_invoked: Option<Arc<[Func]>>,
     /// The caller's `invoked_ref_slots`, parked alongside `saved_invoked`.
     saved_ref_slots: Option<Vec<u32>>,
-    /// The fuel budget handed to the handler for the current run segment. Initially
-    /// `min(OFFER_FUEL, reserve)`; after a 4b promotion+resume it is the reserve left when the
-    /// handler last parked (the segment budgets telescope, so the total reserve drain across
-    /// parks is `initial_budget - final_remaining`, matching a single uninterrupted 3a run).
-    budget: u64,
     /// The offer op's result types — the result `cap`-slot translation edge (provider→caller) and
     /// the values to push into the caller frame on settle.
     results: Arc<[ValType]>,

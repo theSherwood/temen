@@ -411,9 +411,21 @@ plumbing that lands in increments (§8).
      services it. The design reserved op "12"; `reap` took it, so this is **13**. Pinned by
      `crates/svm/tests/fuel_remaining.rs`: interp ≡ JIT on the raw readback (`budget − 1` at entry)
      and on the read-before/read-after **call-metering** idiom.
-   - **5b — caller-pays fuel across the crossing.** Fuel follows the fiber across a cross-domain
-     crossing (the counter keeps draining); the wirer-priced reserve (`impl_fuel_remaining`,
-     `GUEST_IMPL_FUEL`) leaves with increment 6. Uniform on all backends.
+   - **5b — caller-pays fuel across the crossing. DONE (2026-08-04).** §10.5 — an animated offer
+     handler now runs on the **caller's own `*fuel`** counter (it made the call, it pays), not the
+     provider reserve. **As built** this simplified the 4a/4b machinery rather than adding to it: the
+     checkout stops swapping `*fuel` to a provider budget (`budget_ = *fuel`, the caller's whole
+     remaining fuel — no reserve draw, no per-call `OFFER_FUEL` cap, that cap being the deferred
+     §10.5 refinement), charging only the one function-entry fuel; both settles stop restoring
+     `*fuel` and stop draining `st.fuel` (the reserve is left untouched — vestigial until increment
+     6); and `OfferAnim` sheds its now-dead `saved_fuel`/`budget` fields (the promotion telescoping
+     collapses — the caller's counter simply persists across the park at `remaining_budget`). A
+     caller with no fuel to fund the crossing traps `OutOfFuel` **before** any checkout
+     (`Adm::OutOfFuel`, nothing to undo). Pinned by `crates/svm-interp/tests/caller_pays.rs`: a
+     caller's `fuel.remaining` drops by the handler's ~100-back-edge loop (≈0 under the old
+     provider-pays). *Scope:* the durable/`ref.func` `drive_arc` fallback still reserves-and-drains
+     (provider-pays) — it retires with increment 6; a process provider runs on its own §15 budget by
+     construction (a separate domain), so caller-pays here is the inline/library-animation path.
    - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** The net-new JIT thunk +
      park-as-thread-block-on-reply paralleling the interp `live_impl` path; plus the §10.4 per-thread
      crossing-depth bound (declines the inline arm to the parked transport at the bound). Closes the
