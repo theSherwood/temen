@@ -570,7 +570,47 @@ plumbing that lands in increments (§8).
      one execution model, per the consolidation yardstick.
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
-   goal, now reachable without a parity regression).
+   goal, now reachable without a parity regression). **Mapped + decomposed (2026-08-04).** The
+   retirement surface splits into what the eval loop can shed now and what other tiers still need:
+   `drive_instanced_offer` (the eval-loop legacy fn) has exactly 4 call sites, every one already
+   fronted by `animate_instanced_offer!`; but the `cap_dispatch_slots` instanced arm — the true
+   two-lock executor — is reached by the **bytecode engine, the JIT thunk's generic dispatch, the
+   IoRing submit paths, and any embedder holding `&mut Host`**, none of which have an eval loop to
+   animate in (the exact trap increment 2 was re-sequenced to avoid; `imports_impl` runs it on all
+   three backends today). Decliner census: **D1** durable *caller* — real (the animation
+   deliberately skips `shadow_switch`, and a provider window has no `DURABLE_RESERVE`), but pinned
+   by **no test**; **D2** `ref.func` handlers — a small fix (`install_unit_funcs` + the
+   `invoked_ref_slots` remap the animation currently takes away); **D3** durable *provider* —
+   **unreachable dead code** (no API can ever set `durable` on a `ProviderState.host`). Notes:
+   `GUEST_IMPL_FUEL` exists only in prose (the code's reserve is `PROVIDER_FUEL_RESERVE`);
+   `wire_impl_instance`/`impl_service` are already gone; the `GuestImpl`→`Offer` rename landed with
+   §8.1. Slices:
+   - **6a — the eval loop sheds the legacy fn.** D2 animates (cache the unit-func install on the
+     `OfferEntry`, set `invoked_ref_slots` at switch-in — the `invoked_new` shape); D3 deleted;
+     D1 (durable caller) re-routes to the host-side arm — one legacy site instead of two; then
+     **delete `drive_instanced_offer` + its 4 call sites**. New pin: a `ref.func`-taking offer
+     handler animates correctly (no such test exists today — D2 was pure conservatism).
+   - **6b — provider-pays leaves.** Delete `ProviderState.fuel`, `PROVIDER_FUEL_RESERVE`, and the
+     `impl_fuel_remaining`/`set_impl_fuel_reserve` API (callers: one test); the host-side instanced
+     dispatch gets the **pure arm's flat deterministic `OFFER_FUEL` budget** (no reserve, no drain).
+     `provider_pays_from_a_drainable_reserve` flips to pin the new model; the `grant_impl_cap`
+     lock-order caveat dissolves with the blocking accessors.
+   - **6c — the two-lock discipline leaves.** The host-side instanced arm adopts the checkout shape
+     the animation proved: world checked out under a **brief** guard with the §10.1 `busy`
+     admission word, the nested `drive_arc` runs with **no provider guard held**, settle reopens.
+     A cyclic host-side call still answers `-EAGAIN` — but via the admission word, not a held
+     `try_lock`, so the held-locks deadlock argument (and the acyclicity rule) genuinely dies.
+     (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock` keeps its `-11` on this tier; the
+     eval-loop flip already happened in 4c.2.) After 6c, every nested `drive_arc` left in the tree
+     (pure arm + this narrowed arm) runs lock-free over its world — the sub-interpreter-under-locks
+     is gone even where the sub-run survives for eval-loop-less tiers.
+   - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list, each explicit):
+     durable-caller animation (a DURABILITY.md-scoped slice; unpinned today); tier-native offer
+     arms (extend the 5c JIT crossing machinery from `LiveImpl` to instanced offers; a bytecode
+     fold-or-probe) — these are what let the narrowed host-side arm retire entirely; and the
+     `Offer`/`LiveImpl` **binding merge** with `ProviderState` folding onto the 5c shared-cell
+     shape (`Arc<Mutex<Host>>` + window — a library instance becomes structurally a granted
+     child's powerbox), which is where "`ProviderState` + its mutex" finally leaves §7's list.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
