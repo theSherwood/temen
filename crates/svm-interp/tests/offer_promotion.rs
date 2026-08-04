@@ -136,7 +136,10 @@ fn outer_provider(inner_tid: u32) -> svm_ir::Module {
 
 /// Wire `inner` and `outer` as instanced offers, grant `inner` into `outer`'s domain as `inner`,
 /// and drive one consumer `cap.call` into `outer`. Returns the run result.
-fn run_nested(inner: &svm_ir::Module, outer_of: impl Fn(u32) -> svm_ir::Module) -> Result<Vec<Value>, svm_interp::Trap> {
+fn run_nested(
+    inner: &svm_ir::Module,
+    outer_of: impl Fn(u32) -> svm_ir::Module,
+) -> Result<Vec<Value>, svm_interp::Trap> {
     let mut h = Host::new();
     let inner_offer = h.wire_offer_proc(inner, &[0]).expect("inner offer");
     let inner_tid = h.resolve_offer(inner_offer).unwrap().type_id;

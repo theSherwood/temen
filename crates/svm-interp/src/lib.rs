@@ -8225,8 +8225,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (`Blocked::OfferPark`, keyed on the provider domain so the handler's block-wake
                     // re-admits it). Non-durable (a durable animation declined to `drive_arc` in 4a),
                     // so no `shadow_switch` — the 4a switch shape, reversed.
-                    if offer_anim.last().is_some_and(|a| a.handler_slot == leaving) {
-                        let anim = offer_anim.pop().expect("checked is_some");
+                    if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
                         let resume_key =
                             host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
                         let remaining = *fuel; // provider reserve left this segment
@@ -11177,13 +11176,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // instead of the fiber `(status, value)` handoff: its resumer is the original
                     // caller frame (resuming *past* its cap.call), so restore the caller's world,
                     // drain the provider reserve, translate the results (edge 2), and push them.
-                    if offer_anim
-                        .last()
-                        .is_some_and(|a| a.handler_slot == leaving)
-                    {
-                        // Pop the top animation (strictly LIFO — the innermost handler returns
-                        // first); an enclosing caller-handler's animation stays under it.
-                        let anim = offer_anim.pop().expect("checked is_some");
+                    // Pop the top animation (strictly LIFO — the innermost handler returns first)
+                    // iff it names the returning handler; an enclosing caller-handler's animation
+                    // stays under it. `pop_if` keeps the check and the pop atomic.
+                    if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
                         // Restore the caller's code + fuel; pull the provider's world off this vCPU.
                         *invoked = anim.saved_invoked;
                         *invoked_ref_slots = anim.saved_ref_slots;
