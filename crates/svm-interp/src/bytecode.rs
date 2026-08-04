@@ -2646,8 +2646,7 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         size_log2: Option<u8>,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem =
-            size_log2.map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
+        let mem = size_log2.map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 

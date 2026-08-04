@@ -2679,9 +2679,11 @@ impl Func {
     }
 
     /// Whether this function contains a **vCPU/thread** op (`thread.spawn`/`thread.join`) — real OS
-    /// threads (§12 vCPUs), which a submitted `Jit` unit may **not** host yet: a spawned thread would
-    /// outlive the synchronous `cap.call` the unit runs inside and collide with the serialized
-    /// `Mutex<Host>` model (DESIGN.md §22). Split out for the submitted-unit gate.
+    /// threads (§12 vCPUs). A submitted `Jit` unit **may** host these once **installed** into a
+    /// thread-hosting domain (CONSOLIDATION.md §11 — installed code runs in the caller's frames on the
+    /// scheduler seam); an **invoked** unit still may not (its sealed `run_invoke` is seam-free, so a
+    /// thread op CapFaults). Split out for the submitted-unit gate (`define_extra`'s null-thunk check /
+    /// the invoke-dispatch seam gate).
     pub fn uses_threads(&self) -> bool {
         self.blocks.iter().any(|b| {
             b.insts

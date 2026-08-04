@@ -171,29 +171,43 @@ concurrency primitives freely** (`thread.spawn`/`join`, `memory.wait`/`notify`, 
 is `install`, on principle: installed code runs **in the calling vCPU's own frames** (module-aware
 `Frame.module` dispatch) on the caller's scheduler seam — unlike `invoke`, whose sealed nested
 `run_invoke` stays seam-free (that CapFault contract is unchanged; the §10 invoke/install split does
-the contractual work). Today this is *unexercised*, not supported: `VcpuEvent::Spawn` carries no
-module, so a spawn from an installed frame would resolve the func index in module 0 — the same
-frame-module hole class as the `event_instantiate` fix (PR #590).
+the contractual work). Was *unexercised* at first: `VcpuEvent::Spawn` carried no module, so a spawn from an installed frame
+resolved the func index in module 0 — the same frame-module hole class as the `event_instantiate`
+fix (PR #590).
 
 Slices (each differential-pinned; the natural sequel to the §22/§14 wasm-tier arc):
-1. **Module-aware spawn** (TCB): thread the spawning frame's module through
+1. **Module-aware spawn** (TCB) — *landed*: thread the spawning frame's module through
    `Op::ThreadSpawn → VcpuStop/VcpuEvent::Spawn` and into the spawned vCPU's root frame, across all
-   three drivers (cooperative, native parallel, resumable/browser). Audit `wait`/`notify`/atomics
-   (address-based — expected already module-agnostic, pinned not assumed).
-2. **JS drivers**: the spawn relay carries the module (the confined-child path's `smod` pattern).
-3. **Emitted units**: `env.thread_spawn`/`env.thread_join`/`env.mem_wait`/`env.mem_notify` imports
-   in the nested-caps emit (the PR #587/#590 bounce pattern; blocking inside an import *is* the
-   Worker model — every vCPU is a real thread on the par tiers). Consequence: concurrency-using
-   units emit, so the B2 per-Worker table mirror stays total (no interp-only null slots beyond
-   v128).
+   three interp drivers (cooperative, native parallel, resumable/browser) **and the tree-walker
+   oracle** (its `run_inner` spawn started the child in module 0 — fixed to the spawning frame's
+   module, mirroring the bytecode engine). `wait`/`notify`/atomics are address-based (module-agnostic,
+   pinned not assumed).
+2. **JS drivers** — *landed*: the spawn relay carries the module (the confined-child path's `smod`
+   pattern).
+3. **Emitted units (wasm tier)** — *landed*: `env.thread_spawn`/`env.thread_join`/`env.mem_wait`/
+   `env.mem_notify` imports in the nested-caps emit (the PR #587/#590 bounce pattern; blocking inside
+   an import *is* the Worker model — every vCPU is a real thread on the par tiers). Concurrency-using
+   units emit, so the B2 per-Worker table mirror stays total (no interp-only null slots beyond v128).
+4. **Native Cranelift tier** — *landed*: the piece DESIGN.md folded into "items 2–3", promoted to its
+   own slice. `define_extra` admits a `thread.*`/futex unit once the domain hosts threads
+   (`Jit::enable_thread_hosting`, the twin of `enable_fiber_hosting`), driven by a thread-hosting
+   grant (`grant_jit_threads` / `Host::set_jit_hosts_threads`); `jit_cap_run` forces the serialized
+   locked-`Host` path (a hosted unit's spawned vCPUs are concurrent `cap.call`ers). **Soundness**: a
+   unit's `thread.spawn N` dispatches its entry through the shared `fn_table`, so the unit's own funcs
+   are auto-installed there (`ref_slots` now covers `ThreadSpawn`, not just `ref.func`) and the spawn
+   func index is remapped — otherwise it would launch the *parent's* slot `N`. The **invoke seam** is
+   enforced at the invoke dispatch (`jit_native_op` op-1 / `jit_invoke_locked`): a threaded unit is
+   refused (CapFault) there, mirroring the interp's seam-free `run_invoke`.
 
 **Scope guard (§2):** coroutines/`Yielder` in units are NOT built bespoke — they arrive when §2
 collapses the family onto the unified offer; unit-side coroutine plumbing now would be work queued
 for deletion.
 
 **Gates:** per-driver differential pins (an installed unit that spawns its own module's funcs ≡
-oracle on every driver); `run_invoke`'s contract byte-identical; the §22 masking/typing invariants
-untouched (spawn is scheduler plumbing, not the confinement hinge).
+oracle on every driver, native tier included — `svm/tests/jit_cap.rs::installed_unit_spawns_its_own_func_native_agrees`
++ `installed_unit_futex_wait_native_agrees`); `run_invoke`'s contract byte-identical (invoke of a
+threaded unit CapFaults on both tiers); the §22 masking/typing invariants untouched (spawn is
+scheduler plumbing, not the confinement hinge).
 
 ## 12. Sequencing
 
@@ -207,7 +221,7 @@ untouched (spawn is scheduler plumbing, not the confinement hinge).
 | §3 config-record spawn + Budget | §2 | JIT thunk parity in-change |
 | §5b IoRing re-measure | §1 (incr. 5) | benchmark; delete only on measured redundancy |
 | §6 one code handle | — | **named consumer** |
-| §11 installed-unit concurrency | — (slice 3 after the slice-1/2 pins) | per-driver differential pins |
+| §11 installed-unit concurrency | — (slices 1–4 landed: interp, JS, wasm-emit, native Cranelift) | per-driver differential pins |
 | §9 doc folding | each subject settling | owner sign-off per fold |
 
 **End state:** the `Binding` enum at roughly a dozen variants, `Instantiator` at ~6 ops, one

@@ -2657,10 +2657,23 @@ index resolves in the spawning frame's module and the spawned vCPU's root frame 
 (`VcpuEvent::Spawn` carries the module; every driver constructs the child from
 `source.get(module)`, the `event_instantiate` pattern). `wait`/`notify`/atomics are window-global and
 module-agnostic. Pinned by `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`
-(cooperative ≡ parallel, 8 dispatches each spawning the unit's own worker). The **native-Cranelift**
-tier's threaded-unit dispatch and the **wasm tier's** spawn-in-emitted-unit imports are the next
-slices (CONSOLIDATION.md §11 items 2–3) — until pinned there, only the interp/bytecode tiers claim
-this support.
+(cooperative ≡ parallel, 8 dispatches each spawning the unit's own worker) and, on the tree-walker
+oracle, by the `jit_cap.rs` native differentials below (its `run_inner` spawn started the child in
+module 0 — fixed to the spawning frame's module). All tiers now claim this support:
+
+- **Native Cranelift.** `define_extra` admits a `thread.*`/futex unit once the domain hosts threads
+  (`Jit::enable_thread_hosting`, the twin of `enable_fiber_hosting`, driven by a thread-hosting grant
+  — `grant_jit_threads` / `Host::set_jit_hosts_threads`); `jit_cap_run` forces the serialized
+  locked-`Host` path (a hosted unit's spawned vCPUs are concurrent `cap.call`ers). A unit's
+  `thread.spawn N` dispatches its entry through the shared `fn_table`, so the unit's own functions are
+  auto-installed there (the `ref_slots` remap now covers `ThreadSpawn`) — else it would launch the
+  *parent's* slot `N`. The invoke seam is enforced at dispatch (`jit_native_op` op-1 /
+  `jit_invoke_locked` refuse a threaded unit with `CapFault`). Pinned by
+  `jit_cap::installed_unit_spawns_its_own_func_native_agrees`,
+  `installed_unit_futex_wait_native_agrees`, and `invoked_threaded_unit_capfaults_native_agrees`.
+- **wasm tier.** `env.thread_spawn`/`join`/`mem_wait`/`mem_notify` host-bounce imports in the
+  nested-caps emit; the JS drivers service them (the PR #587/#590 bounce pattern). Pinned by the
+  browser harness's `instthreads` item and `nested_vm.rs::threaded_unit_matches_oracle`.
 
 **Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
 (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
@@ -2670,9 +2683,11 @@ it is **auto-installed**: `define_extra` (JIT) / `install_unit_funcs` (interp) r
 unit function and `ref.func N` lowers to `iconst(slot[N])` — a real shared slot that resolves to the unit's
 own function through the ordinary masked dispatch. No escape-TCB change (invariant I2): only *which constant*
 `ref.func` emits, plus the existing Model-B2 `install_at` primitive; fails closed on too few reserved slots.
-The same mechanism serves `thread.spawn` entries. Pinned by
-`jit_cap::submitted_unit_fibers_over_its_own_func_agrees` (differential). Threads-in-a-submitted-unit
-remain deferred.
+The same mechanism serves `thread.spawn` entries — a unit spawning its own function auto-installs it
+so the spawn's shared-`fn_table` dispatch reaches the unit, not the parent's slot `N` (the
+`ref_slots` remap covers `ThreadSpawn` too). Pinned by
+`jit_cap::submitted_unit_fibers_over_its_own_func_agrees` and
+`installed_unit_spawns_its_own_func_native_agrees` (differential).
 
 **Powerbox hosts fibers (2026-07-30).** The CLI powerbox (`grant_powerbox_prefix`) is the maximal grant,
 so its `Jit` cap now opts into fiber hosting (`set_jit_hosts_fibers(true)`), and `powerbox_compile_run`

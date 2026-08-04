@@ -15,7 +15,7 @@ use svm_encode::encode_module;
 use svm_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
 use svm_ir::DEFAULT_RESERVED_LOG2;
 use svm_jit::{JitOutcome, TrapKind};
-use svm_run::{grant_jit, grant_jit_fibers, jit_cap_run};
+use svm_run::{grant_jit, grant_jit_fibers, grant_jit_threads, jit_cap_run};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
@@ -178,6 +178,149 @@ fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (Ji
     (jout, jmem)
 }
 
+/// Like [`diff_run_t`], but grant the `Jit` domain **thread-hosting** (`grant_jit_threads`,
+/// CONSOLIDATION.md §11): an **installed** submitted unit may use §12 threads (`thread.spawn`/`join`)
+/// and the futex. Reserves a `2^table_log2`-slot table so the guest can `install` (the supported path
+/// for a threaded unit — `invoke` stays a seam-free leaf and CapFaults). Same differential assertions
+/// (result equivalence, matching cap/thread trap kinds, byte-identical final memory). The interpreter
+/// drives spawned vCPUs cooperatively (`drive`); the JIT runs them as real OS threads on the parent's
+/// scheduler `Domain` (stood up by `enable_thread_hosting`) — both fold to the same result.
+fn diff_run_threads(
+    guest_src: &str,
+    blob_bytes: &[u8],
+    user_args: &[i64],
+    table_log2: u8,
+) -> (JitOutcome, Vec<u8>) {
+    let m = parse_module(guest_src).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let mut init = vec![0u8; BLOB_OFF + blob_bytes.len()];
+    init[BLOB_OFF..].copy_from_slice(blob_bytes);
+
+    let mut host_i = Host::new();
+    let h_i = grant_jit_threads(&mut host_i, &m, table_log2);
+    let mut iargs = vec![Value::I32(h_i)];
+    iargs.extend(user_args.iter().map(|&a| Value::I32(a as i32)));
+    let mut fuel = 50_000_000u64;
+    let (ires, imem) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &iargs,
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host_i,
+    );
+
+    let mut host_j = Host::new();
+    let h_j = grant_jit_threads(&mut host_j, &m, table_log2);
+    assert_eq!(
+        h_i, h_j,
+        "identical powerbox setup must mint identical handles"
+    );
+    let mut jargs = vec![h_j as i64];
+    jargs.extend_from_slice(user_args);
+    let (jout, jmem) = jit_cap_run(
+        &m,
+        0,
+        &jargs,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        table_log2,
+        &mut host_j,
+    )
+    .expect("jit run");
+
+    match (&ires, &jout) {
+        (Ok(vals), JitOutcome::Returned(slots)) => {
+            assert_eq!(vals.len(), slots.len(), "result arity");
+            for (v, s) in vals.iter().zip(slots) {
+                let iv = match v {
+                    Value::I32(x) => *x as i64,
+                    Value::I64(x) => *x,
+                    other => panic!("scalar result expected, got {other:?}"),
+                };
+                assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
+            }
+        }
+        (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
+        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
+        other => panic!("backends disagree: {other:?}"),
+    }
+    assert_eq!(imem, jmem, "final memory must be byte-identical");
+    (jout, jmem)
+}
+
+/// **Threads in an installed submitted unit — native tier** (CONSOLIDATION.md §11, the §11 slice-2
+/// deliverable): with the domain granted **thread-hosting** (`grant_jit_threads`), the guest
+/// compiles a spawning unit, `install`s it into the reserved `call_indirect` table, and dispatches
+/// it — the installed unit's `f0` `thread.spawn`s the unit's OWN `f1` (module-aware, resolved through
+/// the auto-installed shared-table slot on the JIT / module-aware dispatch on the interp), joins it,
+/// and returns its value (7). The native tier stands up the parent's thread scheduler
+/// (`enable_thread_hosting`) and runs the spawned vCPU as a real OS thread; the interpreter drives it
+/// cooperatively. Differential: both fold to 7, byte-identical memory. This is the native twin of
+/// `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module` (an interp-only pin before this
+/// slice).
+#[test]
+fn installed_unit_spawns_its_own_func_native_agrees() {
+    // The spawning unit: `f0() -> i32` spawns its own `f1` (→ 7), joins, returns 7.
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
+    let b = blob(unit);
+    // (jit) -> i32:  slot = install(compile(blob));  return call_indirect[slot]().
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call_indirect () -> (i32) v5 ()\n  return v6\n  }\n}\n";
+    let guest = with_len(guest_src, b.len());
+    // Reserve a 16-slot table: parent f0 at slot 0, the unit's two funcs auto-install (JIT) into
+    // padding, and the explicit `install` lands in a further padding slot — ample room.
+    let (out, _) = diff_run_threads(&guest, &b, &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[7]),
+        "installed unit spawns its own f1 → 7, got {out:?}"
+    );
+}
+
+/// **Futex in an installed submitted unit — native tier** (CONSOLIDATION.md §11): with the domain
+/// granted thread-hosting, an installed unit's `memory.wait` resolves against the parent's futex
+/// (`enable_thread_hosting` stood up the scheduler `Domain`, so the `wait_thunk` is baked non-null).
+/// The unit `atomic.wait`s on `mem[64]` with an expected value that does **not** match (0 ≠ 99), so
+/// the wait returns `1` ("not-equal") immediately without parking — the same value the interpreter's
+/// futex returns. Proves the native futex path is wired for installed units (the wasm-tier twin is
+/// the browser harness's `instthreads` item). Differential.
+#[test]
+fn installed_unit_futex_wait_native_agrees() {
+    // The unit's `f0() -> i32` `atomic.wait`s on mem[64] (=0) expecting 99 → returns 1 (not-equal).
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vaddr = i64.const 64\n  vexp = i32.const 99\n  vto = i64.const 0\n  vs = i32.atomic.wait vaddr vexp vto\n  return vs\n  }\n}\n";
+    let b = blob(unit);
+    // (jit) -> i32:  slot = install(compile(blob));  return call_indirect[slot]().
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call_indirect () -> (i32) v5 ()\n  return v6\n  }\n}\n";
+    let guest = with_len(guest_src, b.len());
+    let (out, _) = diff_run_threads(&guest, &b, &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[1]),
+        "installed unit's mismatching atomic.wait → 1 (not-equal), got {out:?}"
+    );
+}
+
+/// **Invoke of a threaded unit stays a seam-free leaf — native tier** (CONSOLIDATION.md §11): even
+/// under a thread-hosting grant, `Jit.invoke` of a unit that uses `thread.*`/futex **refuses**
+/// (CapFault) on both backends — the interpreter's `run_invoke` CapFaults any scheduler event, and
+/// the native tier matches by refusing at the invoke dispatch before it trampolines (`install` +
+/// dispatch is the supported path, exercised by `installed_unit_spawns_its_own_func_native_agrees`).
+/// The native twin of `bytecode_parallel_jit.rs::invoked_spawning_unit_stays_capfault`.
+#[test]
+fn invoked_threaded_unit_capfaults_native_agrees() {
+    // The unit's `f0() -> i32` spawns its own `f1`, so it uses threads.
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
+    let b = blob(unit);
+    // (jit) -> i32:  return invoke(compile(blob))  — invoke of a threaded unit is a CapFault.
+    let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 4096\n  v2 = i64.const BLOBLEN\n  v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = cap.call 11 1 (i64) -> (i32) v0 (v3)\n  return v4\n  }\n}\n";
+    let guest = with_len(guest_src, b.len());
+    // Reserve a table so the grant permits install room (the invoke is refused regardless).
+    let (out, _) = diff_run_threads(&guest, &b, &[], 4);
+    assert!(
+        matches!(out, JitOutcome::Trapped(TrapKind::CapFault)),
+        "invoke of a threaded unit must CapFault on the native tier, got {out:?}"
+    );
+}
+
 /// **Fibers in a submitted unit** (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30): with the
 /// domain granted fiber-hosting, a submitted unit runs its OWN §12 fiber — the entry `cont.new`s a
 /// unit-local body and resumes it twice (it `suspend`s 10, then on resume(7) returns 107), computing
@@ -201,13 +344,15 @@ func () -> (i64) {\nblock 0 () {\n  v0 = i32.const 1\n  v1 = i64.const 32768\n  
     );
 }
 
-/// **Threads in a submitted unit — split by tier** (CONSOLIDATION.md §11, renegotiated 2026-08-04;
-/// was: `-EINVAL` at the shared validator on both backends). The interp/bytecode tier now compiles a
-/// spawning unit — `install` + dispatch is the supported path (module-aware spawn,
-/// `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`) and `invoke` still refuses at
-/// runtime (seam-free). The **native Cranelift tier's own unit-compile pipeline still fail-closes**
-/// (`-EINVAL`) — admitting threaded units there is the §11 next slice — so the two tiers
-/// *deliberately* diverge at compile until that lands; this pin holds each tier to its contract.
+/// **Threads in a submitted unit under a NON-thread-hosting grant — split by tier** (CONSOLIDATION.md
+/// §11). This pins the fibers-only grant (`grant_jit_fibers` — hosts `cont.*` but **not** threads):
+/// the interp/bytecode tier's shared validator admits the unit's compile (a code handle ≥ 0), but the
+/// **native Cranelift tier fail-closes** (`-EINVAL`) — `define_extra` refuses a `thread.*`/futex unit
+/// whose thunks were never stood up, so it does not lower a `call_indirect` through null. The split is
+/// **by design**, not a missing slice: the native thunks are baked at compile, so admitting threads
+/// requires an explicit thread-hosting grant. Under `grant_jit_threads` both tiers admit + dispatch a
+/// threaded unit and agree (see `installed_unit_spawns_its_own_func_native_agrees`); `invoke` of a
+/// threaded unit still CapFaults on both (seam-free leaf).
 #[test]
 fn submitted_unit_threads_compile_split_by_tier() {
     let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
@@ -238,7 +383,7 @@ fn submitted_unit_threads_compile_split_by_tier() {
         other => panic!("interp compile run: {other:?}"),
     }
 
-    // Native tier: fail-closed at its own unit compile until the §11 native slice lands.
+    // Native tier under a fibers-only grant: fail-closed at its own unit compile (no thread thunks).
     let mut host_j = Host::new();
     let h_j = grant_jit_fibers(&mut host_j, &m, 0);
     let (jout, _) = jit_cap_run(
@@ -253,7 +398,7 @@ fn submitted_unit_threads_compile_split_by_tier() {
     .expect("jit run");
     assert!(
         matches!(jout, JitOutcome::Returned(ref s) if s == &[-22]),
-        "native tier must stay fail-closed (-EINVAL) until its slice, got {jout:?}"
+        "native tier must fail-closed (-EINVAL) without a thread-hosting grant, got {jout:?}"
     );
 }
 
