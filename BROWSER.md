@@ -765,12 +765,21 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    mismatch fails **closed** (as `dispatch_indirect` traps on `TABLE_EMPTY` / a type-id mismatch), and a
    full-index **mask-confinement sweep** (INVARIANTS.md §4) shows every `call_indirect idx` — including
    over-range — lands in `idx & (size-1)`, never outside `[0, size)`.
-   **Deferred (documented):** the **browser** B2 wiring on top of that seam — a shared
-   `WebAssembly.Table` created at `Jit`-grant time and imported by every domain instance, with
-   `install`/`uninstall` doing `table.set` (the JS analog of the `b2_install.rs` host); the multi-Worker
-   Node/Chromium end-to-end twin; and §14 units whose entry **uses** its instantiator/address-space caps
-   (nested VM-in-VM on wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type;
-   **v128** unit sigs stay on the interpreter.)*
+   **[landed — the browser B2 wiring, one instance-domain]** `svm_wasmjit_compile_b2` (browser cdylib)
+   emits a B2 unit via `compile_module_b2`, and `browser/web/wasmjit_b2.js` (`openB2Domain`) owns one
+   shared `WebAssembly.Table` sized to the reservation: `compile` instantiates each unit importing that
+   table + the cdylib memory; `install(inst, slot)` does `table.set(slot, inst.exports.f0)` and
+   `uninstall(slot)` nulls it — the JS analog of `DomainTable::install` / the `b2_install.rs` host, so a
+   unit's `call_indirect` dispatches at native wasm speed to whatever is installed. The cdylib export
+   compiles; the shared-table dispatch it drives is the exact shape proven native in `b2_install.rs`.
+   **Deferred (documented):** **cross-Worker** B2 — wasm funcrefs are *not* transferable across Workers
+   (unlike the interpreter's `SharedArrayBuffer` `DomainTable`), so each Worker must hold its **own**
+   `WebAssembly.Table` mirroring the shared slot→unit map (instantiating an installed unit locally and
+   `table.set`ting its own funcref at the shared slot index); wiring `openB2Domain` into the par
+   `Jit.invoke`/`install` path + a Node/Chromium end-to-end twin is the remaining verification. Also
+   deferred: §14 units whose entry **uses** its instantiator/address-space caps (nested VM-in-VM on
+   wasm). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by type; **v128** unit sigs stay
+   on the interpreter — the cap ABI is scalar-only by design, §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

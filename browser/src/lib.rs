@@ -5725,6 +5725,44 @@ pub extern "C" fn svm_wasmjit_compile_full(
     }
 }
 
+/// Emit a **§22 Model B2** unit: like [`svm_wasmjit_compile`] but the module *imports* one shared
+/// `env.__indirect_function_table` (sized `1 << table_log2` = the `Jit` grant's reservation) instead
+/// of declaring a private one, and populates no slots — the JS host owns the shared
+/// `WebAssembly.Table`, writing each unit's `f0` funcref into its slot on `install` (`table.set`) and
+/// nulling it on `uninstall`. So an installed unit is a funcref another instance's `call_indirect`
+/// reaches through the one shared table (`svm_wasm_jit::compile_module_b2`; the native differential is
+/// `crates/svm-wasm-jit/tests/b2_install.rs`). Emitted bytes are stashed exactly like
+/// [`svm_wasmjit_compile`] (read via [`svm_wasmjit_ptr`]/[`svm_wasmjit_len`]); `0` if the module is
+/// outside the emitter subset. `shared` matches the linked memory's shared flag as in
+/// [`svm_wasmjit_compile_full`].
+#[no_mangle]
+pub extern "C" fn svm_wasmjit_compile_b2(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    table_log2: u32,
+    shared: i32,
+) -> i32 {
+    let bytes: &[u8] = if mod_ptr.is_null() || mod_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) }
+    };
+    let Ok(m) = svm_encode::decode_module(bytes) else {
+        return 0;
+    };
+    match svm_wasm_jit::compile_module_b2(&m, shared != 0, table_log2) {
+        Ok(wasm) => {
+            // SAFETY: single-reader stash on the main thread, like the `svm_parse` accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm) };
+            // Keep the decoded module for `svm_wasmjit_init_window` (its data segments) + call_interp.
+            unsafe { *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m) };
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Pointer / length of the most recent [`svm_wasmjit_compile`] output (emitted wasm bytes).
 #[no_mangle]
 pub extern "C" fn svm_wasmjit_ptr() -> *const u8 {
