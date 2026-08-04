@@ -83,7 +83,11 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// concurrency ceiling. The residue's `generation`/`slot` fields are still stored *separately* as
 /// `uleb`, so the Section-2 byte layout is unchanged — but a fiber handle the guest held **packed** in
 /// its window across the freeze would decode to a different `(slot, generation)` under the new shift,
-/// so a v9 artifact is rejected rather than mis-resolved. v11 (§4 separate-module children): each
+/// so a v9 artifact is rejected rather than mis-resolved. (The generation field was later narrowed
+/// 40→32 bits, reserving the top byte for guest pointer-tagging — DESIGN.md §3c / INVARIANTS.md §11 —
+/// **without** a format bump: the residue generation is still a separate `uleb`, and every reachable
+/// generation is `< 2^32` (a recycle counter), so a packed handle that ever *resolved* decodes
+/// identically; only unreachable `≥ 2^32` generations, which never validated, would differ.) v11 (§4 separate-module children): each
 /// nested record gains a 32-byte **module digest** (a content hash of the child's granted module,
 /// emitted only for a separate-module child — one `uleb` `0` for a same-module child, else `1` + the
 /// 32 bytes), so the thaw resolves the child against the restore host's re-granted modules. One extra

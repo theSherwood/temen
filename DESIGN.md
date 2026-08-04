@@ -791,6 +791,61 @@ against the window before the host borrows it in place (§9's "arg bounds-check"
 - int↔funcref and int↔handle conversions allowed (plain-data-like) — use-site checks
   carry safety.
 
+### Uniform pointer tagging (`[tag:8][gen?][index]`)  [SETTLED — owner-approved 2026-08-04]
+
+A dynamic-language guest wants a **single tagged-value representation** across every
+pointer-like kind it manipulates. SVM makes that uniform by reserving the **top byte
+(bits 56–63) of every pointer-like value for the guest's tag** and never using it
+itself. Concretely, all four kinds share the layout `[tag:8][generation?][index]` —
+tag at a *fixed* offset, index at the bottom, an optional generation between:
+
+| Kind | carried width | generation | index/payload | tag cost |
+|---|---|---|---|---|
+| **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
+| **funcref** | i64 | — | function-table index | none — no generation; `call_indirect` masks `& (len-1)` |
+| **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `cap.call` truncates to `i32`, dropping the top byte |
+| **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
+
+Three properties make this coherent rather than four ad-hoc conventions:
+
+1. **Tag at a fixed offset.** The tag is always bits 56–63, so tag-extract is one op
+   (`>> 56`) regardless of kind — the *only* field at a fixed position. Generation and
+   index widths vary per kind (and *should* — 256 caps need 8 slot bits, fibers 24);
+   only the tag is fixed.
+2. **Index at the bottom ⇒ auto-stripped at use.** Every use site already masks the low
+   bits to recover the reference — `fref & (len-1)`, `slot(h) & (CAP-1)`, the window mask
+   on a pointer — so tag and generation above it are ignored at use with **no untag op**.
+   (This forces index-at-bottom: generation-at-bottom would let `& (len-1)` mask the
+   generation and break dispatch.)
+3. **Generation is *masked*, not just shifted.** With a tag now above the generation, a
+   resolve that did `gen = h >> shift` would drag the tag into the compare. Every backend
+   masks the generation field to its width (`FIBER_GEN_MASK`/`GEN_MASK`) so a top-byte tag
+   is inert — pinned by unit tests on both backends and the existing interp↔JIT fiber
+   differential (§9 / invariant 9).
+
+**Thread/vCPU handles are not a separate kind** — they share the fiber-handle namespace
+(the domain-wide `SharedFiberTable`, §23), so they inherit the fiber layout. **`type_id`s
+are excluded** — they are structural comparison tokens (D59), not table references, and
+carry no free top byte.
+
+**The errno channel constrains *where* you tag.** The capability ABI returns
+`handle | -errno` in a signed `i32` (§5, invariant 5); callers test the sign. So the raw
+handle stays **untagged at the ABI boundary** — a guest checks the sign of the `i32`
+result, then promotes the good handle into a 64-bit tagged cell where the tag (bits 56–63)
+sits clear of the `i32` sign bit (bit 31). Equivalently: the tag never rides on the value
+the runtime sign-tests. This is why tagged values are 64-bit cells, not tags stamped into
+a 32-bit `int fd` in place (which would shrink the cap generation 24→16 *and* collide with
+the sign convention).
+
+**Cost.** Runtime cost is zero — the masks are the same single AND the use sites already
+emit, and data pointers/funcrefs/cap handles need no change at all. The only behavioral
+change is the fiber-handle generation trim (40→32 bits), lowering fiber ABA resistance
+from ~1.1T to ~4.3B recycles of one slot — far beyond any real churn, and a generation
+wrap was never an escape anyway (a stale handle re-selects one of this domain's own
+current grants, re-checked by `type_id`, D37). The global commitment this bakes in —
+`generation + index ≤ 56 bits` on every kind (window ≤ 2^56 = 64 PiB) — is recorded as
+**INVARIANTS.md §11**.
+
 ---
 
 ## 3d. C ABI & frontend lowering (Phase 2)  [SETTLED]

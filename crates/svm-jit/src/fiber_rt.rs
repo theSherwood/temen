@@ -163,20 +163,51 @@ fn fiber_region_base(slot: usize) -> u64 {
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (recycling step 1). MUST match `svm_interp`'s `FIBER_GEN_SHIFT` — the handle namespace is
 /// cross-backend, so a frozen handle means the same on both. `MAX_FIBERS` bounds a slot to the low 24
-/// bits; the `i64` handle leaves 40 bits for the generation. A handle is
+/// bits; the `i64` handle is laid out `[tag:8][generation:32][slot:24]` (DESIGN.md §3c), leaving 32
+/// bits for the generation and reserving the top byte for a guest pointer-tag. A handle is
 /// `(generation << FIBER_GEN_SHIFT) | slot`; a fresh slot's generation is 0, so a non-recycled run's
 /// handle is exactly its slot (byte-identical to before and to the interp). Widened 16→24 once the
 /// arena removed the VMA wall (see `MAX_FIBERS`).
 const FIBER_GEN_SHIFT: u32 = 24;
 
-/// Encode a fiber guest handle from its registry `slot` and (40-bit-masked) `generation`.
+/// Encode a fiber guest handle from its registry `slot` and (32-bit-masked) `generation`; the top byte
+/// stays clear for a guest tag.
 fn fiber_handle(slot: usize, generation: u64) -> i64 {
     (((generation & FIBER_HANDLE_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
 
-/// The generation a guest fiber handle carries (its high bits above the slot).
+/// The generation a guest fiber handle carries, **masked** to [`FIBER_HANDLE_GEN_MASK`] so a guest tag
+/// in the top byte is ignored (mask, don't just shift).
 fn fiber_handle_generation(handle: i64) -> u64 {
-    (handle as u64) >> FIBER_GEN_SHIFT
+    ((handle as u64) >> FIBER_GEN_SHIFT) & FIBER_HANDLE_GEN_MASK
+}
+
+#[cfg(all(test, not(loom)))]
+mod fiber_handle_tag_tests {
+    use super::{fiber_handle, fiber_handle_generation};
+
+    // The `[tag:8][generation:32][slot:24]` layout (DESIGN.md §3c) must match the interp's: encoding
+    // leaves the top byte clear, and a guest tag stored there is ignored by the generation decode — so
+    // a tagged handle round-trips to the identical generation on this backend as on the interp.
+    #[test]
+    fn top_byte_is_free_and_ignored() {
+        let slot = 12_345usize;
+        let generation = 0x00AB_CDEFu64;
+        let bare = fiber_handle(slot, generation);
+        assert_eq!(
+            (bare as u64) >> 56,
+            0,
+            "encoding must leave the top byte clear"
+        );
+        for tag in [0x00u64, 0x01, 0x7F, 0x80, 0xFF] {
+            let tagged = ((tag << 56) | bare as u64) as i64;
+            assert_eq!(
+                fiber_handle_generation(tagged),
+                generation,
+                "tag {tag:#x} must not perturb the generation",
+            );
+        }
+    }
 }
 
 /// Read a context's shadow-SP word from the durable window. `mem_base` is the window's host base;
@@ -501,7 +532,9 @@ impl SharedFiberTable {
         let (_, slot) = self.resolve(handle)?;
         // Honor the generation ABA guard (recycling step 1/3): a stale handle whose slot has since
         // been recycled names no live fiber, so it gets no backtrace (mirrors `cont.resume`'s check).
-        if slot.own.generation() != fiber_handle_generation(handle) {
+        // Both sides masked to the handle's generation width, so a guest tag in the top byte is ignored
+        // (as `claim_gen` masks — DESIGN.md §3c "Uniform pointer tagging").
+        if (slot.own.generation() & FIBER_HANDLE_GEN_MASK) != fiber_handle_generation(handle) {
             return None;
         }
         if slot.running_on.load(Ordering::Acquire) != NOT_RUNNING {
