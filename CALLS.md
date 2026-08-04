@@ -601,27 +601,117 @@ plumbing that lands in increments (§8).
      Pin: `a_ref_func_offer_handler_animates_with_the_unit_remap` (handler `call_indirect`s its own
      helper through `ref.func`, called twice — the cache path; the first coverage that path ever
      had).
-   - **6b — provider-pays leaves.** Delete `ProviderState.fuel`, `PROVIDER_FUEL_RESERVE`, and the
-     `impl_fuel_remaining`/`set_impl_fuel_reserve` API (callers: one test); the host-side instanced
-     dispatch gets the **pure arm's flat deterministic `OFFER_FUEL` budget** (no reserve, no drain).
-     `provider_pays_from_a_drainable_reserve` flips to pin the new model; the `grant_impl_cap`
-     lock-order caveat dissolves with the blocking accessors.
-   - **6c — the two-lock discipline leaves.** The host-side instanced arm adopts the checkout shape
-     the animation proved: world checked out under a **brief** guard with the §10.1 `busy`
-     admission word, the nested `drive_arc` runs with **no provider guard held**, settle reopens.
-     A cyclic host-side call still answers `-EAGAIN` — but via the admission word, not a held
-     `try_lock`, so the held-locks deadlock argument (and the acyclicity rule) genuinely dies.
-     (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock` keeps its `-11` on this tier; the
-     eval-loop flip already happened in 4c.2.) After 6c, every nested `drive_arc` left in the tree
-     (pure arm + this narrowed arm) runs lock-free over its world — the sub-interpreter-under-locks
-     is gone even where the sub-run survives for eval-loop-less tiers.
-   - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list, each explicit):
-     durable-caller animation (a DURABILITY.md-scoped slice; unpinned today); tier-native offer
-     arms (extend the 5c JIT crossing machinery from `LiveImpl` to instanced offers; a bytecode
-     fold-or-probe) — these are what let the narrowed host-side arm retire entirely; and the
-     `Offer`/`LiveImpl` **binding merge** with `ProviderState` folding onto the 5c shared-cell
-     shape (`Arc<Mutex<Host>>` + window — a library instance becomes structurally a granted
-     child's powerbox), which is where "`ProviderState` + its mutex" finally leaves §7's list.
+   - **6b — provider-pays leaves. DONE (2026-08-04).** `ProviderState.fuel`,
+     `PROVIDER_FUEL_RESERVE`, and the `impl_fuel_remaining`/`set_impl_fuel_reserve` API are
+     deleted; the host-side instanced dispatch runs on the **pure arm's flat deterministic
+     `OFFER_FUEL` budget** (no reserve, no dry-check, no drain — a service serves indefinitely,
+     each call identically priced; a runaway handler still traps `OutOfFuel` at the flat cap).
+     `provider_pays_from_a_drainable_reserve` flipped to
+     `an_instanced_offer_runs_on_a_flat_deterministic_budget`; `grant_impl_cap` is now the one
+     blocking `state.lock()` accessor (its caveat narrowed accordingly — it dissolves with the 6d
+     binding merge).
+   - **6c — the two-lock discipline leaves. DONE (2026-08-04).** The host-side instanced arm
+     adopts the checkout shape the animation proved: the world is checked out under a **brief**
+     guard with the §10.1 `busy` admission word, the nested `drive_arc` runs with **no provider
+     guard held** (world carried on locals), and a single check-in restores the world + reopens the
+     instance on every exit — trap or success alike (an un-restored trap would strand the instance
+     `busy` with an empty world). A cyclic host-side call still answers `-EAGAIN`, but via the
+     admission word, not a held `try_lock`, so the held-locks deadlock argument (and the acyclicity
+     rule) genuinely dies. **As built, one subtlety surfaced that the map missed:** releasing the
+     host-side lock makes a foreign `busy` holder *park-observable* to an eval-loop caller for the
+     first time — pre-6c, cross-run contention always saw a **held** `try_lock` (`WouldBlock →
+     -EAGAIN`), so a 4c.1 admission-park only ever happened *within one run* (a peer vCPU the
+     holder's own scheduler will `admit_wake`). A naive busy-word release would let a cyclic
+     host-side self-call **park** in the nested `drive_arc`'s scheduler (its `offer_anim` is empty,
+     so the 4c.2 self-detect misses) and hang — the outer arm can't clear `busy` until that nested
+     run returns. Fix: an **owning-run token** — `ProviderState.busy_owner` records the holder's
+     scheduler identity (`SchedRef::run_id`, the `Arc` address; `0` for this host-side tier). A
+     caller may only *park* on a busy instance owned by **its own run**; a foreign owner (`0`, or
+     another run sharing the instance via regrant) answers a probeable `-EAGAIN`. Inert on the
+     pre-6c behavior (no cross-run park existed) and exactly the `-11` the held lock gave — no
+     waker, no `drive_arc` run-wiring. (`a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock`
+     keeps its `-11` on this tier; the cap-translation quartet and `imports_impl` — three backends
+     — exercise the new checkout/check-in edges; the eval-loop flip already happened in 4c.2.)
+     After 6c, every nested `drive_arc` left in the tree (pure arm + this narrowed arm) runs
+     lock-free over its world — the sub-interpreter-under-locks is gone even where the sub-run
+     survives for eval-loop-less tiers.
+   - **6d — recorded residues** (the gap between §8.6 and §7's full deletion list). These are not
+     quick slices — each is a sizable mini-increment closing one decliner or deleting one structure,
+     and every one is sensitive TCB (the confinement/durability path, the JIT crossing, or the
+     binding split). Decomposed and ordered smallest/most-independent first:
+     - **6d.1 — durable-caller animation.** Close the D1 decliner: a durable caller currently skips
+       the eval-loop probe (`if durable { None }`) and takes the host-side `drive_arc`, because the
+       animation switch-in deliberately omits `shadow_switch` (it runs the handler over the
+       *provider's* window while the caller's per-context shadow-SP bookkeeping lives in the
+       *caller's* window). Animating a durable caller means threading the durable shadow-SP
+       save/restore across the switch-in and the settle (the `serve_switch` durable choreography,
+       adapted to the cross-*window* offer case) — a DURABILITY.md-scoped slice. **Unpinned today**,
+       so it lands with its first pin (a durable caller invoking an instanced offer, differentially
+       identical to the host-side path). Interp-only; deletes nothing structural, but removes the
+       last reason the eval loop ever falls to the host-side arm for an instanced offer.
+     - **6d.2 — tier-native JIT offer arm.** A JIT `cap.call` to an offer currently falls through
+       `cap_thunk` to `host.cap_dispatch_slots` (the 6c-narrowed host-side arm, an interp
+       `drive_arc` sub-run); this slice runs the offer handler natively (`define_extra` compiles the
+       offer unit into the run's `CompiledModule`, cached; `invoke_extra` runs its trampoline) so
+       the interp sub-run retires for the JIT tier. The offer is *not* the 5c child crossing — a
+       passive offer has no thread/serve loop; it animates on the caller's thread, closer to
+       `serve_native`'s `invoke_extra` than to `live_impl_call`. **Confinement finding (the hinge):**
+       `invoke_extra` masks with the module's `live_fault_range` — the *in-flight run's* window
+       bounds — while `mem_base` is a separate arg. So it can only run code over the run's **own**
+       window. A **pure** offer is windowless (no masked access, any `mem_base`/range is inert); an
+       **instanced** offer runs over the **provider's** window, whose bounds differ from the run's,
+       so running its unit natively needs a way to invoke over a *foreign* window with **that
+       window's** fault range — new confinement-masking plumbing, the security hinge (AGENTS.md; its
+       own fuzz obligation). Split accordingly:
+       - **6d.2a — no-memory pure-offer native arm (masking-safe scaffolding).** A new
+         `offer_call` probe in `cap_thunk` (analogous to `live_impl_call`) resolves the handle to a
+         `Binding::Offer`; it handles natively **only** a pure offer (`state=None`) whose unit
+         **declares no memory** (and no threads/futex/fibers), else returns `None` to fall through
+         to `cap_dispatch_slots` unchanged. No memory decl ⇒ the lowering emits **zero masked
+         accesses** ⇒ the baked mask (`reserved−1`) and the fault range are never consulted, so the
+         `mem_base` is inert and the native run is masking-safe over any base. Mechanism:
+         `define_extra(entry.funcs)` into the run's `CompiledModule`, cached per `(domain, unit)` by
+         `Arc::as_ptr`; `invoke_extra` the op's handler trampoline; `cap` slots translated at the
+         two edges against an ephemeral `Host` (the interp pure arm's shape). **Fuel wrinkle (must
+         resolve first):** the interp pure arm runs under a flat `OFFER_FUEL` (`drive_arc`), but
+         `invoke_extra` shares the run's fuel counter (caller-pays) — so native parity needs a
+         scoped `OFFER_FUEL` budget around the invoke (save/set/restore the counter, or a
+         fuel-bearing invoke variant), or a looping pure offer would trap `OutOfFuel` at a different
+         point than the interp. Differential-pinned (a no-memory pure offer, result **and** fuel
+         parity, three backends). Retires only the pure/no-memory branch of the host-side arm.
+       - **6d.2b — instanced-offer native arm over the provider window (the masking hinge).** Three
+         sensitive sub-problems: **(A) foreign-window invoke** — a new
+         `invoke_extra_window(cm, code, args, results, win_base, win_lo, win_hi, trap_out)` that
+         masks/attributes to an **explicit** provider window instead of `self.live_fault_range`, so
+         a masking-bug escape lands in the provider window's guard range (caught + unwound), never a
+         crash; **(B) the baked-mask/reservation-match invariant** — the offer unit is compiled with
+         the run's reservation `R` (baked mask `R−1`), so the provider window **must** be a
+         reservation of size `R` or the arm **fails closed** (falls through) — a smaller provider
+         window would let a masked access in `[prov_size, R)` hit its unmapped tail; this invariant
+         is the whole confinement argument; **(C) window bridging** — `ProviderState.mem` is an
+         interp `Mem`, a different representation from the JIT `GuestWindow`, so its underlying
+         `svm-mem` reservation base/total must be exposed and asserted `== R` (both wrap `svm-mem`,
+         so the raw reservation is compatible; `mem=None` degenerates to the 6d.2a inert case). Plus
+         the 6c `busy` checkout (already on `ProviderState`), flat `OFFER_FUEL` (the 6d.2a wrinkle),
+         and `cap` translation across the provider `Host`. **Mandatory masking-fuzz obligation**
+         (AGENTS.md — the security hinge gets its own fuzz unit): a target that fuzzes access
+         patterns in an offer unit run over a provider window of reservation `R` and asserts every
+         access stays in `[0, R)` / faults into the provider guard, never the caller's window. Only
+         once 6d.2a **and** 6d.2b land does the JIT's host-side/`-EINVAL` fall-through for offers
+         leave §7's list. **Open question for the owner:** whether native offer animation earns this
+         hinge plumbing + fuzz target, given the host-side arm is correct and no benchmark yet
+         motivates it — 6d.2a is cheap but narrow; 6d.2b is the valuable, sensitive half.
+     - **6d.3 — bytecode offer arm (fold-or-probe).** Bytecode declines offer ops to the tree-walk
+       today, so instanced offers already run correctly via that fallback — this slice is the
+       optional native arm (avoid the per-module fallback), lowest value, sequenced last of the
+       tier work. May be folded into 6d.2 or skipped with a recorded note.
+     - **6d.4 — the `Offer`/`LiveImpl` binding merge.** The endgame: fold `ProviderState`
+       (`{mem, host, busy, admit_parked, busy_owner}`) onto the 5c shared-cell shape
+       (`Arc<Mutex<Host>>` + window) so a library instance is structurally a granted child's
+       powerbox, and unify `Binding::Offer`/`Binding::LiveImpl`. This is where "`ProviderState` +
+       its mutex" and "the `GuestImpl`/`LiveImpl` binding split" finally leave §7's list. Deepest
+       and most invasive (touches every state access + the binding dispatch); gated on 6d.2 so both
+       tiers share one crossing before the shapes merge.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.

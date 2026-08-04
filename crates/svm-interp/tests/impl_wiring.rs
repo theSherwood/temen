@@ -689,34 +689,25 @@ fn a_wrap_holds_and_forwards_a_real_capability() {
 }
 
 #[test]
-fn provider_pays_from_a_drainable_reserve() {
-    // §5.3 (resolved): the provider funds its own dispatch compute. The wirer prices the
-    // service; a dry reserve makes further calls an inert CapFault the caller can probe,
-    // and the wirer reads the meter.
+fn an_instanced_offer_runs_on_a_flat_deterministic_budget() {
+    // CALLS.md 6b — provider-pays is retired: there is no drainable reserve, no meter, no dry
+    // spell. Every host-side dispatch runs on the same flat deterministic per-call budget the
+    // pure arm always had, so a service keeps serving indefinitely (the eval-loop tier is
+    // caller-pays since 5b; a runaway handler still traps OutOfFuel at the flat cap, bounding
+    // each call identically on every backend).
     let provider = counter_provider();
     let mut h = Host::new();
     let offer = h.wire_offer_proc(&provider, &[0]).expect("offer");
     let tid = h.resolve_offer(offer).unwrap().type_id;
 
-    let full = h
-        .impl_fuel_remaining(offer)
-        .expect("instanced offers meter");
-    assert_eq!(h.cap_dispatch_slots(tid, 0, offer, &[], None), Ok(vec![1]));
-    let after = h.impl_fuel_remaining(offer).unwrap();
-    assert!(after < full, "the call drained what it used");
-
-    // Clamp the reserve below one call's cost: the next dispatch fails closed and drains
-    // the remainder; the one after that is refused outright on the empty reserve.
-    h.set_impl_fuel_reserve(offer, 3).expect("wirer prices it");
-    assert!(h.cap_dispatch_slots(tid, 0, offer, &[], None).is_err());
-    assert!(h.cap_dispatch_slots(tid, 0, offer, &[], None).is_err());
-    // Top-up restores service — and the counter state survived the dry spell.
-    h.set_impl_fuel_reserve(offer, 1 << 20).expect("top-up");
-    assert_eq!(h.cap_dispatch_slots(tid, 0, offer, &[], None), Ok(vec![2]));
-
-    // Pure offers have no reserve to meter.
-    let pure = h.wire_offer_func(&offer_funcs(), &[0]).expect("pure");
-    assert!(h.impl_fuel_remaining(pure).is_none());
+    // No reserve to drain: many calls, all identically priced, instance state accumulating.
+    for i in 1..=8i64 {
+        assert_eq!(
+            h.cap_dispatch_slots(tid, 0, offer, &[], None),
+            Ok(vec![i]),
+            "call {i} served on the flat budget — nothing drained, nothing to top up"
+        );
+    }
 }
 
 #[test]
@@ -745,11 +736,16 @@ fn grant_impl_cap_accepts_offers_and_refuses_pure_targets() {
 
 #[test]
 fn a_cyclic_offer_call_is_a_probeable_eagain_not_a_deadlock() {
-    // The structural deadlock-freedom the try-enter admission buys (CALLS.md increment 2),
-    // pinned end to end: a provider granted ITS OWN offer calls it from inside its handler.
-    // The nested dispatch finds the instance busy (the outer call holds it) and answers a
-    // probeable `-EAGAIN` — under the old blocking lock this exact shape was the deadlock the
-    // acyclicity rule existed to forbid. The handler returns the errno; the caller observes it.
+    // The structural deadlock-freedom the admission word buys, pinned end to end: a provider
+    // granted ITS OWN offer calls it from inside its handler. The nested dispatch finds the
+    // instance busy (the outer call holds it) and answers a probeable `-EAGAIN` — under the old
+    // blocking lock this exact shape was the deadlock the acyclicity rule existed to forbid. The
+    // handler returns the errno; the caller observes it.
+    //
+    // CALLS.md 6c — the outer host-side call now checks the instance out under a *brief* guard
+    // (the §10.1 `busy` word) and releases the state lock across its `drive_arc`; the nested
+    // self-call re-acquires the free mutex, reads `busy` with a foreign `busy_owner` (this tier's
+    // `0`), and `-EAGAIN`s — the same `-11`, but via the admission word, not a held `try_lock`.
     let provider = svm_text::parse_module(
         "memory 16\n\
          data 0 \"me\"\n\
