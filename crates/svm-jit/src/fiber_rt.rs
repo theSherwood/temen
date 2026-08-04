@@ -194,7 +194,11 @@ mod fiber_handle_tag_tests {
         let slot = 12_345usize;
         let generation = 0x00AB_CDEFu64;
         let bare = fiber_handle(slot, generation);
-        assert_eq!((bare as u64) >> 56, 0, "encoding must leave the top byte clear");
+        assert_eq!(
+            (bare as u64) >> 56,
+            0,
+            "encoding must leave the top byte clear"
+        );
         for tag in [0x00u64, 0x01, 0x7F, 0x80, 0xFF] {
             let tagged = ((tag << 56) | bare as u64) as i64;
             assert_eq!(
