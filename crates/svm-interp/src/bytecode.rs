@@ -4189,6 +4189,11 @@ fn debug_advance_fiber(
     // active continuation — set by a `resume` under `coro_step_into` — drive *that child* one op over
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
     // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
+    // Stepping *inside* a §22 `Jit.invoke`d unit (single-vCPU step-into): drive it one op over the
+    // caller's shared window/table (the §22 counterpart of `active_coro`), so a breakpoint fires inside.
+    if vt.active_invoke.is_some() {
+        return step_active_invoke(vt, source, table, fuel, mem, host);
+    }
     if vt.active_coro.is_some() {
         return step_active_coro(vt, source, fuel);
     }
@@ -4418,12 +4423,22 @@ fn debug_advance_fiber(
             dst,
             params,
             results,
-        }) => match dbg_jit_invoke(
-            vt, host, source, table, fuel, mem, h, code, &argv, dst, &params, &results,
-        ) {
-            Ok(()) => FiberStep::Stepped,
-            Err(t) => FiberStep::Trapped(t),
-        },
+        }) => {
+            // Single-vCPU `DebugRun` (`invoke_step_into`) steps *into* the invoked unit; the scheduled
+            // engine keeps it an opaque leaf. Either way it starts here — the step-into arm arms
+            // `active_invoke` and the next advance steps the unit's first op.
+            let r = if vt.invoke_step_into {
+                dbg_jit_invoke_step_into(vt, host, source, h, code, &argv, dst, &params, &results)
+            } else {
+                dbg_jit_invoke_leaf(
+                    vt, host, source, table, fuel, mem, h, code, &argv, dst, &params, &results,
+                )
+            };
+            match r {
+                Ok(()) => FiberStep::Stepped,
+                Err(t) => FiberStep::Trapped(t),
+            }
+        }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
         // dispatches its subset).
@@ -4656,7 +4671,7 @@ fn apply_due_writes(
                 width,
                 ..
             } => {
-                if vt.active_coro.is_none() {
+                if vt.active_coro.is_none() && vt.active_invoke.is_none() {
                     let target = FrameReader {
                         vm: &vt.active,
                         source,
@@ -4940,7 +4955,8 @@ impl DebugRun {
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?; // coro_step_into on by default
+        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?; // coro_step_into on by default
+        vt.invoke_step_into = true; // single-vCPU engine steps *into* §22 Jit.invoke (scheduled = leaf)
         let Domain { source, table } = dom;
         Some(DebugRun {
             source,
@@ -5041,6 +5057,11 @@ impl DebugRun {
         self.done.is_none()
             && self.host.checkpoint_safe()
             && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
+            // Reverse-replay *across* a §22 `Jit.invoke` step-into is out-of-subset (CONSOLIDATION.md
+            // §11 debug boundary): the invoked unit's transient `Vm` + its `source.push`ed module aren't
+            // captured here, so a checkpoint mid-invoke can't be restored. A reverse-seek near an invoke
+            // replays from an earlier checkpoint, which re-enters the invoke deterministically.
+            && self.vt.active_invoke.is_none()
             && !self
                 .fibers
                 .iter()
@@ -5404,9 +5425,12 @@ impl DebugRun {
             // parent depth) runs the child to completion, and step-out of the child body lands back in
             // the parent — while stepping *within* the child compares child-local frames as usual.
             let (cur_vm, _) = vt.debug_active();
-            let depth = match vt.active_coro {
-                Some((_, _, pd)) => pd + cur_vm.stack.len() + 1,
-                None => cur_vm.stack.len() + 1,
+            // Cumulative across a coroutine *or* §22-invoke boundary: the child's frames sit above the
+            // parent's resume/invoke frame (`parent_depth + child stack`).
+            let depth = match (&vt.active_invoke, vt.active_coro) {
+                (Some(iv), _) => iv.parent_depth + cur_vm.stack.len() + 1,
+                (None, Some((_, _, pd))) => pd + cur_vm.stack.len() + 1,
+                (None, None) => cur_vm.stack.len() + 1,
             };
             if max_depth.is_none_or(|m| depth <= m) {
                 if let Some(pc) = cur_vm.cur_ir_pc(source) {
@@ -5455,9 +5479,10 @@ impl DebugRun {
     /// when the parent itself is running.
     fn step_depth(&self) -> usize {
         let d = self.reader().depth();
-        match self.vt.active_coro {
-            Some((_, _, pd)) => pd + d,
-            None => d,
+        match (&self.vt.active_invoke, self.vt.active_coro) {
+            (Some(iv), _) => iv.parent_depth + d,
+            (None, Some((_, _, pd))) => pd + d,
+            (None, None) => d,
         }
     }
 
@@ -6379,15 +6404,47 @@ fn dbg_jit_uninstall(
     Ok(())
 }
 
-/// §22 `Jit.invoke` (op 1) under the debug engine: resolve + compile the unit (as for install), then
-/// run it **to completion as a seam-free leaf** over the shared `(source, table)` — its `call_indirect`
-/// reaches installed units, and a spawn/park/re-install inside it is an inert `CapFault`, exactly as
-/// the production `drive`'s `JitInvoke` arm and the tree-walker's `run_invoke`. The invoked unit runs
-/// atomically (no step-into: the debug seam does not fire inside it — stepping *over* `Jit.invoke`
-/// executes the whole unit), matching production semantics. Results marshal to `dst…` through the
-/// i64-slot ABI. Serviced inline in [`debug_advance_fiber`].
+/// Shared prep for §22 `Jit.invoke` on the debug engine (the leaf and step-into paths both use it):
+/// resolve authority + the unit's funcs from the host (forged/cross-domain → `CapFault`), compile the
+/// unit (out-of-coverage → `Malformed`), arity-check its entry (func 0) against the call's
+/// (code-stripped) signature (`CapFault` on mismatch), and marshal the args through the i64-slot ABI.
+/// Returns the compiled unit + its entry args; the caller pushes it to `source` and runs/steps it.
+fn dbg_jit_invoke_unit(
+    host: &mut Host,
+    h: i32,
+    code: i32,
+    argv: &[i64],
+    params: &[ValType],
+    results: &[ValType],
+) -> Result<(Compiled, Vec<Value>), Trap> {
+    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
+        let (cd, cu) = host.resolve_jit_code(code)?;
+        if cd != domain {
+            return Err(Trap::CapFault);
+        }
+        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
+    })?;
+    let unit = compile_module(&funcs).ok_or(Trap::Malformed)?;
+    let arity_ok = unit
+        .sigs
+        .first()
+        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+    if !arity_ok {
+        return Err(Trap::CapFault);
+    }
+    let child_args: Vec<Value> = params
+        .iter()
+        .zip(argv.iter())
+        .map(|(ty, s)| slot_to_val(*ty, *s))
+        .collect();
+    Ok((unit, child_args))
+}
+
+/// §22 `Jit.invoke` (op 1) **as a seam-free leaf** — run the invoked unit to completion over the shared
+/// `(source, table)` and marshal its returns to `dst…`. Used on the `ScheduledDebugRun` (invoke stays
+/// opaque there, as coroutines do) and as production `run_invoke` does. Serviced in [`debug_advance_fiber`].
 #[allow(clippy::too_many_arguments)]
-fn dbg_jit_invoke(
+fn dbg_jit_invoke_leaf(
     vt: &mut VTask,
     host: &mut Host,
     source: &ModuleSource,
@@ -6401,27 +6458,7 @@ fn dbg_jit_invoke(
     params: &[ValType],
     results: &[ValType],
 ) -> Result<(), Trap> {
-    let funcs = host.resolve_jit_domain(h).and_then(|domain| {
-        let (cd, cu) = host.resolve_jit_code(code)?;
-        if cd != domain {
-            return Err(Trap::CapFault);
-        }
-        host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
-    })?;
-    let unit = compile_module(&funcs).ok_or(Trap::Malformed)?;
-    // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
-    let arity_ok = unit
-        .sigs
-        .first()
-        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-    if !arity_ok {
-        return Err(Trap::CapFault);
-    }
-    let child_args: Vec<Value> = params
-        .iter()
-        .zip(argv.iter())
-        .map(|(ty, s)| slot_to_val(*ty, *s))
-        .collect();
+    let (unit, child_args) = dbg_jit_invoke_unit(host, h, code, argv, params, results)?;
     let umod = source.push(unit);
     let vals = run_invoke(
         source,
@@ -6437,6 +6474,88 @@ fn dbg_jit_invoke(
         vt.active.set(dst + i as u32, Reg::from_value(re));
     }
     Ok(())
+}
+
+/// §22 `Jit.invoke` (op 1) **as a step-into** (single-vCPU `DebugRun`): compile + push the unit, then
+/// arm [`VTask::active_invoke`] so [`debug_advance_fiber`] steps the invoked unit op-by-op (breakpoints
+/// fire inside it) instead of running it opaquely — the §22 counterpart of coroutine step-into. The
+/// unit runs over the caller's shared window/table; `dst`/`results` marshal its returns back to the
+/// caller on completion ([`step_active_invoke`]). `Err` traps the caller (forged handle / bad unit).
+#[allow(clippy::too_many_arguments)]
+fn dbg_jit_invoke_step_into(
+    vt: &mut VTask,
+    host: &mut Host,
+    source: &ModuleSource,
+    h: i32,
+    code: i32,
+    argv: &[i64],
+    dst: u32,
+    params: &[ValType],
+    results: &[ValType],
+) -> Result<(), Trap> {
+    let (unit, child_args) = dbg_jit_invoke_unit(host, h, code, argv, params, results)?;
+    let umod = source.push(unit);
+    let cm = source.get(umod).ok_or(Trap::Malformed)?;
+    let mut vm = Vm::new(&cm, 0, &child_args)?;
+    vm.module = umod;
+    let parent_depth = vt.active.stack.len() + 1;
+    vt.active_invoke = Some(Box::new(InvokeStep {
+        vm,
+        dst,
+        results: results.into(),
+        parent_depth,
+    }));
+    Ok(())
+}
+
+/// Advance the **active §22 invoked unit** (`vt.active_invoke`) by exactly one op — the op-by-op,
+/// debugger-facing counterpart of [`run_invoke`]'s loop. The unit runs over the caller's shared
+/// `mem`/`host`/`source`/`table` (a seam-free leaf), so its `call_indirect` reaches installed units and
+/// any spawn/park/yield/re-invoke is an inert `CapFault` — exactly `run_invoke`'s `_ => CapFault`, only
+/// surfaced one op at a time so a breakpoint can fire inside the unit. On the unit's return the caller's
+/// `dst…` slots are filled through the i64-slot ABI and control returns to the caller.
+fn step_active_invoke(
+    vt: &mut VTask,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+) -> FiberStep {
+    enum InvStep {
+        Ran,
+        Done(Vec<Value>),
+        Trap(Trap),
+    }
+    let step = {
+        let iv = vt.active_invoke.as_mut().expect("active invoke present");
+        match iv
+            .vm
+            .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
+        {
+            Ok(Outcome::Suspended) => InvStep::Ran, // budget boundary — one op done, keep stepping
+            Ok(Outcome::Done(vals)) => InvStep::Done(vals),
+            // A seam op (spawn/park/yield/cont.*/re-invoke) inside an invoked unit is an inert CapFault,
+            // matching run_invoke's `_ => CapFault`. Host cap.calls complete inline (never surface here).
+            Ok(_) => InvStep::Trap(Trap::CapFault),
+            Err(t) => InvStep::Trap(t),
+        }
+    };
+    match step {
+        InvStep::Ran => FiberStep::Stepped,
+        InvStep::Done(vals) => {
+            let iv = vt.active_invoke.take().expect("active invoke present");
+            for (i, (v, ty)) in vals.iter().zip(iv.results.iter()).enumerate() {
+                let re = slot_to_val(*ty, val_to_slot(*v));
+                vt.active.set(iv.dst + i as u32, Reg::from_value(re));
+            }
+            FiberStep::Stepped
+        }
+        InvStep::Trap(t) => {
+            vt.active_invoke = None;
+            FiberStep::Trapped(t)
+        }
+    }
 }
 
 /// `memory.wait`: park the caller on futex key `base` until a `notify` or the deadline, unless the
@@ -7344,6 +7463,8 @@ impl ScheduledDebugRun {
                         root_shadow_sp: ts.root_shadow_sp,
                         coro_step_into: true,
                         active_coro: ts.active_coro,
+                        active_invoke: None, // scheduled engine keeps invoke a leaf (never steps in)
+                        invoke_step_into: false,
                     },
                     threads: ts.threads.clone(),
                     env: ts.env,
@@ -7871,6 +7992,33 @@ struct VTask {
     /// Coroutine children hold no `Instantiator`, so they never nest — one level suffices. `None` when
     /// the parent itself is running. Reconstructed deterministically on a reverse-`seek` replay.
     active_coro: Option<(usize, u32, usize)>,
+    /// Step-into of a §22 `Jit.invoke`d unit (single-vCPU [`DebugRun`] only, gated on `coro_step_into`;
+    /// the scheduled engine keeps invoke an opaque leaf, as it does coroutines). `None` when not stepping
+    /// inside an invoke. Mutually exclusive with `active_coro` — an invoked unit is seam-free (a coroutine
+    /// child holds no `Jit` cap, and a `cont.*`/`spawn` inside an invoked unit `CapFault`s).
+    active_invoke: Option<Box<InvokeStep>>,
+    /// Step *into* a §22 `Jit.invoke`d unit rather than running it as an opaque leaf. Set **only** on the
+    /// single-vCPU [`DebugRun`] (where step-into semantics live); `false` on every scheduled task, so the
+    /// [`ScheduledDebugRun`] keeps invoke a leaf and never arms `active_invoke` — the scheduled pinning /
+    /// snapshot paths therefore need no invoke handling. Read only by [`debug_advance_fiber`]'s JitInvoke
+    /// arm; production ignores it.
+    invoke_step_into: bool,
+}
+
+/// While the single-vCPU [`DebugRun`] steps *inside* a §22 `Jit.invoke`d unit, the active continuation
+/// is the invoked unit's [`Vm`], not [`VTask::active`]. Unlike a coroutine child (a confined domain with
+/// its own `mem`/`host`/`table`), an invoked unit is a **seam-free leaf over the caller's** window /
+/// powerbox / dispatch table, so only its `Vm` is held here — the reader resolves its frames against the
+/// session `mem`/`source`/`table` (module ≥ 1 for its own funcs, dispatching installed units through the
+/// shared table like the production `run_invoke`). On completion the unit's returns marshal into the
+/// caller's `dst` slots through the i64-slot ABI; `parent_depth` is the caller's call depth at the
+/// invoke, so the stepping predicate sees a *cumulative* depth across the boundary (step-over of the
+/// `invoke` runs the unit to completion), exactly like [`VTask::active_coro`].
+struct InvokeStep {
+    vm: Vm,
+    dst: u32,
+    results: Box<[ValType]>,
+    parent_depth: usize,
 }
 
 impl VTask {
@@ -7883,6 +8031,8 @@ impl VTask {
             root_shadow_sp: super::SHADOW_BASE,
             coro_step_into: true,
             active_coro: None,
+            active_invoke: None,
+            invoke_step_into: false, // DebugRun::new_with_host flips this on for the single-vCPU engine
         })
     }
 
@@ -7890,6 +8040,14 @@ impl VTask {
     /// (during **step-into**, over its own confined `mem`) or, normally, `active`. The backtrace,
     /// breakpoint scan, and value/variable reads all resolve against this.
     fn debug_active(&self) -> (&Vm, Option<&Coro>) {
+        // A §22 invoked unit shares the caller's window/table (no confined `Coro`), so it surfaces as
+        // `(its Vm, None)` — the reader resolves its frames against the session `mem`/`source`. Its
+        // module-≥1 SSA metadata is not plumbed (value reads there resolve to `None`, like an installed
+        // unit's frame), but its `IrPc`s — hence breakpoints, stepping, and backtrace — resolve via
+        // `source`, so they are correct. Mutually exclusive with `active_coro`.
+        if let Some(iv) = &self.active_invoke {
+            return (&iv.vm, None);
+        }
         match self.active_coro {
             Some((ch, _, _)) => {
                 let c = self.coroutines[ch]
@@ -8005,6 +8163,8 @@ fn freeze_drive(
             root_shadow_sp: root_sp,
             coro_step_into: false,
             active_coro: None,
+            active_invoke: None,
+            invoke_step_into: false,
         };
         match step_vcpu(&mut sub, fibers, fiber_sp, fiber_meta, dom, ctx, budget)? {
             VcpuStop::Done(_) => {}
