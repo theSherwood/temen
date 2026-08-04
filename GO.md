@@ -49,6 +49,15 @@ repo convention.
   runtime), a per-`cont.new` control-stack-size knob for goroutine-scale fiber counts
   (today a host constant, 256 KiB/fiber), and the setjmp×fibers JIT decline
   (avoidable — TinyGo doesn't need setjmp).
+- **Route D — multi-threaded self-hosting Go (§6, added 2026-08-04):** a direct
+  **Go-SSA → svm-ir backend** (a pure-Go compiler; TinyGo's LLVM dependency is
+  exactly what blocks self-hosting it, so the backend replaces LLVM rather than
+  feeding it) + the Route B2 runtime. Because the compiler is pure Go with no cgo,
+  self-hosting is then *by construction*: whatever the backend can compile includes
+  the backend. **Order: the largest language project in the tree so far — roughly
+  3–5× the svm-leng effort** (backend ≈ months of slices, the go/types+go/ssa
+  stdlib tail is the long pole), with the gc-via-wasm lane (§6.5) closing a
+  toolchain-on-svm loop early for near-zero compiler work.
 
 ## 1. What Go needs, and what SVM answers
 
@@ -213,7 +222,173 @@ not gc semantics. Two practical consequences:
   and runtime bugs trap the domain; blocking host calls take async-form capabilities
   so STW never stalls on a parked syscall (`GC.md` §5).
 
-## 6. Non-goals
+## 6. Route D — multi-threaded self-hosting: a direct Go→svm-ir backend
+
+Added 2026-08-04, answering the follow-up: *what would it take to run Go
+multi-threaded and self-host it — a TinyGo-style backend that targets svm-ir, with
+the compiler itself compiled to svm-ir?* "Self-hosting" here follows SELFHOST_C.md
+§1: **the toolchain runs on the platform it targets**, with the true
+compiler-compiles-itself fixpoint kept as the conformance differential — the
+chibicc pattern, which reached per-TU byte-identity fixpoint 2026-07-30.
+
+### 6.0 The crux: LLVM is the self-host blocker, so the backend must replace it
+
+TinyGo as-is cannot self-host on SVM: it links **libLLVM** (a multi-million-line
+C++ dependency with pervasive TLS, threads, and EH) for its mid-end and codegen.
+On-ramping libLLVM as a guest is a mega-project an order beyond Postgres, for no
+architectural payoff — and this tree has already walked away from libLLVM once
+(`svm-llvm` §8 Q1b dropped the link in favor of an in-house `.ll` reader).
+
+The move that dissolves the blocker: a backend that consumes **Go SSA**
+(`go/parser` + `go/types` + `golang.org/x/tools/go/ssa` — all pure Go, no cgo) and
+emits **svm-ir directly**, plus the Route B runtime as ordinary Go+intrinsics
+code. Call it `svmgo`. Whether it lives as a TinyGo fork with the LLVM emission
+layer swapped out (inheriting TinyGo's map/interface/runtime lowering designs) or
+as a fresh compiler reusing those designs is an implementation choice, not a
+strategic one — either way the resulting compiler is **pure Go**, and pure Go is
+exactly what the backend compiles. Self-hosting stops being a separate project and
+becomes a corollary: *the compiler is a member of its own input language subset.*
+
+The IR fit is the favorable kind (`DESIGN.md` §20a's table applies verbatim):
+go/ssa is typed SSA with φ-nodes → block params, svm-ir takes irreducible CFGs,
+multi-value returns (Go's bread and butter), and true tail calls natively. This is
+the svm-llvm situation — "we already have SSA" — not the svm-wasm reconstruction
+one. Like every frontend, `svmgo` sits outside the escape-TCB (§2a): the verifier
+re-checks its output; a compiler bug is a clean error, never an escape.
+
+### 6.1 What the backend must lower (the real size of the work)
+
+| Go construct | Lowering | Calibration |
+|---|---|---|
+| Scalars, structs, arrays, pointers | Window offsets + masking, §3d SysV-pinned layout | The chibicc/svm-leng model, proven twice |
+| Slices, strings, maps | Fat pointers / runtime hash table in guest Go (TinyGo's designs) | Runtime code, not backend code |
+| Interfaces, type switches, type assertions | Interned type-descriptor + itable; **structural interning per Invariant 10** | Same shape as TYPESCRIPT.md §4's descriptors |
+| Closures, `defer`, `panic`/`recover` | Env structs; per-frame defer chains; unwind via the error-flag pattern (nimony's proven shape) or `SetJmp`/`LongJmp` — **flag preferred** (avoids the setjmp×fibers JIT decline, §4.4) | nimony exceptions landed as one slice |
+| `go` / channels / `select` / `sync` | Fibers + guest scheduler + futex — the Route B2 runtime | `steal_fibers` is the template |
+| Generics | go/ssa instantiation (monomorphize) | Handled upstream of the backend |
+| Reflection | Partial, TinyGo-style: type metadata emitted per program, `reflect` over it | The long tail; `fmt` needs a working core |
+| GC | Conservative non-moving mark-sweep over `gc.roots` + window heap | GC.md's contract, JACL-proven shape |
+| Goroutine-local (`g`) | Data-stack-base derivation + `vcpu.tls` for per-P state (§4.3) | No new svm feature |
+
+The backend proper is bounded and slice-able exactly like `svm-leng` was
+(fail-closed `unsup(...)` from day one, grow arm by arm against real go/ssa
+output). The honest long pole is not the backend — it is **compiling
+`go/types` + `go/ssa` themselves** (order 150k+ lines of interface-heavy,
+map-heavy, closure-heavy Go) well enough that the compiler runs as a guest. That
+is a breadth/bug-tail grind, not a design risk: every construct it exercises is
+core semantics the backend must support anyway, so "the compiler compiles" is the
+natural capstone test rather than extra scope, and it doubles as the GC/allocator
+stress test (go/types is allocation-heavy — the window heap and STW get exercised
+for real).
+
+### 6.2 Multi-threaded, in both senses
+
+- **Compiled programs** are multi-threaded via the Route B2 runtime: N vCPUs
+  (`thread.spawn`), work-stealing of suspended fibers, channels/`sync` over
+  futex+atomics, cross-vCPU STW via the §2.1 quiesce barrier. Nothing here is
+  Route-D-specific — B2 is a prerequisite and its own deliverable.
+- **The compiler itself** parallelizes the way gc does (concurrent per-function
+  compilation over a work queue) — on SVM that is goroutines over vCPUs, i.e. the
+  runtime eating its own dog food. One discipline to adopt from gc on day one:
+  **deterministic output under parallelism** (sorted emission, no map-iteration
+  order leaks) — the fixpoint differential (§6.4) is only meaningful if stage2
+  bytes are schedule-independent, and Invariant 9's oracle culture demands it.
+
+### 6.3 Avoiding nimony's W4: one binary, in-process
+
+NIM.md flags multi-binary architecture (`nifler` → `nimony` → `hexer` → `lengc`
+subprocesses) as its "biggest unknown" for self-hosting. `svmgo` sidesteps this by
+construction — unlike nimony, we control the architecture: **one binary,
+parse→types→ssa→emit→link in-process**, importing the linker as a library (the
+`.svmo` narrow waist and `svm_ir::link` already exist for exactly this). File I/O
+bottoms out on the POSIX personality + `svm-fs` memfs; no `exec`, no process tree.
+(`go build`'s real process model, if ever wanted, is EXEC.md/§14-children
+territory — deliberately out of scope for the loop.)
+
+### 6.4 The bootstrap loop, in the tree's own convention
+
+1. **Stage 0:** host Go toolchain builds `svmgo` native. This is the build/dev
+   oracle binary, exactly like chibicc's native form (SELFHOST_C.md §2) — it
+   never ships, it gates.
+2. **Stage 1:** native `svmgo` compiles `svmgo` + runtime + its stdlib closure →
+   `svmgo.svmb`. Runs as a guest on interp + Cranelift JIT.
+3. **Stage 2:** `svmgo.svmb` (on SVM, multi-vCPU) compiles the same sources.
+   **Fixpoint gate: stage1 == stage2 byte-identical** — the chibicc criterion.
+4. **Differentials throughout:** every corpus program byte-matches (a) native
+   TinyGo/gc execution where semantics overlap, and (b) Route A's
+   stock-Go-via-wasm output — the frontend-level oracle Route A exists to provide.
+
+**The SELFHOST_C.md §3 trade, updated for Go.** chibicc ships the on-ramp-built
+artifact because LLVM's `-O2` beats its own codegen. The analog here: the shipping
+`svmgo.svmb` could be built by **stock gc → `GOOS=wasip1` wasm → svm-wasm**
+(inheriting gc's optimizer for the compiler binary), with the self-compiled form
+kept as the conformance differential. But the trade is genuinely different this
+time: the gc-wasm form is **single-threaded** (gc's wasm runtime multiplexes
+cooperatively), while the self-compiled form runs the B2 runtime with real vCPU
+parallelism. gc's better per-function code vs. N-way parallel compilation —
+measure, don't assume; the benchmark harness is the arbiter (AGENTS.md).
+
+### 6.5 The near-free lane: the gc toolchain *on* SVM before any backend exists
+
+Worth naming because it closes a toolchain-on-svm loop for ~zero compiler work,
+as soon as Route A lands: the gc compiler (`cmd/compile`, `cmd/link`) is pure Go,
+so it builds as a `wasip1` binary and runs on SVM through svm-wasm + the widened
+WASI shim + memfs. Output targets `wasip1` too → feed the result back through
+svm-wasm. That is *Go compiling Go on SVM, running the result on SVM* — no new
+backend, no runtime port. Constraints inherited from Route A: single-threaded,
+interpreter-class speed, and the emitted modules carry gc's own in-module runtime
+rather than fibers/`gc.roots`. Not the destination — but a working oracle for
+stage-1 bring-up, a stress corpus for the WASI/fs surface, and an honest demo
+months before Route D's fixpoint.
+
+### 6.6 Work breakdown & calibration
+
+Prerequisites: Route A (oracle + §6.5 lane) and Route B2's runtime (shared
+verbatim). Then, in dependency order:
+
+1. **Backend skeleton** — go/ssa → svm-text for scalars/control-flow/calls,
+   fail-closed elsewhere; differential from the first commit. *(The svm-leng
+   walking-skeleton move; that took days of slices.)*
+2. **Core semantics** — slices/strings/maps/interfaces/closures/defer/panic,
+   runtime in guest Go. *(The bulk of backend work; svm-leng's W1 analog, which
+   closed in about a week of slices — Go's surface is larger; budget several
+   times that.)*
+3. **Concurrency + GC wiring** — `go`/channels/`select` onto the B2 runtime;
+   type-metadata + `gc.roots` collector integration.
+4. **Stdlib closure for self-compile** — os/io/fmt/strings/sort/strconv +
+   go/token/parser/types + x/tools/go/ssa. *(The long pole — a breadth grind
+   measured by "how much of go/types compiles today".)*
+5. **Fixpoint** — stage1==stage2, then multi-vCPU stage2 and the determinism
+   gate.
+
+By conventional accounting this is person-quarters, not person-weeks — the
+largest language project in the tree so far, sized roughly **3–5× svm-leng**
+(which went from empty crate to linking real cross-module nimony programs in
+about a week of slices, per NIM.md §3). It decomposes into the same
+fail-closed, differential-gated slices as every frontend before it, with no
+single high-risk unknown: the runtime substrate is proven (B2/`steal_fibers`),
+the GC contract is proven (JACL), the frontend pattern is proven three times
+over (chibicc, svm-wasm/svm-llvm, svm-leng), and the self-host convention is
+proven (chibicc fixpoint). The one genuinely new bet is compiler-scale Go
+(go/types) running over the conservative-GC runtime — which is why it's staged
+as the capstone with oracles on both sides of it.
+
+### 6.7 Risks, stated
+
+- **go/types+go/ssa breadth.** Interface-heavy stdlib code will find every
+  backend gap; mitigated by fail-closed discipline + the §6.5 oracle, but it is
+  the schedule risk.
+- **GC pressure at compiler scale.** A conservative collector retaining
+  compiler-sized heaps (false roots pinning large subgraphs) is a perf risk, not
+  a correctness one (GC.md §3.2's over-approximation argument); the top-byte
+  payload mask exists if tagging becomes worthwhile.
+- **x/tools/go/ssa version coupling.** The backend couples to go/ssa's API — a
+  vendored pin, refreshed deliberately (the LLVM-18→21 lesson from svm-llvm
+  applies: tolerate versions, don't chase them).
+- **Fiber-count economics** — §4.2's control-stack knob stops being optional at
+  compiler-workload goroutine counts.
+
+## 7. Non-goals
 
 - Bug-for-bug `gc` runtime semantics (contiguous stack growth, precise GC pause
   targets, `runtime` package internals). TinyGo-level semantics are the bar.
