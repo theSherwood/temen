@@ -231,14 +231,86 @@ plumbing that lands in increments (§8).
      + waiter and the caller parks on the reply — `handler_parks` re-plumbed to the library-provider
      case, **reusing** the built waiter table (`ticket_waiters` keyed `(callee, ticket)`, I49) and
      reply plumbing (`cap_reply_or_stash`, `Waiter::Fiber`) rather than growing a parallel one
-     (INVARIANTS.md 1/4). The parked handler's `Vec<Frame>` sits `ParkedOn` in the caller's registry
-     carrying its world, re-installed on resume. The `single` admission gate stops being a **held**
-     `state.try_lock()` (which cannot survive a park) and becomes the §10.3 **admission word** — a
-     flag that reopens when the handler parks, closing its run-to-park atomicity window (§10.1). The
-     generation re-check on the phase-3 relock now earns its place (3a explicitly deferred it because
-     `drive_arc` had no suspension point). Pin: a parking library-provider handler completes
-     observably identical to the same handler behind a process provider (the `live_impl` path is the
-     blocking-behavior oracle).
+     (INVARIANTS.md 1/4). A promoted handler converges onto the exact shape the process-provider
+     path already runs (`serve_run`/`handler_parks`): a handler fiber `ParkedOn` in the caller's
+     registry, its caller parked on `(provider, ticket)`, its return replying via
+     `cap_reply_or_stash`. Two deltas vs. that path: **(world)** the handler's world is the provider
+     *instance's*, so at park the provider's `{mem, host, fuel}` are handed **back to the
+     `ProviderState`** and re-acquired from it on resume — the parked fiber carries only its code +
+     fuel-accounting + results + ticket, never `mem`/`host` by value, because a second caller may
+     legally have animated the instance meanwhile; **(no serve loop)** the caller is re-plumbed onto
+     `ticket_waiters` exactly like `Blocked::CapReply`, and the promoted settle recognizes a promoted
+     slot and `cap_reply_or_stash`es the reply instead of pushing into a same-vCPU resumer. The
+     `single` admission gate stops being a **held** `state.try_lock()` (which cannot survive a park)
+     and becomes the §10.3 **admission word** — a flag that reopens (`busy = false`) when the handler
+     parks, closing its run-to-park atomicity window (§10.1). The generation re-check on the phase-3
+     relock now earns its place (3a explicitly deferred it because `drive_arc` had no suspension
+     point). Two decisions, both fail-closed and oracle-matching: a **multi-result** offer whose
+     handler parks declines to `drive_arc` (`cap_reply_or_stash` carries one `i64`, the oracle's
+     reply width — no parallel table); a **resuming** handler has priority over new callers for the
+     world (the process path's "woken parked handler resumes before new admissions"), a racing new
+     caller getting the unchanged probeable `-EAGAIN` until 4c. Pin: a parking library-provider
+     handler completes observably identical to the same handler behind a process provider (the
+     `live_impl` path is the blocking-behavior oracle). Decomposed smallest-verifiable-first:
+     - **4b.1 — Single-level promotion (the full vertical). DONE (2026-08-04).** A handler that
+       parks on a blocking primitive (futex `wait`) promotes, is woken, resumes with its provider
+       world re-acquired, and returns to the caller. **As built**, the resumer model is a refinement
+       of the sketch above: nothing but a claimant can resume a `ParkedOn` fiber, and a passive
+       library provider has no serve loop, so **the caller's own vCPU is the handler's resumer**. On
+       promotion (a new branch in `fiber_park!`, taken when the parking fiber is
+       `offer_anim.handler_slot`) the provider `{mem, host, fuel}` are drained back to the
+       `ProviderState` and `busy` cleared, the caller's world is restored, an `OfferParked` record is
+       filed, and the vCPU parks on a new `Blocked::OfferPark { key }` — filed in **`svc_waiters`
+       keyed on the provider domain** (the `svc` the handler's block-waiter already targets), so the
+       handler's block-wake (`wake_blocked` + `svc_wake`) re-admits it exactly as it re-admits a
+       serve loop. (The `ticket_waiters`/`cap_reply_or_stash`/`Waiter::Fiber` reuse the sketch named
+       is for the *nested* caller — a caller that is itself a fiber whose vCPU has moved on — which
+       lands in 4b.2; the top-level caller needs no ticket.) On resume the vCPU re-`claim`s the
+       woken handler (`Claimed::LiveWoken`), **re-acquires the world from the live instance** (not
+       carried by value — a second caller may have animated it meanwhile; `busy` re-set, the
+       generation re-check), rebuilds an active `offer_anim`, and switches back in; the handler's
+       eventual return rides the **unchanged 4a settle** (the resumed segment is an ordinary active
+       animation), with the per-segment reserve drains telescoping to `initial - final`. A
+       lost-wakeup recheck on the park (the I52 shape) and a fail-closed `FiberFault` if a handler
+       leaked the provider-host `Arc` (spawned) round it out. Pinned by `offer_promotion.rs`: a
+       timed-wait handler parks and resumes on its timer returning `WAIT_TIMED_OUT`, and a second
+       dispatch is admitted after the first promoted (admission reopened); the full `impl_wiring` /
+       `imports_impl` / `svc_handler_parks` / `svc_serve_chain` suites unregressed.
+     - **4b.2 — Nested / cross-domain promotion. DONE (2026-08-04).** An offer handler that is
+       *itself* a caller — the §1 `A → B → A → B` chain across distinct instances — now nests: the
+       single `OfferAnim` slot became a **stack** (`Vec<OfferAnim>`), pushed on each animation
+       switch and popped (strictly LIFO) on each settle/promotion. Under the coupled resumer model
+       (4b.1) the whole chain stays on **one vCPU**, so the `ticket_waiters`/`cap_reply_or_stash`
+       reuse the original sketch reserved for a "caller whose vCPU moved on" turned out
+       **unnecessary** — there is no such caller; a nested promotion parks the one vCPU carrying the
+       whole chain, and each enclosing handler is a suspended resumer on the stack. Enabling nesting
+       surfaced a **latent 4a cache bug**: both handler frames carry `module = INVOKE_MODULE` but
+       point at different `invoked` tables, and the `cur_funcs` cache keyed on the module *id* did
+       not refresh on an `INVOKE_MODULE → INVOKE_MODULE` switch — so a nested handler ran against its
+       *caller's* function table. Fixed by invalidating the cache (`cur_module = u32::MAX`) at each
+       animation switch and settle (an `invoked` change under an unchanged id). Pinned by
+       `offer_promotion.rs`: a non-parking nested offer settles under the outer animation (the
+       cache-bug regression), and an inner handler promotes+resumes while the outer animation stays
+       on the stack. *Self-instance* re-entrancy (a true cycle back to a **busy** instance) stays a
+       probeable `-EAGAIN` until 4c.
+     - **4b.3 — Teardown hardening. DONE (2026-08-04).** Two teardown gaps the coupled resumer
+       model (4b.1) opened, both closed: **(i)** a reaped caller that was *mid-animation* held a
+       provider instance checked out (`busy = true`, its world on the dying vCPU) — `reap` now
+       reopens `busy` on each `offer_anim` state, so a **reused** `Host` never sees a
+       permanently-busy instance (fail-closed to `-EAGAIN`, never a wrong answer; a
+       promoted-but-parked handler already handed its world back, so only the active stack needs
+       clearing); **(ii)** an `OfferPark` caller parks in `svc_waiters` under the **provider**
+       domain's key, not its own, so `teardown_domain` (which removed only `svc_waiters[dying_key]`)
+       would strand a dying domain's caller under a live provider's key — the sweep now scans every
+       `svc_waiters` queue for member vCPUs by identity (mirroring the `ticket_waiters` sweep).
+       `teardown_run` already drained all `svc_waiters`, so the root-exit path was covered; a durable
+       provider keeps declining to `drive_arc` (fail-closed, unchanged from 4a). Pinned by
+       `offer_promotion.rs`: the root abandons a promoted daemon on exit and the run ends promptly,
+       never awaiting the daemon's infinite block. **Deferred:** the §10.3 **closed** bit (freeze +
+       quiesce) has no library-path trigger yet — a library provider is non-durable (declines
+       freeze) and teardown is handled by domain-death + the `reap` reset above — so adding a
+       `closed` word now would be speculative machinery (prime directive); it rides the
+       quiesce/process-provider work where a serve loop actually freezes mid-handler.
    - **4c — Queue-on-contention (old 3c).** With a parked holder freeing the thread, the busy
      `single` path enqueues + parks instead of answering `-EAGAIN`; a re-entrant/cyclic call
      completes instead of self-deadlocking. The bounded queue still refuses `-EAGAIN` at the rim when

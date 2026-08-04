@@ -279,6 +279,13 @@ retry-guarded `fork_then_wait`. Unlike `fork_then_wait`, the `pid_mode` fixture 
 `-EAGAIN`, so it flakes directly under Windows CI load; the standing mitigation (guest-side retry) or
 the deterministic-serve fix would cover it. Same I53 root class, unrelated to the diff.
 
+**Sighting 2026-08-04** (local, CALLS.md 4b.3 branch `claude/domain-communication-patterns-ypdwz0` — a
+promotion/teardown diff touching nothing in the fork/clone path): one failure of
+`pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child` in a full parallel
+`cargo test -p svm-interp` sweep, then **passed on the immediate full re-run and 3/3 isolated** on the
+same commit. Confirms the flake reproduces under **local** parallel load too (not only Windows CI),
+and is load-sensitive not diff-sensitive. Same I53 root class; no new information beyond that.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
