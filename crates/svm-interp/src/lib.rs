@@ -14453,6 +14453,22 @@ pub struct Host {
     /// hosts that are not shared granted-child cells (interp domains, top-level runs) — their
     /// transports have their own wakers.
     svc_cv: Option<Arc<Condvar>>,
+    /// CALLS.md 5c.2 — the child's **published serve activation** while its serve loop is parked
+    /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_size)` — everything a claiming
+    /// caller needs to invoke a handler inline over the child's live window (the §10.2 arm-4
+    /// direct handoff, JIT twin). Published/cleared only by the child's own serve loop, under the
+    /// cell's lock; `None` whenever the child is running, serving, or gone.
+    serve_activation: Option<(usize, usize, u64)>,
+    /// CALLS.md 5c.2 — the activation **claim** flag: set (under the lock, atomically with the
+    /// activation check) by the one caller serving inline. While set: no second claimer, the
+    /// child's serve loop neither pops nor exits (its window must stay alive under the claimer),
+    /// and interrupt exits defer until release.
+    handoff_claimed: bool,
+    /// CALLS.md 5c.2 — dispatches served **by claimers** since the child last folded its count:
+    /// the §10.2 settlement rule ("a handoff-served dispatch counts in the callee's serve
+    /// accounting") — the child's parked `svc.wait` completes with the same served-count
+    /// observation the enqueue path would have delivered.
+    handoff_served: i64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
@@ -14794,6 +14810,9 @@ impl Host {
             child_serve_ctx: 0,
             epoch_cell: 0,
             svc_cv: None,
+            serve_activation: None,
+            handoff_claimed: false,
+            handoff_served: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -16188,6 +16207,44 @@ impl Host {
     /// The shared-cell wake signal, cloned out under the cell's lock (`None` ⇒ not a shared cell).
     pub fn svc_cv(&self) -> Option<Arc<Condvar>> {
         self.svc_cv.clone()
+    }
+
+    /// CALLS.md 5c.2 — publish / clear this child's parked serve activation; see
+    /// [`Host::serve_activation`]. Child serve loop only, under the cell's lock.
+    pub fn set_serve_activation(&mut self, a: Option<(usize, usize, u64)>) {
+        self.serve_activation = a;
+    }
+
+    /// CALLS.md 5c.2 — try to claim the published activation (atomic with the check under the
+    /// cell's lock): `Some((serve_ctx, mem_base, mem_size))` and the claim is held; `None` when
+    /// nothing is published or another claimer holds it.
+    pub fn try_claim_handoff(&mut self) -> Option<(usize, usize, u64)> {
+        if self.handoff_claimed {
+            return None;
+        }
+        let a = self.serve_activation?;
+        self.handoff_claimed = true;
+        Some(a)
+    }
+
+    /// CALLS.md 5c.2 — release the claim after the inline serve, recording `served` dispatches
+    /// into the callee's serve accounting (the §10.2 settlement rule). The caller then notifies
+    /// the cell's Condvar so the child folds the count and completes its `svc.wait`.
+    pub fn release_handoff(&mut self, served: i64) {
+        self.handoff_claimed = false;
+        self.handoff_served += served;
+    }
+
+    /// Whether a claimer currently holds this child's activation (the child's serve loop must
+    /// neither pop, exit, nor honor interrupts while it does — the claimer runs over the child's
+    /// live window).
+    pub fn handoff_claimed(&self) -> bool {
+        self.handoff_claimed
+    }
+
+    /// CALLS.md 5c.2 — fold and reset the handoff-served count (the child's serve loop, on wake).
+    pub fn take_handoff_served(&mut self) -> i64 {
+        std::mem::take(&mut self.handoff_served)
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op
