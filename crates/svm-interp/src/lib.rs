@@ -1888,6 +1888,9 @@ fn drive_arc(
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
     let jit_table_log2 = host.jit_table_log2();
+    // CALLS.md 6a — reserve dispatch-table headroom for `ref.func`-taking offer units (the
+    // animation installs them, deduped; without room every such call would be `-EAGAIN`).
+    let offer_table_demand = host.offer_table_demand();
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
@@ -2005,7 +2008,14 @@ fn drive_arc(
         // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
         // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
         // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
-        let dt = Arc::new(DomainTable::new(&funcs, jit_table_log2));
+        let dt = Arc::new(DomainTable::new(&funcs, {
+            if offer_table_demand == 0 {
+                jit_table_log2
+            } else {
+                let need = (funcs.len() + offer_table_demand).next_power_of_two();
+                jit_table_log2.max(need.trailing_zeros() as u8)
+            }
+        }));
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
@@ -3608,6 +3618,26 @@ impl DomainTable {
     fn install_unit_funcs(&self, unit: Arc<[Func]>) -> Option<Vec<u32>> {
         let n = unit.len();
         let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        // CALLS.md 6a — dedup: a unit already installed (same `Arc`) reuses its slots. Repeat
+        // installs — multiple vCPUs animating one `ref.func` offer, repeat invokes of one unit —
+        // must not leak table slots. (A B2 `uninstall` of any slot voids the reuse: the recount
+        // below misses and a fresh install runs, exactly as before.)
+        if let Some(k) = units.iter().position(|u| Arc::ptr_eq(u, &unit)) {
+            let module = (k + 1) as u32;
+            let mut found: Vec<(u32, u32)> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let v = s.load(Ordering::Relaxed);
+                    ((v >> 32) as u32 == module).then_some(((v & 0xffff_ffff) as u32, i as u32))
+                })
+                .collect();
+            if found.len() == n {
+                found.sort_by_key(|&(f, _)| f);
+                return Some(found.into_iter().map(|(_, slot)| slot).collect());
+            }
+        }
         let free: Vec<usize> = self
             .slots
             .iter()
@@ -7351,6 +7381,12 @@ struct VCpu {
     /// `admit_parked` count before the re-attempt (keeping the bound accurate). `None` whenever the
     /// vCPU is not a parked admission-waiter.
     admit_retry: Option<Arc<Mutex<ProviderState>>>,
+    /// CALLS.md 6a — per-vCPU cache of **unit-own funcref remaps** for animated offer handlers,
+    /// keyed by the unit's `Arc<[Func]>` address: `install_unit_funcs` is run-permanent, so a
+    /// repeated animation must reuse its first install rather than leak table slots per call.
+    /// `None` in a slot = the table had no room at first install (the animation then answers
+    /// `-EAGAIN`, and retries re-check — the table may have drained).
+    unit_ref_cache: Vec<(usize, Option<Vec<u32>>)>,
 }
 
 /// §3.6 slice 5b — the serve loop's in-flight handler: the registry slot/handle the handler
@@ -7442,6 +7478,7 @@ impl VCpu {
             offer_anim: Vec::new(),
             offer_parked: None,
             admit_retry: None,
+            unit_ref_cache: Vec::new(),
         }
     }
 
@@ -7507,6 +7544,7 @@ impl VCpu {
             offer_anim: Vec::new(),
             offer_parked: None,
             admit_retry: None,
+            unit_ref_cache: Vec::new(),
         })
     }
 
@@ -7594,6 +7632,7 @@ impl VCpu {
             offer_anim: Vec::new(),
             offer_parked: None,
             admit_retry: None,
+            unit_ref_cache: Vec::new(),
         }
     }
 
@@ -8027,6 +8066,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         offer_anim,
         offer_parked,
         admit_retry,
+        unit_ref_cache,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -8078,7 +8118,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // resumed handler continues draining the caller's fuel from where it parked.
                 *fuel = parked.remaining_budget;
                 let saved_invoked = invoked.replace(parked.entry_funcs.clone());
-                let saved_ref = invoked_ref_slots.take();
+                // CALLS.md 6a — reinstall the unit-own funcref remap for the resumed handler.
+                // Cache-hit by construction: the promoted handler's first switch-in installed it
+                // on this vCPU (the caller's own vCPU is the resumer, 4b.1). A miss is a
+                // wrong-shape guard: fail closed, never a wrong `ref.func` resolution.
+                let resume_ref_ = if unit_uses_ref_func(&parked.entry_funcs) {
+                    let key_ = Arc::as_ptr(&parked.entry_funcs) as *const Func as usize;
+                    match unit_ref_cache.iter().find(|(k_, _)| *k_ == key_) {
+                        Some((_, Some(s_))) => Some(s_.clone()),
+                        _ => return Err(Trap::FiberFault),
+                    }
+                } else {
+                    None
+                };
+                let saved_ref = std::mem::replace(invoked_ref_slots, resume_ref_);
                 // Push (not overwrite): the enclosing animation, if any, stays under this one on
                 // the stack — a nested handler resumes inside its caller-handler's animation.
                 offer_anim.push(OfferAnim {
@@ -8148,7 +8201,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 let entry_: &OfferEntry = $entry;
                 let op_: u32 = $op;
                 let args_: &[i64] = $args;
-                if !durable && !unit_uses_ref_func(&entry_.funcs) {
+                if !durable {
                     if let (Some(&f_), Some(osig_)) =
                         (entry_.ops.get(op_ as usize), entry_.sigs.get(op_ as usize))
                     {
@@ -8199,7 +8252,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // CALLS.md 5b — caller-pays: the caller has no fuel to fund the
                                 // crossing. Decided before checkout (nothing to undo) ⇒ clean trap.
                                 OutOfFuel,
-                                Decline,
                             }
                             let adm_ = {
                                 let mut guard_ = match state_.try_lock() {
@@ -8231,10 +8283,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let key_ = Arc::as_ptr(&state_) as usize;
                                         Adm::ParkAdmit(state_.clone(), key_)
                                     }
-                                } else if st_.host.is_durable() {
-                                    // A durable provider world: the 3a `drive_arc` fallback handles
-                                    // it, byte-identically.
-                                    Adm::Decline
                                 } else if *fuel == 0 {
                                     // CALLS.md 5b caller-pays: the handler runs on the **caller's**
                                     // fuel; a caller with none can't fund the crossing. Decided here,
@@ -8288,8 +8336,52 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     return Ok(Inner::Park(Blocked::OfferAdmit { key: key_ }));
                                 }
                                 Adm::OutOfFuel => return Err(Trap::OutOfFuel),
-                                Adm::Decline => {} // fall through to the caller's 3a sub-run
                                 Adm::Go(arg_slots_, budget_, pm_, ph_) => {
+                                    // CALLS.md 6a — a `ref.func`-taking handler unit needs the
+                                    // unit-own funcref remap (the `invoked_new` shape), installed
+                                    // once per (vCPU, unit) via the cache (installs are
+                                    // run-permanent; per-call installs would leak table slots). A
+                                    // full table is backpressure: undo the checkout, `-EAGAIN`.
+                                    let ref_slots_: Option<Vec<u32>> =
+                                        if unit_uses_ref_func(&entry_.funcs) {
+                                            let key_ =
+                                                Arc::as_ptr(&entry_.funcs) as *const Func as usize;
+                                            let cached_ = match unit_ref_cache
+                                                .iter()
+                                                .find(|(k_, _)| *k_ == key_)
+                                            {
+                                                Some((_, s_)) => s_.clone(),
+                                                None => {
+                                                    let s_ = dt.install_unit_funcs(
+                                                        entry_.funcs.clone(),
+                                                    );
+                                                    unit_ref_cache.push((key_, s_.clone()));
+                                                    s_
+                                                }
+                                            };
+                                            match cached_ {
+                                                Some(v_) => Some(v_),
+                                                None => {
+                                                    {
+                                                        let mut st_ = state_
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
+                                                        st_.mem = pm_;
+                                                        st_.host = *ph_;
+                                                        st_.busy = false;
+                                                    }
+                                                    if let SchedRef::Real(sr) = sched {
+                                                        sr.admit_wake(
+                                                            Arc::as_ptr(&state_) as usize
+                                                        );
+                                                    }
+                                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
                                     // undo the checkout, answer -EAGAIN (never a trap).
                                     let handle_ =
@@ -8330,7 +8422,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         std::mem::replace(host, Arc::new(Mutex::new(*ph_)));
                                     *fuel = budget_ - 1;
                                     let saved_invoked_ = invoked.replace(entry_.funcs.clone());
-                                    let saved_ref_ = invoked_ref_slots.take();
+                                    let saved_ref_ =
+                                        std::mem::replace(invoked_ref_slots, ref_slots_);
                                     let hvals_: Vec<Reg> = osig_
                                         .params
                                         .iter()
@@ -10243,7 +10336,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Probe under a brief lock; a miss falls through to the unchanged generic
                     // dispatch below (byte-identical). Every other capability kind — incl. a *pure*
                     // offer, a revoked/forged handle — is `None` and takes the fall-through.
-                    let inst_offer = {
+                    let inst_offer = if durable {
+                        None // 6a: a durable caller takes the host-side dispatch below
+                    } else {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.instanced_offer_of(h, *type_id)
                     };
@@ -10253,11 +10348,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // switch, `-EAGAIN` on a busy instance), or fall through to the byte-identical
                         // 3a `drive_arc` sub-run when it declines (durable caller/provider, `ref.func`).
                         animate_instanced_offer!(&entry, *op, &argv);
-                        let results = drive_instanced_offer(host, &entry, *op, &argv)?;
-                        for (s, ty) in results.iter().zip(&sig.results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                        }
-                        continue;
+                        // 6a — the sub-run is retired: the macro handles every non-durable
+                        // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
+                        // or arity miss — the retired path's CapFault, fail-closed.
+                        return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
@@ -10451,7 +10545,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `cap.call` arm). Probe reproduces the
                     // `CAP_IMPORT_TYPE_ID` op remap; a miss falls through unchanged.
-                    let inst_offer = {
+                    let inst_offer = if durable {
+                        None // 6a: a durable caller takes the host-side dispatch below
+                    } else {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.instanced_offer_for_import(*import | (*op << 16))
                     };
@@ -10459,11 +10555,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
                         animate_instanced_offer!(&entry, eff_op, &argv);
-                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
-                        for (s, ty) in results.iter().zip(&sig.results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                        }
-                        continue;
+                        // 6a — the sub-run is retired: the macro handles every non-durable
+                        // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
+                        // or arity miss — the retired path's CapFault, fail-closed.
+                        return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -10584,7 +10679,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
                     // so `packed = *import` (consumer_op 0 ⇒ the bound base op). Miss falls through.
-                    let inst_offer = {
+                    let inst_offer = if durable {
+                        None // 6a: a durable caller takes the host-side dispatch below
+                    } else {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.instanced_offer_for_import(*import)
                     };
@@ -10592,11 +10689,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
                         animate_instanced_offer!(&entry, eff_op, &argv);
-                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
-                        for (s, ty) in results.iter().zip(&sig.results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                        }
-                        continue;
+                        // 6a — the sub-run is retired: the macro handles every non-durable
+                        // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
+                        // or arity miss — the retired path's CapFault, fail-closed.
+                        return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -10624,7 +10720,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // CALLS.md increment 3 (slice 1): a dynamic-mode call on an instanced offer runs
                     // with the narrowed powerbox lock. Probe interns the self shape `ty` (as the
                     // generic dyn path does) then checks the handle; a miss falls through unchanged.
-                    let inst_offer = {
+                    let inst_offer = if durable {
+                        None // 6a: a durable caller takes the host-side dispatch below
+                    } else {
                         let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         hg.instanced_offer_for_dyn(*ty, *op, h)
                     };
@@ -10632,13 +10730,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // CALLS.md 4a — animate the handler in-loop (see the `cap.call` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
                         animate_instanced_offer!(&entry, eff_op, &argv);
-                        let results = drive_instanced_offer(host, &entry, eff_op, &argv)?;
-                        for (s, tyv) in results.iter().zip(&sig.results) {
-                            frames[top]
-                                .vals
-                                .push(Reg::from_value(slot_to_val(*tyv, *s)));
-                        }
-                        continue;
+                        // 6a — the sub-run is retired: the macro handles every non-durable
+                        // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
+                        // or arity miss — the retired path's CapFault, fail-closed.
+                        return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -14191,88 +14286,6 @@ fn translate_cap_slots(
     Ok(())
 }
 
-/// CALLS.md increment 3, slice 1 (lock-narrowing) — drive an **instanced** offer with the
-/// caller's powerbox lock held ONLY around the two `cap`-slot translation edges, never across the
-/// `drive_arc` sub-run. Behaviorally identical to the `Some(state)` branch of
-/// [`Host::cap_dispatch_slots_inner`] (results / traps / provider-pays fuel drain); the sole
-/// difference is that the caller's whole cap surface no longer halts for the duration of the
-/// sub-run (CALLS.md §1 defect / §4 lock discipline). `entry` is a snapshot the eval-loop arm
-/// resolved under a brief `hg` lock ([`Host::instanced_offer_of`] and friends), so its `state` is
-/// `Some` by construction of the probe.
-///
-/// **Why no generation re-check on the phase-3 relock (yet):** the provider instance is named by
-/// the cloned `state` `Arc`, and `cap` results are minted fresh into whatever the caller table is
-/// at relock — there is no suspension point inside `drive_arc` at which a stale offer handle could
-/// matter (the sub-run runs to completion or trap on its own executor; it never parks a fiber back
-/// into the outer scheduler). The re-check CALLS.md §4 mentions belongs to the promotion slice
-/// (increment 4), where a handler *parks* mid-animation and a reified fiber re-crosses the
-/// boundary.
-///
-/// **Lock discipline:** the provider `state` guard is held continuously from try-enter through
-/// phase 3 (the mutual-exclusion invariant); the caller `hg` lock is acquired inside phase 1 and
-/// phase 3 only, and dropped around `drive_arc`. This introduces a `state → hg` acquisition order;
-/// it cannot cycle with the generic `hg → state.try_lock()` order because the dispatch path's
-/// `try_lock` never blocks. (The only *blocking* `hg → state` edges are the wiring/introspection
-/// APIs — see the invariant note on [`Host::grant_impl_cap`] — which are not called concurrently
-/// with a live run.)
-fn drive_instanced_offer(
-    host: &Arc<Mutex<Host>>,
-    entry: &OfferEntry,
-    op: u32,
-    args: &[i64],
-) -> Result<Vec<i64>, Trap> {
-    let f = *entry.ops.get(op as usize).ok_or(Trap::CapFault)?;
-    let sig = entry.sigs.get(op as usize).ok_or(Trap::CapFault)?;
-    if args.len() != sig.params.len() {
-        return Err(Trap::CapFault);
-    }
-    // The probe guarantees `state.is_some()`; a race that cleared it is fail-closed.
-    let state = entry.state.clone().ok_or(Trap::CapFault)?;
-    // Try-enter admission (verbatim from the inner arm): a busy instance answers a probeable
-    // `-EAGAIN`, never a blocking wait — deadlock-free by construction, a cycle refuses (CALLS.md
-    // increment 2). The guard is held continuously through phase 3.
-    let mut st = match state.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(vec![EAGAIN]),
-    };
-    let st = &mut *st;
-    if st.fuel == 0 {
-        return Err(Trap::CapFault);
-    }
-    // Phase 1 — `cap` args caller→provider. The caller `hg` lock is held ONLY here.
-    let mut arg_slots = args.to_vec();
-    {
-        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-        translate_cap_slots(&mut hg, &mut st.host, &sig.params, &mut arg_slots)?;
-    }
-    let vals: Vec<Value> = sig
-        .params
-        .iter()
-        .zip(&arg_slots)
-        .map(|(ty, &s)| slot_to_val(*ty, s))
-        .collect();
-    // Phase 2 — the provider sub-run, holding NO caller lock (the whole point of the slice).
-    let budget = st.fuel.min(OFFER_FUEL);
-    let mut impl_fuel = budget;
-    let (res, _, _) = drive_arc(
-        entry.funcs.clone(),
-        f,
-        &vals,
-        &mut impl_fuel,
-        &mut st.mem,
-        &mut st.host,
-    );
-    st.fuel -= budget - impl_fuel; // drain what the call used — before `?`, as in the inner arm
-    let mut result_slots: Vec<i64> = res?.iter().map(|v| val_to_slot(*v)).collect();
-    // Phase 3 — `cap` results provider→caller. The caller `hg` lock is re-acquired ONLY here.
-    {
-        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-        translate_cap_slots(&mut st.host, &mut hg, &sig.results, &mut result_slots)?;
-    }
-    Ok(result_slots)
-}
-
 // The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
@@ -16957,6 +16970,26 @@ impl Host {
     /// `install`; `0` ⇒ natural size.
     pub fn jit_table_log2(&self) -> u8 {
         self.jit_table_log2
+    }
+
+    /// CALLS.md 6a — the dispatch-table headroom this host's **`ref.func`-taking offer units**
+    /// need: the animation installs each such unit's functions into the run's shared table
+    /// (deduped — one install per distinct unit), so the run reserves room for them up front.
+    /// Zero when no wired offer takes its own funcrefs — the common case, and then the table is
+    /// byte-identical to before.
+    pub fn offer_table_demand(&self) -> usize {
+        let mut seen: Vec<usize> = Vec::new();
+        let mut demand = 0usize;
+        for e in &self.offers {
+            if e.state.is_some() && unit_uses_ref_func(&e.funcs) {
+                let key = Arc::as_ptr(&e.funcs) as *const Func as usize;
+                if !seen.contains(&key) {
+                    seen.push(key);
+                    demand += e.funcs.len();
+                }
+            }
+        }
+        demand
     }
 
     /// Mark this run's granted `Jit` domain(s) as **fiber-hosting** — a submitted unit may use §12

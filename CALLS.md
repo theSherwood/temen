@@ -585,11 +585,22 @@ plumbing that lands in increments (§8).
    `GUEST_IMPL_FUEL` exists only in prose (the code's reserve is `PROVIDER_FUEL_RESERVE`);
    `wire_impl_instance`/`impl_service` are already gone; the `GuestImpl`→`Offer` rename landed with
    §8.1. Slices:
-   - **6a — the eval loop sheds the legacy fn.** D2 animates (cache the unit-func install on the
-     `OfferEntry`, set `invoked_ref_slots` at switch-in — the `invoked_new` shape); D3 deleted;
-     D1 (durable caller) re-routes to the host-side arm — one legacy site instead of two; then
-     **delete `drive_instanced_offer` + its 4 call sites**. New pin: a `ref.func`-taking offer
-     handler animates correctly (no such test exists today — D2 was pure conservatism).
+   - **6a — the eval loop sheds the legacy fn. DONE (2026-08-04).** D2 animates: the switch-in
+     installs the unit-own funcref remap (`install_unit_funcs`) and sets `invoked_ref_slots` — the
+     `invoked_new` shape — with a **per-vCPU cache** so repeat animations reuse the first install;
+     the promoted resume reinstalls from the cache (a miss is a fail-closed `FiberFault`). **As
+     built, two table facts surfaced:** default run tables have **no free slots** (the reserve is a
+     max, not a sum), so `drive_arc` at run start now reserves `Host::offer_table_demand()` —
+     headroom for each distinct `ref.func`-taking offer unit (zero ⇒ byte-identical table); and
+     `install_unit_funcs` gained **dedup by unit identity** (recovering slots by module-id scan),
+     fixing a latent leak that predates 6a — repeat `invoke`s of one unit each burned fresh slots.
+     A genuinely full table still answers `-EAGAIN` (the checkout-undo shape). D3 deleted
+     (unreachable, with the `Adm::Decline` variant); D4/D5 (unknown op / arity) answer the retired
+     path's `CapFault` at the call sites; D1 (durable caller) skips the probe and takes the
+     host-side dispatch — one legacy site instead of two. **`drive_instanced_offer` is deleted.**
+     Pin: `a_ref_func_offer_handler_animates_with_the_unit_remap` (handler `call_indirect`s its own
+     helper through `ref.func`, called twice — the cache path; the first coverage that path ever
+     had).
    - **6b — provider-pays leaves.** Delete `ProviderState.fuel`, `PROVIDER_FUEL_RESERVE`, and the
      `impl_fuel_remaining`/`set_impl_fuel_reserve` API (callers: one test); the host-side instanced
      dispatch gets the **pure arm's flat deterministic `OFFER_FUEL` budget** (no reserve, no drain).

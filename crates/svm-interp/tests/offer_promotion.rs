@@ -410,3 +410,62 @@ fn concurrent_callers_park_and_retry_instead_of_eagain() {
         "both concurrent callers completed with the real result (parked+retried, never -EAGAIN)"
     );
 }
+
+/// A provider whose handler (func 0) calls its own helper (func 1) **through `ref.func` +
+/// `call_indirect`** — a unit-own-funcref handler. handler(x) = helper(x) + 10 = 2x + 10.
+fn ref_func_provider() -> svm_ir::Module {
+    module(
+        "memory 16\n\
+         func (i64) -> (i64) {\n\
+         block 0 (va: i64) {\n\
+           vf = ref.func 1\n\
+           vr = call_indirect (i64) -> (i64) vf (va)\n\
+           vten = i64.const 10\n\
+           vs = i64.add vr vten\n\
+           return vs\n\
+           }\n\
+         }\n\
+         func (i64) -> (i64) {\n\
+         block 0 (va: i64) {\n\
+           vtwo = i64.const 2\n\
+           vm = i64.mul va vtwo\n\
+           return vm\n\
+           }\n\
+         }\n",
+    )
+}
+
+/// CALLS.md 6a — a `ref.func`-taking offer handler **animates** (pre-6a it declined to the now-
+/// retired `drive_arc` sub-run; pure conservatism, pinned by nothing until this test): the
+/// animation installs the unit-own funcref remap (`install_unit_funcs`, cached per vCPU), so the
+/// handler's `call_indirect` through `ref.func 1` resolves to its own helper — never the caller's
+/// table. Called **twice**: the second call exercises the cache path (installs are run-permanent;
+/// a re-install per call would leak table slots).
+#[test]
+fn a_ref_func_offer_handler_animates_with_the_unit_remap() {
+    let provider = ref_func_provider();
+    let mut host = Host::new();
+    let offer = host.wire_offer_proc(&provider, &[0]).expect("offer");
+    let tid = host.resolve_offer(offer).unwrap().type_id;
+
+    let consumer_src = format!(
+        "func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vh = i32.const {offer}\n\
+           va = i64.const 16\n\
+           v1 = cap.call {tid} 0 (i64) -> (i64) vh (va)\n\
+           v2 = cap.call {tid} 0 (i64) -> (i64) vh (va)\n\
+           vs = i64.add v1 v2\n\
+           return vs\n\
+           }}\n\
+         }}\n"
+    );
+    let consumer = module(&consumer_src);
+    let mut fuel = 10_000_000u64;
+    let r = run_with_host(&consumer, 0, &[], &mut fuel, &mut host);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(84)]),
+        "handler(16) = 2*16+10 = 42, twice — the ref.func remap resolved both animated calls"
+    );
+}
