@@ -138,12 +138,13 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-fn run_jit_i64(src: &str) -> i64 {
+fn run_jit_i64_knob(src: &str, handoff: bool) -> i64 {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let am = Arc::new(m);
     let mut host = Host::new();
     host.set_self_module(&am);
+    host.set_handoff(handoff);
     let ih = host.grant_instantiator(0, 128 << 10);
     let (jo, _jmem) = compile_and_run_capture_reserved_with_host_ex(
         &am,
@@ -161,6 +162,10 @@ fn run_jit_i64(src: &str) -> i64 {
         JitOutcome::Returned(v) => v.first().copied().unwrap_or(i64::MIN),
         other => panic!("jit did not return cleanly: {other:?}"),
     }
+}
+
+fn run_jit_i64(src: &str) -> i64 {
+    run_jit_i64_knob(src, false)
 }
 
 fn run_interp_i64(src: &str) -> i64 {
@@ -219,4 +224,145 @@ fn call_through_minted_offer_completes_on_both_backends() {
 #[test]
 fn child_offer_on_a_plain_child_refuses() {
     assert_eq!(run_jit_i64(PLAIN_SRC), -22);
+}
+
+/// CALLS.md 5c.2 — the **settlement** module: the parent calls `add(40,2)` through the minted
+/// offer AND joins the child, returning `call*100 + join`. The child's `svc.wait` returns its
+/// served count — which, under the §10.2 settlement rule, must observe the dispatch **whichever
+/// transport served it** (enqueue+park or a claimed inline handoff): 42*100 + 1 = 4201, always.
+const JOIN_SRC: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func (i32) -> (i64) {
+block 0 (vinst: i32) {
+  gp = i64.const 0
+  gn = i64.const 0
+  ent = i64.const 1
+  off = i64.const 65536
+  sl = i64.const 16
+  q = i64.const 0
+  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  vexp = i64.const 0
+  vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
+  vspin = i32.const 2000000
+  br 1(vspin, vh, vch, vinst)
+}
+block 1 (vk0: i32, vh1: i32, vch1: i32, vin1: i32) {
+  vone = i32.const 1
+  vk1 = i32.sub vk0 vone
+  br_if vk1 1(vk1, vh1, vch1, vin1) 2(vh1, vch1, vin1)
+}
+block 2 (vh2: i32, vch2: i32, vin2: i32) {
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) vin2 (vch2)
+  vk = i64.const 100
+  vm = i64.mul vr vk
+  vs = i64.add vm vj
+  return vs
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  s = i64.add va vb
+  return s
+  }
+}
+"#;
+
+/// Like [`JOIN_SRC`] but the handler **parks mid-serve** (a 2ms timed `atomic.wait` that times
+/// out) before returning — CALLS.md 5c.4: under handoff the *claimer's* thread blocks inside the
+/// inline invoke (the §10.2 arm-6 "thread-blocks (JIT)" flavor); under the parked transport the
+/// child's thread blocks. Same observables either way.
+const PARK_SRC: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func (i32) -> (i64) {
+block 0 (vinst: i32) {
+  gp = i64.const 0
+  gn = i64.const 0
+  ent = i64.const 1
+  off = i64.const 65536
+  sl = i64.const 16
+  q = i64.const 0
+  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  vexp = i64.const 0
+  vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
+  vspin = i32.const 2000000
+  br 1(vspin, vh, vch, vinst)
+}
+block 1 (vk0: i32, vh1: i32, vch1: i32, vin1: i32) {
+  vone = i32.const 1
+  vk1 = i32.sub vk0 vone
+  br_if vk1 1(vk1, vh1, vch1, vin1) 2(vh1, vch1, vin1)
+}
+block 2 (vh2: i32, vch2: i32, vin2: i32) {
+  va = i64.const 40
+  vb = i64.const 2
+  vr = cap.call 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
+  vj = cap.call 6 1 (i32) -> (i64) vin2 (vch2)
+  vk = i64.const 100
+  vm = i64.mul vr vk
+  vs = i64.add vm vj
+  return vs
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vaddr = i64.const 8
+  vexp = i32.const 0
+  vto = i64.const 2000000
+  vst = i32.atomic.wait vaddr vexp vto
+  s = i64.add va vb
+  return s
+  }
+}
+"#;
+
+/// **The 5c.2 pin**: handoff-on ≡ handoff-off ≡ interp, on the result AND the callee's
+/// served-count observation (the §10.2 settlement rule). With the knob on, whether a given run
+/// claims (child parked in time) or falls back to enqueue is a race — and the pin's point is
+/// that the observables are identical either way.
+#[test]
+fn direct_handoff_matches_parked_and_settles() {
+    assert_eq!(run_interp_i64(JOIN_SRC), 4201, "interp: 42*100 + served(1)");
+    assert_eq!(
+        run_jit_i64_knob(JOIN_SRC, false),
+        4201,
+        "JIT parked transport"
+    );
+    assert_eq!(run_jit_i64_knob(JOIN_SRC, true), 4201, "JIT direct handoff");
+}
+
+/// **The 5c.4 pin**: a handler that parks mid-serve (timed futex wait) completes identically
+/// under handoff (the claimer's thread blocks inline — the arm-6 thread-block flavor) and under
+/// the parked transport (the child's thread blocks).
+#[test]
+fn direct_handoff_with_parking_handler_matches() {
+    assert_eq!(run_interp_i64(PARK_SRC), 4201, "interp");
+    assert_eq!(
+        run_jit_i64_knob(PARK_SRC, false),
+        4201,
+        "JIT parked transport"
+    );
+    assert_eq!(run_jit_i64_knob(PARK_SRC, true), 4201, "JIT direct handoff");
 }
