@@ -13,9 +13,21 @@
 //! params ahead of the SVM signature:
 //!
 //! - `win: i32` — the guest window's base address in linear memory (import `env.memory`);
-//! - `env: i32` — the engine-side environment cell: an `i64` **fuel counter** at offset 0, debited
-//!   once per dispatcher iteration (coarser than the interpreter's per-op fuel — a bound, not an
-//!   observable; DESIGN.md §5) and trapped on exhaustion.
+//! - `env: i32` — the engine-side environment cell: cross-tier `call_interp` marshals its i64
+//!   arg/result slots here (offset 16 on). Offset 0 is a legacy fuel slot the shipped emitter no
+//!   longer debits (see below); it stays reserved so the scratch layout is unchanged.
+//!
+//! **Fuel is debited from a mutable wasm `i64` global** (`FuelMode::Global`, exported `"fuel"`),
+//! once per dispatcher iteration — coarser than the interpreter's per-op fuel, a bound not an
+//! observable (DESIGN.md §5), trapped on exhaustion. A global (not a linear-memory cell) because no
+//! guest memory store can alias it, so V8/TurboFan keeps the counter in a register across a hot
+//! loop instead of reloading it every iteration — measured **1.5–2.8× on hot integer loops**, up to
+//! the no-fuel bound (BROWSER.md § "Fuel in a global"). The global self-initializes to the standard
+//! `1<<61` region budget, so a host that seeds the old `env`-cell no-ops harmlessly; a host wanting
+//! a tighter bound (or to re-arm across regions on a reused instance) sets the `"fuel"` export
+//! before the call. Fuel here is per-region/per-vCPU (as the linear-memory cell already was — the
+//! threads tier allocates one budget per Worker); cross-thread preemption rides the separate
+//! `epoch_cell` (svm-run), never this counter.
 //!
 //! ## Confinement (the load-bearing part)
 //!
@@ -40,7 +52,11 @@
 //! `loop` re-dispatches on a `$next` local via `br_table` over one wasm `block` per SVM block.
 //! Branch arguments are pushed onto the operand stack *then* popped into the target's param locals
 //! (reverse order), so a self-branch that permutes its own params can't read an already-overwritten
-//! local. A relooper for reducible CFGs is a planned upgrade, not a correctness need.
+//! local. A relooper for reducible CFGs is a planned upgrade, not a correctness need — and measured
+//! low-ROI so far: it made no V8 difference on Lua's giant reducible function (BROWSER.md), and the
+//! per-dispatch fuel cost it also carried is now removed by the fuel global. It would only pay on
+//! *multi-block-per-trip* loops, where re-dispatching each block both costs and defeats the fuel
+//! global's register allocation (the `branchy` row in BROWSER.md § "Fuel in a global").
 //!
 //! Proven by `tests/differential.rs`: every kernel runs on the bytecode engine (the oracle) and on
 //! the emitted wasm under `wasmi`, comparing results **and trap kinds**.
@@ -74,6 +90,33 @@ impl core::fmt::Display for Error {
 }
 
 const MASK: u64 = (1u64 << DEFAULT_RESERVED_LOG2) - 1;
+
+/// Where the per-dispatch fuel counter lives. `Global` (the shipped default) debits a mutable wasm
+/// `i64` global — register-allocatable, because it cannot alias a guest memory store, so V8 keeps it
+/// in a register across a hot loop. `Memory` debits an `i64` cell in linear memory at `env` (the
+/// pre-change placement, which V8 must reload every iteration); `None` omits the debit entirely (an
+/// upper-bound measurement probe). `Memory`/`None` survive only as A/B knobs for the cross-engine
+/// fuel bench — see `examples/fuelbench`; the shipped emitter always emits `Global`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FuelMode {
+    /// The pre-change placement: an `i64` debit against the linear-memory `env` cell (offset 0).
+    Memory,
+    /// The shipped default: a mutable `i64` wasm global (index 0), exported as `"fuel"` so the host
+    /// may re-arm the per-region budget (it self-initializes to [`FUEL_DEFAULT`]).
+    Global,
+    /// No fuel debit — an upper-bound probe only.
+    None,
+}
+
+/// The wasm global index of the fuel counter in [`FuelMode::Global`] (the only declared global).
+const FUEL_GLOBAL_IDX: u32 = 0;
+/// The fuel global's instantiation-time default — the standard per-region budget every host seed
+/// site writes (`1 << 61`). Because the global self-initializes to this, an emitted module runs
+/// with the usual generous bound even if the host never touches the `"fuel"` export; a host that
+/// wants a *tighter* bound (or to re-arm the counter across regions on a reused instance) sets the
+/// export to a smaller value before the call. This keeps fuel-in-global a drop-in for the shipped
+/// linear-memory-cell seeding: the old `env`-cell write becomes a no-op, the budget is unchanged.
+const FUEL_DEFAULT: i64 = 1 << 61;
 
 // ---- wasm binary encoding primitives -------------------------------------------------------------
 
@@ -1144,6 +1187,31 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
     compile_module_with(m, false)
 }
 
+/// **Bench/experiment front door** — like [`compile_module`], but with the fuel counter placed per
+/// `fuel_mode`. Used by the cross-engine fuel A/B (`examples/fuelbench`) to measure the ROI of a
+/// register-allocatable fuel global vs the shipped linear-memory cell. Not a shipping path.
+pub fn compile_module_fuel(m: &Module, fuel_mode: FuelMode) -> Result<Vec<u8>, Error> {
+    let a = analyze(m);
+    if !a.in_subset.iter().all(|&s| s) {
+        return Err(Error::Unsupported(
+            "a function is outside the integer subset",
+        ));
+    }
+    let n = m.funcs.len();
+    let emitted: Vec<usize> = (0..n).collect();
+    let wasm_of: Vec<Option<u32>> = (0..n).map(|i| Some(IMPORTED_FUNCS + i as u32)).collect();
+    emit_module(
+        m,
+        false,
+        &emitted,
+        &wasm_of,
+        &a.interp_leaf,
+        None,
+        false,
+        fuel_mode,
+    )
+}
+
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
 /// `IMPORTED_FUNCS + its position among the emitted functions`.
 const IMPORTED_FUNCS: u32 = 2;
@@ -1195,6 +1263,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         &a.interp_leaf,
         None,
         false,
+        FuelMode::Global,
     )
 }
 
@@ -1252,6 +1321,7 @@ pub fn compile_module_nested_with_eligibility(
         &interp_leaf,
         None,
         true,
+        FuelMode::Global,
     )?;
     Ok((wasm, eligible))
 }
@@ -1291,6 +1361,7 @@ pub fn compile_module_b2(
         &a.interp_leaf,
         Some(table_log2),
         false,
+        FuelMode::Global,
     )
 }
 
@@ -1524,7 +1595,16 @@ pub fn compile_module_reactor(
             emitted_bitmap[i] = true;
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &cross, None, false)?;
+    let wasm = emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &cross,
+        None,
+        false,
+        FuelMode::Global,
+    )?;
     Ok((wasm, emitted_bitmap))
 }
 
@@ -1596,7 +1676,16 @@ pub fn compile_module_tierup(
             emitted.push(i);
         }
     }
-    let wasm = emit_module(m, shared_memory, &emitted, &wasm_of, &leaf, None, false)?;
+    let wasm = emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &leaf,
+        None,
+        false,
+        FuelMode::Global,
+    )?;
     Ok((wasm, emit))
 }
 
@@ -1695,6 +1784,7 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
 /// Assemble the wasm module: emit the functions listed in `emitted` (SVM indices, in the order they
 /// take wasm indices), routing each `Call` via `wasm_of` (a direct wasm call) or, for an interp
 /// leaf, through `env.call_interp`. See the module docs for the emitted shape.
+#[allow(clippy::too_many_arguments)]
 fn emit_module(
     m: &Module,
     shared_memory: bool,
@@ -1703,6 +1793,7 @@ fn emit_module(
     interp_leaf: &[bool],
     reserved_table_log2: Option<u32>,
     nested_caps: bool,
+    fuel_mode: FuelMode,
 ) -> Result<Vec<u8>, Error> {
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
@@ -1898,6 +1989,7 @@ fn emit_module(
             &types,
             table_size,
             nested_caps,
+            fuel_mode,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -1991,14 +2083,37 @@ fn emit_module(
         section(&mut out, 4, &sec);
     }
 
+    if fuel_mode == FuelMode::Global {
+        // Global section (6): one mutable `i64` fuel counter, self-initialized to the standard
+        // per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
+        // or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check` — a
+        // register-allocatable counter that no guest memory store can alias.
+        let mut sec = Vec::new();
+        uleb(&mut sec, 1); // one global
+        sec.push(0x7e); // i64
+        sec.push(0x01); // mutable
+        sec.push(OP_I64_CONST);
+        sleb64(&mut sec, FUEL_DEFAULT);
+        sec.push(OP_END);
+        section(&mut out, 6, &sec);
+    }
+
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
-    uleb(&mut sec, emitted.len() as u64);
+    let n_exports = emitted.len() as u64 + (fuel_mode == FuelMode::Global) as u64;
+    uleb(&mut sec, n_exports);
     for &fi in emitted {
         let name = format!("f{fi}");
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x00);
         uleb(&mut sec, wasm_of[fi].unwrap() as u64);
+    }
+    if fuel_mode == FuelMode::Global {
+        let name = "fuel";
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x03); // global export kind
+        uleb(&mut sec, FUEL_GLOBAL_IDX as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -2155,6 +2270,8 @@ struct FnCtx {
     /// Open label count inside the body; the dispatcher `loop` is the first label opened, so a
     /// branch back to it from depth `d` is `br (d - 1)`.
     depth: u32,
+    /// Where the per-dispatch fuel debit reads/writes its counter.
+    fuel_mode: FuelMode,
 }
 
 impl FnCtx {
@@ -2174,6 +2291,7 @@ fn emit_func(
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
     nested_caps: bool,
+    fuel_mode: FuelMode,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -2275,6 +2393,7 @@ fn emit_func(
         fuel_l,
         atomic_addr_l,
         depth: 0,
+        fuel_mode,
     };
 
     let mut code = Vec::new();
@@ -2349,21 +2468,44 @@ fn emit_func(
     Ok(body)
 }
 
-/// Debit one fuel unit from the `i64` cell at `env` and trap `TRAP_OUT_OF_FUEL` when it goes
-/// negative. Runs once per dispatcher iteration — a coarser debit than the interpreter's per-op
-/// fuel, deliberately (fuel is a §5 bound, not an observable).
+/// Debit one fuel unit from the counter (`FuelMode::Global` global, or the legacy `env` cell) and
+/// trap `TRAP_OUT_OF_FUEL` when it goes negative. Runs once per dispatcher iteration — a coarser
+/// debit than the interpreter's per-op fuel, deliberately (fuel is a §5 bound, not an observable).
+/// The debited value and the `< 0` trap are identical across modes, so the `OutOfFuel` differential
+/// is placement-insensitive.
 fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
-    code.push(OP_LOCAL_GET); // [env]        (store address)
-    uleb(code, 1);
-    code.push(OP_LOCAL_GET); // [env, env]
-    uleb(code, 1);
-    code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8 → [env, fuel]
-    code.push(OP_I64_CONST);
-    sleb64(code, 1);
-    code.push(0x7d); // i64.sub → [env, fuel-1]
-    code.push(OP_LOCAL_TEE);
-    uleb(code, cx.fuel_l as u64);
-    code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8 → []
+    match cx.fuel_mode {
+        FuelMode::None => {}
+        FuelMode::Memory => {
+            code.push(OP_LOCAL_GET); // [env]        (store address)
+            uleb(code, 1);
+            code.push(OP_LOCAL_GET); // [env, env]
+            uleb(code, 1);
+            code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8 → [env, fuel]
+            code.push(OP_I64_CONST);
+            sleb64(code, 1);
+            code.push(0x7d); // i64.sub → [env, fuel-1]
+            code.push(OP_LOCAL_TEE);
+            uleb(code, cx.fuel_l as u64);
+            code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8 → []
+        }
+        FuelMode::Global => {
+            // global.get FUEL; i64.const 1; i64.sub; tee $fuel; global.set FUEL — the counter lives
+            // in a mutable global no guest memory store can alias, so V8 register-allocates it.
+            code.push(0x23); // global.get
+            uleb(code, FUEL_GLOBAL_IDX as u64);
+            code.push(OP_I64_CONST);
+            sleb64(code, 1);
+            code.push(0x7d); // i64.sub
+            code.push(OP_LOCAL_TEE);
+            uleb(code, cx.fuel_l as u64);
+            code.push(0x24); // global.set
+            uleb(code, FUEL_GLOBAL_IDX as u64);
+        }
+    }
+    if cx.fuel_mode == FuelMode::None {
+        return;
+    }
     code.push(OP_LOCAL_GET);
     uleb(code, cx.fuel_l as u64);
     code.push(OP_I64_CONST);

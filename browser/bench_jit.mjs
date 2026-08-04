@@ -66,7 +66,10 @@ const WIN_BYTES = 1 << 24; // 16 MiB
 const win = Number(ex.svm_alloc(WIN_BYTES));
 ex.svm_wasmjit_init_window(win, WIN_BYTES); // lay the module's data segments into the window
 const env = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
-new DataView(ex.memory.buffer).setBigInt64(env, (1n << 61n), true);
+// Fuel lives in the emitted module's `fuel` global now (register-allocatable — the per-dispatch
+// debit no longer touches linear memory). Seed the generous budget once; it debits monotonically
+// across all timed reps (never resets), and 1<<61 dwarfs the total dispatch count of the bench.
+einst.exports.fuel.value = 1n << 61n;
 
 // The frontend ABI is `func(sp: i64, n: i32)`; the emitted entry prepends (win, env). `n` is i32.
 const runN = (n) => entry(win, env, sp, n);
