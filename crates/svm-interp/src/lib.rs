@@ -10091,6 +10091,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
+                // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
+                // domain's remaining fuel. No handler context, no host lock — just the live counter,
+                // so it is answered on every tier (never `-EINVAL`). Deterministic by construction
+                // (safepoint-anchored fuel), so the JIT/bytecode arms return the identical value —
+                // the differential pin. Reads the counter as it stands at this op (the `cap.call`
+                // self-op charges no fuel of its own, mirroring the other self-ops), so a
+                // read-before/read-after pair meters exactly the work between them under caller-pays.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_FUEL_REMAINING,
+                    sig,
+                    ..
+                } => {
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(*fuel as i64));
+                    }
+                }
                 Inst::CapCall {
                     type_id,
                     op,
@@ -13986,6 +14003,17 @@ pub const CAP_SELF_CLONE_CALLER: u32 = 11;
 /// `-ECHILD`. Eval-loop-only (needs `serve_run`) and Real-scheduler-only (like `clone_caller`); a
 /// host-side or non-serving dispatch answers a probeable `-EINVAL`. Pinned at 12.
 pub const CAP_SELF_REAP: u32 = 12;
+
+/// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
+/// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
+/// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
+/// wire change, no new opcode. Deterministic **by construction**: fuel is a checked cross-engine
+/// quantity charged at IR-anchored safepoints (INVARIANTS.md 9), so the readout returns the identical
+/// value on every backend — its differential pin. Under caller-pays the cost of a call is
+/// read-before minus read-after (no metering ABI). Unlike the serve/fork self-ops it needs no handler
+/// context, so it is answered on every tier, never `-EINVAL`. The design reserved "12"; that number
+/// went to `reap` first, so `fuel.remaining` takes 13.
+pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's

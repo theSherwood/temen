@@ -398,7 +398,26 @@ plumbing that lands in increments (§8).
        loops (the common shape) are the tested path; a timed-serve-loop handoff gate is a later
        refinement if a consumer needs it.
 5. **JIT arm** — the thunk fast path; park = thread-block on the reply; **caller-pays fuel lands
-   here**, uniformly on all backends. Closes the `live_impl` parity gap.
+   here**, uniformly on all backends. Closes the `live_impl` parity gap. Decomposed
+   smallest-verifiable-first:
+   - **5a — `fuel.remaining` (self-op 13), all backends. DONE (2026-08-04).** §10.6 — an
+     authority-neutral readout of the domain's remaining fuel. **Interp** services it in the eval loop
+     (pushes `*fuel`, charging none of its own). **JIT** lowers it inline in `lower_block` to a
+     `load(I64, fuel_addr)` — the same host-owned cell `emit_fuel_check` charges — so it returns the
+     identical value under the differential oracle (which arms counted fuel on the JIT); when a
+     compile has no counted fuel armed (`fuel_addr == 0`, the production CLI path) it reports
+     `i64::MAX` ("unmetered"). **Bytecode** can't see the vCPU counter from host-side dispatch, so it
+     declines op 13 (`compile_module → None`) and the module falls back to the tree-walker, which
+     services it. The design reserved op "12"; `reap` took it, so this is **13**. Pinned by
+     `crates/svm/tests/fuel_remaining.rs`: interp ≡ JIT on the raw readback (`budget − 1` at entry)
+     and on the read-before/read-after **call-metering** idiom.
+   - **5b — caller-pays fuel across the crossing.** Fuel follows the fiber across a cross-domain
+     crossing (the counter keeps draining); the wirer-priced reserve (`impl_fuel_remaining`,
+     `GUEST_IMPL_FUEL`) leaves with increment 6. Uniform on all backends.
+   - **5c — JIT cross-domain (`live_impl`) call arm + crossing-depth bound.** The net-new JIT thunk +
+     park-as-thread-block-on-reply paralleling the interp `live_impl` path; plus the §10.4 per-thread
+     crossing-depth bound (declines the inline arm to the parked transport at the bound). Closes the
+     `live_impl` parity gap (today the JIT force-folds serving-with-park modules to `TreeWalk`).
 6. **Retire the two-lock sub-run** — with 3–5 landed, the passive-provider `drive_arc` nested
    executor and `ProviderState` collapse onto the inline-animation path (the original increment-2
    goal, now reachable without a parity regression).
