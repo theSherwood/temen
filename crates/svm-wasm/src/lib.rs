@@ -247,7 +247,16 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             Payload::TypeSection(reader) => {
                 for rec in reader {
                     for sub in rec?.into_types() {
-                        let ft = sub.unwrap_func();
+                        // We lower only function types. wasmparser's default feature set validates
+                        // the GC proposal, so a `struct`/`array`/`cont` composite type passes the
+                        // up-front validator and reaches here — `unwrap_func()` would panic ("not a
+                        // func") on it. Bail closed with a clean `Unsupported` instead of aborting
+                        // the fuzz target. (A func type carrying a supertype / non-final marker is
+                        // still the `Func` arm; we ignore finality/supertype and lower it as usual.)
+                        let ft = match &sub.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(ft) => ft,
+                            _ => return unsup("non-function GC composite type"),
+                        };
                         let params = ft
                             .params()
                             .iter()

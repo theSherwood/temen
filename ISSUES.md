@@ -21,6 +21,27 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I61 — `wasm_transpile` panicked ("not a func") on a GC composite type that the up-front validator accepts (S2, nightly fuzz red) — **FIX LANDED 2026-08-04** (`claude/nightly-ci-failures-u9y1ly`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (wasm_transpile)` has failed every run since 2026-07-25
+(last green 2026-07-24). The minimized crash is a 13-byte module —
+`[0,97,115,109, 1,0,0,0, 1,3,1, 0x5f, 0]` = `\0asm` + version + a type section declaring one
+zero-field GC **struct** (`0x5f`) — that aborts with `thread panicked at
+wasmparser-.../types.rs: not a func`.
+
+**Root cause.** `svm_wasm::transpile` guards with `wasmparser::Validator::new().validate_all()`, whose
+**default** `WasmFeatures` now enable the stabilized GC proposal, so a `struct`/`array`/`cont`
+composite type validates cleanly. The type-section loop then assumed every sub-type was a function and
+called `SubType::unwrap_func()`, which `panic!("not a func")`s on any non-func composite. We only lower
+function types, so this is a fail-*open* on hostile-but-valid input — exactly what the fuzz target is
+the standing net for.
+
+**Fix.** Match `sub.composite_type.inner` and bail closed with `Error::Unsupported("non-function GC
+composite type")` for the non-`Func` arms instead of `unwrap_func()`. Regression test
+`gc_struct_type_is_unsupported_not_panic` replays the exact crash bytes and asserts a clean
+`Unsupported`, not a panic. (This latent hole surfaced the moment the fuzzer first generated a GC
+composite type; no transpile code regressed on 2026-07-24.)
+
 ### I60 — the vendored-`svm` submodule is a *linked worktree* of the parent repo's `.git`, so a `git gc` in one checkout can prune unpushed commits authored in the other's detached HEAD (S3, tooling hazard — cost real committed work this run) — recorded 2026-07-31 on the JACL SVM-backend migration
 
 **Symptom.** JACL vendors this repo at `jacl_impl/vendor/svm` as a **linked git worktree** sharing the
