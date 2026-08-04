@@ -8123,10 +8123,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // CALLS.md 6c — the resumed segment runs on this vCPU's run; re-stamp the
                     // owning-run token so a same-run peer may park on the re-held instance.
                     st.busy_owner = sched.run_id();
-                    (st.mem.take(), std::mem::take(&mut st.host))
+                    // CALLS.md 6d.4.1 — clone the shared powerbox cell for the resumed segment
+                    // (the instance keeps its ref); the window is still taken by value.
+                    (st.mem.take(), Arc::clone(&st.host))
                 };
                 let saved_mem = std::mem::replace(mem, pm);
-                let saved_host = std::mem::replace(host, Arc::new(Mutex::new(ph)));
+                let saved_host = std::mem::replace(host, ph);
                 // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter and persisted on this
                 // vCPU across the park at exactly `remaining_budget`; set it explicitly so the
                 // resumed handler continues draining the caller's fuel from where it parked.
@@ -8257,9 +8259,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // check+set is atomic under it, so concurrent callers serialize).
                             enum Adm {
                                 Eagain,
-                                // `Host` is large (~1KB); box it so the enum stays small
-                                // (clippy `large_enum_variant`).
-                                Go(Vec<i64>, u64, Option<Mem>, Box<Host>),
+                                // CALLS.md 6d.4.1 — the provider powerbox is the shared cell
+                                // (`Arc<Mutex<Host>>`): the checkout clones it here and the vCPU
+                                // install swaps the clone in (no per-call `Arc::new`).
+                                Go(Vec<i64>, u64, Option<Mem>, Arc<Mutex<Host>>),
                                 // CALLS.md 4c.1 — contention on a busy instance held by a *different*
                                 // vCPU: rewind + park as an admission-waiter, keyed by this state.
                                 ParkAdmit(Arc<Mutex<ProviderState>>, usize),
@@ -8320,9 +8323,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     {
                                         let mut hg =
                                             host.lock().unwrap_or_else(|e| e.into_inner());
+                                        let mut ph_g =
+                                            st_.host.lock().unwrap_or_else(|e| e.into_inner());
                                         translate_cap_slots(
                                             &mut hg,
-                                            &mut st_.host,
+                                            &mut ph_g,
                                             &osig_.params,
                                             &mut arg_slots_,
                                         )?;
@@ -8338,10 +8343,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // `-EAGAIN`s. Cleared with `busy` at every settle.
                                     st_.busy_owner = sched.run_id();
                                     let pm_ = st_.mem.take();
-                                    // `take` leaves a throwaway default in `st_.host`; the real host
-                                    // rides on the vCPU until the settle restores it (busy meanwhile).
-                                    let ph_ = std::mem::take(&mut st_.host);
-                                    Adm::Go(arg_slots_, budget_, pm_, Box::new(ph_))
+                                    // CALLS.md 6d.4.1 — clone the shared powerbox cell onto the
+                                    // checkout; the instance keeps its own ref, so an animated
+                                    // handler's mutations land directly and the settle needs no host
+                                    // restore. `busy` (just set) guards against a second checkout.
+                                    let ph_ = Arc::clone(&st_.host);
+                                    Adm::Go(arg_slots_, budget_, pm_, ph_)
                                 }
                                 // `guard_` drops — the state lock is not held across the run.
                             };
@@ -8394,7 +8401,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                             .lock()
                                                             .unwrap_or_else(|e| e.into_inner());
                                                         st_.mem = pm_;
-                                                        st_.host = *ph_;
+                                                        // 6d.4.1 — no host restore: the checkout
+                                                        // cloned the cell (kept its ref); the clone
+                                                        // is dropped as `ph_` leaves scope.
                                                         st_.busy = false;
                                                     }
                                                     if let SchedRef::Real(sr) = sched {
@@ -8420,7 +8429,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                         .lock()
                                                         .unwrap_or_else(|e| e.into_inner());
                                                     st_.mem = pm_;
-                                                    st_.host = *ph_;
+                                                    // 6d.4.1 — no host restore (see above); the
+                                                    // cloned cell ref drops with `ph_`.
                                                     st_.busy = false;
                                                 }
                                                 // 4c.1 — the brief checkout is undone (`busy`
@@ -8445,8 +8455,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // `budget_ == *fuel >= 1` (the `*fuel == 0` case became
                                     // `Adm::OutOfFuel` before checkout), so this cannot underflow.
                                     let saved_mem_ = std::mem::replace(mem, pm_);
-                                    let saved_host_ =
-                                        std::mem::replace(host, Arc::new(Mutex::new(*ph_)));
+                                    let saved_host_ = std::mem::replace(host, ph_);
                                     *fuel = budget_ - 1;
                                     let saved_invoked_ = invoked.replace(entry_.funcs.clone());
                                     let saved_ref_ =
@@ -8642,15 +8651,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // can't hand the world back cleanly: fail closed, terminal for this run (a
                         // spawning handler declines to `drive_arc` in a later slice). Fuel/world are
                         // never surrendered on this path, so the errno is a wrong-shape guard, never
-                        // a wrong answer.
-                        let prov_host = match Arc::try_unwrap(prov_host_arc) {
-                            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-                            Err(_) => return Err(Trap::FiberFault),
-                        };
+                        // a wrong answer. CALLS.md 6d.4.1 — the powerbox is now the instance's
+                        // permanent shared cell, so the old `try_unwrap` (unique-ownership) test is
+                        // re-expressed as a `strong_count`: on a clean return the only live refs are
+                        // the instance's own (1) and this vCPU's checkout clone (1) = 2; a surviving
+                        // extra ref is the leaked fiber. `busy` serialized admission, so no
+                        // concurrent checkout races the count.
+                        if Arc::strong_count(&prov_host_arc) != 2 {
+                            return Err(Trap::FiberFault);
+                        }
+                        drop(prov_host_arc); // the checkout clone; the instance keeps its ref
                         {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.mem = prov_mem;
-                            st.host = prov_host;
+                            // 6d.4.1 — no host restore: mutations landed through the shared cell.
                             st.busy = false;
                         }
                         // CALLS.md 4c.1 — the promotion freed the instance (`busy` cleared); re-admit
@@ -11716,14 +11730,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // Run-to-completion: a handler that parked/spawned would have leaked a clone
                         // of the provider-host `Arc` (that is 4b's promotion). If one escaped, fail
                         // closed — a mid-animation park is a 4b capability, never a wrong answer.
-                        let prov_host = match Arc::try_unwrap(prov_host_arc) {
-                            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-                            Err(_) => {
-                                let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
-                                st.busy = false;
-                                return Err(Trap::FiberFault);
-                            }
-                        };
+                        // CALLS.md 6d.4.1 — shared-cell form: clean return ⇒ exactly the instance's
+                        // ref + this checkout clone = 2; more is a leak (`busy` serialized admission).
+                        if Arc::strong_count(&prov_host_arc) != 2 {
+                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.busy = false;
+                            return Err(Trap::FiberFault);
+                        }
+                        drop(prov_host_arc); // the checkout clone; the instance keeps its ref
                         let mut result_slots: Vec<i64> = anim
                             .results
                             .iter()
@@ -11737,11 +11751,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.mem = prov_mem;
-                            st.host = prov_host;
+                            // 6d.4.1 — no host restore: mutations landed through the shared cell.
                             st.busy = false;
                             let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                            // 6d.4.1 — the provider powerbox is the shared cell; lock it for the
+                            // result edge. Uncontended (the ProviderState guard `st` serializes
+                            // this instance's edges), so this never blocks — dissolves at 6d.4.3.
+                            let mut ph_g = st.host.lock().unwrap_or_else(|e| e.into_inner());
                             translate_cap_slots(
-                                &mut st.host,
+                                &mut ph_g,
                                 &mut hg,
                                 &anim.results,
                                 &mut result_slots,
@@ -14189,7 +14207,16 @@ struct LiveImplEntry {
 /// in ([`Host::grant_impl_cap`]) — how a wrap holds the real cap it forwards to.
 pub struct ProviderState {
     mem: Option<Mem>,
-    host: Host,
+    /// CALLS.md 6d.4.1 — the provider's powerbox now lives in the **shared-cell shape** a granted
+    /// child uses (`Arc<Mutex<Host>>`), the first step of folding `ProviderState` onto that shape.
+    /// The animation clones this `Arc` onto the caller's vCPU (no per-call `Arc::new`); the
+    /// host-side `drive_arc` arm briefly locks it to take/restore the inner `Host` by value for its
+    /// sub-run (no lock held across the run — `busy` guards, §10.1). Mutations by an animated
+    /// handler land directly through the shared `Arc`, so the settle needs no host restore. The
+    /// world-handback **leak guard** (a handler that spawned a fiber holding the world) is
+    /// re-expressed as a `strong_count` check at each settle: with `busy` serializing admission the
+    /// only live refs are this cell + the one vCPU clone, so a surviving extra ref is a leak.
+    host: Arc<Mutex<Host>>,
     /// CALLS.md 4a **admission word**: `true` while an in-loop cross-world animation has this
     /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
     /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
@@ -16131,7 +16158,7 @@ impl Host {
             depth: 1,
             state: Some(Arc::new(Mutex::new(ProviderState {
                 mem,
-                host: Host::new(),
+                host: Arc::new(Mutex::new(Host::new())),
                 busy: false,
                 admit_parked: 0,
                 busy_owner: 0,
@@ -16595,7 +16622,7 @@ impl Host {
                 });
                 Arc::new(Mutex::new(ProviderState {
                     mem,
-                    host: Host::new(),
+                    host: Arc::new(Mutex::new(Host::new())),
                     busy: false,
                     admit_parked: 0,
                     busy_owner: 0,
@@ -16651,9 +16678,11 @@ impl Host {
     /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        let h = self.regrant_into_child(cap, &mut st.host)?;
-        st.host.register_cap_name(name, h);
+        let st = state.lock().unwrap_or_else(|e| e.into_inner());
+        // CALLS.md 6d.4.1 — the powerbox is the shared cell; lock it for the re-grant.
+        let mut ph = st.host.lock().unwrap_or_else(|e| e.into_inner());
+        let h = self.regrant_into_child(cap, &mut ph)?;
+        ph.register_cap_name(name, h);
         Some(h)
     }
 
@@ -17957,7 +17986,14 @@ impl Host {
                             // instance (via regrant) sees the foreign `0` and `-EAGAIN`s rather
                             // than parking on a holder that would never `admit_wake` it.
                             st.busy_owner = 0;
-                            (st.mem.take(), std::mem::take(&mut st.host))
+                            // CALLS.md 6d.4.1 — take the inner `Host` by value out of the shared
+                            // cell for the lock-free `drive_arc` sub-run (leaving a default in the
+                            // cell, exactly as the old by-value field did); no inner lock is held
+                            // across the run — `busy` guards it (6c). Restored at the check-in.
+                            let host_taken = std::mem::take(
+                                &mut *st.host.lock().unwrap_or_else(|e| e.into_inner()),
+                            );
+                            (st.mem.take(), host_taken)
                         };
                         // The crossing runs with the state lock released. `?` inside stays local so
                         // the check-in below always restores the world and reopens the instance —
@@ -18001,7 +18037,8 @@ impl Host {
                         {
                             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                             st.mem = mem_local;
-                            st.host = host_local;
+                            // 6d.4.1 — restore the taken inner Host back into the shared cell.
+                            *st.host.lock().unwrap_or_else(|e| e.into_inner()) = host_local;
                             st.busy = false;
                             st.busy_owner = 0;
                         }

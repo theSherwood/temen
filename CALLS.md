@@ -649,7 +649,26 @@ plumbing that lands in increments (§8).
        so it lands with its first pin (a durable caller invoking an instanced offer, differentially
        identical to the host-side path). Interp-only; deletes nothing structural, but removes the
        last reason the eval loop ever falls to the host-side arm for an instanced offer.
-     - **6d.2 — tier-native JIT offer arm.** A JIT `cap.call` to an offer currently falls through
+     - **6d.2 — tier-native JIT offer arm — DEFERRED (owner decision 2026-08-04).** We are
+       **leaving the host-side interp arm in place as the shared offer path for every tier** and not
+       building the native offer arms (6d.2/6d.3) now. Rationale: there are four execution tiers —
+       interp (which *is* the host-side arm), bytecode (folds offers to interp), `svm-jit` (Cranelift,
+       falls through `cap_thunk` to the host-side arm), and `svm-wasm-jit` (folds `cap.call`s to
+       interp) — and **all four already reach an offer through the one correct host-side arm.**
+       Retiring it means writing a native arm *per tier*, each against a **different confinement
+       model** — `svm-jit`'s guard-page + baked fault-range (the hinge below), `svm-wasm-jit`'s
+       base-as-param + baked size — i.e. N× hinge-sensitive work for a speedup **no benchmark has
+       asked for**. Across four tiers the host-side arm is an asset (one correct path, not four), not
+       debt. **The limitation we accept:** a `svm-jit`/`svm-wasm-jit` caller invoking an offer drops
+       into the interp for the sub-run rather than running the handler natively (a dispatch-cost
+       overhead on that specific crossing; correctness and confinement are unaffected — every tier
+       gets the oracle's exact answer). **Revisit trigger:** a benchmark showing offer dispatch hot
+       on a specific tier — then build a native arm for *that* tier only, from its own confinement
+       model (prefer `svm-wasm-jit`'s base-as-param shape over `svm-jit`'s guard-page range if the
+       choice is open). Critically, **6d.4's deletion does not depend on this** (see 6d.4). The full
+       design is retained below for whoever picks it up.
+
+       A JIT `cap.call` to an offer currently falls through
        `cap_thunk` to `host.cap_dispatch_slots` (the 6c-narrowed host-side arm, an interp
        `drive_arc` sub-run); this slice runs the offer handler natively (`define_extra` compiles the
        offer unit into the run's `CompiledModule`, cached; `invoke_extra` runs its trampoline) so
@@ -710,8 +729,63 @@ plumbing that lands in increments (§8).
        (`Arc<Mutex<Host>>` + window) so a library instance is structurally a granted child's
        powerbox, and unify `Binding::Offer`/`Binding::LiveImpl`. This is where "`ProviderState` +
        its mutex" and "the `GuestImpl`/`LiveImpl` binding split" finally leave §7's list. Deepest
-       and most invasive (touches every state access + the binding dispatch); gated on 6d.2 so both
-       tiers share one crossing before the shapes merge.
+       and most invasive (touches every state access + the binding dispatch). **Not gated on 6d.2**
+       (an earlier note said it was — corrected): every tier reaches offers through the host-side
+       arm, so 6d.4 rewrites that arm's *representation* and all four tiers keep working through it
+       unchanged. The deletion is tier-independent, which is exactly why it is the right increment-6
+       finale to build now while the native arms stay deferred.
+
+       **Scope (settled by §7/§8's own words):** this is a *storage fold + binding-variant unify*,
+       **not** a transport merge. The two transports genuinely differ — a `LiveImpl` is an active
+       callee served by its own `svc.wait` loop over its own run's window (the 5c crossing:
+       enqueue + park), while an instanced offer is a passive library animated on the *caller's*
+       thread over a window carried in its state (4a). Making the offer grow a serve loop would
+       *reverse* the 4a decision (animate-on-caller was chosen precisely to avoid a per-instance
+       thread), so 6d.4 keeps both transports and merges only the **representation**: the offer's
+       `{host, window}` becomes an `Arc<Mutex<Host>>` shared cell like a child's, the bespoke
+       `ProviderState` struct + its mutex are deleted, and the two `Binding` variants collapse into
+       one that carries an internal passive-vs-live discriminant (the transport chosen at call
+       time, exactly as today). Decomposed smallest-first:
+       - **6d.4.1 — the offer powerbox becomes a shared `Arc<Mutex<Host>>` cell. DONE.**
+         `ProviderState.host: Host` → `Arc<Mutex<Host>>` (the window + the 6c admission word stay
+         alongside in `ProviderState`, exactly as a child's window is separate from its powerbox
+         cell). The animation now **clones** the cell onto the vCPU (deleting the per-call
+         `Arc::new(Mutex::new(..))` at every checkout/resume) and its mutations land through the
+         shared `Arc`, so the settle needs no host restore; the host-side `drive_arc` arm briefly
+         locks the cell to take/restore the inner `Host` by value, preserving 6c's no-lock-across-
+         the-sub-run. The world-handback **leak guard** (a handler that leaked the provider world by
+         spawning a fiber that still holds it) is re-expressed from `Arc::try_unwrap`
+         (unique-ownership) to `Arc::strong_count == 2` (the instance's own ref + the one checkout
+         clone; `busy` serializes admission so nothing races the count) — fail-closed exactly as
+         before, at both the 4a and 4d settles. Behaviour-identical; the existing offer suite is the
+         oracle (`impl_wiring` 25, `offer_promotion` 8 incl. the 4a–4d settles, `imports_impl`
+         three-backend).
+       - **6d.4.2 / 6d.4.3 / 6d.4.4 — NOT RECOMMENDED (finding, owner decision needed).** Building
+         6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and partly not achievable given the
+         4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
+         `Binding::LiveImpl` (16 sites) are handled *separately* at ~35 sites with **opposite**
+         semantics — `Offer` is non-durable (freeze errors) while `LiveImpl` is durably capturable
+         via `callee_slot`; `Offer` animates in `cap_dispatch_slots` while `LiveImpl` answers
+         `-EINVAL` there and crosses via `live_impl_call`; their payloads share nothing
+         (`funcs`/`ops`/`state` vs `callee`/`export`/`callee_slot`). Folding them into one
+         discriminated `ImplEntry` would **relocate** the passive-vs-live split from the enum to a
+         field without deleting logic, and add `Option`-heavy union fields — a net complexity
+         *increase* on the TCB (AGENTS.md prime directive: don't add abstraction until something
+         concrete demands it). Worse, **`ProviderState` cannot actually be deleted while the passive
+         transport is kept**: its `busy`/`admit_parked`/`busy_owner` admission word and its window
+         must live *outside* the `Host` that the sub-run takes by value (else a contender reads a
+         stale `busy=false` and double-checks-out the instance), and the passive-animation transport
+         (4a) genuinely needs them. So §7's "delete `ProviderState` + its mutex" and "the
+         `GuestImpl`/`LiveImpl` binding split" presuppose the **transport merge** (give a library
+         instance its own serve loop) that 6d.4's scope note explicitly rejected for reversing 4a.
+         The two goals are in tension inside this doc. **Recommendation: 6d.4 concludes at 6d.4.1.**
+         The clean structural win is banked (the offer powerbox is now the granted-child shared-cell
+         shape; the per-call `Arc::new` is gone); the residual is one uncontended nested lock
+         (`Mutex<Host>` inside `Mutex<ProviderState>`), inherent to a passive instance needing
+         checkout atomicity over {admission word, window} separate from its takeable powerbox. To
+         actually retire `ProviderState`, the owner would first have to renegotiate the 4a
+         passive-transport decision (or accept `LiveImpl` carrying inert admission/window fields —
+         bloat, not simplification). Left as an explicit owner call, not built.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
