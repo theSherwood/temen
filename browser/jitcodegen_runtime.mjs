@@ -62,7 +62,10 @@ async function main() {
   const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = Number(ex.svm_par_alloc(STACK)) + STACK;
-  if (ex.__tls_size.value > 0) ex.__wasm_init_tls(Number(ex.svm_par_alloc(ex.__tls_size.value + ex.__tls_align.value)));
+  // Single-vCPU run: TLS init only if the toolchain exported it (newer nightlies drop __wasm_init_tls).
+  if (ex.__wasm_init_tls && ex.__tls_size && ex.__tls_size.value > 0) {
+    ex.__wasm_init_tls(Number(ex.svm_par_alloc(ex.__tls_size.value + (ex.__tls_align?.value ?? 16))));
+  }
   const u8 = () => new Uint8Array(memory.buffer);
 
   // Parse SVM text → encoded module bytes (a stable copy in a fresh allocation).
