@@ -39,6 +39,13 @@
 //! branches — measured, the chain regressed the interpreters and the wasm-JIT tier while the
 //! br_table turns them into wins (`bench/src/bin/peval_indirect`).
 //!
+//! **Continuation folding.** A *small* continuation (the block tail after the call) is duplicated
+//! into every arm rather than shared, so an arm returns / branches directly instead of routing
+//! through one more block. This removes a block transition per iteration — which the svm-wasm-jit
+//! dispatcher charges (a linear-memory fuel check + a br_table redispatch), and which was the whole
+//! residual regression on that tier (measured: 0.79× → parity once folded). A large tail stays
+//! shared (avoiding `k`-fold code growth).
+//!
 //! **Soundness of the masked compare.** The interpreter dispatches `slot = idx & (next_pow2(n)-1)`
 //! then checks the target's signature, trapping `IndirectCallType` on a mismatch or empty slot
 //! ([`svm_interp`]'s `dispatch_indirect`). Baking the *same* mask and comparing against the
@@ -328,21 +335,51 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
         }
     }
 
-    // --- call arms: C_j = direct call to cands[j], then branch to the continuation ---
-    // Params of C_j: the live values (indices [0, nl)); the call results land at [nl, nl+r).
+    // Where a tail operand lands after the call: its live-param slot if it was a head value, else it
+    // shifts down by `head_count - nl` (the CI results at [nl, nl+r) and every later tail value line
+    // up after the params). Shared by the folded arms and the shared continuation.
+    let remap = |o: u32| -> u32 {
+        if o < head_count {
+            live_pos[&o]
+        } else {
+            o - head_count + nl
+        }
+    };
+
+    // --- call arms: C_j = direct call to cands[j]. When the continuation is small, its body is
+    // *folded into each arm* (tail duplication) so the arm returns/branches directly — removing a
+    // block transition per iteration, which the svm-wasm-jit dispatcher charges (a fuel check + a
+    // br_table redispatch). A large tail is not duplicated (k-fold code growth); the arms branch to
+    // one shared continuation instead. Params of C_j: the live values (indices [0, nl)). ---
+    /// Continuation size (instructions) up to which it is duplicated into every arm rather than
+    /// shared. Small tails are the common case (a loop back-edge, a return) and the ones that pay off.
+    const TAIL_DUP_LIMIT: usize = 8;
+    let dup = tail_insts.len() <= TAIL_DUP_LIMIT;
     for &target in &cands {
         let call_args: Vec<u32> = args.iter().map(|a| live_pos[a]).collect();
-        let cont_args: Vec<u32> = (0..nl + r as u32).collect(); // live ++ call results
+        let mut insts = vec![Inst::Call {
+            func: target,
+            args: call_args,
+        }];
+        let term = if dup {
+            for inst in &tail_insts {
+                let mut c = inst.clone();
+                map_operands(&mut c, &mut |o| remap(o));
+                insts.push(c);
+            }
+            let mut t = tail_term.clone();
+            map_term_operands(&mut t, &mut |o| remap(o));
+            t
+        } else {
+            Terminator::Br {
+                target: cont_blk,
+                args: (0..nl + r as u32).collect(), // live ++ call results
+            }
+        };
         new_blocks.push(Block {
             params: live_types.clone(),
-            insts: vec![Inst::Call {
-                func: target,
-                args: call_args,
-            }],
-            term: Terminator::Br {
-                target: cont_blk,
-                args: cont_args,
-            },
+            insts,
+            term,
         });
     }
 
@@ -354,30 +391,24 @@ fn split_site(f: &mut Func, site: Site, types: &[Vec<ValType>], mask: i32, fn_re
         term: Terminator::Unreachable,
     });
 
-    // --- continuation: the original tail, with operands remapped into CONT's value space.
-    // CONT params: live values [0, nl), then the CI results [nl, nl+r). A tail operand `o` maps to
-    // its live-param slot if it was a head value, else it shifts down by `head_count - nl` (the CI
-    // results and every later tail value line up after the params). ---
-    let remap = |o: u32| -> u32 {
-        if o < head_count {
-            live_pos[&o]
-        } else {
-            o - head_count + nl
+    // --- shared continuation (only when the tail was too large to fold into the arms): the original
+    // tail, operands remapped into its value space. CONT params: live values [0, nl), then the CI
+    // results [nl, nl+r). ---
+    if !dup {
+        let mut cont_insts = tail_insts;
+        for inst in &mut cont_insts {
+            map_operands(inst, &mut |o| remap(o));
         }
-    };
-    let mut cont_insts = tail_insts;
-    for inst in &mut cont_insts {
-        map_operands(inst, &mut |o| remap(o));
+        let mut cont_term = tail_term;
+        map_term_operands(&mut cont_term, &mut |o| remap(o));
+        let mut cont_params = live_types;
+        cont_params.extend_from_slice(&ty.results);
+        new_blocks.push(Block {
+            params: cont_params,
+            insts: cont_insts,
+            term: cont_term,
+        });
     }
-    let mut cont_term = tail_term;
-    map_term_operands(&mut cont_term, &mut |o| remap(o));
-    let mut cont_params = live_types;
-    cont_params.extend_from_slice(&ty.results);
-    new_blocks.push(Block {
-        params: cont_params,
-        insts: cont_insts,
-        term: cont_term,
-    });
 
     f.blocks.extend(new_blocks);
 }

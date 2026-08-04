@@ -424,3 +424,68 @@ fn high_index_cluster_uses_offset_table() {
         );
     }
 }
+
+/// A large continuation (more than the tail-duplication limit) must use the *shared* continuation
+/// block, not fold into every arm — keeps the `!dup` path covered and faithful.
+#[test]
+fn large_tail_uses_shared_continuation() {
+    let ty = FuncType {
+        params: vec![I64],
+        results: vec![I64],
+    };
+    let mut insts = vec![Inst::CallIndirect {
+        ty,
+        idx: 0,
+        args: vec![1],
+    }]; // r = v2
+        // 10 dependent adds of x into the result → an 11-inst tail after the call (> TAIL_DUP_LIMIT).
+    for k in 0..10u32 {
+        insts.push(Inst::IntBin {
+            ty: IntTy::I64,
+            op: BinOp::Add,
+            a: 2 + k,
+            b: 1,
+        });
+    }
+    let last = 2 + 10; // v12
+    let entry = Func {
+        params: vec![I32, I64],
+        results: vec![I64],
+        blocks: vec![Block {
+            params: vec![I32, I64],
+            insts,
+            term: Terminator::Return(vec![last]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![
+            entry,
+            unary(BinOp::Add, 1),
+            unary(BinOp::Mul, 2),
+            unary(BinOp::Sub, 3),
+        ],
+        memory: None,
+        data: vec![],
+        imports: vec![],
+        exports: vec![],
+        data_exports: vec![],
+        data_ptrs: vec![],
+        data_funcrefs: vec![],
+        impl_exports: vec![],
+        types: vec![],
+        debug_info: None,
+    };
+    verify_module(&m).expect("source verifies");
+    let low = lower_indirect_dispatch(&m, 8);
+    verify_module(&low).expect("shared-continuation-lowered verifies");
+    for sel in 1..=3i32 {
+        for x in [-4i64, 0, 6, 500] {
+            let a = &[Value::I32(sel), Value::I64(x)];
+            assert_eq!(
+                run(&m, a),
+                run(&low, a),
+                "shared cont diverged sel={sel} x={x}"
+            );
+        }
+    }
+}
