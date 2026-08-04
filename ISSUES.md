@@ -216,7 +216,7 @@ early-exit drain deterministic (flush/join the pipeline's stages in a fixed orde
 combined output), or have the test compare a set/sorted view of the lines rather than raw byte order.
 Low priority (S4) until it recurs; logged now so it isn't rediscovered from scratch.
 
-### I53 — `clone_caller::clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply` intermittently fails the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #539
+### I53 — `clone_caller::clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply` (and `pid_mode_…`) intermittently fail the Linux `build · test · fmt · clippy` gate (S4, flaky CI) — surfaced 2026-07-30 on PR #539 — **FIX LANDED 2026-08-04** (`claude/i53-flake-issues-9wnzzw`)
 
 **Symptom.** On PR #539 (a **docs + `#[ignore]`d-test + `workflows_src` only** change — zero lines in
 `crates/svm-interp`) the `build · test · fmt · clippy` job failed with
@@ -294,6 +294,37 @@ promotion/teardown diff touching nothing in the fork/clone path): one failure of
 `cargo test -p svm-interp` sweep, then **passed on the immediate full re-run and 3/3 isolated** on the
 same commit. Confirms the flake reproduces under **local** parallel load too (not only Windows CI),
 and is load-sensitive not diff-sensitive. Same I53 root class; no new information beyond that.
+
+**FIX LANDED (2026-08-04) — the two tests now use the FORK.md §8.6 `reap` idiom, closing BOTH serve/park
+races; no product change (the real fork path was always deterministic under a `wait`ing parent — this was
+a test-fixture race).** First **reproduced** it deterministically to confirm the diagnosis: hammering the
+`clone_caller` binary (`--test-threads=8` under CPU load) failed **5/200** in exactly the two documented
+faces — the two-reply test `left: 8, right: 16` (×3) and pid-mode `left: [I64(-11)]` (×2). Two distinct
+races, per the sightings above:
+
+- **Teardown-drain (both tests).** A fork twin is minted straight onto `runnable` with **no handle in
+  anyone's table** — a detached daemon — and INVARIANT #6 says root completion abandons daemons
+  (post-teardown sibling effects unspecified). The old fixtures had root `join` only the *original* `C`,
+  so the twin's stdout write raced teardown and was dropped (`left: 8`). **Fix:** the original **reaps**
+  its twin (`wait` verb, op 1 → `reap`, func 3 — the sibling `fork_then_wait` already used) before
+  returning, so the run cannot end until the twin has finished (and thus written). The twin's
+  deterministic `TaskId` is `3` (root 0, S 1, C 2, twin 3 — failed forks never consume an id, so the
+  *winning* fork always mints 3).
+- **Fork-park (pid mode).** `fork` can lose the enqueue-before-park window (server drains the dispatch
+  before `C` registers its `CapReply` waiter); pid mode answers `-EAGAIN`, so `C` retries
+  `while ((pid = fork()) < 0)`. This is what the `left: [-11]` sighting was.
+- **Fork-park (two-reply).** The explicit two-reply `clone_caller(reply_orig, reply_twin)` has **no
+  `-EAGAIN` signal** — on the lost race it *silently degrades to a single reply with no twin*. So the
+  guest detects it structurally: after the `reply_orig` (100) return, `reap(3)` answers `-ECHILD` (no
+  such twin) and `C` **re-forks**; a live twin instead makes `reap` retryable-`-EAGAIN` or delivers its
+  status, never `-ECHILD`. (This second face was invisible in the original two-reply fixture and is why
+  a reap-only fix still flaked ~6/400 until the re-fork was added.)
+
+**Verified robust:** the rewritten tests passed **1100/1100** hammered iterations (`--test-threads=8`,
+with and without background CPU contention) where the originals failed ~2.5%; full `cargo test -p
+svm-interp` + `fmt` + `clippy` green. Interp-only, like every fork test. This retires the whole I53
+family, including the `pid_mode` `-EAGAIN`/`-ECHILD` face and the §8.6 serve-race note recorded above —
+the standing mitigation (guest-side retry) is now baked into the fixtures themselves.
 
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
