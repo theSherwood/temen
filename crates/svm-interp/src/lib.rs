@@ -16152,6 +16152,23 @@ impl Host {
         Ok(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
     }
 
+    /// CALLS.md 5c.0 — the `child_offer` (op 14) mint over a **shared** child powerbox, for
+    /// backends whose children are not interp thread slots (the JIT's granted children, once
+    /// their `Host` is `Arc<Mutex<_>>`-shared). The op-14 arm's body minus the thread-slot
+    /// resolution: fetch the export shape from the **callee's** `self_module` (its guard dropped
+    /// before this table is touched — the two powerbox locks are never held together), then
+    /// install the live-impl entry and grant the handle. `None` on any miss (no `self_module`,
+    /// bad export, unknown interface) — the caller answers the op-14 probeable `-EINVAL`.
+    /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
+    /// [`Host::wire_live_impl`] rule).
+    pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
+        let sigs = callee
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .offer_shape(export)?;
+        Some(self.install_live_impl(Arc::clone(callee), export, sigs.into(), None))
+    }
+
     /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
     /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
     /// re-links it to the re-created child at this slot).
@@ -17180,6 +17197,8 @@ impl Host {
             return None;
         }
         let mut ch = Host::new();
+        // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
+        ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
@@ -17298,6 +17317,11 @@ impl Host {
             return None;
         }
         let mut ch = Host::new();
+        // §3.6/5c.0: a named-grant child runs the holder's own program, so its **self module** —
+        // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's
+        // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
+        // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
+        ch.self_module = self.self_module.clone();
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false));
         let cinst = ch.grant_instantiator(0, child_size);
