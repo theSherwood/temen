@@ -380,6 +380,79 @@ block 0 (v0: i64) {
   } catch (e) {
     set('instcodegen', 'fail', `instcodegen: error ${e}`);
   }
+
+  // --- 10) §14 **VM-in-VM real codegen** (nested instantiate on emitted wasm) -----------------------
+  // Same root, but the granted unit's entry USES its Instantiator: it reads its "K"=75, spawns a pure
+  // grandchild (→ 9) into a narrowed 1 KiB sub-carve of its own window, joins it, returns 84 →
+  // 8 × 84 = 672. With codegen the cap-using entry itself runs on EMITTED WASM (`compile_module_nested`
+  // — the browser's last §14 gap): its instantiate/join arrive as `env.instantiate`/`env.join` imports,
+  // serviced by the Worker through the same completion-slot protocol, the grandchildren spawning on
+  // their own Workers (17 total). Both tiers must agree, and codegen must actually emit (tierups —
+  // children AND their emitted grandchildren bump it).
+  try {
+    const guest = await fetchBytes('/corpus/threads_inst_mod.svmbc');
+    const unit = await fetchBytes('/corpus/threads_inst_nested_unit.svmbc');
+    const opt = { unit, winSize: 1 << 20 };
+    const t0 = performance.now();
+    const interp = await run(guest, { ...opt, inst: true });
+    const codegen = await run(guest, { ...opt, instCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups > 0;
+    set('instnested', ok ? 'pass' : 'fail',
+      `instnested: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
+      `(want 672, ${codegen.tierups} emitted incl. VM-in-VM parents) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`instnested → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('instnested', 'fail', `instnested: error ${e}`);
+  }
+
+  // --- 11) §22 **runtime-`Jit.compile` across Workers** (the multi-Worker runtime twin) -----------
+  // 8 worker vCPUs each compile their OWN unit at runtime through the shared Mutex<Host> powerbox
+  // (concurrent mutating compiles serialize on the lock) and `invoke` it (→ 7), folding an atomic
+  // counter → 56. Interp vs codegen must agree; with codegen every invoke runs the unit's emitted
+  // wasm per-Worker (tierups counts them). The browser twin of
+  // bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound.
+  try {
+    const guest = await fetchBytes('/corpus/jit_rt.svmbc');
+    const unit = await fetchBytes('/corpus/jit_rt_unit.svmbc');
+    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: unit }] };
+    const t0 = performance.now();
+    const interp = await run(guest, opt);
+    const codegen = await run(guest, { ...opt, jitRuntimeCodegen: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 56n && codegen.value === 56n && codegen.tierups > 0;
+    set('jitruntime', ok ? 'pass' : 'fail',
+      `jitruntime: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
+      `(want 56, ${codegen.tierups} runtime units ran on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`jitruntime → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('jitruntime', 'fail', `jitruntime: error ${e}`);
+  }
+
+  // --- 12) §22 **cross-Worker Model B2** (install → call_indirect through the table mirror) --------
+  // 8 workers each runtime-compile a leaf (→ 7), `install` it into the shared dispatch table (raced
+  // slots), runtime-compile a dispatcher whose body `call_indirect`s a slot, and `invoke` it passing
+  // their slot. Interp: the dispatch runs over the shared interpreter Domain. Codegen (+B2): the
+  // dispatcher runs on B2-emitted wasm — its call_indirect goes through THIS Worker's
+  // WebAssembly.Table mirror of the shared slot→unit map (worker.js syncs before each invoke). Both
+  // → 56. The browser twin of b2_install.rs + parallel_install_call_indirect_matches_oracle.
+  try {
+    const guest = await fetchBytes('/corpus/jit_b2.svmbc');
+    const leaf = await fetchBytes('/corpus/jit_rt_unit.svmbc');
+    const disp = await fetchBytes('/corpus/jit_b2_unit.svmbc');
+    const opt = { jitRuntime: true, jitBlobs: [{ off: 0x2000, bytes: leaf }, { off: 0x3000, bytes: disp }] };
+    const t0 = performance.now();
+    const interp = await run(guest, opt);
+    const codegen = await run(guest, { ...opt, jitRuntimeCodegen: true, jitB2: true });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = interp.value === 56n && codegen.value === 56n && codegen.tierups > 0;
+    set('jitb2', ok ? 'pass' : 'fail',
+      `jitb2: ${codegen.started} Workers · interp → ${interp.value} · B2 codegen → ${codegen.value} ` +
+      `(want 56, ${codegen.tierups} B2 dispatches on emitted wasm) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`jitb2 → interp ${interp.value} / B2 ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('jitb2', 'fail', `jitb2: error ${e}`);
+  }
 }
 
 main().catch((e) => { log(`fatal: ${e}\n${e.stack ?? ''}`); set('threads', 'fail', `fatal: ${e}`); });

@@ -1221,6 +1221,169 @@ block 0 (v0: i64) {
 }
 "#;
 
+// The **§14 VM-in-VM** granted module: like [`THREADS_INST_UNIT`] but the entry *uses* its
+// `Instantiator` — it reads its own data byte ("K" = 75), `instantiate`s func 1 (a pure grandchild →
+// 9) into a **narrowed** 1 KiB sub-carve of its own window, `join`s it, and returns 75 + 9 = 84. With
+// the same [`THREADS_INST_MOD`] root: 8 × 84 = 672. On the codegen tier the entry emits via
+// `compile_module_nested` — its `cap.call 6 0/1` become `env.instantiate`/`env.join` serviced by the
+// Worker through the confined-child completion-slot protocol (grandchildren spawn on their own
+// Workers), differential against the interpreter's driver servicing the same ops.
+const THREADS_INST_NESTED_UNIT: &str = r#"memory 16
+data 0 "K"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vinst = i32.wrap_i64 v0
+  vz = i64.const 0
+  vk32 = i32.load8_u vz
+  vk = i64.extend_i32_u vk32
+  ventry = i64.const 1
+  voff = i64.const 0
+  vslog = i64.const 10
+  vquota = i64.const 0
+  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vg = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vr = i64.add vk vg
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 9
+  return v1
+  }
+}
+"#;
+
+// §22 runtime-compile unit for the multi-Worker twins: `() -> (i32)` returning 7 — each worker vCPU
+// compiles it AT RUNTIME (`cap.call 11 0`) from the blob the harness stages in the window.
+const JIT_RT_UNIT: &str = r#"memory 16
+func () -> (i32) {
+block 0 () {
+  v1 = i32.const 7
+  return v1
+  }
+}
+"#;
+
+// §22 Model-B2 dispatcher unit: `(i64 slot) -> (i32)` — `call_indirect`s the given shared-table slot.
+// Emitted in B2 mode it imports the shared reserved funcref table; each Worker's mirror routes the
+// slot to whatever unit is installed there (cross-Worker install → dispatch).
+const JIT_B2_UNIT: &str = r#"memory 16
+func (i64) -> (i32) {
+block 0 (vs: i64) {
+  vs32 = i32.wrap_i64 vs
+  vr = call_indirect () -> (i32) vs32 ()
+  return vr
+  }
+}
+"#;
+
+/// Root `(jit) -> counter`: spawn 8 workers, each **runtime-`compile`s** the [`JIT_RT_UNIT`] blob
+/// staged at `off` and `invoke`s its own unit (→ 7), atomically folding into `mem[8]` → 56. The
+/// multi-Worker twin of `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound`.
+fn jit_rt_guest(off: usize, blob_len: usize) -> String {
+    format!(
+        "{JIT_PAR_ROOT}func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, vp: i64) {{
+  vjit = i32.wrap_i64 vp
+  vptr = i64.const {off}
+  vlen = i64.const {blob_len}
+  vcode = cap.call 11 0 (i64, i64) -> (i64) vjit (vptr, vlen)
+  vw = cap.call 11 1 (i64) -> (i32) vjit (vcode)
+  vw64 = i64.extend_i32_u vw
+  vc8 = i64.const 8
+  vold = i64.atomic.rmw.add vc8 vw64
+  vret = i64.const 0
+  return vret
+  }}
+}}
+"
+    )
+}
+
+/// Root `(jit) -> counter`: spawn 8 workers, each runtime-compiles the leaf [`JIT_RT_UNIT`] (at
+/// `offa`), **`install`s** it into the shared dispatch table (a raced slot), runtime-compiles the
+/// [`JIT_B2_UNIT`] dispatcher (at `offb`), and `invoke`s it passing its slot — the dispatcher's
+/// `call_indirect` lands in the installed leaf (→ 7); fold → 56. On the codegen tier the dispatcher
+/// runs on B2-emitted wasm, dispatching through the per-Worker table mirror (cross-Worker §22 B2).
+fn jit_b2_guest(offa: usize, len_a: usize, offb: usize, len_b: usize) -> String {
+    format!(
+        "{JIT_PAR_ROOT}func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, vp: i64) {{
+  vjit = i32.wrap_i64 vp
+  vpa = i64.const {offa}
+  vla = i64.const {len_a}
+  vca = cap.call 11 0 (i64, i64) -> (i64) vjit (vpa, vla)
+  vslot = cap.call 11 3 (i64) -> (i64) vjit (vca)
+  vpb = i64.const {offb}
+  vlb = i64.const {len_b}
+  vcb = cap.call 11 0 (i64, i64) -> (i64) vjit (vpb, vlb)
+  vr = cap.call 11 1 (i64, i64) -> (i32) vjit (vcb, vslot)
+  vr64 = i64.extend_i32_u vr
+  vc8 = i64.const 8
+  vold = i64.atomic.rmw.add vc8 vr64
+  vret = i64.const 0
+  return vret
+  }}
+}}
+"
+    )
+}
+
+/// The shared root skeleton of the two §22 multi-Worker twins: `(i32 jit) -> (i64)` — spawn 8
+/// workers (func 1) each handed the `Jit` handle, join them, return the folded counter at `mem[8]`.
+const JIT_PAR_ROOT: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vjit0: i32) {
+  vje = i64.extend_i32_u vjit0
+  vi0 = i64.const 0
+  br 1(vi0, vje)
+}
+block 1 (vi: i64, vp: i64) {
+  vn = i64.const 8
+  vlt = i64.lt_u vi vn
+  br_if vlt 2(vi, vp) 3()
+}
+block 2 (vi2: i64, vp2: i64) {
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vp2
+  v4 = i64.const 4
+  v5 = i64.mul vi2 v4
+  v6 = i64.const 16
+  v7 = i64.add v6 v5
+  i32.store v7 vt
+  v8 = i64.const 1
+  v9 = i64.add vi2 v8
+  br 1(v9, vp2)
+}
+block 3 () {
+  vj0 = i64.const 0
+  br 4(vj0)
+}
+block 4 (vj: i64) {
+  vn2 = i64.const 8
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 5(vj) 6()
+}
+block 5 (vj2: i64) {
+  v13 = i64.const 4
+  v14 = i64.mul vj2 v13
+  v15 = i64.const 16
+  v16 = i64.add v15 v14
+  v17 = i32.load v16
+  v18 = thread.join v17
+  v19 = i64.const 1
+  v20 = i64.add vj2 v19
+  br 4(v20)
+}
+block 6 () {
+  v21 = i64.const 8
+  v22 = i64.atomic.load v21
+  return v22
+  }
+}
+"#;
+
 // Root `(instantiator, module) -> sum`: `instantiate_module` the granted module 8 times, join, sum —
 // compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
 const THREADS_INST_MOD: &str = r#"memory 20
@@ -1982,6 +2145,16 @@ fn main() {
     emit("threads_inst_nested", THREADS_INST_NESTED);
     emit("threads_inst_mod", THREADS_INST_MOD);
     emit("threads_inst_unit", THREADS_INST_UNIT);
+    emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
+    // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them
+    // (blob offsets/lengths baked into the guest's `compile (ptr, len)` sites; the harness stages
+    // the encoded unit files at those window offsets).
+    let rt_len = svm_encode::encode_module(&svm_text::parse_module(JIT_RT_UNIT).unwrap()).len();
+    let b2_len = svm_encode::encode_module(&svm_text::parse_module(JIT_B2_UNIT).unwrap()).len();
+    emit("jit_rt_unit", JIT_RT_UNIT);
+    emit("jit_b2_unit", JIT_B2_UNIT);
+    emit("jit_rt", &jit_rt_guest(0x2000, rt_len));
+    emit("jit_b2", &jit_b2_guest(0x2000, rt_len, 0x3000, b2_len));
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000

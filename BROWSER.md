@@ -749,8 +749,11 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
    runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
    `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
-   single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; a multi-Worker Node/Chromium twin is the
-   remaining **end-to-end** verification.
+   single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; the **multi-Worker Chromium twin landed**
+   as the CI-gated `jitruntime` work item (`browser-test.mjs`): 8 worker vCPUs each runtime-compile
+   their own unit through the shared powerbox and invoke it on per-Worker emitted wasm — interp ≡
+   codegen ≡ 56 across 9 Workers, verified in real Chromium (par.js's `jitRuntime`/`jitBlobs` options
+   publish the runtime powerbox + stage the blobs).
    **[landed — §22 Model B2 emitter mechanism + native cross-instance differential]** An installed
    unit can now be a funcref another instance's `call_indirect` reaches through **one shared reserved
    funcref table**. [`svm_wasm_jit::compile_module_b2`] emits a module that *imports*
@@ -785,11 +788,13 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    nulling empty slots so a stale `call_indirect` traps), then runs the invoked unit resolved by its
    code handle; `par.js` sets the toggle + passes `jitB2`. The **mirror design is proven native** by
    `b2_install.rs::b2_per_worker_mirror_is_consistent` (8 threads each build an independent domain from
-   the same install map, all agreeing with the interpreter oracle). **Pending:** this multi-Worker JS
-   path has no native/CI harness in-repo — it needs a Chromium/Node end-to-end twin, and the
-   multi-Worker runtime-compile powerbox itself is still only driven by the single-Worker
-   `jitcodegen_runtime.mjs` (par.js's `runAcrossWorkers` carries the `jitB2` flag but not yet the
-   runtime-powerbox setup).
+   the same install map, all agreeing with the interpreter oracle). **End-to-end verified:** the CI-gated `jitb2` work item
+   (`browser-test.mjs`) drives the whole story in real Chromium — 8 workers each runtime-compile a
+   leaf, `install` it into the shared table (raced slots), runtime-compile a `call_indirect`
+   dispatcher, and invoke it: on the B2 tier the dispatch goes through each Worker's own table mirror
+   (synced before every invoke) — interp ≡ B2 codegen ≡ 56 across 9 Workers. par.js's `jitRuntime`
+   branch supplies the once-missing runtime-powerbox setup (publish + blob staging + recipe
+   self-cleaning: `powerbox_none` first, the sticky B2 flag set explicitly both ways).
    **[landed — §14 VM-in-VM emitter mechanism + native differential]** A unit whose entry *uses* its
    `Instantiator` cap (spawns a nested confined VM + `join`s it) now emits, where before **any**
    `cap.call` forced the whole entry onto the interpreter (`block_value_types` rejected it).
@@ -815,10 +820,25 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    mask-only confinement, so they stay on the interpreter, deferred with the D40/§13 page-enforcement
    question. Coroutine/`Yielder` ops are deliberately **never** lowered on this tier — CONSOLIDATION.md
    §2 deletes them onto the unified offer, so any wasm-tier arm would be work queued for deletion.
-   **Deferred:** the **browser driver wiring** (`worker.js`/`par.js` servicing `env.instantiate` by
-   spawning the child on a Worker into the confined-child completion-slot protocol —
-   *browser-verification pending*). *(All scalar unit signatures — i32/i64/f32/f64 — now marshal by
-   type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design, §17.)*
+   **[landed — the browser driver wiring, real-browser-verified]** A confined child whose granted-unit
+   entry *uses* its `Instantiator` now runs on emitted wasm in the browser: `svm_par_enable_inst_codegen`
+   emits the granted module via `compile_module_nested` first (falling back to the tier-up shape — an
+   ADDRESS_SPACE-using entry fails closed to the interpreter until the browser's `call_interp` carries a
+   powerbox), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
+   through the *same* confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms
+   — the grandchild spawns on its own Worker via the page relay; `env.join` `Atomics.wait`s its slot;
+   the carve checks (power-of-two, aligned, inside the child's own window) replicate the engine's, so a
+   violation traps exactly as the interpreter does. Wiring this surfaced two pre-existing depth-2 bugs,
+   both fixed: `event_instantiate` validated against `primary()` and stamped `module: 0` (an op-0
+   instantiate from an `instantiate_module` child got `-EINVAL`; it now uses the calling frame's
+   module), and the JS JOIN arms hung on a bad handle (`Atomics.wait` on address 0; they now deliver a
+   trap). Pinned by the `instnested` work item (`threads_inst_nested_unit`: entry reads its "K"=75,
+   spawns a pure grandchild → 9 into a narrowed 1 KiB sub-carve, joins → 84; root sums 8 × 84 = 672) —
+   interp ≡ codegen ≡ 672 across **17 Workers** with **16 on emitted wasm** (the cap-using parents
+   themselves + their grandchildren), verified in Node (`threads-spawn.mjs`, ported in parity) and in
+   real Chromium (`browser-test.mjs`, CI-gated). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
+   §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `svm-wasmjit` cross-engine bench
    row (`browser/bench_jit.mjs` + `cross_engine.rs`, cross-checked vs native) measures **~16–112×**
    over interp-in-wasm across the integer kernels (alu/xorshift/call/mem/chase/chase_rand/fnv),

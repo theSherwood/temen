@@ -2972,8 +2972,17 @@ impl<'p> Vcpu<'p> {
         quota: i64,
         dst: u32,
     ) -> Option<VcpuEvent> {
-        let c0 = self.prog.dom.source.primary();
-        let ok_entry = c0.sigs.get(entry as usize).is_some_and(|(p, r)| {
+        // The child runs in the CALLING frame's module — module 0 for a root/plain guest, the granted
+        // module for an `instantiate_module` child whose entry itself instantiates (§14 nesting
+        // composes across `instantiate_module`). Validating against `primary()` here used to send a
+        // module-child's nested instantiate to `-EINVAL` (its entry index doesn't exist in module 0).
+        let cur_module = self.vt.active.module;
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        let Some(cm) = dom.source.get(cur_module) else {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return None;
+        };
+        let ok_entry = cm.sigs.get(entry as usize).is_some_and(|(p, r)| {
             r[..] == [ValType::I64]
                 && (p[..] == [ValType::I64] || p[..] == [ValType::I64, ValType::I64])
         });
@@ -3002,7 +3011,7 @@ impl<'p> Vcpu<'p> {
         };
         self.pending = Some(dst);
         Some(VcpuEvent::Instantiate {
-            module: 0,
+            module: cur_module as u32,
             entry: entry as u32,
             carve,
             size_log2: size_log2 as u8,

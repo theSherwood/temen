@@ -31,7 +31,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2 } = e.data;
+    jitB2, jitRuntime } = e.data;
   // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
   // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -117,8 +117,8 @@ self.onmessage = async (e) => {
   if (jitB2) {
     const size = 1 << ex.svm_par_jit_table_log2();
     jitTable = new WebAssembly.Table({ initial: size, maximum: size, element: 'anyfunc' });
-    if (!jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   }
+  if ((jitB2 || jitRuntime) && !jitEnvCell) jitEnvCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
   // Instantiate a unit's emitted bytes importing this Worker's shared table, or null if not emitted.
   const jitInstantiate = (bytes) =>
     new WebAssembly.Instance(new WebAssembly.Module(bytes), {
@@ -152,20 +152,61 @@ self.onmessage = async (e) => {
     }
   };
 
-  // §14 instantiate real codegen (BROWSER.md slice 5): a confined child whose granted-unit entry is
-  // fully in-subset runs it on EMITTED WASM here and fills the completion slot the parent joins — no
+  // §14 instantiate real codegen (BROWSER.md slice 5 + VM-in-VM): a confined child whose granted-unit
+  // entry is eligible runs it on EMITTED WASM here and fills the completion slot the parent joins — no
   // vCPU. The unit's data segments were materialized into the carve by the parent before this event,
-  // so `f{entry}(win=carveBase, env, …cap-handle args a pure unit ignores)` reads them. A cap-using
-  // entry isn't in-subset (`svm_par_inst_eligible` is 0), so it falls through to the interpreter.
+  // so `f{entry}(win=carveBase, env, …cap-handle args a pure unit ignores)` reads them. With the
+  // nested emit (`compile_module_nested`) a cap-using entry is ALSO eligible: its `cap.call 6 0/1`
+  // (instantiate/join) arrives here as the `env.instantiate`/`env.join` imports, serviced through the
+  // SAME confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms below —
+  // the grandchild spawns on its own Worker (page relay), and `env.join` blocks on its slot with
+  // `Atomics.wait` (legal in a Worker). A non-nested (2-import) unit simply ignores the extra keys.
   if (role === 'confined' && instCodegen && ex.svm_par_enable_inst_codegen() === 1
       && ex.svm_par_inst_eligible(entry) === 1) {
     const wptr = Number(ex.svm_par_inst_unit_wasm_ptr()), wlen = ex.svm_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
         trap: () => {},
         call_interp: (f, a) => { if (ex.svm_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        // §14 VM-in-VM spawn bounce. The emitted parent does no confinement itself, so the engine's
+        // `event_instantiate` carve checks are replicated here: the grandchild's power-of-two carve
+        // must be aligned and lie inside THIS child's own window (confinement composes); a violation
+        // throws → this child's slot reads trapped, exactly as the interpreter traps the parent.
+        // The `inst` handle arg is inert (0n) on the emitted tier — authority is this child's §14
+        // construction itself (every confined child holds an attenuated Instantiator), mirroring the
+        // native harness (crates/svm-wasm-jit/tests/nested_vm.rs).
+        instantiate: (cwin, _inst, centry, off, cslog, quota) => {
+          const gsize = 1 << Number(cslog), goff = Number(off);
+          if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize)
+            throw new Error('bad nested carve');
+          const gslot = ex.svm_par_alloc(SLOT);
+          const gstackTop = ex.svm_par_alloc(STACK) + STACK;
+          const gtlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+          // Fuel: min(quota, parent's) — the emitted tier tracks fuel coarsely (the env-cell
+          // counter), so "parent's" is this child's own granted fuel from its init cfg.
+          const pf = BigInt(fuel);
+          const gfuel = quota > 0n && quota < pf ? quota : pf;
+          self.postMessage({
+            kind: 'spawn', role: 'confined', smod, entry: Number(centry), slog: Number(cslog),
+            fuel: gfuel.toString(), win: cwin + goff, winSize: gsize,
+            slot: gslot, stackTop: gstackTop, tlsBase: gtlsBase,
+          });
+          const h = childSlots.length;
+          childSlots.push(gslot);
+          return h;
+        },
+        // §14 VM-in-VM join: block on the grandchild's completion slot — the same wait the
+        // interpreter JOIN arm does — and surface its result (or trap) to the emitted parent.
+        join: (_inst, child) => {
+          const gslot = childSlots[child];
+          if (gslot === undefined) throw new Error('join of unknown child');
+          Atomics.wait(i32(), gslot >> 2, 0);
+          if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
+          return i64()[(gslot + 8) >> 3];
+        },
       },
     });
     const envCell = Number(ex.svm_par_alloc(ex.svm_wasmjit_env_bytes()));
@@ -256,6 +297,7 @@ self.onmessage = async (e) => {
     }
     if (evc === JOIN) {
       const cslot = handles[Number(ex.svm_par_ev_a(v))];
+      if (cslot === undefined) { ex.svm_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       ex.svm_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
@@ -336,8 +378,12 @@ self.onmessage = async (e) => {
       if (jitB2) {
         jitSyncTable();
         unit = jitUnitFor(ex.svm_par_jit_code(v));
-        if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      } else if (!unit) {
+        // Runtime-`Jit.compile` path without B2: resolve the invoked unit by its code handle (each
+        // Worker instantiates + caches per handle; the emitted bytes live on the shared host).
+        unit = jitUnitFor(ex.svm_par_jit_code(v));
       }
+      if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];

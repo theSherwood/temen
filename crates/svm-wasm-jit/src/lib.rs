@@ -1193,7 +1193,13 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
 /// leaf** via `env.call_interp` iff its signature is all-integer — the [`outline_nested_cap_calls`]
 /// ADDRESS_SPACE wrappers ride this (run them with a powerbox-carrying callback) — else `Err`; the
 /// entry (func 0) must itself be emittable.
-pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
+/// [`compile_module_nested`] plus the per-function emit map (like [`compile_module_tierup`]'s
+/// `emitted`): `eligible[i]` iff `f{i}` is an emitted export a host may call directly — the browser's
+/// per-entry `svm_par_inst_eligible` gate. A cross-tier leaf (an outlined wrapper) is `false`.
+pub fn compile_module_nested_with_eligibility(
+    m: &Module,
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
     // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers) reached
@@ -1223,7 +1229,8 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
     if wasm_of.first().copied().flatten().is_none() {
         return Err(Error::Unsupported("nested entry outside the subset"));
     }
-    emit_module(
+    let eligible: Vec<bool> = wasm_of.iter().map(|w| w.is_some()).collect();
+    let wasm = emit_module(
         m,
         shared_memory,
         &emitted,
@@ -1231,7 +1238,13 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
         &interp_leaf,
         None,
         true,
-    )
+    )?;
+    Ok((wasm, eligible))
+}
+
+/// The wasm-only front of [`compile_module_nested_with_eligibility`] (the original signature).
+pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
+    compile_module_nested_with_eligibility(m, shared_memory).map(|(w, _)| w)
 }
 
 /// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a

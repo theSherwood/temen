@@ -63,7 +63,7 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null, jitB2 = false } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.svm_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.svm_par_powerbox(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox failed');
@@ -76,12 +76,27 @@ export function makeRunner({ module, memory, ex }) {
     // provides its own `WebAssembly.Table` mirror (`jitB2` in the cfg → worker.js). Browser-
     // verification pending — see BROWSER.md § "wasm-JIT tier".
     if (jitB2) ex.svm_par_jit_set_b2(1);
+    // §22 runtime-`Jit.compile` across Workers: publish the shared Mutex<Host> powerbox every vCPU
+    // dispatches its cap.calls through (the guest compiles its OWN units at runtime); with
+    // `jitRuntimeCodegen` each compiled unit's emitted wasm services `Jit.invoke` per-Worker
+    // (worker.js instantiates per code handle). `jitBlobs` stages the unit blobs into the window
+    // where the guest's `compile (ptr, len)` reads them.
+    if (jitRuntime) {
+      // Self-clean: clear any prior run's recipe (svm_par_root checks the §14/§22-fixed recipes
+      // first, so a stale one would hijack this run), and set the B2 flag explicitly both ways —
+      // it is a sticky static that powerbox_none does not reset.
+      ex.svm_par_powerbox_none();
+      ex.svm_par_jit_set_b2(jitB2 ? 1 : 0);
+      if (ex.svm_par_powerbox_jit_runtime(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_runtime failed');
+      ex.svm_par_jit_set_codegen(jitRuntimeCodegen ? 1 : 0);
+    }
     if (jitCodegen && ex.svm_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('svm_par_powerbox_jit_codegen failed');
     if (io && ex.svm_par_powerbox_io() !== 1) throw new Error('svm_par_powerbox_io failed');
-    if (!jit && !jitCodegen && !io && !inst && !instCodegen) ex.svm_par_powerbox_none();
-    const prog = (jit || jitCodegen) ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
+    if (!jit && !jitCodegen && !io && !inst && !instCodegen && !jitRuntime) ex.svm_par_powerbox_none();
+    const prog = (jit || jitCodegen || jitRuntime) ? ex.svm_par_compile_jit(gptr, guest.length) : ex.svm_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('module unsupported on the parallel driver (svm_par_compile null)');
     const win = ex.svm_par_alloc(winSize);
+    for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
     // §14 real-codegen (`instCodegen`) publishes the same recipe as `inst`; each confined child whose
     // granted-unit entry is emitted runs it on wasm instead of interpreting (see worker.js).
     if (inst || instCodegen) {
@@ -99,7 +114,7 @@ export function makeRunner({ module, memory, ex }) {
     // A shared i32 cell every Worker atomically bumps each time it runs an emitted region (a tier-up
     // or a §22 JIT-codegen invoke), so the caller can prove the seam actually fired (a result match
     // alone can't tell "ran emitted wasm" from "silently interpreted"). Read back after the run.
-    const tierupCell = (tierup || jitCodegen || instCodegen) ? ex.svm_par_alloc(4) : 0;
+    const tierupCell = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? ex.svm_par_alloc(4) : 0;
 
     const workers = new Set();
     let started = 0;
@@ -129,7 +144,7 @@ export function makeRunner({ module, memory, ex }) {
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
           // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
           // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, gptr, glen: guest.length, tierupCell, ...cfg });
+          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, jitRuntime, gptr, glen: guest.length, tierupCell, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.svm_par_alloc(SLOT);
@@ -137,7 +152,7 @@ export function makeRunner({ module, memory, ex }) {
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.svm_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
-      const tierups = (tierup || jitCodegen || instCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
+      const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, started, tierups };
     } finally {
       for (const w of workers) w.terminate();
