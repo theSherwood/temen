@@ -3916,6 +3916,17 @@ enum Blocked {
     /// back into the handler ([`OfferParked`]). Filed in `svc_waiters` (reusing that map + its
     /// wake), with the same park-vs-wake recheck the [`Blocked::SvcWait`] handler uses.
     OfferPark { key: usize },
+    /// CALLS.md 4c.1 — the caller of a `single` instanced offer held **busy by a different vCPU**
+    /// (genuine concurrent contention). Instead of a probeable `-EAGAIN`, the offer op is rewound
+    /// and the caller parks as an **admission-waiter**, keyed by the `ProviderState` identity
+    /// (`key` = its `Arc` pointer — the instance's world is checked out on the holder, so its domain
+    /// id is unreadable; the pointer is a stable per-instance key both sides compute). When the
+    /// holder clears `busy` (the 4a settle or a 4b promotion-park) it wakes these waiters and the
+    /// rewound op re-attempts admission (winning, or re-parking on a lost race). Distinct from
+    /// `OfferPark`: that vCPU carries a promoted handler to resume; this one is only waiting to
+    /// *start* one. A self-re-entrant call (the instance on the caller's own `offer_anim` stack) is
+    /// **not** filed here — it has no distinct holder to wait for (4c.2 handles it inline).
+    OfferAdmit { key: usize },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -4085,6 +4096,16 @@ struct Sched {
     /// this map and `runnable` as a pointer, never by value.)
     #[allow(clippy::vec_box)]
     svc_waiters: BTreeMap<usize, Vec<Box<VCpu>>>,
+    /// CALLS.md 4c.1 — **admission-waiters** on a busy `single` instanced offer, keyed by the
+    /// `ProviderState` identity (its `Arc` pointer; see [`Blocked::OfferAdmit`]). A distinct-vCPU
+    /// caller that lost the busy race parks here (its offer op rewound) instead of spinning on
+    /// `-EAGAIN`; the holder wakes them when it clears `busy`, and the rewound op re-attempts. A
+    /// separate map from `svc_waiters` so the two wake kinds never cross (an admission-waiter has no
+    /// promoted handler, only a pending admission). Bounded per instance by
+    /// [`ProviderState::admit_parked`] (checked under the state lock), so this never grows past the
+    /// rim — over it the caller gets `-EAGAIN`.
+    #[allow(clippy::vec_box)]
+    admit_waiters: BTreeMap<usize, VecDeque<Box<VCpu>>>,
     /// Min-heap of `(deadline, waiter id, futex key)` for timing out `wait`s.
     timers: BinaryHeap<Reverse<(Instant, u64, FutexKey)>>,
     /// Min-heap of `(deadline, domain key, task)` for the I38 **timed `svc.wait`** — fired by
@@ -4325,6 +4346,22 @@ impl Scheduler {
             true
         } else {
             false
+        }
+    }
+
+    /// CALLS.md 4c.1 — a `single` instance (`ProviderState` pointer `key`) just cleared `busy`:
+    /// re-admit every caller parked as an **admission-waiter** on it (all of them — the winner takes
+    /// the instance, the losers re-park on their re-executed offer op, the ordinary futex-retry
+    /// shape). Idempotent: an instance with no waiters is a no-op. Called at each point the holder
+    /// frees the instance (the 4a settle, a 4b promotion-park, the fiber-exhaustion undo).
+    fn admit_wake(&self, key: usize) {
+        let mut s = self.lock();
+        if let Some(q) = s.admit_waiters.remove(&key) {
+            if !q.is_empty() {
+                s.runnable.extend(q);
+                drop(s);
+                self.work.notify_all();
+            }
         }
     }
 
@@ -4587,6 +4624,11 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     for anim in &v.offer_anim {
         anim.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
     }
+    // CALLS.md 4c.1 — a reaped admission-waiter drops out of its instance's `admit_parked` count
+    // (it will never re-attempt), so a reused `Host`'s bound stays accurate.
+    if let Some(state) = &v.admit_retry {
+        state.lock().unwrap_or_else(|e| e.into_inner()).admit_parked -= 1;
+    }
     if v.vcpu_ctx > 0 {
         v.registry.free_vcpu_context(v.vcpu_ctx);
     }
@@ -4732,6 +4774,22 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
         }
     }
     s.svc_waiters.retain(|_, q| !q.is_empty());
+    // CALLS.md 4c.1 — admission-waiters are keyed by the provider instance, so a dying domain's
+    // caller waiting on a *live* provider sits under that provider's key: scan by identity too
+    // (reap drops each one's `admit_parked` count).
+    for q in s.admit_waiters.values_mut() {
+        let mut i = 0;
+        while i < q.len() {
+            if domain_key_of(&q[i]) == key {
+                if let Some(vv) = q.remove(i) {
+                    victims.push(vv);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    s.admit_waiters.retain(|_, q| !q.is_empty());
     let mut tickets: Vec<u64> = Vec::new();
     for v in victims {
         tickets.extend(reap(s, v, reason.clone()));
@@ -4782,6 +4840,10 @@ fn teardown_run(s: &mut Sched) {
     }
     for (_, vs) in std::mem::take(&mut s.svc_waiters) {
         victims.extend(vs);
+    }
+    // CALLS.md 4c.1 — abandon every parked admission-waiter too (reap drops its `admit_parked`).
+    for (_, q) in std::mem::take(&mut s.admit_waiters) {
+        victims.extend(q);
     }
     for v in victims {
         let reason = s
@@ -5392,6 +5454,31 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 sched.work.notify_one();
             } else {
                 s.svc_waiters.entry(key).or_default().push(v);
+            }
+        }
+        Step::Park(Blocked::OfferAdmit { key }) => {
+            // CALLS.md 4c.1 — park the caller of a busy `single` instance as an admission-waiter
+            // (keyed by the `ProviderState` pointer). Lost-wakeup guard, the `SvcWait` shape: the
+            // holder may have cleared `busy` + `admit_wake`d in the enqueue→park window (before this
+            // vCPU registered), so that wake was dropped. Under the scheduler lock, re-read `busy`
+            // (via the carried `admit_retry` instance); if the instance is already free, re-admit
+            // instead of parking — the rewound offer op re-attempts admission. `admit_wake` and this
+            // handler both hold the scheduler lock, so the check-and-park cannot race the wake.
+            let mut s = sched.lock();
+            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+            let Some(v) = park_gate(&mut s, v) else {
+                sched.work.notify_all();
+                return;
+            };
+            let freed = v
+                .admit_retry
+                .as_ref()
+                .is_some_and(|st| !st.lock().unwrap_or_else(|e| e.into_inner()).busy);
+            if freed {
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+            } else {
+                s.admit_waiters.entry(key).or_default().push_back(v);
             }
         }
         Step::Yield => {
@@ -6020,7 +6107,8 @@ impl SchedDriver {
                     Blocked::CapRead { .. }
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
-                    | Blocked::OfferPark { .. },
+                    | Blocked::OfferPark { .. }
+                    | Blocked::OfferAdmit { .. },
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -7191,6 +7279,12 @@ struct VCpu {
     /// one at a time, since a vCPU parks on a single block event (enclosing animations are
     /// suspended resumers on the `offer_anim` stack, not parked). See [`OfferParked`].
     offer_parked: Option<OfferParked>,
+    /// CALLS.md 4c.1 — set while this vCPU is parked as an **admission-waiter** on a busy instance
+    /// (`Blocked::OfferAdmit`): the `ProviderState` it is waiting to enter. On resume (the holder
+    /// woke it) the offer op re-executes; this handle lets the resume decrement that instance's
+    /// `admit_parked` count before the re-attempt (keeping the bound accurate). `None` whenever the
+    /// vCPU is not a parked admission-waiter.
+    admit_retry: Option<Arc<Mutex<ProviderState>>>,
 }
 
 /// §3.6 slice 5b — the serve loop's in-flight handler: the registry slot/handle the handler
@@ -7281,6 +7375,7 @@ impl VCpu {
             serve_count: 0,
             offer_anim: Vec::new(),
             offer_parked: None,
+            admit_retry: None,
         }
     }
 
@@ -7345,6 +7440,7 @@ impl VCpu {
             serve_count: 0,
             offer_anim: Vec::new(),
             offer_parked: None,
+            admit_retry: None,
         })
     }
 
@@ -7431,6 +7527,7 @@ impl VCpu {
             serve_count: 0,
             offer_anim: Vec::new(),
             offer_parked: None,
+            admit_retry: None,
         }
     }
 
@@ -7863,6 +7960,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         serve_count,
         offer_anim,
         offer_parked,
+        admit_retry,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -7880,6 +7978,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
     // root/fiber exits read out of the same buffer.
     let mut ret_buf: Vec<Reg> = Vec::new();
+
+    // CALLS.md 4c.1 — a woken **admission-waiter** (parked on a busy instance via
+    // `Blocked::OfferAdmit`) is no longer queued: drop the instance's `admit_parked` count before
+    // its rewound offer op re-attempts admission below. (The offer op was left rewound at park, so
+    // it re-executes naturally in the loop — winning the now-free instance or re-parking.)
+    if let Some(state) = admit_retry.take() {
+        state.lock().unwrap_or_else(|e| e.into_inner()).admit_parked -= 1;
+    }
 
     // CALLS.md 4b — resume a **promoted** offer animation. This vCPU parked as the resumer of a
     // handler that parked mid-run (`Blocked::OfferPark`); a `svc_wake` on the provider domain
@@ -7982,13 +8088,48 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     {
                         if args_.len() == osig_.params.len() {
                             let state_ = entry_.state.clone().ok_or(Trap::CapFault)?;
-                            // The three admission outcomes, decided under one brief state lock (the
-                            // busy check+set is atomic under it, so concurrent callers serialize).
+                            // CALLS.md 4c.2 — a **direct self-re-entrant** call: the instance is the
+                            // one this vCPU is currently animating (the TOP of the animation stack,
+                            // its world already installed). This is not a cross-world dispatch — run
+                            // the handler as an ordinary recursive call over the current world (same
+                            // domain: no checkout, no `busy` change, no `cap` translation). Bounded
+                            // recursion completes; unbounded hits `OutOfFuel`/`StackOverflow` and
+                            // traps, fail-closed — never the old `-EAGAIN`. (A *buried* self-call —
+                            // the instance on the stack but not the top, its world in the stack's
+                            // saved state — is not caught here; it falls to the busy arm and stays
+                            // `-EAGAIN`, the harder residue.)
+                            if offer_anim.last().is_some_and(|a| Arc::ptr_eq(&a.state, &state_)) {
+                                step(fuel, kill.as_deref())?; // function-entry fuel, as a `call`
+                                if depth as usize + *parked_frames + frames.len()
+                                    > MAX_CALL_DEPTH as usize
+                                {
+                                    return Err(Trap::StackOverflow);
+                                }
+                                let hvals_: Vec<Reg> = osig_
+                                    .params
+                                    .iter()
+                                    .zip(args_)
+                                    .map(|(ty, &s)| Reg::from_value(slot_to_val(*ty, s)))
+                                    .collect();
+                                frames.push(Frame {
+                                    func: f_,
+                                    module: INVOKE_MODULE,
+                                    block: 0,
+                                    inst: 0,
+                                    vals: hvals_,
+                                });
+                                continue 'frames;
+                            }
+                            // The admission outcomes, decided under one brief state lock (the busy
+                            // check+set is atomic under it, so concurrent callers serialize).
                             enum Adm {
                                 Eagain,
                                 // `Host` is large (~1KB); box it so the enum stays small
                                 // (clippy `large_enum_variant`).
                                 Go(Vec<i64>, u64, Option<Mem>, Box<Host>),
+                                // CALLS.md 4c.1 — contention on a busy instance held by a *different*
+                                // vCPU: rewind + park as an admission-waiter, keyed by this state.
+                                ParkAdmit(Arc<Mutex<ProviderState>>, usize),
                                 Decline,
                             }
                             let adm_ = {
@@ -8005,7 +8146,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 };
                                 let st_ = &mut *guard_;
                                 if st_.busy {
-                                    Adm::Eagain
+                                    // 4c.2's direct self-call was handled before the lock. A
+                                    // **buried** self-call (the instance on this vCPU's own
+                                    // animation stack but not the top — its world is in the stack's
+                                    // saved state, not on the instance) still answers `-EAGAIN`, the
+                                    // harder residue. Otherwise the instance is held by a
+                                    // **different** vCPU (4c.1 contention): park as a bounded
+                                    // admission-waiter — at the rim, `-EAGAIN` (fail-closed, §9).
+                                    if offer_anim.iter().any(|a| Arc::ptr_eq(&a.state, &state_)) {
+                                        Adm::Eagain
+                                    } else if st_.admit_parked >= ADMIT_QUEUE_MAX {
+                                        Adm::Eagain
+                                    } else {
+                                        st_.admit_parked += 1;
+                                        let key_ = Arc::as_ptr(&state_) as usize;
+                                        Adm::ParkAdmit(state_.clone(), key_)
+                                    }
                                 } else if st_.fuel == 0 || st_.host.is_durable() {
                                     // Dry reserve or a durable provider world: the 3a `drive_arc`
                                     // fallback handles both, byte-identically.
@@ -8040,6 +8196,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     frames[top].vals.push(Reg::from_i64(EAGAIN));
                                     continue;
                                 }
+                                Adm::ParkAdmit(state_arc_, key_) => {
+                                    // 4c.1 — rewind the offer op and park as an admission-waiter on
+                                    // the busy instance. The holder wakes us when it clears `busy`
+                                    // (settle / promotion-park), and the rewound op re-executes —
+                                    // winning the now-free instance or re-parking on a lost race.
+                                    // `admit_retry` carries the instance so the resume drops its
+                                    // `admit_parked` count before the re-attempt. (`admit_parked`
+                                    // was already incremented under the state lock above.)
+                                    frames[top].inst -= 1;
+                                    *admit_retry = Some(state_arc_);
+                                    return Ok(Inner::Park(Blocked::OfferAdmit { key: key_ }));
+                                }
                                 Adm::Decline => {} // fall through to the caller's 3a sub-run
                                 Adm::Go(arg_slots_, budget_, pm_, ph_) => {
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
@@ -8048,12 +8216,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         match registry.create(0, 0, spawn_quota.max_fibers, false) {
                                             Ok(h_) => h_,
                                             Err(_) => {
-                                                let mut st_ = state_
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                st_.mem = pm_;
-                                                st_.host = *ph_;
-                                                st_.busy = false;
+                                                {
+                                                    let mut st_ = state_
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner());
+                                                    st_.mem = pm_;
+                                                    st_.host = *ph_;
+                                                    st_.busy = false;
+                                                }
+                                                // 4c.1 — the brief checkout is undone (`busy`
+                                                // cleared); wake any admission-waiter that parked
+                                                // in that window (state guard dropped first).
+                                                if let SchedRef::Real(sr) = sched {
+                                                    sr.admit_wake(
+                                                        Arc::as_ptr(&state_) as usize
+                                                    );
+                                                }
                                                 frames[top].vals.push(Reg::from_i64(EAGAIN));
                                                 continue;
                                             }
@@ -8272,6 +8450,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             st.host = prov_host;
                             st.fuel -= spent;
                             st.busy = false;
+                        }
+                        // CALLS.md 4c.1 — the promotion freed the instance (`busy` cleared); re-admit
+                        // any callers parked as admission-waiters on it (state guard already dropped).
+                        if let SchedRef::Real(sr) = sched {
+                            sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
                         }
                         *offer_parked = Some(OfferParked {
                             state: anim.state,
@@ -11254,6 +11437,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // (its frame is also `INVOKE_MODULE`), the id is unchanged but the table
                         // differs, so the id-keyed cache must be forced to re-resolve.
                         cur_module = u32::MAX;
+                        // CALLS.md 4c.1 — the instance just cleared `busy`; re-admit any callers
+                        // parked as admission-waiters on it (after the state guard dropped, so the
+                        // wake's scheduler lock never nests under the state lock).
+                        if let SchedRef::Real(sr) = sched {
+                            sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
+                        }
                     } else {
                         frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
                         frames[rtop]
@@ -13684,7 +13873,18 @@ pub struct ProviderState {
     /// fallback (durable providers) still admits under the held guard and never sets this. (The
     /// full §10.3 closed bit — freeze/teardown — rides 4b.)
     busy: bool,
+    /// CALLS.md 4c.1 — count of **admission-waiters** parked on this busy instance
+    /// ([`Sched::admit_waiters`]). Incremented under the state lock when a distinct-vCPU caller
+    /// parks (so the bound decision is atomic with the busy check), decremented when that vCPU
+    /// re-attempts admission (via its carried [`VCpu::admit_retry`]). Bounds the queue: a caller
+    /// finding it at [`ADMIT_QUEUE_MAX`] gets `-EAGAIN` at the rim (fail-closed, §9).
+    admit_parked: u32,
 }
+
+/// CALLS.md 4c.1 — the bounded depth of the per-instance admission-waiter queue. A busy `single`
+/// instance parks contending callers up to this many; beyond it a caller gets a probeable
+/// `-EAGAIN` (backpressure is the caller's problem — §9, the same rim the `svc_queue` enforces).
+const ADMIT_QUEUE_MAX: u32 = 64;
 
 /// The default provider fuel reserve (§5.3 provider-pays): generous — a service is expected
 /// to live for many calls — and wirer-adjustable via [`Host::set_impl_fuel_reserve`].
@@ -15586,6 +15786,7 @@ impl Host {
                 host: Host::new(),
                 fuel: PROVIDER_FUEL_RESERVE,
                 busy: false,
+                admit_parked: 0,
             }))),
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
@@ -15941,6 +16142,7 @@ impl Host {
                     host: Host::new(),
                     fuel: PROVIDER_FUEL_RESERVE,
                     busy: false,
+                    admit_parked: 0,
                 }))
             })
             .clone();
