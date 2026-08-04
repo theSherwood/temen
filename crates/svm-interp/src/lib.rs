@@ -14438,6 +14438,13 @@ pub struct Host {
     /// `ChildCode` outlives every in-child `cap.call` by construction; stale reads are prevented
     /// by the clear-on-release). `0` ⇒ none.
     child_serve_ctx: usize,
+    /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
+    /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
+    /// thunk** (the parked transport's caller wait / the child serve loop's empty-queue wait) can
+    /// poll it in its bounded re-check — the same cell `emit_epoch_check` polls from compiled code
+    /// and the `instantiator_rt` join park polls natively. Set alongside the nursery at run start,
+    /// inherited by granted children at spawn (one stable host cell per run).
+    epoch_cell: usize,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
     /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
@@ -14777,6 +14784,7 @@ impl Host {
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_native_ctx: 0,
             child_serve_ctx: 0,
+            epoch_cell: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
@@ -16140,6 +16148,18 @@ impl Host {
     /// The registered JIT-child serve context (`0` ⇒ none / already released).
     pub fn child_serve_ctx(&self) -> usize {
         self.child_serve_ctx
+    }
+
+    /// CALLS.md 5c.1b — arm / read the kill-path epoch cell a thunk-blocked thread polls; see
+    /// [`Host::epoch_cell`].
+    pub fn set_epoch_cell(&mut self, addr: usize) {
+        self.epoch_cell = addr;
+    }
+
+    /// The armed epoch cell (`0` ⇒ none — an un-killable embedder run; waits still bound on the
+    /// trap cell and timeout).
+    pub fn epoch_cell(&self) -> usize {
+        self.epoch_cell
     }
 
     /// §3.6 — the shape of THIS domain's impl-export `export` (its op signatures, in op
