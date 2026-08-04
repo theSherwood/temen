@@ -136,3 +136,17 @@ The one honest non-structural bit — who terminates a capability — lives in t
 non-interposable attest/provenance namespace, so a parent can interpose everything but
 cannot hide that it did. *Violated by:* nominal type registries, or trust decisions keyed on
 names rather than provenance. (D59; IMPORTS.md §3.1.)
+
+## 11. The top byte belongs to the guest tag
+
+Every pointer-like value — data pointer, funcref, import/cap handle, fiber/thread handle —
+lays out as `[tag:8][generation?][index]`: the **top byte (bits 56–63) is reserved for the
+guest's pointer-tag** and the VM never stores meaning there, so `generation + index ≤ 56
+bits` on every kind. Concretely this caps the window at 2^56 (64 PiB) and holds the fiber
+generation to 32 bits. Every backend must **mask** a handle's generation to its field
+width on compare (never bare-shift), so a tagged value is inert at the use site. *Violated
+by:* a window wider than 2^56, a generation/index field that reaches bit 56, a resolve that
+compares an unmasked `h >> shift` generation, or a tag stamped into a value the runtime
+sign-tests as `handle | -errno` (invariant 5) — tag only in 64-bit cells, keep the raw
+handle untagged at the ABI boundary. (Owner-approved 2026-08-04; DESIGN.md §3c "Uniform
+pointer tagging"; the fiber 40→32 trim.)

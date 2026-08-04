@@ -6144,20 +6144,24 @@ const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 /// handle index became the binding limit — 24 bits allows ~16.7M concurrent fibers.
 const FIBER_GEN_SHIFT: u32 = 24;
 
-/// The generation bits a fiber guest handle carries (the field above the slot): an `i64` handle leaves
-/// **40 bits** for the generation, so a stale handle is rejected modulo `2^40` — an ABA window so vast
-/// (≈ a trillion recycles of one slot) that wraparound is unreachable in practice. Matches `svm_jit`'s
-/// `FIBER_HANDLE_GEN_MASK`.
-const FIBER_GEN_MASK: u64 = (1 << 40) - 1;
+/// The generation bits a fiber guest handle carries (the field above the slot). The `i64` handle is
+/// laid out `[tag:8][generation:32][slot:24]` (DESIGN.md §3c "Uniform pointer tagging"): the **top
+/// byte is reserved for a guest pointer-tag**, leaving **32 bits** for the generation, so a stale
+/// handle is rejected modulo `2^32` — an ABA window of ~4.3 billion recycles of one slot, still far
+/// beyond any real churn. Trimmed 40→32 to free the top byte across all pointer kinds (INVARIANTS.md
+/// §11). Matches `svm_jit`'s `FIBER_HANDLE_GEN_MASK`.
+const FIBER_GEN_MASK: u64 = (1 << 32) - 1;
 
-/// Encode a fiber guest handle from its registry `slot` and `generation` (low 40 bits).
+/// Encode a fiber guest handle from its registry `slot` and `generation` (low 32 bits); the top byte
+/// stays clear for a guest tag.
 fn fiber_handle(slot: usize, generation: u64) -> i64 {
     (((generation & FIBER_GEN_MASK) << FIBER_GEN_SHIFT) | slot as u64) as i64
 }
 
-/// The generation field a guest fiber handle carries (the high bits above the slot).
+/// The generation field a guest fiber handle carries, **masked** to [`FIBER_GEN_MASK`] so a guest tag
+/// in the top byte is ignored (mask, don't just shift). The slot bits below are decoded separately.
 fn fiber_handle_generation(handle: i64) -> u64 {
-    (handle as u64) >> FIBER_GEN_SHIFT
+    ((handle as u64) >> FIBER_GEN_SHIFT) & FIBER_GEN_MASK
 }
 
 #[cfg(test)]
@@ -6178,7 +6182,7 @@ mod fiber_handle_layout_tests {
     fn handle_round_trips_beyond_the_old_16_bit_ceiling() {
         // A slot the old 16-bit index could not represent (> 65 535), with a non-zero generation.
         let slot = 1_000_000usize; // < MAX_FIBERS (1<<24 = 16 777 216)
-        let generation = 0x3_ABCD_1234u64;
+        let generation = 0xABCD_1234u64; // full 32-bit generation (top byte reserved for a tag)
         let handle = fiber_handle(slot, generation);
         // Generation decodes back exactly.
         assert_eq!(fiber_handle_generation(handle), generation);
@@ -6190,13 +6194,44 @@ mod fiber_handle_layout_tests {
 
     #[test]
     fn top_slot_and_generation_do_not_overlap() {
-        // The largest addressable slot and a full-width generation must not collide in the i64 handle.
+        // The largest addressable slot and a full-width (32-bit) generation must not collide in the
+        // i64 handle, and together they must leave the **top byte** clear for a guest tag.
         let slot = (1usize << 24) - 1;
-        let generation = (1u64 << 40) - 1;
+        let generation = (1u64 << 32) - 1;
         let handle = fiber_handle(slot, generation);
         assert_eq!(fiber_handle_generation(handle), generation);
         let mask = (1u64 << FIBER_GEN_SHIFT) - 1;
         assert_eq!((handle as u64) & mask, slot as u64);
+        assert_eq!(
+            (handle as u64) >> 56,
+            0,
+            "the top byte is reserved for a guest tag and must stay clear even at max slot+generation"
+        );
+    }
+
+    #[test]
+    fn top_byte_is_ignored_as_a_guest_tag() {
+        // A guest may store a pointer-tag in the top byte (bits 56..64, DESIGN.md §3c). The generation
+        // decode masks it off and the slot decode never reaches it, so a tagged handle resolves to the
+        // identical (slot, generation) — this is the "mask, don't just shift" property the resume path
+        // relies on.
+        let slot = 12_345usize;
+        let generation = 0x00AB_CDEFu64;
+        let bare = fiber_handle(slot, generation);
+        for tag in [0x00u64, 0x01, 0x7F, 0x80, 0xFF] {
+            let tagged = ((tag << 56) | bare as u64) as i64;
+            assert_eq!(
+                fiber_handle_generation(tagged),
+                generation,
+                "tag {tag:#x} must not perturb the generation"
+            );
+            let mask = (slot + 1).next_power_of_two() - 1;
+            assert_eq!(
+                (tagged as u64 as usize) & mask,
+                slot,
+                "tag {tag:#x} must not perturb the slot"
+            );
+        }
     }
 }
 
@@ -6312,8 +6347,9 @@ pub struct FrozenFiber {
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
     /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
-    /// non-recycled fiber — then the handle is exactly its slot. 48-bit field (the `i64` handle's
-    /// generation bits); serialized as `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
+    /// non-recycled fiber — then the handle is exactly its slot. 32-bit field (the `i64` handle's
+    /// generation bits, with the top byte reserved for a guest tag — DESIGN.md §3c); serialized as
+    /// `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
     pub generation: u64,
 }
 
@@ -6665,8 +6701,9 @@ impl FiberRegistry {
         }
         // Generation check (recycling step 1/3): reject a handle whose generation doesn't match the
         // slot's current one — a stale handle to a slot's former occupant after the slot was recycled
-        // (`finish` bumped the generation). Compared modulo `2^40` (the handle's field width); a forged
-        // non-zero generation is rejected, exactly as a forged slot is masked-and-lost.
+        // (`finish` bumped the generation). Compared modulo `2^32` (the handle's field width, top byte
+        // reserved for a guest tag); a forged non-zero generation is rejected, exactly as a forged slot
+        // is masked-and-lost.
         if fiber_handle_generation(handle) != (t.gens[slot] & FIBER_GEN_MASK) {
             return Err(Trap::FiberFault);
         }
