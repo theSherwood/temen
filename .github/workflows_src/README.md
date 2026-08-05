@@ -30,6 +30,18 @@ identical until the next agent edit.
   condition for the `chibicc2 == chibicc3` fixpoint. (The always-on job already runs the giant test too
   via `-- --ignored`, but it self-skips fast without the env var.)
 
+- **`full-depth-gates` job** — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job that runs
+  the `#[ignore]`d full-depth *correctness* gates that no CI job previously ran: Lua's suite
+  (`lua_tlib`/`lua_all`/`lua_sweep`) on both the bytecode engine and the tree-walker, plus the
+  whole-language capstones (`demo_tcl_repl_stdin`/`demo_tcl_init_stdin` and the full
+  `demo_sqlite_logictest_full` sweep) via `cargo test --test … -- --ignored` from `crates/svm-llvm`
+  (workspace-excluded, so run from its dir). Each asserts byte-identity with the native `cc` build.
+  `#[ignore]`d only for wall-clock (minutes per suite on the tree-walker), so it rides the daily cron
+  like `miri`/giants rather than the per-PR gate — closing the JIT-only blind spot that let the QuickJS
+  on-ramp recipe drift unseen once. Capstones self-skip loudly (never fail) without clang/curl/make/
+  openlibm, so grep the log for `skipping` before trusting a green run. First green run on CI is the
+  real validation of the ~90-min timeout budget.
+
 - **`nim-e2e` job** — builds the real nimony toolchain (`scripts/ci/provision-nimony.sh`, cached) and
   runs `crates/svm-leng/tests/nim_e2e.rs`, which compiles small **Nim source** programs through
   `nimony c` and runs them on both SVM engines. The tests self-skip (pass) in the always-on `check`
