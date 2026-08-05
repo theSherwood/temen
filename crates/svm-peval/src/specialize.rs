@@ -94,7 +94,9 @@ use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use svm_ir::{CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
+use svm_ir::{
+    Block, CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType,
+};
 use svm_verify::func_value_types;
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
@@ -215,6 +217,17 @@ enum InlineErr {
     NeedsCfg,
     /// A real failure (unsupported op/access, or budget exhausted).
     Spec(SpecError),
+}
+
+/// How a cut call treats the live rename cells across the opaque boundary (see [`Spec::emit_cut_call`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CutMode {
+    /// [`SpecConfig::cut_calls`]: the callee touches no renamed state — cells preserved, no spill.
+    Opaque,
+    /// [`SpecConfig::cut_calls_read_state`]: the callee reads the state — spill (any width), no reload.
+    ReadState,
+    /// [`SpecConfig::cut_calls_touch_state`]: the callee reads/writes the state — spill then reload.
+    TouchState,
 }
 
 /// The default ceiling on residual blocks before we declare likely divergence.
@@ -340,6 +353,24 @@ pub struct SpecConfig {
     /// operates on the generic rename region, nothing Lua-specific. Spilled/reloaded cells must be a
     /// natural 4- or 8-byte width; anything else fails closed. Empty by default.
     pub cut_calls_touch_state: Vec<u32>,
+    /// **Cut calls that *read* the renamed state but do not rewrite its cells** — the safepoint spill
+    /// for a **non-moving** collector or a read-only scan (a GC that marks the register file but never
+    /// relocates it, a read barrier). Like [`cut_calls_touch_state`](Self::cut_calls_touch_state) the
+    /// live rename cells are **spilled to the window before the call** (any natural width — the tag
+    /// bytes spill too, so the scan sees correctly-typed registers), but they are **not reloaded**
+    /// afterward: the abstract cells keep their pre-call SSA values. That is exactly right when the
+    /// callee reads the state but leaves the registers unchanged — and, crucially, it keeps the folded
+    /// tag constants *folded* across the call (a reload would turn every tag into a fresh unknown and
+    /// re-open the per-opcode type checks the dispatch fold depends on). This is what lets an
+    /// **allocating** loop keep a rolled, dispatch-free fast path while the allocator/GC stay opaque
+    /// call-outs (a `luaC_checkGC` step, a `luaH_new`), where the collector scanning the stack would
+    /// otherwise force projecting the whole GC.
+    ///
+    /// **Caller promise** (like [`rename_is_private`](Self::rename_is_private)): the callee must not
+    /// write, nor **relocate**, any renamed region — a GC that reallocates the stack would invalidate
+    /// the baked cell addresses. Spilled cells use the natural 1/2/4/8-byte widths; anything else fails
+    /// closed. Empty by default.
+    pub cut_calls_read_state: Vec<u32>,
     /// **Guard-and-deopt targets** (slice 2): `(func, block)` source blocks that are *cold paths* the
     /// specializer must **not** project — a type-check failure, an overflow slow path, an error raise,
     /// a GC-needed branch. When a dynamic branch would enter one, the residual instead **deopts**:
@@ -363,6 +394,22 @@ pub struct SpecConfig {
     ///
     /// `None` unless [`deopt_targets`] is used.
     pub deopt_handler: Option<u32>,
+    /// **Carry the whole source module at its original function indices** (for cut call-outs whose
+    /// closure contains *indirect* calls). The normal cut carry (`cut_calls*`) renumbers the carried
+    /// closure to compact residual indices — which is unsound the moment a carried function dispatches
+    /// through the function table, because the runtime funcref values it loads (a `global_State`'s
+    /// allocator / panic / finalizer pointers) are **original** indices, and there is no table to
+    /// remap. Real allocators/GCs do exactly this (`(*g->frealloc)(…)`, `g->panic(L)`), so their cut
+    /// closure can't be compacted.
+    ///
+    /// With this set, the residual instead keeps **every** source function at its own index (plus the
+    /// source data / data-funcref image), so the identity function table stays valid and any carried
+    /// indirect call resolves; the cut map is the identity, and the specialized entry is **appended at
+    /// the end** (index `module.funcs.len()`, *not* 0 — the source entry is left intact so a re-entrant
+    /// carried callee, e.g. a GC finalizer, still finds the original). The residual is therefore large
+    /// (it contains the whole runtime), but only the appended entry is the rolled fast path; the rest
+    /// is the cold runtime, reached only through the opaque cut calls. Inline mode only. Off by default.
+    pub carry_whole_module: bool,
     /// **Runtime-input cells — the Futamura "dynamic input" for a rolled residual.** Rename-region
     /// cells `(address, width)` whose entry value is *not* known at specialization time: instead of
     /// reading its seed from the constant image (as [`rename_seed_from_image`](Self::rename_seed_from_image)
@@ -489,6 +536,83 @@ pub fn specialize_with_config(
     // Functions carried verbatim into the residual: every cut callee (opaque and state-touching) plus
     // the deopt handler, closed over their direct calls. Empty ⇒ the plain single-function inline path.
     let carry_roots = cut_roots(config);
+
+    // Whole-module carry: keep every source function at its original index (identity cut), so a carried
+    // cut callee's *indirect* calls (an allocator's `frealloc`, a GC's finalizer) resolve through the
+    // unchanged identity table. The specialized entry is appended after them (see the field docs).
+    if config.carry_whole_module {
+        if config.outline_calls || config.selective_outline {
+            return Err(SpecError::Unsupported);
+        }
+        // Identity cut over the roots (each cut callee / deopt handler is carried at its own index).
+        let mut cut: BTreeMap<u32, u32> = BTreeMap::new();
+        for &r in &carry_roots {
+            if r as usize >= module.funcs.len() {
+                return Err(SpecError::BadFunc);
+            }
+            cut.insert(r, r);
+        }
+        let mut deopt_targets: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for &t in &config.deopt_targets {
+            deopt_targets.insert(t);
+        }
+        let (deopt_handler, deopt_pass_args) =
+            match resolve_deopt_handler(module, config, func, &cut)? {
+                Some((ridx, pass)) => (Some(ridx), pass),
+                None => (None, false),
+            };
+        let entry_func = build_func(
+            module,
+            config,
+            &value_types,
+            None,
+            func,
+            &entry_pattern,
+            &entry_mem,
+            &cut,
+            &deopt_targets,
+            deopt_handler,
+            deopt_pass_args,
+            false,
+        )?
+        .0;
+        // Carry every source function at its own index, but replace any function that reaches a host
+        // boundary (a `CallImport` / capability / symbol call) with a same-signature trap stub: a
+        // standalone residual can't verify an unresolved import, and such functions are never on the
+        // cut closure's execution path (they are the guest's I/O layer, not its allocator/GC). Their
+        // slots stay filled so every other function's indices — and the identity table — are unchanged.
+        let mut funcs: Vec<Func> = module
+            .funcs
+            .iter()
+            .map(|f| {
+                if imports_a_boundary(f) {
+                    trap_stub(f)
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        funcs.push(entry_func); // the rolled fast path — the residual entry, at index funcs.len()-1
+        return Ok(Module {
+            funcs,
+            memory: module.memory,
+            // Keep the data image so any baked data pointers resolve; the `call_indirect` identity
+            // table needs no side data (a funcref is its own function index, and its runtime value is
+            // read from the live heap the caller re-seeds). `imports` / `types` are dropped — every
+            // import-bearing function is stubbed, and `call_indirect` carries its signature inline —
+            // which also keeps this branch free of the `String`-cloning the LLVM→IR on-ramp can't
+            // resolve when svm-peval is itself on-ramped (the `peval_futamura` guest test).
+            data: module.data.clone(),
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            data_exports: Vec::new(),
+            impl_exports: Vec::new(),
+            types: Vec::new(),
+            debug_info: None,
+        });
+    }
     let funcs = if config.outline_calls || config.selective_outline {
         if !carry_roots.is_empty() {
             // Carry numbers residual functions inline-style (entry 0, carried after); the outline
@@ -676,7 +800,19 @@ fn build_func(
         if blocks.len() >= DEFAULT_BUDGET {
             return Err(SpecError::Budget);
         }
-        blocks.push(spec.build_block(task)?);
+        #[cfg(feature = "trace")]
+        let where_ = task.frames.last().map(|f| (f.func, f.block, f.ip));
+        match spec.build_block(task) {
+            Ok(b) => blocks.push(b),
+            Err(e) => {
+                trace_unsup!(
+                    "build_block failed at (func,block,ip)={:?}: {:?}",
+                    where_,
+                    e
+                );
+                return Err(e);
+            }
+        }
     }
     // The threaded region cells flow back as extra results (after the callee's own), in the address
     // order fixed at the first `return` (see `return_from`); empty when nothing is threaded.
@@ -1140,12 +1276,19 @@ impl Spec<'_> {
                 // unknowns — never inline or fold through it. Only *explicitly listed* callees are cut;
                 // the transitive closure is carried so cut callees resolve, but a direct call to a
                 // closure member is inlined as usual. State-touching callees spill+reload the region.
-                let opaque = self.config.cut_calls.contains(&callee);
-                let touches = self.config.cut_calls_touch_state.contains(&callee);
-                if opaque || touches {
+                let mode = if self.config.cut_calls.contains(&callee) {
+                    Some(CutMode::Opaque)
+                } else if self.config.cut_calls_touch_state.contains(&callee) {
+                    Some(CutMode::TouchState)
+                } else if self.config.cut_calls_read_state.contains(&callee) {
+                    Some(CutMode::ReadState)
+                } else {
+                    None
+                };
+                if let Some(mode) = mode {
                     let ridx = self.cut[&callee];
                     let results =
-                        self.emit_cut_call(ridx, callee, &args_abs, touches, mem, out, rnext)?;
+                        self.emit_cut_call(ridx, callee, &args_abs, mode, mem, out, rnext)?;
                     env.extend(results);
                     continue;
                 }
@@ -1280,20 +1423,33 @@ impl Spec<'_> {
         ridx: u32,
         callee: u32,
         args_abs: &[Abs],
-        touches_state: bool,
+        mode: CutMode,
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
     ) -> Result<Vec<Abs>, SpecError> {
-        if touches_state {
-            // Spill the live state to the window so the opaque callee sees it. (Reload happens after
-            // the call, below — the cells must survive `mem` until then.)
-            self.spill_cells_natural(mem, out, rnext)?;
-        } else if !self.config.rename_is_private && !mem.is_empty() {
-            // `mem` holds only rename-region cells. Without the private promise an opaque non-touching
-            // callee could still alias them, and neither preserving nor dropping is sound — refuse.
-            trace_unsup!("cut call with live non-private region cells");
-            return Err(SpecError::Unsupported);
+        match mode {
+            CutMode::TouchState => {
+                // Spill the live state to the window so the opaque callee sees it. (Reload happens
+                // after the call, below — the cells must survive `mem` until then.)
+                self.spill_cells_natural(mem, out, rnext)?;
+            }
+            CutMode::ReadState => {
+                // The callee reads the state but does not rewrite its cells: spill every live cell
+                // (any natural width — tags included, so a stack scan sees typed registers), then keep
+                // the abstract cells as-is. No reload — the folded tag constants stay folded, so the
+                // dispatch stays collapsed across the call.
+                self.write_back_cells(mem, out, rnext)?;
+            }
+            CutMode::Opaque => {
+                if !self.config.rename_is_private && !mem.is_empty() {
+                    // `mem` holds only rename-region cells. Without the private promise an opaque
+                    // non-touching callee could still alias them, and neither preserving nor dropping
+                    // is sound — refuse.
+                    trace_unsup!("cut call with live non-private region cells");
+                    return Err(SpecError::Unsupported);
+                }
+            }
         }
         // Materialize the arguments in call order (constants become `const` insts), then emit the call.
         let args: Vec<u32> = args_abs
@@ -1303,7 +1459,7 @@ impl Spec<'_> {
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
-        if touches_state {
+        if mode == CutMode::TouchState {
             // The opaque callee may have rewritten the state: reload every cell from the window so
             // later renamed accesses see its writes (each becomes a fresh unknown).
             self.reload_cells_natural(mem, out, rnext)?;
@@ -2348,7 +2504,14 @@ impl Spec<'_> {
         rnext: &mut u32,
     ) -> Result<(), SpecError> {
         for (&eff, &(width, val)) in mem.iter() {
-            let op = writeback_store_op(width).ok_or(SpecError::Unsupported)?;
+            let op = writeback_store_op(width).ok_or_else(|| {
+                trace_unsup!(
+                    "write_back_cells: no store op for width {} @ {:#x}",
+                    width,
+                    eff
+                );
+                SpecError::Unsupported
+            })?;
             out.push(Inst::ConstI64(eff as i64));
             let addr = bump(rnext);
             let value = materialize(val, out, rnext);
@@ -2579,6 +2742,9 @@ fn cut_roots(config: &SpecConfig) -> Vec<u32> {
     for &f in &config.cut_calls_touch_state {
         push(f);
     }
+    for &f in &config.cut_calls_read_state {
+        push(f);
+    }
     if !config.deopt_targets.is_empty() {
         if let Some(h) = config.deopt_handler {
             push(h);
@@ -2655,7 +2821,13 @@ fn plan_cut_carry(
             return Err(SpecError::Unsupported);
         }
         carried.push(fidx);
-        for callee in direct_callees(&module.funcs[fidx as usize])? {
+        let callees = direct_callees(&module.funcs[fidx as usize]).inspect_err(|_e| {
+            trace_unsup!(
+                "plan_cut_carry: func {} has an indirect call (can't carry)",
+                fidx
+            );
+        })?;
+        for callee in callees {
             if callee as usize >= module.funcs.len() {
                 return Err(SpecError::BadFunc);
             }
@@ -2672,6 +2844,38 @@ fn plan_cut_carry(
         map.insert(orig, i as u32 + 1);
     }
     Ok((map, carried))
+}
+
+/// Whether `f` reaches a host boundary the standalone residual can't resolve — a `CallImport`,
+/// `CallImportDyn`, `CapCall`, or `CallSym`. Used by [`SpecConfig::carry_whole_module`] to decide
+/// which carried functions to replace with a trap stub (an unresolved import fails verification, and
+/// these are the guest's I/O layer — off the allocator/GC path the cut closure actually runs).
+fn imports_a_boundary(f: &Func) -> bool {
+    f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(
+            i,
+            Inst::CallImport { .. }
+                | Inst::CallImportDyn { .. }
+                | Inst::CapCall { .. }
+                | Inst::CallSym { .. }
+        )
+    })
+}
+
+/// A same-signature stub whose single block just traps — the placeholder for a carried function that
+/// [`carry_whole_module`](SpecConfig::carry_whole_module) can't keep verbatim (see
+/// [`imports_a_boundary`]). Filling the slot keeps every other function's index — and the identity
+/// `call_indirect` table — unchanged; the body is unreachable on the cut closure's execution path.
+fn trap_stub(f: &Func) -> Func {
+    Func {
+        params: f.params.clone(),
+        results: f.results.clone(),
+        blocks: vec![Block {
+            params: f.params.clone(),
+            insts: Vec::new(),
+            term: Terminator::Unreachable,
+        }],
+    }
 }
 
 /// The direct-call callee indices referenced by `f` (`call` / `return_call`), in program order.
