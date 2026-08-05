@@ -14986,6 +14986,17 @@ pub struct Host {
     /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
     /// `None` (the default) fail-closes every `compile` (`-EINVAL`).
     jit_validator: Option<JitValidator>,
+    /// The durable-JIT install fence (DURABILITY.md §12.5, R8): an injected predicate — set only by
+    /// a durable grant — that returns `true` to **reject** a just-validated unit whose entry
+    /// suspends but whose signature the program does not taint (an un-instrumented `call_indirect`
+    /// site could reach it, silently losing the continuation on thaw). Injected (like
+    /// [`Host::jit_validator`]) so this TCB crate holds no `svm-durable` dependency — it only calls
+    /// the predicate with plain IR data ([`Host::jit_durable_tainted_sigs`]). `None` ⇒ no fence.
+    jit_durable_gate: Option<JitDurableGate>,
+    /// The program's tainted signatures (`svm_durable::tainted_signatures_of`), stashed by a durable
+    /// grant so [`Host::jit_durable_gate`] can check a submitted unit's entry signature against them.
+    /// Plain data — the analysis ran in the injecting tier, never here. Empty otherwise.
+    jit_durable_tainted_sigs: Vec<FuncType>,
     /// The host-injected wasm-JIT emitter ([`JitWasmEmitter`], the browser tier). When set, each
     /// closed-blob `compile` also emits the unit's wasm and stashes it on the [`JitUnit`], so a later
     /// `invoke` can run the guest's *own* runtime-compiled unit on emitted wasm instead of the
@@ -15125,6 +15136,12 @@ impl BoundImport {
 /// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
 /// fails closed — and carries the guest's table only for the `compile_linked` op.
 pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
+
+/// The durable-JIT install fence predicate ([`Host::set_jit_durable_gate`]): given a just-validated
+/// unit's functions and the program's tainted signatures, return `true` to **reject** the unit
+/// (suspendable at an untainted signature — DURABILITY.md §12.5). Injected as a bare `fn` so this TCB
+/// crate keeps no `svm-durable` dependency (the analysis lives in the injecting tier).
+pub type JitDurableGate = fn(&[Func], &[FuncType]) -> bool;
 
 /// A wasm-JIT **emitter** the browser tier installs (DESIGN.md §22, the "guest-compiled units on the
 /// wasm tier" slice): given a *validated closed-unit* blob (the exact bytes `compile` accepted), it
@@ -15332,6 +15349,8 @@ impl Host {
             quota: Quota::default(),
             jit_domains: Vec::new(),
             jit_validator: None,
+            jit_durable_gate: None,
+            jit_durable_tainted_sigs: Vec::new(),
             jit_wasm_emitter: None,
             jit_table_log2: 0,
             jit_hosts_fibers: false,
@@ -17504,6 +17523,20 @@ impl Host {
         self.jit_validator = Some(v);
     }
 
+    /// Install the durable-JIT install fence: the predicate ([`Host::jit_durable_gate`]) plus the
+    /// program's tainted signatures it checks against ([`Host::jit_durable_tainted_sigs`]). Set by a
+    /// durable `Jit` grant (DURABILITY.md §12.5) so a later `Jit.compile` of a *suspendable* unit
+    /// whose signature the program does not taint fails closed — it could never be installed and
+    /// then reached by an un-instrumented `call_indirect`. The analysis runs in the injecting tier.
+    pub fn set_jit_durable_gate(
+        &mut self,
+        gate: JitDurableGate,
+        program_tainted_sigs: Vec<FuncType>,
+    ) {
+        self.jit_durable_gate = Some(gate);
+        self.jit_durable_tainted_sigs = program_tainted_sigs;
+    }
+
     /// Install the [`JitWasmEmitter`] — the browser wasm-JIT tier's compile→wasm step. With one set,
     /// every closed-blob `compile` also emits the unit's wasm (stashed on the unit, fetched by
     /// [`Host::jit_unit_wasm`]); without one, units only `invoke` on the interpreter. Fail-closed:
@@ -17722,6 +17755,14 @@ impl Host {
         // The wasm-JIT emitter is a `Copy` fn pointer — read it out before the `&mut` borrow of
         // `jit_domains` so the closed-unit emit below can call it without a self-borrow conflict.
         let emitter = self.jit_wasm_emitter;
+        // Read the durable install fence out before the `&mut jit_domains` borrow (disjoint fields):
+        // the gate predicate (Copy) and a shared borrow of the program's tainted signatures.
+        let durable_gate = if self.durable {
+            self.jit_durable_gate
+        } else {
+            None
+        };
+        let durable_tainted = &self.jit_durable_tainted_sigs;
         let d = &mut self.jit_domains[domain as usize];
         // Compile quota first: charge the *attempt's* bytes (validation is the cost a looping
         // guest imposes), the unit slot only on success; out of either budget is `-ENOMEM`.
@@ -17734,6 +17775,16 @@ impl Host {
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
         };
+        // Durable install fence (DURABILITY.md §12.5, R8 fork-critical case): in a durable run, a
+        // *suspendable* unit whose entry signature the program does not taint is rejected — else a
+        // `call_indirect` reaching an installed slot at an un-instrumented site would silently lose
+        // the unit's continuation on thaw. Fail closed here so the unit can never be installed. The
+        // predicate + tainted set are injected by the durable grant; this TCB crate runs no analysis.
+        if let Some(gate) = durable_gate {
+            if gate(&funcs, durable_tainted) {
+                return Ok(Err(EINVAL));
+            }
+        }
         d.units_left -= 1;
         let unit = d.units.len() as u32;
         // Emit wasm for a **closed** unit (`compile`, empty symbol table) when the browser tier has
