@@ -798,7 +798,40 @@ simplification of the execution path, not a collapse to a single mechanism.
          Retiring `ProviderState` would require making library instances serve-loop-driven, which
          pessimizes the common synchronous cross-domain call — **rejected** on that basis
          (`OFFER_TRANSPORT.md`). Increment 6 concludes at 6d.4.1.
-7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
+7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization (§5 axis 2,
+   §10.1). Today every instanced offer is `single`: the `busy` admission word serializes handlers
+   (a rival caller `-EAGAIN`s or parks as an admission-waiter). `threaded` is a **provider
+   declaration** that its handlers may run concurrently — no gate at all (only the quiesce bit, when
+   it exists) — with the provider synchronizing its own state via guest atomics/futexes (the §12
+   defined-race regime; confinement never depends on data-race freedom). It reuses proven machinery:
+   `Mem::fork_for_thread` already shares a window's backing across concurrent vCPUs (the
+   `thread.spawn` path), and 6d.4.1 already made the powerbox a shared `Arc<Mutex<Host>>` cell — so
+   a concurrent handler forks the provider window and clones the host cell instead of `single`'s
+   exclusive take. Decomposed smallest-first:
+   - **7.1 — the policy field + the threaded eval-loop admission arm.** Add `policy: OfferPolicy`
+     (`Single` default / `Threaded`) to `OfferEntry` (threaded via a wiring param; a guest-facing
+     declaration is 7.4). In the eval-loop offer arm, a `Threaded` provider **skips the `busy`
+     gate**: briefly lock the state to `fork_for_thread` the window + `Arc::clone` the host cell
+     (no `busy` set, no exclusive take), then animate the handler fiber. The settle skips the
+     `busy` clear, the window restore, and the `strong_count` leak guard (all `single`-specific —
+     concurrent clones are expected under `threaded`); a `threaded` flag on `OfferAnim`/`OfferParked`
+     carries the branch. Pin (single-threaded, no multi-vCPU harness needed): a `threaded` provider
+     whose handler **re-enters itself** recurses on a countdown arg and returns the sum, where the
+     existing `single` cyclic pin `-EAGAIN`s — the cleanest observable of "no gate". `single`
+     behavior unchanged (the whole existing offer suite is the oracle).
+   - **7.2 — true concurrent-callers pin.** Two vCPUs (one multi-vCPU domain, or two domains sharing
+     a re-granted threaded offer) call one `threaded` provider concurrently and both run over the
+     shared window; a provider-side atomic counter reflects both (the defined-race regime, à la
+     `parallel_miri`). Asserts concurrency + confinement-safety, not timing.
+   - **7.3 — the non-eval-loop tiers.** The host-side `drive_arc` arm and the JIT thunk arm admit a
+     `threaded` provider without the `busy` gate (concurrent host-side/JIT callers). Deferrable; the
+     eval loop is the oracle.
+   - **7.4 — guest-facing declaration.** An IR/interface attribute so a guest module declares
+     `threaded` itself, rather than the host wiring param 7.1 uses. Rounds out "policy is the
+     provider's declaration" (§10.1).
+   - **Quiesce interaction (§10.3):** `threaded`'s only per-call check is the closed bit; folds in
+     whenever the §10.3 closed bit lands (it is not yet a field on `ProviderState`), tracked with
+     that work, not 7.1.
 
 Addendum deltas to this plan: §10.7.
 
