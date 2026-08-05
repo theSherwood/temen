@@ -108,6 +108,7 @@ fn impl_export_ops_are_dfe_roots() {
             name: "adder".into(),
             interface: 1,
             ops: vec![3],
+            threaded: false,
         }],
         ..Default::default()
     };

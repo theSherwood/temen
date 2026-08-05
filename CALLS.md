@@ -131,18 +131,30 @@ is a capability-surface distinction, not an IR one.
 
 ## 7. What this deletes / what it adds
 
-**Deleted:** the nested `drive_arc`-under-two-locks sub-interpreter; `ProviderState` + its mutex;
-the acyclicity rule and its deadlock argument; provider-pays fuel (`GUEST_IMPL_FUEL`);
-`wire_impl_instance` / `impl_service`; the `GuestImpl`/`LiveImpl` binding split; eventually the
-JIT's `-EINVAL` arm for offers.
+**Deleted:** the nested `drive_arc`-under-two-locks sub-interpreter; the acyclicity rule and its
+deadlock argument; provider-pays fuel (`GUEST_IMPL_FUEL`); `wire_impl_instance` / `impl_service`.
+
+**Amended (owner decision 2026-08-04, see `OFFER_TRANSPORT.md`):** `ProviderState` + its mutex and
+the `GuestImpl`/`LiveImpl` binding split are **not** deleted. Finishing those deletions would require
+making library instances *serve-loop-driven* (an enqueue-park-reply-wake round trip in place of the
+§8 4a animated crossing), which **pessimizes the common synchronous cross-domain call** — the wrong
+trade against the wasm/Wasmtime yardstick (§1a). The animated transport stays; `ProviderState`'s
+admission word + window are irreducible for it (they must live outside the host the sub-run takes by
+value). What increment 6 *did* delete stands (the two-lock sub-interpreter, provider-pays, the
+eval-loop `drive_instanced_offer`); the offer powerbox is now the granted-child shared-cell shape
+(§8 6d.4.1). The JIT's `-EINVAL`/host-side fall-through for offers is **deferred**, not deleted (§8
+6d.2): all tiers share the one correct host-side arm.
 
 **Added:** admission into library providers (reuses the existing queue + handler-fiber machinery);
 the inline cross-domain animation fast path (assembled from existing pieces: §14 coroutine drive +
 `serve_switch`'s fiber switch); the JIT thunk fast path + thread-blocking promotion.
 
-Net: three offer mechanisms → one; two execution models → one; a lock-held nested interpreter and
-its safety argument leave the TCB. A genuine net simplification, paid for with scheduler-adjacent
-plumbing that lands in increments (§8).
+Net (as realized — see `OFFER_TRANSPORT.md` for why it stops short of the original "→ one"): the
+lock-held nested interpreter and its safety argument leave the TCB; provider-pays retires; the offer
+powerbox becomes the granted-child shared-cell shape. The **two transports are kept on purpose** —
+the animated crossing for passive library instances (cheap synchronous calls) and the serve-loop
+crossing for live callees — because collapsing them would pessimize cross-domain calls. A genuine
+simplification of the execution path, not a collapse to a single mechanism.
 
 ## 8. Increment plan (same discipline as FORK.md: smallest verifiable step first)
 
@@ -760,9 +772,9 @@ plumbing that lands in increments (§8).
          before, at both the 4a and 4d settles. Behaviour-identical; the existing offer suite is the
          oracle (`impl_wiring` 25, `offer_promotion` 8 incl. the 4a–4d settles, `imports_impl`
          three-backend).
-       - **6d.4.2 / 6d.4.3 / 6d.4.4 — NOT RECOMMENDED (finding, owner decision needed).** Building
-         6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and partly not achievable given the
-         4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
+       - **6d.4.2 / 6d.4.3 / 6d.4.4 — REJECTED (owner decision 2026-08-04, see
+         `OFFER_TRANSPORT.md`).** Building 6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and
+         partly not achievable given the 4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
          `Binding::LiveImpl` (16 sites) are handled *separately* at ~35 sites with **opposite**
          semantics — `Offer` is non-durable (freeze errors) while `LiveImpl` is durably capturable
          via `callee_slot`; `Offer` animates in `cap_dispatch_slots` while `LiveImpl` answers
@@ -782,11 +794,77 @@ plumbing that lands in increments (§8).
          The clean structural win is banked (the offer powerbox is now the granted-child shared-cell
          shape; the per-call `Arc::new` is gone); the residual is one uncontended nested lock
          (`Mutex<Host>` inside `Mutex<ProviderState>`), inherent to a passive instance needing
-         checkout atomicity over {admission word, window} separate from its takeable powerbox. To
-         actually retire `ProviderState`, the owner would first have to renegotiate the 4a
-         passive-transport decision (or accept `LiveImpl` carrying inert admission/window fields —
-         bloat, not simplification). Left as an explicit owner call, not built.
-7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
+         checkout atomicity over {admission word, window} separate from its takeable powerbox.
+         Retiring `ProviderState` would require making library instances serve-loop-driven, which
+         pessimizes the common synchronous cross-domain call — **rejected** on that basis
+         (`OFFER_TRANSPORT.md`). Increment 6 concludes at 6d.4.1.
+7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization (§5 axis 2,
+   §10.1). Today every instanced offer is `single`: the `busy` admission word serializes handlers
+   (a rival caller `-EAGAIN`s or parks as an admission-waiter). `threaded` is a **provider
+   declaration** that its handlers may run concurrently — no gate at all (only the quiesce bit, when
+   it exists) — with the provider synchronizing its own state via guest atomics/futexes (the §12
+   defined-race regime; confinement never depends on data-race freedom). It reuses proven machinery:
+   `Mem::fork_for_thread` already shares a window's backing across concurrent vCPUs (the
+   `thread.spawn` path), and 6d.4.1 already made the powerbox a shared `Arc<Mutex<Host>>` cell — so
+   a concurrent handler forks the provider window and clones the host cell instead of `single`'s
+   exclusive take. Decomposed smallest-first:
+   - **7.1 — the policy field + the threaded eval-loop admission arm. DONE.** `OfferEntry.policy:
+     OfferPolicy` (`Single` default / `Threaded` via `wire_offer_proc_with_policy`; a guest-facing
+     declaration is 7.4). In the eval-loop offer arm, a `Threaded` provider **skips the `busy`
+     gate**: briefly lock the state to `fork_for_thread` the window + `Arc::clone` the host cell
+     (no `busy` set, no exclusive take), then animate the handler fiber. The settle/undo/resume
+     paths branch on a `threaded` flag carried by `OfferAnim`/`OfferParked`: no `busy` clear, no
+     window restore (the fork drops), no `admit_wake` (nothing can park on an ungated instance),
+     and no `strong_count` leak guard (concurrent clones are the declared regime). The host-side
+     arm **refused `Threaded` probeably** (`-EAGAIN`) this slice: its checkout takes the world out
+     by value, which would gut the shared cell under in-flight animations — closed by 7.3's
+     shared-cell sub-run arm. **Pin correction (found in build):** the planned
+     "self-recursion vs `-EAGAIN`" observable was wrong — 4c.2 makes a *top-of-stack* self-call
+     recurse under both policies. The real single-threaded observable is a **buried** re-entry
+     (`X → Y → X`, X on the animation stack but not the top): `threaded` X admits a second
+     concurrent animation (`[X, Y, X]`, each over its own forked view) and the chain sums to 9;
+     `single` X refuses `-EAGAIN` (pinned both ways in `threaded_offers.rs`).
+   - **7.2 — true concurrent-callers pin. DONE.** Two `thread.spawn`ed vCPUs each call one
+     `Threaded` instance (each animation over its own `fork_for_thread` view — the `thread.spawn`
+     sibling shape) writing distinct cells; the joiner reads both back through the same offer.
+     Asserts concurrent cross-vCPU admission and one shared instance window — safety, not timing.
+     Plus a state-persistence pin (policy changes admission, never shared-instance semantics).
+   - **7.3 — the non-eval-loop tiers. DONE.** Two pieces. **(a) The lock-order fix 7.1 owed:**
+     under `Threaded`, two translation-edge scopes can hold *crossed* cells (T1 animating X→Y while
+     T2 animates Y→X — a vCPU's current host is itself a provider cell mid-animation), so the
+     semantic-order dual acquisition (`hg` then cell) was a latent AB-BA deadlock; `single` could
+     never cross (its `busy` gate keeps an instance on one vCPU, checked before any edge lock). All
+     dual-`Host` acquisitions now go through `lock_host_pair` — **stable address order**, guards
+     returned in argument order; the degenerate same-cell pair (an offer self-wired into its own
+     powerbox) refuses probeably at admission. **(b) The tier arm:** `drive_arc` split into a core
+     (`drive_over_cell`) that runs the M:N executor over any `Arc<Mutex<Host>>` cell, an owned
+     wrapper (`drive_arc`, wrap + unwrap as before — byte-identical), and **`drive_arc_shared`**,
+     which runs the sub-run over the instance's **live 6d.4.1 cell** (durable refused fail-closed;
+     thaw seeds empty by construction). The host-side `Threaded` arm replaces 7.1's `-EAGAIN`
+     refusal: fork the window view, run `drive_arc_shared` over the cell at flat `OFFER_FUEL`, and
+     translate the edges (edge 1 `try_lock` + probeable `-EAGAIN`; edge 2 blocking — sound because
+     no path can enter this arm holding a provider cell: `IoRing` is not regrantable into a
+     powerbox and durable sub-runs are refused). `busy` survives on a `Threaded` instance only as
+     the **host-side gate**: one sub-run per instance at a time (the sub-run wires transient run
+     hooks onto the cell that concurrent sub-runs would clobber), while eval-loop admission stays
+     ungated alongside it. JIT and durable callers get the arm for free through the
+     `cap_thunk` → `cap_dispatch_slots` fall-through. Pins: the three-backend threaded state test
+     (`imports_impl` — the JIT lane exercises this arm) and the direct host-side dispatch +
+     gate-reopen pin (`threaded_offers`).
+   - **7.4 — guest-facing declaration. DONE.** `ImplExport.threaded`: a module marks its own offer
+     export `threaded` — text `export N interface "name" threaded T { … }` (parses, prints,
+     round-trips; the header prescan skips it), binary **v10** (a policy uleb after each offer's op
+     list, values ≥ 2 a fail-closed `BadOfferPolicy` decode error; the version-locked format makes
+     the bump clean). The declaration is what §10.1 means by "policy is a declaration by the
+     provider": `HostCap::offer_proc` wires the **declared** policy (the explicit
+     `offer_proc_threaded`/`wire_offer_proc_with_policy` remain as host-side overrides), and
+     `reify_export` (the `cap.self` route) mints one's own export under one's own declaration.
+     The linker and interproc-opt carry the flag. Pins: text + binary round-trips, the
+     reify-under-declaration pin (threaded vs undeclared control), and the three-backend
+     declared-threaded parity run.
+   - **Quiesce interaction (§10.3):** `threaded`'s only per-call check is the closed bit; folds in
+     whenever the §10.3 closed bit lands (it is not yet a field on `ProviderState`), tracked with
+     that work, not 7.1.
 
 Addendum deltas to this plan: §10.7.
 

@@ -154,8 +154,10 @@ pub fn print_module(m: &Module) -> String {
             };
             let _ = writeln!(
                 s,
-                "export {i} interface \"{}\" {} {{ {} }}",
+                "export {i} interface \"{}\" {}{} {{ {} }}",
                 e.name,
+                // 7.4 — the provider's declared concurrency policy round-trips.
+                if e.threaded { "threaded " } else { "" },
                 e.interface,
                 entries.join(", ")
             );
@@ -1462,12 +1464,19 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                         if idx < 0 || idx as usize != impl_exports.len() {
                             return err("offer indices must be dense and in declaration order");
                         }
+                        // CALLS.md 7.4 — optional `threaded` keyword: the provider's own
+                        // concurrency-policy declaration (omitted ⇒ `single`).
+                        let threaded = matches!(p.peek(), Some(Tok::Ident(w)) if w == "threaded");
+                        if threaded {
+                            p.next()?;
+                        }
                         let interface = p.parse_u32()?;
                         let ops = p.parse_offer_ops(interface)?;
                         impl_exports.push(ImplExport {
                             name,
                             interface,
                             ops,
+                            threaded,
                         });
                     }
                     // `export <idx> data "<name>" <offset>`: a data symbol at a window byte offset,
@@ -1636,6 +1645,10 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 let kind = p.parse_ident()?;
                 p.parse_str()?;
+                // 7.4 — skip the optional `threaded` policy keyword in the prescan.
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "threaded") {
+                    p.next()?;
+                }
                 p.parse_int()?;
                 if kind == "interface" {
                     p.expect(&Tok::LBrace)?;
@@ -3480,9 +3493,23 @@ block 0 (v0: i64) {
         assert_eq!(m.impl_exports.len(), 1);
         let offer = m.resolve_impl_export("logger").expect("offer");
         assert_eq!(offer.ops, vec![1, 0]);
+        assert!(!offer.threaded, "policy defaults to single when undeclared");
         // Print → re-parse is identity (offers preserved in declaration and op order).
         let m2 = parse_module(&print_module(&m)).expect("reparse");
         assert_eq!(m, m2, "impl export syntax must round-trip");
+
+        // CALLS.md 7.4 — the `threaded` policy keyword parses, resolves, and round-trips.
+        let src_t = src.replace(
+            "export 0 interface \"logger\" 1",
+            "export 0 interface \"logger\" threaded 1",
+        );
+        let mt = parse_module(&src_t).expect("threaded parses");
+        assert!(
+            mt.resolve_impl_export("logger").expect("offer").threaded,
+            "the declared policy is carried"
+        );
+        let mt2 = parse_module(&print_module(&mt)).expect("threaded reparse");
+        assert_eq!(mt, mt2, "the threaded keyword must round-trip");
     }
 
     #[test]

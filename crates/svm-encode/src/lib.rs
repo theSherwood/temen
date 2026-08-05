@@ -240,6 +240,13 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
+// v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
+// concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
+// list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 is the
+// first bump made after committed `.svmb` assets existed, so it carries the format's one
+// **compatibility window**: the decoder also accepts v9 (whose impl-exports read as `single` —
+// exactly what every v9-era offer was), until the assets regenerate (ISSUES.md). The
+// exact-current-VERSION rule below predates stored blobs and resumes once the window closes.
 // v9 adds the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
 // a serialized *link unit* — the binary twin of a pre-link text unit (named consumer: the external
 // toolchain blocked on format standardization, owner-approved 2026-07-30). An object file may carry
@@ -273,7 +280,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 
 /// Header flags byte, bit 0 (v9): this file is an **object** (a pre-link unit, `decode_unit`
 /// dialect). All other bits are reserved and must be zero (fail-closed).
@@ -293,6 +300,8 @@ pub enum DecodeError {
     ObjectInput,
     /// A `data.ptr` relocation's target tag byte was neither 0 (self) nor 1 (sym).
     BadDataPtrTag(u8),
+    /// An impl-export's policy byte (v10, CALLS.md 7.4) was neither 0 (single) nor 1 (threaded).
+    BadOfferPolicy(u64),
     BadType(u8),
     BadOpcode(u8),
     /// A LEB128-encoded integer did not fit its target width.
@@ -517,6 +526,8 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         for &f in &e.ops {
             write_uleb(&mut out, f as u64);
         }
+        // v10 (CALLS.md 7.4): the provider's declared concurrency policy.
+        write_uleb(&mut out, e.threaded as u64);
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
@@ -1803,7 +1814,13 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         return Err(DecodeError::BadMagic);
     }
     let v = c.byte()?;
-    if v != VERSION {
+    // v10 accepts **v9** as a one-version compatibility window (the only such window): 17
+    // committed `.svmb` assets (the browser playground/fixtures — chibicc, QuickJS, the canvas
+    // demos) predate the impl-export policy byte and regenerate only through their heavyweight
+    // LLVM on-ramps. A v9 impl-export simply has no policy byte — it reads as `single`, exactly
+    // what every v9-era offer was. The window retires (back to exact-version) when the assets
+    // regenerate (tracked in ISSUES.md); everything below v9 stays rejected.
+    if v != VERSION && v != 9 {
         return Err(DecodeError::BadVersion(v));
     }
     // v9 flags byte. Reserved bits fail closed; the object bit is rejected on the runnable path
@@ -1951,10 +1968,23 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         for _ in 0..nops {
             ops.push(c.uleb()? as FuncIdx);
         }
+        // v10 (CALLS.md 7.4): the declared concurrency policy — any value past the two defined
+        // ones is a malformed module (fail-closed, never a guessed policy). A v9 blob has no
+        // policy byte: every v9-era offer was `single`, so that is what it declares.
+        let threaded = if v >= 10 {
+            match c.uleb()? {
+                0 => false,
+                1 => true,
+                p => return Err(DecodeError::BadOfferPolicy(p)),
+            }
+        } else {
+            false
+        };
         impl_exports.push(svm_ir::ImplExport {
             name,
             interface,
             ops,
+            threaded,
         });
     }
     let nfuncs = c.count()?;
@@ -3151,11 +3181,13 @@ mod debug_tests {
                 name: "logger".to_string(),
                 interface: 1,
                 ops: vec![1, 2],
+                threaded: true, // v10: the declared policy round-trips
             },
             svm_ir::ImplExport {
                 name: "sink".to_string(),
                 interface: 2,
                 ops: vec![0],
+                threaded: false,
             },
         ];
         let decoded = decode_module(&encode_module(&m)).expect("decode");
@@ -3164,6 +3196,65 @@ mod debug_tests {
             "impl-export section round-trips"
         );
         assert_eq!(decoded, m);
+    }
+
+    /// CALLS.md 7.4 — the v10 decoder's one **compatibility window**: a v9 blob (no impl-export
+    /// policy byte) decodes, its offers reading as `single` — the 17 committed `.svmb` assets'
+    /// lifeline until they regenerate. The v9 bytes are derived from the v10 encoder itself
+    /// (encode `threaded: false`/`true` twins; the single differing byte IS the policy byte;
+    /// strip it and stamp v9), so the pin tracks the real layout, not a hand copy of it.
+    #[test]
+    fn a_v9_blob_with_an_impl_export_decodes_as_single() {
+        let mut m = module(None);
+        m.funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        m.types = vec![
+            svm_ir::TypeEntry::Func(svm_ir::FuncType {
+                params: vec![],
+                results: vec![],
+            }),
+            svm_ir::TypeEntry::Interface(vec![svm_ir::IfaceOp {
+                name: "f".to_string(),
+                ty: 0,
+            }]),
+        ];
+        m.impl_exports = vec![svm_ir::ImplExport {
+            name: "off".to_string(),
+            interface: 1,
+            ops: vec![1],
+            threaded: false,
+        }];
+        let b_single = encode_module(&m);
+        m.impl_exports[0].threaded = true;
+        let b_threaded = encode_module(&m);
+        assert_eq!(b_single.len(), b_threaded.len());
+        let diffs: Vec<usize> = (0..b_single.len())
+            .filter(|&i| b_single[i] != b_threaded[i])
+            .collect();
+        assert_eq!(diffs.len(), 1, "the policy byte is the only difference");
+        let mut v9 = b_single.clone();
+        v9.remove(diffs[0]);
+        v9[4] = 9;
+        let decoded = decode_module(&v9).expect("v9 decodes through the window");
+        assert_eq!(decoded.impl_exports.len(), 1);
+        assert!(
+            !decoded.impl_exports[0].threaded,
+            "a v9 offer reads as single"
+        );
+        // The same bytes stamped v8 stay rejected — the window is exactly one version wide.
+        let mut v8 = v9.clone();
+        v8[4] = 8;
+        assert!(matches!(
+            decode_module(&v8),
+            Err(DecodeError::BadVersion(8))
+        ));
     }
 
     #[test]
@@ -3181,6 +3272,7 @@ mod debug_tests {
     }
 }
 
+#[cfg(test)]
 #[cfg(test)]
 mod leb_tests {
     use super::*;
