@@ -173,9 +173,30 @@ so a durable domain **admits** the (instrumented) unit instead of refusing (`svm
 runs no pass; the embedder-injected validator does, keeping `svm-durable` out of the TCB). A
 unit outside the strict transform's scope (a guest-memory suspend point) fails closed. Pinned by
 `crates/svm/tests/durable_guest_jit.rs` (admit-vs-refuse gate; end-to-end NORMAL compile+invoke ≡
-non-durable). *Still v1-non-durable:* the `JitCode`/`JitDomain` **handles** — persisting a compiled
-unit *across* a snapshot (freeze/thaw reconstruction) is the Slice-2 follow-on; for now JIT handles
-drain before a checkpoint. The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+non-durable). **Persisting the `JitCode`/`JitDomain` handles across a snapshot now lands (Slice 2).**
+A `Jit` domain's out-of-line unit state — each unit's already-instrumented+verified IR and the
+compile quotas — rides a new snapshot **Section 5** (`TAG_JIT`, svm-snapshot format v16;
+`Host::capture_durable_jit`), and the handle table's `JitDomain { idx }` / `JitCode { domain, unit }`
+bindings become durable (`DurableBinding`), re-pinned into the positionally-rebuilt `jit_domains` on
+thaw. Restore **re-decodes and re-verifies** each unit (the artifact is untrusted, so its funcs must
+clear the verifier again — the deserialization-boundary re-check, and a forged handle index is
+bounds-rejected fail-closed), then an interpreter run invokes the reconstructed unit directly. So a
+guest that compiled a unit **keeps it across a checkpoint** instead of draining it (`drain_non_durable`
+no longer closes JIT handles). Pinned by `svm-snapshot/tests/jit_roundtrip.rs` (byte-identical
+re-serialize; JIT-free elision; fail-closed on a corrupt/tampered unit) and
+`durable_guest_jit.rs::durable_jit_domain_survives_freeze_and_invokes` (compile → freeze → restore →
+invoke ≡ 42). **Native reconstruct-on-thaw now lands (Slice 3).** The **native/wasm** code pointers are
+process-local, so they restore to `0`; `svm_run::reconstruct_jit_units` re-compiles each restored
+**live-handled** unit into the thaw run's `CompiledModule` (`define_extra` + `set_jit_unit_native`) —
+the cold-start twin of `recompact_into`. `jit_cap_run` runs it transparently after compiling the
+module and before re-entering the guest (a no-op for a fresh run, which holds no restored units), so a
+native `invoke` of a restored unit runs its **own** code, matching the interpreter thaw (the §12.6
+cross-backend contract). Pinned by
+`durable_guest_jit.rs::durable_jit_domain_reconstructs_and_invokes_native` (freeze → restore →
+`jit_cap_run` reconstructs + invokes natively ≡ 42). *Follow-on:* reproducing a B2-`install`ed unit's
+`call_indirect` **table slot** across a thaw (Slice 2 captured the unit IR + install type id, not the
+slot occupancy — the `invoke` handle still resolves, only a funcref through the old slot would miss).
+The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
@@ -812,6 +833,8 @@ Per **live** slot (`Slot.entry.is_some()`, `svm-interp` `:4427`), sparse:
 | `Exit` / `Clock` / `Memory` / `Yielder` | — | `grant_exit`/`grant_clock`/`grant_memory`/`grant_yielder` |
 | `AddressSpace { base, size }` | base, size | `grant_address_space` |
 | `Instantiator { base, size }` | base, size | `grant_instantiator` |
+| `JitDomain { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
+| `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so
@@ -819,7 +842,11 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 `Host::drain_non_durable`, below):
 
 `SharedRegion(u32)` (R4), `Module(u32)`, `IoRing(u32)` (drain residue §5),
-`Blocking(u32)` (§5 + cancellation R2), `JitDomain(u32)`, `JitCode{domain,unit}`.
+`Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitDomain`/`JitCode` handles were here until
+**Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
+Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
+still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is
+the Slice-3 follow-on.)*
 
 **Generation/slot pinning.** Restore must reinstate the **same `(slot, generation)`**
 so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`

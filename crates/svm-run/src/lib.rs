@@ -1174,6 +1174,12 @@ pub fn jit_cap_run(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3), locked twin of the single-threaded path
+        // below: re-compile any restore-rebuilt units into this fresh module. A no-op for a fresh run.
+        {
+            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            reconstruct_jit_units(&mut cm, &mut hg)?;
+        }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
         // above); all of the run's vCPU threads serialize their `cap.call`s through `host_mutex`.
         let r =
@@ -1206,6 +1212,10 @@ pub fn jit_cap_run(
     host.set_jit_native_ctx(cm_ptr as usize);
     // §3.6 / I36 slice 3: register for the native serve arm too (see `powerbox_compile_run`).
     host.set_serve_native_ctx(cm_ptr as usize);
+    // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3): re-compile any units a restore rebuilt into
+    // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
+    // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
+    reconstruct_jit_units(&mut cm, host)?;
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
@@ -1326,6 +1336,46 @@ pub fn recompact_into(
                 // Exact-slot reproduction: a funcref old code holds keeps resolving to this unit.
                 fresh.install_at(slot, d.code, d.type_id);
             }
+        }
+    }
+    Ok(())
+}
+
+/// **Reconstruct-on-thaw** for a durable guest-`Jit` domain (DURABILITY.md §12.5 Slice 3): after
+/// [`svm_snapshot::restore`] rebuilds each domain's units (interpreter funcs; native code reset to
+/// `0` — the units' IR rode the artifact, not their process-local code pointers, §12.5 Slice 2),
+/// re-compile each **live-handled** unit into the thaw run's `cm` and re-register its native
+/// trampoline. A native `invoke` of a restored unit then runs its own code, not just the
+/// interpreter reference. Every re-granted domain is walked ([`Host::jit_domain_count`]); this is
+/// the cold-start twin of [`recompact_into`] (which sources from a live *old* module).
+///
+/// **Quiescent-only.** Call after `cm` is compiled and its native ctx registered, before
+/// re-entering the guest. [`jit_cap_run`] runs it transparently, so an embedder that thaws through
+/// `jit_cap_run` needs no extra call — and a *fresh* run (no restored units) is a no-op, since a
+/// just-granted domain holds no live `CompiledCode` handle.
+///
+/// **Scope.** The `invoke` path only (live `CompiledCode` handles). Reproducing a B2-`install`ed
+/// unit's `call_indirect` **table slot** across a thaw is a follow-on: Slice 2 captured the units'
+/// IR + install type id but not the slot occupancy, so an installed unit's slot is not re-established
+/// here (its handle still `invoke`s correctly; only a funcref reached through the old slot would
+/// miss). Register-side install reproduction rides the same `define_extra` result (`d.code`/
+/// `d.type_id`) once the slot index is captured.
+///
+/// # Safety
+/// `cm` must be the run's live [`CompiledModule`] (the one whose native ctx is registered in
+/// `host`); `define_extra` requires `!cm.is_running()`, which holds at this quiescent thaw point.
+pub fn reconstruct_jit_units(
+    cm: &mut CompiledModule,
+    host: &mut Host,
+) -> Result<(), svm_jit::JitError> {
+    for domain in 0..host.jit_domain_count() {
+        for unit in host.jit_live_units(domain) {
+            let Some(funcs) = host.jit_unit_funcs(domain, unit) else {
+                continue; // no IR retained (cannot happen for a restored unit) — skip defensively
+            };
+            let defs = cm.define_extra(&funcs)?;
+            let d = defs[0];
+            host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         }
     }
     Ok(())

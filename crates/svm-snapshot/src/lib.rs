@@ -40,8 +40,8 @@
 
 use svm_encode::{digest256, encode_module};
 use svm_interp::{
-    DurableBinding, DurableHandle, FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host,
-    NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
+    DurableBinding, DurableHandle, DurableJitDomain, DurableJitUnit, FrozenChildState, FrozenFiber,
+    FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use svm_ir::Module;
 
@@ -116,7 +116,15 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// structurally by the callee's join slot (a `DomainId`/`Arc` never rides the artifact). A v14
 /// artifact holding no live-impl cap is byte-identical (only the version differs); one that does
 /// couldn't have been produced by v14 (freeze refused it), so there's no v14 mis-parse to guard.
-const FORMAT_VERSION: u16 = 15;
+/// v16 (DURABILITY.md §12.5 Slice 2: durable guest-JIT): the handle-table binding codec gains
+/// `JitDomain { idx }` / `JitCode { domain, unit }` tags (`B_JIT_DOMAIN`/`B_JIT_CODE`), and a new
+/// Section 5 (`TAG_JIT`, after the serve state) carries each granted §22 domain's out-of-line unit
+/// state — the memory-match precondition, compile quotas, and units (each unit's instrumented+
+/// verified IR + `install` type id), rebuilt positionally on thaw so the binding indices re-resolve.
+/// Elided when the domain holds no granted JIT, so a JIT-free artifact keeps the v15 layout (only
+/// the version differs); one holding a JIT cap couldn't have been produced by v15 (freeze refused
+/// it), so there's no v15 mis-parse to guard.
+const FORMAT_VERSION: u16 = 16;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -133,6 +141,10 @@ const TAG_HANDLES: u64 = 3;
 /// Serve state (DURABILITY.md §13.4 step 3, v13) — the domain's inbound dispatch queue,
 /// completion cells, and ticket counter. Emitted only when non-empty (see `FORMAT_VERSION`).
 const TAG_SERVE: u64 = 4;
+/// Durable guest-JIT state (DURABILITY.md §12.5 Slice 2, v16) — each granted §22 domain's
+/// out-of-line units (instrumented+verified IR + `install` type id) and compile quotas. Emitted
+/// only when the domain holds granted JIT, so a JIT-free artifact keeps the pre-JIT layout.
+const TAG_JIT: u64 = 5;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
 const B_STREAM: u8 = 0;
@@ -143,6 +155,9 @@ const B_YIELDER: u8 = 4;
 const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
 const B_LIVE_IMPL: u8 = 7;
+/// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
+const B_JIT_DOMAIN: u8 = 8;
+const B_JIT_CODE: u8 = 9;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -201,6 +216,10 @@ pub enum RestoreError {
     /// the same window-containment invariant the grant path guarantees — otherwise a forged `base`
     /// drives the §14 JIT instantiator's `unsafe` window copy out of bounds (a host-memory escape).
     BindingOutOfWindow,
+    /// A §22 guest-JIT unit in the [`TAG_JIT`] section didn't decode or failed re-verification
+    /// (Slice 2). The artifact is untrusted, so its units must clear the verifier again before
+    /// their funcs become invocable — a failure is fail-closed (no domains reconstructed).
+    JitReconstruct,
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -470,7 +489,40 @@ pub fn freeze_with_prots(
         });
     }
 
+    // Section 5 — Durable guest-JIT state (DURABILITY.md §12.5 Slice 2, v16): each granted §22
+    // domain's out-of-line units + compile quotas. The handle table (Section 3) carries the
+    // `JitDomain`/`JitCode` *bindings* (indices); this carries the *state* those indices name,
+    // rebuilt positionally on thaw. Elided when no JIT is granted, so a JIT-free artifact keeps
+    // the pre-JIT section layout (only the version differs).
+    let jit = host.capture_durable_jit();
+    if !jit.is_empty() {
+        section(&mut out, TAG_JIT, |b| write_jit(b, &jit));
+    }
+
     Ok(out)
+}
+
+/// Serialize the durable guest-JIT domains (Section 5, v16). Canonical: domains and units in
+/// index order (capture already yields them so), minimal LEB128.
+fn write_jit(b: &mut Vec<u8>, jit: &[DurableJitDomain]) {
+    write_uleb(b, jit.len() as u64);
+    for d in jit {
+        match d.mem_log2 {
+            None => write_uleb(b, 0),
+            Some(m) => {
+                write_uleb(b, 1);
+                b.push(m);
+            }
+        }
+        write_uleb(b, d.units_left as u64);
+        write_uleb(b, d.bytes_left);
+        write_uleb(b, d.units.len() as u64);
+        for u in &d.units {
+            write_uleb(b, u.install_type_id as u64);
+            write_uleb(b, u.unit_ir.len() as u64);
+            b.extend_from_slice(&u.unit_ir);
+        }
+    }
 }
 
 /// Restore a §12 artifact: validate it against `module` (R5 digest gate + geometry), re-grant
@@ -501,6 +553,7 @@ pub fn restore_with_prots(
 
     let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
     let mut serve_body = None;
+    let mut jit_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -511,6 +564,7 @@ pub fn restore_with_prots(
             TAG_CONTROL => control_body = Some(body),
             TAG_HANDLES => handles_body = Some(body),
             TAG_SERVE => serve_body = Some(body),
+            TAG_JIT => jit_body = Some(body),
             _ => {} // forward-compatible: skip unknown sections
         }
     }
@@ -600,6 +654,28 @@ pub fn restore_with_prots(
     if !hr.at_end() {
         return Err(RestoreError::Malformed);
     }
+
+    // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5, bounds-check the handle
+    // table's JIT indices against it, and rebuild the domains (each unit re-verified). Do this
+    // *before* re-granting the table so a forged `JitDomain`/`JitCode` index that names no restored
+    // domain/unit is rejected here — otherwise the guest's first `compile`/`invoke` would index
+    // `jit_domains` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
+    // bounds check). ----
+    let jit = decode_jit(jit_body)?;
+    for h in &handles {
+        let ok = match h.binding {
+            DurableBinding::JitDomain { idx } => (idx as usize) < jit.len(),
+            DurableBinding::JitCode { domain, unit } => jit
+                .get(domain as usize)
+                .is_some_and(|d| (unit as usize) < d.units.len()),
+            _ => true,
+        };
+        if !ok {
+            return Err(RestoreError::JitReconstruct);
+        }
+    }
+    host.restore_durable_jit(&jit)
+        .map_err(|_| RestoreError::JitReconstruct)?;
     host.restore_durable_handles(&handles);
 
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
@@ -876,6 +952,52 @@ fn decode_control(
     Ok((fibers, vcpus, root_sp, nested, child_state))
 }
 
+/// Decode Section 5: the durable guest-JIT domains (v16). A `None` body ⇒ no JIT granted (empty
+/// set). Enforces canonical minimal encoding via the shared [`Reader`]; a unit's IR is carried
+/// opaquely here (its decode + re-verify happens in [`Host::restore_durable_jit`]).
+fn decode_jit(body: Option<&[u8]>) -> Result<Vec<DurableJitDomain>, RestoreError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut jr = Reader::new(body);
+    let nd = jr.uleb()?;
+    let mut domains = Vec::with_capacity(nd as usize);
+    for _ in 0..nd {
+        let mem_log2 = match jr.uleb()? {
+            0 => None,
+            1 => Some(jr.u8()?),
+            _ => return Err(RestoreError::Malformed),
+        };
+        let units_left = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let bytes_left = jr.uleb()?;
+        let nu = jr.uleb()?;
+        let mut units = Vec::with_capacity(nu as usize);
+        for _ in 0..nu {
+            let install_type_id = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let ir_len = jr.uleb()? as usize;
+            let unit_ir = jr.take(ir_len)?.to_vec();
+            units.push(DurableJitUnit {
+                unit_ir,
+                install_type_id,
+            });
+        }
+        domains.push(DurableJitDomain {
+            mem_log2,
+            units_left,
+            bytes_left,
+            units,
+        });
+    }
+    if !jr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    // Canonical: an empty JIT set elides the section (freeze only emits it when non-empty).
+    if domains.is_empty() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(domains)
+}
+
 // ---- Binding (de)serialization (§12.5) ----
 
 fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
@@ -907,6 +1029,15 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, slot as u64);
             write_uleb(b, export as u64);
         }
+        DurableBinding::JitDomain { idx } => {
+            b.push(B_JIT_DOMAIN);
+            write_uleb(b, idx as u64);
+        }
+        DurableBinding::JitCode { domain, unit } => {
+            b.push(B_JIT_CODE);
+            write_uleb(b, domain as u64);
+            write_uleb(b, unit as u64);
+        }
     }
 }
 
@@ -933,6 +1064,13 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_LIVE_IMPL => DurableBinding::LiveImpl {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_JIT_DOMAIN => DurableBinding::JitDomain {
+            idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_JIT_CODE => DurableBinding::JitCode {
+            domain: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            unit: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         _ => return Err(RestoreError::Malformed),
     })
