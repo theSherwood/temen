@@ -29,25 +29,51 @@ const PROTO_CODE: usize = 64;
 const STACKVALUE_SIZE: u64 = 16; // sizeof(TValue) == sizeof(StackValue)
 
 fn lua_module() -> Module {
-    let path = format!("{}/tests/fixtures/lua/lua_eval.ll", env!("CARGO_MANIFEST_DIR"));
-    svm_llvm::translate_ll_path(&path).expect("translate").module
+    let path = format!(
+        "{}/tests/fixtures/lua/lua_eval.ll",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    svm_llvm::translate_ll_path(&path)
+        .expect("translate")
+        .module
 }
 fn luav_execute(m: &Module) -> u32 {
-    m.exports.iter().find(|e| e.name == "luaV_execute").expect("export").func
+    m.exports
+        .iter()
+        .find(|e| e.name == "luaV_execute")
+        .expect("export")
+        .func
 }
-fn rd_u64(w: &[u8], a: u64) -> u64 { u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap()) }
-fn rd_i32(w: &[u8], a: u64) -> i32 { i32::from_le_bytes(w[a as usize..a as usize + 4].try_into().unwrap()) }
+fn rd_u64(w: &[u8], a: u64) -> u64 {
+    u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap())
+}
+fn rd_i32(w: &[u8], a: u64) -> i32 {
+    i32::from_le_bytes(w[a as usize..a as usize + 4].try_into().unwrap())
+}
 
 /// Capture (sp, L, ci, window) at luaV_execute entry.
 fn capture(m: &Module, luav: u32) -> (i64, i64, i64, Vec<u8>) {
     let inst = svm_run::instantiate(m.clone()).expect("instantiate");
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    insp.set_breakpoint(IrPc { module: 0, func: luav, block: 0, inst: 0 });
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: 0,
+        inst: 0,
+    });
     match insp.run_until_stop() {
-        Stop::Break { reason: StopReason::Breakpoint, .. } => {
-            let g = |i| match insp.read_ir_value(0, i) { Some(Value::I64(v)) => v, o => panic!("{o:?}") };
-            let dump = insp.read_window(0, (win as usize).min(CAPTURE_LEN)).expect("window");
+        Stop::Break {
+            reason: StopReason::Breakpoint,
+            ..
+        } => {
+            let g = |i| match insp.read_ir_value(0, i) {
+                Some(Value::I64(v)) => v,
+                o => panic!("{o:?}"),
+            };
+            let dump = insp
+                .read_window(0, (win as usize).min(CAPTURE_LEN))
+                .expect("window");
             (g(0), g(1), g(2), dump)
         }
         o => panic!("no break: {o:?}"),
@@ -67,7 +93,11 @@ fn dispatch_folds_with_constant_bytecode() {
     let proto = rd_u64(&w, closure + LCLOSURE_P as u64);
     let code_addr = rd_u64(&w, proto + PROTO_CODE as u64);
     let sizecode = rd_i32(&w, proto + PROTO_SIZECODE as u64) as u64;
-    assert_eq!(rd_u64(&w, ci + CI_SAVEDPC as u64), code_addr, "savedpc != code");
+    assert_eq!(
+        rd_u64(&w, ci + CI_SAVEDPC as u64),
+        code_addr,
+        "savedpc != code"
+    );
 
     // The register file: base = ci->func.p + 1, extent = maxstacksize TValues. Renaming it lifts the
     // registers into SSA — crucially the 1-byte tags, written as the constant LUA_VNUMINT by each
@@ -91,14 +121,32 @@ fn dispatch_folds_with_constant_bytecode() {
     println!("register file: base={base:#x} maxstack={maxstack} region=[{base:#x}, {reg_hi:#x})");
 
     // Baseline: un-specialized luaV_execute is Unsupported (dispatch stays dynamic, cold paths hit).
-    let base = specialize_with_config(&m, luav, &[SpecArg::Dynamic, SpecArg::Dynamic, SpecArg::Dynamic], &SpecConfig { indirect_targets_cap: Some(16), ..Default::default() });
-    println!("\nbaseline (all-dynamic): {:?}", base.as_ref().map(|r| r.funcs[0].blocks.len()).map_err(|e| e));
+    let base = specialize_with_config(
+        &m,
+        luav,
+        &[SpecArg::Dynamic, SpecArg::Dynamic, SpecArg::Dynamic],
+        &SpecConfig {
+            indirect_targets_cap: Some(16),
+            ..Default::default()
+        },
+    );
+    println!(
+        "\nbaseline (all-dynamic): {:?}",
+        base.as_ref().map(|r| r.funcs[0].blocks.len())
+    );
 
     // With the bytecode constant + L/ci baked:
-    let args = [SpecArg::ConstI64(sp), SpecArg::ConstI64(l), SpecArg::ConstI64(ci as i64)];
+    let args = [
+        SpecArg::ConstI64(sp),
+        SpecArg::ConstI64(l),
+        SpecArg::ConstI64(ci as i64),
+    ];
     match specialize_with_config(&m, luav, &args, &cfg) {
-        Ok(r) => println!("SPECIALIZED: Ok — residual {} blocks (interpreter luaV_execute had {})",
-            r.funcs[0].blocks.len(), m.funcs[luav as usize].blocks.len()),
+        Ok(r) => println!(
+            "SPECIALIZED: Ok — residual {} blocks (interpreter luaV_execute had {})",
+            r.funcs[0].blocks.len(),
+            m.funcs[luav as usize].blocks.len()
+        ),
         Err(e) => println!("SPECIALIZED: Err({e:?})"),
     }
 }

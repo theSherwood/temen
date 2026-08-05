@@ -141,18 +141,35 @@ fn chase(w: &[u8], ci: u64) -> Located {
     let code_addr = rd_u64(w, proto + PROTO_CODE as u64);
     let k_addr = rd_u64(w, proto + PROTO_K as u64);
     let sizecode = rd_i32(w, proto + PROTO_SIZECODE as u64);
-    let sizek = rd_i32(w, proto + PROTO_SIZECODE as u64 - (PROTO_SIZECODE - PROTO_SIZEK) as u64);
+    let sizek = rd_i32(
+        w,
+        proto + PROTO_SIZECODE as u64 - (PROTO_SIZECODE - PROTO_SIZEK) as u64,
+    );
     let savedpc = rd_u64(w, ci + CI_SAVEDPC as u64);
 
     // Cross-check: at entry the cursor points at the code start, validating both offsets at once.
-    assert_eq!(savedpc, code_addr, "savedpc != Proto.code — a struct offset is wrong");
-    assert!((0..4096).contains(&sizecode), "implausible sizecode {sizecode} — offsets wrong");
-    assert!((code_addr as usize) + 4 * sizecode as usize <= w.len(), "code past capture");
+    assert_eq!(
+        savedpc, code_addr,
+        "savedpc != Proto.code — a struct offset is wrong"
+    );
+    assert!(
+        (0..4096).contains(&sizecode),
+        "implausible sizecode {sizecode} — offsets wrong"
+    );
+    assert!(
+        (code_addr as usize) + 4 * sizecode as usize <= w.len(),
+        "code past capture"
+    );
 
     let code: Vec<u32> = (0..sizecode as u64)
         .map(|i| rd_i32(w, code_addr + 4 * i) as u32)
         .collect();
-    Located { code_addr, code, k_addr, sizek }
+    Located {
+        code_addr,
+        code,
+        k_addr,
+        sizek,
+    }
 }
 
 #[test]
@@ -163,16 +180,30 @@ fn chase_to_bytecode_and_validate() {
     let loc = chase(&w, ci as u64);
 
     println!("\nlocated program via ci={ci:#x}:");
-    println!("  code @ {:#x}: {} instructions", loc.code_addr, loc.code.len());
+    println!(
+        "  code @ {:#x}: {} instructions",
+        loc.code_addr,
+        loc.code.len()
+    );
     println!("  k    @ {:#x}: {} constants", loc.k_addr, loc.sizek);
 
     // Every instruction's opcode (low 7 bits) must be a valid Lua 5.4 opcode (0..82) — a strong
     // signal we located the real bytecode and not garbage.
     for (i, &word) in loc.code.iter().enumerate() {
         let op = word & 0x7f;
-        assert!(op <= 82, "instruction {i} opcode {op} out of range — not real bytecode");
+        assert!(
+            op <= 82,
+            "instruction {i} opcode {op} out of range — not real bytecode"
+        );
     }
     // The first opcode of a chunk with locals is VARARGPREP (opcode 0 in 5.4).
-    println!("  first opcodes: {:?}", loc.code.iter().take(6).map(|w| w & 0x7f).collect::<Vec<_>>());
+    println!(
+        "  first opcodes: {:?}",
+        loc.code
+            .iter()
+            .take(6)
+            .map(|w| w & 0x7f)
+            .collect::<Vec<_>>()
+    );
     assert!(loc.code.len() >= 6, "expected a non-trivial loop program");
 }

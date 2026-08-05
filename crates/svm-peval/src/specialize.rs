@@ -1251,6 +1251,12 @@ impl Spec<'_> {
                 offset,
                 align,
             } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
+            Inst::MemCopy { dst, src, len } => {
+                return self.eval_mem_copy(dst, src, len, env, mem, out, rnext)
+            }
+            Inst::MemFill { dst, val, len } => {
+                return self.eval_mem_fill(dst, val, len, env, mem, out, rnext)
+            }
 
             // Any other pure, single-result value op. A scalar **float** or **v128 (SIMD)** op with
             // all-constant operands folds (bit-for-bit the interpreter; a `FToITrap` that would trap
@@ -1438,6 +1444,142 @@ impl Spec<'_> {
             align,
         });
         Ok(None)
+    }
+
+    /// A `memory.copy` of a **constant** length between **constant** addresses. When source and
+    /// destination both lie fully inside the renameable region, model it as an abstract **cell copy**
+    /// — Lua's 16-byte `TValue` struct moves (`MOVE`, loop-control) lower to `llvm.memcpy`, so this is
+    /// the hinge that lets `luaV_execute` fold. Every source cell is shifted to the destination and
+    /// the rest of the destination span is invalidated, so untouched bytes read back as the region's
+    /// zero-init — matching a real copy of the source's uninitialized bytes. Both-disjoint copies are
+    /// emitted residually; a dynamic length/address is residual only when the region is private (else
+    /// it could alias renamed cells and is refused).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_mem_copy(
+        &self,
+        dst: u32,
+        src: u32,
+        len: u32,
+        env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let consts = match (env[dst as usize], env[src as usize], env[len as usize]) {
+            (Abs::Const(Known::I64(d)), Abs::Const(Known::I64(s)), Abs::Const(Known::I64(l))) => {
+                Some((d as u64, s as u64, l as u64))
+            }
+            _ => None,
+        };
+        let emit_residual = |out: &mut Vec<Inst>, rnext: &mut u32| {
+            let dst = materialize(env[dst as usize], out, rnext);
+            let src = materialize(env[src as usize], out, rnext);
+            let len = materialize(env[len as usize], out, rnext);
+            out.push(Inst::MemCopy { dst, src, len });
+        };
+        let (da, sa, ln) = match consts {
+            Some(t) => t,
+            None => {
+                // A dynamic span might alias the renamed region unless the caller promised it private.
+                if self.config.rename.is_some() && !self.config.rename_is_private {
+                    trace_unsup!("mem_copy: dynamic span with a non-private rename region");
+                    return Err(SpecError::Unsupported);
+                }
+                emit_residual(out, rnext);
+                return Ok(None);
+            }
+        };
+        if ln == 0 {
+            return Ok(None);
+        }
+        let region = self.config.rename;
+        if within_region(region, da, ln) && within_region(region, sa, ln) {
+            // A source cell straddling the span boundary can't be split abstractly.
+            if mem.iter().any(|(&a, &(w, _))| {
+                a < sa + ln && sa < a + w as u64 && !(a >= sa && a + w as u64 <= sa + ln)
+            }) {
+                trace_unsup!("mem_copy: a source cell straddles the span");
+                return Err(SpecError::Unsupported);
+            }
+            let moved: Vec<(u64, u32, Abs)> = mem
+                .iter()
+                .filter(|(&a, &(w, _))| a >= sa && a + w as u64 <= sa + ln)
+                .map(|(&a, &(w, v))| (da + (a - sa), w, v))
+                .collect();
+            mem.retain(|&a, &mut (w, _)| !(a < da + ln && da < a + w as u64));
+            for (a, w, v) in moved {
+                mem.insert(a, (w, v));
+            }
+            return Ok(None);
+        }
+        if disjoint_from_region(region, da, ln) && disjoint_from_region(region, sa, ln) {
+            emit_residual(out, rnext);
+            return Ok(None);
+        }
+        trace_unsup!(
+            "mem_copy: mixed/straddle da={:#x} sa={:#x} len={}",
+            da,
+            sa,
+            ln
+        );
+        Err(SpecError::Unsupported)
+    }
+
+    /// A `memory.fill` of a **constant** length. A **zero** fill inside the renameable region simply
+    /// invalidates the span (untouched cells read back as the zero-init); a fill disjoint from the
+    /// region is residual. Other cases (non-zero fill into the region, straddle) are not modeled yet.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_mem_fill(
+        &self,
+        dst: u32,
+        val: u32,
+        len: u32,
+        env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let consts = match (env[dst as usize], env[val as usize], env[len as usize]) {
+            (Abs::Const(Known::I64(d)), Abs::Const(v), Abs::Const(Known::I64(l))) => {
+                Some((d as u64, v.as_i32().unwrap_or(1), l as u64))
+            }
+            _ => None,
+        };
+        let emit_residual = |out: &mut Vec<Inst>, rnext: &mut u32| {
+            let dst = materialize(env[dst as usize], out, rnext);
+            let val = materialize(env[val as usize], out, rnext);
+            let len = materialize(env[len as usize], out, rnext);
+            out.push(Inst::MemFill { dst, val, len });
+        };
+        let (da, byte, ln) = match consts {
+            Some(t) => t,
+            None => {
+                if self.config.rename.is_some() && !self.config.rename_is_private {
+                    trace_unsup!("mem_fill: dynamic span with a non-private rename region");
+                    return Err(SpecError::Unsupported);
+                }
+                emit_residual(out, rnext);
+                return Ok(None);
+            }
+        };
+        if ln == 0 {
+            return Ok(None);
+        }
+        let region = self.config.rename;
+        if within_region(region, da, ln) {
+            if byte != 0 {
+                trace_unsup!("mem_fill: non-zero fill into the rename region byte={byte}");
+                return Err(SpecError::Unsupported);
+            }
+            mem.retain(|&a, &mut (w, _)| !(a < da + ln && da < a + w as u64));
+            return Ok(None);
+        }
+        if disjoint_from_region(region, da, ln) {
+            emit_residual(out, rnext);
+            return Ok(None);
+        }
+        trace_unsup!("mem_fill: straddle da={:#x} len={}", da, ln);
+        Err(SpecError::Unsupported)
     }
 
     /// Evaluate the active frame's terminator, given the suspended caller frames (`outer`) and the
