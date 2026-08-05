@@ -57,6 +57,30 @@ five `Instantiator` ops, the child-suspension plumbing only coroutine children u
 relevant tiers); a **benchmark pin on the fault-service path** — the collapse must not regress
 lazy-paging latency vs the bespoke coroutine ops (bench harness is the arbiter, AGENTS.md).
 
+### §2 status (2026-08-05, after PR #622)
+
+Landed: **2.0** (`paging_bench` pin: bespoke interp ~1.4–2.1 µs/fault, bespoke JIT ~29 µs —
+every fault switch pays `sync_committed` mirroring both ways across the carve); **2.1**
+(coroutine-as-provider vertical, `coroutine_offer_bench`); **2.1b** (`RunConfig::handoff`
+default-on — the 4d direct-handoff lane was built but unreachable from `svm-run`, so 2.1's 9–10×
+reading measured the queued transport; with handoff on, interp offers ~740 ns); **2.2**
+(`Instantiator` op 16 `spawn_process_demand`: pager-serviced demand paging as a call on the
+spawner's own impl export, eval-loop tier; bytecode vetoes to the oracle, JIT folds via
+`module_demand_spawns`).
+
+The gate reading (`paging_bench`, offer lane vs bespoke, identical checksum): **JIT 6.7×
+FASTER** (29.3 µs → 4.4 µs — the mirroring cost is deleted by construction, the collapse
+thesis vindicated on the tier that matters); **interp tiers 1.8–2.8× slower** (TreeWalk
+1.4 → 4.1 µs) — the concurrent-child offer transport (admission, revocation check, provider
+dispatch, cross-worker scheduling) vs a direct in-Rust `resume`. Profiling (2.1b) puts the
+parked-provider transport floor at ~300–450 ns; that fast lane is the queued next slice.
+
+**2.3 (the deletion) stays blocked** until either the interp fault-service gap closes to
+the pin's tolerance or the owner explicitly accepts the interp cost against the JIT win and
+the machinery deleted. Note the shape difference the numbers ride on: the bespoke child is
+inline-driven (zero scheduling), the op-16 child is genuinely concurrent — some of the gap
+is the price of a real process child, not transport waste.
+
 ## 3. Instantiator: config-record spawn; Budget swallows the fuel scalars
 
 With §2 done, de-proliferate what remains of the op table (~16 ops today):
