@@ -99,6 +99,18 @@ use svm_verify::func_value_types;
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
 
+/// Diagnostic: name the op/context that forced a [`SpecError::Unsupported`]. A no-op unless the
+/// `trace` feature is on (which pulls in `std` for `eprintln`), so it never touches the `no_std`
+/// build. Used to find the first blocker when specializing a large real function (e.g. `luaV_execute`).
+#[cfg(feature = "trace")]
+macro_rules! trace_unsup {
+    ($($t:tt)*) => {{ extern crate std; std::eprintln!($($t)*); }};
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_unsup {
+    ($($t:tt)*) => {{}};
+}
+
 /// How one parameter of the function being specialized is bound.
 #[derive(Clone, Copy, Debug)]
 pub enum SpecArg {
@@ -933,7 +945,17 @@ impl Spec<'_> {
             Inst::CallIndirect { ty, idx, args } => {
                 let callee = self
                     .resolve_indirect(ty, env[*idx as usize])
-                    .ok_or(SpecError::Unsupported)?;
+                    .ok_or_else(|| {
+                        trace_unsup!(
+                            "call_indirect unresolved ty={:?} idx_const={:?}",
+                            ty,
+                            match env[*idx as usize] {
+                                Abs::Const(k) => Some(k.as_i32()),
+                                Abs::Dyn(_) => None,
+                            }
+                        );
+                        SpecError::Unsupported
+                    })?;
                 Some((callee, args.iter().map(|&a| env[a as usize]).collect()))
             }
             _ => None,
@@ -1242,8 +1264,10 @@ impl Spec<'_> {
                 if let Some(k) = fold {
                     return Ok(Some(Abs::Const(k)));
                 }
-                let abs =
-                    emit_residual_pure(inst, env, out, rnext).ok_or(SpecError::Unsupported)?;
+                let abs = emit_residual_pure(inst, env, out, rnext).ok_or_else(|| {
+                    trace_unsup!("eval_inst fallthrough: {:?}", inst);
+                    SpecError::Unsupported
+                })?;
                 return Ok(Some(abs));
             }
         };
@@ -1271,6 +1295,7 @@ impl Spec<'_> {
                 // The renameable region must be resolved entirely abstractly. Only integer loads
                 // can be (the abstract domain tracks integer cells); a float load into it can't.
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
+                    trace_unsup!("load: non-integer into rename region op={:?}", op);
                     return Err(SpecError::Unsupported);
                 }
                 // An exact cell — same address *and* width — resolves directly. A constant cell's
@@ -1285,7 +1310,14 @@ impl Spec<'_> {
                                 Abs::Const(extend_loaded(raw, op).ok_or(SpecError::Unsupported)?)
                             }
                             Abs::Dyn(i) if is_full_natural_load(op, width) => Abs::Dyn(i),
-                            Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                            Abs::Dyn(_) => {
+                                trace_unsup!(
+                                    "load: narrow dynamic cell eff={:#x} op={:?}",
+                                    eff,
+                                    op
+                                );
+                                return Err(SpecError::Unsupported);
+                            }
                         }));
                     }
                 }
@@ -1295,6 +1327,11 @@ impl Spec<'_> {
                     .iter()
                     .any(|(&b, &(wc, _))| b < eff + width && eff < b + wc as u64)
                 {
+                    trace_unsup!(
+                        "load: straddling/overlap in rename region eff={:#x} w={}",
+                        eff,
+                        width
+                    );
                     return Err(SpecError::Unsupported);
                 }
                 // Untouched region cell ⇒ the zero-initialized backing, extended per the load.
@@ -1351,6 +1388,7 @@ impl Spec<'_> {
             if within_region(self.config.rename, eff, width) {
                 // Only integer stores can be renamed (the abstract domain tracks integer cells).
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
+                    trace_unsup!("store: non-integer into rename region op={:?}", op);
                     return Err(SpecError::Unsupported);
                 }
                 let cell = match env[value as usize] {
@@ -1361,7 +1399,10 @@ impl Spec<'_> {
                     // loading it back at that width is the identity. A *narrow* dynamic store would
                     // need residual masking to read back soundly, so refuse it instead.
                     Abs::Dyn(i) if is_full_natural_store(op, width) => Abs::Dyn(i),
-                    Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                    Abs::Dyn(_) => {
+                        trace_unsup!("store: narrow dynamic cell eff={:#x} op={:?}", eff, op);
+                        return Err(SpecError::Unsupported);
+                    }
                 };
                 // Invalidate any overlapping cell, then record this one. No residual store.
                 mem.retain(|&b, &mut (wc, _)| !(b < eff + width && eff < b + wc as u64));
