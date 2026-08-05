@@ -23,6 +23,10 @@
 //! `invoke` is a seam-free atomic leaf (never interrupted mid-flight), so the freezable path for
 //! suspendable unit code is `install` + `call_indirect` — the unit runs in the caller's durable
 //! frames, so a continuation suspended inside it freezes/thaws with the caller's shadow stack.
+//!
+//! **Install fence** (`durable_jit_compile_fences_suspending_untainted_unit`): the by-signature-taint
+//! gap (R8) — a durable domain rejects a *suspendable* unit whose entry signature the program does not
+//! taint at `compile`, so it can never be installed and reached by an un-instrumented `call_indirect`.
 
 use svm_durable::{
     begin_thaw, init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
@@ -592,5 +596,58 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
         rt.expect("thaw ok"),
         vec![Value::I64(142)],
         "in-flight continuation inside the installed unit resumed: saved Clock(42) reloaded (not re-issued → 100)"
+    );
+}
+
+/// **Durable install fence (DURABILITY.md §12.5, R8 fork-critical case).** A durable domain must not
+/// admit a *suspendable* unit whose entry signature the program does not taint: a `call_indirect`
+/// reaching such an installed unit would be at an un-instrumented site, silently losing the unit's
+/// continuation on thaw (confirmed corruption). The gate fails it closed at `compile`. Three branches:
+/// suspendable + untainted → **rejected**; suspendable + tainted → admitted; non-suspendable → admitted
+/// (safe regardless of taint — no continuation to lose).
+#[test]
+fn durable_jit_compile_fences_suspending_untainted_unit() {
+    // Program taints only `(i32)->(i64)` — a may-suspend function of that signature (never called;
+    // it establishes the `call_indirect` seam the taint analysis keys on).
+    let prog = parse_module(
+        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+    )
+    .expect("parse program");
+    verify_module(&prog).expect("verify program");
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let jit = grant_jit_durable(&mut h, &prog, TABLE_LOG2);
+
+    // (A) suspendable, signature `(i32)->(i64)` — TAINTED by the program → admitted.
+    let unit_a = blob(
+        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  \
+         v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+    );
+    assert!(
+        matches!(h.jit_compile(jit, &unit_a), Ok(Ok(_))),
+        "suspendable unit of a TAINTED signature is admitted (the call_indirect seam exists)"
+    );
+
+    // (B) suspendable, signature `(i64)->(i64)` — NOT tainted → fenced closed.
+    let unit_b = blob(
+        "memory 17\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+         vh = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) vh (vh)\n  return v2\n  }\n}\n",
+    );
+    assert!(
+        matches!(h.jit_compile(jit, &unit_b), Ok(Err(-22))),
+        "suspendable unit of an UNTAINTED signature is fenced (would lose its continuation on thaw)"
+    );
+
+    // (C) non-suspendable, signature `(i64)->(i64)` — untainted but SAFE → admitted.
+    let unit_c = blob(
+        "memory 17\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+         vc = i64.const 7\n  return vc\n  }\n}\n",
+    );
+    assert!(
+        matches!(h.jit_compile(jit, &unit_c), Ok(Ok(_))),
+        "non-suspendable unit is admitted regardless of taint (no continuation to lose)"
     );
 }

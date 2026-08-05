@@ -217,10 +217,28 @@ module frame with no offset collision) and freezes/thaws with it. On thaw the ca
 (install-durability), so it re-selects the unit, which rewinds. Pinned by
 `durable_guest_jit.rs::durable_jit_install_call_indirect_freezes_in_flight_continuation` (freeze
 UNWINDING mid-`call_indirect` inside an installed Clock-suspending unit → thaw reloads the saved clock,
-≡ the uninterrupted run). *Soundness note (follow-on):* the `call_indirect` taint is **by signature**
-(§6, R8) — a program that `call_indirect`s an installed unit whose signature no program function shares
-would under-instrument the site; widening the taint to treat *every* `call_indirect` as may-suspend
-once a `Jit` cap is granted (the run-time-installable-targets case) is the remaining hardening.
+≡ the uninterrupted run).
+
+**Install fence (the by-signature-taint gap, closed fail-closed).** The `call_indirect` taint is **by
+signature** (§6, R8): a program that `call_indirect`s an installed unit whose signature *no program
+function taints* would reach it at an **un-instrumented** site — a freeze mid-unit then silently loses
+the unit's continuation on thaw (a demonstrated wrong answer, not a trap:
+`durable_guest_jit.rs`'s untamed double-`call_indirect` returned 243 vs. the correct 285, R9's
+module-wide guest-memory rejection notwithstanding — the vector uses neither memory nor globals). Since
+"the unit suspends" is only known at install/compile time (not at the program transform, which is why a
+blunt transform-level reject would wrongly kill the tested new→old unit `call_indirect` and durable
+non-suspending dispatch), the fence lives at **`Jit.compile`**: a durable domain **rejects a
+*suspendable* unit whose entry signature the program does not taint** (`svm_durable::
+unit_suspends_untainted`, injected as the `Host` taint gate by `grant_jit_durable` alongside the
+program's `tainted_signatures_of`). Can't compile ⇒ can't install ⇒ the un-instrumented-site path is
+unreachable. The analysis lives in `svm-durable`; the TCB `Host` only stores the tainted-sig data and
+calls the injected predicate (no `svm-durable` dependency in the TCB). A non-suspending unit, or a
+suspending unit whose signature the program *does* taint (the seam exists — the in-flight test's case),
+is admitted. Pinned by `durable_guest_jit.rs::durable_jit_compile_fences_suspending_untainted_unit`
+(all three branches). *Remaining lift (not a soundness gap):* **widening** the taint so such programs are
+*admitted* — instrument *every* `call_indirect` as may-suspend once a `Jit` cap is granted — trades an
+always-on poll on all durable indirect calls (+ shadow-frame budget pressure) for accepting the
+run-time-installable-targets case; deferred until a workload needs it.
 The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable

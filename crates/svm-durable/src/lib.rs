@@ -217,8 +217,8 @@ pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformE
 
 fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
-    let may_suspend = compute_may_suspend(m);
-    let tainted_sigs = tainted_signatures(m, &may_suspend);
+    let may_suspend = compute_may_suspend(&m.funcs);
+    let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
     // R9 enforcement: the durable region shares the window with guest memory at fixed low
@@ -408,9 +408,9 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
 /// function taints its own signature). Marking the caller (rather than ignoring the
 /// indirect call) is what flips R8 from fail-**open** — silent under-instrumentation — to
 /// sound: `transform_func` then either instruments the site or fails the module closed.
-fn compute_may_suspend(m: &Module) -> Vec<bool> {
-    let mut ms = vec![false; m.funcs.len()];
-    for (i, f) in m.funcs.iter().enumerate() {
+fn compute_may_suspend(funcs: &[Func]) -> Vec<bool> {
+    let mut ms = vec![false; funcs.len()];
+    for (i, f) in funcs.iter().enumerate() {
         if f.blocks.iter().any(|b| {
             b.insts.iter().any(|x| {
                 // `cap.call` suspends to the host; a fiber `cont.resume`/`suspend` switches
@@ -434,13 +434,12 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
         // newly-tainted functions first (read-only over `ms`), then apply — so the taint predicate's
         // borrow of `ms` doesn't clash with the mutation.
         let tainted = |ty: &svm_ir::FuncType| -> bool {
-            m.funcs
+            funcs
                 .iter()
                 .enumerate()
                 .any(|(j, g)| ms[j] && g.params == ty.params && g.results == ty.results)
         };
-        let to_mark: Vec<usize> = m
-            .funcs
+        let to_mark: Vec<usize> = funcs
             .iter()
             .enumerate()
             .filter(|&(i, f)| {
@@ -477,9 +476,9 @@ fn compute_may_suspend(m: &Module) -> Vec<bool> {
 /// The distinct signatures of the may-suspend functions — the tainted set a `call_indirect`
 /// checks its type against (see [`compute_may_suspend`]). Computed once from the final `ms`
 /// and threaded into `transform_func` so it recognizes indirect suspend sites the same way.
-fn tainted_signatures(m: &Module, ms: &[bool]) -> Vec<svm_ir::FuncType> {
+fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<svm_ir::FuncType> {
     let mut sigs: Vec<svm_ir::FuncType> = Vec::new();
-    for (i, f) in m.funcs.iter().enumerate() {
+    for (i, f) in funcs.iter().enumerate() {
         if ms[i] {
             let ty = svm_ir::FuncType {
                 params: f.params.clone(),
@@ -491,6 +490,40 @@ fn tainted_signatures(m: &Module, ms: &[bool]) -> Vec<svm_ir::FuncType> {
         }
     }
     sigs
+}
+
+/// The distinct signatures a *program* instruments for suspension — i.e. every `call_indirect`
+/// of one of these types has a poll/unwind seam. Computed on the program's (pre-transform)
+/// functions, this is the set a durable host stashes so it can gate later `Jit.compile`s
+/// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
+pub fn tainted_signatures_of(funcs: &[Func]) -> Vec<svm_ir::FuncType> {
+    let ms = compute_may_suspend(funcs);
+    tainted_signatures(funcs, &ms)
+}
+
+/// The durable-JIT install fence (DURABILITY.md §12.5, R8 fork-critical case). Returns `true`
+/// — *reject this unit* — when the unit's entry (func 0, the `invoke`/`call_indirect` target)
+/// transitively **suspends** yet its signature is **not** in `program_tainted` (the caller
+/// program's [`tainted_signatures_of`]). In that case a program `call_indirect` reaching the
+/// installed unit would be at an *un-instrumented* site (the taint is by-signature), so a freeze
+/// mid-unit would silently lose the continuation on thaw. Fences fail-closed at compile so the
+/// unit can never be installed. A non-suspending unit, or one whose signature the program taints
+/// (the seam exists), returns `false` — admitted. Runs on the already-instrumented unit funcs;
+/// the entry's `cap.call`/`cont.*` survive instrumentation, so `ms[0]` is unchanged, and the
+/// transform preserves signatures. Injected into the durable `Host` as its taint gate.
+pub fn unit_suspends_untainted(unit_funcs: &[Func], program_tainted: &[svm_ir::FuncType]) -> bool {
+    if unit_funcs.is_empty() {
+        return false; // no entry to invoke; the empty-unit case is rejected elsewhere
+    }
+    let ms = compute_may_suspend(unit_funcs);
+    if !ms[0] {
+        return false; // entry cannot suspend → no continuation to lose → safe
+    }
+    let entry = svm_ir::FuncType {
+        params: unit_funcs[0].params.clone(),
+        results: unit_funcs[0].results.clone(),
+    };
+    !program_tainted.contains(&entry)
 }
 
 /// The single may-suspend operation in an instrumented block.

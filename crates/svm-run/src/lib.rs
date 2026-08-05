@@ -1120,6 +1120,15 @@ pub fn grant_jit_threads(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_hosts_durable(true);
     host.set_jit_validator(jit_blob_validator_durable);
+    // Install fence (DURABILITY.md §12.5, R8 fork-critical case): stash the program's tainted
+    // signatures + the gate predicate so a later `Jit.compile` of a *suspendable* unit whose entry
+    // signature the program does not taint fails closed (an un-instrumented `call_indirect` could
+    // otherwise reach the installed unit and lose its continuation on thaw). The analysis lives here
+    // in `svm-durable`; the TCB `Host` only stores the data and calls the predicate.
+    host.set_jit_durable_gate(
+        svm_durable::unit_suspends_untainted,
+        svm_durable::tainted_signatures_of(&m.funcs),
+    );
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
