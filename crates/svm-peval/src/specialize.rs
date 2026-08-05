@@ -248,6 +248,20 @@ pub struct SpecConfig {
     /// operand stack *and* a pointer-addressed heap at once. Unsound if violated (a dynamic write
     /// into the region would desync the elided renamed cells), so it is opt-in and off by default.
     pub rename_is_private: bool,
+    /// Treat the [`rename`](Self::rename) region as **live memory backed by the constant image**
+    /// rather than zero-initialized scratch: an untouched renamed cell reads its **seed** from the
+    /// constant-memory sources (an overlay, a [`const_regions`](Self::const_regions) promise, or a
+    /// readonly data segment) instead of reading zero. This is what lets the specializer SSA-lift —
+    /// and then mutate — real interpreter state captured from a live run (a `lua_State`'s stack
+    /// pointers, a `CallInfo`, the register file), so the guards those fields drive fold while writes
+    /// still update the abstract cell. Off by default (the region stays zero-init scratch), so
+    /// existing renames — whose regions never overlap a constant source — are unaffected.
+    ///
+    /// **Correctness contract:** seeding makes the region *alias real memory*. If any renamed cell is
+    /// **written**, the residual elides that store, so the window is left stale after the call — sound
+    /// only when that memory is dead once the residual returns. When the memory persists (its final
+    /// value is read by the caller), pair this with write-back so the live cells are spilled on exit.
+    pub rename_seed_from_image: bool,
     /// **Outline calls** instead of inlining them: a direct (or constant-index indirect) call is
     /// specialized to a *separate* residual function — memoized per `(callee, arg pattern)` so call
     /// sites with the same static binding share one — and emitted as a residual `call`, producing a
@@ -1340,7 +1354,16 @@ impl Spec<'_> {
                     );
                     return Err(SpecError::Unsupported);
                 }
-                // Untouched region cell ⇒ the zero-initialized backing, extended per the load.
+                // Untouched region cell. If the caller declared the region live-backed by the
+                // constant image, read its seed from the constant-memory sources (overlay / promised
+                // const region / readonly data) so captured VM state folds; otherwise it is the
+                // zero-initialized scratch backing. A *written* cell was resolved above, so the seed
+                // is only ever the region's pre-call value — writes correctly shadow it.
+                if self.config.rename_seed_from_image {
+                    if let Some(k) = read_const_mem(self.config, self.module, base, offset, op) {
+                        return Ok(Some(Abs::Const(k)));
+                    }
+                }
                 return Ok(Some(Abs::Const(
                     extend_loaded(0, op).ok_or(SpecError::Unsupported)?,
                 )));
