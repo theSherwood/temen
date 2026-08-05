@@ -43,3 +43,5 @@ svm-interp.workspace = true
 # compile it to native code — the "ship a specialized artifact" path.
 svm-encode.workspace = true
 svm-jit.workspace = true
+# The dispatch-ROI harness (tests/lua_dispatch_roi.rs) writes its bytecode-VM skeleton in textual IR.
+svm-text.workspace = true
