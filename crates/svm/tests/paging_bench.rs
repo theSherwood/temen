@@ -321,7 +321,8 @@ fn fault_service_latency() {
     }
 
     println!("\nfault-service round-trip — {s} spawns x {p} faults = {faults}, per-fault ns");
-    println!("(offer / bespoke in brackets — the CONSOLIDATION.md §2 gate):");
+    println!("(offer / bespoke in brackets — the CONSOLIDATION.md §2 gate)");
+    println!("(4th backend, wasm-JIT: both lanes fold to bytecode — see wasm_jit_lane_folds_closed_today):");
     for b in BACKENDS {
         let mut per: [f64; 2] = [0.0; 2];
         for (li, (_, src)) in lanes.iter().enumerate() {
@@ -342,6 +343,30 @@ fn fault_service_latency() {
             per[0],
             per[1],
             per[1] / per[0]
+        );
+    }
+}
+
+/// The **fourth backend** — the wasm-JIT tier (`svm-wasm-jit`) — pinned so it is never silently
+/// forgotten in this comparison. Today both lanes' parents sit outside the emitter's nested
+/// subset (`svc.wait` serve loops and the coroutine/pager Instantiator ops have no bounce arms),
+/// so the tier **fails closed** and the entry folds to the bytecode interpreter: the wasm-JIT
+/// row of the fault-service table *is* the Bytecode row. This test asserts exactly that state.
+/// When the emitter grows the arms, the assert flips — replace it with a real timed lane
+/// (emit + run under `wasmi`, the `nested_vm.rs` harness shape) instead of deleting the test.
+#[test]
+fn wasm_jit_lane_folds_closed_today() {
+    for (name, src) in [
+        ("bespoke", paging_program(1, 1)),
+        ("offer", offer_paging_program(1, 1)),
+    ] {
+        let m = parse_module(&src).expect("parse");
+        svm_verify::verify_module(&m).expect("verify");
+        let r = svm_wasm_jit::compile_module_nested(&m, false);
+        assert!(
+            r.is_err(),
+            "wasm-jit {name}: the emitter now accepts this shape — add the timed wasmi lane \
+             to the probe (and to the fault-service table) instead of relying on the fold"
         );
     }
 }

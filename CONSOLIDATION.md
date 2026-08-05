@@ -68,18 +68,24 @@ reading measured the queued transport; with handoff on, interp offers ~740 ns); 
 spawner's own impl export, eval-loop tier; bytecode vetoes to the oracle, JIT folds via
 `module_demand_spawns`).
 
-The gate reading (`paging_bench`, offer lane vs bespoke, identical checksum): **JIT 6.7×
-FASTER** (29.3 µs → 4.4 µs — the mirroring cost is deleted by construction, the collapse
-thesis vindicated on the tier that matters); **interp tiers 1.8–2.8× slower** (TreeWalk
-1.4 → 4.1 µs) — the concurrent-child offer transport (admission, revocation check, provider
-dispatch, cross-worker scheduling) vs a direct in-Rust `resume`. Profiling (2.1b) puts the
-parked-provider transport floor at ~300–450 ns; that fast lane is the queued next slice.
+The gate reading (`paging_bench`, offer lane vs bespoke, identical checksum), **after the
+§2.2 fast lane** (dispatch loops instead of requeuing an inline-serviced faulter — the
+run-queue round trip per fault was the dominant residual): **JIT 12.4× FASTER** (28.8 µs →
+2.3 µs — the per-switch mirroring cost is deleted by construction, the collapse thesis
+vindicated on the tier that matters); **interp tiers 1.3–1.65×** (TreeWalk 1.43 → 2.36 µs,
+Bytecode 1.83 → 2.41 µs; was 1.8–2.8× before the fast lane). The remaining residual is
+largely the price of a genuinely concurrent child (enqueue/ticket under the provider lock,
+provider vCPU enter/exit per serve) vs an inline-driven coroutine's direct in-Rust resume.
+The 2.1b-profiled cached-handler lane (~300–450 ns floor) could shave further but touches
+the most sensitive scheduler code — priced, not queued. The resume/yield round-trip
+(`coroutine_offer_bench`) is unchanged at ~740 ns interp / 0.22× JIT (already inline).
+The **fourth backend** (wasm-JIT tier) fails closed on both lanes today — the entries fold
+to bytecode, pinned by `wasm_jit_lane_folds_closed_today` so the tier is never silently
+forgotten in this table.
 
-**2.3 (the deletion) stays blocked** until either the interp fault-service gap closes to
-the pin's tolerance or the owner explicitly accepts the interp cost against the JIT win and
-the machinery deleted. Note the shape difference the numbers ride on: the bespoke child is
-inline-driven (zero scheduling), the op-16 child is genuinely concurrent — some of the gap
-is the price of a real process child, not transport waste.
+**2.3 (the deletion) is now an owner call**: interp fault-service costs 1.3–1.65× the
+bespoke ops; everything else (resume/yield on the JIT, fault-service on the JIT, the
+machinery deleted, the special cases closed) favors the collapse.
 
 ## 3. Instantiator: config-record spawn; Budget swallows the fuel scalars
 

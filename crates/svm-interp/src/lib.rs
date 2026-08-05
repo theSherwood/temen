@@ -5243,568 +5243,575 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
 }
 
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
-    // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
-    // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
-    // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
-    // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
-    // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
-    // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
-    // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
-    // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
-    if v.durable && v.cur == ROOT_FIBER {
-        // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
-        // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
-        v.durable_sp_ctx = v.vcpu_ctx;
-        let root_word = shadow_region_base(v.vcpu_ctx);
-        if let Some(m) = v.mem.as_mut() {
-            // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
-            // its own per-context thaw word, so its rewind can't disturb a sibling's.
-            m.durable_store_dstate(v.vcpu_ctx, v.dstate);
-            m.durable_set_sp(root_word, v.root_shadow_sp);
+    // §2.2 fast lane: the whole body loops so an inline-serviced page fault (`Step::PageFault`
+    // + parked pager + direct handoff) supplies the page and **continues this vCPU on this
+    // worker immediately** — the rewound access re-executes with no run-queue round trip, no
+    // futex wake, no worker pickup. Every other arm `return`s or falls through to the final
+    // `break` exactly as before the loop existed.
+    loop {
+        // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
+        // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
+        // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
+        // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
+        // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
+        // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
+        // rewinding. Only at root context — a vCPU parked mid-fiber-resume keeps the fiber swap's own
+        // bookkeeping (a no-op for the no-fiber slice, where `cur` is always `ROOT_FIBER`).
+        if v.durable && v.cur == ROOT_FIBER {
+            // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
+            // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
+            v.durable_sp_ctx = v.vcpu_ctx;
+            let root_word = shadow_region_base(v.vcpu_ctx);
+            if let Some(m) = v.mem.as_mut() {
+                // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
+                // its own per-context thaw word, so its rewind can't disturb a sibling's.
+                m.durable_store_dstate(v.vcpu_ctx, v.dstate);
+                m.durable_set_sp(root_word, v.root_shadow_sp);
+            }
         }
-    }
-    let step = v.run(u64::MAX);
-    // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
-    // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
-    // from the live words below).
-    if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
-        let root_word = shadow_region_base(v.vcpu_ctx);
-        if let Some(m) = v.mem.as_ref() {
-            // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
-            // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
-            v.dstate = m.durable_load_dstate(v.vcpu_ctx);
-            v.root_shadow_sp = m.durable_get_sp(root_word);
+        let step = v.run(u64::MAX);
+        // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
+        // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
+        // from the live words below).
+        if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
+            let root_word = shadow_region_base(v.vcpu_ctx);
+            if let Some(m) = v.mem.as_ref() {
+                // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
+                // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
+                v.dstate = m.durable_load_dstate(v.vcpu_ctx);
+                v.root_shadow_sp = m.durable_get_sp(root_word);
+            }
         }
-    }
-    match step {
-        Step::Done(result) => {
-            // `froze` distinguishes a **freeze-unwind** (the run is `UNWINDING`; a spawned child
-            // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
-            // (NORMAL completion). Context recycling frees a finished child's shadow context back to
-            // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
-            let froze = v.durable
-                && result.is_ok()
-                && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
-            // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
-            // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
-            // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
-            // vCPU drives its own (slice 3.4: a spawned child that owns fibers must flatten them too — the
-            // root's drive runs before the children exist, so it can't see a child's fiber). `freeze_drive`
-            // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
-            // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
-            // drive trap (out-of-scope module) surfaces as the run's result.
-            // §4 subtree freeze (DURABILITY.md): handle this vCPU's live §14 children before its
-            // own residue is recorded. The **covered** shape — same-module, still-running children,
-            // no unjoined `thread.spawn` siblings — is frozen for real: broadcast `UNWINDING` into
-            // each live child's carve state word (the subtree STW; the child self-unwinds into its
-            // carve's own durable reserve, which is inside this window's image, at its next poll) and
-            // record it as [`FrozenNested`] re-attach residue, tagged with **this** vCPU's task id as
-            // its `parent_task`. Depth is now covered to **arbitrary nesting** (parent→child→
-            // grandchild, …): a §14 child records its *own* live children (its grandchildren of the
-            // root) into the subtree's shared freeze-residue **sink** — the root host, reached via
-            // [`VCpu::freeze_sink`] since the child's own powerbox is private — so the whole subtree's
-            // residue coalesces where a thaw reads it, disambiguated by `parent_task` (the exact
-            // shape by which `thread.spawn`'s shared host coalesces [`FrozenVCpu`]). A
-            // **completed-but-unjoined** child rides via `completed_result` (its result taken from
-            // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
-            // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
-            // (host-side native continuation), a separate-module child (its module identity can't ride
-            // the artifact yet), a completed child that **trapped** (its trap can't ride yet), and
-            // mixing with unjoined `thread.spawn` children (the two thaw seedings would contend for
-            // the join table).
-            let nested_refused = froze && {
-                let live: Vec<NestedChildInfo> = v
-                    .nested_children
-                    .iter()
-                    .filter(|c| v.threads.get(c.slot).is_some_and(Option::is_some))
-                    .copied()
-                    .collect();
-                if v.coroutines.iter().any(Option::is_some) {
-                    true
-                } else if live.is_empty() {
-                    false
-                } else if v.threads.iter().enumerate().any(|(slot, t)| {
-                    // A live `thread.spawn` sibling (a `threads` slot not backed by a
-                    // `nested_children` entry): its thaw seeding and the §14 seeding would contend
-                    // for the join table — fail closed.
-                    t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
-                }) || v.mem.is_none()
-                {
-                    true // uncovered shape / malformed durable freeze
-                } else {
-                    // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
-                    // child may record its own live children (grandchildren), tagged with this
-                    // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
-                    let mut refuse = false;
-                    for c in &live {
-                        let cid = v.threads[c.slot].expect("filtered to Some");
-                        let completed_result = if v.sched.has_result(cid) {
-                            // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
-                            // a completed-with-trap child is not yet representable — fail closed.
-                            match v.sched.take_result(cid).map(|o| o.result) {
-                                Some(Ok(vals)) => Some(match vals.first() {
-                                    Some(Value::I64(x)) => *x,
-                                    Some(Value::I32(x)) => *x as i64,
-                                    _ => 0,
-                                }),
-                                _ => {
-                                    refuse = true;
-                                    break;
+        match step {
+            Step::Done(result) => {
+                // `froze` distinguishes a **freeze-unwind** (the run is `UNWINDING`; a spawned child
+                // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
+                // (NORMAL completion). Context recycling frees a finished child's shadow context back to
+                // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
+                let froze = v.durable
+                    && result.is_ok()
+                    && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
+                // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
+                // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
+                // vCPU drives its own (slice 3.4: a spawned child that owns fibers must flatten them too — the
+                // root's drive runs before the children exist, so it can't see a child's fiber). `freeze_drive`
+                // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
+                // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
+                // drive trap (out-of-scope module) surfaces as the run's result.
+                // §4 subtree freeze (DURABILITY.md): handle this vCPU's live §14 children before its
+                // own residue is recorded. The **covered** shape — same-module, still-running children,
+                // no unjoined `thread.spawn` siblings — is frozen for real: broadcast `UNWINDING` into
+                // each live child's carve state word (the subtree STW; the child self-unwinds into its
+                // carve's own durable reserve, which is inside this window's image, at its next poll) and
+                // record it as [`FrozenNested`] re-attach residue, tagged with **this** vCPU's task id as
+                // its `parent_task`. Depth is now covered to **arbitrary nesting** (parent→child→
+                // grandchild, …): a §14 child records its *own* live children (its grandchildren of the
+                // root) into the subtree's shared freeze-residue **sink** — the root host, reached via
+                // [`VCpu::freeze_sink`] since the child's own powerbox is private — so the whole subtree's
+                // residue coalesces where a thaw reads it, disambiguated by `parent_task` (the exact
+                // shape by which `thread.spawn`'s shared host coalesces [`FrozenVCpu`]). A
+                // **completed-but-unjoined** child rides via `completed_result` (its result taken from
+                // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
+                // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
+                // (host-side native continuation), a separate-module child (its module identity can't ride
+                // the artifact yet), a completed child that **trapped** (its trap can't ride yet), and
+                // mixing with unjoined `thread.spawn` children (the two thaw seedings would contend for
+                // the join table).
+                let nested_refused = froze && {
+                    let live: Vec<NestedChildInfo> = v
+                        .nested_children
+                        .iter()
+                        .filter(|c| v.threads.get(c.slot).is_some_and(Option::is_some))
+                        .copied()
+                        .collect();
+                    if v.coroutines.iter().any(Option::is_some) {
+                        true
+                    } else if live.is_empty() {
+                        false
+                    } else if v.threads.iter().enumerate().any(|(slot, t)| {
+                        // A live `thread.spawn` sibling (a `threads` slot not backed by a
+                        // `nested_children` entry): its thaw seeding and the §14 seeding would contend
+                        // for the join table — fail closed.
+                        t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
+                    }) || v.mem.is_none()
+                    {
+                        true // uncovered shape / malformed durable freeze
+                    } else {
+                        // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
+                        // child may record its own live children (grandchildren), tagged with this
+                        // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
+                        let mut refuse = false;
+                        for c in &live {
+                            let cid = v.threads[c.slot].expect("filtered to Some");
+                            let completed_result = if v.sched.has_result(cid) {
+                                // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
+                                // a completed-with-trap child is not yet representable — fail closed.
+                                match v.sched.take_result(cid).map(|o| o.result) {
+                                    Some(Ok(vals)) => Some(match vals.first() {
+                                        Some(Value::I64(x)) => *x,
+                                        Some(Value::I32(x)) => *x as i64,
+                                        _ => 0,
+                                    }),
+                                    _ => {
+                                        refuse = true;
+                                        break;
+                                    }
                                 }
-                            }
-                        } else {
-                            // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
-                            if let Some(m) = v.mem.as_mut() {
-                                m.write_bytes(
-                                    c.carve_off + STATE_OFF,
-                                    &STATE_UNWINDING.to_le_bytes(),
-                                );
-                            }
-                            None
-                        };
-                        // §4 depth-2: push to the subtree's **effective sink** (the root host for a
-                        // nested child, our own host for the root), tagged with our own task id as
-                        // the child's `parent_task`, so the whole nesting subtree's residue coalesces
-                        // where a thaw reads it — the root records its child with `parent_task = 0`,
-                        // a child records its grandchild with `parent_task = <child's task>`.
-                        let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                        sink.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .frozen_nested
-                            .push(FrozenNested {
-                                parent_task: v.id as usize,
-                                slot: c.slot,
-                                carve_off: c.carve_off,
-                                size_log2: c.size_log2,
-                                entry: c.entry,
-                                module_digest: c.module_digest,
-                                completed_result,
-                            });
-                    }
-                    refuse
-                }
-            };
-            // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
-            // and durable handle table — rides the subtree's shared sink as a
-            // [`FrozenChildState`] keyed by `(parent_task, nested_slot)`, merged into its
-            // nested record at codec time and seeded back onto the re-created child's fresh
-            // host at thaw. A child holding a **non-durable** handle refuses the subtree
-            // freeze exactly like a root would (`capture_durable_handles` errs — the same
-            // fail-closed shape as `nested_refused`). Plain children (empty trio, only the
-            // fresh-grant instantiator/AS handles) record nothing, keeping plain-subtree
-            // artifacts unchanged.
-            let child_state_refused = froze && v.nested_child && {
-                let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
-                let (q, r, t) = hg.svc_state();
-                match hg.capture_durable_handles() {
-                    Err(_) => true, // a non-durable child handle: fail the freeze closed
-                    Ok(handles) => {
-                        // Record whenever the child holds ANY state a fresh-host thaw would
-                        // drop — handles included (every child holds at least its
-                        // instantiator grant; restoring the captured table verbatim
-                        // preserves guest-held handle values exactly).
-                        if !q.is_empty() || !r.is_empty() || t != 0 || !handles.is_empty() {
-                            drop(hg);
+                            } else {
+                                // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
+                                if let Some(m) = v.mem.as_mut() {
+                                    m.write_bytes(
+                                        c.carve_off + STATE_OFF,
+                                        &STATE_UNWINDING.to_le_bytes(),
+                                    );
+                                }
+                                None
+                            };
+                            // §4 depth-2: push to the subtree's **effective sink** (the root host for a
+                            // nested child, our own host for the root), tagged with our own task id as
+                            // the child's `parent_task`, so the whole nesting subtree's residue coalesces
+                            // where a thaw reads it — the root records its child with `parent_task = 0`,
+                            // a child records its grandchild with `parent_task = <child's task>`.
                             let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
                             sink.lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .frozen_child_state
-                                .push(FrozenChildState {
-                                    parent_task: v.parent_task as usize,
-                                    slot: v.nested_slot,
-                                    svc_queue: q,
-                                    svc_results: r,
-                                    svc_next_ticket: t,
-                                    handles,
+                                .frozen_nested
+                                .push(FrozenNested {
+                                    parent_task: v.id as usize,
+                                    slot: c.slot,
+                                    carve_off: c.carve_off,
+                                    size_log2: c.size_log2,
+                                    entry: c.entry,
+                                    module_digest: c.module_digest,
+                                    completed_result,
                                 });
                         }
-                        false
+                        refuse
                     }
-                }
-            };
-            let result = if nested_refused || child_state_refused {
-                Err(Trap::ThreadFault)
-            } else if froze {
-                // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
-                // repoints the active-SP word to flatten idle fibers and restores it to this extent.
-                let self_sp = v
-                    .mem
-                    .as_ref()
-                    .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
-                    .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
-                if let Some((func, args)) = v.spawn_residue.clone() {
-                    // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
-                    // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
-                    v.host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .frozen_vcpus
-                        .push(FrozenVCpu {
-                            task: v.id as usize,
-                            parent_task: v.parent_task as usize,
-                            func: func as i32,
-                            args,
-                            shadow_sp: self_sp,
-                            completed_result: None, // interp runs durable single-worker
-                        });
-                } else if !v.nested_child {
-                    // The root: record its extent (the shared active-SP word will be overwritten by a
-                    // later child, so the root's residue can't ride the window).
-                    v.host
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .frozen_root_sp = Some(self_sp);
-                }
-                // (A §14 nested child records nothing: its extent is its carve's own shadow-SP
-                // word, inside the parent's window image — carve-self-describing.)
-                let mut r = v.freeze_drive().and(result);
-                // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
-                // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
-                // makes the accumulation order irrelevant to the artifact.
-                if !v.frozen.is_empty() {
-                    let frozen = std::mem::take(&mut v.frozen);
-                    if v.nested_child {
-                        // A nested child's fiber residue is child-local (its slots/extents name
-                        // its own registry + carve) — it cannot ride the parent's tables. Fail
-                        // closed until per-child fiber residue lands (DURABILITY.md §4).
-                        drop(frozen);
-                        r = Err(Trap::ThreadFault);
-                    } else {
+                };
+                // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
+                // and durable handle table — rides the subtree's shared sink as a
+                // [`FrozenChildState`] keyed by `(parent_task, nested_slot)`, merged into its
+                // nested record at codec time and seeded back onto the re-created child's fresh
+                // host at thaw. A child holding a **non-durable** handle refuses the subtree
+                // freeze exactly like a root would (`capture_durable_handles` errs — the same
+                // fail-closed shape as `nested_refused`). Plain children (empty trio, only the
+                // fresh-grant instantiator/AS handles) record nothing, keeping plain-subtree
+                // artifacts unchanged.
+                let child_state_refused = froze && v.nested_child && {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    let (q, r, t) = hg.svc_state();
+                    match hg.capture_durable_handles() {
+                        Err(_) => true, // a non-durable child handle: fail the freeze closed
+                        Ok(handles) => {
+                            // Record whenever the child holds ANY state a fresh-host thaw would
+                            // drop — handles included (every child holds at least its
+                            // instantiator grant; restoring the captured table verbatim
+                            // preserves guest-held handle values exactly).
+                            if !q.is_empty() || !r.is_empty() || t != 0 || !handles.is_empty() {
+                                drop(hg);
+                                let sink =
+                                    v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                                sink.lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .frozen_child_state
+                                    .push(FrozenChildState {
+                                        parent_task: v.parent_task as usize,
+                                        slot: v.nested_slot,
+                                        svc_queue: q,
+                                        svc_results: r,
+                                        svc_next_ticket: t,
+                                        handles,
+                                    });
+                            }
+                            false
+                        }
+                    }
+                };
+                let result = if nested_refused || child_state_refused {
+                    Err(Trap::ThreadFault)
+                } else if froze {
+                    // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
+                    // repoints the active-SP word to flatten idle fibers and restores it to this extent.
+                    let self_sp = v
+                        .mem
+                        .as_ref()
+                        .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
+                        .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
+                    if let Some((func, args)) = v.spawn_residue.clone() {
+                        // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
+                        // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
                         v.host
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .frozen_fibers
-                            .extend(frozen);
+                            .frozen_vcpus
+                            .push(FrozenVCpu {
+                                task: v.id as usize,
+                                parent_task: v.parent_task as usize,
+                                func: func as i32,
+                                args,
+                                shadow_sp: self_sp,
+                                completed_result: None, // interp runs durable single-worker
+                            });
+                    } else if !v.nested_child {
+                        // The root: record its extent (the shared active-SP word will be overwritten by a
+                        // later child, so the root's residue can't ride the window).
+                        v.host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .frozen_root_sp = Some(self_sp);
+                    }
+                    // (A §14 nested child records nothing: its extent is its carve's own shadow-SP
+                    // word, inside the parent's window image — carve-self-describing.)
+                    let mut r = v.freeze_drive().and(result);
+                    // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
+                    // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
+                    // makes the accumulation order irrelevant to the artifact.
+                    if !v.frozen.is_empty() {
+                        let frozen = std::mem::take(&mut v.frozen);
+                        if v.nested_child {
+                            // A nested child's fiber residue is child-local (its slots/extents name
+                            // its own registry + carve) — it cannot ride the parent's tables. Fail
+                            // closed until per-child fiber residue lands (DURABILITY.md §4).
+                            drop(frozen);
+                            r = Err(Trap::ThreadFault);
+                        } else {
+                            v.host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .frozen_fibers
+                                .extend(frozen);
+                        }
+                    }
+                    r
+                } else {
+                    result
+                };
+                // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
+                // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
+                if v.vcpu_ctx > 0 && !froze {
+                    v.registry.free_vcpu_context(v.vcpu_ctx);
+                }
+                let id = v.id;
+                // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
+                let trap_bt = if result.is_err() {
+                    frames_to_pcs(&v.frames)
+                } else {
+                    Vec::new()
+                };
+                let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
+                // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
+                // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
+                let key = domain_key_of(&v);
+                let dying_host = Arc::clone(&v.host);
+                let own_tickets: Vec<u64> = v
+                    .handler_parks
+                    .values()
+                    .map(|&(_, t)| t)
+                    .chain(v.serve_run.as_ref().map(|r| r.ticket))
+                    .collect();
+                let mut outcome = Outcome {
+                    result,
+                    mem: v.mem.take(),
+                    fuel: v.fuel,
+                    trap_bt,
+                    trap_fiber,
+                };
+                drop(v);
+                let mut s = sched.lock();
+                // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
+                // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
+                // true origin. A clean finish leaves it untouched.
+                if outcome.result.is_err() {
+                    s.trap_origin
+                        .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+                }
+                // §12 domain lifetime: a member of an already-dead domain finishing *after* the
+                // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
+                // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
+                // observable outcome is the domain's trap. (Never during a freeze unwind, which
+                // completes vCPUs early on purpose.)
+                if !froze && outcome.result.is_ok() {
+                    if let Some(t) = s.dead.get(&key) {
+                        outcome.result = Err(t.clone());
                     }
                 }
-                r
-            } else {
-                result
-            };
-            // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
-            // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
-            if v.vcpu_ctx > 0 && !froze {
-                v.registry.free_vcpu_context(v.vcpu_ctx);
-            }
-            let id = v.id;
-            // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
-            let trap_bt = if result.is_err() {
-                frames_to_pcs(&v.frames)
-            } else {
-                Vec::new()
-            };
-            let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
-            // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
-            // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
-            // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
-            let key = domain_key_of(&v);
-            let dying_host = Arc::clone(&v.host);
-            let own_tickets: Vec<u64> = v
-                .handler_parks
-                .values()
-                .map(|&(_, t)| t)
-                .chain(v.serve_run.as_ref().map(|r| r.ticket))
-                .collect();
-            let mut outcome = Outcome {
-                result,
-                mem: v.mem.take(),
-                fuel: v.fuel,
-                trap_bt,
-                trap_fiber,
-            };
-            drop(v);
-            let mut s = sched.lock();
-            // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
-            // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
-            // true origin. A clean finish leaves it untouched.
-            if outcome.result.is_err() {
-                s.trap_origin
-                    .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
-            }
-            // §12 domain lifetime: a member of an already-dead domain finishing *after* the
-            // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
-            // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
-            // observable outcome is the domain's trap. (Never during a freeze unwind, which
-            // completes vCPUs early on purpose.)
-            if !froze && outcome.result.is_ok() {
-                if let Some(t) = s.dead.get(&key) {
-                    outcome.result = Err(t.clone());
+                let died: Option<Trap> = outcome.result.as_ref().err().cloned();
+                if let Some(parent) = s.join_waiters.remove(&id) {
+                    s.runnable.push_back(parent);
+                    sched.work.notify_one();
                 }
-            }
-            let died: Option<Trap> = outcome.result.as_ref().err().cloned();
-            if let Some(parent) = s.join_waiters.remove(&id) {
-                s.runnable.push_back(parent);
-                sched.work.notify_one();
-            }
-            s.results.insert(id, outcome);
-            s.live -= 1;
-            // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
-            // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
-            // from ANY member is domain-wide teardown; the ROOT's completion (return, exit, or
-            // trap — or its domain's death via a sibling) ends the whole run, parked daemons
-            // abandoned. Gated off during a freeze unwind (`froze`): a freeze intentionally
-            // completes vCPUs early — including fail-closed `ThreadFault` refusals — and must
-            // drain every sibling, not kill it.
-            if !froze {
-                if let Some(t) = &died {
-                    teardown_domain(&mut s, key, t, &dying_host);
-                    wake_dead_tickets(&mut s, key, own_tickets);
+                s.results.insert(id, outcome);
+                s.live -= 1;
+                // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
+                // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
+                // from ANY member is domain-wide teardown; the ROOT's completion (return, exit, or
+                // trap — or its domain's death via a sibling) ends the whole run, parked daemons
+                // abandoned. Gated off during a freeze unwind (`froze`): a freeze intentionally
+                // completes vCPUs early — including fail-closed `ThreadFault` refusals — and must
+                // drain every sibling, not kill it.
+                if !froze {
+                    if let Some(t) = &died {
+                        teardown_domain(&mut s, key, t, &dying_host);
+                        wake_dead_tickets(&mut s, key, own_tickets);
+                    }
+                    if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
+                        teardown_run(&mut s);
+                    }
                 }
-                if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
-                    teardown_run(&mut s);
+                if s.live == 0 {
+                    s.shutdown = true;
                 }
-            }
-            if s.live == 0 {
-                s.shutdown = true;
-            }
-            sched.work.notify_all();
-        }
-        Step::Park(Blocked::Join { child }) => {
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(v) = park_gate(&mut s, v) else {
                 sched.work.notify_all();
-                return;
-            };
-            if s.results.contains_key(&child) {
-                // Already finished between the join check and here — resume immediately.
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-            } else {
-                s.join_waiters.insert(child, v);
             }
-        }
-        Step::Park(Blocked::Wait {
-            key,
-            addr,
-            expected,
-            width,
-            timeout_ns,
-        }) => {
-            let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(mut v) = park_gate(&mut s, v) else {
-                sched.work.notify_all();
-                return;
-            };
-            // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
-            // The value lives at the absolute `addr`; the queue/timer key is the canonical `key` (S1b).
-            if v.atomic_value(addr, width) != expected {
-                v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-            } else {
-                let wid = s.next_wid;
-                s.next_wid += 1;
-                s.timers.push(Reverse((deadline, wid, key)));
-                s.wait_waiters
-                    .entry(key)
-                    .or_default()
-                    .push((wid, Waiter::VCpu(v)));
-                sched.work.notify_all(); // let idle workers recompute their timer deadline
-            }
-        }
-        Step::Park(Blocked::CapRead { handle }) => {
-            // §3.6 slice 1: park inside a capability call, keyed by the handle. The
-            // park-vs-revoke race mirrors the futex compare-and-park: enqueue under the
-            // scheduler lock, then re-check the handle's liveness — a `cap_revoke` that ran
-            // between the empty-read decision and this insertion found no waiter, so if the
-            // handle is now dead we wake ourselves with the same errno instead of parking
-            // forever. (Lock order sched → host; the revoke path holds neither.)
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(mut v) = park_gate(&mut s, v) else {
-                sched.work.notify_all();
-                return;
-            };
-            let live = v
-                .host
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle_live(handle);
-            if live {
-                s.cap_waiters
-                    .entry(handle)
-                    .or_default()
-                    .push(Waiter::VCpu(v));
-            } else {
-                v.pending = Some(Pending::CapResult(CAP_REVOKED));
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-            }
-        }
-        Step::Park(Blocked::CapReply { ticket, callee }) => {
-            park_cap_reply(sched, v, ticket, callee);
-        }
-        // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
-        // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
-        // direct handoff and the pager parked at `svc.wait`, the handler runs inline on this
-        // thread (the §10.2 shape) — supply the page and requeue; otherwise park exactly as a
-        // live-offer caller does (`park_cap_reply`), with `page_fault` marking the wake to
-        // supply instead of pushing a reply.
-        Step::PageFault(addr) => {
-            let Some(pb) = v.pager.clone() else {
-                // Unreachable by construction (`fault_pager` is set only with `pager`), but never
-                // trust a flag alone: clear it and re-run — the re-executed access now traps as an
-                // ordinary detect-and-kill memory fault.
-                v.fault_pager = false;
+            Step::Park(Blocked::Join { child }) => {
                 let mut s = sched.lock();
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-                return;
-            };
-            let (ticket, pager_id) = {
-                let mut cg = pb.cell.lock().unwrap_or_else(|e| e.into_inner());
-                (
-                    cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
-                    cg.domain_id(),
-                )
-            };
-            let Some(t) = ticket else {
-                // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
-                // was rewound), retrying the enqueue after the pager drains.
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                if s.results.contains_key(&child) {
+                    // Already finished between the join check and here — resume immediately.
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.join_waiters.insert(child, v);
+                }
+            }
+            Step::Park(Blocked::Wait {
+                key,
+                addr,
+                expected,
+                width,
+                timeout_ns,
+            }) => {
+                let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
                 let mut s = sched.lock();
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-                return;
-            };
-            if sched.handoff {
-                if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
-                    dispatch(sched, provider);
-                    let served = pb
-                        .cell
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .svc_results
-                        .remove(&t);
-                    if let Some(r) = served {
-                        if r < 0 {
-                            // Pager refused: an unserviceable fault — detect-and-kill semantics
-                            // via the marker path (re-entry sees the negative reply and traps).
-                            v.page_fault = Some(addr);
-                            v.pending = Some(Pending::CapResult(r));
-                        } else {
-                            if let Some(m) = v.mem.as_ref() {
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(mut v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                // Re-read the value **under the lock** so the compare-and-park is atomic vs. `notify`.
+                // The value lives at the absolute `addr`; the queue/timer key is the canonical `key` (S1b).
+                if v.atomic_value(addr, width) != expected {
+                    v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    let wid = s.next_wid;
+                    s.next_wid += 1;
+                    s.timers.push(Reverse((deadline, wid, key)));
+                    s.wait_waiters
+                        .entry(key)
+                        .or_default()
+                        .push((wid, Waiter::VCpu(v)));
+                    sched.work.notify_all(); // let idle workers recompute their timer deadline
+                }
+            }
+            Step::Park(Blocked::CapRead { handle }) => {
+                // §3.6 slice 1: park inside a capability call, keyed by the handle. The
+                // park-vs-revoke race mirrors the futex compare-and-park: enqueue under the
+                // scheduler lock, then re-check the handle's liveness — a `cap_revoke` that ran
+                // between the empty-read decision and this insertion found no waiter, so if the
+                // handle is now dead we wake ourselves with the same errno instead of parking
+                // forever. (Lock order sched → host; the revoke path holds neither.)
+                let mut s = sched.lock();
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(mut v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let live = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle_live(handle);
+                if live {
+                    s.cap_waiters
+                        .entry(handle)
+                        .or_default()
+                        .push(Waiter::VCpu(v));
+                } else {
+                    v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::CapReply { ticket, callee }) => {
+                park_cap_reply(sched, v, ticket, callee);
+            }
+            // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
+            // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
+            // direct handoff and the pager parked at `svc.wait`, the handler runs inline on this
+            // thread (the §10.2 shape) — supply the page and requeue; otherwise park exactly as a
+            // live-offer caller does (`park_cap_reply`), with `page_fault` marking the wake to
+            // supply instead of pushing a reply.
+            Step::PageFault(addr) => {
+                let Some(pb) = v.pager.clone() else {
+                    // Unreachable by construction (`fault_pager` is set only with `pager`), but never
+                    // trust a flag alone: clear it and re-run — the re-executed access now traps as an
+                    // ordinary detect-and-kill memory fault.
+                    v.fault_pager = false;
+                    let mut s = sched.lock();
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                    return;
+                };
+                let (ticket, pager_id) = {
+                    let mut cg = pb.cell.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
+                        cg.domain_id(),
+                    )
+                };
+                let Some(t) = ticket else {
+                    // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
+                    // was rewound), retrying the enqueue after the pager drains.
+                    let mut s = sched.lock();
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                    return;
+                };
+                if sched.handoff {
+                    if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
+                        dispatch(sched, provider);
+                        let served = pb
+                            .cell
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .svc_results
+                            .remove(&t);
+                        if let Some(r) = served {
+                            if r < 0 {
+                                // Pager refused: an unserviceable fault — detect-and-kill semantics
+                                // via the marker path (the re-entry on the next loop iteration sees
+                                // the negative reply and traps; its Done arm tears down as usual).
+                                v.page_fault = Some(addr);
+                                v.pending = Some(Pending::CapResult(r));
+                            } else if let Some(m) = v.mem.as_ref() {
                                 m.supply_page(addr);
                             }
+                            // Fast lane: continue this vCPU here and now — the rewound access
+                            // re-executes on this worker with the page in place.
+                            continue;
                         }
-                        let mut s = sched.lock();
-                        s.runnable.push_back(v);
-                        sched.work.notify_one();
-                        return;
+                        // Handler parked mid-service (4d.2): fall through to the ticket park — it
+                        // replies via `t` when it completes.
                     }
-                    // Handler parked mid-service (4d.2): fall through to the ticket park — it
-                    // replies via `t` when it completes.
+                }
+                v.page_fault = Some(addr);
+                park_cap_reply(sched, v, t, pb.cell);
+            }
+            Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
+                // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
+                // check under the scheduler lock: an enqueue that landed since the empty check
+                // found no waiter, so re-run ourselves (the frame was rewound — the re-executed
+                // `svc.wait` finds the work). Multi-consumer: push alongside any sibling
+                // consumers already parked on this domain (never displace them).
+                let mut s = sched.lock();
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let empty = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .svc_queue
+                    .is_empty();
+                // Lost-wakeup guard (the macOS/Windows serve-chain flake, ISSUES.md I52): a reply may
+                // have woken one of THIS vCPU's parked handler fibers between the serve loop deciding
+                // to park (its `handler_parks` claim saw the handler still blocked) and this point.
+                // That reply's `svc_wake` found no parked consumer here yet, so it was dropped — but
+                // the woken handler is runnable work. Both this recheck and the reply's `wake_blocked`
+                // are ordered by the scheduler lock (the reply holds it across `wake_blocked` +
+                // `svc_wake`; we hold it here), so observing any woken `handler_parks` slot closes the
+                // window: re-admit instead of parking, and the rewound `svc.wait` re-claims and
+                // resumes the handler. Each vCPU checks only its own `handler_parks`, so this is
+                // correct for a multi-consumer domain too.
+                let woken_handler = v
+                    .handler_parks
+                    .keys()
+                    .any(|slot| v.registry.slot_woken(*slot));
+                if empty && !woken_handler {
+                    if deadline_ns >= 0 {
+                        s.svc_timers.push(Reverse((
+                            Instant::now() + std::time::Duration::from_nanos(deadline_ns as u64),
+                            key,
+                            v.id,
+                        )));
+                    }
+                    s.svc_waiters.entry(key).or_default().push(v);
+                } else {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
                 }
             }
-            v.page_fault = Some(addr);
-            park_cap_reply(sched, v, t, pb.cell);
-        }
-        Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
-            // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
-            // check under the scheduler lock: an enqueue that landed since the empty check
-            // found no waiter, so re-run ourselves (the frame was rewound — the re-executed
-            // `svc.wait` finds the work). Multi-consumer: push alongside any sibling
-            // consumers already parked on this domain (never displace them).
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(v) = park_gate(&mut s, v) else {
-                sched.work.notify_all();
-                return;
-            };
-            let empty = v
-                .host
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .svc_queue
-                .is_empty();
-            // Lost-wakeup guard (the macOS/Windows serve-chain flake, ISSUES.md I52): a reply may
-            // have woken one of THIS vCPU's parked handler fibers between the serve loop deciding
-            // to park (its `handler_parks` claim saw the handler still blocked) and this point.
-            // That reply's `svc_wake` found no parked consumer here yet, so it was dropped — but
-            // the woken handler is runnable work. Both this recheck and the reply's `wake_blocked`
-            // are ordered by the scheduler lock (the reply holds it across `wake_blocked` +
-            // `svc_wake`; we hold it here), so observing any woken `handler_parks` slot closes the
-            // window: re-admit instead of parking, and the rewound `svc.wait` re-claims and
-            // resumes the handler. Each vCPU checks only its own `handler_parks`, so this is
-            // correct for a multi-consumer domain too.
-            let woken_handler = v
-                .handler_parks
-                .keys()
-                .any(|slot| v.registry.slot_woken(*slot));
-            if empty && !woken_handler {
-                if deadline_ns >= 0 {
-                    s.svc_timers.push(Reverse((
-                        Instant::now() + std::time::Duration::from_nanos(deadline_ns as u64),
-                        key,
-                        v.id,
-                    )));
+            Step::Park(Blocked::OfferPark { key }) => {
+                // CALLS.md 4b — park the caller of a **promoted** offer handler as that handler's
+                // resumer, keyed on the provider domain so the handler's block-wake (`wake_blocked` +
+                // `svc_wake`) re-admits it (reusing `svc_waiters` + its wake). Lost-wakeup guard, the
+                // same shape as `SvcWait`'s (ISSUES.md I52): a block-event that fired in the
+                // enqueue→park window `svc_wake`d before this vCPU registered, so its wake was dropped
+                // — observe the woken handler under the scheduler lock and re-admit instead of parking
+                // (the run_inner resume re-claim then switches back in).
+                let mut s = sched.lock();
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let woken = v
+                    .offer_parked
+                    .as_ref()
+                    .is_some_and(|p| v.registry.slot_woken(p.handler_slot));
+                if woken {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.svc_waiters.entry(key).or_default().push(v);
                 }
-                s.svc_waiters.entry(key).or_default().push(v);
-            } else {
+            }
+            Step::Park(Blocked::OfferAdmit { key }) => {
+                // CALLS.md 4c.1 — park the caller of a busy `single` instance as an admission-waiter
+                // (keyed by the `ProviderState` pointer). Lost-wakeup guard, the `SvcWait` shape: the
+                // holder may have cleared `busy` + `admit_wake`d in the enqueue→park window (before this
+                // vCPU registered), so that wake was dropped. Under the scheduler lock, re-read `busy`
+                // (via the carried `admit_retry` instance); if the instance is already free, re-admit
+                // instead of parking — the rewound offer op re-attempts admission. `admit_wake` and this
+                // handler both hold the scheduler lock, so the check-and-park cannot race the wake.
+                let mut s = sched.lock();
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let freed = v
+                    .admit_retry
+                    .as_ref()
+                    .is_some_and(|st| !st.lock().unwrap_or_else(|e| e.into_inner()).busy);
+                if freed {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.admit_waiters.entry(key).or_default().push_back(v);
+                }
+            }
+            Step::Yield => {
+                // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
+                let mut s = sched.lock();
                 s.runnable.push_back(v);
                 sched.work.notify_one();
             }
+            // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
+            Step::Pause(..) => unreachable!("debug pause on a pooled vCPU"),
         }
-        Step::Park(Blocked::OfferPark { key }) => {
-            // CALLS.md 4b — park the caller of a **promoted** offer handler as that handler's
-            // resumer, keyed on the provider domain so the handler's block-wake (`wake_blocked` +
-            // `svc_wake`) re-admits it (reusing `svc_waiters` + its wake). Lost-wakeup guard, the
-            // same shape as `SvcWait`'s (ISSUES.md I52): a block-event that fired in the
-            // enqueue→park window `svc_wake`d before this vCPU registered, so its wake was dropped
-            // — observe the woken handler under the scheduler lock and re-admit instead of parking
-            // (the run_inner resume re-claim then switches back in).
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(v) = park_gate(&mut s, v) else {
-                sched.work.notify_all();
-                return;
-            };
-            let woken = v
-                .offer_parked
-                .as_ref()
-                .is_some_and(|p| v.registry.slot_woken(p.handler_slot));
-            if woken {
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-            } else {
-                s.svc_waiters.entry(key).or_default().push(v);
-            }
-        }
-        Step::Park(Blocked::OfferAdmit { key }) => {
-            // CALLS.md 4c.1 — park the caller of a busy `single` instance as an admission-waiter
-            // (keyed by the `ProviderState` pointer). Lost-wakeup guard, the `SvcWait` shape: the
-            // holder may have cleared `busy` + `admit_wake`d in the enqueue→park window (before this
-            // vCPU registered), so that wake was dropped. Under the scheduler lock, re-read `busy`
-            // (via the carried `admit_retry` instance); if the instance is already free, re-admit
-            // instead of parking — the rewound offer op re-attempts admission. `admit_wake` and this
-            // handler both hold the scheduler lock, so the check-and-park cannot race the wake.
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(v) = park_gate(&mut s, v) else {
-                sched.work.notify_all();
-                return;
-            };
-            let freed = v
-                .admit_retry
-                .as_ref()
-                .is_some_and(|st| !st.lock().unwrap_or_else(|e| e.into_inner()).busy);
-            if freed {
-                s.runnable.push_back(v);
-                sched.work.notify_one();
-            } else {
-                s.admit_waiters.entry(key).or_default().push_back(v);
-            }
-        }
-        Step::Yield => {
-            // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
-            let mut s = sched.lock();
-            s.runnable.push_back(v);
-            sched.work.notify_one();
-        }
-        // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
-        Step::Pause(..) => unreachable!("debug pause on a pooled vCPU"),
+        break;
     }
 }
 
