@@ -1239,10 +1239,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-durable"
+version = "0.0.0"
+dependencies = [
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-encode"
 version = "0.0.0"
 dependencies = [
  "svm-ir",
+]
+
+[[package]]
+name = "svm-exec"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
 ]
 
 [[package]]
@@ -1332,17 +1346,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-posix"
+version = "0.0.0"
+dependencies = [
+ "svm-interp",
+ "svm-ir",
+]
+
+[[package]]
 name = "svm-run"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "svm-durable",
  "svm-encode",
+ "svm-exec",
  "svm-fs",
  "svm-interp",
  "svm-ir",
  "svm-jit",
  "svm-opt",
  "svm-peval",
+ "svm-posix",
  "svm-text",
  "svm-verify",
  "windows-sys 0.59.0",

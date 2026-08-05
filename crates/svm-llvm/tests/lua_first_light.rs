@@ -30,6 +30,7 @@ fn run(backend: Backend) -> Outcome {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     };
     inst.run(backend, &config)
         .expect("run Lua through the powerbox")

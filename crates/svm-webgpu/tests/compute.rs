@@ -52,6 +52,7 @@ fn demo_webgpu_compute() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     for backend in [

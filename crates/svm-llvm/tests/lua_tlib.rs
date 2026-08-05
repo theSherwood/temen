@@ -38,6 +38,7 @@ fn run(bc: &str, backend: Backend) -> svm_run::Run {
         memory_size_log2: None,
         args: vec![],
         env: vec![b"PATH=/usr/bin".to_vec()],
+        ..RunConfig::default()
     };
     inst.run_with_caps(backend, &config, &[("fs", fs::mem_fs())])
         .expect("run T-library bundle through the powerbox")
