@@ -363,6 +363,23 @@ pub struct SpecConfig {
     ///
     /// `None` unless [`deopt_targets`] is used.
     pub deopt_handler: Option<u32>,
+    /// **Runtime-input cells — the Futamura "dynamic input" for a rolled residual.** Rename-region
+    /// cells `(address, width)` whose entry value is *not* known at specialization time: instead of
+    /// reading its seed from the constant image (as [`rename_seed_from_image`](Self::rename_seed_from_image)
+    /// would), each cell becomes a fresh **dynamic residual parameter**, appended after the dynamic
+    /// call arguments in address order.
+    ///
+    /// This is what turns the interpreter's own state capture into an *input-taking* residual: seed
+    /// the whole VM state from the image so the dispatch (opcode/`pc`/tag cells) folds, but mark the
+    /// one register (or few) that carry the program's runtime input dynamic — so the loop condition
+    /// that reads them stays dynamic and the loop **rolls** instead of unrolling to a constant. It is
+    /// the direct generalization of the toy-VM demos where the residual took `(input)` and the entry
+    /// threaded it into a register; here the register *is* the input, named by its window address.
+    ///
+    /// Each cell must lie fully within a rename region (it is renamed like any region cell — carried
+    /// in SSA, spilled on deopt, written back on exit); a dynamic cell outside every region is
+    /// rejected. Widths are the natural 4/8. Empty by default.
+    pub dynamic_cells: Vec<(u64, u32)>,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -428,6 +445,32 @@ pub fn specialize_with_config(
         })
         .collect();
 
+    // Runtime-input cells become dynamic residual parameters: an entry `MemPattern` of dynamic
+    // (`None`) cells in address order, shared by every entry build path (its cells are appended after
+    // the dynamic call args, matching `build_func`'s residual-param order and `build_block`'s entry
+    // parameters). Each must be a natural 4/8-byte cell fully inside a rename region — it is renamed
+    // like any region cell (carried in SSA, spilled on deopt, written back on exit). Built with
+    // explicit pushes + insertion sort (no `.collect()`/`slice::sort` — the LLVM→IR on-ramp can't
+    // resolve driftsort's `sqrt_approx`, and svm-peval is itself on-ramped in the guest peval tests).
+    let mut entry_mem: MemPattern = Vec::new();
+    if !config.dynamic_cells.is_empty() {
+        let regions = all_regions(config);
+        for &(addr, width) in &config.dynamic_cells {
+            if width != 4 && width != 8 {
+                return Err(SpecError::Unsupported);
+            }
+            if !within_region(&regions, addr, width as u64) {
+                return Err(SpecError::Unsupported);
+            }
+            // Insert keeping `entry_mem` sorted by address (the canonical memory-cell order).
+            let mut i = entry_mem.len();
+            while i > 0 && entry_mem[i - 1].0 > addr {
+                i -= 1;
+            }
+            entry_mem.insert(i, (addr, width, None));
+        }
+    }
+
     let has_memory = module.memory.is_some();
     let value_types: Vec<Vec<Vec<ValType>>> = module
         .funcs
@@ -452,7 +495,14 @@ pub fn specialize_with_config(
             // driver numbers them differently, so the combination is rejected.
             return Err(SpecError::Unsupported);
         }
-        outline_funcs(module, config, &value_types, func, entry_pattern)?
+        outline_funcs(
+            module,
+            config,
+            &value_types,
+            func,
+            entry_pattern,
+            &entry_mem,
+        )?
     } else if carry_roots.is_empty() {
         vec![
             build_func(
@@ -462,7 +512,7 @@ pub fn specialize_with_config(
                 None,
                 func,
                 &entry_pattern,
-                &Vec::new(),
+                &entry_mem,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 None,
@@ -498,7 +548,7 @@ pub fn specialize_with_config(
                 None,
                 func,
                 &entry_pattern,
-                &Vec::new(),
+                &entry_mem,
                 &cut,
                 &deopt_targets,
                 deopt_handler,
@@ -656,6 +706,7 @@ fn outline_funcs(
     value_types: &[Vec<Vec<ValType>>],
     entry: u32,
     entry_pattern: ParamPattern,
+    entry_mem: &MemPattern,
 ) -> Result<Vec<Func>, SpecError> {
     let state = RefCell::new(OutlineState {
         memo: BTreeMap::new(),
@@ -663,11 +714,12 @@ fn outline_funcs(
     });
     // The entry is residual function 0. It does **not** thread region cells in/out: the rename region
     // is private scratch, established fresh (zero) on entry and discarded on return, so the residual
-    // entry's signature is just the source function's.
+    // entry's signature is just the source function's — plus any runtime-input (`dynamic_cells`)
+    // parameters, which are part of the entry key.
     {
         let mut s = state.borrow_mut();
         s.memo.insert(
-            (entry, entry_pattern.clone(), Vec::new()),
+            (entry, entry_pattern.clone(), entry_mem.clone()),
             (0, Some(Vec::new())),
         );
         s.funcs.push(None);
@@ -679,7 +731,7 @@ fn outline_funcs(
         Some(&state),
         entry,
         &entry_pattern,
-        &Vec::new(),
+        entry_mem,
         &BTreeMap::new(),
         &BTreeSet::new(),
         None,
