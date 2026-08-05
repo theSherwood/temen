@@ -1997,6 +1997,7 @@ fn drive_arc(
         thaw_child_state,
         thaw_root_sp,
         handoff,
+        jit_reapply,
     );
     // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is
     // uniquely owned — unwrap it back into the caller so it observes the run's effects (stdout,
@@ -2029,14 +2030,22 @@ fn drive_arc_shared(
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
-    let (quota, jit_table_log2, offer_table_demand, durable, handoff) = {
+    let (quota, jit_table_log2, offer_table_demand, durable, handoff, jit_reapply) = {
         let h = cell.lock().unwrap_or_else(|e| e.into_inner());
+        // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
+        // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
+        let reapply: Vec<(u32, Arc<[Func]>)> = h
+            .jit_all_installs()
+            .into_iter()
+            .filter_map(|(d, slot, unit)| h.jit_unit_funcs(d, unit).map(|f| (slot, f)))
+            .collect();
         (
             h.quota(),
             h.jit_table_log2(),
             h.offer_table_demand(),
             h.is_durable(),
             h.handoff(),
+            reapply,
         )
     };
     if durable {
@@ -2066,6 +2075,7 @@ fn drive_arc_shared(
         Vec::new(),
         None,
         handoff,
+        jit_reapply,
     )
 }
 
@@ -2093,6 +2103,7 @@ fn drive_over_cell(
     thaw_child_state: Vec<FrozenChildState>,
     thaw_root_sp: Option<u64>,
     handoff: bool,
+    jit_reapply: Vec<(u32, Arc<[Func]>)>,
 ) -> TracedRun {
     // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
     let sched = {
