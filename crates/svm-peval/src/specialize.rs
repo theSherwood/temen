@@ -248,6 +248,28 @@ pub struct SpecConfig {
     /// operand stack *and* a pointer-addressed heap at once. Unsound if violated (a dynamic write
     /// into the region would desync the elided renamed cells), so it is opt-in and off by default.
     pub rename_is_private: bool,
+    /// Treat the [`rename`](Self::rename) region as **live memory backed by the constant image**
+    /// rather than zero-initialized scratch: an untouched renamed cell reads its **seed** from the
+    /// constant-memory sources (an overlay, a [`const_regions`](Self::const_regions) promise, or a
+    /// readonly data segment) instead of reading zero. This is what lets the specializer SSA-lift —
+    /// and then mutate — real interpreter state captured from a live run (a `lua_State`'s stack
+    /// pointers, a `CallInfo`, the register file), so the guards those fields drive fold while writes
+    /// still update the abstract cell. Off by default (the region stays zero-init scratch), so
+    /// existing renames — whose regions never overlap a constant source — are unaffected.
+    ///
+    /// **Correctness contract:** seeding makes the region *alias real memory*. If any renamed cell is
+    /// **written**, the residual elides that store, so the window is left stale after the call — sound
+    /// only when that memory is dead once the residual returns. When the memory persists (its final
+    /// value is read by the caller), pair this with write-back so the live cells are spilled on exit.
+    pub rename_seed_from_image: bool,
+    /// **Additional** rename regions beyond [`rename`](Self::rename), with identical semantics (same
+    /// `rename_is_private` / `rename_seed_from_image` treatment). A real interpreter's mutable state is
+    /// several disjoint objects — a `lua_State`, its stack array, the current `CallInfo` — at unrelated
+    /// window addresses, so one contiguous range can't cover them without also sweeping in the
+    /// allocations between (a `global_State`, other frames). Each `[lo, hi)` here is SSA-lifted like
+    /// `rename`; an access is "in the region set" if it lies fully within *any* one, and disjoint only
+    /// if disjoint from *all*. Empty by default.
+    pub rename_extra: Vec<(u64, u64)>,
     /// **Outline calls** instead of inlining them: a direct (or constant-index indirect) call is
     /// specialized to a *separate* residual function — memoized per `(callee, arg pattern)` so call
     /// sites with the same static binding share one — and emitted as a residual `call`, producing a
@@ -427,6 +449,7 @@ fn build_func(
     let mut spec = Spec {
         module,
         config,
+        regions: all_regions(config),
         value_types,
         outline,
         selective,
@@ -613,6 +636,10 @@ fn dyn_args(args_abs: &[Abs]) -> Vec<u32> {
 struct Spec<'a> {
     module: &'a Module,
     config: &'a SpecConfig,
+    /// The full rename region set: [`SpecConfig::rename`] (if any) followed by
+    /// [`SpecConfig::rename_extra`], precomputed once. An access is renamed if it lies fully within
+    /// any one; disjoint only if disjoint from all.
+    regions: Vec<(u64, u64)>,
     /// Per-function, per-block, per-value source types (`value_types[func][block][value_idx]`) —
     /// used to type the SSA values threaded into a residual block as block parameters.
     value_types: &'a [Vec<Vec<ValType>>],
@@ -1297,28 +1324,25 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.config.rename, eff, width) {
-                // The renameable region must be resolved entirely abstractly. Only integer loads
-                // can be (the abstract domain tracks integer cells); a float load into it can't.
-                if !matches!(op.info().1, ValType::I32 | ValType::I64) {
-                    trace_unsup!("load: non-integer into rename region op={:?}", op);
-                    return Err(SpecError::Unsupported);
-                }
+            if within_region(&self.regions, eff, width) {
+                // The renameable region resolves entirely abstractly. Integer *and constant float*
+                // cells work (a float's raw bits are its content — see [`load_bits`]); only a
+                // *dynamic* float cell can't, which the store side never creates.
                 // An exact cell — same address *and* width — resolves directly. A constant cell's
-                // raw bytes are re-extended per this load op (so an `i8` cell loaded `*_u`/`*_s`
-                // zero-/sign-extends correctly); a dynamic cell is only renamed at its full natural
-                // width, where loading it back is the identity (no residual fixup needed).
+                // raw bytes are reconstructed per this load op (an `i8` cell loaded `*_u`/`*_s`
+                // zero-/sign-extends; an `f64` cell loaded `f64` reinterprets its bits); a dynamic
+                // cell is renamed only at its full natural width, where loading it back is identity.
                 if let Some(&(wc, val)) = mem.get(&eff) {
                     if wc as u64 == width {
                         return Ok(Some(match val {
                             Abs::Const(k) => {
                                 let raw = known_raw(k, width);
-                                Abs::Const(extend_loaded(raw, op).ok_or(SpecError::Unsupported)?)
+                                Abs::Const(load_bits(raw, op).ok_or(SpecError::Unsupported)?)
                             }
                             Abs::Dyn(i) if is_full_natural_load(op, width) => Abs::Dyn(i),
                             Abs::Dyn(_) => {
                                 trace_unsup!(
-                                    "load: narrow dynamic cell eff={:#x} op={:?}",
+                                    "load: unrenamable dynamic cell eff={:#x} op={:?}",
                                     eff,
                                     op
                                 );
@@ -1340,9 +1364,18 @@ impl Spec<'_> {
                     );
                     return Err(SpecError::Unsupported);
                 }
-                // Untouched region cell ⇒ the zero-initialized backing, extended per the load.
+                // Untouched region cell. If the caller declared the region live-backed by the
+                // constant image, read its seed from the constant-memory sources (overlay / promised
+                // const region / readonly data) so captured VM state folds; otherwise it is the
+                // zero-initialized scratch backing. A *written* cell was resolved above, so the seed
+                // is only ever the region's pre-call value — writes correctly shadow it.
+                if self.config.rename_seed_from_image {
+                    if let Some(k) = read_const_mem(self.config, self.module, base, offset, op) {
+                        return Ok(Some(Abs::Const(k)));
+                    }
+                }
                 return Ok(Some(Abs::Const(
-                    extend_loaded(0, op).ok_or(SpecError::Unsupported)?,
+                    load_bits(0, op).ok_or(SpecError::Unsupported)?,
                 )));
             }
             // Outside the region: a readonly constant-memory read folds; otherwise residual.
@@ -1360,7 +1393,7 @@ impl Spec<'_> {
         }
         // Dynamic address: with a region active it might alias the renamed stack, so refuse —
         // unless the caller has promised the region is private to the renamed accesses.
-        if self.config.rename.is_some() && !self.config.rename_is_private {
+        if !self.regions.is_empty() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -1391,22 +1424,22 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.config.rename, eff, width) {
-                // Only integer stores can be renamed (the abstract domain tracks integer cells).
-                if !matches!(op.info().1, ValType::I32 | ValType::I64) {
-                    trace_unsup!("store: non-integer into rename region op={:?}", op);
-                    return Err(SpecError::Unsupported);
-                }
+            if within_region(&self.regions, eff, width) {
+                let is_int = matches!(op.info().1, ValType::I32 | ValType::I64);
                 let cell = match env[value as usize] {
-                    // A constant is truncated to the store width and kept as the cell's raw bytes,
-                    // so a later load re-extends it correctly (an `i8` store of `0x1FF` ⇒ `0xFF`).
+                    // A constant is kept as the cell's raw bytes (truncated to the store width), so a
+                    // later load re-extends it correctly (an `i8` store of `0x1FF` ⇒ `0xFF`). This
+                    // covers a **constant float** store too — its bits *are* its memory content — so a
+                    // `TValue` value the interpreter moves via an `f64` load/store renames like any
+                    // 8-byte cell.
                     Abs::Const(k) => Abs::Const(cell_const(known_raw(k, width), width)),
-                    // A dynamic value is only renamed when stored at its full natural width — then
-                    // loading it back at that width is the identity. A *narrow* dynamic store would
-                    // need residual masking to read back soundly, so refuse it instead.
-                    Abs::Dyn(i) if is_full_natural_store(op, width) => Abs::Dyn(i),
+                    // A dynamic value is only renamed when stored at its full natural *integer* width —
+                    // then loading it back at that width is the identity. A narrow dynamic store, or a
+                    // dynamic float (which would need a residual bitcast to read back cross-type),
+                    // isn't renamable — refuse it.
+                    Abs::Dyn(i) if is_int && is_full_natural_store(op, width) => Abs::Dyn(i),
                     Abs::Dyn(_) => {
-                        trace_unsup!("store: narrow dynamic cell eff={:#x} op={:?}", eff, op);
+                        trace_unsup!("store: unrenamable dynamic cell eff={:#x} op={:?}", eff, op);
                         return Err(SpecError::Unsupported);
                     }
                 };
@@ -1415,7 +1448,7 @@ impl Spec<'_> {
                 mem.insert(eff, (width as u32, cell));
                 return Ok(None);
             }
-            if disjoint_from_region(self.config.rename, eff, width) {
+            if disjoint_from_region(&self.regions, eff, width) {
                 let addr = materialize(env[addr as usize], out, rnext);
                 let value = materialize(env[value as usize], out, rnext);
                 out.push(Inst::Store {
@@ -1431,7 +1464,7 @@ impl Spec<'_> {
         }
         // Dynamic address: with a region active it might alias the renamed stack, so refuse —
         // unless the caller has promised the region is private to the renamed accesses.
-        if self.config.rename.is_some() && !self.config.rename_is_private {
+        if !self.regions.is_empty() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -1481,7 +1514,7 @@ impl Spec<'_> {
             Some(t) => t,
             None => {
                 // A dynamic span might alias the renamed region unless the caller promised it private.
-                if self.config.rename.is_some() && !self.config.rename_is_private {
+                if !self.regions.is_empty() && !self.config.rename_is_private {
                     trace_unsup!("mem_copy: dynamic span with a non-private rename region");
                     return Err(SpecError::Unsupported);
                 }
@@ -1492,7 +1525,7 @@ impl Spec<'_> {
         if ln == 0 {
             return Ok(None);
         }
-        let region = self.config.rename;
+        let region = self.regions.as_slice();
         if within_region(region, da, ln) && within_region(region, sa, ln) {
             // A source cell straddling the span boundary can't be split abstractly.
             if mem.iter().any(|(&a, &(w, _))| {
@@ -1554,7 +1587,7 @@ impl Spec<'_> {
         let (da, byte, ln) = match consts {
             Some(t) => t,
             None => {
-                if self.config.rename.is_some() && !self.config.rename_is_private {
+                if !self.regions.is_empty() && !self.config.rename_is_private {
                     trace_unsup!("mem_fill: dynamic span with a non-private rename region");
                     return Err(SpecError::Unsupported);
                 }
@@ -1565,7 +1598,7 @@ impl Spec<'_> {
         if ln == 0 {
             return Ok(None);
         }
-        let region = self.config.rename;
+        let region = self.regions.as_slice();
         if within_region(region, da, ln) {
             if byte != 0 {
                 trace_unsup!("mem_fill: non-zero fill into the rename region byte={byte}");
@@ -1756,7 +1789,7 @@ impl Spec<'_> {
             // this function's results) isn't supported — there's no return point to append this
             // function's own out-cells at. Fail closed; a rename region forces it.
             let outline_tail = |args_abs: &[Abs]| -> Result<Terminator, SpecError> {
-                if self.config.rename.is_some() {
+                if !self.regions.is_empty() {
                     return Err(SpecError::Unsupported);
                 }
                 let (ridx, _) = request_outline(
@@ -1833,6 +1866,16 @@ impl Spec<'_> {
     ) -> Result<Terminator, SpecError> {
         Ok(match outer.pop() {
             None => {
+                // Write-back: a live-backed rename region (`rename_seed_from_image`) aliases real,
+                // persistent memory, so before the residual's true exit spill every written cell to
+                // the window — otherwise the caller (e.g. Lua's `poscall` reading `L->top` and the
+                // return registers) would see stale pre-call bytes. Only at the entry's exit
+                // (`!thread_cells`); outlined callees thread their cells out as results instead, and
+                // those flow back into this `mem` before the entry returns. Untouched (seed-only)
+                // cells never entered `mem`, so their memory already holds the correct seed.
+                if self.config.rename_seed_from_image && !self.thread_cells {
+                    self.write_back_cells(mem, out, rnext)?;
+                }
                 let mut vals: Vec<u32> = results
                     .iter()
                     .map(|&a| materialize(a, out, rnext))
@@ -1856,6 +1899,31 @@ impl Spec<'_> {
                 Terminator::Br { target, args }
             }
         })
+    }
+
+    /// Spill the live abstract cells to the window as residual stores (write-back for a live-backed
+    /// rename region). Each written cell `(eff, width, val)` becomes `store.<width> eff, val`; a width
+    /// with no natural store op fails closed. Emitted in address order for a deterministic residual.
+    fn write_back_cells(
+        &self,
+        mem: &BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<(), SpecError> {
+        for (&eff, &(width, val)) in mem.iter() {
+            let op = writeback_store_op(width).ok_or(SpecError::Unsupported)?;
+            out.push(Inst::ConstI64(eff as i64));
+            let addr = bump(rnext);
+            let value = materialize(val, out, rnext);
+            out.push(Inst::Store {
+                op,
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        }
+        Ok(())
     }
 
     /// Resolve one outgoing edge into a residual block id + dynamic arguments. The successor inherits
@@ -2007,21 +2075,30 @@ fn cell_type(width: u32) -> ValType {
 }
 
 /// Whether `[eff, eff+width)` lies fully inside the renameable region.
-fn within_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
-    match region {
-        Some((lo, hi)) => eff >= lo && eff.checked_add(width).is_some_and(|end| end <= hi),
+fn within_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
+    let Some(end) = eff.checked_add(width) else {
+        return false;
+    };
+    regions.iter().any(|&(lo, hi)| eff >= lo && end <= hi)
+}
+
+/// Whether `[eff, eff+width)` is entirely outside **every** renameable region (vacuously true if the
+/// set is empty). An access that is neither within one region nor disjoint from all straddles a
+/// region boundary — the caller treats that as unsupported.
+fn disjoint_from_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
+    match eff.checked_add(width) {
+        Some(end) => regions.iter().all(|&(lo, hi)| end <= lo || eff >= hi),
         None => false,
     }
 }
 
-/// Whether `[eff, eff+width)` is entirely outside the renameable region (vacuously true if none).
-fn disjoint_from_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
-    match region {
-        Some((lo, hi)) => eff
-            .checked_add(width)
-            .is_some_and(|end| end <= lo || eff >= hi),
-        None => true,
-    }
+/// The full rename region set: [`SpecConfig::rename`] then [`SpecConfig::rename_extra`].
+fn all_regions(config: &SpecConfig) -> Vec<(u64, u64)> {
+    config
+        .rename
+        .into_iter()
+        .chain(config.rename_extra.iter().copied())
+        .collect()
 }
 
 /// The byte width of a store op.
@@ -2083,6 +2160,20 @@ fn is_full_natural_load(op: LoadOp, width: u64) -> bool {
     matches!((op, width), (LoadOp::I32, 4) | (LoadOp::I64, 8))
 }
 
+/// The store op that spills a renamed cell of `width` bytes back to the window (write-back). The op's
+/// value type matches the cell's canonical type (`i32` for width < 8, `i64` for 8 — see
+/// [`cell_const`]/[`cell_type`]): a width-8 cell holds an `i64`, everything narrower an `i32`, so the
+/// low `width` bytes of that value are the cell's content. Returns `None` for an unsupported width.
+fn writeback_store_op(width: u32) -> Option<StoreOp> {
+    Some(match width {
+        1 => StoreOp::I32_8,
+        2 => StoreOp::I32_16,
+        4 => StoreOp::I32,
+        8 => StoreOp::I64,
+        _ => return None,
+    })
+}
+
 /// Apply load `op`'s width + sign/zero extension to the assembled little-endian content `raw`,
 /// producing the loaded integer constant exactly as the interpreter would. Returns `None` for a
 /// float load (the abstract domain tracks integer constants only).
@@ -2105,7 +2196,19 @@ fn extend_loaded(raw: u64, op: LoadOp) -> Option<Known> {
     })
 }
 
-/// Read an integer load from constant memory. The effective address `base + offset` must lie
+/// Reconstruct the loaded constant from `width` raw little-endian bytes per load `op`. Integer ops
+/// sign/zero-extend ([`extend_loaded`]); **float** ops reinterpret the bits (`f64`/`f32`), since a
+/// float's memory content *is* its bit pattern. Lets a rename cell written by a float store — a
+/// `TValue` value the interpreter moves via an `f64` load/store — read back as the right constant.
+fn load_bits(raw: u64, op: LoadOp) -> Option<Known> {
+    match op.info().1 {
+        ValType::F64 => Some(Known::F64(raw)),
+        ValType::F32 => Some(Known::F32(raw as u32)),
+        _ => extend_loaded(raw, op),
+    }
+}
+
+/// Read an integer or float load from constant memory. The effective address `base + offset` must lie
 /// fully in range (so the interpreter would not fault) and resolve to bytes the caller has
 /// promised constant — a `const_overlay`, a `const_region`, or (the default) a **readonly** data
 /// segment. Returns the loaded value, sign/zero-extended per `op`, matching the interpreter's
@@ -2117,10 +2220,7 @@ fn read_const_mem(
     offset: u64,
     op: LoadOp,
 ) -> Option<Known> {
-    let (_, vt, width, _) = op.info();
-    if !matches!(vt, ValType::I32 | ValType::I64) {
-        return None;
-    }
+    let width = op.info().2;
     let mem = module.memory?;
     let eff = base.checked_add(offset)?;
     let end = eff.checked_add(width as u64)?;
@@ -2132,7 +2232,7 @@ fn read_const_mem(
     for (i, &byte) in bytes.iter().enumerate() {
         raw |= (byte as u64) << (8 * i);
     }
-    extend_loaded(raw, op)
+    load_bits(raw, op)
 }
 
 /// Resolve `width` constant bytes at window address `eff`, if the caller has promised that range
