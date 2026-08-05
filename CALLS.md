@@ -808,21 +808,27 @@ simplification of the execution path, not a collapse to a single mechanism.
    `thread.spawn` path), and 6d.4.1 already made the powerbox a shared `Arc<Mutex<Host>>` cell — so
    a concurrent handler forks the provider window and clones the host cell instead of `single`'s
    exclusive take. Decomposed smallest-first:
-   - **7.1 — the policy field + the threaded eval-loop admission arm.** Add `policy: OfferPolicy`
-     (`Single` default / `Threaded`) to `OfferEntry` (threaded via a wiring param; a guest-facing
+   - **7.1 — the policy field + the threaded eval-loop admission arm. DONE.** `OfferEntry.policy:
+     OfferPolicy` (`Single` default / `Threaded` via `wire_offer_proc_with_policy`; a guest-facing
      declaration is 7.4). In the eval-loop offer arm, a `Threaded` provider **skips the `busy`
      gate**: briefly lock the state to `fork_for_thread` the window + `Arc::clone` the host cell
-     (no `busy` set, no exclusive take), then animate the handler fiber. The settle skips the
-     `busy` clear, the window restore, and the `strong_count` leak guard (all `single`-specific —
-     concurrent clones are expected under `threaded`); a `threaded` flag on `OfferAnim`/`OfferParked`
-     carries the branch. Pin (single-threaded, no multi-vCPU harness needed): a `threaded` provider
-     whose handler **re-enters itself** recurses on a countdown arg and returns the sum, where the
-     existing `single` cyclic pin `-EAGAIN`s — the cleanest observable of "no gate". `single`
-     behavior unchanged (the whole existing offer suite is the oracle).
-   - **7.2 — true concurrent-callers pin.** Two vCPUs (one multi-vCPU domain, or two domains sharing
-     a re-granted threaded offer) call one `threaded` provider concurrently and both run over the
-     shared window; a provider-side atomic counter reflects both (the defined-race regime, à la
-     `parallel_miri`). Asserts concurrency + confinement-safety, not timing.
+     (no `busy` set, no exclusive take), then animate the handler fiber. The settle/undo/resume
+     paths branch on a `threaded` flag carried by `OfferAnim`/`OfferParked`: no `busy` clear, no
+     window restore (the fork drops), no `admit_wake` (nothing can park on an ungated instance),
+     and no `strong_count` leak guard (concurrent clones are the declared regime). The host-side
+     arm **refuses `Threaded` probeably** (`-EAGAIN`): its checkout takes the world out by value,
+     which would gut the shared cell under in-flight animations — so durable/JIT callers observe
+     `-EAGAIN` until the 7.3 tier arm. **Pin correction (found in build):** the planned
+     "self-recursion vs `-EAGAIN`" observable was wrong — 4c.2 makes a *top-of-stack* self-call
+     recurse under both policies. The real single-threaded observable is a **buried** re-entry
+     (`X → Y → X`, X on the animation stack but not the top): `threaded` X admits a second
+     concurrent animation (`[X, Y, X]`, each over its own forked view) and the chain sums to 9;
+     `single` X refuses `-EAGAIN` (pinned both ways in `threaded_offers.rs`).
+   - **7.2 — true concurrent-callers pin. DONE.** Two `thread.spawn`ed vCPUs each call one
+     `Threaded` instance (each animation over its own `fork_for_thread` view — the `thread.spawn`
+     sibling shape) writing distinct cells; the joiner reads both back through the same offer.
+     Asserts concurrent cross-vCPU admission and one shared instance window — safety, not timing.
+     Plus a state-persistence pin (policy changes admission, never shared-instance semantics).
    - **7.3 — the non-eval-loop tiers.** The host-side `drive_arc` arm and the JIT thunk arm admit a
      `threaded` provider without the `busy` gate (concurrent host-side/JIT callers). Deferrable; the
      eval loop is the oracle.

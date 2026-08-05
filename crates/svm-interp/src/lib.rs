@@ -8119,13 +8119,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // phase-3 relock deferred). `busy` set again for the resumed segment.
                 let (pm, ph) = {
                     let mut st = parked.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.busy = true;
-                    // CALLS.md 6c — the resumed segment runs on this vCPU's run; re-stamp the
-                    // owning-run token so a same-run peer may park on the re-held instance.
-                    st.busy_owner = sched.run_id();
-                    // CALLS.md 6d.4.1 — clone the shared powerbox cell for the resumed segment
-                    // (the instance keeps its ref); the window is still taken by value.
-                    (st.mem.take(), Arc::clone(&st.host))
+                    if parked.threaded {
+                        // CALLS.md increment 7 — a threaded animation never checked the world
+                        // out: re-fork the window view and re-clone the cell; `busy` untouched.
+                        (
+                            st.mem.as_ref().map(|m| m.fork_for_thread()),
+                            Arc::clone(&st.host),
+                        )
+                    } else {
+                        st.busy = true;
+                        // CALLS.md 6c — the resumed segment runs on this vCPU's run; re-stamp the
+                        // owning-run token so a same-run peer may park on the re-held instance.
+                        st.busy_owner = sched.run_id();
+                        // CALLS.md 6d.4.1 — clone the shared powerbox cell for the resumed segment
+                        // (the instance keeps its ref); the window is still taken by value.
+                        (st.mem.take(), Arc::clone(&st.host))
+                    }
                 };
                 let saved_mem = std::mem::replace(mem, pm);
                 let saved_host = std::mem::replace(host, ph);
@@ -8160,6 +8169,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     saved_ref_slots: saved_ref,
                     results: parked.results,
                     entry_funcs: parked.entry_funcs,
+                    threaded: parked.threaded,
                 });
                 // Park the caller frames (currently on this vCPU) as the handler's resumer and
                 // switch into the handler — the 4a animation switch, replayed on resume.
@@ -8261,8 +8271,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Eagain,
                                 // CALLS.md 6d.4.1 — the provider powerbox is the shared cell
                                 // (`Arc<Mutex<Host>>`): the checkout clones it here and the vCPU
-                                // install swaps the clone in (no per-call `Arc::new`).
-                                Go(Vec<i64>, u64, Option<Mem>, Arc<Mutex<Host>>),
+                                // install swaps the clone in (no per-call `Arc::new`). The `bool`
+                                // is increment 7's `threaded` mark: `true` ⇒ the window is a
+                                // [`Mem::fork_for_thread`] view (never taken) and no `busy` was
+                                // set, so the settle/undo paths skip the whole checkout protocol.
+                                Go(Vec<i64>, u64, Option<Mem>, Arc<Mutex<Host>>, bool),
                                 // CALLS.md 4c.1 — contention on a busy instance held by a *different*
                                 // vCPU: rewind + park as an admission-waiter, keyed by this state.
                                 ParkAdmit(Arc<Mutex<ProviderState>>, usize),
@@ -8283,7 +8296,42 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     }
                                 };
                                 let st_ = &mut *guard_;
-                                if st_.busy {
+                                if entry_.policy == OfferPolicy::Threaded {
+                                    // CALLS.md increment 7 (§10.1) — **no admission gate**: the
+                                    // provider declared its handlers safe to run concurrently, so
+                                    // every caller is admitted immediately as a concurrent fiber.
+                                    // The window is a `fork_for_thread` **view** (exactly a
+                                    // `thread.spawn` sibling's shape — shared backing, never
+                                    // taken) and the powerbox cell is cloned; `busy` is never
+                                    // set, so nothing here can strand the instance and the settle
+                                    // has nothing to hand back. `busy` stays permanently `false`
+                                    // for a `Threaded` instance: the eval loop never sets it and
+                                    // the host-side arm refuses `Threaded` outright (`-EAGAIN`,
+                                    // the 7.3 residue) rather than checking the world out from
+                                    // under in-flight animations.
+                                    if *fuel == 0 {
+                                        Adm::OutOfFuel
+                                    } else {
+                                        // Edge 1 — cap args caller→provider, as the single arm.
+                                        let mut arg_slots_ = args_.to_vec();
+                                        {
+                                            let mut hg =
+                                                host.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut ph_g =
+                                                st_.host.lock().unwrap_or_else(|e| e.into_inner());
+                                            translate_cap_slots(
+                                                &mut hg,
+                                                &mut ph_g,
+                                                &osig_.params,
+                                                &mut arg_slots_,
+                                            )?;
+                                        }
+                                        let budget_ = *fuel;
+                                        let pm_ = st_.mem.as_ref().map(|m| m.fork_for_thread());
+                                        let ph_ = Arc::clone(&st_.host);
+                                        Adm::Go(arg_slots_, budget_, pm_, ph_, true)
+                                    }
+                                } else if st_.busy {
                                     // 4c.2's direct self-call was handled before the lock. A
                                     // **buried** self-call (the instance on this vCPU's own
                                     // animation stack but not the top — its world is in the stack's
@@ -8348,7 +8396,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // handler's mutations land directly and the settle needs no host
                                     // restore. `busy` (just set) guards against a second checkout.
                                     let ph_ = Arc::clone(&st_.host);
-                                    Adm::Go(arg_slots_, budget_, pm_, ph_)
+                                    Adm::Go(arg_slots_, budget_, pm_, ph_, false)
                                 }
                                 // `guard_` drops — the state lock is not held across the run.
                             };
@@ -8370,7 +8418,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     return Ok(Inner::Park(Blocked::OfferAdmit { key: key_ }));
                                 }
                                 Adm::OutOfFuel => return Err(Trap::OutOfFuel),
-                                Adm::Go(arg_slots_, budget_, pm_, ph_) => {
+                                Adm::Go(arg_slots_, budget_, pm_, ph_, threaded_) => {
                                     // CALLS.md 6a — a `ref.func`-taking handler unit needs the
                                     // unit-own funcref remap (the `invoked_new` shape), installed
                                     // once per (vCPU, unit) via the cache (installs are
@@ -8396,20 +8444,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             match cached_ {
                                                 Some(v_) => Some(v_),
                                                 None => {
-                                                    {
-                                                        let mut st_ = state_
-                                                            .lock()
-                                                            .unwrap_or_else(|e| e.into_inner());
-                                                        st_.mem = pm_;
-                                                        // 6d.4.1 — no host restore: the checkout
-                                                        // cloned the cell (kept its ref); the clone
-                                                        // is dropped as `ph_` leaves scope.
-                                                        st_.busy = false;
-                                                    }
-                                                    if let SchedRef::Real(sr) = sched {
-                                                        sr.admit_wake(
-                                                            Arc::as_ptr(&state_) as usize
-                                                        );
+                                                    // 7.1 threaded: nothing was checked out (the
+                                                    // window is a fork, `busy` untouched) — the
+                                                    // fork and cell clone just drop.
+                                                    if !threaded_ {
+                                                        {
+                                                            let mut st_ = state_
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner());
+                                                            st_.mem = pm_;
+                                                            // 6d.4.1 — no host restore: the checkout
+                                                            // cloned the cell (kept its ref); the
+                                                            // clone is dropped as `ph_` leaves scope.
+                                                            st_.busy = false;
+                                                        }
+                                                        if let SchedRef::Real(sr) = sched {
+                                                            sr.admit_wake(
+                                                                Arc::as_ptr(&state_) as usize
+                                                            );
+                                                        }
                                                     }
                                                     frames[top].vals.push(Reg::from_i64(EAGAIN));
                                                     continue;
@@ -8424,22 +8477,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         match registry.create(0, 0, spawn_quota.max_fibers, false) {
                                             Ok(h_) => h_,
                                             Err(_) => {
-                                                {
-                                                    let mut st_ = state_
-                                                        .lock()
-                                                        .unwrap_or_else(|e| e.into_inner());
-                                                    st_.mem = pm_;
-                                                    // 6d.4.1 — no host restore (see above); the
-                                                    // cloned cell ref drops with `ph_`.
-                                                    st_.busy = false;
-                                                }
-                                                // 4c.1 — the brief checkout is undone (`busy`
-                                                // cleared); wake any admission-waiter that parked
-                                                // in that window (state guard dropped first).
-                                                if let SchedRef::Real(sr) = sched {
-                                                    sr.admit_wake(
-                                                        Arc::as_ptr(&state_) as usize
-                                                    );
+                                                // 7.1 threaded: no checkout to undo (see above).
+                                                if !threaded_ {
+                                                    {
+                                                        let mut st_ = state_
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
+                                                        st_.mem = pm_;
+                                                        // 6d.4.1 — no host restore (see above); the
+                                                        // cloned cell ref drops with `ph_`.
+                                                        st_.busy = false;
+                                                    }
+                                                    // 4c.1 — the brief checkout is undone (`busy`
+                                                    // cleared); wake any admission-waiter that
+                                                    // parked in that window (guard dropped first).
+                                                    if let SchedRef::Real(sr) = sched {
+                                                        sr.admit_wake(
+                                                            Arc::as_ptr(&state_) as usize
+                                                        );
+                                                    }
                                                 }
                                                 frames[top].vals.push(Reg::from_i64(EAGAIN));
                                                 continue;
@@ -8478,6 +8534,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         saved_ref_slots: saved_ref_,
                                         results: Arc::from(osig_.results.clone()),
                                         entry_funcs: entry_.funcs.clone(),
+                                        threaded: threaded_,
                                     });
                                     // Park the caller frames as this handler's resumer and switch
                                     // in (serve_switch shape; no `shadow_switch` — non-durable).
@@ -8657,20 +8714,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // the instance's own (1) and this vCPU's checkout clone (1) = 2; a surviving
                         // extra ref is the leaked fiber. `busy` serialized admission, so no
                         // concurrent checkout races the count.
-                        if Arc::strong_count(&prov_host_arc) != 2 {
-                            return Err(Trap::FiberFault);
-                        }
-                        drop(prov_host_arc); // the checkout clone; the instance keeps its ref
-                        {
-                            let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
-                            st.mem = prov_mem;
-                            // 6d.4.1 — no host restore: mutations landed through the shared cell.
-                            st.busy = false;
-                        }
-                        // CALLS.md 4c.1 — the promotion freed the instance (`busy` cleared); re-admit
-                        // any callers parked as admission-waiters on it (state guard already dropped).
-                        if let SchedRef::Real(sr) = sched {
-                            sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
+                        if anim.threaded {
+                            // CALLS.md increment 7 — a threaded animation holds a fork + a cell
+                            // clone, never the world: both just drop (concurrent clones are the
+                            // declared regime, so no leak guard), and there is no `busy` to
+                            // reopen and nobody parked to wake.
+                            drop(prov_mem);
+                            drop(prov_host_arc);
+                        } else {
+                            if Arc::strong_count(&prov_host_arc) != 2 {
+                                return Err(Trap::FiberFault);
+                            }
+                            drop(prov_host_arc); // the checkout clone; the instance keeps its ref
+                            {
+                                let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.mem = prov_mem;
+                                // 6d.4.1 — no host restore: mutations landed through the shared
+                                // cell.
+                                st.busy = false;
+                            }
+                            // CALLS.md 4c.1 — the promotion freed the instance (`busy` cleared);
+                            // re-admit any callers parked as admission-waiters on it (state guard
+                            // already dropped).
+                            if let SchedRef::Real(sr) = sched {
+                                sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
+                            }
                         }
                         *offer_parked = Some(OfferParked {
                             state: anim.state,
@@ -8680,6 +8748,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             entry_funcs: anim.entry_funcs,
                             remaining_budget: remaining,
                             resume_key,
+                            threaded: anim.threaded,
                         });
                         // Unwind to the caller (the handler's resumer) and park the whole vCPU.
                         chain.pop();
@@ -11732,7 +11801,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // closed — a mid-animation park is a 4b capability, never a wrong answer.
                         // CALLS.md 6d.4.1 — shared-cell form: clean return ⇒ exactly the instance's
                         // ref + this checkout clone = 2; more is a leak (`busy` serialized admission).
-                        if Arc::strong_count(&prov_host_arc) != 2 {
+                        // Increment 7: a **threaded** animation skips the guard — concurrent clones
+                        // are the declared regime, and there is no world to hand back (the fork
+                        // drops) and no `busy` to reopen.
+                        if !anim.threaded && Arc::strong_count(&prov_host_arc) != 2 {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.busy = false;
                             return Err(Trap::FiberFault);
@@ -11750,13 +11822,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // no reserve drain (caller-pays — the caller's `*fuel` already paid).
                         {
                             let mut st = anim.state.lock().unwrap_or_else(|e| e.into_inner());
-                            st.mem = prov_mem;
-                            // 6d.4.1 — no host restore: mutations landed through the shared cell.
-                            st.busy = false;
+                            if anim.threaded {
+                                // Increment 7 — the fork just drops; the instance kept its window.
+                                drop(prov_mem);
+                            } else {
+                                st.mem = prov_mem;
+                                // 6d.4.1 — no host restore: mutations landed through the shared
+                                // cell.
+                                st.busy = false;
+                            }
                             let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                             // 6d.4.1 — the provider powerbox is the shared cell; lock it for the
-                            // result edge. Uncontended (the ProviderState guard `st` serializes
-                            // this instance's edges), so this never blocks — dissolves at 6d.4.3.
+                            // result edge. Uncontended for `single` (the ProviderState guard `st`
+                            // serializes this instance's edges); briefly contended under
+                            // `threaded` (concurrent settles), which is exactly the §12 regime.
                             let mut ph_g = st.host.lock().unwrap_or_else(|e| e.into_inner());
                             translate_cap_slots(
                                 &mut ph_g,
@@ -11779,9 +11858,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         cur_module = u32::MAX;
                         // CALLS.md 4c.1 — the instance just cleared `busy`; re-admit any callers
                         // parked as admission-waiters on it (after the state guard dropped, so the
-                        // wake's scheduler lock never nests under the state lock).
-                        if let SchedRef::Real(sr) = sched {
-                            sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
+                        // wake's scheduler lock never nests under the state lock). Threaded: no
+                        // gate, so nothing can be parked — skip.
+                        if !anim.threaded {
+                            if let SchedRef::Real(sr) = sched {
+                                sr.admit_wake(Arc::as_ptr(&anim.state) as usize);
+                            }
                         }
                     } else {
                         frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
@@ -14092,6 +14174,20 @@ pub fn coverage_remap(
     Some(remap.into())
 }
 
+/// CALLS.md §5 axis 2 / increment 7 — a provider's **concurrency policy**, a declaration by the
+/// provider (never inferred from vCPU count, §10.1). `Single` (default): admissions are serialized
+/// by the `busy` word — run-to-park atomicity, exactly what all existing handler code assumes.
+/// `Threaded`: no admission gate — concurrent handler fibers animate over the instance's shared
+/// world at once (each over a [`Mem::fork_for_thread`] view, exactly a `thread.spawn` sibling's
+/// shape), and the provider synchronizes its own state with guest atomics/futexes (the §12
+/// defined-race regime; confinement never depends on data-race freedom). The runtime never pays a
+/// serialization cost the guest didn't order (host = mechanism, guest = policy, INVARIANTS.md 4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OfferPolicy {
+    Single,
+    Threaded,
+}
+
 #[derive(Clone)]
 pub struct OfferEntry {
     pub funcs: Arc<[Func]>,
@@ -14119,6 +14215,11 @@ pub struct OfferEntry {
     /// never a blocking wait — so deadlock is impossible structurally, providers may hold
     /// offers, and a cyclic call is a refusal, not a hang.
     pub state: Option<Arc<Mutex<ProviderState>>>,
+    /// CALLS.md increment 7 — the provider's concurrency policy ([`OfferPolicy`]). `Single` for
+    /// every wire today; `Threaded` (opt-in via [`Host::wire_offer_proc_with_policy`]) drops the
+    /// `busy` admission gate on the eval-loop arm so handlers animate concurrently over the shared
+    /// world. Inert for a pure (`state: None`) offer — windowless, nothing to race.
+    pub policy: OfferPolicy,
 }
 
 /// §3.6 slice 2 — one queued inbound dispatch (the serve-loop core): a call targeting this
@@ -14291,6 +14392,11 @@ struct OfferAnim {
     /// re-install the provider code (`invoked = entry_funcs`) when its parked animation resumes on
     /// this (or any) vCPU. On the run-to-completion 4a path it is simply carried and dropped.
     entry_funcs: Arc<[Func]>,
+    /// CALLS.md increment 7 — `true` iff this animation was admitted under [`OfferPolicy::Threaded`]:
+    /// the installed window is a `fork_for_thread` view (never taken from the instance) and `busy`
+    /// was never set, so the settle drops the fork instead of handing a world back — no leak guard,
+    /// no `busy` clear, no `admit_wake` (nothing can be parked on an ungated instance).
+    threaded: bool,
 }
 
 /// CALLS.md 4b — a **parked** cross-world offer animation: the handler fiber parked mid-run, so
@@ -14319,6 +14425,9 @@ struct OfferParked {
     /// The provider domain id this vCPU is parked under in `svc_waiters` — the key the handler's
     /// block-wake `svc_wake`s, and the key to re-park under on a spurious wake.
     resume_key: usize,
+    /// CALLS.md increment 7 — the parked animation's [`OfferAnim::threaded`] mark, carried through
+    /// the park: the resume re-forks the window (instead of re-taking it under `busy`).
+    threaded: bool,
 }
 
 /// §3.5 `cap` **boundary translation**: for each slot the signature types `ValType::Cap`,
@@ -16125,6 +16234,8 @@ impl Host {
             type_id,
             depth: 1,
             state: None,
+            // A pure offer has no state to race — policy is inert; record `Single`.
+            policy: OfferPolicy::Single,
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
     }
@@ -16137,6 +16248,19 @@ impl Host {
     /// wrap-holding-its-real-cap story). Fail-closed like `wire_offer_func`; `m.funcs` must be
     /// verifier-passing (the host is trusted to wire only verified modules, as with every grant).
     pub fn wire_offer_proc(&mut self, m: &Module, ops: &[u32]) -> Option<i32> {
+        self.wire_offer_proc_with_policy(m, ops, OfferPolicy::Single)
+    }
+
+    /// CALLS.md increment 7 — wire an instanced offer with an explicit concurrency
+    /// [`OfferPolicy`]. [`Host::wire_offer_proc`] is the `Single` default; a `Threaded` wire drops
+    /// the eval-loop admission gate so handlers animate concurrently over the shared world (the
+    /// provider owns its synchronization, §12). A guest-facing declaration is the 7.4 follow-up.
+    pub fn wire_offer_proc_with_policy(
+        &mut self,
+        m: &Module,
+        ops: &[u32],
+        policy: OfferPolicy,
+    ) -> Option<i32> {
         let funcs: Arc<[Func]> = m.funcs.clone().into();
         if ops.is_empty() || ops.iter().any(|&f| f as usize >= funcs.len()) {
             return None;
@@ -16171,6 +16295,7 @@ impl Host {
                 admit_parked: 0,
                 busy_owner: 0,
             }))),
+            policy,
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
     }
@@ -16647,6 +16772,8 @@ impl Host {
             type_id,
             depth: 1,
             state: Some(state),
+            // The self-reified offer is `Single` today; a guest-declared policy rides 7.4.
+            policy: OfferPolicy::Single,
         });
         let h = self.grant(type_id, Binding::Offer(idx));
         self.self_reified.insert(k, h);
@@ -17990,6 +18117,17 @@ impl Host {
                     // drain. The eval-loop tier is caller-pays (5b); this host-side tier keeps
                     // the flat bounded price until the arm itself retires (6d residues).
                     Some(state) => {
+                        // CALLS.md increment 7 (7.1) — a `Threaded` provider is **eval-loop only**
+                        // for now: this arm's checkout takes the world out by value (window +
+                        // inner `Host`), which would gut the shared cell under any in-flight
+                        // concurrent animation (they hold forks of the window and clones of the
+                        // cell). Refuse probeably (`-EAGAIN`) rather than race them; the
+                        // tier-native concurrent admission is the recorded 7.3 residue. Durable
+                        // and JIT callers reach a `Threaded` offer through here, so they observe
+                        // `-EAGAIN` until 7.3.
+                        if entry.policy == OfferPolicy::Threaded {
+                            return Ok(vec![EAGAIN]);
+                        }
                         // Checkout: reserve the instance under one brief lock, then release it. A
                         // busy instance (any owner) or a momentarily-held short critical section is
                         // a probeable `-EAGAIN`. The world moves onto locals so the guard drops.
