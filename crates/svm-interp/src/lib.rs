@@ -9251,6 +9251,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // §2.2 (op 16): the resolved pager binding, threaded into the spawn tail
                     // (demand-page the carve + stamp the child's substrate-held pager).
                     let mut pager_ref: Option<(Arc<Mutex<Host>>, u32)> = None;
+                    // §3 (op 17): the record's spawn geometry `(entry, off, size_log2, quota)`,
+                    // overriding the op-0 arm's positional-arg parse when the spawn came in as a
+                    // config record instead of scalars.
+                    let mut rec_geo: Option<(u64, u64, i64, i64)> = None;
                     #[allow(clippy::type_complexity)]
                     // `grant`/`named` carry the re-grant **handles** (not pre-resolved bindings): a pipe
                     // end must alias its shared backing into the child, not copy a parent-local index, so
@@ -9343,6 +9347,98 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 list.push((name, handle));
                             }
                             (0, None, 2, None, list)
+                        }
+                        // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr)` (op 17): the
+                        // config-record spawn. One record subsumes every spawn variant as data —
+                        // module (`-1` = self), entry, carve `(off, size_log2)`, pager export
+                        // (`u32::MAX` = none; anything else makes a §2.2 demand child paged by
+                        // the spawner's own impl export), quota (raw scalar until §3b's Budget
+                        // handle replaces it; the `budget` field is reserved-zero until then),
+                        // and the op-11 named-grant list `(grants_ptr, grants_n)`. Spawn shape
+                        // is data, not opcode; `join`/`poll`/`detach`/`kill` stay verbs. A
+                        // malformed record (bad version, nonzero reserved field, out-of-window
+                        // list) fails the spawn closed before any child state exists.
+                        17 => {
+                            let rp =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                            let rec = m.read_window(rp, 56)?;
+                            let u32_at = |o: usize| {
+                                u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]])
+                            };
+                            let u64_at = |o: usize| {
+                                u64::from_le_bytes([
+                                    rec[o],
+                                    rec[o + 1],
+                                    rec[o + 2],
+                                    rec[o + 3],
+                                    rec[o + 4],
+                                    rec[o + 5],
+                                    rec[o + 6],
+                                    rec[o + 7],
+                                ])
+                            };
+                            if u32_at(0) != 0 || u32_at(28) != 0 {
+                                // version / budget (reserved until §3b) — fail closed.
+                                return Err(Trap::CapFault);
+                            }
+                            let entry = u32_at(4) as u64;
+                            let off = u64_at(8);
+                            let size_log2 = u32_at(16) as i64;
+                            let pager = u32_at(20);
+                            let modh = u32_at(24) as i32;
+                            let quota = u64_at(32) as i64;
+                            let grants_ptr = u64_at(40);
+                            let grants_n = u64_at(48);
+                            let mut list: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                }
+                                list.push((name, handle));
+                            }
+                            if pager != u32::MAX {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                // A missing/empty pager export fails the spawn closed (§3.3).
+                                let ok = hg
+                                    .self_module
+                                    .as_ref()
+                                    .and_then(|sm| sm.impl_exports.get(pager as usize))
+                                    .is_some_and(|e| !e.ops.is_empty());
+                                if !ok {
+                                    return Err(Trap::CapFault);
+                                }
+                                pager_ref = Some((Arc::clone(host), pager));
+                            }
+                            let g = if modh >= 0 {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                let g = hg.resolve_module(modh)?;
+                                Some(ChildMod {
+                                    funcs: g.funcs.clone(),
+                                    memory_log2: g.memory_log2,
+                                    data: g.data.clone(),
+                                    durable: g.durable,
+                                    digest: g.digest,
+                                    imports: g.imports.clone(),
+                                    types: g.types.clone(),
+                                    module: Arc::clone(&g.module),
+                                })
+                            } else {
+                                None
+                            };
+                            rec_geo = Some((entry, off, size_log2, quota));
+                            (0, g, 0, None, list)
                         }
                         // CONSOLIDATION.md §2.2 — `spawn_process_demand(grants_ptr, grants_n,
                         // entry, off, size_log2, quota, pager_export)` (op 16): an op-11 process
@@ -9465,10 +9561,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 )?
                                 .i64())
                             };
-                            let entry = argn(0)? as u64;
-                            let off = argn(1)? as u64;
-                            let size_log2 = argn(2)?;
-                            let quota = argn(3)?;
+                            let (entry, off, size_log2, quota) = match rec_geo.take() {
+                                Some(g) => g,
+                                None => (argn(0)? as u64, argn(1)? as u64, argn(2)?, argn(3)?),
+                            };
                             // The child entry returns one `i64` and takes its starter capabilities as
                             // `i64` args, in order: `Instantiator`, then (if 2+ params) `AddressSpace`,
                             // then (S2 `instantiate_granted`, 3 params) the re-granted `Stream`/`Exit`/

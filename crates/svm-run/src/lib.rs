@@ -3798,8 +3798,9 @@ fn module_nests(m: &svm_ir::Module) -> bool {
     })
 }
 
-/// CONSOLIDATION.md §2.2: the module spawns a demand process child (`Instantiator` op 16 —
-/// pager-serviced faults). The JIT has no native arm for the fault seam yet, so these modules
+/// CONSOLIDATION.md §2.2/§3: the module spawns a demand process child (`Instantiator` op 16 —
+/// pager-serviced faults) or uses the §3 config-record spawn (op 17 — §3c migrates the spawn
+/// ABI to the JIT). The JIT has no native arm for either yet, so these modules
 /// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
 /// transport itself is what makes this cheap to defer: JIT callers already reach providers
 /// through the cap-thunk handoff at interp cost.
@@ -3811,7 +3812,7 @@ fn module_demand_spawns(m: &svm_ir::Module) -> bool {
                     i,
                     svm_ir::Inst::CapCall {
                         type_id: 6,
-                        op: 16,
+                        op: 16 | 17,
                         ..
                     }
                 )
