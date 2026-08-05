@@ -44,9 +44,9 @@ const PAGE_BYTE: i64 = 7;
 /// never unmapped, a supply that didn't stick) breaks the expected value rather than hiding.
 const FAULT_MARK: i64 = 1000;
 
-/// Statuses `resume` (op 3) reports: child suspended at a fault / child returned.
+/// The status `resume` (op 3) reports for a child suspended at a fault; any other status exits
+/// the resume loop (`RETURNED` = 1 folds the child's sum into the checksum implicitly).
 const FAULTED: i64 = 2;
-const RETURNED: i64 = 1;
 
 /// A parent `_start` that runs `s` pager cycles: spawn a demand coroutine over the carve, then
 /// resume-loop — on `FAULTED`, store `PAGE_BYTE` at the reported (parent-coordinate) address and
