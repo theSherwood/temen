@@ -94,6 +94,7 @@ fn domain_dispatch(
         memory_size_log2: None,
         args: argv.into_iter().map(String::into_bytes).collect(),
         env: Vec::new(),
+        ..RunConfig::default()
     };
     match p.instance.run(Backend::TreeWalk, &config) {
         Ok(run) => {

@@ -23,13 +23,18 @@
 //! the offer lane's op-14 mint + parking live call does not `serve_qualifies` on `Backend::Jit`,
 //! so that lane folds to the tree-walk oracle — read the JIT column accordingly.
 //!
-//! Observed shape at pin time (ratios matter, not absolute ns): the offer transport runs
-//! **~9-10x the bespoke resume/yield** on both interp tiers (~250 ns bespoke vs ~2.4 us offer per
-//! round) — a bespoke resume is a direct in-Rust call into a coroutine slot, while an offer call
-//! pays admission + window fork + park/wake per round even with the provider already parked at
-//! `svc.wait`. This is the §2 decision input: 2.2/2.3 cannot simply swap transports — either the
-//! offer hot path grows a parked-provider fast lane cheap enough to meet `paging_bench`'s pin, or
-//! the gate forces a rethink of the deletion's scope.
+//! Observed shape (ratios matter, not absolute ns). The first pin of this probe read ~9-10x
+//! offer-over-bespoke on the interp tiers — but the 2.1b profile showed that run measured the
+//! **queued transport**: the CALLS.md 4d direct-handoff lane existed and was semantically pinned,
+//! yet sat behind a `Host::set_handoff` knob no `svm-run` entry point exposed, so every round paid
+//! ticket + queue + two cross-thread futex wakes (~55% of the delta was scheduling alone). With
+//! `RunConfig::handoff` now on by default, the same shape reads **~3x bespoke on the interp tiers**
+//! (~250 ns bespoke vs ~740 ns offer — the residual is the admission word, per-call revocation
+//! check, provider dispatch, and serve accounting), and on the JIT the offer lane **beats the
+//! bespoke coroutine ~3x** (~1.1 us vs ~3.5 us — the bespoke path pays per-switch committed-page
+//! window mirroring; the offer path rides the cap-thunk handoff over shared backing). Remaining §2
+//! decision input: a parked-provider cache (reusable handler frame + fiber slot, no ticket/stash)
+//! has an estimated ~300-450 ns floor if the residual 3x on interp tiers matters for 2.3.
 
 use std::time::Instant;
 

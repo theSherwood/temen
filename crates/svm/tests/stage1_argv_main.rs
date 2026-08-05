@@ -87,6 +87,7 @@ fn run(backend: Backend, args: &[&[u8]]) -> (i64, Vec<u8>) {
         memory_size_log2: None,
         args: args.iter().map(|s| s.to_vec()).collect(),
         env: Vec::new(),
+        ..RunConfig::default()
     };
     let run = inst.run(backend, &cfg).expect("run");
     let code = match run.outcome {
