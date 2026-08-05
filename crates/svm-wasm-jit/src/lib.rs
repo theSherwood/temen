@@ -1610,6 +1610,65 @@ pub fn compile_module_reactor(
     Ok((wasm, emitted_bitmap))
 }
 
+/// Like [`compile_module_reactor`], but emit only the functions in `keep` (plus any whose signature
+/// can't be marshalled cross-tier, and the entry) — the rest of the reachable in-subset set falls back
+/// to the interpreter via `env.call_interp`, exactly like a non-in-subset function. This is the
+/// **subset / profile-guided emit** the tier-up break-even measurement drives: `keep` is the set a run
+/// actually touches (the profiler showed ~12% of functions), so the emitted module carries only the hot
+/// code. A dropped function that is later called still runs correctly (on the interp), just not on wasm.
+/// `keep[i]` out of range defaults to *kept* (so an under-sized `keep` degrades to whole-module emit).
+pub fn compile_module_reactor_keep(
+    m: &Module,
+    entry: u32,
+    keep: &[bool],
+    shared_memory: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let n = m.funcs.len();
+    let a = analyze_from(m, entry);
+    // Emit a reachable in-subset function iff it is the entry, kept, or has a signature that can't be
+    // marshalled to the interpreter (so it *must* stay on wasm). Everything else reachable becomes
+    // cross-tier (interp over the shared window) — the same fallback path non-in-subset functions use.
+    let emitted_pred: Vec<bool> = (0..n)
+        .map(|i| {
+            a.reachable[i]
+                && a.in_subset[i]
+                && (i as u32 == entry
+                    || keep.get(i).copied().unwrap_or(true)
+                    || !int_sig(&m.funcs[i]))
+        })
+        .collect();
+    let cross: Vec<bool> = (0..n)
+        .map(|i| a.reachable[i] && !emitted_pred[i] && int_sig(&m.funcs[i]))
+        .collect();
+    let ok = (entry as usize) < n
+        && emitted_pred[entry as usize]
+        && (0..n).all(|i| !a.reachable[i] || emitted_pred[i] || cross[i]);
+    if !ok {
+        return Err(Error::Unsupported("keep-set not cross-tier runnable"));
+    }
+    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
+    let mut emitted: Vec<usize> = Vec::new();
+    let mut emitted_bitmap = vec![false; n];
+    for (i, &e) in emitted_pred.iter().enumerate() {
+        if e {
+            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            emitted.push(i);
+            emitted_bitmap[i] = true;
+        }
+    }
+    let wasm = emit_module(
+        m,
+        shared_memory,
+        &emitted,
+        &wasm_of,
+        &cross,
+        None,
+        false,
+        FuelMode::Global,
+    )?;
+    Ok((wasm, emitted_bitmap))
+}
+
 /// Compile a **tier-up** module for the browser threads tier (`BROWSER.md` § "wasm-JIT tier",
 /// per-Worker JIT). Unlike the rooted, wasm-driven [`compile_module_reactor`], eligibility is **not** rooted at one
 /// entry: the guest keeps running on the resumable interpreter (which drives `thread.spawn`/`join`,
