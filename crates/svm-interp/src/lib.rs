@@ -1894,6 +1894,16 @@ fn drive_arc(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
+    // Install-durability (DURABILITY.md §12.5): the domain's B2 `install` occupancy, resolved to
+    // `(slot, funcs)` now (before the host moves into the shared Arc) so the freshly-built dispatch
+    // table below can re-apply it. Empty for a fresh run (nothing installed), so it is a pure no-op
+    // there; on a thaw it re-installs each captured unit at its slot, so a `call_indirect` through an
+    // installed slot resolves after freeze/thaw. Install order is preserved (dense module ids).
+    let jit_reapply: Vec<(u32, Arc<[Func]>)> = host
+        .jit_all_installs()
+        .into_iter()
+        .filter_map(|(d, slot, unit)| host.jit_unit_funcs(d, unit).map(|f| (slot, f)))
+        .collect();
     // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
     // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
     // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
@@ -2132,6 +2142,13 @@ fn drive_over_cell(
                 jit_table_log2.max(need.trailing_zeros() as u8)
             }
         }));
+        // Install-durability (DURABILITY.md §12.5): re-apply the domain's captured B2 `install`
+        // occupancy onto the fresh table, in install order, so a thawed `call_indirect` resolves. A
+        // no-op for a fresh run (`jit_reapply` empty). `jit_table_log2` was restored from the
+        // artifact on thaw, so the padding these slots land in exists.
+        for (slot, unit_funcs) in &jit_reapply {
+            dt.install_at(*slot, Arc::clone(unit_funcs));
+        }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
@@ -3716,6 +3733,24 @@ impl DomainTable {
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
+    }
+
+    /// Install `unit` at an **exact** slot (DURABILITY.md §12.5 install-durability): the reconstruct
+    /// twin of [`Self::install`], used to re-apply a domain's captured install occupancy onto a
+    /// freshly-built table at run start so a `call_indirect` through the slot resolves after a
+    /// freeze/thaw. Called in the guest's original install order, so the appended module ids stay
+    /// dense and each slot maps to its own re-applied unit. Out-of-range / real-function slots are a
+    /// no-op (a forged captured slot can only mis-dispatch within the guest's own table — never
+    /// escape — but stay defensive). Not on the concurrent hot path (run setup, before any vCPU).
+    fn install_at(&self, slot: u32, unit: Arc<[Func]>) {
+        let s = slot as usize;
+        if s >= self.slots.len() {
+            return;
+        }
+        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        units.push(unit);
+        let module = units.len() as u32; // module k ≡ units[k-1]
+        self.slots[s].store(pack_slot(module, 0), Ordering::Release);
     }
 
     /// **Auto-install a unit's own functions** (DESIGN.md §22 "unit-own funcref", the interpreter
@@ -8910,21 +8945,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 ($h:expr, $args:expr) => {{
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let unit_funcs = {
+                    let (domain, cu, unit_funcs) = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                        (domain, cu, hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?)
                     };
                     // Append the unit to the **shared** domain table (module id = its 1-based
                     // index) and fill the next empty slot — visible at once to every vCPU of the
                     // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
                     // so the first install lands at the same index the JIT's `install` returns.
                     let res = match dt.install(unit_funcs) {
-                        Some(slot) => slot as i64,
+                        Some(slot) => {
+                            // Record the occupancy on the domain so it survives the run (the table is
+                            // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
+                            host.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .jit_record_install(domain, slot, cu);
+                            slot as i64
+                        }
                         None => ENOSPC,
                     };
                     frames[top].vals.push(Reg::from_i64(res));
@@ -8932,15 +8974,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             macro_rules! jit_uninstall_body {
                 ($h:expr, $args:expr) => {{
-                    {
+                    let domain = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                        hg.resolve_jit_domain($h)?; // authority: a forged handle is inert
-                    }
+                        hg.resolve_jit_domain($h)? // authority: a forged handle is inert
+                    };
                     let slot = get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64()
                         as usize;
                     // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
                     // function count) — `dt.uninstall` enforces the range + filled checks.
                     let res = if dt.uninstall(slot, funcs.len()) {
+                        // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
+                        host.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .jit_forget_install(domain, slot as u32);
                         0
                     } else {
                         EINVAL
@@ -13898,9 +13944,11 @@ impl Attestation {
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
-/// into a fresh `Host` reconstructs the exact authority. The non-value bindings
-/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostProc`) are
-/// **not** durable: a live one makes the domain non-snapshottable.
+/// into a fresh `Host` reconstructs the exact authority. The `JitDomain`/`JitCode` variants
+/// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
+/// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`, `IoRing`,
+/// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
     Stream(StreamRole),
@@ -13924,6 +13972,23 @@ pub enum DurableBinding {
         slot: u32,
         export: u32,
     },
+    /// §22 guest-JIT **domain** handle (DESIGN.md §22, DURABILITY.md §12.5 Slice 2). The domain's
+    /// out-of-line unit state — each unit's already-instrumented+verified funcs and the compile
+    /// quotas — is *not* value-typed enough to ride this `Copy` binding, so it travels in a
+    /// separate artifact section ([`Host::capture_durable_jit`]); this binding carries only the
+    /// domain's **index**, which the thaw re-pins into the positionally-rebuilt `jit_domains`. The
+    /// native/wasm code pointers are process-local and re-derived on thaw (a native re-compile is
+    /// the Slice-3 follow-on; an interpreter run invokes the restored funcs directly).
+    JitDomain {
+        idx: u32,
+    },
+    /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
+    /// `jit_domains`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
+    /// index pair is its whole authority — durable once the domain's units are captured.
+    JitCode {
+        domain: u32,
+        unit: u32,
+    },
 }
 
 /// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
@@ -13937,6 +14002,49 @@ pub struct DurableHandle {
     pub generation: u32,
     pub type_id: u32,
     pub binding: DurableBinding,
+}
+
+/// One §22 guest-JIT **unit** captured for snapshot (DURABILITY.md §12.5 Slice 2). The durable
+/// state is the unit's already-instrumented+verified IR (encoded as a module image, `unit_ir`)
+/// plus its B2 `install` type id; the native/wasm code pointers are process-local and re-derived
+/// on thaw. `unit_ir` re-clears the verifier on restore ([`Host::restore_durable_jit`]), so a
+/// tampered artifact can never inject unverified funcs into a domain.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableJitUnit {
+    /// The unit's funcs encoded as a canonical module image (`svm_encode::encode_module` of a
+    /// funcs+memory wrapper). Decoded and **re-verified** on restore.
+    pub unit_ir: Vec<u8>,
+    /// The interned `type_id` the embedder registered for a B2-`install`ed unit (`0` for an
+    /// interpreter unit / one never installed). Value-typed, so it rides as-is.
+    pub install_type_id: u32,
+}
+
+/// One §22 guest-JIT **domain** captured for snapshot (DURABILITY.md §12.5 Slice 2): the
+/// memory-match precondition, the compile quotas, and the domain's units in index order (dead
+/// units included, so a live [`DurableBinding::JitCode`]'s `(domain, unit)` index stays valid).
+/// Captured as a set by [`Host::capture_durable_jit`] and rebuilt positionally by
+/// [`Host::restore_durable_jit`], so the handle-table `JitDomain`/`JitCode` indices re-resolve.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableJitDomain {
+    pub mem_log2: Option<u8>,
+    pub units_left: u32,
+    pub bytes_left: u64,
+    pub units: Vec<DurableJitUnit>,
+    /// B2 `install` occupancy: `(table slot, unit index)` in install order (DURABILITY.md §12.5
+    /// install-durability). Re-applied to the thaw run's dispatch table so a `call_indirect`
+    /// through an installed slot resolves after a freeze/thaw.
+    pub installed: Vec<(u32, u32)>,
+}
+
+/// Why restoring a §22 guest-JIT domain from an artifact failed (DURABILITY.md §12.5 Slice 2).
+/// Both are fail-closed — a bad artifact reconstructs no units rather than admitting unsafe code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JitRestoreError {
+    /// A unit's `unit_ir` didn't decode as a module image.
+    Decode,
+    /// A decoded unit failed re-verification — the artifact is untrusted, so its funcs must clear
+    /// the verifier again before they become invocable.
+    Verify,
 }
 
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
@@ -15063,6 +15171,14 @@ struct JitDomainState {
     /// *proxy* for compiled bytes.
     units_left: u32,
     bytes_left: u64,
+    /// B2 `install` occupancy (DURABILITY.md §12.5 install-durability): `(table slot, unit)` for
+    /// each of this domain's units currently installed in the run's shared `call_indirect` table.
+    /// The table itself is a per-run transient rebuilt from module-0 (§12.4), so this is the
+    /// **persistent** record of the guest's `install`s — recorded on `install`, dropped on
+    /// `uninstall`, re-applied when a run builds its table (so an install survives a freeze/thaw),
+    /// and captured beside the units (`capture_durable_jit`). Push order = install order, so a
+    /// re-apply reproduces the same slot→unit dispatch.
+    installed: Vec<(u32, u32)>,
 }
 
 /// Default per-domain compile quota: generous for a long REPL session, far below what could
@@ -15125,6 +15241,22 @@ fn module_digest(m: &Module) -> [u8; 32] {
         debug_info: None,
     };
     svm_encode::digest256(&svm_encode::encode_module(&canon))
+}
+
+/// Encode a compiled §22 unit's already-instrumented+verified funcs as a canonical module image
+/// for the snapshot (DURABILITY.md §12.5 Slice 2). Only `funcs` + the domain's declared `memory`
+/// ride — the resolved funcs are self-contained (`call_indirect`/`cap.call` carry inline
+/// signatures, imports are already linked away), so no type/import/export section is needed, and
+/// `decode_module` + `verify_module` reconstruct them losslessly on thaw. Debug info is dropped
+/// (untrusted, backend-ignored). `encode_module` is canonical, so `decode`→`encode` round-trips
+/// byte-identically, which is what keeps the §12.6 re-serialize invariant a plain `==`.
+fn encode_jit_unit(funcs: &[Func], mem_log2: Option<u8>) -> Vec<u8> {
+    let m = Module {
+        funcs: funcs.to_vec(),
+        memory: mem_log2.map(|size_log2| Memory { size_log2 }),
+        ..Module::default()
+    };
+    svm_encode::encode_module(&m)
 }
 
 impl Default for Host {
@@ -15992,12 +16124,11 @@ impl Host {
                 Binding::Blocking(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::Blocking))
                 }
-                Binding::JitDomain(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::JitDomain))
-                }
-                Binding::JitCode { .. } => {
-                    return Err(self.non_durable(slot, NonDurableKind::JitCode))
-                }
+                // Slice 2 (DURABILITY.md §12.5): a guest-JIT domain/unit handle is now durable —
+                // its out-of-line unit state is captured alongside (`capture_durable_jit`) and
+                // rebuilt positionally on thaw, so the binding's index re-resolves.
+                Binding::JitDomain(idx) => DurableBinding::JitDomain { idx },
+                Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostProc))
                 }
@@ -16066,13 +16197,15 @@ impl Host {
                 | Binding::Memory
                 | Binding::Yielder
                 | Binding::AddressSpace { .. }
-                | Binding::Instantiator { .. } => continue,
+                | Binding::Instantiator { .. }
+                // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
+                // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
+                | Binding::JitDomain(_)
+                | Binding::JitCode { .. } => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
                 Binding::IoRing(_) => NonDurableKind::IoRing,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
-                Binding::JitDomain(_) => NonDurableKind::JitDomain,
-                Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
@@ -16129,9 +16262,82 @@ impl Host {
                     self.pending_live_impls.push((idx, slot as usize, export));
                     Binding::LiveImpl(idx)
                 }
+                // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
+                // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
+                DurableBinding::JitDomain { idx } => Binding::JitDomain(idx),
+                DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// Capture the §22 guest-JIT domains' out-of-line state for a snapshot (DURABILITY.md §12.5
+    /// Slice 2). Complements [`Self::capture_durable_handles`]: the handle table carries the
+    /// `JitDomain`/`JitCode` *bindings* (indices), and this carries the *state* those indices name —
+    /// each domain's memory-match precondition, compile quotas, and units (in index order, dead
+    /// units included so a live `JitCode`'s `unit` index stays valid). Every domain is captured
+    /// positionally (even one no live handle names, so a `JitCode` whose `JitDomain` was dropped
+    /// still resolves), which is what makes the restore's index re-pin exact. The native/wasm code
+    /// pointers and `native_ctx` are process-local and dropped — an interpreter thaw invokes the
+    /// restored funcs directly; a native re-compile is the Slice-3 follow-on.
+    pub fn capture_durable_jit(&self) -> Vec<DurableJitDomain> {
+        self.jit_domains
+            .iter()
+            .map(|d| DurableJitDomain {
+                mem_log2: d.mem_log2,
+                units_left: d.units_left,
+                bytes_left: d.bytes_left,
+                units: d
+                    .units
+                    .iter()
+                    .map(|u| DurableJitUnit {
+                        unit_ir: encode_jit_unit(&u.funcs, d.mem_log2),
+                        install_type_id: u.install_type_id,
+                    })
+                    .collect(),
+                installed: d.installed.clone(),
+            })
+            .collect()
+    }
+
+    /// Rebuild the §22 guest-JIT domains from a captured set (DURABILITY.md §12.5 Slice 2), the
+    /// counterpart of [`Self::capture_durable_jit`]. Each unit's `unit_ir` is decoded **and
+    /// re-verified** — the artifact is untrusted, so its funcs must clear the verifier again before
+    /// they can be invoked (the deserialization-boundary safety re-check, like the codec's
+    /// window-containment gate). Domains are rebuilt positionally, so the handle table's re-pinned
+    /// `JitDomain`/`JitCode` indices resolve. Native/wasm code pointers restore to `0` (an
+    /// interpreter run invokes the funcs directly; a native `invoke` of a not-yet-recompiled unit
+    /// fails closed — the Slice-3 boundary). Fail-closed: a bad unit reconstructs no domains.
+    pub fn restore_durable_jit(
+        &mut self,
+        domains: &[DurableJitDomain],
+    ) -> Result<(), JitRestoreError> {
+        let mut rebuilt = Vec::with_capacity(domains.len());
+        for d in domains {
+            let mut units = Vec::with_capacity(d.units.len());
+            for u in &d.units {
+                let m =
+                    svm_encode::decode_module(&u.unit_ir).map_err(|_| JitRestoreError::Decode)?;
+                svm_verify::verify_module(&m).map_err(|_| JitRestoreError::Verify)?;
+                units.push(JitUnit {
+                    funcs: Arc::from(m.funcs),
+                    native_code: 0,
+                    install_code: 0,
+                    install_type_id: u.install_type_id,
+                    wasm: None,
+                });
+            }
+            rebuilt.push(JitDomainState {
+                mem_log2: d.mem_log2,
+                units,
+                native_ctx: 0,
+                units_left: d.units_left,
+                bytes_left: d.bytes_left,
+                installed: d.installed.clone(),
+            });
+        }
+        self.jit_domains = rebuilt;
+        Ok(())
     }
 
     /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
@@ -17313,9 +17519,59 @@ impl Host {
             native_ctx: 0,
             units_left: JIT_DEFAULT_MAX_UNITS,
             bytes_left: JIT_DEFAULT_MAX_BLOB_BYTES,
+            installed: Vec::new(),
         });
         self.jit_table_log2 = self.jit_table_log2.max(table_log2);
         self.grant(cap_id::JIT, Binding::JitDomain(id))
+    }
+
+    /// Restore the `call_indirect` table reservation (DURABILITY.md §12.5 install-durability): the
+    /// thaw path re-establishes it from the artifact (a fresh host defaults to `0`, which would give
+    /// the thaw run's dispatch table no padding to re-apply the captured installs into). Monotone
+    /// like the grant path, so a restore that also re-grants never shrinks it.
+    pub fn set_jit_table_log2(&mut self, v: u8) {
+        self.jit_table_log2 = self.jit_table_log2.max(v);
+    }
+
+    /// Record a B2 `install`: `unit` now occupies `slot` in the run's dispatch table (DURABILITY.md
+    /// §12.5 install-durability). Kept on the domain so the occupancy survives the run (the table is
+    /// a per-run transient) and rides a snapshot. A repeat of the same slot replaces (the table slot
+    /// holds one unit); push order is preserved otherwise, so a re-apply reproduces dispatch.
+    pub fn jit_record_install(&mut self, domain: u32, slot: u32, unit: u32) {
+        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+            d.installed.retain(|&(s, _)| s != slot);
+            d.installed.push((slot, unit));
+        }
+    }
+
+    /// Forget a B2 `uninstall`: `slot` is cleared, so drop its occupancy record (DURABILITY.md §12.5).
+    pub fn jit_forget_install(&mut self, domain: u32, slot: u32) {
+        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+            d.installed.retain(|&(s, _)| s != slot);
+        }
+    }
+
+    /// This domain's B2 `install` occupancy — `(slot, unit)` in install order (DURABILITY.md §12.5).
+    /// The reconstruct-on-thaw embedder re-installs each into the fresh table (interp re-applies at
+    /// run start; the native tier via `svm_run::reconstruct_jit_units`).
+    pub fn jit_installs(&self, domain: u32) -> Vec<(u32, u32)> {
+        self.jit_domains
+            .get(domain as usize)
+            .map_or(Vec::new(), |d| d.installed.clone())
+    }
+
+    /// Every domain's install occupancy flattened to `(domain, slot, unit)` in domain-then-install
+    /// order — what the run entry re-applies to a freshly-built dispatch table so a restored install
+    /// survives a freeze/thaw (DURABILITY.md §12.5 install-durability). Empty for a fresh run (no
+    /// installs recorded), so re-apply is a no-op there.
+    fn jit_all_installs(&self) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        for (domain, d) in self.jit_domains.iter().enumerate() {
+            for &(slot, unit) in &d.installed {
+                out.push((domain as u32, slot, unit));
+            }
+        }
+        out
     }
 
     /// The `call_indirect` table reservation (`log2`) the run's root vCPU should build for B2
@@ -17573,6 +17829,12 @@ impl Host {
         self.jit_domains
             .get(domain as usize)
             .map_or(0, |d| d.units.len() as u32)
+    }
+
+    /// The number of granted `Jit` domains (append-only, indexed `0..count`). The reconstruct-on-thaw
+    /// embedder (DURABILITY.md §12.5 Slice 3) walks these to re-compile each restored domain's units.
+    pub fn jit_domain_count(&self) -> u32 {
+        self.jit_domains.len() as u32
     }
 
     /// The units of `domain` still reachable through a **live `CompiledCode` handle** (a
