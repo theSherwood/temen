@@ -1,11 +1,15 @@
-//! Slice A of the mutable-VM-state rename feature: **seed rename cells from the constant image**.
+//! The mutable-VM-state rename feature: **seed rename cells from the constant image** (slice A) and
+//! **write the live cells back on exit** (slice B).
 //!
-//! The plain `rename` region is zero-init scratch — an untouched renamed cell reads 0. That is wrong
-//! for a region that aliases *real* captured memory (a `lua_State`, a `CallInfo`): its fields must
-//! fold to their captured values, not zero, for the guards they drive to fold. With
-//! `rename_seed_from_image` the untouched cell instead reads its seed from the constant-memory sources
-//! (here a writable data segment declared constant via const_regions), while writes still shadow it. These tests pin both against the
-//! interpreter oracle, and confirm the region is still fully SSA-lifted (no residual load/store).
+//! The plain `rename` region is zero-init scratch — an untouched renamed cell reads 0, and writes are
+//! elided entirely. That is wrong for a region that aliases *real* captured memory (a `lua_State`, a
+//! `CallInfo`): its fields must fold to their captured values (not zero) for the guards they drive to
+//! fold, and any field the interpreter mutates must reach memory so a later reader (Lua's `poscall`)
+//! sees it. With `rename_seed_from_image` an untouched cell reads its seed from the constant-memory
+//! sources (here a writable data segment declared constant via `const_regions`) while writes shadow
+//! it, and every written cell is spilled back to the window before the residual returns. These tests
+//! pin all of it against the interpreter oracle — seeded reads, write-shadows-seed, and post-call
+//! memory — and check the residual keeps only the loads/stores it must.
 
 use svm_interp::{Trap, Value};
 use svm_ir::{Data, Module};
@@ -30,12 +34,19 @@ fn with_seed(mut m: Module, at: u64, val: i64) -> Module {
     m
 }
 
-fn has_mem_op(m: &Module) -> bool {
+fn count<F: Fn(&svm_ir::Inst) -> bool>(m: &Module, pred: F) -> usize {
     m.funcs
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, svm_ir::Inst::Load { .. } | svm_ir::Inst::Store { .. }))
+        .filter(|i| pred(i))
+        .count()
+}
+fn n_loads(m: &Module) -> usize {
+    count(m, |i| matches!(i, svm_ir::Inst::Load { .. }))
+}
+fn n_stores(m: &Module) -> usize {
+    count(m, |i| matches!(i, svm_ir::Inst::Store { .. }))
 }
 
 const SEED: i64 = 0x1234_5678;
@@ -68,9 +79,10 @@ block 0 (v0: i64) {
     };
     let residual = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
     verify_module(&residual).expect("residual verifies");
-    assert!(
-        !has_mem_op(&residual),
-        "the seeded cell should be SSA-lifted, leaving no residual load/store"
+    assert_eq!(
+        n_loads(&residual) + n_stores(&residual),
+        0,
+        "a read-only seeded cell is SSA-lifted, leaving no residual load/store (nothing to write back)"
     );
 
     for x in [0i64, 1, -9, 1000, i64::MAX - SEED] {
@@ -135,13 +147,96 @@ block 0 (v0: i64) {
     };
     let residual = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
     verify_module(&residual).expect("residual verifies");
-    assert!(
-        !has_mem_op(&residual),
-        "write+read of the cell should fully fold"
+    // The read folds (shadowed by the store) → no residual load. The store, into a live-backed
+    // region, is spilled once on exit (write-back, slice B) rather than elided.
+    assert_eq!(
+        n_loads(&residual),
+        0,
+        "the read should fold to the shadowing store's value"
+    );
+    assert_eq!(
+        n_stores(&residual),
+        1,
+        "the written live cell is written back once on exit"
     );
 
     for x in [0i64, 3, -1, 12345] {
         assert_eq!(run(&residual, x), run(&m, x), "diverged at x={x}");
         assert_eq!(run(&residual, x), Ok(vec![Value::I64(x.wrapping_add(999))]));
     }
+}
+
+#[test]
+fn write_back_makes_post_call_memory_correct() {
+    // f(x) = { *S = x; return 7 }. The write into the live-backed region must reach the window so a
+    // caller reading S afterward sees x — the property Lua's `poscall` needs (it reads L->top and the
+    // return registers luaV_execute leaves behind). We observe it via the captured final window.
+    let src = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 128
+  i64.store va v0
+  vc = i64.const 7
+  return vc
+}
+}
+";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("source verifies");
+    let cfg = SpecConfig {
+        rename: Some((AT, AT + 8)),
+        rename_is_private: true,
+        rename_seed_from_image: true,
+        ..SpecConfig::default()
+    };
+    let residual = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&residual).expect("residual verifies");
+    assert_eq!(
+        n_stores(&residual),
+        1,
+        "the write must be spilled back to the window"
+    );
+
+    let init = vec![0u8; (AT + 8) as usize];
+    for x in [1i64, -5, 0x0BAD_F00D, i64::MIN] {
+        let mut f1 = 1_000_000u64;
+        let (r_ref, w_ref) = svm_interp::run_capture(&m, 0, &[Value::I64(x)], &mut f1, &init);
+        let mut f2 = 1_000_000u64;
+        let (r_res, w_res) =
+            svm_interp::run_capture(&residual, 0, &[Value::I64(x)], &mut f2, &init);
+        assert_eq!(r_res, r_ref, "result diverged at x={x}");
+        assert_eq!(w_res, w_ref, "post-call window diverged at x={x}");
+        assert_eq!(
+            &w_res[AT as usize..AT as usize + 8],
+            &x.to_le_bytes(),
+            "the written value must be visible in memory after the call (x={x})"
+        );
+    }
+
+    // Contrast: plain scratch rename (no seed/write-back) elides the store, so the window stays at
+    // its pre-call bytes — stale, diverging from the interpreter. This is what write-back fixes.
+    let scratch = specialize_with_config(
+        &m,
+        0,
+        &[SpecArg::Dynamic],
+        &SpecConfig {
+            rename: Some((AT, AT + 8)),
+            rename_is_private: true,
+            ..SpecConfig::default()
+        },
+    )
+    .expect("specializes");
+    assert_eq!(
+        n_stores(&scratch),
+        0,
+        "scratch rename elides the store (no write-back)"
+    );
+    let mut f = 1_000_000u64;
+    let (_, w_scratch) = svm_interp::run_capture(&scratch, 0, &[Value::I64(42)], &mut f, &init);
+    assert_eq!(
+        &w_scratch[AT as usize..AT as usize + 8],
+        &[0u8; 8],
+        "without write-back the window keeps its stale pre-call bytes"
+    );
 }

@@ -1856,6 +1856,16 @@ impl Spec<'_> {
     ) -> Result<Terminator, SpecError> {
         Ok(match outer.pop() {
             None => {
+                // Write-back: a live-backed rename region (`rename_seed_from_image`) aliases real,
+                // persistent memory, so before the residual's true exit spill every written cell to
+                // the window — otherwise the caller (e.g. Lua's `poscall` reading `L->top` and the
+                // return registers) would see stale pre-call bytes. Only at the entry's exit
+                // (`!thread_cells`); outlined callees thread their cells out as results instead, and
+                // those flow back into this `mem` before the entry returns. Untouched (seed-only)
+                // cells never entered `mem`, so their memory already holds the correct seed.
+                if self.config.rename_seed_from_image && !self.thread_cells {
+                    self.write_back_cells(mem, out, rnext)?;
+                }
                 let mut vals: Vec<u32> = results
                     .iter()
                     .map(|&a| materialize(a, out, rnext))
@@ -1879,6 +1889,31 @@ impl Spec<'_> {
                 Terminator::Br { target, args }
             }
         })
+    }
+
+    /// Spill the live abstract cells to the window as residual stores (write-back for a live-backed
+    /// rename region). Each written cell `(eff, width, val)` becomes `store.<width> eff, val`; a width
+    /// with no natural store op fails closed. Emitted in address order for a deterministic residual.
+    fn write_back_cells(
+        &self,
+        mem: &BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<(), SpecError> {
+        for (&eff, &(width, val)) in mem.iter() {
+            let op = writeback_store_op(width).ok_or(SpecError::Unsupported)?;
+            out.push(Inst::ConstI64(eff as i64));
+            let addr = bump(rnext);
+            let value = materialize(val, out, rnext);
+            out.push(Inst::Store {
+                op,
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        }
+        Ok(())
     }
 
     /// Resolve one outgoing edge into a residual block id + dynamic arguments. The successor inherits
@@ -2104,6 +2139,20 @@ fn is_full_natural_store(op: StoreOp, width: u64) -> bool {
 /// back as the identity, so a dynamic cell may be returned directly.
 fn is_full_natural_load(op: LoadOp, width: u64) -> bool {
     matches!((op, width), (LoadOp::I32, 4) | (LoadOp::I64, 8))
+}
+
+/// The store op that spills a renamed cell of `width` bytes back to the window (write-back). The op's
+/// value type matches the cell's canonical type (`i32` for width < 8, `i64` for 8 — see
+/// [`cell_const`]/[`cell_type`]): a width-8 cell holds an `i64`, everything narrower an `i32`, so the
+/// low `width` bytes of that value are the cell's content. Returns `None` for an unsupported width.
+fn writeback_store_op(width: u32) -> Option<StoreOp> {
+    Some(match width {
+        1 => StoreOp::I32_8,
+        2 => StoreOp::I32_16,
+        4 => StoreOp::I32,
+        8 => StoreOp::I64,
+        _ => return None,
+    })
 }
 
 /// Apply load `op`'s width + sign/zero extension to the assembled little-endian content `raw`,
