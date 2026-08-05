@@ -48,7 +48,7 @@ fn analyze_guest(path: &str) {
         .filter(|&i| a.in_subset[i])
         .map(|i| (i, func_insts(&m, i), has_loop(&m, i)))
         .collect();
-    sizes.sort_by(|x, y| y.1.cmp(&x.1)); // largest first
+    sizes.sort_by_key(|&(_, s, _)| std::cmp::Reverse(s)); // largest first
 
     let emitted = sizes.len();
     let total_insts: usize = sizes.iter().map(|(_, s, _)| s).sum();
@@ -63,11 +63,7 @@ fn analyze_guest(path: &str) {
     println!(
         "  emitted code: {} IR insts across {emitted} funcs · {loop_funcs} carry a loop ({}%)",
         total_insts,
-        if emitted > 0 {
-            100 * loop_funcs / emitted
-        } else {
-            0
-        }
+        (100 * loop_funcs).checked_div(emitted).unwrap_or(0)
     );
     // Concentration: what fraction of emitted code is the top-K biggest functions?
     let cum = |k: usize| -> f64 {
