@@ -217,6 +217,25 @@ pub struct Translated {
     /// programs against it). Synthesized helpers (`_start`, `memset`, `malloc`, …) carry no source
     /// name and are not exported.
     pub exports: Vec<(String, u32)>,
+    /// **Global-variable symbols**: each source global's name → its window address, byte size, and
+    /// read-only flag. A `@global` reference in the IR is baked to its window address (there is no
+    /// runtime symbol table), so a *caller* — e.g. `svm-peval` renaming a mutable VM-state global like
+    /// an interpreter's `savedpc` — needs this map to find where a named global lives in the window.
+    /// In source declaration order (writable/BSS first, then read-only), matching the layout.
+    pub data_symbols: Vec<DataSymbol>,
+}
+
+/// One translated global variable's window placement — see [`Translated::data_symbols`].
+#[derive(Debug, Clone)]
+pub struct DataSymbol {
+    /// The source global's name (the LLVM `@name`).
+    pub name: String,
+    /// Its window address (the value a `@name` reference is baked to).
+    pub addr: u64,
+    /// Its byte size (from the serialized initializer, or the declared type size for a BSS/extern global).
+    pub size: u64,
+    /// Whether it is a read-only (`const`) global — its data segment is page-protected (D40).
+    pub readonly: bool,
 }
 
 /// Opt-in translation knobs. The default is the strict, fail-closed on-ramp — every entry point that
@@ -671,7 +690,7 @@ fn translate_impl(
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { stack_page } else { DATA_BASE };
-    let (globals, mut data, mut globals_end, cstrs, gbytes) =
+    let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols) =
         globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
     // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
@@ -1189,6 +1208,7 @@ fn translate_impl(
             .enumerate()
             .map(|(i, f)| (f.name.clone(), base + i as u32))
             .collect(),
+        data_symbols,
     })
 }
 
@@ -1541,6 +1561,7 @@ type Globals = (
     u64,
     HashMap<String, u64>,
     HashMap<String, Vec<u8>>,
+    Vec<DataSymbol>,
 );
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
@@ -1566,40 +1587,52 @@ fn globals_layout(
     let mut addr = HashMap::new();
     let mut off = base;
     let mut placed: Vec<(usize, u64)> = Vec::with_capacity(m.global_vars.len());
-    let mut place =
-        |off: &mut u64, addr: &mut HashMap<String, u64>, want_const: bool| -> Result<(), Error> {
-            for (gi, g) in m.global_vars.iter().enumerate() {
-                if g.is_constant != want_const {
-                    continue;
-                }
-                // LLVM-reserved globals (`llvm.global_ctors`/`global_dtors`/`used`/`compiler.used`)
-                // are metadata, never real window data — they are handled out of band (the ctors run
-                // in `_start`, the rest are dropped), so never lay them out / serialize them.
-                if name_str(&g.name).starts_with("llvm.") {
-                    continue;
-                }
-                // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
-                // globals have no initializer, so fall back to the declared type size.
-                let size = match &g.initializer {
-                    Some(init) => const_size(init.as_ref(), &m.types)?,
-                    None => type_size(g.ty.as_ref(), &m.types)?,
-                }
-                .max(1);
-                let align = (g.alignment as u64).max(1);
-                *off = off.div_ceil(align) * align;
-                addr.insert(name_str(&g.name), *off);
-                placed.push((gi, *off));
-                *off += size;
+    // Name → (addr, size, readonly) for every laid-out global, exposed as `Translated::data_symbols`
+    // so a caller can locate a named global in the window (there is no runtime symbol table).
+    let mut syms: Vec<DataSymbol> = Vec::with_capacity(m.global_vars.len());
+    let mut place = |off: &mut u64,
+                     addr: &mut HashMap<String, u64>,
+                     syms: &mut Vec<DataSymbol>,
+                     want_const: bool|
+     -> Result<(), Error> {
+        for (gi, g) in m.global_vars.iter().enumerate() {
+            if g.is_constant != want_const {
+                continue;
             }
-            Ok(())
-        };
-    place(&mut off, &mut addr, false)?; // writable + BSS globals
+            // LLVM-reserved globals (`llvm.global_ctors`/`global_dtors`/`used`/`compiler.used`)
+            // are metadata, never real window data — they are handled out of band (the ctors run
+            // in `_start`, the rest are dropped), so never lay them out / serialize them.
+            if name_str(&g.name).starts_with("llvm.") {
+                continue;
+            }
+            // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
+            // globals have no initializer, so fall back to the declared type size.
+            let size = match &g.initializer {
+                Some(init) => const_size(init.as_ref(), &m.types)?,
+                None => type_size(g.ty.as_ref(), &m.types)?,
+            }
+            .max(1);
+            let align = (g.alignment as u64).max(1);
+            *off = off.div_ceil(align) * align;
+            addr.insert(name_str(&g.name), *off);
+            placed.push((gi, *off));
+            syms.push(DataSymbol {
+                name: name_str(&g.name),
+                addr: *off,
+                size,
+                readonly: want_const,
+            });
+            *off += size;
+        }
+        Ok(())
+    };
+    place(&mut off, &mut addr, &mut syms, false)?; // writable + BSS globals
     let any_const = m.global_vars.iter().any(|g| g.is_constant);
     if any_const && off > base {
         off = off.div_ceil(stack_page) * stack_page; // page-isolate the read-only region
     }
-    place(&mut off, &mut addr, true)?; // read-only (constant) globals
-                                       // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
+    place(&mut off, &mut addr, &mut syms, true)?; // read-only (constant) globals
+                                                  // Phase B: serialize each initialized global (now able to resolve relocations via `addr`).
     let mut segs = Vec::new();
     let mut cstrs = HashMap::new();
     let mut gbytes = HashMap::new();
@@ -1633,7 +1666,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off, cstrs, gbytes))
+    Ok((addr, segs, off, cstrs, gbytes, syms))
 }
 
 /// The pointer-cell window addresses the synthesized glibc ctype locators return (`None` = the program
