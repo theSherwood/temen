@@ -99,6 +99,18 @@ use svm_verify::func_value_types;
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
 
+/// Diagnostic: name the op/context that forced a [`SpecError::Unsupported`]. A no-op unless the
+/// `trace` feature is on (which pulls in `std` for `eprintln`), so it never touches the `no_std`
+/// build. Used to find the first blocker when specializing a large real function (e.g. `luaV_execute`).
+#[cfg(feature = "trace")]
+macro_rules! trace_unsup {
+    ($($t:tt)*) => {{ extern crate std; std::eprintln!($($t)*); }};
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_unsup {
+    ($($t:tt)*) => {{}};
+}
+
 /// How one parameter of the function being specialized is bound.
 #[derive(Clone, Copy, Debug)]
 pub enum SpecArg {
@@ -933,7 +945,17 @@ impl Spec<'_> {
             Inst::CallIndirect { ty, idx, args } => {
                 let callee = self
                     .resolve_indirect(ty, env[*idx as usize])
-                    .ok_or(SpecError::Unsupported)?;
+                    .ok_or_else(|| {
+                        trace_unsup!(
+                            "call_indirect unresolved ty={:?} idx_const={:?}",
+                            ty,
+                            match env[*idx as usize] {
+                                Abs::Const(k) => Some(k.as_i32()),
+                                Abs::Dyn(_) => None,
+                            }
+                        );
+                        SpecError::Unsupported
+                    })?;
                 Some((callee, args.iter().map(|&a| env[a as usize]).collect()))
             }
             _ => None,
@@ -1229,6 +1251,12 @@ impl Spec<'_> {
                 offset,
                 align,
             } => return self.eval_store(op, addr, value, offset, align, env, mem, out, rnext),
+            Inst::MemCopy { dst, src, len } => {
+                return self.eval_mem_copy(dst, src, len, env, mem, out, rnext)
+            }
+            Inst::MemFill { dst, val, len } => {
+                return self.eval_mem_fill(dst, val, len, env, mem, out, rnext)
+            }
 
             // Any other pure, single-result value op. A scalar **float** or **v128 (SIMD)** op with
             // all-constant operands folds (bit-for-bit the interpreter; a `FToITrap` that would trap
@@ -1242,8 +1270,10 @@ impl Spec<'_> {
                 if let Some(k) = fold {
                     return Ok(Some(Abs::Const(k)));
                 }
-                let abs =
-                    emit_residual_pure(inst, env, out, rnext).ok_or(SpecError::Unsupported)?;
+                let abs = emit_residual_pure(inst, env, out, rnext).ok_or_else(|| {
+                    trace_unsup!("eval_inst fallthrough: {:?}", inst);
+                    SpecError::Unsupported
+                })?;
                 return Ok(Some(abs));
             }
         };
@@ -1271,6 +1301,7 @@ impl Spec<'_> {
                 // The renameable region must be resolved entirely abstractly. Only integer loads
                 // can be (the abstract domain tracks integer cells); a float load into it can't.
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
+                    trace_unsup!("load: non-integer into rename region op={:?}", op);
                     return Err(SpecError::Unsupported);
                 }
                 // An exact cell — same address *and* width — resolves directly. A constant cell's
@@ -1285,7 +1316,14 @@ impl Spec<'_> {
                                 Abs::Const(extend_loaded(raw, op).ok_or(SpecError::Unsupported)?)
                             }
                             Abs::Dyn(i) if is_full_natural_load(op, width) => Abs::Dyn(i),
-                            Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                            Abs::Dyn(_) => {
+                                trace_unsup!(
+                                    "load: narrow dynamic cell eff={:#x} op={:?}",
+                                    eff,
+                                    op
+                                );
+                                return Err(SpecError::Unsupported);
+                            }
                         }));
                     }
                 }
@@ -1295,6 +1333,11 @@ impl Spec<'_> {
                     .iter()
                     .any(|(&b, &(wc, _))| b < eff + width && eff < b + wc as u64)
                 {
+                    trace_unsup!(
+                        "load: straddling/overlap in rename region eff={:#x} w={}",
+                        eff,
+                        width
+                    );
                     return Err(SpecError::Unsupported);
                 }
                 // Untouched region cell ⇒ the zero-initialized backing, extended per the load.
@@ -1351,6 +1394,7 @@ impl Spec<'_> {
             if within_region(self.config.rename, eff, width) {
                 // Only integer stores can be renamed (the abstract domain tracks integer cells).
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
+                    trace_unsup!("store: non-integer into rename region op={:?}", op);
                     return Err(SpecError::Unsupported);
                 }
                 let cell = match env[value as usize] {
@@ -1361,7 +1405,10 @@ impl Spec<'_> {
                     // loading it back at that width is the identity. A *narrow* dynamic store would
                     // need residual masking to read back soundly, so refuse it instead.
                     Abs::Dyn(i) if is_full_natural_store(op, width) => Abs::Dyn(i),
-                    Abs::Dyn(_) => return Err(SpecError::Unsupported),
+                    Abs::Dyn(_) => {
+                        trace_unsup!("store: narrow dynamic cell eff={:#x} op={:?}", eff, op);
+                        return Err(SpecError::Unsupported);
+                    }
                 };
                 // Invalidate any overlapping cell, then record this one. No residual store.
                 mem.retain(|&b, &mut (wc, _)| !(b < eff + width && eff < b + wc as u64));
@@ -1397,6 +1444,142 @@ impl Spec<'_> {
             align,
         });
         Ok(None)
+    }
+
+    /// A `memory.copy` of a **constant** length between **constant** addresses. When source and
+    /// destination both lie fully inside the renameable region, model it as an abstract **cell copy**
+    /// — Lua's 16-byte `TValue` struct moves (`MOVE`, loop-control) lower to `llvm.memcpy`, so this is
+    /// the hinge that lets `luaV_execute` fold. Every source cell is shifted to the destination and
+    /// the rest of the destination span is invalidated, so untouched bytes read back as the region's
+    /// zero-init — matching a real copy of the source's uninitialized bytes. Both-disjoint copies are
+    /// emitted residually; a dynamic length/address is residual only when the region is private (else
+    /// it could alias renamed cells and is refused).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_mem_copy(
+        &self,
+        dst: u32,
+        src: u32,
+        len: u32,
+        env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let consts = match (env[dst as usize], env[src as usize], env[len as usize]) {
+            (Abs::Const(Known::I64(d)), Abs::Const(Known::I64(s)), Abs::Const(Known::I64(l))) => {
+                Some((d as u64, s as u64, l as u64))
+            }
+            _ => None,
+        };
+        let emit_residual = |out: &mut Vec<Inst>, rnext: &mut u32| {
+            let dst = materialize(env[dst as usize], out, rnext);
+            let src = materialize(env[src as usize], out, rnext);
+            let len = materialize(env[len as usize], out, rnext);
+            out.push(Inst::MemCopy { dst, src, len });
+        };
+        let (da, sa, ln) = match consts {
+            Some(t) => t,
+            None => {
+                // A dynamic span might alias the renamed region unless the caller promised it private.
+                if self.config.rename.is_some() && !self.config.rename_is_private {
+                    trace_unsup!("mem_copy: dynamic span with a non-private rename region");
+                    return Err(SpecError::Unsupported);
+                }
+                emit_residual(out, rnext);
+                return Ok(None);
+            }
+        };
+        if ln == 0 {
+            return Ok(None);
+        }
+        let region = self.config.rename;
+        if within_region(region, da, ln) && within_region(region, sa, ln) {
+            // A source cell straddling the span boundary can't be split abstractly.
+            if mem.iter().any(|(&a, &(w, _))| {
+                a < sa + ln && sa < a + w as u64 && !(a >= sa && a + w as u64 <= sa + ln)
+            }) {
+                trace_unsup!("mem_copy: a source cell straddles the span");
+                return Err(SpecError::Unsupported);
+            }
+            let moved: Vec<(u64, u32, Abs)> = mem
+                .iter()
+                .filter(|(&a, &(w, _))| a >= sa && a + w as u64 <= sa + ln)
+                .map(|(&a, &(w, v))| (da + (a - sa), w, v))
+                .collect();
+            mem.retain(|&a, &mut (w, _)| !(a < da + ln && da < a + w as u64));
+            for (a, w, v) in moved {
+                mem.insert(a, (w, v));
+            }
+            return Ok(None);
+        }
+        if disjoint_from_region(region, da, ln) && disjoint_from_region(region, sa, ln) {
+            emit_residual(out, rnext);
+            return Ok(None);
+        }
+        trace_unsup!(
+            "mem_copy: mixed/straddle da={:#x} sa={:#x} len={}",
+            da,
+            sa,
+            ln
+        );
+        Err(SpecError::Unsupported)
+    }
+
+    /// A `memory.fill` of a **constant** length. A **zero** fill inside the renameable region simply
+    /// invalidates the span (untouched cells read back as the zero-init); a fill disjoint from the
+    /// region is residual. Other cases (non-zero fill into the region, straddle) are not modeled yet.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_mem_fill(
+        &self,
+        dst: u32,
+        val: u32,
+        len: u32,
+        env: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Option<Abs>, SpecError> {
+        let consts = match (env[dst as usize], env[val as usize], env[len as usize]) {
+            (Abs::Const(Known::I64(d)), Abs::Const(v), Abs::Const(Known::I64(l))) => {
+                Some((d as u64, v.as_i32().unwrap_or(1), l as u64))
+            }
+            _ => None,
+        };
+        let emit_residual = |out: &mut Vec<Inst>, rnext: &mut u32| {
+            let dst = materialize(env[dst as usize], out, rnext);
+            let val = materialize(env[val as usize], out, rnext);
+            let len = materialize(env[len as usize], out, rnext);
+            out.push(Inst::MemFill { dst, val, len });
+        };
+        let (da, byte, ln) = match consts {
+            Some(t) => t,
+            None => {
+                if self.config.rename.is_some() && !self.config.rename_is_private {
+                    trace_unsup!("mem_fill: dynamic span with a non-private rename region");
+                    return Err(SpecError::Unsupported);
+                }
+                emit_residual(out, rnext);
+                return Ok(None);
+            }
+        };
+        if ln == 0 {
+            return Ok(None);
+        }
+        let region = self.config.rename;
+        if within_region(region, da, ln) {
+            if byte != 0 {
+                trace_unsup!("mem_fill: non-zero fill into the rename region byte={byte}");
+                return Err(SpecError::Unsupported);
+            }
+            mem.retain(|&a, &mut (w, _)| !(a < da + ln && da < a + w as u64));
+            return Ok(None);
+        }
+        if disjoint_from_region(region, da, ln) {
+            emit_residual(out, rnext);
+            return Ok(None);
+        }
+        trace_unsup!("mem_fill: straddle da={:#x} len={}", da, ln);
+        Err(SpecError::Unsupported)
     }
 
     /// Evaluate the active frame's terminator, given the suspended caller frames (`outer`) and the

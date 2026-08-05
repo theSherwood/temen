@@ -326,6 +326,21 @@ svm-interp` + `fmt` + `clippy` green. Interp-only, like every fork test. This re
 family, including the `pid_mode` `-EAGAIN`/`-ECHILD` face and the §8.6 serve-race note recorded above —
 the standing mitigation (guest-side retry) is now baked into the fixtures themselves.
 
+**Sighting 2026-08-05 — the fix's blind spot: `crates/svm/tests/fork_manager.rs`** (CI, `build ·
+test · fmt · clippy` on PR #607, run 30988982256 — a **peval-only** diff touching `svm-peval` /
+`svm-run` / `svm-llvm` tests, nothing in the svc/fork path). `a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs`
+got `left: [I64(-11)]` vs `right: [I64(3)]` — the same `-EAGAIN` fork-park face, now on the
+manager-topology **real-libc** test. This is exactly the gap the 2026-08-04 fix left open: that
+rewrite baked the guest-side retry into the `svm-interp` fixtures only, but `fork_manager` lives in
+the **`svm`** crate and its hand-written-IR guest (func 3) calls `fork()` **one-shot**
+(`vr = cap.call 268435456 0 … vfork (varg)`, no `while (vr < 0)` loop), so it still flakes directly
+under CI load. An earlier note (Sighting 2026-07-31 #2) wrongly generalized "the manager-topology
+fork tests do **not** flake" — true for the *teardown-drain* face (a `join`ing manager drains the
+twin) but **not** for the fork-park `-EAGAIN` face, which fires at the `fork()` call itself before any
+twin exists. **Fix (deferred — not in this peval PR):** give func 3's guest the same `-EAGAIN` retry
+loop the I53 rewrite gave the interp fixtures; deterministic-safe because failed forks never consume a
+task id, so the winning fork still mints twin id 3. Unrelated to the diff; reran the job to unblock.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and

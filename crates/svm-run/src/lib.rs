@@ -4958,6 +4958,20 @@ impl Instance {
     /// slot bindings: the name-bound registry (import order, slot i ↔ import i) when present, else
     /// the fixed §3e powerbox. The entry takes no positional args (IMPORTS.md phase 4 — the slot
     /// binding IS the capability delivery).
+    /// Attach an [`svm_interp::Inspector`] (the debug engine) to this instance's powerbox `_start`,
+    /// with a full powerbox host (`stdin`, the eight §3e caps, and — for a manifest module — its
+    /// import slots bound), so a caller can breakpoint / single-step / capture a real capability-using
+    /// program on the interpreter. This is the debug counterpart of [`Instance::run`]; it reuses the
+    /// same [`grant_caps`](Instance::grant_caps) setup so cap dispatch, `cap.self`, and manifest slot
+    /// binding all behave identically. Tooling entry point (e.g. the Lua Futamura capture harness).
+    pub fn debug_attach(&self, stdin: Vec<u8>, fuel: u64) -> svm_interp::Inspector {
+        let win = self.module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let mut host = Host::new();
+        host.stdin = stdin;
+        self.grant_caps(&mut host, win);
+        svm_interp::Inspector::attach_with_host(&self.module, 0, &[], fuel, host)
+    }
+
     fn grant_caps(&self, h: &mut Host, win: u64) {
         // §3.5: register the module's self-referential surface so `call.import.dyn`,
         // `cap.self.type_id`/`covers`, and `export.handle` resolve host-side.

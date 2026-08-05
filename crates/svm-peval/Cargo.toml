@@ -18,6 +18,10 @@ default = ["libm-floats"]
 # Forwarded to `svm-opt`, which owns the float-fold machinery. The in-svm svm-IR build turns this off
 # (`default-features = false`) so libm's untranslatable `fma` (x86 inline-asm + i128) is dropped.
 libm-floats = ["svm-opt/libm-floats"]
+# `trace` (dev/diagnostic only) prints the op that forced a `SpecError::Unsupported` to stderr, to
+# find the first blocker when specializing a large real function. Pulls in `std` — never enable it
+# for the in-svm (`no_std`) build; it exists for host-side spikes (e.g. the Lua Futamura harness).
+trace = []
 
 [dependencies]
 # The IR definition this pass transforms.
@@ -39,3 +43,5 @@ svm-interp.workspace = true
 # compile it to native code — the "ship a specialized artifact" path.
 svm-encode.workspace = true
 svm-jit.workspace = true
+# The dispatch-ROI harness (tests/lua_dispatch_roi.rs) writes its bytecode-VM skeleton in textual IR.
+svm-text.workspace = true
