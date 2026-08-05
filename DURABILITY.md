@@ -202,9 +202,26 @@ the thaw run builds its table (interp `DomainTable::install_at` at run entry; na
 `CompiledCode` handle was released). So a `call_indirect` through an installed slot resolves after a
 freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_freeze_thaw`(`_native`)
 (install → freeze → restore → `call_indirect` ≡ 42, both backends) and
-`jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize). *Remaining
-durability follow-on:* freezing an **in-flight `invoke`/dispatch continuation** (freeze is currently a
-quiescent point). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+`jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize).
+
+**In-flight guest-JIT continuations freeze via `install` + `call_indirect` (the design's freezable
+path).** `Jit.invoke` is a **seam-free atomic leaf** by design (DESIGN.md §22 / CONSOLIDATION.md §11 —
+the nested run refuses anything but a plain return, the fuzzed hinge), so it is *never interrupted
+mid-flight*: a freeze lands at the parent's poll after the invoke returns (a bounded invoke completes;
+an unbounded one is fuel-bounded, not a hang). The **freezable** way to run suspendable guest-JIT code
+is `install` + `call_indirect`, which executes the installed unit in the **caller's own durable
+frames** — so a continuation suspended *inside* an installed (instrumented) unit rides the caller's
+per-context shadow stack (SP-based, so it composes across the `call_indirect` into the unit's own
+module frame with no offset collision) and freezes/thaws with it. On thaw the caller's
+`PropagatedIndirect` site re-issues the `call_indirect` (R8) and the install slot survived
+(install-durability), so it re-selects the unit, which rewinds. Pinned by
+`durable_guest_jit.rs::durable_jit_install_call_indirect_freezes_in_flight_continuation` (freeze
+UNWINDING mid-`call_indirect` inside an installed Clock-suspending unit → thaw reloads the saved clock,
+≡ the uninterrupted run). *Soundness note (follow-on):* the `call_indirect` taint is **by signature**
+(§6, R8) — a program that `call_indirect`s an installed unit whose signature no program function shares
+would under-instrument the site; widening the taint to treat *every* `call_indirect` as may-suspend
+once a `Jit` cap is granted (the run-time-installable-targets case) is the remaining hardening.
+The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).

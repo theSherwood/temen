@@ -18,8 +18,15 @@
 //! **Install-durability** (`durable_jit_install_slot_survives_freeze_thaw`(`_native`)): a unit's B2
 //! `install` occupancy rides the artifact (Section 5 / v17) and is re-applied on thaw, so a
 //! `call_indirect` through an installed slot resolves after a freeze/thaw on both backends.
+//!
+//! **In-flight continuation** (`durable_jit_install_call_indirect_freezes_in_flight_continuation`):
+//! `invoke` is a seam-free atomic leaf (never interrupted mid-flight), so the freezable path for
+//! suspendable unit code is `install` + `call_indirect` — the unit runs in the caller's durable
+//! frames, so a continuation suspended inside it freezes/thaws with the caller's shadow stack.
 
-use svm_durable::{init_durable_window, transform_module, write_state, STATE_NORMAL};
+use svm_durable::{
+    begin_thaw, init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
+};
 use svm_encode::encode_module;
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_jit::JitOutcome;
@@ -450,4 +457,140 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         ),
         other => panic!("expected Returned(42), got {other:?}"),
     }
+}
+
+/// **In-flight continuation across a freeze — the design's freezable path.** `Jit.invoke` is a
+/// *seam-free atomic leaf* by design (DESIGN.md §22 / CONSOLIDATION.md §11 — anything but a plain
+/// return is a CapFault, the fuzzed hinge), so it is never interrupted mid-flight: a freeze lands at
+/// the parent's poll *after* the invoke returns. The **freezable** way to run suspendable guest-JIT
+/// code is `install` + `call_indirect`, which executes the installed unit in the **caller's own
+/// durable frames** — so an in-flight continuation *inside* an installed unit rides the caller's
+/// shadow stack like any other frame and freezes/thaws with it.
+///
+/// This pins that end-to-end: an instrumented program installs an instrumented unit whose entry
+/// suspends on a `cap.call` (Clock), then a run that `call_indirect`s the unit **under UNWINDING**
+/// freezes the continuation *inside* the unit. After restore + REWINDING the caller re-issues the
+/// `call_indirect` (the install slot survived — install-durability) and the unit rewinds, **reloading
+/// the saved clock (42) rather than re-issuing it (0)** → 142, matching an uninterrupted run.
+#[test]
+fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
+    // The submitted unit: `(clk) -> i64` = Clock.now + 100 — a `cap.call` suspend point.
+    let unit = blob(
+        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+         v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  \
+         v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+    );
+    // The program: func 0 = installer (compile+install → slot); func 1 = caller (call_indirect the
+    // slot, passing the Clock handle); func 2 = a `(i32)->(i64)` may-suspend function so the taint
+    // analysis marks the caller's `call_indirect` of that signature may-suspend (PropagatedIndirect),
+    // the fork-critical case — else the site would be under-instrumented and the freeze miss it.
+    let m_src = "memory 17\n\
+        func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
+          v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+          v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
+        func (i32, i32) -> (i64) {\nblock 0 (v0: i32, v1: i32) {\n  \
+          v2 = call_indirect (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n\
+        func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+          v1 = i32.const 0\n  v2 = cap.call 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
+    let m = parse_module(m_src).expect("parse program");
+    verify_module(&m).expect("verify program");
+    let inst = transform_module(&m).expect("program in transform scope");
+    verify_module(&inst).expect("instrumented program verifies");
+
+    // Install the unit once (NORMAL), so the occupancy is recorded on the domain (it persists across
+    // runs and rides the freeze). Grant Clock (durable) + a durable JIT domain with table room.
+    let install = |h: &mut Host, jd: i32| -> i32 {
+        let mut w = init_durable_window(WINDOW);
+        write_state(&mut w, STATE_NORMAL);
+        w[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+        let mut fuel = 5_000_000u64;
+        let (r, _) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[
+                Value::I32(jd),
+                Value::I64(BLOB_OFF as i64),
+                Value::I64(unit.len() as i64),
+            ],
+            &mut fuel,
+            &w,
+            SIZE_LOG2,
+            h,
+        );
+        match r.expect("install ok").as_slice() {
+            [Value::I64(s)] if *s >= 0 => *s as i32,
+            other => panic!("install returned {other:?}"),
+        }
+    };
+
+    // --- Baseline: install, then a NORMAL call_indirect into the unit → Clock(42) + 100 = 142.
+    let mut hb = Host::new();
+    hb.clock_ns = 42;
+    let clk_b = hb.grant_clock();
+    let jd_b = grant_jit_durable(&mut hb, &m, TABLE_LOG2);
+    let slot_b = install(&mut hb, jd_b);
+    let mut wb = init_durable_window(WINDOW);
+    write_state(&mut wb, STATE_NORMAL);
+    let mut fuel = 5_000_000u64;
+    let (rb, _) = run_capture_reserved_with_host(
+        &inst,
+        1,
+        &[Value::I32(slot_b), Value::I32(clk_b)],
+        &mut fuel,
+        &wb,
+        SIZE_LOG2,
+        &mut hb,
+    );
+    assert_eq!(
+        rb.expect("baseline ok"),
+        vec![Value::I64(142)],
+        "uninterrupted: Clock(42) + 100"
+    );
+
+    // --- Freeze run: install, then call_indirect the unit UNDER UNWINDING. The unit's `cap.call`
+    // unwinds the continuation into the shadow stack (inside the installed unit's frame).
+    let mut hf = Host::new();
+    hf.clock_ns = 42;
+    let clk = hf.grant_clock();
+    let jd = grant_jit_durable(&mut hf, &m, TABLE_LOG2);
+    let slot = install(&mut hf, jd);
+    assert_eq!(slot, slot_b, "install is deterministic across hosts");
+    let mut wf = init_durable_window(WINDOW);
+    write_state(&mut wf, STATE_UNWINDING);
+    let mut fuel = 5_000_000u64;
+    let (rf, snap) = run_capture_reserved_with_host(
+        &inst,
+        1,
+        &[Value::I32(slot), Value::I32(clk)],
+        &mut fuel,
+        &wf,
+        SIZE_LOG2,
+        &mut hf,
+    );
+    assert!(rf.is_ok(), "freeze returns a placeholder: {rf:?}");
+
+    // Serialize + restore into a fresh host (Clock now 0 — a re-issue would give 100, not 142).
+    let artifact = freeze(&inst, &snap, &hf).expect("freeze");
+    let mut th = Host::new();
+    th.clock_ns = 0;
+    let mut window = restore(&artifact, &inst, &mut th).expect("restore");
+
+    // Thaw: REWINDING → the caller re-issues the call_indirect (install slot survived), the unit
+    // rewinds and reloads the saved clock (42), not the fresh 0.
+    begin_thaw(&mut window, 0);
+    let mut fuel = 5_000_000u64;
+    let (rt, _) = run_capture_reserved_with_host(
+        &inst,
+        1,
+        &[Value::I32(slot), Value::I32(clk)],
+        &mut fuel,
+        &window,
+        SIZE_LOG2,
+        &mut th,
+    );
+    assert_eq!(
+        rt.expect("thaw ok"),
+        vec![Value::I64(142)],
+        "in-flight continuation inside the installed unit resumed: saved Clock(42) reloaded (not re-issued → 100)"
+    );
 }
