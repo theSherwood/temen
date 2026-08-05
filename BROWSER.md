@@ -980,42 +980,63 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    with a proof the confinement invariant holds) or **function splitting** are the real targets;
    stackification is not.
 
-### Fuel in a global (LANDED — the highest-ROI emitter win measured so far)
+### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 
-The per-dispatch fuel debit was an `i64` load+store against a **linear-memory** cell (`env` offset 0),
-run once per dispatcher iteration. V8 cannot keep that cell in a register across a hot loop: the guest's
-own memory stores (`win + (addr & mask)`) may-alias `env`, so TurboFan must reload fuel from memory
-every iteration. Moving the counter to a **mutable wasm `i64` global** (exported `"fuel"`) removes the
-aliasing — a global is a distinct storage class no memory store can touch — so V8 register-allocates it.
-Semantics are unchanged: same debit (once per dispatch), same `< 0` trap, so the `OutOfFuel` differential
-holds bit-for-bit (`tests/differential.rs` seeds and asserts against the global). The global
-self-initializes to the standard `1<<61` region budget, so every existing host seed site (which wrote
-exactly `1<<61` to the `env` cell) is a byte-identical no-op — a drop-in.
+Two changes to how the wasm-JIT meters fuel, measured together because they interact.
+
+**1. Safepoint parity (the bigger lever, and a correctness fix).** The emitter used to debit fuel
+**once per dispatcher iteration** — i.e. once per *block executed*. The tree-walk/bytecode/Cranelift
+oracle charges at **IR-anchored safepoints** instead: one per function entry, one per *taken back-edge*
+(a branch whose target block index `<= current`), one per `cont.resume` (INVARIANTS.md #9). So the
+wasm-JIT was charging at a *different, coarser-but-more-frequent* unit than the other three engines —
+which is exactly what #9 flags as a violation, and it meant a run given budget *B* could trap `OutOfFuel`
+on the wasm tier while completing on the oracle. The fix mirrors the oracle exactly: charge once before
+the dispatcher loop (function entry) and once inside `emit_edge` when `target <= from_block` (back-edge),
+both statically known per edge. `tests/differential.rs::fuel_parity_exact` now pins the **complete↔OutOfFuel
+boundary to the oracle's exact consumption** (not just "both eventually trap on an infinite loop"), for a
+back-edge kernel and a call-in-a-loop kernel. This also *removes redundant checks*: a multi-block loop that
+re-dispatched N blocks per trip paid N debits; now it pays one (its single back-edge).
+
+**2. Fuel in a global.** The debit was an `i64` load+store against a **linear-memory** cell (`env` offset 0).
+V8 cannot keep that cell in a register across a loop — the guest's own stores (`win + (addr & mask)`)
+may-alias `env`, forcing a reload — whereas a **mutable wasm `i64` global** (exported `"fuel"`) is a
+storage class no memory store can touch, so V8 register-allocates it. Same debit, same `< 0` trap; the
+global self-initializes to the standard `1<<61` region budget, so every existing host seed site (all of
+which wrote exactly `1<<61` to the `env` cell) is a byte-identical no-op — a drop-in.
 
 Measured, this machine class (per-loop-iteration ns; `crates/svm-wasm-jit/examples/fuelbench.{rs,mjs}`,
-min-over-reps, large/small-`n` subtraction, TurboFan-warmed). `mem` = old linear-memory fuel, `global`
-= this change, `nofuel` = the fuel debit removed entirely (the upper bound):
+min-over-reps, large/small-`n` subtraction, TurboFan-warmed). Columns walk the journey: `mem/dispatch` =
+the original (linear-memory cell, per-dispatch charging); `mem/parity` = safepoint charging alone;
+`global/parity` = **shipped** (both); `nofuel` = fuel removed (upper bound):
 
-| kernel (hot loop) | wasm-JIT `mem` | wasm-JIT `global` | speedup | `nofuel` bound | for scale: bytecode / cranelift(native) |
+| kernel (hot loop) | `mem/dispatch` | `mem/parity` | `global/parity` (shipped) | `nofuel` bound | for scale: bytecode / cranelift(native) |
 | --- | --: | --: | --: | --: | --: |
-| `alu_lcg` (pure LCG, 1 block) | 4.36 | **1.55** | **2.81×** | 1.24 | 30.6 / 1.24 |
-| `xorshift` (scalar hash, 1 block) | 4.42 | **2.02** | **2.19×** | 1.87 | 48.2 / 1.88 |
-| `mem_fwd` (store→load fixed cell) | 4.53 | **2.80** | **1.62×** | 2.79 | 92.0 / 1.24 |
-| `mem_scatter` (rolling-addr store) | 4.34 | **2.82** | **1.54×** | 2.80 | 102 / 1.24 |
-| `branchy` (if/else, multi-block/trip) | 7.54 | 7.57 | 1.00× | ~2–5 (noisy) | 44.2 / 0.62 |
+| `alu_lcg` (pure LCG, 1 block) | 4.36 | 1.89 | **1.42** | 1.25 | 31.0 / 1.25 |
+| `xorshift` (scalar hash, 1 block) | 4.42 | 2.15 | **1.86** | 1.86 | 49.2 / 1.87 |
+| `mem_fwd` (store→load fixed cell) | 4.53 | 2.80 | **2.81** | 2.80 | 92.7 / 1.24 |
+| `mem_scatter` (rolling-addr store) | 4.34 | 2.82 | **2.80** | 2.82 | 103 / 1.24 |
+| `branchy` (if/else, multi-block/trip) | 7.54 | 5.22 | **5.16** | 5.08 | 45.2 / 0.65 |
 
-Readings: (1) on straight-line integer loops the global captures **90–100 % of the entire fuel cost**
-(`global` ≈ `nofuel`), taking the wasm-JIT from ~20–50× slower than the native Cranelift JIT to **within
-~1.2–1.6×** on scalar kernels (`alu` 1.55 vs 1.24; `xorshift` 2.02 vs 1.88); the memory kernels stay ~2.3×
-off native, the structural double-sandbox indirection §"Why, and how much" predicts, not fuel. (2) `branchy`
-is the one non-win and it is *informative*: a loop whose trip crosses several blocks re-enters the
-dispatcher (and its fuel check) multiple times per iteration, and that round-trip **also defeats the
-global's register allocation** — so fuel placement can't help it. This is exactly the shape a
-**relooper** would fix (fallthrough/loop edges wouldn't round-trip the dispatcher), and it is the
-*only* measured case where the relooper's structural win survives — the giant-reducible-function case
-(Lua) already showed no V8 benefit above. So the relooper stays deferred, now with a precise trigger
-condition (multi-block-per-trip hot loops) instead of a blanket "later", and the far cheaper fuel-global
-change banks the win the dispatcher-tax actually had.
+Readings:
+- **Parity is most of the win** — and is required by #9 regardless. It alone takes `alu` 4.36→1.89,
+  `mem_fwd` 4.53→2.80, and `branchy` 7.54→5.22 (that loop re-dispatched ~4 blocks/trip → ~4 debits, now 1).
+- **The global is a smaller *additional* win, concentrated on compute-bound loops.** Once parity cuts the
+  check to once per iteration, the linear-memory penalty (which was multiplied by the old check *frequency*)
+  mostly evaporates: `global` ≈ `mem` on the memory kernels and `branchy` (their one per-iteration mem
+  debit hides behind the guest's own memory traffic / the dispatch cost). It still pays on pure-ALU loops
+  where that debit is the *only* memory op: `alu` 1.89→1.42 (1.33×), `xorshift` 2.15→1.86 (1.16×). It costs
+  nothing to keep (drop-in), so it ships. (My first cut measured the global at 1.5–2.8× — that was against
+  the *pre-parity* baseline, where the redundant per-block checks amplified the memory penalty; with correct
+  safepoint charging the global's marginal value is real but smaller. Measure, then attribute.)
+- **Combined, the wasm-JIT now ≈ the native Cranelift JIT on scalar integer throughput**: `xorshift` 1.86
+  vs 1.87 (parity), `alu` 1.42 vs 1.25 (within 14%). Memory kernels stay ~2.3× off native — the structural
+  double-sandbox indirection §"Why, and how much" predicts, not fuel.
+- **`branchy` is now fuel-flat** (`global` ≈ `mem` ≈ `nofuel`, all ~5.1): parity removed its fuel cost
+  entirely, so its remaining gap to native is **purely the dispatcher round-trip**. That isolates the
+  relooper's target precisely — it is the *only* remaining lever for multi-block-per-trip loops, and the
+  *only* measured case where the reverted relooper's structural win would survive (the giant-reducible
+  Lua function already showed no V8 benefit above). It stays deferred, now with a concrete trigger
+  condition instead of a blanket "later".
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
