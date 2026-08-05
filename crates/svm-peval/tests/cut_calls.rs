@@ -420,3 +420,46 @@ block 0 (v0: i64) {
         "a cut call with live non-private region cells is rejected"
     );
 }
+
+#[test]
+fn cut_keeps_a_tail_call_opaque() {
+    // A `return runtime_bail(...)` tail-call kept opaque: emitted as a residual `return_call` to the
+    // carried callee, not inlined. Models an interpreter that checkpoints its state and tail-calls a
+    // resume/slow-path routine on a cold edge. entry(x) = tail-call rt(x + 10); rt(y) = y * 2.
+    let src = r#"
+memory 1
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v10 = i64.const 10
+  va = i64.add v0 v10
+  return_call 1 (va)
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v2 = i64.const 2
+  vr = i64.mul v0 v2
+  return vr
+}
+}
+"#;
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("source verifies");
+    let r = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cut(vec![1])).expect("specializes");
+    verify_module(&r).expect("residual verifies");
+    assert_eq!(r.funcs.len(), 2, "entry + the carried tail callee");
+    assert_eq!(
+        r.funcs[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.term, svm_ir::Terminator::ReturnCall { .. }))
+            .count(),
+        1,
+        "the tail call stays opaque as a residual return_call"
+    );
+    assert_eq!(n_muls(&r.funcs[0]), 0, "the callee body is not inlined");
+    for x in [0i64, 1, 5, -3, 100] {
+        assert_eq!(run(&r, x), run(&m, x), "diverged at x={x}");
+        assert_eq!(run(&r, x), Ok(vec![Value::I64((x + 10) * 2)]));
+    }
+}
