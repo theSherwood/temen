@@ -15,8 +15,13 @@
 //! - **Slice 2 — guard-and-deopt** ([`SpecConfig::deopt_targets`] / [`SpecConfig::deopt_handler`]). A
 //!   cold-path block the specializer must not project (a type-check failure, an error raise, a GC-
 //!   needed slow path) becomes a **deopt**: when a dynamic branch would enter it, the residual spills
-//!   all live state to the window (a valid interpreter resume image) and tail-calls a `() -> results`
-//!   resume handler, which finishes from that state. Fast paths fold; cold paths bail to the runtime.
+//!   all live state to the window (a valid interpreter resume image) and tail-calls a resume handler,
+//!   which finishes from that state. Fast paths fold; cold paths bail to the runtime.
+//!
+//! - **Slice 3 — threading dynamic entry args to a deopt edge**. When the resume handler takes the
+//!   entry's arguments (`<entry params> -> R`), the specializer threads the entry's dynamic parameters
+//!   through the CFG to every deopt edge and passes them to the handler — so an interpreter whose input
+//!   arrives as a parameter (not only via the window) can resume. Both handler shapes coexist.
 //!
 //! Run: `cargo test -p svm-peval --test cut_state -- --nocapture`
 
@@ -389,5 +394,147 @@ fn a_rolled_fast_path_composes_a_safepoint_call_out_and_a_deopt_guard() {
     for x in [0i64, 1, 249, 250, 400] {
         let want = if 4 * x < 1000 { 4 * x } else { 4 * x + 1 };
         assert_eq!(run(&r, x), Ok(vec![Value::I64(want)]), "x={x}");
+    }
+}
+
+// =============================================================================================
+// Slice 3: threading the entry's *dynamic argument* to a deopt edge.
+//
+// The interpreter's input `n` arrives as a function PARAMETER, not pre-seeded in the window, and the
+// resume handler is `(i64) -> i64` — it must receive `n` directly. `n` is the loop trip count (plain
+// memory@8, dynamic → the loop rolls) and is also threaded as a live value `vn` through the loop to
+// the exit block, which is a DEOPT TARGET reached only after the rolled loop. So `n` must survive the
+// whole rolled loop and land on the deopt edge. Source: loop `n` times, then `return n*100`; handler:
+// `n*100`. Both equal, so the residual (which replaces the exit block with `handler(n)`) matches the
+// interpreter — and only if `n` was correctly threaded to the deopt.
+// =============================================================================================
+const THREADED_ARG_DEOPT: &str = r#"
+memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v8 = i64.const 8
+  i64.store v8 v0
+  br 1(v0)
+}
+block 1 (vn: i64) {
+  v8 = i64.const 8
+  vc = i64.load v8
+  vzero = i64.const 0
+  vcond = i64.ne vc vzero
+  br_if vcond 2(vn) 3(vn)
+}
+block 2 (vn: i64) {
+  v8 = i64.const 8
+  vc = i64.load v8
+  v1 = i64.const 1
+  vc2 = i64.sub vc v1
+  i64.store v8 vc2
+  br 1(vn)
+}
+block 3 (vn: i64) {
+  v100 = i64.const 100
+  vr = i64.mul vn v100
+  return vr
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v100 = i64.const 100
+  vr = i64.mul v0 v100
+  return vr
+}
+}
+"#;
+
+#[test]
+fn a_deopt_edge_receives_the_threaded_entry_argument() {
+    let m = parse_module(THREADED_ARG_DEOPT).expect("parse");
+    verify_module(&m).expect("source verifies");
+    let cfg = SpecConfig {
+        deopt_targets: vec![(0, 3)],
+        deopt_handler: Some(1), // (i64) -> i64 — receives the threaded entry arg `n`
+        ..SpecConfig::default()
+    };
+    let r = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&r).expect("residual verifies");
+    assert_eq!(r.funcs.len(), 2, "entry + the carried arg-taking handler");
+    assert_eq!(
+        n_return_calls(&r.funcs[0]),
+        1,
+        "the exit deopts, tail-calling handler(n) — n threaded through the rolled loop"
+    );
+    // The loop rolled: fixed block count despite the dynamic trip count.
+    assert!(
+        r.funcs[0].blocks.len() <= 5,
+        "the loop rolled with the arg threaded (got {} blocks)",
+        r.funcs[0].blocks.len()
+    );
+
+    // Differential: the residual deopts to handler(n) = n*100, matching the source (loop then n*100),
+    // for every input — proving n reached the deopt edge after surviving the whole rolled loop.
+    for n in [0i64, 1, 2, 5, 37, 250] {
+        assert_eq!(run(&r, n), run(&m, n), "diverged at n={n}");
+        assert_eq!(run(&r, n), Ok(vec![Value::I64(n * 100)]), "n={n}");
+    }
+}
+
+#[test]
+fn a_no_arg_handler_still_resumes_from_the_window() {
+    // The `() -> R` shape is unchanged by arg threading: same program, but the handler ignores args
+    // and returns a constant. (Guards the two handler shapes don't interfere.)
+    let m = parse_module(THREADED_ARG_DEOPT).expect("parse");
+    let src_noarg = r#"
+memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v8 = i64.const 8
+  i64.store v8 v0
+  br 1(v0)
+}
+block 1 (vn: i64) {
+  v8 = i64.const 8
+  vc = i64.load v8
+  vzero = i64.const 0
+  vcond = i64.ne vc vzero
+  br_if vcond 2(vn) 3(vn)
+}
+block 2 (vn: i64) {
+  v8 = i64.const 8
+  vc = i64.load v8
+  v1 = i64.const 1
+  vc2 = i64.sub vc v1
+  i64.store v8 vc2
+  br 1(vn)
+}
+block 3 (vn: i64) {
+  v42 = i64.const 42
+  return v42
+}
+}
+func () -> (i64) {
+block 0 () {
+  v42 = i64.const 42
+  return v42
+}
+}
+"#;
+    let _ = m;
+    let mn = parse_module(src_noarg).expect("parse");
+    verify_module(&mn).expect("source verifies");
+    let cfg = SpecConfig {
+        deopt_targets: vec![(0, 3)],
+        deopt_handler: Some(1), // () -> i64
+        ..SpecConfig::default()
+    };
+    let r = specialize_with_config(&mn, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&r).expect("residual verifies");
+    assert_eq!(
+        n_return_calls(&r.funcs[0]),
+        1,
+        "still deopts via the no-arg handler"
+    );
+    for n in [0i64, 1, 5, 100] {
+        assert_eq!(run(&r, n), run(&mn, n), "diverged at n={n}");
+        assert_eq!(run(&r, n), Ok(vec![Value::I64(42)]), "n={n}");
     }
 }

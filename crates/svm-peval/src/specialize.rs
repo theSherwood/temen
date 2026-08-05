@@ -176,6 +176,12 @@ struct Frame {
 struct Task {
     frames: Vec<Frame>,
     mem: MemPattern,
+    /// The **entry seed** flag for deopt argument threading: `true` only for the initial entry-block
+    /// context, where the threaded entry arguments are the entry frame's own parameters (no extra
+    /// block params); `false` everywhere else, where they are reconstructed as extra block parameters.
+    /// Always `false` unless the deopt handler takes the entry's arguments, so it leaves every other
+    /// residual's memo partition unchanged.
+    seed: bool,
 }
 
 /// A frame with its SSA values resolved to concrete abstract values (constants or residual SSA
@@ -344,12 +350,18 @@ pub struct SpecConfig {
     /// Lua. Requires [`deopt_handler`](Self::deopt_handler). Empty by default.
     pub deopt_targets: Vec<(u32, u32)>,
     /// The resume function tail-called on a deopt (see [`deopt_targets`](Self::deopt_targets)),
-    /// carried into the residual like a cut callee. Its signature is **`() -> <entry results>`**: a
-    /// deopt tail-calls it with no arguments, so it resumes purely from the **written-back window
-    /// state** (the captured-VM-state model — the VM state, including a resumable `pc`, lives at known
-    /// window addresses the handler reads). This keeps deopt interpreter-agnostic: the specializer
-    /// need not thread the entry's arguments to every cold edge. Its results must match the entry's
-    /// (the tail-call forwards them). `None` unless [`deopt_targets`] is used.
+    /// carried into the residual like a cut callee. Two signatures are accepted, both returning the
+    /// entry's results (the tail-call forwards them):
+    ///
+    /// - **`() -> <entry results>`** — resumes purely from the **written-back window state** (the
+    ///   captured-VM-state model: the VM state, including a resumable `pc`, lives at known window
+    ///   addresses the handler reads). Nothing is threaded.
+    /// - **`<entry params> -> <entry results>`** — also receives the **entry's argument values**. The
+    ///   specializer threads the entry's dynamic parameters through the CFG to every deopt edge and
+    ///   passes them to the handler, so an interpreter whose input arrives as parameters (not only via
+    ///   the window) can resume. Constant entry arguments are baked in; dynamic ones are threaded.
+    ///
+    /// `None` unless [`deopt_targets`] is used.
     pub deopt_handler: Option<u32>,
 }
 
@@ -455,6 +467,7 @@ pub fn specialize_with_config(
                 &BTreeSet::new(),
                 None,
                 false,
+                false,
             )?
             .0,
         ]
@@ -472,7 +485,11 @@ pub fn specialize_with_config(
         for &t in &config.deopt_targets {
             deopt_targets.insert(t);
         }
-        let deopt_handler = resolve_deopt_handler(module, config, func, &cut)?;
+        let (deopt_handler, deopt_pass_args) =
+            match resolve_deopt_handler(module, config, func, &cut)? {
+                Some((ridx, pass)) => (Some(ridx), pass),
+                None => (None, false),
+            };
         let mut funcs = vec![
             build_func(
                 module,
@@ -485,6 +502,7 @@ pub fn specialize_with_config(
                 &cut,
                 &deopt_targets,
                 deopt_handler,
+                deopt_pass_args,
                 false,
             )?
             .0,
@@ -530,6 +548,7 @@ fn build_func(
     cut: &BTreeMap<u32, u32>,
     deopt_targets: &BTreeSet<(u32, u32)>,
     deopt_handler: Option<u32>,
+    deopt_pass_args: bool,
     thread_cells: bool,
 ) -> Result<(Func, CellSig), SpecError> {
     let cf = module
@@ -548,6 +567,17 @@ fn build_func(
             residual_params.push(cell_type(width));
         }
     }
+    // The types of the entry's dynamic parameters — the block-parameter types of the deopt argument-
+    // threading channel (see [`Spec::cur_thread`]). Empty unless the handler takes the entry's args.
+    let thread_types: Vec<ValType> = if deopt_pass_args {
+        pattern
+            .iter()
+            .zip(&cf.params)
+            .filter_map(|(slot, ty)| slot.is_none().then_some(*ty))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Selective outlining only makes sense when outlining is enabled; when it is, populate the
     // per-frame recursion signatures (otherwise they stay empty, leaving the memo key unchanged).
@@ -563,6 +593,10 @@ fn build_func(
         cut,
         deopt_targets,
         deopt_handler,
+        deopt_pass_args,
+        entry_pattern: pattern,
+        cur_thread: Vec::new(),
+        thread_types,
         out_cells: None,
         memo: BTreeMap::new(),
         queue: VecDeque::new(),
@@ -573,6 +607,8 @@ fn build_func(
     } else {
         Vec::new()
     };
+    // The initial context is the deopt entry seed when the handler takes the entry's arguments (see
+    // [`Task::seed`]); otherwise `false`, leaving the memo partition unchanged.
     spec.intern(
         vec![Frame {
             func: callee,
@@ -582,6 +618,7 @@ fn build_func(
             entry,
         }],
         mem_pat.clone(),
+        deopt_pass_args,
     );
 
     let mut blocks = Vec::new();
@@ -646,6 +683,7 @@ fn outline_funcs(
         &BTreeMap::new(),
         &BTreeSet::new(),
         None,
+        false,
         false,
     )?;
     state.borrow_mut().funcs[0] = Some(entry_func);
@@ -717,6 +755,7 @@ fn request_outline(
         &BTreeMap::new(),
         &BTreeSet::new(),
         None,
+        false,
         true,
     )?;
     let mut s = state.borrow_mut();
@@ -776,15 +815,30 @@ struct Spec<'a> {
     /// on the inline entry build — carried/outlined functions never carry deopt targets).
     deopt_targets: &'a BTreeSet<(u32, u32)>,
     /// The residual function index of the deopt resume handler ([`SpecConfig::deopt_handler`]), tail-
-    /// called (with no args) on a deopt. `None` unless deopt is active.
+    /// called on a deopt. `None` unless deopt is active.
     deopt_handler: Option<u32>,
+    /// Whether the deopt handler takes the entry's arguments (`<entry params> -> R`) rather than
+    /// resuming purely from the window (`() -> R`). When set, the entry's dynamic parameters are
+    /// threaded through the CFG (see [`Spec::cur_thread`]) and passed to the handler at each deopt.
+    deopt_pass_args: bool,
+    /// The entry function's [`ParamPattern`]: the argument shape a deopt tail-call reconstructs for the
+    /// handler (constant lanes baked, dynamic lanes taken from [`Spec::cur_thread`]). Only read when
+    /// `deopt_pass_args` is set.
+    entry_pattern: &'a ParamPattern,
+    /// **Working state, set per built block.** The current block's threaded entry-argument values (the
+    /// dynamic entry params, in entry order), read by [`Spec::branch_to`] to forward them along every
+    /// edge and by the deopt emitter to build the handler call. Empty unless `deopt_pass_args`.
+    cur_thread: Vec<Abs>,
+    /// The block-parameter types of the [`Spec::cur_thread`] channel — the entry's dynamic-parameter
+    /// types, reconstructed as extra block params on every non-seed block. Empty unless `deopt_pass_args`.
+    thread_types: Vec<ValType>,
     /// The threaded out-cell signature (`(addr, width)` by address), fixed at the first `return` and
     /// required to match at every other return. `None` until the first return; stays `None` when
     /// nothing is threaded.
     out_cells: Option<CellSig>,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
-    memo: BTreeMap<(Vec<Frame>, MemPattern), u32>,
+    memo: BTreeMap<(Vec<Frame>, MemPattern, bool), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }
@@ -792,9 +846,11 @@ struct Spec<'a> {
 impl Spec<'_> {
     /// Get (or create) the residual block id for a context, enqueuing it the first time it is
     /// seen. Ids are assigned in enqueue order and blocks are produced in that same (FIFO) order,
-    /// so id == position in the output `blocks`.
-    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern) -> u32 {
-        let key = (frames, mem);
+    /// so id == position in the output `blocks`. `seed` is the deopt entry-seed flag (see
+    /// [`Task::seed`]); it is `false` for every non-initial context and always `false` unless deopt
+    /// argument threading is active, so it leaves the memo partition unchanged in the common case.
+    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern, seed: bool) -> u32 {
+        let key = (frames, mem, seed);
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
@@ -803,6 +859,7 @@ impl Spec<'_> {
         self.queue.push_back(Task {
             frames: key.0.clone(),
             mem: key.1.clone(),
+            seed,
         });
         self.memo.insert(key, id);
         id
@@ -882,6 +939,17 @@ impl Spec<'_> {
                 }
             }
         }
+        // Deopt argument threading: on every non-seed block, the entry's dynamic arguments arrive as
+        // extra block parameters, declared *after* the memory cells — the fixed position `branch_to`
+        // forwards them at. The entry seed block instead sources them from its own parameters (below).
+        let mut thread_abs: Vec<Abs> = Vec::new();
+        if self.deopt_pass_args && !task.seed {
+            for &ty in &self.thread_types {
+                thread_abs.push(Abs::Dyn(rnext));
+                rnext += 1;
+                params.push(ty);
+            }
+        }
 
         // Execute the active (innermost) frame's block from its resume point. `fuel` bounds any
         // straight-line call inlining within this block.
@@ -893,21 +961,35 @@ impl Spec<'_> {
             entry: active_entry,
         } = frames.pop().expect("a context has at least one frame");
 
+        // Seed the threading channel at the entry block: the threaded arguments *are* the entry's own
+        // dynamic parameters (its env here), so no extra params are declared. Then publish the current
+        // block's threaded values for `branch_to` and the deopt emitter to read.
+        if self.deopt_pass_args && task.seed {
+            thread_abs = self
+                .entry_pattern
+                .iter()
+                .zip(&env)
+                .filter_map(|(slot, &a)| slot.is_none().then_some(a))
+                .collect();
+        }
+        self.cur_thread = thread_abs;
+
         // Guard-and-deopt: entering a cold target block bails to the resume handler instead of
         // projecting the block (which would drag in the interpreter's cold, stateful machinery). Spill
         // all live rename cells to the window — making it a valid interpreter resume image — then tail-
-        // call the handler, which resumes from that state. (Deopt targets are only set on the inline
-        // entry; the handler is `() -> <entry results>`, validated in `resolve_deopt_handler`.)
+        // call the handler, which resumes from that state (and, for a `<entry params> -> R` handler,
+        // from the threaded entry arguments). Deopt targets are only set on the inline entry.
         if let Some(handler) = self.deopt_handler {
             if self.deopt_targets.contains(&(active_func, active_block)) {
                 let mut out: Vec<Inst> = Vec::new();
                 self.write_back_cells(&mem, &mut out, &mut rnext)?;
+                let args = self.deopt_handler_args(&mut out, &mut rnext);
                 return Ok(svm_ir::Block {
                     params,
                     insts: out,
                     term: Terminator::ReturnCall {
                         func: handler,
-                        args: Vec::new(),
+                        args,
                     },
                 });
             }
@@ -2216,6 +2298,28 @@ impl Spec<'_> {
         Ok(())
     }
 
+    /// The argument list for a deopt tail-call to the resume handler. Empty for a `() -> R` handler;
+    /// for a `<entry params> -> R` handler, the entry's arguments in order — constant lanes
+    /// materialized as `const` insts, dynamic lanes taken from the threaded channel
+    /// ([`Spec::cur_thread`], set for the current block in `build_block`).
+    fn deopt_handler_args(&self, out: &mut Vec<Inst>, rnext: &mut u32) -> Vec<u32> {
+        if !self.deopt_pass_args {
+            return Vec::new();
+        }
+        let mut thread = self.cur_thread.iter();
+        let mut args = Vec::with_capacity(self.entry_pattern.len());
+        for slot in self.entry_pattern {
+            let abs = match slot {
+                Some(k) => Abs::Const(*k),
+                None => *thread
+                    .next()
+                    .expect("one threaded value per dynamic entry param"),
+            };
+            args.push(materialize(abs, out, rnext));
+        }
+        args
+    }
+
     /// Resolve one outgoing edge into a residual block id + dynamic arguments. The successor inherits
     /// the full call stack and the current abstract memory; constant lanes join the context, dynamic
     /// lanes are passed as residual block arguments in the canonical order (frames outermost→
@@ -2257,7 +2361,18 @@ impl Spec<'_> {
                 }
             }
         }
-        let id = self.intern(frames, mem_pat);
+        // Forward the threaded entry arguments (deopt arg passing) as the edge's trailing arguments,
+        // after the memory cells — the fixed position `build_block` reconstructs them at. They are
+        // always dynamic, so they add no memo diversity; the successor is never the entry seed.
+        for &a in &self.cur_thread {
+            dyn_args.push(match a {
+                Abs::Dyn(i) => i,
+                // The threaded lanes are the entry's dynamic params (always `Dyn`); a `Const` here
+                // would mean a constant entry arg leaked into the channel, which never happens.
+                Abs::Const(_) => unreachable!("threaded entry args are always dynamic"),
+            });
+        }
+        let id = self.intern(frames, mem_pat, false);
         (id, dyn_args)
     }
 }
@@ -2417,7 +2532,7 @@ fn resolve_deopt_handler(
     config: &SpecConfig,
     entry: u32,
     cut: &BTreeMap<u32, u32>,
-) -> Result<Option<u32>, SpecError> {
+) -> Result<Option<(u32, bool)>, SpecError> {
     if config.deopt_targets.is_empty() {
         return Ok(None);
     }
@@ -2427,11 +2542,21 @@ fn resolve_deopt_handler(
         .get(handler as usize)
         .ok_or(SpecError::BadFunc)?;
     let ef = module.funcs.get(entry as usize).ok_or(SpecError::BadFunc)?;
-    if !hf.params.is_empty() || hf.results != ef.results {
-        trace_unsup!("deopt handler must be `() -> <entry results>`");
+    if hf.results != ef.results {
+        trace_unsup!("deopt handler results must match the entry's");
         return Err(SpecError::Unsupported);
     }
-    Ok(Some(cut[&handler]))
+    // Two supported shapes: `() -> R` resumes purely from the written-back window; `P -> R` (same
+    // params as the entry) also receives the entry's argument values, threaded to the deopt edge.
+    let pass_args = if hf.params.is_empty() {
+        false
+    } else if hf.params == ef.params {
+        true
+    } else {
+        trace_unsup!("deopt handler must be `() -> R` or `<entry params> -> R`");
+        return Err(SpecError::Unsupported);
+    };
+    Ok(Some((cut[&handler], pass_args)))
 }
 
 /// Plan the cut-set carry (see [`SpecConfig::cut_calls`]). From the `roots` (the cut callees) walk the
