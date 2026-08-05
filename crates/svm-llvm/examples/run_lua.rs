@@ -25,6 +25,7 @@ fn main() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     };
     match inst.run(backend, &config) {
         Ok(run) => {

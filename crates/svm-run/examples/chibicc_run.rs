@@ -78,6 +78,7 @@ fn main() {
             v
         },
         env: vec![],
+        ..RunConfig::default()
     };
     let run = inst
         .run_with_caps(backend, &cfg, &[("fs", fs::mem_fs_seeded(files, dirs))])
@@ -110,6 +111,7 @@ fn main() {
             memory_size_log2: None,
             args: vec![],
             env: vec![],
+            ..RunConfig::default()
         };
         let out_run = out_inst
             .run(backend, &out_cfg)

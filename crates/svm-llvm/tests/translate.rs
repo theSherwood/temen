@@ -3722,6 +3722,7 @@ fn demo_lmdb_mmap_cap_vs_native() {
         memory_size_log2: None,
         args,
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     // Oracle bytes: create (fresh dir) + verify (same dir).
@@ -3899,6 +3900,7 @@ fn demo_lmdb_crash_recovery() {
         memory_size_log2: None,
         args,
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     // Each run gets a FRESH crashy in-memory fs (empty, disarmed); the guest arms it internally.
     let run = |args: Vec<Vec<u8>>| -> String {
@@ -4077,6 +4079,7 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
         memory_size_log2: None,
         args,
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     // Native create + verify (oracle stdout).
@@ -4216,6 +4219,7 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     // Run on BOTH backends. The interpreter models the alias in software (loads/stores route through
@@ -4347,6 +4351,7 @@ fn demo_sqlite_fs_cap_vs_native() {
         memory_size_log2: None,
         args,
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     // 1. mem_fs: hermetic create → reopen → verify, byte-identical stdout.
@@ -4483,6 +4488,7 @@ fn demo_pg_oscap_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     // 1. mem_fs: hermetic, byte-identical to the native oracle.
@@ -4571,6 +4577,7 @@ fn trap_error_surfaces_guest_output() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     let err = inst
         .run_with_caps(svm_run::Backend::Bytecode, &config, &[])
@@ -4795,6 +4802,7 @@ fn demo_pg_stdio_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     for (label, cap) in [
         ("mem_fs", svm_run::fs::mem_fs()),
@@ -4880,6 +4888,7 @@ fn demo_pg_stream_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     for (label, cap) in [
         ("mem_fs", svm_run::fs::mem_fs()),
@@ -4967,6 +4976,7 @@ fn demo_pg_fprintf_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     // All three engines over mem_fs; then host_fs (a real temp dir) once, to prove the fs-cap file
     // path is backend-agnostic. Each must byte-match native.
@@ -5069,6 +5079,7 @@ fn demo_pg_sscanf_vs_native() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
     for backend in [
         svm_run::Backend::TreeWalk,

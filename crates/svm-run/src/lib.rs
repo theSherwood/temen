@@ -3644,6 +3644,7 @@ fn run_powerbox_inner(
         memory_size_log2: None,
         args: args.iter().map(|s| s.to_vec()).collect(),
         env: env.iter().map(|s| s.to_vec()).collect(),
+        ..RunConfig::default()
     };
     inst.run(Backend::Jit, &config)
 }
@@ -3797,6 +3798,28 @@ fn module_nests(m: &svm_ir::Module) -> bool {
     })
 }
 
+/// CONSOLIDATION.md §2.2: the module spawns a demand process child (`Instantiator` op 16 —
+/// pager-serviced faults). The JIT has no native arm for the fault seam yet, so these modules
+/// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
+/// transport itself is what makes this cheap to defer: JIT callers already reach providers
+/// through the cap-thunk handoff at interp cost.
+fn module_demand_spawns(m: &svm_ir::Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    svm_ir::Inst::CapCall {
+                        type_id: 6,
+                        op: 16,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 fn module_serves(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -3922,8 +3945,8 @@ impl Limits {
 
 /// How to run a powerbox entry: the resource [`Limits`], the guest's stdin, and an optional override of
 /// the module's declared window size (the "amount of memory available"). `Default` is the easy button —
-/// default limits, empty stdin, the module's own window.
-#[derive(Clone, Debug, Default)]
+/// default limits, empty stdin, the module's own window, direct handoff on.
+#[derive(Clone, Debug)]
 pub struct RunConfig {
     pub limits: Limits,
     pub stdin: Vec<u8>,
@@ -3936,6 +3959,25 @@ pub struct RunConfig {
     pub args: Vec<Vec<u8>>,
     /// The guest's environment vector (`envp`), each entry `KEY=VALUE`. See [`RunConfig::args`].
     pub env: Vec<Vec<u8>>,
+    /// CALLS.md 4d/§10.2 **direct handoff**: a `cap.call` into a provider parked at an empty-queue
+    /// `svc.wait` runs the handler inline on the caller's thread instead of queueing through the
+    /// scheduler (measured ~3.4x on the serving round-trip; CONSOLIDATION.md §2.1b). On by default —
+    /// semantics are pinned handoff-on ≡ handoff-off by the `direct_handoff` differential tests; turn
+    /// off to force the queued transport (e.g. when diagnosing scheduling itself).
+    pub handoff: bool,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            stdin: Vec::new(),
+            memory_size_log2: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            handoff: true,
+        }
+    }
 }
 
 impl RunConfig {
@@ -4961,6 +5003,7 @@ impl Instance {
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
+        host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
             let handle = (cap.grant)(&mut host, win);
@@ -4973,9 +5016,10 @@ impl Instance {
         // (the cap thunk's `serve_native` arm). Everything else `module_serves` catches — op-14
         // offer mints, serving modules whose handlers could park — still folds to the oracle.
         let backend = if matches!(backend, Backend::Jit)
-            && module_serves(m)
-            && !svm_interp::bytecode::serve_qualifies(&m.funcs)
-            && !module_nests(m)
+            && (module_demand_spawns(m)
+                || (module_serves(m)
+                    && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+                    && !module_nests(m)))
         {
             Backend::TreeWalk
         } else {
@@ -5030,6 +5074,8 @@ impl Instance {
         hj.stdin = config.stdin.clone();
         hi.set_quota(config.limits.quota());
         hj.set_quota(config.limits.quota());
+        hi.set_handoff(config.handoff);
+        hj.set_handoff(config.handoff);
         self.grant_caps(&mut hi, win);
         self.grant_caps(&mut hj, win);
 
@@ -5499,6 +5545,7 @@ impl Instance {
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
         host.set_quota(config.limits.quota());
+        host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
 
         // Run `_start` (func 0) once: run the module's initializer against the installed import

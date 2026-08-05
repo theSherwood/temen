@@ -35,6 +35,7 @@ fn run(backend: Backend) -> svm_run::Run {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     };
     inst.run(backend, &config)
         .expect("run Lua math.lua through the powerbox")

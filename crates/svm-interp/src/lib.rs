@@ -1240,6 +1240,13 @@ impl Inspector {
                     return Stop::Finished(r);
                 }
                 Step::Park(_) | Step::Yield => return Stop::Blocked,
+                // §2.2: pager fault-service needs the real scheduler; under the inspector it is
+                // out of scope (fail closed, like a Yielder with no resumer).
+                Step::PageFault(_) => {
+                    let r = Err(Trap::FiberFault);
+                    self.finished = Some(r.clone());
+                    return Stop::Finished(r);
+                }
                 Step::Pause(_, pc) => {
                     if root.debug_clock() >= t {
                         return Stop::Break {
@@ -1488,6 +1495,13 @@ impl Inspector {
         }
         match self.v.as_mut().unwrap().run(u64::MAX) {
             Step::Pause(reason, pc) => Stop::Break { reason, pc },
+            // §2.2: pager fault-service needs the real scheduler — fail closed under the
+            // single-vCPU inspector driver (like a Yielder with no resumer).
+            Step::PageFault(_) => {
+                let r = Err(Trap::FiberFault);
+                self.finished = Some(r.clone());
+                Stop::Finished(r)
+            }
             Step::Done(r) => {
                 self.finished = Some(r.clone());
                 Stop::Finished(r)
@@ -4155,6 +4169,18 @@ enum Step {
     /// Only produced when an [`Inspector`] drives the vCPU; the [`VCpu`] continuation is intact, so
     /// the next `run` resumes exactly here. Carries the reason + location for the driver to report.
     Pause(StopReason, IrPc),
+    /// CONSOLIDATION.md §2.2: a demand process child's recoverable fault, serviced by its pager
+    /// binding at dispatch level (see [`Inner::PageFault`]).
+    PageFault(u64),
+}
+
+/// CONSOLIDATION.md §2.2: a demand process child's pager binding — the provider (parent) host
+/// cell and the export whose op 0 is `page(addr) -> (i64)`. Resolved once at spawn from the
+/// parent's reified offer (7.4), so per-fault dispatch never re-walks the parent's handle table.
+#[derive(Clone)]
+struct PagerRef {
+    cell: Arc<Mutex<Host>>,
+    export: u32,
 }
 
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
@@ -4172,6 +4198,12 @@ enum Inner {
     /// been rewound; the parent's `resume` supplies the page and re-runs it (userfaultfd-style lazy
     /// paging). Like `CoYield`, only produced for an inline-driven coroutine.
     CoFault(u64),
+    /// CONSOLIDATION.md §2.2: a demand **process** child (`fault_pager`) hit a recoverable page
+    /// fault at this confined address. The access is rewound; the scheduler converts the fault
+    /// into a call on the child's pager binding (direct handoff when the pager is parked at
+    /// `svc.wait`), supplies the page on reply, and re-runs the access. The process-tier
+    /// analogue of `CoFault` — surfaced to `dispatch`, never to a resume-driver.
+    PageFault(u64),
     /// A **debug pause** (DEBUGGING.md W2/S4): the per-op hook stopped before the op at this
     /// [`IrPc`]. Folded to [`Step::Pause`] by [`VCpu::run`]; never produced unless `debug` is set.
     Pause(StopReason, IrPc),
@@ -5162,6 +5194,54 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 
 /// Run one vCPU until it yields, then route the outcome: publish a result (waking a joiner) and
 /// retire the slot, or park it on a join target / wait address.
+/// §3.6 slice 3 — park a caller awaiting a live-callee reply on `ticket`, with the
+/// park-vs-reply race check under the scheduler lock (an early reply in the callee's completion
+/// cell wakes the caller instead of stranding it) and D37 death-is-revocation. Shared by the
+/// `Blocked::CapReply` park and the §2.2 page-fault park (which sets `page_fault` first, so the
+/// wake supplies the page instead of pushing the reply).
+fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc<Mutex<Host>>) {
+    let mut s = sched.lock();
+    // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+    let Some(mut v) = park_gate(&mut s, v) else {
+        // I40: the caller's domain was torn down in the enqueue→park window, so it never
+        // registered a waiter — but its dispatch is queued on the (live) callee and will be
+        // served. Record the ticket as an orphan so the reply is dropped, not leaked. (A
+        // dead callee never replies; its queue was already drained, so skip it.)
+        let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+        if !s.dead.contains_key(&callee_id) {
+            s.orphan_tickets.insert((callee_id, ticket));
+        }
+        sched.work.notify_all();
+        return;
+    };
+    // D37 death-is-revocation: a callee torn down between the enqueue and this park will
+    // never reply (its queue was drained by the teardown before we got here) — complete
+    // with the probeable errno instead of stranding the caller.
+    let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+    let callee_dead = s.dead.contains_key(&callee_id);
+    let early = callee
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .svc_results
+        .remove(&ticket);
+    match early {
+        Some(r) => {
+            v.pending = Some(Pending::CapResult(r));
+            s.runnable.push_back(v);
+            sched.work.notify_one();
+        }
+        None if callee_dead => {
+            v.pending = Some(Pending::CapResult(CAP_REVOKED));
+            s.runnable.push_back(v);
+            sched.work.notify_one();
+        }
+        None => {
+            s.ticket_waiters
+                .insert((callee_id, ticket), Waiter::VCpu(v));
+        }
+    }
+}
+
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
     // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
@@ -5555,50 +5635,71 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             }
         }
         Step::Park(Blocked::CapReply { ticket, callee }) => {
-            // §3.6 slice 3: park awaiting a live-callee reply. Park-vs-reply race check under
-            // the scheduler lock: a reply that landed before this park sits in the callee's
-            // completion cell — take it and wake ourselves instead of stranding the caller.
-            let mut s = sched.lock();
-            // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
-            let Some(mut v) = park_gate(&mut s, v) else {
-                // I40: the caller's domain was torn down in the enqueue→park window, so it never
-                // registered a waiter — but its dispatch is queued on the (live) callee and will be
-                // served. Record the ticket as an orphan so the reply is dropped, not leaked. (A
-                // dead callee never replies; its queue was already drained, so skip it.)
-                let callee_id =
-                    callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
-                if !s.dead.contains_key(&callee_id) {
-                    s.orphan_tickets.insert((callee_id, ticket));
-                }
-                sched.work.notify_all();
+            park_cap_reply(sched, v, ticket, callee);
+        }
+        // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
+        // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
+        // direct handoff and the pager parked at `svc.wait`, the handler runs inline on this
+        // thread (the §10.2 shape) — supply the page and requeue; otherwise park exactly as a
+        // live-offer caller does (`park_cap_reply`), with `page_fault` marking the wake to
+        // supply instead of pushing a reply.
+        Step::PageFault(addr) => {
+            let Some(pb) = v.pager.clone() else {
+                // Unreachable by construction (`fault_pager` is set only with `pager`), but never
+                // trust a flag alone: clear it and re-run — the re-executed access now traps as an
+                // ordinary detect-and-kill memory fault.
+                v.fault_pager = false;
+                let mut s = sched.lock();
+                s.runnable.push_back(v);
+                sched.work.notify_one();
                 return;
             };
-            // D37 death-is-revocation: a callee torn down between the enqueue and this park will
-            // never reply (its queue was drained by the teardown before we got here) — complete
-            // with the probeable errno instead of stranding the caller.
-            let callee_id = callee.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
-            let callee_dead = s.dead.contains_key(&callee_id);
-            let early = callee
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .svc_results
-                .remove(&ticket);
-            match early {
-                Some(r) => {
-                    v.pending = Some(Pending::CapResult(r));
-                    s.runnable.push_back(v);
-                    sched.work.notify_one();
-                }
-                None if callee_dead => {
-                    v.pending = Some(Pending::CapResult(CAP_REVOKED));
-                    s.runnable.push_back(v);
-                    sched.work.notify_one();
-                }
-                None => {
-                    s.ticket_waiters
-                        .insert((callee_id, ticket), Waiter::VCpu(v));
+            let (ticket, pager_id) = {
+                let mut cg = pb.cell.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
+                    cg.domain_id(),
+                )
+            };
+            let Some(t) = ticket else {
+                // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
+                // was rewound), retrying the enqueue after the pager drains.
+                let mut s = sched.lock();
+                s.runnable.push_back(v);
+                sched.work.notify_one();
+                return;
+            };
+            if sched.handoff {
+                if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
+                    dispatch(sched, provider);
+                    let served = pb
+                        .cell
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .svc_results
+                        .remove(&t);
+                    if let Some(r) = served {
+                        if r < 0 {
+                            // Pager refused: an unserviceable fault — detect-and-kill semantics
+                            // via the marker path (re-entry sees the negative reply and traps).
+                            v.page_fault = Some(addr);
+                            v.pending = Some(Pending::CapResult(r));
+                        } else {
+                            if let Some(m) = v.mem.as_ref() {
+                                m.supply_page(addr);
+                            }
+                        }
+                        let mut s = sched.lock();
+                        s.runnable.push_back(v);
+                        sched.work.notify_one();
+                        return;
+                    }
+                    // Handler parked mid-service (4d.2): fall through to the ticket park — it
+                    // replies via `t` when it completes.
                 }
             }
+            v.page_fault = Some(addr);
+            park_cap_reply(sched, v, t, pb.cell);
         }
         Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
             // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
@@ -6261,7 +6362,15 @@ impl SchedDriver {
                     det.lock().wake_spins(base, width);
                 }
             }
+            // §2.2: pager fault-service runs on the real scheduler only for this slice (the
+            // deterministic explorer has no handoff/park transport for it) — fail closed.
+            let step = if matches!(step, Step::PageFault(_)) {
+                Step::Done(Err(Trap::FiberFault))
+            } else {
+                step
+            };
             match step {
+                Step::PageFault(_) => unreachable!("converted to Done(FiberFault) above"),
                 Step::Done(result) => {
                     let id = v.id;
                     // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (trap only).
@@ -7442,6 +7551,17 @@ struct VCpu {
     /// driven yield / lazy paging) instead of trapping. Set for `Instantiator.spawn_coroutine`
     /// children; `false` for every ordinary vCPU (a page fault is detect-and-kill).
     fault_yields: bool,
+    /// CONSOLIDATION.md §2.2: this vCPU is a **demand process child** (`Instantiator` op 16)
+    /// whose recoverable page faults become calls on its parent's pager offer instead of trapping
+    /// (or suspending — that is the coroutine's `fault_yields`). Set together with `pager`.
+    fault_pager: bool,
+    /// The resolved pager binding op 16 stored at spawn: the provider's host cell + export. Held
+    /// substrate-side (never in the child's powerbox) — the child cannot name or call it; only the
+    /// fault seam does, userfaultfd-style.
+    pager: Option<PagerRef>,
+    /// A fault address awaiting its pager reply: set when the fault parks awaiting the pager
+    /// (the queued transport), consumed at resume — supply the page instead of pushing the reply.
+    page_fault: Option<u64>,
     /// Call-depth base for the stack-overflow bound.
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
@@ -7622,6 +7742,9 @@ impl VCpu {
             nested_slot: 0,
             coroutines: Vec::new(),
             fault_yields: false,
+            fault_pager: false,
+            pager: None,
+            page_fault: None,
             depth,
             id,
             parent_task: 0,
@@ -7688,6 +7811,9 @@ impl VCpu {
             nested_slot: 0,
             coroutines: Vec::new(),
             fault_yields: false,
+            fault_pager: false,
+            pager: None,
+            page_fault: None,
             depth: self.depth,
             id: new_id,
             parent_task: self.parent_task,
@@ -7776,6 +7902,9 @@ impl VCpu {
             nested_slot: 0,
             coroutines: Vec::new(),
             fault_yields: false,
+            fault_pager: false,
+            pager: None,
+            page_fault: None,
             depth,
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
@@ -7922,6 +8051,7 @@ impl VCpu {
             // A `Yielder` cap.call / fault-driven yield on a vCPU the *executor* runs has no resumer to
             // yield to (a coroutine child is driven inline by `resume`, never enqueued here) — inert.
             Ok(Inner::CoYield(_)) | Ok(Inner::CoFault(_)) => Step::Done(Err(Trap::FiberFault)),
+            Ok(Inner::PageFault(a)) => Step::PageFault(a),
             Ok(Inner::Pause(r, pc)) => Step::Pause(r, pc),
             Err(t) => Step::Done(Err(t)),
         }
@@ -8107,6 +8237,7 @@ fn handle_mem(
     r: Result<Option<Reg>, Trap>,
     frame: &mut Frame,
     fault_yields: bool,
+    fault_pager: bool,
     mem: &Option<Mem>,
 ) -> Result<Option<Inner>, Trap> {
     match r {
@@ -8115,13 +8246,21 @@ fn handle_mem(
             Ok(None)
         }
         Ok(None) => Ok(None),
-        Err(Trap::MemoryFault) if fault_yields => match mem.as_ref().and_then(|m| m.take_fault()) {
-            Some(addr) => {
-                frame.inst -= 1; // re-execute the access on resume
-                Ok(Some(Inner::CoFault(addr)))
+        Err(Trap::MemoryFault) if fault_yields || fault_pager => {
+            match mem.as_ref().and_then(|m| m.take_fault()) {
+                Some(addr) => {
+                    frame.inst -= 1; // re-execute the access on resume
+                                     // §2.2: a demand *process* child routes to its pager binding at dispatch
+                                     // level; a demand *coroutine* suspends to its inline resume-driver.
+                    Ok(Some(if fault_pager {
+                        Inner::PageFault(addr)
+                    } else {
+                        Inner::CoFault(addr)
+                    }))
+                }
+                None => Err(Trap::MemoryFault),
             }
-            None => Err(Trap::MemoryFault),
-        },
+        }
         Err(t) => Err(t),
     }
 }
@@ -8168,11 +8307,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             v.frames[top].vals.push(Reg::from_i64(value));
         }
         Some(Pending::CapResult(status)) => {
-            // §3.6 revocation-unparks: the handle this fiber's capability call was parked
-            // through was revoked. The call completes with the negative errno — the fiber
-            // resumes on its own error path (no trap, no kill; cancellation is a value).
-            let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Reg::from_i64(status));
+            if let Some(addr) = v.page_fault.take() {
+                // §2.2: this was a page-fault park, not a guest cap.call — the faulting op was
+                // rewound, so nothing is pushed. A non-negative reply means the pager wrote the
+                // page's bytes: supply it and let the rewound access re-execute over them. A
+                // negative reply (pager error, or CAP_REVOKED from a dead pager — D37
+                // death-is-revocation) is an unserviceable fault: detect-and-kill, exactly as a
+                // pagerless fault would have been.
+                if status < 0 {
+                    return Err(Trap::MemoryFault);
+                }
+                if let Some(m) = v.mem.as_ref() {
+                    m.supply_page(addr);
+                }
+            } else {
+                // §3.6 revocation-unparks: the handle this fiber's capability call was parked
+                // through was revoked. The call completes with the negative errno — the fiber
+                // resumes on its own error path (no trap, no kill; cancellation is a value).
+                let top = v.frames.len() - 1;
+                v.frames[top].vals.push(Reg::from_i64(status));
+            }
         }
         Some(Pending::SvcTimeout) => svc_timed_out = true,
         None => {}
@@ -8188,6 +8342,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         registry,
         chain,
         cur,
+        fault_pager,
+        pager: _,
+        page_fault: _,
         frames,
         root_parked,
         parked_frames,
@@ -8239,6 +8396,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let durable = *durable;
     let memop = *memop;
     let fault_yields = *fault_yields;
+    let fault_pager = *fault_pager;
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -9209,6 +9367,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // only instantiate modules it was given). Resolve the grant here, shift the
                     // remaining args by one, and fold into the shared op logic below; `join`/`resume`
                     // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
+                    // §2.2 (op 16): the resolved pager binding, threaded into the spawn tail
+                    // (demand-page the carve + stamp the child's substrate-held pager).
+                    let mut pager_ref: Option<(Arc<Mutex<Host>>, u32)> = None;
                     #[allow(clippy::type_complexity)]
                     // `grant`/`named` carry the re-grant **handles** (not pre-resolved bindings): a pipe
                     // end must alias its shared backing into the child, not copy a parent-local index, so
@@ -9303,6 +9464,58 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
                                 }
                                 list.push((name, handle));
+                            }
+                            (0, None, 2, None, list)
+                        }
+                        // CONSOLIDATION.md §2.2 — `spawn_process_demand(grants_ptr, grants_n,
+                        // entry, off, size_log2, quota, pager_export)` (op 16): an op-11 process
+                        // child whose window starts demand-paged and whose recoverable faults
+                        // call op 0 of the **spawner's own impl export** `pager_export` — served
+                        // by the spawner's live serve loop (`svc.wait`) over its real window,
+                        // exactly as it serves any provider dispatch. The binding (own cell +
+                        // export index) is held substrate-side on the child vCPU: the child can
+                        // neither name nor call it (userfaultfd-style).
+                        16 => {
+                            let grants_ptr =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let grants_n =
+                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            let pager_k =
+                                get_i64(&frames[top].vals, *args.get(6).ok_or(Trap::Malformed)?)?
+                                    as u32;
+                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                            let mut list: Vec<(String, i32)> = Vec::new();
+                            for i in 0..grants_n {
+                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                                let name_off =
+                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                                let name_len =
+                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                                let name_bytes = m.read_window(name_off, name_len)?;
+                                let name =
+                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
+                                {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                }
+                                list.push((name, handle));
+                            }
+                            {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                // A missing/empty pager export fails the spawn closed — before
+                                // any child code runs (§3.3 withhold discipline).
+                                let ok = hg
+                                    .self_module
+                                    .as_ref()
+                                    .and_then(|m| m.impl_exports.get(pager_k as usize))
+                                    .is_some_and(|e| !e.ops.is_empty());
+                                if !ok {
+                                    return Err(Trap::CapFault);
+                                }
+                                pager_ref = Some((Arc::clone(host), pager_k));
                             }
                             (0, None, 2, None, list)
                         }
@@ -9432,6 +9645,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_mem = mem
                                     .as_ref()
                                     .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                // §2.2 (op 16): a demand process child starts with every page of
+                                // its carve unmapped — first touches fault to the pager binding.
+                                if pager_ref.is_some() {
+                                    if let Some(cm) = child_mem.as_ref() {
+                                        cm.demand_page();
+                                    }
+                                }
                                 // A separate-module child's **data segments** materialize into the
                                 // carve at spawn (exactly as if the child wrote them; the verifier
                                 // bounded them to its declared window == the carve). RO protection of
@@ -9585,6 +9805,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // parent* keys with its own id), so a depth-2+ server thaws
                                     // without its serve module and can't dispatch.
                                     let self_task = *id;
+                                    let pager_for_child = pager_ref.take();
                                     let made = sched.spawn(move |id| {
                                         // A nested child is its **own** domain (own host/window/program),
                                         // so it gets its own dispatch table, not the parent's.
@@ -9603,6 +9824,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             cdt,
                                         );
                                         child.memop = memop;
+                                        // §2.2 (op 16): recoverable faults route to the pager
+                                        // binding, substrate-side (the child can't name it).
+                                        if let Some((cell, export)) = pager_for_child {
+                                            child.pager = Some(PagerRef { cell, export });
+                                            child.fault_pager = true;
+                                        }
                                         // §4: durability is a subtree property — a durable parent's
                                         // instantiated child runs durable (freezable module enforced
                                         // at the admission check above).
@@ -9830,8 +10057,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     ));
                                 }
                                 // A coroutine that parks used a blocking concurrency op (it has no
-                                // executor driving it) — unsupported; surface as a fault.
-                                Ok(Inner::Park(_)) | Ok(Inner::Yield) => {
+                                // executor driving it) — unsupported; surface as a fault. Likewise
+                                // `PageFault`: only an op-16 *process* child carries `fault_pager`,
+                                // never an inline-driven coroutine (defensive, not reachable).
+                                Ok(Inner::Park(_)) | Ok(Inner::Yield) | Ok(Inner::PageFault(_)) => {
                                     return Err(Trap::FiberFault)
                                 }
                                 // A co-fiber child never carries `debug`, so it cannot pause (S4).
@@ -11770,7 +11999,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let m = mem.as_ref().ok_or(Trap::Malformed)?;
                         Ok(Some(Reg::from_value(m.load(a, *offset, *op)?)))
                     })();
-                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                    if let Some(inner) =
+                        handle_mem(r, &mut frames[top], fault_yields, fault_pager, mem)?
+                    {
                         return Ok(inner);
                     }
                 }
@@ -11789,7 +12020,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             .store(a, *offset, *op, v)?;
                         Ok(None)
                     })();
-                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                    if let Some(inner) =
+                        handle_mem(r, &mut frames[top], fault_yields, fault_pager, mem)?
+                    {
                         return Ok(inner);
                     }
                 }
@@ -11797,7 +12030,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // call, through the same fault-yield handling.
                 other => {
                     let r = eval_inst(other, &frames[top].vals, mem);
-                    if let Some(inner) = handle_mem(r, &mut frames[top], fault_yields, mem)? {
+                    if let Some(inner) =
+                        handle_mem(r, &mut frames[top], fault_yields, fault_pager, mem)?
+                    {
                         return Ok(inner);
                     }
                 }

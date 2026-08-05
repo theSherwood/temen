@@ -55,6 +55,7 @@ fn demo_webgpu_mandelbrot() {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..svm_run::RunConfig::default()
     };
 
     for backend in [

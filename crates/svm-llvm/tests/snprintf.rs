@@ -62,6 +62,7 @@ fn check(name: &str, src: &str) {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     };
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         let run = inst

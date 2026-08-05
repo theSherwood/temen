@@ -41,6 +41,7 @@ fn main() {
         memory_size_log2: None,
         args: vec![b"arc_probe".to_vec()],
         env: vec![],
+        ..RunConfig::default()
     };
     let run = inst.run(backend, &cfg).expect("run probe guest");
 

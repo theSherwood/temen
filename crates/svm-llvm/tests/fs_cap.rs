@@ -33,6 +33,7 @@ fn config() -> RunConfig {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     }
 }
 
