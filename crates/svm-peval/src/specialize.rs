@@ -262,6 +262,14 @@ pub struct SpecConfig {
     /// only when that memory is dead once the residual returns. When the memory persists (its final
     /// value is read by the caller), pair this with write-back so the live cells are spilled on exit.
     pub rename_seed_from_image: bool,
+    /// **Additional** rename regions beyond [`rename`](Self::rename), with identical semantics (same
+    /// `rename_is_private` / `rename_seed_from_image` treatment). A real interpreter's mutable state is
+    /// several disjoint objects — a `lua_State`, its stack array, the current `CallInfo` — at unrelated
+    /// window addresses, so one contiguous range can't cover them without also sweeping in the
+    /// allocations between (a `global_State`, other frames). Each `[lo, hi)` here is SSA-lifted like
+    /// `rename`; an access is "in the region set" if it lies fully within *any* one, and disjoint only
+    /// if disjoint from *all*. Empty by default.
+    pub rename_extra: Vec<(u64, u64)>,
     /// **Outline calls** instead of inlining them: a direct (or constant-index indirect) call is
     /// specialized to a *separate* residual function — memoized per `(callee, arg pattern)` so call
     /// sites with the same static binding share one — and emitted as a residual `call`, producing a
@@ -441,6 +449,7 @@ fn build_func(
     let mut spec = Spec {
         module,
         config,
+        regions: all_regions(config),
         value_types,
         outline,
         selective,
@@ -627,6 +636,10 @@ fn dyn_args(args_abs: &[Abs]) -> Vec<u32> {
 struct Spec<'a> {
     module: &'a Module,
     config: &'a SpecConfig,
+    /// The full rename region set: [`SpecConfig::rename`] (if any) followed by
+    /// [`SpecConfig::rename_extra`], precomputed once. An access is renamed if it lies fully within
+    /// any one; disjoint only if disjoint from all.
+    regions: Vec<(u64, u64)>,
     /// Per-function, per-block, per-value source types (`value_types[func][block][value_idx]`) —
     /// used to type the SSA values threaded into a residual block as block parameters.
     value_types: &'a [Vec<Vec<ValType>>],
@@ -1311,7 +1324,7 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.config.rename, eff, width) {
+            if within_region(&self.regions, eff, width) {
                 // The renameable region must be resolved entirely abstractly. Only integer loads
                 // can be (the abstract domain tracks integer cells); a float load into it can't.
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
@@ -1383,7 +1396,7 @@ impl Spec<'_> {
         }
         // Dynamic address: with a region active it might alias the renamed stack, so refuse —
         // unless the caller has promised the region is private to the renamed accesses.
-        if self.config.rename.is_some() && !self.config.rename_is_private {
+        if !self.regions.is_empty() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -1414,7 +1427,7 @@ impl Spec<'_> {
         if let Abs::Const(Known::I64(base)) = env[addr as usize] {
             let base = base as u64;
             let eff = base.wrapping_add(offset);
-            if within_region(self.config.rename, eff, width) {
+            if within_region(&self.regions, eff, width) {
                 // Only integer stores can be renamed (the abstract domain tracks integer cells).
                 if !matches!(op.info().1, ValType::I32 | ValType::I64) {
                     trace_unsup!("store: non-integer into rename region op={:?}", op);
@@ -1438,7 +1451,7 @@ impl Spec<'_> {
                 mem.insert(eff, (width as u32, cell));
                 return Ok(None);
             }
-            if disjoint_from_region(self.config.rename, eff, width) {
+            if disjoint_from_region(&self.regions, eff, width) {
                 let addr = materialize(env[addr as usize], out, rnext);
                 let value = materialize(env[value as usize], out, rnext);
                 out.push(Inst::Store {
@@ -1454,7 +1467,7 @@ impl Spec<'_> {
         }
         // Dynamic address: with a region active it might alias the renamed stack, so refuse —
         // unless the caller has promised the region is private to the renamed accesses.
-        if self.config.rename.is_some() && !self.config.rename_is_private {
+        if !self.regions.is_empty() && !self.config.rename_is_private {
             return Err(SpecError::Unsupported);
         }
         let addr = materialize(env[addr as usize], out, rnext);
@@ -1504,7 +1517,7 @@ impl Spec<'_> {
             Some(t) => t,
             None => {
                 // A dynamic span might alias the renamed region unless the caller promised it private.
-                if self.config.rename.is_some() && !self.config.rename_is_private {
+                if !self.regions.is_empty() && !self.config.rename_is_private {
                     trace_unsup!("mem_copy: dynamic span with a non-private rename region");
                     return Err(SpecError::Unsupported);
                 }
@@ -1515,7 +1528,7 @@ impl Spec<'_> {
         if ln == 0 {
             return Ok(None);
         }
-        let region = self.config.rename;
+        let region = self.regions.as_slice();
         if within_region(region, da, ln) && within_region(region, sa, ln) {
             // A source cell straddling the span boundary can't be split abstractly.
             if mem.iter().any(|(&a, &(w, _))| {
@@ -1577,7 +1590,7 @@ impl Spec<'_> {
         let (da, byte, ln) = match consts {
             Some(t) => t,
             None => {
-                if self.config.rename.is_some() && !self.config.rename_is_private {
+                if !self.regions.is_empty() && !self.config.rename_is_private {
                     trace_unsup!("mem_fill: dynamic span with a non-private rename region");
                     return Err(SpecError::Unsupported);
                 }
@@ -1588,7 +1601,7 @@ impl Spec<'_> {
         if ln == 0 {
             return Ok(None);
         }
-        let region = self.config.rename;
+        let region = self.regions.as_slice();
         if within_region(region, da, ln) {
             if byte != 0 {
                 trace_unsup!("mem_fill: non-zero fill into the rename region byte={byte}");
@@ -1779,7 +1792,7 @@ impl Spec<'_> {
             // this function's results) isn't supported — there's no return point to append this
             // function's own out-cells at. Fail closed; a rename region forces it.
             let outline_tail = |args_abs: &[Abs]| -> Result<Terminator, SpecError> {
-                if self.config.rename.is_some() {
+                if !self.regions.is_empty() {
                     return Err(SpecError::Unsupported);
                 }
                 let (ridx, _) = request_outline(
@@ -2065,21 +2078,30 @@ fn cell_type(width: u32) -> ValType {
 }
 
 /// Whether `[eff, eff+width)` lies fully inside the renameable region.
-fn within_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
-    match region {
-        Some((lo, hi)) => eff >= lo && eff.checked_add(width).is_some_and(|end| end <= hi),
+fn within_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
+    let Some(end) = eff.checked_add(width) else {
+        return false;
+    };
+    regions.iter().any(|&(lo, hi)| eff >= lo && end <= hi)
+}
+
+/// Whether `[eff, eff+width)` is entirely outside **every** renameable region (vacuously true if the
+/// set is empty). An access that is neither within one region nor disjoint from all straddles a
+/// region boundary — the caller treats that as unsupported.
+fn disjoint_from_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
+    match eff.checked_add(width) {
+        Some(end) => regions.iter().all(|&(lo, hi)| end <= lo || eff >= hi),
         None => false,
     }
 }
 
-/// Whether `[eff, eff+width)` is entirely outside the renameable region (vacuously true if none).
-fn disjoint_from_region(region: Option<(u64, u64)>, eff: u64, width: u64) -> bool {
-    match region {
-        Some((lo, hi)) => eff
-            .checked_add(width)
-            .is_some_and(|end| end <= lo || eff >= hi),
-        None => true,
-    }
+/// The full rename region set: [`SpecConfig::rename`] then [`SpecConfig::rename_extra`].
+fn all_regions(config: &SpecConfig) -> Vec<(u64, u64)> {
+    config
+        .rename
+        .into_iter()
+        .chain(config.rename_extra.iter().copied())
+        .collect()
 }
 
 /// The byte width of a store op.
