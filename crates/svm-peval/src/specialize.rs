@@ -176,6 +176,12 @@ struct Frame {
 struct Task {
     frames: Vec<Frame>,
     mem: MemPattern,
+    /// The **entry seed** flag for deopt argument threading: `true` only for the initial entry-block
+    /// context, where the threaded entry arguments are the entry frame's own parameters (no extra
+    /// block params); `false` everywhere else, where they are reconstructed as extra block parameters.
+    /// Always `false` unless the deopt handler takes the entry's arguments, so it leaves every other
+    /// residual's memo partition unchanged.
+    seed: bool,
 }
 
 /// A frame with its SSA values resolved to concrete abstract values (constants or residual SSA
@@ -317,13 +323,46 @@ pub struct SpecConfig {
     /// plain memory **disjoint from every rename and constant region**. Under that promise a cut call
     /// preserves the rename cells across the boundary (so the loop-carried register file stays in SSA
     /// and the loop rolls) when [`rename_is_private`](Self::rename_is_private) is set; without the
-    /// private promise it conservatively spills-and-drops every live cell before the call (the callee
-    /// might alias the region). A cut callee that must *read* renamed state takes it as an explicit
-    /// argument; one that *mutates* renamed state is beyond this prototype (it would need the cell
-    /// threaded back as a result, as outlining does). Inline mode only; combining with
-    /// [`outline_calls`](Self::outline_calls) / [`selective_outline`](Self::selective_outline) is
-    /// rejected. Empty by default.
+    /// private promise it rejects rather than miscompile (an opaque callee might alias the region, and
+    /// neither preserving nor dropping the cell is sound). A cut callee that must *read or mutate*
+    /// renamed state uses [`cut_calls_touch_state`](Self::cut_calls_touch_state) instead. Inline mode
+    /// only; combining with [`outline_calls`](Self::outline_calls) /
+    /// [`selective_outline`](Self::selective_outline) is rejected. Empty by default.
     pub cut_calls: Vec<u32>,
+    /// **Cut calls that read/write the renamed state** (slice 1): a runtime call-out that touches the
+    /// interpreter's register file / VM state — a GC that scans the stack, a `poscall` that rewrites
+    /// registers. Same opacity as [`cut_calls`](Self::cut_calls) (emitted verbatim, results unknown,
+    /// callee carried), but the live rename cells are **spilled to the window before the call and
+    /// reloaded after** — so the callee observes the current state through memory and its writes are
+    /// seen by later renamed accesses. The rename region must alias the state the callee touches (as
+    /// with any live-backed rename). This is the general safepoint-spill discipline (a call is a
+    /// safepoint; live registers spill to the frame and reload), and it is interpreter-agnostic — it
+    /// operates on the generic rename region, nothing Lua-specific. Spilled/reloaded cells must be a
+    /// natural 4- or 8-byte width; anything else fails closed. Empty by default.
+    pub cut_calls_touch_state: Vec<u32>,
+    /// **Guard-and-deopt targets** (slice 2): `(func, block)` source blocks that are *cold paths* the
+    /// specializer must **not** project — a type-check failure, an overflow slow path, an error raise,
+    /// a GC-needed branch. When a dynamic branch would enter one, the residual instead **deopts**:
+    /// it spills all live rename cells to the window (making it a valid interpreter resume image) and
+    /// tail-calls [`deopt_handler`](Self::deopt_handler) to resume the original interpreter from that
+    /// state. Fast paths fold; cold paths bail out — the standard guarded-fast-path JIT discipline,
+    /// expressed generically over `(func, block)` so it fits any interpreter ported to svm, not just
+    /// Lua. Requires [`deopt_handler`](Self::deopt_handler). Empty by default.
+    pub deopt_targets: Vec<(u32, u32)>,
+    /// The resume function tail-called on a deopt (see [`deopt_targets`](Self::deopt_targets)),
+    /// carried into the residual like a cut callee. Two signatures are accepted, both returning the
+    /// entry's results (the tail-call forwards them):
+    ///
+    /// - **`() -> <entry results>`** — resumes purely from the **written-back window state** (the
+    ///   captured-VM-state model: the VM state, including a resumable `pc`, lives at known window
+    ///   addresses the handler reads). Nothing is threaded.
+    /// - **`<entry params> -> <entry results>`** — also receives the **entry's argument values**. The
+    ///   specializer threads the entry's dynamic parameters through the CFG to every deopt edge and
+    ///   passes them to the handler, so an interpreter whose input arrives as parameters (not only via
+    ///   the window) can resume. Constant entry arguments are baked in; dynamic ones are threaded.
+    ///
+    /// `None` unless [`deopt_targets`] is used.
+    pub deopt_handler: Option<u32>,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -399,14 +438,22 @@ pub fn specialize_with_config(
     // When outlining, the renamed region's live abstract cells are threaded across each residual call
     // boundary (passed in as extra arguments, returned as extra results); see `outline_call`. The
     // single-function inline path keeps the region entirely internal (no threading).
+    // Deopt targets require a handler; reject early so the config can't be silently ignored (with no
+    // cut callees and no handler, `carry_roots` would be empty and the plain inline path taken).
+    if !config.deopt_targets.is_empty() && config.deopt_handler.is_none() {
+        return Err(SpecError::Unsupported);
+    }
+    // Functions carried verbatim into the residual: every cut callee (opaque and state-touching) plus
+    // the deopt handler, closed over their direct calls. Empty ⇒ the plain single-function inline path.
+    let carry_roots = cut_roots(config);
     let funcs = if config.outline_calls || config.selective_outline {
-        if !config.cut_calls.is_empty() {
-            // The cut set carries callees into the residual at inline-mode indices (entry 0, carried
-            // after); the outline driver numbers functions differently, so the combination is rejected.
+        if !carry_roots.is_empty() {
+            // Carry numbers residual functions inline-style (entry 0, carried after); the outline
+            // driver numbers them differently, so the combination is rejected.
             return Err(SpecError::Unsupported);
         }
         outline_funcs(module, config, &value_types, func, entry_pattern)?
-    } else if config.cut_calls.is_empty() {
+    } else if carry_roots.is_empty() {
         vec![
             build_func(
                 module,
@@ -417,16 +464,32 @@ pub fn specialize_with_config(
                 &entry_pattern,
                 &Vec::new(),
                 &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                false,
                 false,
             )?
             .0,
         ]
     } else {
-        // Cut set: reserve residual index 0 for the specialized entry, then carry each cut callee and
-        // its transitive direct-call closure verbatim at indices 1.. — so an opaque cut `call` in the
-        // entry resolves. `cut` maps a source callee index to its residual index; `carried` is the
-        // closure in the order the indices were assigned.
-        let (cut, carried) = plan_cut_carry(module, func, &config.cut_calls)?;
+        // Reserve residual index 0 for the specialized entry, then carry each root and its transitive
+        // direct-call closure verbatim at indices 1.. — so an opaque cut `call` / deopt tail-call
+        // resolves. `cut` maps a source callee index to its residual index; `carried` is the closure
+        // in the order the indices were assigned.
+        let (cut, carried) = plan_cut_carry(module, func, &carry_roots)?;
+        // Deopt targets (as a set) and the handler's residual index. Validated: deopt requires a
+        // handler whose signature matches the entry (a deopt tail-calls it), and the handler must be
+        // carried (it is, via `cut_roots`). Built with explicit inserts, not `.collect()` — a
+        // `BTreeSet::from_iter` sorts via `slice::sort`, which the LLVM→IR on-ramp can't resolve.
+        let mut deopt_targets: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for &t in &config.deopt_targets {
+            deopt_targets.insert(t);
+        }
+        let (deopt_handler, deopt_pass_args) =
+            match resolve_deopt_handler(module, config, func, &cut)? {
+                Some((ridx, pass)) => (Some(ridx), pass),
+                None => (None, false),
+            };
         let mut funcs = vec![
             build_func(
                 module,
@@ -437,6 +500,9 @@ pub fn specialize_with_config(
                 &entry_pattern,
                 &Vec::new(),
                 &cut,
+                &deopt_targets,
+                deopt_handler,
+                deopt_pass_args,
                 false,
             )?
             .0,
@@ -480,6 +546,9 @@ fn build_func(
     pattern: &ParamPattern,
     mem_pat: &MemPattern,
     cut: &BTreeMap<u32, u32>,
+    deopt_targets: &BTreeSet<(u32, u32)>,
+    deopt_handler: Option<u32>,
+    deopt_pass_args: bool,
     thread_cells: bool,
 ) -> Result<(Func, CellSig), SpecError> {
     let cf = module
@@ -498,6 +567,17 @@ fn build_func(
             residual_params.push(cell_type(width));
         }
     }
+    // The types of the entry's dynamic parameters — the block-parameter types of the deopt argument-
+    // threading channel (see [`Spec::cur_thread`]). Empty unless the handler takes the entry's args.
+    let thread_types: Vec<ValType> = if deopt_pass_args {
+        pattern
+            .iter()
+            .zip(&cf.params)
+            .filter_map(|(slot, ty)| slot.is_none().then_some(*ty))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Selective outlining only makes sense when outlining is enabled; when it is, populate the
     // per-frame recursion signatures (otherwise they stay empty, leaving the memo key unchanged).
@@ -511,6 +591,12 @@ fn build_func(
         selective,
         thread_cells,
         cut,
+        deopt_targets,
+        deopt_handler,
+        deopt_pass_args,
+        entry_pattern: pattern,
+        cur_thread: Vec::new(),
+        thread_types,
         out_cells: None,
         memo: BTreeMap::new(),
         queue: VecDeque::new(),
@@ -521,6 +607,8 @@ fn build_func(
     } else {
         Vec::new()
     };
+    // The initial context is the deopt entry seed when the handler takes the entry's arguments (see
+    // [`Task::seed`]); otherwise `false`, leaving the memo partition unchanged.
     spec.intern(
         vec![Frame {
             func: callee,
@@ -530,6 +618,7 @@ fn build_func(
             entry,
         }],
         mem_pat.clone(),
+        deopt_pass_args,
     );
 
     let mut blocks = Vec::new();
@@ -592,6 +681,9 @@ fn outline_funcs(
         &entry_pattern,
         &Vec::new(),
         &BTreeMap::new(),
+        &BTreeSet::new(),
+        None,
+        false,
         false,
     )?;
     state.borrow_mut().funcs[0] = Some(entry_func);
@@ -661,6 +753,9 @@ fn request_outline(
         &key.1,
         &key.2,
         &BTreeMap::new(),
+        &BTreeSet::new(),
+        None,
+        false,
         true,
     )?;
     let mut s = state.borrow_mut();
@@ -715,13 +810,35 @@ struct Spec<'a> {
     /// [`SpecConfig::cut_calls`]). A call whose callee is a key is emitted as an opaque residual `call`
     /// to the mapped (carried) function instead of being inlined. Empty unless the cut set is active.
     cut: &'a BTreeMap<u32, u32>,
+    /// Guard-and-deopt targets ([`SpecConfig::deopt_targets`]) as `(func, block)`. Reaching one of
+    /// these blocks emits a deopt exit instead of projecting it. Empty unless deopt is active (and only
+    /// on the inline entry build — carried/outlined functions never carry deopt targets).
+    deopt_targets: &'a BTreeSet<(u32, u32)>,
+    /// The residual function index of the deopt resume handler ([`SpecConfig::deopt_handler`]), tail-
+    /// called on a deopt. `None` unless deopt is active.
+    deopt_handler: Option<u32>,
+    /// Whether the deopt handler takes the entry's arguments (`<entry params> -> R`) rather than
+    /// resuming purely from the window (`() -> R`). When set, the entry's dynamic parameters are
+    /// threaded through the CFG (see [`Spec::cur_thread`]) and passed to the handler at each deopt.
+    deopt_pass_args: bool,
+    /// The entry function's [`ParamPattern`]: the argument shape a deopt tail-call reconstructs for the
+    /// handler (constant lanes baked, dynamic lanes taken from [`Spec::cur_thread`]). Only read when
+    /// `deopt_pass_args` is set.
+    entry_pattern: &'a ParamPattern,
+    /// **Working state, set per built block.** The current block's threaded entry-argument values (the
+    /// dynamic entry params, in entry order), read by [`Spec::branch_to`] to forward them along every
+    /// edge and by the deopt emitter to build the handler call. Empty unless `deopt_pass_args`.
+    cur_thread: Vec<Abs>,
+    /// The block-parameter types of the [`Spec::cur_thread`] channel — the entry's dynamic-parameter
+    /// types, reconstructed as extra block params on every non-seed block. Empty unless `deopt_pass_args`.
+    thread_types: Vec<ValType>,
     /// The threaded out-cell signature (`(addr, width)` by address), fixed at the first `return` and
     /// required to match at every other return. `None` until the first return; stays `None` when
     /// nothing is threaded.
     out_cells: Option<CellSig>,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
-    memo: BTreeMap<(Vec<Frame>, MemPattern), u32>,
+    memo: BTreeMap<(Vec<Frame>, MemPattern, bool), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }
@@ -729,9 +846,11 @@ struct Spec<'a> {
 impl Spec<'_> {
     /// Get (or create) the residual block id for a context, enqueuing it the first time it is
     /// seen. Ids are assigned in enqueue order and blocks are produced in that same (FIFO) order,
-    /// so id == position in the output `blocks`.
-    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern) -> u32 {
-        let key = (frames, mem);
+    /// so id == position in the output `blocks`. `seed` is the deopt entry-seed flag (see
+    /// [`Task::seed`]); it is `false` for every non-initial context and always `false` unless deopt
+    /// argument threading is active, so it leaves the memo partition unchanged in the common case.
+    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern, seed: bool) -> u32 {
+        let key = (frames, mem, seed);
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
@@ -740,6 +859,7 @@ impl Spec<'_> {
         self.queue.push_back(Task {
             frames: key.0.clone(),
             mem: key.1.clone(),
+            seed,
         });
         self.memo.insert(key, id);
         id
@@ -819,6 +939,17 @@ impl Spec<'_> {
                 }
             }
         }
+        // Deopt argument threading: on every non-seed block, the entry's dynamic arguments arrive as
+        // extra block parameters, declared *after* the memory cells — the fixed position `branch_to`
+        // forwards them at. The entry seed block instead sources them from its own parameters (below).
+        let mut thread_abs: Vec<Abs> = Vec::new();
+        if self.deopt_pass_args && !task.seed {
+            for &ty in &self.thread_types {
+                thread_abs.push(Abs::Dyn(rnext));
+                rnext += 1;
+                params.push(ty);
+            }
+        }
 
         // Execute the active (innermost) frame's block from its resume point. `fuel` bounds any
         // straight-line call inlining within this block.
@@ -829,6 +960,41 @@ impl Spec<'_> {
             mut env,
             entry: active_entry,
         } = frames.pop().expect("a context has at least one frame");
+
+        // Seed the threading channel at the entry block: the threaded arguments *are* the entry's own
+        // dynamic parameters (its env here), so no extra params are declared. Then publish the current
+        // block's threaded values for `branch_to` and the deopt emitter to read.
+        if self.deopt_pass_args && task.seed {
+            thread_abs = self
+                .entry_pattern
+                .iter()
+                .zip(&env)
+                .filter_map(|(slot, &a)| slot.is_none().then_some(a))
+                .collect();
+        }
+        self.cur_thread = thread_abs;
+
+        // Guard-and-deopt: entering a cold target block bails to the resume handler instead of
+        // projecting the block (which would drag in the interpreter's cold, stateful machinery). Spill
+        // all live rename cells to the window — making it a valid interpreter resume image — then tail-
+        // call the handler, which resumes from that state (and, for a `<entry params> -> R` handler,
+        // from the threaded entry arguments). Deopt targets are only set on the inline entry.
+        if let Some(handler) = self.deopt_handler {
+            if self.deopt_targets.contains(&(active_func, active_block)) {
+                let mut out: Vec<Inst> = Vec::new();
+                self.write_back_cells(&mem, &mut out, &mut rnext)?;
+                let args = self.deopt_handler_args(&mut out, &mut rnext);
+                return Ok(svm_ir::Block {
+                    params,
+                    insts: out,
+                    term: Terminator::ReturnCall {
+                        func: handler,
+                        args,
+                    },
+                });
+            }
+        }
+
         let src = &module.funcs[active_func as usize].blocks[active_block as usize];
         let mut out: Vec<Inst> = Vec::new();
         let mut fuel = INLINE_FUEL;
@@ -919,9 +1085,15 @@ impl Spec<'_> {
             if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
                 // Cut set: a call-out we deliberately keep opaque (see [`SpecConfig::cut_calls`]).
                 // Emit it as a residual `call` to the carried callee and treat its results as
-                // unknowns — never inline or fold through it.
-                if let Some(&ridx) = self.cut.get(&callee) {
-                    let results = self.emit_cut_call(ridx, callee, &args_abs, mem, out, rnext)?;
+                // unknowns — never inline or fold through it. Only *explicitly listed* callees are cut;
+                // the transitive closure is carried so cut callees resolve, but a direct call to a
+                // closure member is inlined as usual. State-touching callees spill+reload the region.
+                let opaque = self.config.cut_calls.contains(&callee);
+                let touches = self.config.cut_calls_touch_state.contains(&callee);
+                if opaque || touches {
+                    let ridx = self.cut[&callee];
+                    let results =
+                        self.emit_cut_call(ridx, callee, &args_abs, touches, mem, out, rnext)?;
                     env.extend(results);
                     continue;
                 }
@@ -1038,26 +1210,36 @@ impl Spec<'_> {
     ///
     /// **Memory across the boundary.** `mem` holds only rename-region cells; plain window memory is
     /// never cached, so the callee's plain-memory reads/writes already flow faithfully through the
-    /// residual loads/stores around this call (the caller promises the callee's footprint is disjoint
-    /// from every rename and constant region — [`SpecConfig::cut_calls`]). Under the
-    /// [`rename_is_private`](SpecConfig::rename_is_private) promise the rename cells are private to the
-    /// renamed accesses, so they are **preserved** across the call and the loop-carried register file
-    /// stays in SSA. Without that promise an opaque callee might alias the region, and there is no
-    /// sound recovery — dropping a live cell would make a later in-region load read the region's seed
-    /// (in-region loads never residualize), silently losing the write — so a cut call with live
-    /// unprivate region cells is rejected rather than miscompiled.
+    /// residual loads/stores around this call.
+    ///
+    /// - `touches_state == false` (an opaque [`SpecConfig::cut_calls`] callee): the callee is promised
+    ///   not to touch the rename region. Under [`rename_is_private`](SpecConfig::rename_is_private) the
+    ///   cells are **preserved** across the call (the loop-carried register file stays in SSA and the
+    ///   loop rolls). Without that promise the callee might alias the region, and neither preserving nor
+    ///   dropping is sound — a dropped cell would make a later in-region load read the region's seed —
+    ///   so it is rejected rather than miscompiled.
+    /// - `touches_state == true` (a [`SpecConfig::cut_calls_touch_state`] callee): the live cells are
+    ///   **spilled to the window before the call and reloaded after** (the safepoint-spill discipline),
+    ///   so the callee reads the current state through memory and its writes are seen by later renamed
+    ///   accesses. Reloaded cells become fresh unknowns.
+    #[allow(clippy::too_many_arguments)]
     fn emit_cut_call(
         &self,
         ridx: u32,
         callee: u32,
         args_abs: &[Abs],
+        touches_state: bool,
         mem: &mut BTreeMap<u64, (u32, Abs)>,
         out: &mut Vec<Inst>,
         rnext: &mut u32,
     ) -> Result<Vec<Abs>, SpecError> {
-        // `mem` holds only rename-region cells. Without the private promise an opaque callee could
-        // alias them, and neither preserving nor dropping is sound (see the doc comment) — refuse.
-        if !self.config.rename_is_private && !mem.is_empty() {
+        if touches_state {
+            // Spill the live state to the window so the opaque callee sees it. (Reload happens after
+            // the call, below — the cells must survive `mem` until then.)
+            self.spill_cells_natural(mem, out, rnext)?;
+        } else if !self.config.rename_is_private && !mem.is_empty() {
+            // `mem` holds only rename-region cells. Without the private promise an opaque non-touching
+            // callee could still alias them, and neither preserving nor dropping is sound — refuse.
             trace_unsup!("cut call with live non-private region cells");
             return Err(SpecError::Unsupported);
         }
@@ -1068,7 +1250,62 @@ impl Spec<'_> {
             .collect();
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
-        Ok((0..nres).map(|_| Abs::Dyn(bump(rnext))).collect())
+        let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
+        if touches_state {
+            // The opaque callee may have rewritten the state: reload every cell from the window so
+            // later renamed accesses see its writes (each becomes a fresh unknown).
+            self.reload_cells_natural(mem, out, rnext)?;
+        }
+        Ok(results)
+    }
+
+    /// Spill every live rename cell to the window at its natural 4/8-byte width (a `store`), leaving
+    /// `mem` intact — the caller reloads afterward. Non-natural widths fail closed.
+    fn spill_cells_natural(
+        &self,
+        mem: &BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<(), SpecError> {
+        for (&eff, &(width, val)) in mem.iter() {
+            let op = natural_store_op(width).ok_or(SpecError::Unsupported)?;
+            out.push(Inst::ConstI64(eff as i64));
+            let addr = bump(rnext);
+            let value = materialize(val, out, rnext);
+            out.push(Inst::Store {
+                op,
+                addr,
+                value,
+                offset: 0,
+                align: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reload every rename cell from the window at its natural 4/8-byte width, replacing its abstract
+    /// value with a fresh unknown backed by the `load`. The inverse of [`Self::spill_cells_natural`],
+    /// run after an opaque state-touching call so its writes become visible.
+    fn reload_cells_natural(
+        &self,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<(), SpecError> {
+        let addrs: Vec<(u64, u32)> = mem.iter().map(|(&a, &(w, _))| (a, w)).collect();
+        for (eff, width) in addrs {
+            let op = natural_load_op(width).ok_or(SpecError::Unsupported)?;
+            out.push(Inst::ConstI64(eff as i64));
+            let addr = bump(rnext);
+            out.push(Inst::Load {
+                op,
+                addr,
+                offset: 0,
+                align: 0,
+            });
+            mem.insert(eff, (width, Abs::Dyn(bump(rnext))));
+        }
+        Ok(())
     }
 
     /// If `inst` is an inlinable call — a direct [`Inst::Call`], or an [`Inst::CallIndirect`] whose
@@ -2061,6 +2298,28 @@ impl Spec<'_> {
         Ok(())
     }
 
+    /// The argument list for a deopt tail-call to the resume handler. Empty for a `() -> R` handler;
+    /// for a `<entry params> -> R` handler, the entry's arguments in order — constant lanes
+    /// materialized as `const` insts, dynamic lanes taken from the threaded channel
+    /// ([`Spec::cur_thread`], set for the current block in `build_block`).
+    fn deopt_handler_args(&self, out: &mut Vec<Inst>, rnext: &mut u32) -> Vec<u32> {
+        if !self.deopt_pass_args {
+            return Vec::new();
+        }
+        let mut thread = self.cur_thread.iter();
+        let mut args = Vec::with_capacity(self.entry_pattern.len());
+        for slot in self.entry_pattern {
+            let abs = match slot {
+                Some(k) => Abs::Const(*k),
+                None => *thread
+                    .next()
+                    .expect("one threaded value per dynamic entry param"),
+            };
+            args.push(materialize(abs, out, rnext));
+        }
+        args
+    }
+
     /// Resolve one outgoing edge into a residual block id + dynamic arguments. The successor inherits
     /// the full call stack and the current abstract memory; constant lanes join the context, dynamic
     /// lanes are passed as residual block arguments in the canonical order (frames outermost→
@@ -2102,7 +2361,18 @@ impl Spec<'_> {
                 }
             }
         }
-        let id = self.intern(frames, mem_pat);
+        // Forward the threaded entry arguments (deopt arg passing) as the edge's trailing arguments,
+        // after the memory cells — the fixed position `build_block` reconstructs them at. They are
+        // always dynamic, so they add no memo diversity; the successor is never the entry seed.
+        for &a in &self.cur_thread {
+            dyn_args.push(match a {
+                Abs::Dyn(i) => i,
+                // The threaded lanes are the entry's dynamic params (always `Dyn`); a `Const` here
+                // would mean a constant entry arg leaked into the channel, which never happens.
+                Abs::Const(_) => unreachable!("threaded entry args are always dynamic"),
+            });
+        }
+        let id = self.intern(frames, mem_pat, false);
         (id, dyn_args)
     }
 }
@@ -2225,6 +2495,68 @@ fn disjoint_from_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
         Some(end) => regions.iter().all(|&(lo, hi)| end <= lo || eff >= hi),
         None => false,
     }
+}
+
+/// The source functions carried verbatim into the residual: every cut callee (opaque
+/// [`SpecConfig::cut_calls`] and state-touching [`SpecConfig::cut_calls_touch_state`]) plus the deopt
+/// handler ([`SpecConfig::deopt_handler`], carried only when [`SpecConfig::deopt_targets`] is used).
+/// Deduplicated, in a deterministic order. Empty ⇒ the plain single-function inline path.
+fn cut_roots(config: &SpecConfig) -> Vec<u32> {
+    let mut roots: Vec<u32> = Vec::new();
+    let mut push = |f: u32| {
+        if !roots.contains(&f) {
+            roots.push(f);
+        }
+    };
+    for &f in &config.cut_calls {
+        push(f);
+    }
+    for &f in &config.cut_calls_touch_state {
+        push(f);
+    }
+    if !config.deopt_targets.is_empty() {
+        if let Some(h) = config.deopt_handler {
+            push(h);
+        }
+    }
+    roots
+}
+
+/// Validate and resolve the deopt handler (see [`SpecConfig::deopt_handler`]) to its residual index.
+/// `Ok(None)` when no deopt targets are configured. Otherwise a handler must be named, its signature
+/// must be `() -> <entry results>` (a deopt tail-calls it with no args, forwarding its results), and it
+/// must have been carried (it is — [`cut_roots`] includes it). Fails [`SpecError::Unsupported`] on a
+/// missing/mis-typed handler, [`SpecError::BadFunc`] on an out-of-range index.
+fn resolve_deopt_handler(
+    module: &Module,
+    config: &SpecConfig,
+    entry: u32,
+    cut: &BTreeMap<u32, u32>,
+) -> Result<Option<(u32, bool)>, SpecError> {
+    if config.deopt_targets.is_empty() {
+        return Ok(None);
+    }
+    let handler = config.deopt_handler.ok_or(SpecError::Unsupported)?;
+    let hf = module
+        .funcs
+        .get(handler as usize)
+        .ok_or(SpecError::BadFunc)?;
+    let ef = module.funcs.get(entry as usize).ok_or(SpecError::BadFunc)?;
+    if hf.results != ef.results {
+        trace_unsup!("deopt handler results must match the entry's");
+        return Err(SpecError::Unsupported);
+    }
+    // Two supported shapes: `() -> R` resumes purely from the written-back window; `P -> R` (same
+    // params as the entry) also receives the entry's argument values, threaded to the deopt edge.
+    let pass_args = if hf.params.is_empty() {
+        false
+    } else if hf.params == ef.params {
+        true
+    } else {
+        trace_unsup!("deopt handler must be `() -> R` or `<entry params> -> R`");
+        return Err(SpecError::Unsupported);
+    };
+    Ok(Some((cut[&handler], pass_args)))
 }
 
 /// Plan the cut-set carry (see [`SpecConfig::cut_calls`]). From the `roots` (the cut callees) walk the
@@ -2423,6 +2755,28 @@ fn writeback_store_op(width: u32) -> Option<StoreOp> {
         2 => StoreOp::I32_16,
         4 => StoreOp::I32,
         8 => StoreOp::I64,
+        _ => return None,
+    })
+}
+
+/// The full-width store op for a natural 4/8-byte cell — the spill side of a state-touching cut call
+/// ([`Spec::spill_cells_natural`]). Narrow cells aren't round-trip-reloadable as identity, so only the
+/// two natural widths are supported; anything else fails closed.
+fn natural_store_op(width: u32) -> Option<StoreOp> {
+    Some(match width {
+        4 => StoreOp::I32,
+        8 => StoreOp::I64,
+        _ => return None,
+    })
+}
+
+/// The full-width load op matching [`natural_store_op`] — the reload side ([`Spec::reload_cells_natural`]).
+/// Loads the whole cell back as its natural integer type (`i32` for width 4, `i64` for width 8), which
+/// is the cell's [`cell_type`], so the reloaded value re-renames as the identity.
+fn natural_load_op(width: u32) -> Option<LoadOp> {
+    Some(match width {
+        4 => LoadOp::I32,
+        8 => LoadOp::I64,
         _ => return None,
     })
 }
