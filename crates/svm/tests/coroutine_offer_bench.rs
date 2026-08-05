@@ -22,6 +22,14 @@
 //! same as `serving_bench` documents: the bespoke lane runs natively on all three backends, while
 //! the offer lane's op-14 mint + parking live call does not `serve_qualifies` on `Backend::Jit`,
 //! so that lane folds to the tree-walk oracle — read the JIT column accordingly.
+//!
+//! Observed shape at pin time (ratios matter, not absolute ns): the offer transport runs
+//! **~9-10x the bespoke resume/yield** on both interp tiers (~250 ns bespoke vs ~2.4 us offer per
+//! round) — a bespoke resume is a direct in-Rust call into a coroutine slot, while an offer call
+//! pays admission + window fork + park/wake per round even with the provider already parked at
+//! `svc.wait`. This is the §2 decision input: 2.2/2.3 cannot simply swap transports — either the
+//! offer hot path grows a parked-provider fast lane cheap enough to meet `paging_bench`'s pin, or
+//! the gate forces a rethink of the deletion's scope.
 
 use std::time::Instant;
 
