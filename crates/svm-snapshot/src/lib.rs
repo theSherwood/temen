@@ -157,7 +157,7 @@ const B_STREAM: u8 = 0;
 const B_EXIT: u8 = 1;
 const B_CLOCK: u8 = 2;
 const B_MEMORY: u8 = 3;
-const B_YIELDER: u8 = 4;
+// B_YIELDER (4) retired with the §2.3 coroutine deletion; the tag stays reserved.
 const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
 const B_LIVE_IMPL: u8 = 7;
@@ -1042,7 +1042,6 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         DurableBinding::Exit => b.push(B_EXIT),
         DurableBinding::Clock => b.push(B_CLOCK),
         DurableBinding::Memory => b.push(B_MEMORY),
-        DurableBinding::Yielder => b.push(B_YIELDER),
         DurableBinding::AddressSpace { base, size } => {
             b.push(B_ADDRESS_SPACE);
             write_uleb(b, base);
@@ -1081,7 +1080,8 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_EXIT => DurableBinding::Exit,
         B_CLOCK => DurableBinding::Clock,
         B_MEMORY => DurableBinding::Memory,
-        B_YIELDER => DurableBinding::Yielder,
+        // B_YIELDER (5): retired with the §2.3 coroutine deletion — a pre-2.3 artifact carrying
+        // one fails decode closed rather than resurrecting a dead cap kind.
         B_ADDRESS_SPACE => DurableBinding::AddressSpace {
             base: r.uleb()?,
             size: r.uleb()?,

@@ -1,113 +1,29 @@
-//! CONSOLIDATION.md §2.1 — the **value-coroutine ⇄ offer equivalence** pin and latency probe
-//! (probe is run on demand, not in CI):
+//! CONSOLIDATION.md §2.1/§2.3 — the **value round-trip** pin and latency probe on the unified
+//! offer transport (probe is run on demand, not in CI):
 //!
 //!   cargo test -p svm --release --test coroutine_offer_bench -- --ignored --nocapture
 //!
-//! The §2 collapse says a coroutine child *is* a process-provider child: `resume` is a `cap.call`
-//! through a live offer, `yield` is the handler replying. This file makes that claim executable
-//! **before** anything is deleted, as two programs computing the identical checksum
-//! `Σ_{i=0}^{n-1}(i+1) = n(n+1)/2`:
+//! Until §2.3 this file raced the offer lane against the bespoke coroutine ops (Instantiator
+//! ops 2/3 + `Yielder`) it replaced; the collapse deleted those ops, so the offer lane is now the
+//! only transport and this pin holds the absolute per-round shape: the parent spawns a serving
+//! child (op 11), mints a live offer over its `adder` export (op 14), and calls `add(i, 1)`
+//! through it n times, the child replying from a `svc.wait` loop — checksum
+//! `Σ_{i=0}^{n-1}(i+1) = n(n+1)/2`. Known asymmetry, same as `serving_bench` documents: the
+//! op-14 mint + parking live call does not `serve_qualifies` on `Backend::Jit`, so that lane
+//! folds to the tree-walk oracle — read the JIT row accordingly.
 //!
-//!   - **bespoke** — the parent `spawn_coroutine`s a child (Instantiator op 2) and drives n
-//!     resume/yield rounds: resume k delivers `k`, the child yields `k+1` (returning on the last
-//!     round so the parent never abandons a suspended coroutine).
-//!   - **offer** — `serving_bench`'s shape verbatim: the parent spawns a serving child (op 11),
-//!     mints a live offer over its `adder` export (op 14), and calls `add(i, 1)` through it n
-//!     times, the child replying from a `svc.wait` loop.
-//!
-//! The CI pin asserts both programs agree with each other and across all three backends — the
-//! semantic half of the §2 gate. The `#[ignore]`d probe times both transports per-round; the
-//! offer ÷ bespoke ratio per tier is the migration cost §2.3 must accept (or drive down) on the
-//! plain value-ping shape, complementing `paging_bench`'s fault-service pin. Known asymmetry,
-//! same as `serving_bench` documents: the bespoke lane runs natively on all three backends, while
-//! the offer lane's op-14 mint + parking live call does not `serve_qualifies` on `Backend::Jit`,
-//! so that lane folds to the tree-walk oracle — read the JIT column accordingly.
-//!
-//! Observed shape (ratios matter, not absolute ns). The first pin of this probe read ~9-10x
-//! offer-over-bespoke on the interp tiers — but the 2.1b profile showed that run measured the
-//! **queued transport**: the CALLS.md 4d direct-handoff lane existed and was semantically pinned,
-//! yet sat behind a `Host::set_handoff` knob no `svm-run` entry point exposed, so every round paid
-//! ticket + queue + two cross-thread futex wakes (~55% of the delta was scheduling alone). With
-//! `RunConfig::handoff` now on by default, the same shape reads **~3x bespoke on the interp tiers**
-//! (~250 ns bespoke vs ~740 ns offer — the residual is the admission word, per-call revocation
-//! check, provider dispatch, and serve accounting), and on the JIT the offer lane **beats the
-//! bespoke coroutine ~3x** (~1.1 us vs ~3.5 us — the bespoke path pays per-switch committed-page
-//! window mirroring; the offer path rides the cap-thunk handoff over shared backing). Remaining §2
-//! decision input: a parked-provider cache (reusable handler frame + fiber slot, no ticket/stash)
-//! has an estimated ~300-450 ns floor if the residual 3x on interp tiers matters for 2.3.
+//! Deletion-time record (the §2.3 evidence, measured on the last commit carrying both lanes):
+//! bespoke resume/yield ~250 ns/round interp; offer ~740 ns interp (the residual = admission
+//! word, per-call revocation check, provider dispatch, serve accounting — the price of a real
+//! concurrent child); on the JIT the offer lane **beat** the bespoke coroutine ~3x (~1.1 us vs
+//! ~3.5 us of per-switch committed-page window mirroring). The first 9-10x reading predated
+//! `RunConfig::handoff` (2.1b) — it measured the queued transport. A parked-provider cache
+//! (~300-450 ns floor) remains the priced-but-not-queued option if ~740 ns ever matters.
 
 use std::time::Instant;
 
 use svm_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use svm_text::parse_module;
-
-/// The bespoke lane: n resume/yield rounds through Instantiator op 2 / op 3 and the child's
-/// `Yielder` (iface 7), whose handle arrives as the child's entry argument (the spawn arm passes
-/// `Value::I64(yielder_handle)`). Child carve: 64 KiB window at offset 64 KiB in a 128 KiB parent.
-fn bespoke_program(n: u64) -> String {
-    format!(
-        "\
-memory 17
-data 0 \"vm\"
-import 0 \"exit\" (i32) -> ()
-
-func 0 () -> () {{
-block 0 () {{
-  vp = i64.const 0
-  vl = i64.const 2
-  vh = cap.self.resolve vp vl
-  ventry = i64.const 1
-  voff = i64.const 65536
-  vsl = i64.const 16
-  vq = i64.const 0
-  vch = cap.call 6 2 (i64, i64, i64, i64) -> (i32) vh (ventry, voff, vsl, vq)
-  vi0 = i64.const 0
-  vacc0 = i64.const 0
-  br 1(vh, vch, vi0, vacc0)
-}}
-block 1 (vh1: i32, vch1: i32, vi: i64, vacc: i64) {{
-  vst, vy = cap.call 6 3 (i32, i64) -> (i32, i64) vh1 (vch1, vi)
-  vacc2 = i64.add vacc vy
-  vone = i64.const 1
-  vi2 = i64.add vi vone
-  vn = i64.const {n}
-  vcmp = i64.lt_s vi2 vn
-  br_if vcmp 1(vh1, vch1, vi2, vacc2) 2(vacc2)
-}}
-block 2 (vaccf: i64) {{
-  vc = i32.wrap_i64 vaccf
-  call.import 0 (vc)
-  unreachable
-  }}
-}}
-
-func 1 (i64) -> (i64) {{
-block 0 (v0: i64) {{
-  vd0 = i64.const 0
-  vk0 = i64.const 1
-  br 1(v0, vd0, vk0)
-}}
-block 1 (vyh: i64, vd: i64, vk: i64) {{
-  vone = i64.const 1
-  vy = i64.add vd vone
-  vn = i64.const {n}
-  vcmp = i64.lt_s vk vn
-  br_if vcmp 2(vyh, vk, vy) 3(vy)
-}}
-block 2 (vyh2: i64, vk2: i64, vy2: i64) {{
-  vhh = i32.wrap_i64 vyh2
-  vr = cap.call 7 0 (i64) -> (i64) vhh (vy2)
-  vone2 = i64.const 1
-  vk3 = i64.add vk2 vone2
-  br 1(vyh2, vr, vk3)
-}}
-block 3 (vyf: i64) {{
-  return vyf
-  }}
-}}
-",
-    )
-}
 
 /// The offer lane — `serving_bench::serving_program` duplicated verbatim (test targets cannot
 /// share code without a fixture crate; the duplication is deliberate so the two probes stay
@@ -217,58 +133,45 @@ fn run(backend: Backend, src: &str) -> i32 {
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
-/// Correctness pin (runs in CI): the bespoke resume/yield rounds and the offer serve rounds
-/// compute the identical checksum on every backend — the CONSOLIDATION.md §2 collapse statement
-/// (`resume` = `cap.call`, `yield` = the handler replying) as an executable equivalence.
+/// Correctness pin (runs in CI): n offer serve rounds compute the expected checksum on every
+/// backend — the §2 collapse statement (`resume` = `cap.call`, `yield` = the handler replying)
+/// with the offer transport as the only transport.
 #[test]
-fn bespoke_and_offer_rounds_agree_across_backends() {
+fn offer_rounds_agree_across_backends() {
     let n = 32;
     let want = expected_exit(n);
-    let bespoke = bespoke_program(n);
     let offer = offer_program(n);
     for b in BACKENDS {
-        assert_eq!(run(b, &bespoke), want, "{b:?}: bespoke resume/yield lane");
         assert_eq!(run(b, &offer), want, "{b:?}: offer serve lane");
     }
 }
 
-/// The latency probe. Ignored (timing is machine-dependent and not a CI gate); the offer ÷
-/// bespoke per-round ratio per backend is the §2.3 migration cost on the value-ping shape.
+/// The latency probe. Ignored (timing is machine-dependent and not a CI gate); the per-round
+/// numbers track the offer transport against the deletion-time record in the header.
 #[test]
 #[ignore = "perf probe — run with --ignored --nocapture"]
 fn value_roundtrip_latency() {
     let n = 20_000u64;
     let want = expected_exit(n);
-    let lanes = [("bespoke", bespoke_program(n)), ("offer", offer_program(n))];
+    let src = offer_program(n);
 
     // Correctness first — never benchmark a miscompile.
-    for (name, src) in &lanes {
-        for b in BACKENDS {
-            assert_eq!(run(b, src), want, "{b:?}/{name}: checksum before timing");
-        }
+    for b in BACKENDS {
+        assert_eq!(run(b, &src), want, "{b:?}: checksum before timing");
     }
 
-    println!("\nvalue round-trip — {n} rounds, per-round ns (offer ÷ bespoke in brackets):");
+    println!("\nvalue round-trip — {n} rounds, per-round ns:");
     for b in BACKENDS {
-        let mut per: [f64; 2] = [0.0; 2];
-        for (li, (_, src)) in lanes.iter().enumerate() {
-            // Warm, then best-of-5 to shed scheduler noise.
-            run(b, src);
-            let mut best = f64::INFINITY;
-            for _ in 0..5 {
-                let t = Instant::now();
-                let got = run(b, src);
-                let elapsed = t.elapsed().as_nanos() as f64;
-                assert_eq!(got, want);
-                best = best.min(elapsed);
-            }
-            per[li] = best / n as f64;
+        // Warm, then best-of-5 to shed scheduler noise.
+        run(b, &src);
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let got = run(b, &src);
+            let elapsed = t.elapsed().as_nanos() as f64;
+            assert_eq!(got, want);
+            best = best.min(elapsed);
         }
-        println!(
-            "  {b:?}: bespoke {:.0} ns  offer {:.0} ns  [{:.2}x]",
-            per[0],
-            per[1],
-            per[1] / per[0]
-        );
+        println!("  {b:?}: {:.0} ns/round", best / n as f64);
     }
 }

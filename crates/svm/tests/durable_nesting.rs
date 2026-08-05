@@ -357,27 +357,6 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// Durable parent that spawns a §14 coroutine child (op 2) and never resumes it — the child stays
-/// suspended (host-side native continuation) when the freeze lands.
-const PARENT_CORO: &str = "memory 18
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 131072
-  v3 = i64.const 17
-  v4 = i64.const 0
-  v5 = cap.call 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  return v5
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 9
-  return v1
-  }
-}
-";
-
 /// §4 subtree freeze (the covered shape): a freeze landing while a same-module §14 child is
 /// **live** no longer refuses — the child is driven to unwind into its own carve (the subtree STW
 /// broadcast), rides as `FrozenNested` residue, and a thaw re-attaches it under `REWINDING`; the
@@ -599,33 +578,6 @@ fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {
         run_thaw(Some(child_other())),
         Err(Trap::ThreadFault),
         "mismatched module (wrong digest): thaw fails closed"
-    );
-}
-
-/// Same fail-closed for a suspended §14 **coroutine** child (its native continuation can't ride
-/// the artifact either).
-#[test]
-fn freeze_with_suspended_coroutine_fails_closed() {
-    let parent = instrument(PARENT_CORO);
-    let mut host = Host::new();
-    host.set_durable(true);
-    let ih = host.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
-    write_state(&mut win, STATE_UNWINDING);
-    let mut fuel = 5_000_000u64;
-    let (r, _) = run_capture_reserved_with_host(
-        &parent,
-        0,
-        &[Value::I32(ih)],
-        &mut fuel,
-        &win,
-        SIZE_LOG2,
-        &mut host,
-    );
-    assert_eq!(
-        r,
-        Err(Trap::ThreadFault),
-        "a freeze with a suspended §14 coroutine must refuse"
     );
 }
 

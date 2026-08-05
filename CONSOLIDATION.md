@@ -83,9 +83,18 @@ The **fourth backend** (wasm-JIT tier) fails closed on both lanes today — the 
 to bytecode, pinned by `wasm_jit_lane_folds_closed_today` so the tier is never silently
 forgotten in this table.
 
-**2.3 (the deletion) is now an owner call**: interp fault-service costs 1.3–1.65× the
-bespoke ops; everything else (resume/yield on the JIT, fault-service on the JIT, the
-machinery deleted, the special cases closed) favors the collapse.
+**2.3 landed (owner-approved 2026-08-05)**: deleted `Binding::Yielder` (+ durable variant,
+snapshot tag retired, guest-facing cap id 7), Instantiator ops 2/3/4/6/7 across **all four
+tiers** (tree-walker arms; bytecode `Op`/`Outcome`/`VcpuStop` variants, drivers, debug
+step-into + checkpoint/restore coroutine plumbing; Cranelift lowering arms + the whole
+native coroutine runtime — `coro_spawn`/`coro_resume`/`coro_cap_thunk`, `sync_committed`
+mirroring, guard/demand fault-recovery shims in `svm-jit/mem.rs`; the wasm-JIT tier never
+had the arms), the `Coro`/`CoroSnapshot` structs in both engines, `fault_yields`,
+`Inner::CoYield`/`CoFault`, `Pending::CoResume`, and the SharedRegion op-4
+grant-into-suspended-coroutine arm. `paging_bench` and `coroutine_offer_bench` keep the
+offer lanes as absolute pins with the deletion-time records in their headers. The
+PROCESS.md §0 gap ("a guest-serviced capability exists only as the special-cased Yielder")
+is closed: every guest-serviced capability is now an offer.
 
 ## 3. Instantiator: config-record spawn; Budget swallows the fuel scalars
 
