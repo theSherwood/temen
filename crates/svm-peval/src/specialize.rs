@@ -94,7 +94,7 @@ use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use svm_ir::{ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
+use svm_ir::{CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType};
 use svm_verify::func_value_types;
 
 use crate::{fold_int_bin, fold_int_cmp, fold_int_un, Known};
@@ -1340,6 +1340,17 @@ impl Spec<'_> {
                                 Abs::Const(load_bits(raw, op).ok_or(SpecError::Unsupported)?)
                             }
                             Abs::Dyn(i) if is_full_natural_load(op, width) => Abs::Dyn(i),
+                            // A dynamic cell (held as integer bits) loaded as a **float**: reinterpret
+                            // back to the requested float type — the inverse of the store-side cast.
+                            Abs::Dyn(i) if is_full_natural_float(op.info().1, width) => {
+                                let cast = if width == 8 {
+                                    CastOp::ReinterpI64F64
+                                } else {
+                                    CastOp::ReinterpI32F32
+                                };
+                                out.push(Inst::Cast { op: cast, a: i });
+                                Abs::Dyn(bump(rnext))
+                            }
                             Abs::Dyn(_) => {
                                 trace_unsup!(
                                     "load: unrenamable dynamic cell eff={:#x} op={:?}",
@@ -1433,11 +1444,23 @@ impl Spec<'_> {
                     // `TValue` value the interpreter moves via an `f64` load/store renames like any
                     // 8-byte cell.
                     Abs::Const(k) => Abs::Const(cell_const(known_raw(k, width), width)),
-                    // A dynamic value is only renamed when stored at its full natural *integer* width —
-                    // then loading it back at that width is the identity. A narrow dynamic store, or a
-                    // dynamic float (which would need a residual bitcast to read back cross-type),
-                    // isn't renamable — refuse it.
+                    // A dynamic integer value renames directly at its full natural width (loading it
+                    // back at that width is the identity).
                     Abs::Dyn(i) if is_int && is_full_natural_store(op, width) => Abs::Dyn(i),
+                    // A dynamic full-natural **float** value (a `TValue` value moved via `f64`/`f32`):
+                    // reinterpret its bits to a same-width integer so the cell is uniformly
+                    // integer-typed; a later float load reinterprets back. This lets a rolled loop
+                    // carry a dynamic register through the `TValue` value union.
+                    Abs::Dyn(i) if is_full_natural_float(op.info().1, width) => {
+                        let cast = if width == 8 {
+                            CastOp::ReinterpF64I64
+                        } else {
+                            CastOp::ReinterpF32I32
+                        };
+                        out.push(Inst::Cast { op: cast, a: i });
+                        Abs::Dyn(bump(rnext))
+                    }
+                    // A narrow dynamic store would need residual masking to read back — refuse.
                     Abs::Dyn(_) => {
                         trace_unsup!("store: unrenamable dynamic cell eff={:#x} op={:?}", eff, op);
                         return Err(SpecError::Unsupported);
@@ -2152,6 +2175,13 @@ fn cell_const(raw: u64, width: u64) -> Known {
 /// survive, so a same-width load reads it back unchanged).
 fn is_full_natural_store(op: StoreOp, width: u64) -> bool {
     matches!((op, width), (StoreOp::I32, 4) | (StoreOp::I64, 8))
+}
+
+/// Whether a load/store's value type `vt` is a **full-natural float** at `width` — `f32`@4 / `f64`@8.
+/// A dynamic value of this shape is renamed by reinterpreting its bits to the same-width integer (and
+/// back on load), so the cell stays uniformly integer-typed.
+fn is_full_natural_float(vt: ValType, width: u64) -> bool {
+    matches!((vt, width), (ValType::F32, 4) | (ValType::F64, 8))
 }
 
 /// The load counterpart of [`is_full_natural_store`]: `i32.load`/`i64.load` read a full natural cell
