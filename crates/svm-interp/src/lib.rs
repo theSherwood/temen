@@ -9255,6 +9255,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // overriding the op-0 arm's positional-arg parse when the spawn came in as a
                     // config record instead of scalars.
                     let mut rec_geo: Option<(u64, u64, i64, i64)> = None;
+                    // §3b (op 17): the record's Budget handle, validated at parse, consumed
+                    // (drained) only at spawn commit.
+                    let mut rec_budget_h: Option<i32> = None;
                     #[allow(clippy::type_complexity)]
                     // `grant`/`named` carry the re-grant **handles** (not pre-resolved bindings): a pipe
                     // end must alias its shared backing into the child, not copy a parent-local index, so
@@ -9379,8 +9382,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     rec[o + 7],
                                 ])
                             };
-                            if u32_at(0) != 0 || u32_at(28) != 0 {
-                                // version / budget (reserved until §3b) — fail closed.
+                            if u32_at(0) != 0 {
+                                // version — fail closed.
                                 return Err(Trap::CapFault);
                             }
                             let entry = u32_at(4) as u64;
@@ -9388,7 +9391,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let size_log2 = u32_at(16) as i64;
                             let pager = u32_at(20);
                             let modh = u32_at(24) as i32;
+                            let budget_h = u32_at(28) as i32;
                             let quota = u64_at(32) as i64;
+                            // §3b: a live Budget handle funds the child — fuel from the budget
+                            // (still capped by the physical remaining), the carve gated by its
+                            // mem quota, the child's vCPU ceiling tightened by its spawn quota.
+                            // Mixing it with a raw quota scalar is ambiguous — fail closed; a
+                            // dangling/mistyped handle likewise. The budget is only *consumed*
+                            // (drained) at spawn commit, so a spawn refused later (bad carve /
+                            // entry) leaves it intact.
+                            if budget_h != 0 {
+                                if quota != 0 {
+                                    return Err(Trap::CapFault);
+                                }
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                if hg.peek_budget(budget_h).is_none() {
+                                    return Err(Trap::CapFault);
+                                }
+                                rec_budget_h = Some(budget_h);
+                            }
                             let grants_ptr = u64_at(40);
                             let grants_n = u64_at(48);
                             let mut list: Vec<(String, i32)> = Vec::new();
@@ -9598,7 +9619,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
-                                && off.checked_add(child_size).is_some_and(|e| e <= isize);
+                                && off.checked_add(child_size).is_some_and(|e| e <= isize)
+                                // §3b: a budget-funded spawn's carve must fit the budget's mem
+                                // quota (`-1` = unbounded). Peek, not take — a refused spawn
+                                // leaves the budget intact.
+                                && rec_budget_h.is_none_or(|bh| {
+                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                    hg.peek_budget(bh)
+                                        .is_some_and(|b| b.mem < 0 || child_size <= b.mem as u64)
+                                });
                             // §4 enforcement: *a durable domain admits only freezable modules* — a
                             // separate-module child must carry the grant's durable attestation
                             // (`grant_durable_module`); an un-instrumented child could never
@@ -9726,11 +9755,35 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let Some(cg) = cgrant {
                                         child_args.push(Value::I64(cg as i64));
                                     }
-                                    // Quota: the child's fuel, sub-allocated from (and capped by) ours.
-                                    let child_fuel = if quota <= 0 {
-                                        *fuel
-                                    } else {
-                                        (quota as u64).min(*fuel)
+                                    // Quota: the child's fuel, sub-allocated from (and capped
+                                    // by) ours. §3b: a budget-funded spawn draws fuel from the
+                                    // budget instead (bounded 0 = literally zero fuel — distinct
+                                    // from the legacy scalar's 0 = inherit); the budget is
+                                    // CONSUMED here at commit (drained; the handle reads 0s
+                                    // after), and its spawn field tightens the child's vCPU
+                                    // ceiling below.
+                                    let rec_b = rec_budget_h.take().and_then(|bh| {
+                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        hg.take_budget(bh)
+                                    });
+                                    let child_fuel = match rec_b.as_ref() {
+                                        Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
+                                        Some(_) => *fuel,
+                                        None => {
+                                            if quota <= 0 {
+                                                *fuel
+                                            } else {
+                                                (quota as u64).min(*fuel)
+                                            }
+                                        }
+                                    };
+                                    let spawn_quota = match rec_b.as_ref() {
+                                        Some(b) if b.spawn >= 0 => svm_ir::Quota {
+                                            max_vcpus: (b.spawn.max(1) as usize)
+                                                .min(spawn_quota.max_vcpus),
+                                            max_fibers: spawn_quota.max_fibers,
+                                        },
+                                        _ => spawn_quota,
                                     };
                                     let cfuncs = child_mod.as_ref().map_or_else(
                                         || Arc::clone(&funcs),
@@ -10071,10 +10124,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if want_as {
                                         child_args.push(Value::I64(cas as i64));
                                     }
-                                    let child_fuel = if quota <= 0 {
-                                        *fuel
-                                    } else {
-                                        (quota as u64).min(*fuel)
+                                    // §3b: budget-funded spawn — same consumption as the
+                                    // same-module branch above.
+                                    let rec_b = rec_budget_h.take().and_then(|bh| {
+                                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                        hg.take_budget(bh)
+                                    });
+                                    let child_fuel = match rec_b.as_ref() {
+                                        Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
+                                        Some(_) => *fuel,
+                                        None => {
+                                            if quota <= 0 {
+                                                *fuel
+                                            } else {
+                                                (quota as u64).min(*fuel)
+                                            }
+                                        }
+                                    };
+                                    let spawn_quota = match rec_b.as_ref() {
+                                        Some(b) if b.spawn >= 0 => svm_ir::Quota {
+                                            max_vcpus: (b.spawn.max(1) as usize)
+                                                .min(spawn_quota.max_vcpus),
+                                            max_fibers: spawn_quota.max_fibers,
+                                        },
+                                        _ => spawn_quota,
                                     };
                                     let cfuncs = Arc::clone(&cm.funcs);
                                     let csched = sched.clone();
@@ -17469,6 +17542,34 @@ impl Host {
     /// domain; the guest `split`s sub-budgets out of it (attenuation) and `read`s remaining. A field of
     /// `-1` means "unbounded" (the anti-bomb ceilings still cap actual consumption; `read` reports it as
     /// `-1`). Charging live consumption against a budget is the follow-up — this is the passable object.
+    /// §3b — read a Budget handle's state without consuming it (the op-17 spawn's `fits`-time
+    /// mem-quota gate). `None` for a dangling/mistyped handle (the spawn fails closed).
+    pub(crate) fn peek_budget(&self, h: i32) -> Option<BudgetState> {
+        match self.resolve(h, cap_id::BUDGET).ok()? {
+            Binding::Budget(i) => self.budgets.get(i as usize).copied(),
+            _ => None,
+        }
+    }
+
+    /// §3b — **consume** a Budget at spawn commit: the state is drained to zero (the handle stays
+    /// granted; `read` reports 0s), so one budget funds exactly one child — split first to fund
+    /// several. Returns the taken state; `None` for a dangling/mistyped handle.
+    pub(crate) fn take_budget(&mut self, h: i32) -> Option<BudgetState> {
+        match self.resolve(h, cap_id::BUDGET).ok()? {
+            Binding::Budget(i) => {
+                let s = self.budgets.get_mut(i as usize)?;
+                let t = *s;
+                *s = BudgetState {
+                    fuel: 0,
+                    mem: 0,
+                    spawn: 0,
+                };
+                Some(t)
+            }
+            _ => None,
+        }
+    }
+
     pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
         let id = self.budgets.len() as u32;
         self.budgets.push(BudgetState { fuel, mem, spawn });
