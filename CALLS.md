@@ -131,18 +131,30 @@ is a capability-surface distinction, not an IR one.
 
 ## 7. What this deletes / what it adds
 
-**Deleted:** the nested `drive_arc`-under-two-locks sub-interpreter; `ProviderState` + its mutex;
-the acyclicity rule and its deadlock argument; provider-pays fuel (`GUEST_IMPL_FUEL`);
-`wire_impl_instance` / `impl_service`; the `GuestImpl`/`LiveImpl` binding split; eventually the
-JIT's `-EINVAL` arm for offers.
+**Deleted:** the nested `drive_arc`-under-two-locks sub-interpreter; the acyclicity rule and its
+deadlock argument; provider-pays fuel (`GUEST_IMPL_FUEL`); `wire_impl_instance` / `impl_service`.
+
+**Amended (owner decision 2026-08-04, see `OFFER_TRANSPORT.md`):** `ProviderState` + its mutex and
+the `GuestImpl`/`LiveImpl` binding split are **not** deleted. Finishing those deletions would require
+making library instances *serve-loop-driven* (an enqueue-park-reply-wake round trip in place of the
+§8 4a animated crossing), which **pessimizes the common synchronous cross-domain call** — the wrong
+trade against the wasm/Wasmtime yardstick (§1a). The animated transport stays; `ProviderState`'s
+admission word + window are irreducible for it (they must live outside the host the sub-run takes by
+value). What increment 6 *did* delete stands (the two-lock sub-interpreter, provider-pays, the
+eval-loop `drive_instanced_offer`); the offer powerbox is now the granted-child shared-cell shape
+(§8 6d.4.1). The JIT's `-EINVAL`/host-side fall-through for offers is **deferred**, not deleted (§8
+6d.2): all tiers share the one correct host-side arm.
 
 **Added:** admission into library providers (reuses the existing queue + handler-fiber machinery);
 the inline cross-domain animation fast path (assembled from existing pieces: §14 coroutine drive +
 `serve_switch`'s fiber switch); the JIT thunk fast path + thread-blocking promotion.
 
-Net: three offer mechanisms → one; two execution models → one; a lock-held nested interpreter and
-its safety argument leave the TCB. A genuine net simplification, paid for with scheduler-adjacent
-plumbing that lands in increments (§8).
+Net (as realized — see `OFFER_TRANSPORT.md` for why it stops short of the original "→ one"): the
+lock-held nested interpreter and its safety argument leave the TCB; provider-pays retires; the offer
+powerbox becomes the granted-child shared-cell shape. The **two transports are kept on purpose** —
+the animated crossing for passive library instances (cheap synchronous calls) and the serve-loop
+crossing for live callees — because collapsing them would pessimize cross-domain calls. A genuine
+simplification of the execution path, not a collapse to a single mechanism.
 
 ## 8. Increment plan (same discipline as FORK.md: smallest verifiable step first)
 
@@ -760,9 +772,9 @@ plumbing that lands in increments (§8).
          before, at both the 4a and 4d settles. Behaviour-identical; the existing offer suite is the
          oracle (`impl_wiring` 25, `offer_promotion` 8 incl. the 4a–4d settles, `imports_impl`
          three-backend).
-       - **6d.4.2 / 6d.4.3 / 6d.4.4 — NOT RECOMMENDED (finding, owner decision needed).** Building
-         6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and partly not achievable given the
-         4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
+       - **6d.4.2 / 6d.4.3 / 6d.4.4 — REJECTED (owner decision 2026-08-04, see
+         `OFFER_TRANSPORT.md`).** Building 6d.4.1 surfaced that the rest of 6d.4 is **cosmetic, and
+         partly not achievable given the 4a decision this same plan made**. Measured: `Binding::Offer` (19 sites) and
          `Binding::LiveImpl` (16 sites) are handled *separately* at ~35 sites with **opposite**
          semantics — `Offer` is non-durable (freeze errors) while `LiveImpl` is durably capturable
          via `callee_slot`; `Offer` animates in `cap_dispatch_slots` while `LiveImpl` answers
@@ -782,10 +794,10 @@ plumbing that lands in increments (§8).
          The clean structural win is banked (the offer powerbox is now the granted-child shared-cell
          shape; the per-call `Arc::new` is gone); the residual is one uncontended nested lock
          (`Mutex<Host>` inside `Mutex<ProviderState>`), inherent to a passive instance needing
-         checkout atomicity over {admission word, window} separate from its takeable powerbox. To
-         actually retire `ProviderState`, the owner would first have to renegotiate the 4a
-         passive-transport decision (or accept `LiveImpl` carrying inert admission/window fields —
-         bloat, not simplification). Left as an explicit owner call, not built.
+         checkout atomicity over {admission word, window} separate from its takeable powerbox.
+         Retiring `ProviderState` would require making library instances serve-loop-driven, which
+         pessimizes the common synchronous cross-domain call — **rejected** on that basis
+         (`OFFER_TRANSPORT.md`). Increment 6 concludes at 6d.4.1.
 7. **`threaded` policy** — opt-in concurrent admission; provider-owned synchronization.
 
 Addendum deltas to this plan: §10.7.
