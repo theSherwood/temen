@@ -89,7 +89,7 @@
 //! multi-result, or other cross-function ops (indirect/host calls, atomics, fibers/threads), and
 //! memory accesses the engine can't resolve, return [`SpecError::Unsupported`] rather than guessing.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -299,6 +299,31 @@ pub struct SpecConfig {
     /// behavior. See `lower_indirect` for the masked-compare soundness and the one known trap-kind
     /// gap on an out-of-signature index.
     pub indirect_targets_cap: Option<usize>,
+    /// **Cut set — opaque runtime call-outs.** Source function indices the specializer must **not**
+    /// inline, outline, or fold through. Each call to a cut callee is emitted verbatim as a residual
+    /// `call`: its arguments are materialized (constants baked to `const` insts, dynamics passed
+    /// through), its results become fresh unknowns, and the callee is **carried into the residual
+    /// module** unspecialized (with its transitive direct-call closure) so the call resolves. This is
+    /// what lets a **rolled loop keep a stateful runtime call-out** — a GC step, an allocator, an
+    /// error raiser — as an opaque call while the dispatch and arithmetic around it still fold: the
+    /// residual branch a rolled loop needs no longer has to *project* the callee's deeply-stateful
+    /// body (the GC/`setjmp` wall), only *call* it.
+    ///
+    /// **Memory contract (caller promise, like [`rename_is_private`](Self::rename_is_private)).** The
+    /// specializer's only abstract memory caches are the rename-region cells (held in SSA) and the
+    /// constant-image folds ([`const_regions`](Self::const_regions) / readonly data / overlays); plain
+    /// window memory is never cached, so a cut callee's reads/writes there flow through faithfully via
+    /// the residual loads/stores already emitted around it. A cut callee must therefore touch only
+    /// plain memory **disjoint from every rename and constant region**. Under that promise a cut call
+    /// preserves the rename cells across the boundary (so the loop-carried register file stays in SSA
+    /// and the loop rolls) when [`rename_is_private`](Self::rename_is_private) is set; without the
+    /// private promise it conservatively spills-and-drops every live cell before the call (the callee
+    /// might alias the region). A cut callee that must *read* renamed state takes it as an explicit
+    /// argument; one that *mutates* renamed state is beyond this prototype (it would need the cell
+    /// threaded back as a result, as outlining does). Inline mode only; combining with
+    /// [`outline_calls`](Self::outline_calls) / [`selective_outline`](Self::selective_outline) is
+    /// rejected. Empty by default.
+    pub cut_calls: Vec<u32>,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -375,8 +400,13 @@ pub fn specialize_with_config(
     // boundary (passed in as extra arguments, returned as extra results); see `outline_call`. The
     // single-function inline path keeps the region entirely internal (no threading).
     let funcs = if config.outline_calls || config.selective_outline {
+        if !config.cut_calls.is_empty() {
+            // The cut set carries callees into the residual at inline-mode indices (entry 0, carried
+            // after); the outline driver numbers functions differently, so the combination is rejected.
+            return Err(SpecError::Unsupported);
+        }
         outline_funcs(module, config, &value_types, func, entry_pattern)?
-    } else {
+    } else if config.cut_calls.is_empty() {
         vec![
             build_func(
                 module,
@@ -386,10 +416,35 @@ pub fn specialize_with_config(
                 func,
                 &entry_pattern,
                 &Vec::new(),
+                &BTreeMap::new(),
                 false,
             )?
             .0,
         ]
+    } else {
+        // Cut set: reserve residual index 0 for the specialized entry, then carry each cut callee and
+        // its transitive direct-call closure verbatim at indices 1.. — so an opaque cut `call` in the
+        // entry resolves. `cut` maps a source callee index to its residual index; `carried` is the
+        // closure in the order the indices were assigned.
+        let (cut, carried) = plan_cut_carry(module, func, &config.cut_calls)?;
+        let mut funcs = vec![
+            build_func(
+                module,
+                config,
+                &value_types,
+                None,
+                func,
+                &entry_pattern,
+                &Vec::new(),
+                &cut,
+                false,
+            )?
+            .0,
+        ];
+        for &orig in &carried {
+            funcs.push(carry_func(&module.funcs[orig as usize], &cut)?);
+        }
+        funcs
     };
 
     Ok(Module {
@@ -424,6 +479,7 @@ fn build_func(
     callee: u32,
     pattern: &ParamPattern,
     mem_pat: &MemPattern,
+    cut: &BTreeMap<u32, u32>,
     thread_cells: bool,
 ) -> Result<(Func, CellSig), SpecError> {
     let cf = module
@@ -454,6 +510,7 @@ fn build_func(
         outline,
         selective,
         thread_cells,
+        cut,
         out_cells: None,
         memo: BTreeMap::new(),
         queue: VecDeque::new(),
@@ -534,6 +591,7 @@ fn outline_funcs(
         entry,
         &entry_pattern,
         &Vec::new(),
+        &BTreeMap::new(),
         false,
     )?;
     state.borrow_mut().funcs[0] = Some(entry_func);
@@ -602,6 +660,7 @@ fn request_outline(
         callee,
         &key.1,
         &key.2,
+        &BTreeMap::new(),
         true,
     )?;
     let mut s = state.borrow_mut();
@@ -652,6 +711,10 @@ struct Spec<'a> {
     /// the incoming cells are extra parameters and the live cells flow back as extra results. `false`
     /// for the entry function and the single-function inline path (the region is internal there).
     thread_cells: bool,
+    /// The cut set as a **source callee index → residual function index** map (see
+    /// [`SpecConfig::cut_calls`]). A call whose callee is a key is emitted as an opaque residual `call`
+    /// to the mapped (carried) function instead of being inlined. Empty unless the cut set is active.
+    cut: &'a BTreeMap<u32, u32>,
     /// The threaded out-cell signature (`(addr, width)` by address), fixed at the first `return` and
     /// required to match at every other return. `None` until the first return; stays `None` when
     /// nothing is threaded.
@@ -854,6 +917,14 @@ impl Spec<'_> {
     ) -> Result<Exec, SpecError> {
         for (k, inst) in insts.iter().enumerate().skip(start_ip) {
             if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
+                // Cut set: a call-out we deliberately keep opaque (see [`SpecConfig::cut_calls`]).
+                // Emit it as a residual `call` to the carried callee and treat its results as
+                // unknowns — never inline or fold through it.
+                if let Some(&ridx) = self.cut.get(&callee) {
+                    let results = self.emit_cut_call(ridx, callee, &args_abs, mem, out, rnext)?;
+                    env.extend(results);
+                    continue;
+                }
                 match self.outline {
                     // Full outline: every call becomes a residual call to the shared specialized callee.
                     Some(state) if !self.selective => {
@@ -957,6 +1028,47 @@ impl Spec<'_> {
             mem.insert(addr, (width, Abs::Dyn(bump(rnext))));
         }
         Ok(results)
+    }
+
+    /// Emit an **opaque cut call** (see [`SpecConfig::cut_calls`]): a residual `call` to the carried
+    /// callee `ridx`, with each argument materialized (a constant to a `const` inst, a dynamic passed
+    /// through) and each result a fresh unknown. The call is emitted verbatim — the callee's body is
+    /// never entered, so its stateful effects (a GC step, an error raise) stay behind the call
+    /// boundary instead of being projected.
+    ///
+    /// **Memory across the boundary.** `mem` holds only rename-region cells; plain window memory is
+    /// never cached, so the callee's plain-memory reads/writes already flow faithfully through the
+    /// residual loads/stores around this call (the caller promises the callee's footprint is disjoint
+    /// from every rename and constant region — [`SpecConfig::cut_calls`]). Under the
+    /// [`rename_is_private`](SpecConfig::rename_is_private) promise the rename cells are private to the
+    /// renamed accesses, so they are **preserved** across the call and the loop-carried register file
+    /// stays in SSA. Without that promise an opaque callee might alias the region, and there is no
+    /// sound recovery — dropping a live cell would make a later in-region load read the region's seed
+    /// (in-region loads never residualize), silently losing the write — so a cut call with live
+    /// unprivate region cells is rejected rather than miscompiled.
+    fn emit_cut_call(
+        &self,
+        ridx: u32,
+        callee: u32,
+        args_abs: &[Abs],
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Vec<Abs>, SpecError> {
+        // `mem` holds only rename-region cells. Without the private promise an opaque callee could
+        // alias them, and neither preserving nor dropping is sound (see the doc comment) — refuse.
+        if !self.config.rename_is_private && !mem.is_empty() {
+            trace_unsup!("cut call with live non-private region cells");
+            return Err(SpecError::Unsupported);
+        }
+        // Materialize the arguments in call order (constants become `const` insts), then emit the call.
+        let args: Vec<u32> = args_abs
+            .iter()
+            .map(|&a| materialize(a, out, rnext))
+            .collect();
+        out.push(Inst::Call { func: ridx, args });
+        let nres = self.module.funcs[callee as usize].results.len();
+        Ok((0..nres).map(|_| Abs::Dyn(bump(rnext))).collect())
     }
 
     /// If `inst` is an inlinable call — a direct [`Inst::Call`], or an [`Inst::CallIndirect`] whose
@@ -2113,6 +2225,116 @@ fn disjoint_from_region(regions: &[(u64, u64)], eff: u64, width: u64) -> bool {
         Some(end) => regions.iter().all(|&(lo, hi)| end <= lo || eff >= hi),
         None => false,
     }
+}
+
+/// Plan the cut-set carry (see [`SpecConfig::cut_calls`]). From the `roots` (the cut callees) walk the
+/// transitive **direct**-call closure and give each carried source function a residual index: the
+/// specialized entry is residual 0, and carried functions follow at 1.. in the deterministic
+/// discovery order. Returns the `source index → residual index` map and the carried source indices in
+/// that order (used to append them to the residual `funcs`).
+///
+/// Fails with [`SpecError::Unsupported`] if the closure reaches the entry (which is specialized, not
+/// carried, so it can't also be a verbatim callee) or a function that dispatches through an indirect
+/// call (the residual carries no table); [`SpecError::BadFunc`] on an out-of-range root.
+fn plan_cut_carry(
+    module: &Module,
+    entry: u32,
+    roots: &[u32],
+) -> Result<(BTreeMap<u32, u32>, Vec<u32>), SpecError> {
+    let mut carried: Vec<u32> = Vec::new();
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut work: VecDeque<u32> = VecDeque::new();
+    for &r in roots {
+        if r as usize >= module.funcs.len() {
+            return Err(SpecError::BadFunc);
+        }
+        if seen.insert(r) {
+            work.push_back(r);
+        }
+    }
+    while let Some(fidx) = work.pop_front() {
+        if fidx == entry {
+            // The entry is residual function 0 (specialized); it cannot also be carried verbatim.
+            return Err(SpecError::Unsupported);
+        }
+        carried.push(fidx);
+        for callee in direct_callees(&module.funcs[fidx as usize])? {
+            if callee as usize >= module.funcs.len() {
+                return Err(SpecError::BadFunc);
+            }
+            if seen.insert(callee) {
+                work.push_back(callee);
+            }
+        }
+    }
+    // Residual indices: entry is 0, carried functions follow in discovery order.
+    let map = carried
+        .iter()
+        .enumerate()
+        .map(|(i, &orig)| (orig, i as u32 + 1))
+        .collect();
+    Ok((map, carried))
+}
+
+/// The direct-call callee indices referenced by `f` (`call` / `return_call`), in program order.
+/// Fails with [`SpecError::Unsupported`] if `f` uses an indirect call — a carried function is emitted
+/// verbatim, and the residual has no table to resolve one through.
+fn direct_callees(f: &Func) -> Result<Vec<u32>, SpecError> {
+    let mut out = Vec::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                Inst::Call { func, .. } => out.push(*func),
+                Inst::CallIndirect { .. } => return Err(SpecError::Unsupported),
+                _ => {}
+            }
+        }
+        match &b.term {
+            Terminator::ReturnCall { func, .. } => out.push(*func),
+            Terminator::ReturnCallIndirect { .. } => return Err(SpecError::Unsupported),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Carry a cut callee into the residual verbatim, rewriting its direct-call targets from source
+/// indices to residual indices via `cut`. Every callee it references was included in the carry
+/// closure, so each target is present in the map.
+fn carry_func(f: &Func, cut: &BTreeMap<u32, u32>) -> Result<Func, SpecError> {
+    let remap = |func: u32| -> Result<u32, SpecError> {
+        cut.get(&func).copied().ok_or(SpecError::Unsupported)
+    };
+    let mut blocks = Vec::with_capacity(f.blocks.len());
+    for b in &f.blocks {
+        let mut insts = Vec::with_capacity(b.insts.len());
+        for inst in &b.insts {
+            match inst {
+                Inst::Call { func, args } => insts.push(Inst::Call {
+                    func: remap(*func)?,
+                    args: args.clone(),
+                }),
+                other => insts.push(other.clone()),
+            }
+        }
+        let term = match &b.term {
+            Terminator::ReturnCall { func, args } => Terminator::ReturnCall {
+                func: remap(*func)?,
+                args: args.clone(),
+            },
+            other => other.clone(),
+        };
+        blocks.push(svm_ir::Block {
+            params: b.params.clone(),
+            insts,
+            term,
+        });
+    }
+    Ok(Func {
+        params: f.params.clone(),
+        results: f.results.clone(),
+        blocks,
+    })
 }
 
 /// The full rename region set: [`SpecConfig::rename`] then [`SpecConfig::rename_extra`].
