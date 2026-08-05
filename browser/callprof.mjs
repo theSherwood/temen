@@ -5,7 +5,7 @@
 // cdylib built with `--features callprof`. Light workloads (the interp is slow) — the touched SET and
 // distribution shape don't need heavy iteration. Run from browser/:
 //   node callprof.mjs [path/to/svm_browser.wasm]  (default: the wasm32 build path)
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] || 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
@@ -31,6 +31,10 @@ function run(name, guestBytes, stdinBytes, totalFuncs) {
   const counts = [];
   for (let i = 0; i < len / 8; i++) counts.push(dv.getBigUint64(i * 8, true));
   report(name, counts, totalFuncs, out);
+  // Write the touched-function index set (for the subset-emit measurement, `lazybench`).
+  const touched = counts.flatMap((c, i) => (c > 0n ? [i] : []));
+  const tag = name.includes('OUTPUT') ? 'output' : 'compute';
+  writeFileSync(`/tmp/touched-${tag}.json`, JSON.stringify(touched));
 }
 
 function report(name, counts, totalFuncs, out) {
