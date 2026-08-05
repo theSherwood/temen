@@ -12,8 +12,11 @@
 //!   `instantiate_named`, re-granting BOTH the fork offer (as `"fork"`) and the libc (as `"libc"`)
 //!   into it; joins the guest and returns its result.
 //! - **server** (func 1): a `svc.wait` loop whose handler (func 2) runs **pid-mode `clone_caller`**.
-//! - **guest** (func 3): resolves `"libc"` + `"fork"` by name, calls `fork()`, then BOTH copies
-//!   `write(1, &ret, 8)` their fork return through the shared libc, and return it.
+//! - **guest** (func 3): resolves `"libc"` + `"fork"` by name, calls `fork()` (retrying on the
+//!   `-EAGAIN` serve/park race — the realistic `while ((pid = fork()) < 0)` shell idiom, see
+//!   ISSUES.md I53), then BOTH copies `write(1, &ret, 8)` their fork return through the shared libc,
+//!   and return it. The retry is deterministic-safe: a failed fork never consumes a task id, so the
+//!   winning fork still mints twin id 3.
 //!
 //! The guest's fork() returns the twin's task id (3) in the original and 0 in the twin — POSIX
 //! parent-sees-pid / child-sees-0 — and both writes land in the ONE shared libc memfs/stdout (the
@@ -99,8 +102,16 @@ block 0 (v0: i64) {
   i64.store vz8 vfn
   vp8 = i64.const 8
   vfork = cap.self.resolve vp8 vl4
+  br 1(vlibc, vfork)
+}
+block 1 (vlibc: i32, vfork: i32) {
   varg = i64.const 0
   vr = cap.call 268435456 0 (i64) -> (i64) vfork (varg)
+  vzero = i64.const 0
+  vforkfail = i64.lt_s vr vzero
+  br_if vforkfail 1(vlibc, vfork) 2(vlibc, vr)
+}
+block 2 (vlibc: i32, vr: i64) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vfd1 = i64.const 1

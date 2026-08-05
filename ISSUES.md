@@ -371,6 +371,17 @@ twin exists. **Fix (deferred — not in this peval PR):** give func 3's guest th
 loop the I53 rewrite gave the interp fixtures; deterministic-safe because failed forks never consume a
 task id, so the winning fork still mints twin id 3. Unrelated to the diff; reran the job to unblock.
 
+**FIX LANDED (2026-08-05, `claude/flaky-test-issues-3vdppg`) — the blind spot is closed.** Func 3's
+guest now wraps its `fork()` in the `while ((vr = fork()) < 0)` retry loop the I53 rewrite baked into
+the interp fixtures: the single `cap.call … vfork` moved into its own block that re-branches to itself
+on `i64.lt_s vr 0` (an `-EAGAIN`/`-11` fork-park loss) and falls through to the write/return only on a
+non-negative result. Deterministic-safe exactly as the sighting predicted — a lost fork never mints a
+task id, so the winning fork still returns twin id 3 to the original and 0 to the twin, and the
+sorted-stdout assertion (`{0, 3}`) is unchanged. The manager still `join`s the guest, so the
+teardown-drain face stays covered; this only adds the fork-park retry that face never needed. Verified
+green + hammered **60/60** (`fork_manager --test-threads=8` under load) where the one-shot form flaked
+under CI contention. This retires the last documented face of the I53 family.
+
 ### I52 — `svc_serve_chain::a_handler_forwarding_to_another_server_completes` intermittently hangs the `build · test` job (macOS + Windows) to the timeout ceiling (S4, flaky CI hang) — surfaced 2026-07-29 on PR #504 — **ROOT-CAUSED & FIXED 2026-07-29** (fail-fast watchdog + the underlying lost-wakeup; `claude/ci-flakiness-review-fix-3xrmgg`)
 
 **Symptom.** On PR #504 (a `svm-dap`/browser-only change) both `build · test (macos-latest)` and
