@@ -13692,9 +13692,11 @@ impl Attestation {
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
-/// into a fresh `Host` reconstructs the exact authority. The non-value bindings
-/// (`SharedRegion`, `Module`, `IoRing`, `Blocking`, `JitDomain`, `JitCode`, `HostProc`) are
-/// **not** durable: a live one makes the domain non-snapshottable.
+/// into a fresh `Host` reconstructs the exact authority. The `JitDomain`/`JitCode` variants
+/// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
+/// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`, `IoRing`,
+/// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
     Stream(StreamRole),
@@ -13718,6 +13720,23 @@ pub enum DurableBinding {
         slot: u32,
         export: u32,
     },
+    /// §22 guest-JIT **domain** handle (DESIGN.md §22, DURABILITY.md §12.5 Slice 2). The domain's
+    /// out-of-line unit state — each unit's already-instrumented+verified funcs and the compile
+    /// quotas — is *not* value-typed enough to ride this `Copy` binding, so it travels in a
+    /// separate artifact section ([`Host::capture_durable_jit`]); this binding carries only the
+    /// domain's **index**, which the thaw re-pins into the positionally-rebuilt `jit_domains`. The
+    /// native/wasm code pointers are process-local and re-derived on thaw (a native re-compile is
+    /// the Slice-3 follow-on; an interpreter run invokes the restored funcs directly).
+    JitDomain {
+        idx: u32,
+    },
+    /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
+    /// `jit_domains`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
+    /// index pair is its whole authority — durable once the domain's units are captured.
+    JitCode {
+        domain: u32,
+        unit: u32,
+    },
 }
 
 /// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
@@ -13731,6 +13750,45 @@ pub struct DurableHandle {
     pub generation: u32,
     pub type_id: u32,
     pub binding: DurableBinding,
+}
+
+/// One §22 guest-JIT **unit** captured for snapshot (DURABILITY.md §12.5 Slice 2). The durable
+/// state is the unit's already-instrumented+verified IR (encoded as a module image, `unit_ir`)
+/// plus its B2 `install` type id; the native/wasm code pointers are process-local and re-derived
+/// on thaw. `unit_ir` re-clears the verifier on restore ([`Host::restore_durable_jit`]), so a
+/// tampered artifact can never inject unverified funcs into a domain.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableJitUnit {
+    /// The unit's funcs encoded as a canonical module image (`svm_encode::encode_module` of a
+    /// funcs+memory wrapper). Decoded and **re-verified** on restore.
+    pub unit_ir: Vec<u8>,
+    /// The interned `type_id` the embedder registered for a B2-`install`ed unit (`0` for an
+    /// interpreter unit / one never installed). Value-typed, so it rides as-is.
+    pub install_type_id: u32,
+}
+
+/// One §22 guest-JIT **domain** captured for snapshot (DURABILITY.md §12.5 Slice 2): the
+/// memory-match precondition, the compile quotas, and the domain's units in index order (dead
+/// units included, so a live [`DurableBinding::JitCode`]'s `(domain, unit)` index stays valid).
+/// Captured as a set by [`Host::capture_durable_jit`] and rebuilt positionally by
+/// [`Host::restore_durable_jit`], so the handle-table `JitDomain`/`JitCode` indices re-resolve.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableJitDomain {
+    pub mem_log2: Option<u8>,
+    pub units_left: u32,
+    pub bytes_left: u64,
+    pub units: Vec<DurableJitUnit>,
+}
+
+/// Why restoring a §22 guest-JIT domain from an artifact failed (DURABILITY.md §12.5 Slice 2).
+/// Both are fail-closed — a bad artifact reconstructs no units rather than admitting unsafe code.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JitRestoreError {
+    /// A unit's `unit_ir` didn't decode as a module image.
+    Decode,
+    /// A decoded unit failed re-verification — the artifact is untrusted, so its funcs must clear
+    /// the verifier again before they become invocable.
+    Verify,
 }
 
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
@@ -14858,6 +14916,22 @@ fn module_digest(m: &Module) -> [u8; 32] {
     svm_encode::digest256(&svm_encode::encode_module(&canon))
 }
 
+/// Encode a compiled §22 unit's already-instrumented+verified funcs as a canonical module image
+/// for the snapshot (DURABILITY.md §12.5 Slice 2). Only `funcs` + the domain's declared `memory`
+/// ride — the resolved funcs are self-contained (`call_indirect`/`cap.call` carry inline
+/// signatures, imports are already linked away), so no type/import/export section is needed, and
+/// `decode_module` + `verify_module` reconstruct them losslessly on thaw. Debug info is dropped
+/// (untrusted, backend-ignored). `encode_module` is canonical, so `decode`→`encode` round-trips
+/// byte-identically, which is what keeps the §12.6 re-serialize invariant a plain `==`.
+fn encode_jit_unit(funcs: &[Func], mem_log2: Option<u8>) -> Vec<u8> {
+    let m = Module {
+        funcs: funcs.to_vec(),
+        memory: mem_log2.map(|size_log2| Memory { size_log2 }),
+        ..Module::default()
+    };
+    svm_encode::encode_module(&m)
+}
+
 impl Default for Host {
     fn default() -> Host {
         Host::new()
@@ -15723,12 +15797,11 @@ impl Host {
                 Binding::Blocking(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::Blocking))
                 }
-                Binding::JitDomain(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::JitDomain))
-                }
-                Binding::JitCode { .. } => {
-                    return Err(self.non_durable(slot, NonDurableKind::JitCode))
-                }
+                // Slice 2 (DURABILITY.md §12.5): a guest-JIT domain/unit handle is now durable —
+                // its out-of-line unit state is captured alongside (`capture_durable_jit`) and
+                // rebuilt positionally on thaw, so the binding's index re-resolves.
+                Binding::JitDomain(idx) => DurableBinding::JitDomain { idx },
+                Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostProc))
                 }
@@ -15797,13 +15870,15 @@ impl Host {
                 | Binding::Memory
                 | Binding::Yielder
                 | Binding::AddressSpace { .. }
-                | Binding::Instantiator { .. } => continue,
+                | Binding::Instantiator { .. }
+                // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
+                // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
+                | Binding::JitDomain(_)
+                | Binding::JitCode { .. } => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
                 Binding::IoRing(_) => NonDurableKind::IoRing,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
-                Binding::JitDomain(_) => NonDurableKind::JitDomain,
-                Binding::JitCode { .. } => NonDurableKind::JitCode,
                 Binding::HostProc(_) | Binding::HostProcRegion(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
@@ -15860,9 +15935,80 @@ impl Host {
                     self.pending_live_impls.push((idx, slot as usize, export));
                     Binding::LiveImpl(idx)
                 }
+                // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
+                // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
+                DurableBinding::JitDomain { idx } => Binding::JitDomain(idx),
+                DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// Capture the §22 guest-JIT domains' out-of-line state for a snapshot (DURABILITY.md §12.5
+    /// Slice 2). Complements [`Self::capture_durable_handles`]: the handle table carries the
+    /// `JitDomain`/`JitCode` *bindings* (indices), and this carries the *state* those indices name —
+    /// each domain's memory-match precondition, compile quotas, and units (in index order, dead
+    /// units included so a live `JitCode`'s `unit` index stays valid). Every domain is captured
+    /// positionally (even one no live handle names, so a `JitCode` whose `JitDomain` was dropped
+    /// still resolves), which is what makes the restore's index re-pin exact. The native/wasm code
+    /// pointers and `native_ctx` are process-local and dropped — an interpreter thaw invokes the
+    /// restored funcs directly; a native re-compile is the Slice-3 follow-on.
+    pub fn capture_durable_jit(&self) -> Vec<DurableJitDomain> {
+        self.jit_domains
+            .iter()
+            .map(|d| DurableJitDomain {
+                mem_log2: d.mem_log2,
+                units_left: d.units_left,
+                bytes_left: d.bytes_left,
+                units: d
+                    .units
+                    .iter()
+                    .map(|u| DurableJitUnit {
+                        unit_ir: encode_jit_unit(&u.funcs, d.mem_log2),
+                        install_type_id: u.install_type_id,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Rebuild the §22 guest-JIT domains from a captured set (DURABILITY.md §12.5 Slice 2), the
+    /// counterpart of [`Self::capture_durable_jit`]. Each unit's `unit_ir` is decoded **and
+    /// re-verified** — the artifact is untrusted, so its funcs must clear the verifier again before
+    /// they can be invoked (the deserialization-boundary safety re-check, like the codec's
+    /// window-containment gate). Domains are rebuilt positionally, so the handle table's re-pinned
+    /// `JitDomain`/`JitCode` indices resolve. Native/wasm code pointers restore to `0` (an
+    /// interpreter run invokes the funcs directly; a native `invoke` of a not-yet-recompiled unit
+    /// fails closed — the Slice-3 boundary). Fail-closed: a bad unit reconstructs no domains.
+    pub fn restore_durable_jit(
+        &mut self,
+        domains: &[DurableJitDomain],
+    ) -> Result<(), JitRestoreError> {
+        let mut rebuilt = Vec::with_capacity(domains.len());
+        for d in domains {
+            let mut units = Vec::with_capacity(d.units.len());
+            for u in &d.units {
+                let m =
+                    svm_encode::decode_module(&u.unit_ir).map_err(|_| JitRestoreError::Decode)?;
+                svm_verify::verify_module(&m).map_err(|_| JitRestoreError::Verify)?;
+                units.push(JitUnit {
+                    funcs: Arc::from(m.funcs),
+                    native_code: 0,
+                    install_code: 0,
+                    install_type_id: u.install_type_id,
+                    wasm: None,
+                });
+            }
+            rebuilt.push(JitDomainState {
+                mem_log2: d.mem_log2,
+                units,
+                native_ctx: 0,
+                units_left: d.units_left,
+                bytes_left: d.bytes_left,
+            });
+        }
+        self.jit_domains = rebuilt;
+        Ok(())
     }
 
     /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
