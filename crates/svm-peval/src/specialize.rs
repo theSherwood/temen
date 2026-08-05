@@ -2267,12 +2267,13 @@ fn plan_cut_carry(
             }
         }
     }
-    // Residual indices: entry is 0, carried functions follow in discovery order.
-    let map = carried
-        .iter()
-        .enumerate()
-        .map(|(i, &orig)| (orig, i as u32 + 1))
-        .collect();
+    // Residual indices: entry is 0, carried functions follow in discovery order. Built with explicit
+    // inserts rather than `.collect()` — `BTreeMap::from_iter` sorts its input via `slice::sort`, whose
+    // driftsort helper the LLVM→IR on-ramp can't resolve (it would break the `peval_futamura` guest).
+    let mut map = BTreeMap::new();
+    for (i, &orig) in carried.iter().enumerate() {
+        map.insert(orig, i as u32 + 1);
+    }
     Ok((map, carried))
 }
 
