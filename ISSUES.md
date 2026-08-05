@@ -21,6 +21,36 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I64 — the binary format's v9→v10 bump carries a one-version decoder compatibility window; retire it when the committed `.svmb` assets regenerate (S3, tracked debt) — recorded 2026-08-05, CALLS.md 7.4 (PR #612)
+
+v10 added the impl-export policy byte (CALLS.md 7.4). The bump surfaced that the format's
+exact-current-VERSION rule predated **stored artifacts**: 17 committed `.svmb` blobs
+(`browser/web/assets/` + `browser/tests/fixtures/` — chibicc, QuickJS, the canvas demos, the
+stage-1 shell) are v9 and regenerate only through their heavyweight LLVM on-ramps
+(`build_chibicc_svmb.sh`, `prep_svmb`, `build-pg-assets.mjs`). The decoder therefore accepts
+**v9 and v10** (a v9 impl-export has no policy byte and reads as `single` — what every v9-era
+offer was); v8 and below stay rejected. Pinned by
+`svm-encode::a_v9_blob_with_an_impl_export_decodes_as_single` (bytes derived from the v10
+encoder, so the pin tracks the real layout). **Close-out:** regenerate the 17 assets at ≥v10,
+drop the `v != 9` arm and the pin, restore exact-version. Hand-rolled guest emitters
+(`demos/jit/*.c`) were bumped to v10 in the same PR — grep `format v` before any future bump.
+
+### I65 — `real-browser` `instnested` one-off: `vcpu confined setup/host trap: memory access out of bounds` (S4, flaky CI — single occurrence) — recorded 2026-08-05 on PR #612
+
+Failed once on run 31022849148 (commit `7f8a4813`, the CALLS.md 7.3 push); the identical suite
+passed on the same code plus 7.4 (run 31025127104) and on main at the shared base. No local
+reproduction attempted (the scenario needs the Playwright harness). If it recurs, suspect the
+§14-on-emitted-wasm worker setup path (the main-side `696c83e5` fuel-global change is nearby);
+one data point is not a diagnosis. Logged per the AGENTS.md flakiness rule.
+
+### I66 — macOS `jit_poll_observes_a_concurrently_running_child` is timing-gated: a loaded runner finishes the 20M-iteration child before the parent's first poll (S4, flaky CI) — recorded 2026-08-05 on PR #612
+
+Failed on run 31021473236 (commit `b682562f`) with `got Returned([11])` — the child ran to
+completion before the first poll, so the "still running" observation raced. The assertion is
+inherently timing-based (`crates/svm/tests/jit_lifecycle.rs:191`); a slow/loaded macOS runner
+loses the race legitimately. Rerun-once policy applies (like I53). A robust fix would gate the
+child on a rendezvous the parent releases *after* its first poll rather than a spin count.
+
 ### I61 — `wasm_transpile` panicked ("not a func") on a GC composite type that the up-front validator accepts (S2, nightly fuzz red) — **FIX LANDED 2026-08-04** (`claude/nightly-ci-failures-u9y1ly`)
 
 **Symptom.** Nightly `cargo-fuzz (all targets) (wasm_transpile)` has failed every run since 2026-07-25
