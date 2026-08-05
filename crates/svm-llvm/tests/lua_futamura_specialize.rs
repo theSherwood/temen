@@ -133,15 +133,19 @@ fn dispatch_folds_with_constant_bytecode() {
     // those 4 bytes constant makes the load fold, pruning the prologue trap block and every
     // per-instruction hook check. This is the "no debug hooks" specialization contract.
     const HOOKMASK_OFF: u64 = 192;
-    assert_eq!(rd_i32(&w, lu + HOOKMASK_OFF), 0, "L->hookmask not 0 (a hook is set?)");
+    assert_eq!(
+        rd_i32(&w, lu + HOOKMASK_OFF),
+        0,
+        "L->hookmask not 0 (a hook is set?)"
+    );
     let cfg = SpecConfig {
         const_overlays: vec![
             (ci, slice(ci, CI_SIZE)),
             (lu + HOOKMASK_OFF, vec![0u8; 4]),
             (code_addr, slice(code_addr, 4 * sizecode as usize)),
-            (func, slice(func, 16)),      // the closure TValue (holds the LClosure ptr + tag)
+            (func, slice(func, 16)), // the closure TValue (holds the LClosure ptr + tag)
             (closure, slice(closure, 48)), // LClosure header + p + upvals
-            (proto, slice(proto, 128)),   // Proto (code/k/sizes/…)
+            (proto, slice(proto, 128)), // Proto (code/k/sizes/…)
         ],
         rename: Some((base, reg_hi)),
         rename_is_private: true,
