@@ -1894,6 +1894,16 @@ fn drive_arc(
     // Durability is a domain property (DURABILITY.md §12.8): every vCPU of a durable run maintains
     // the per-context shadow-SP swap. Read before the host moves into the shared Arc.
     let durable = host.is_durable();
+    // Install-durability (DURABILITY.md §12.5): the domain's B2 `install` occupancy, resolved to
+    // `(slot, funcs)` now (before the host moves into the shared Arc) so the freshly-built dispatch
+    // table below can re-apply it. Empty for a fresh run (nothing installed), so it is a pure no-op
+    // there; on a thaw it re-installs each captured unit at its slot, so a `call_indirect` through an
+    // installed slot resolves after freeze/thaw. Install order is preserved (dense module ids).
+    let jit_reapply: Vec<(u32, Arc<[Func]>)> = host
+        .jit_all_installs()
+        .into_iter()
+        .filter_map(|(d, slot, unit)| host.jit_unit_funcs(d, unit).map(|f| (slot, f)))
+        .collect();
     // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
     // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
     // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
@@ -2016,6 +2026,13 @@ fn drive_arc(
                 jit_table_log2.max(need.trailing_zeros() as u8)
             }
         }));
+        // Install-durability (DURABILITY.md §12.5): re-apply the domain's captured B2 `install`
+        // occupancy onto the fresh table, in install order, so a thawed `call_indirect` resolves. A
+        // no-op for a fresh run (`jit_reapply` empty). `jit_table_log2` was restored from the
+        // artifact on thaw, so the padding these slots land in exists.
+        for (slot, unit_funcs) in &jit_reapply {
+            dt.install_at(*slot, Arc::clone(unit_funcs));
+        }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
             entry,
@@ -3606,6 +3623,24 @@ impl DomainTable {
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
+    }
+
+    /// Install `unit` at an **exact** slot (DURABILITY.md §12.5 install-durability): the reconstruct
+    /// twin of [`Self::install`], used to re-apply a domain's captured install occupancy onto a
+    /// freshly-built table at run start so a `call_indirect` through the slot resolves after a
+    /// freeze/thaw. Called in the guest's original install order, so the appended module ids stay
+    /// dense and each slot maps to its own re-applied unit. Out-of-range / real-function slots are a
+    /// no-op (a forged captured slot can only mis-dispatch within the guest's own table — never
+    /// escape — but stay defensive). Not on the concurrent hot path (run setup, before any vCPU).
+    fn install_at(&self, slot: u32, unit: Arc<[Func]>) {
+        let s = slot as usize;
+        if s >= self.slots.len() {
+            return;
+        }
+        let mut units = self.units.lock().unwrap_or_else(|e| e.into_inner());
+        units.push(unit);
+        let module = units.len() as u32; // module k ≡ units[k-1]
+        self.slots[s].store(pack_slot(module, 0), Ordering::Release);
     }
 
     /// **Auto-install a unit's own functions** (DESIGN.md §22 "unit-own funcref", the interpreter
@@ -8720,21 +8755,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 ($h:expr, $args:expr) => {{
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let unit_funcs = {
+                    let (domain, cu, unit_funcs) = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
                         let domain = hg.resolve_jit_domain($h)?;
                         let (cd, cu) = hg.resolve_jit_code(ch)?;
                         if cd != domain {
                             return Err(Trap::CapFault);
                         }
-                        hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?
+                        (domain, cu, hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?)
                     };
                     // Append the unit to the **shared** domain table (module id = its 1-based
                     // index) and fill the next empty slot — visible at once to every vCPU of the
                     // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
                     // so the first install lands at the same index the JIT's `install` returns.
                     let res = match dt.install(unit_funcs) {
-                        Some(slot) => slot as i64,
+                        Some(slot) => {
+                            // Record the occupancy on the domain so it survives the run (the table is
+                            // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
+                            host.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .jit_record_install(domain, slot, cu);
+                            slot as i64
+                        }
                         None => ENOSPC,
                     };
                     frames[top].vals.push(Reg::from_i64(res));
@@ -8742,15 +8784,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
             macro_rules! jit_uninstall_body {
                 ($h:expr, $args:expr) => {{
-                    {
+                    let domain = {
                         let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                        hg.resolve_jit_domain($h)?; // authority: a forged handle is inert
-                    }
+                        hg.resolve_jit_domain($h)? // authority: a forged handle is inert
+                    };
                     let slot = get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64()
                         as usize;
                     // A guest may only clear slots it installed (`≥ funcs.len()`, the module-0
                     // function count) — `dt.uninstall` enforces the range + filled checks.
                     let res = if dt.uninstall(slot, funcs.len()) {
+                        // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
+                        host.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .jit_forget_install(domain, slot as u32);
                         0
                     } else {
                         EINVAL
@@ -13778,6 +13824,10 @@ pub struct DurableJitDomain {
     pub units_left: u32,
     pub bytes_left: u64,
     pub units: Vec<DurableJitUnit>,
+    /// B2 `install` occupancy: `(table slot, unit index)` in install order (DURABILITY.md §12.5
+    /// install-durability). Re-applied to the thaw run's dispatch table so a `call_indirect`
+    /// through an installed slot resolves after a freeze/thaw.
+    pub installed: Vec<(u32, u32)>,
 }
 
 /// Why restoring a §22 guest-JIT domain from an artifact failed (DURABILITY.md §12.5 Slice 2).
@@ -14852,6 +14902,14 @@ struct JitDomainState {
     /// *proxy* for compiled bytes.
     units_left: u32,
     bytes_left: u64,
+    /// B2 `install` occupancy (DURABILITY.md §12.5 install-durability): `(table slot, unit)` for
+    /// each of this domain's units currently installed in the run's shared `call_indirect` table.
+    /// The table itself is a per-run transient rebuilt from module-0 (§12.4), so this is the
+    /// **persistent** record of the guest's `install`s — recorded on `install`, dropped on
+    /// `uninstall`, re-applied when a run builds its table (so an install survives a freeze/thaw),
+    /// and captured beside the units (`capture_durable_jit`). Push order = install order, so a
+    /// re-apply reproduces the same slot→unit dispatch.
+    installed: Vec<(u32, u32)>,
 }
 
 /// Default per-domain compile quota: generous for a long REPL session, far below what could
@@ -15968,6 +16026,7 @@ impl Host {
                         install_type_id: u.install_type_id,
                     })
                     .collect(),
+                installed: d.installed.clone(),
             })
             .collect()
     }
@@ -16005,6 +16064,7 @@ impl Host {
                 native_ctx: 0,
                 units_left: d.units_left,
                 bytes_left: d.bytes_left,
+                installed: d.installed.clone(),
             });
         }
         self.jit_domains = rebuilt;
@@ -17167,9 +17227,59 @@ impl Host {
             native_ctx: 0,
             units_left: JIT_DEFAULT_MAX_UNITS,
             bytes_left: JIT_DEFAULT_MAX_BLOB_BYTES,
+            installed: Vec::new(),
         });
         self.jit_table_log2 = self.jit_table_log2.max(table_log2);
         self.grant(cap_id::JIT, Binding::JitDomain(id))
+    }
+
+    /// Restore the `call_indirect` table reservation (DURABILITY.md §12.5 install-durability): the
+    /// thaw path re-establishes it from the artifact (a fresh host defaults to `0`, which would give
+    /// the thaw run's dispatch table no padding to re-apply the captured installs into). Monotone
+    /// like the grant path, so a restore that also re-grants never shrinks it.
+    pub fn set_jit_table_log2(&mut self, v: u8) {
+        self.jit_table_log2 = self.jit_table_log2.max(v);
+    }
+
+    /// Record a B2 `install`: `unit` now occupies `slot` in the run's dispatch table (DURABILITY.md
+    /// §12.5 install-durability). Kept on the domain so the occupancy survives the run (the table is
+    /// a per-run transient) and rides a snapshot. A repeat of the same slot replaces (the table slot
+    /// holds one unit); push order is preserved otherwise, so a re-apply reproduces dispatch.
+    pub fn jit_record_install(&mut self, domain: u32, slot: u32, unit: u32) {
+        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+            d.installed.retain(|&(s, _)| s != slot);
+            d.installed.push((slot, unit));
+        }
+    }
+
+    /// Forget a B2 `uninstall`: `slot` is cleared, so drop its occupancy record (DURABILITY.md §12.5).
+    pub fn jit_forget_install(&mut self, domain: u32, slot: u32) {
+        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+            d.installed.retain(|&(s, _)| s != slot);
+        }
+    }
+
+    /// This domain's B2 `install` occupancy — `(slot, unit)` in install order (DURABILITY.md §12.5).
+    /// The reconstruct-on-thaw embedder re-installs each into the fresh table (interp re-applies at
+    /// run start; the native tier via `svm_run::reconstruct_jit_units`).
+    pub fn jit_installs(&self, domain: u32) -> Vec<(u32, u32)> {
+        self.jit_domains
+            .get(domain as usize)
+            .map_or(Vec::new(), |d| d.installed.clone())
+    }
+
+    /// Every domain's install occupancy flattened to `(domain, slot, unit)` in domain-then-install
+    /// order — what the run entry re-applies to a freshly-built dispatch table so a restored install
+    /// survives a freeze/thaw (DURABILITY.md §12.5 install-durability). Empty for a fresh run (no
+    /// installs recorded), so re-apply is a no-op there.
+    fn jit_all_installs(&self) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        for (domain, d) in self.jit_domains.iter().enumerate() {
+            for &(slot, unit) in &d.installed {
+                out.push((domain as u32, slot, unit));
+            }
+        }
+        out
     }
 
     /// The `call_indirect` table reservation (`log2`) the run's root vCPU should build for B2

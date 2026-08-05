@@ -103,6 +103,40 @@ fn jit_domain_survives_freeze_serialize_restore() {
     );
 }
 
+/// Install-durability (v17): a domain's B2 `install` occupancy + the `call_indirect` table
+/// reservation ride Section 5 and re-grant on restore, byte-identically.
+#[test]
+fn jit_install_occupancy_round_trips() {
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_jit_validator(validator);
+    let dom = host.grant_jit_with_table(Some(SIZE_LOG2), 4); // reserve call_indirect padding
+    let c0 = host.jit_compile(dom, &unit_blob(42)).unwrap().unwrap();
+    // Record an install of the unit at a padding slot (what the eval-loop / native install arm does).
+    host.jit_record_install(c0.domain, 3, c0.unit);
+
+    let window = vec![0u8; WINDOW];
+    let artifact = freeze(&module, &window, &host).expect("freeze");
+    let mut thost = Host::new();
+    let restored = restore(&artifact, &module, &mut thost).expect("restore");
+
+    assert_eq!(
+        thost.jit_installs(c0.domain),
+        vec![(3, c0.unit)],
+        "install occupancy re-grants (slot 3 → unit)"
+    );
+    assert_eq!(
+        thost.jit_table_log2(),
+        4,
+        "the call_indirect table reservation is restored"
+    );
+    assert_eq!(
+        freeze(&module, &restored, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored install-bearing domain is byte-identical"
+    );
+}
+
 /// A JIT-free durable domain's artifact is unaffected by Slice 2: Section 5 is elided, so it stays
 /// byte-identical across a round-trip (the `!jit.is_empty()` guard).
 #[test]
@@ -134,6 +168,7 @@ fn restore_rejects_a_corrupt_unit() {
             unit_ir: vec![0xff, 0x00, 0x13, 0x37], // not a module image
             install_type_id: 0,
         }],
+        installed: Vec::new(),
     }];
     assert_eq!(
         host.restore_durable_jit(&bad),

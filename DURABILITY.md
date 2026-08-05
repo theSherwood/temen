@@ -193,10 +193,18 @@ module and before re-entering the guest (a no-op for a fresh run, which holds no
 native `invoke` of a restored unit runs its **own** code, matching the interpreter thaw (the §12.6
 cross-backend contract). Pinned by
 `durable_guest_jit.rs::durable_jit_domain_reconstructs_and_invokes_native` (freeze → restore →
-`jit_cap_run` reconstructs + invokes natively ≡ 42). *Follow-on:* reproducing a B2-`install`ed unit's
-`call_indirect` **table slot** across a thaw (Slice 2 captured the unit IR + install type id, not the
-slot occupancy — the `invoke` handle still resolves, only a funcref through the old slot would miss).
-The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+`jit_cap_run` reconstructs + invokes natively ≡ 42). **B2 `install` table-slot durability now lands
+too:** the dispatch table is a per-run transient (§12.4), so a unit's `install` occupancy — `(slot,
+unit)` + the `call_indirect` table reservation — is recorded on the domain (on `install`, dropped on
+`uninstall`, on both backends' install ops), rides Section 5 (codec v17), and is **re-applied** when
+the thaw run builds its table (interp `DomainTable::install_at` at run entry; native via
+`reconstruct_jit_units` → `CompiledModule::install_at`, which also carries an installed unit whose
+`CompiledCode` handle was released). So a `call_indirect` through an installed slot resolves after a
+freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_freeze_thaw`(`_native`)
+(install → freeze → restore → `call_indirect` ≡ 42, both backends) and
+`jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize). *Remaining
+durability follow-on:* freezing an **in-flight `invoke`/dispatch continuation** (freeze is currently a
+quiescent point). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
@@ -811,13 +819,16 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
-- **Dispatch table** (`DomainTable`, `svm-interp:2002`): **nothing to capture in v1.**
-  The table is an *identity* table built deterministically from the module
-  (`slot i → (module 0, func i)`), so it is re-created bit-identically on thaw from the
-  same instrumented module — like the JIT's `readonly` data segments. The only runtime
-  mutation is `install` of guest-JIT native units, which are **non-durable** anyway
-  (their `JitDomain`/`JitCode` handles make freeze refuse — §12.5). So a freezable
-  domain's table is a pure function of the module; storing it would be redundant.
+- **Dispatch table** (`DomainTable`, `svm-interp:2002`): the table's **identity** part is
+  module-derived — `slot i → (module 0, func i)` plus trapping padding — so it is re-created
+  bit-identically on thaw from the same module, and only the runtime mutation needs capturing.
+  That mutation is B2 `install` of guest-JIT units. **Install-durability (§12.5) now captures it:**
+  the occupancy — `(slot, unit)` per installed unit, plus the table reservation `table_log2` — is
+  recorded on the domain (`JitDomainState.installed`, not the per-run table), rides Section 5 beside
+  the units, and is **re-applied** when a run builds its table (`DomainTable::install_at` at run
+  entry; the native tier via `svm_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
+  `call_indirect` through an installed slot resolves after a freeze/thaw. The identity slots stay a
+  pure function of the module (not stored).
 
 ### 12.5 Section 3 — Handle table (durability classification)
 

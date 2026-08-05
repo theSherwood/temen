@@ -760,7 +760,12 @@ unsafe fn jit_native_op(
             // synchronous cap.call); `code` is a natural-ABI entry the JIT registered for this
             // unit. The slot write does not move the table base (pre-reserved at compile).
             let v = match (*cm).install(code as *const u8, type_id) {
-                Some(slot) => slot as i64,
+                Some(slot) => {
+                    // Record the occupancy on the domain so it survives the run and rides a
+                    // snapshot (DURABILITY.md §12.5 install-durability), matching the interp path.
+                    host.jit_record_install(cd, slot, cu);
+                    slot as i64
+                }
                 None => ENOSPC,
             };
             put(results, n_results, v, trap_out);
@@ -778,6 +783,8 @@ unsafe fn jit_native_op(
             let slot = *args.first().unwrap_or(&-1);
             // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended).
             let v = if slot >= 0 && (*cm).uninstall(slot as u32) {
+                // Drop the occupancy record so a snapshot doesn't re-apply a cleared slot.
+                host.jit_forget_install(domain, slot as u32);
                 0
             } else {
                 EINVAL
@@ -1354,12 +1361,13 @@ pub fn recompact_into(
 /// `jit_cap_run` needs no extra call — and a *fresh* run (no restored units) is a no-op, since a
 /// just-granted domain holds no live `CompiledCode` handle.
 ///
-/// **Scope.** The `invoke` path only (live `CompiledCode` handles). Reproducing a B2-`install`ed
-/// unit's `call_indirect` **table slot** across a thaw is a follow-on: Slice 2 captured the units'
-/// IR + install type id but not the slot occupancy, so an installed unit's slot is not re-established
-/// here (its handle still `invoke`s correctly; only a funcref reached through the old slot would
-/// miss). Register-side install reproduction rides the same `define_extra` result (`d.code`/
-/// `d.type_id`) once the slot index is captured.
+/// **Scope.** The `invoke` path (live `CompiledCode` handles) **and** the B2 `install` path: a
+/// unit occupying a `call_indirect` table slot ([`Host::jit_installs`]) is compiled and its slot
+/// reproduced at the exact index ([`CompiledModule::install_at`]), so a `call_indirect` through an
+/// installed slot resolves after a thaw (DURABILITY.md §12.5 install-durability) — the interpreter
+/// re-applies the same occupancy when it builds the run's dispatch table. An installed unit whose
+/// `CompiledCode` handle was already released is still carried (union of live + installed), like
+/// [`recompact_into`]'s `keep`.
 ///
 /// # Safety
 /// `cm` must be the run's live [`CompiledModule`] (the one whose native ctx is registered in
@@ -1369,13 +1377,31 @@ pub fn reconstruct_jit_units(
     host: &mut Host,
 ) -> Result<(), svm_jit::JitError> {
     for domain in 0..host.jit_domain_count() {
-        for unit in host.jit_live_units(domain) {
+        let installs = host.jit_installs(domain);
+        // Carry every reachable unit: live-handled (the `invoke` path) unioned with installed (a
+        // slot occupant whose handle may have been released — the redefinition-survivor case).
+        let mut keep = host.jit_live_units(domain);
+        for &(_, unit) in &installs {
+            if !keep.contains(&unit) {
+                keep.push(unit);
+            }
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        for unit in keep {
             let Some(funcs) = host.jit_unit_funcs(domain, unit) else {
                 continue; // no IR retained (cannot happen for a restored unit) — skip defensively
             };
             let defs = cm.define_extra(&funcs)?;
             let d = defs[0];
             host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
+        }
+        // Reproduce the B2 install slots (the unit's natural-ABI entry + type id are now registered).
+        for (slot, unit) in installs {
+            let (install_code, type_id) = host.jit_unit_install(domain, unit);
+            if install_code != 0 {
+                cm.install_at(slot, install_code as *const u8, type_id);
+            }
         }
     }
     Ok(())

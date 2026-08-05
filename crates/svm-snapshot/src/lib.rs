@@ -124,7 +124,13 @@ const MAGIC: &[u8; 4] = b"SVMD";
 /// Elided when the domain holds no granted JIT, so a JIT-free artifact keeps the v15 layout (only
 /// the version differs); one holding a JIT cap couldn't have been produced by v15 (freeze refused
 /// it), so there's no v15 mis-parse to guard.
-const FORMAT_VERSION: u16 = 16;
+/// v17 (§12.5 install-durability): Section 5 (`TAG_JIT`) gains a leading `table_log2` header (the
+/// domain's `call_indirect` table reservation, restored so a thaw's dispatch table has the padding
+/// the installs land in) and a per-domain **install occupancy** list — `(slot, unit)` pairs, in
+/// install order — re-applied to the thaw run's table so a `call_indirect` through an installed slot
+/// resolves. A v16 JIT section had neither, so it mis-parses under v17; a JIT-free artifact is
+/// unaffected (Section 5 stays elided).
+const FORMAT_VERSION: u16 = 17;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -496,15 +502,18 @@ pub fn freeze_with_prots(
     // the pre-JIT section layout (only the version differs).
     let jit = host.capture_durable_jit();
     if !jit.is_empty() {
-        section(&mut out, TAG_JIT, |b| write_jit(b, &jit));
+        let table_log2 = host.jit_table_log2();
+        section(&mut out, TAG_JIT, |b| write_jit(b, table_log2, &jit));
     }
 
     Ok(out)
 }
 
-/// Serialize the durable guest-JIT domains (Section 5, v16). Canonical: domains and units in
-/// index order (capture already yields them so), minimal LEB128.
-fn write_jit(b: &mut Vec<u8>, jit: &[DurableJitDomain]) {
+/// Serialize the durable guest-JIT domains (Section 5, v17). Canonical: the `table_log2` header,
+/// then domains and units in index order (capture already yields them so), install occupancy in
+/// install order — all minimal LEB128.
+fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitDomain]) {
+    b.push(table_log2); // v17: the run's call_indirect table reservation
     write_uleb(b, jit.len() as u64);
     for d in jit {
         match d.mem_log2 {
@@ -521,6 +530,12 @@ fn write_jit(b: &mut Vec<u8>, jit: &[DurableJitDomain]) {
             write_uleb(b, u.install_type_id as u64);
             write_uleb(b, u.unit_ir.len() as u64);
             b.extend_from_slice(&u.unit_ir);
+        }
+        // v17: B2 install occupancy — (slot, unit) in install order.
+        write_uleb(b, d.installed.len() as u64);
+        for &(slot, unit) in &d.installed {
+            write_uleb(b, slot as u64);
+            write_uleb(b, unit as u64);
         }
     }
 }
@@ -661,7 +676,7 @@ pub fn restore_with_prots(
     // domain/unit is rejected here — otherwise the guest's first `compile`/`invoke` would index
     // `jit_domains` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
     // bounds check). ----
-    let jit = decode_jit(jit_body)?;
+    let (jit_table_log2, jit) = decode_jit(jit_body)?;
     for h in &handles {
         let ok = match h.binding {
             DurableBinding::JitDomain { idx } => (idx as usize) < jit.len(),
@@ -676,6 +691,9 @@ pub fn restore_with_prots(
     }
     host.restore_durable_jit(&jit)
         .map_err(|_| RestoreError::JitReconstruct)?;
+    // v17: restore the call_indirect table reservation so the thaw run's dispatch table has the
+    // padding the re-applied installs land in (a fresh host defaults to 0).
+    host.set_jit_table_log2(jit_table_log2);
     host.restore_durable_handles(&handles);
 
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
@@ -952,14 +970,16 @@ fn decode_control(
     Ok((fibers, vcpus, root_sp, nested, child_state))
 }
 
-/// Decode Section 5: the durable guest-JIT domains (v16). A `None` body ⇒ no JIT granted (empty
-/// set). Enforces canonical minimal encoding via the shared [`Reader`]; a unit's IR is carried
-/// opaquely here (its decode + re-verify happens in [`Host::restore_durable_jit`]).
-fn decode_jit(body: Option<&[u8]>) -> Result<Vec<DurableJitDomain>, RestoreError> {
+/// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
+/// ⇒ no JIT granted (`table_log2 = 0`, empty set). Enforces canonical minimal encoding via the
+/// shared [`Reader`]; a unit's IR is carried opaquely here (its decode + re-verify happens in
+/// [`Host::restore_durable_jit`]). Returns `(table_log2, domains)`.
+fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitDomain>), RestoreError> {
     let Some(body) = body else {
-        return Ok(Vec::new());
+        return Ok((0, Vec::new()));
     };
     let mut jr = Reader::new(body);
+    let table_log2 = jr.u8()?;
     let nd = jr.uleb()?;
     let mut domains = Vec::with_capacity(nd as usize);
     for _ in 0..nd {
@@ -981,11 +1001,20 @@ fn decode_jit(body: Option<&[u8]>) -> Result<Vec<DurableJitDomain>, RestoreError
                 install_type_id,
             });
         }
+        // v17: B2 install occupancy — (slot, unit) in install order.
+        let ni = jr.uleb()?;
+        let mut installed = Vec::with_capacity(ni as usize);
+        for _ in 0..ni {
+            let slot = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            let unit = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            installed.push((slot, unit));
+        }
         domains.push(DurableJitDomain {
             mem_log2,
             units_left,
             bytes_left,
             units,
+            installed,
         });
     }
     if !jr.at_end() {
@@ -995,7 +1024,7 @@ fn decode_jit(body: Option<&[u8]>) -> Result<Vec<DurableJitDomain>, RestoreError
     if domains.is_empty() {
         return Err(RestoreError::Malformed);
     }
-    Ok(domains)
+    Ok((table_log2, domains))
 }
 
 // ---- Binding (de)serialization (§12.5) ----

@@ -7,11 +7,17 @@
 //!
 //! Slice 1 covers *compile-side* composition + a NORMAL-state end-to-end run.
 //!
-//! **Slice 2 — persisting `JitCode`/`JitDomain` handles across a snapshot** now lands
+//! **Slice 2 — persist `JitCode`/`JitDomain` across a snapshot**
 //! (`durable_jit_domain_survives_freeze_and_invokes`): a durable domain's compiled units ride the
-//! artifact (svm-snapshot Section 5 / v16), and after restore the re-pinned handles invoke the
-//! reconstructed (re-verified) unit on the interpreter. Native re-compile of a restored unit is the
-//! Slice-3 follow-on (a native `invoke` of a not-yet-recompiled unit fails closed until then).
+//! artifact (svm-snapshot Section 5), and after restore the re-pinned handles invoke the
+//! reconstructed (re-verified) unit on the interpreter.
+//!
+//! **Slice 3 — native reconstruct-on-thaw** (`…reconstructs_and_invokes_native`): `jit_cap_run`
+//! re-compiles a restored unit into the fresh module, so the native tier invokes its own code ≡ 42.
+//!
+//! **Install-durability** (`durable_jit_install_slot_survives_freeze_thaw`(`_native`)): a unit's B2
+//! `install` occupancy rides the artifact (Section 5 / v17) and is re-applied on thaw, so a
+//! `call_indirect` through an installed slot resolves after a freeze/thaw on both backends.
 
 use svm_durable::{init_durable_window, transform_module, write_state, STATE_NORMAL};
 use svm_encode::encode_module;
@@ -295,5 +301,153 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
             "native invoke of the reconstructed unit → 42 (matches the interp thaw)"
         ),
         other => panic!("expected Returned(42) from the native thaw, got {other:?}"),
+    }
+}
+
+/// A durable program with two entries: **func 0** compiles + B2-`install`s a unit and returns its
+/// table slot; **func 1** `call_indirect`s that slot. Shared by the interp + native install-slot
+/// durability tests. The unit is `() -> i64` returning 42; the module declares memory 17 to match.
+const INSTALLER_CALLER: &str = "memory 17\n\
+    func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
+      v3 = cap.call 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+      v4 = cap.call 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
+    func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+      v1 = call_indirect () -> (i64) v0 ()\n  return v1\n  }\n}\n";
+
+/// The unit blob the installer compiles + installs.
+fn install_unit() -> Vec<u8> {
+    blob("memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n")
+}
+
+/// A `call_indirect` table reservation with room for the installer's padding slots.
+const TABLE_LOG2: u8 = 4;
+
+/// **Install-durability, interpreter.** A guest compiles + `install`s a unit into a `call_indirect`
+/// slot, the domain is frozen + restored, and a second entry `call_indirect`s that slot → 42. The
+/// dispatch table is a per-run transient (§12.4), so the occupancy is recorded on the domain, rides
+/// the artifact (Section 5, v17), and is **re-applied** when the thaw run builds its table.
+#[test]
+fn durable_jit_install_slot_survives_freeze_thaw() {
+    let unit = install_unit();
+    let m = parse_module(INSTALLER_CALLER).expect("parse installer/caller");
+    verify_module(&m).expect("verify");
+
+    let mut hd = Host::new();
+    let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+
+    // Entry 0: compile + install the unit (staged at BLOB_OFF) → the table slot.
+    let mut win = vec![0u8; WINDOW];
+    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+    let mut fuel = 5_000_000u64;
+    let (r_inst, snap) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[
+            Value::I32(jd),
+            Value::I64(BLOB_OFF as i64),
+            Value::I64(unit.len() as i64),
+        ],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut hd,
+    );
+    let slot = match r_inst.expect("install ok").as_slice() {
+        [Value::I64(s)] if *s >= 0 => *s as i32,
+        other => panic!("install returned {other:?}"),
+    };
+
+    // Freeze + restore. The install occupancy is captured on the domain and re-granted.
+    let artifact = freeze(&m, &snap, &hd).expect("freeze");
+    let mut th = Host::new();
+    let window = restore(&artifact, &m, &mut th).expect("restore");
+    assert_eq!(
+        th.jit_installs(0),
+        vec![(slot as u32, 0)],
+        "the install occupancy round-trips (slot → unit 0)"
+    );
+    assert_eq!(
+        freeze(&m, &window, &th).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored install-bearing domain is byte-identical"
+    );
+
+    // Entry 1 over the thawed host: call_indirect through the restored slot resolves to the unit.
+    let mut fuel2 = 5_000_000u64;
+    let (r_call, _) = run_capture_reserved_with_host(
+        &m,
+        1,
+        &[Value::I32(slot)],
+        &mut fuel2,
+        &window,
+        SIZE_LOG2,
+        &mut th,
+    );
+    assert_eq!(
+        r_call.expect("call ok"),
+        vec![Value::I64(42)],
+        "call_indirect through the restored install slot → 42"
+    );
+}
+
+/// **Install-durability, native.** The same install → freeze → restore, but both entries run on the
+/// Cranelift backend: `jit_cap_run` reconstructs the unit and reproduces its `call_indirect` table
+/// slot (`reconstruct_jit_units` → `CompiledModule::install_at`), so the thawed `call_indirect`
+/// dispatches to the unit's own native code → 42.
+#[test]
+fn durable_jit_install_slot_survives_freeze_thaw_native() {
+    let unit = install_unit();
+    let m = parse_module(INSTALLER_CALLER).expect("parse installer/caller");
+    verify_module(&m).expect("verify");
+
+    let mut hd = Host::new();
+    let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+
+    // Entry 0 (native): compile + install the unit → the table slot, then snapshot the run window.
+    let mut win = vec![0u8; WINDOW];
+    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+    let (out, snap) = jit_cap_run(
+        &m,
+        0,
+        &[jd as i64, BLOB_OFF as i64, unit.len() as i64],
+        &win,
+        SIZE_LOG2,
+        TABLE_LOG2,
+        &mut hd,
+    )
+    .expect("native install run");
+    let slot = match out {
+        JitOutcome::Returned(ref s) if s.len() == 1 && s[0] >= 0 => s[0] as i32,
+        other => panic!("install returned {other:?}"),
+    };
+
+    // Freeze + restore.
+    let artifact = freeze(&m, &snap, &hd).expect("freeze");
+    let mut th = Host::new();
+    let window = restore(&artifact, &m, &mut th).expect("restore");
+    assert_eq!(
+        th.jit_installs(0),
+        vec![(slot as u32, 0)],
+        "install round-trips"
+    );
+
+    // Entry 1 (native) over the thawed host: reconstruct reproduces the slot; call_indirect → 42.
+    let (out2, _) = jit_cap_run(
+        &m,
+        1,
+        &[slot as i64],
+        &window,
+        SIZE_LOG2,
+        TABLE_LOG2,
+        &mut th,
+    )
+    .expect("native thaw call run");
+    match out2 {
+        JitOutcome::Returned(slots) => assert_eq!(
+            slots,
+            vec![42],
+            "native call_indirect through the reproduced install slot → 42"
+        ),
+        other => panic!("expected Returned(42), got {other:?}"),
     }
 }
