@@ -2156,6 +2156,19 @@ impl Spec<'_> {
         rnext: &mut u32,
         fuel: &mut usize,
     ) -> Result<Terminator, SpecError> {
+        // Cut set: a `return runtime_callout(...)` tail-bail (a common shape — e.g. an interpreter
+        // checkpointing its state and tail-calling a resume/slow-path routine). Emit it verbatim as a
+        // residual `return_call` to the carried callee, exactly like an opaque `call` — never inlined
+        // or folded. State-touching cut callees would need the region spilled here, which the tail
+        // position (no return point to reload at) can't do, so only the plain opaque cut set applies.
+        if self.config.cut_calls.contains(&callee) {
+            let ridx = self.cut[&callee];
+            let args: Vec<u32> = args_abs
+                .iter()
+                .map(|&a| materialize(a, out, rnext))
+                .collect();
+            return Ok(Terminator::ReturnCall { func: ridx, args });
+        }
         if let Some(state) = self.outline {
             // Threading the renamed region across a *tail* call (where the callee's results become
             // this function's results) isn't supported — there's no return point to append this
