@@ -1529,7 +1529,8 @@ pub extern "C" fn svm_par_child(
     let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win_size as u64) });
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl) {
+    match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl)
+    {
         Ok(inner) => {
             // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
             // the root, `svm_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
@@ -4339,6 +4340,37 @@ fn stash(slot: &mut (*mut u8, usize), data: Vec<u8>) {
         let len = boxed.len();
         (Box::into_raw(boxed) as *mut u8, len)
     };
+}
+
+// ---- Per-function call profiler FFI (opt-in `callprof` feature; tier-up break-even measurement) ---
+// Not present in a shipped build. Arm with `svm_callprof_reset(n_funcs)`, run a guest via
+// `svm_run_onramp`, then `svm_callprof_dump()` and read the buffer (LE `u64` per function).
+#[cfg(feature = "callprof")]
+static mut CALLPROF: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+#[cfg(feature = "callprof")]
+#[no_mangle]
+pub extern "C" fn svm_callprof_reset(n: usize) {
+    bytecode::callprof_reset(n);
+}
+#[cfg(feature = "callprof")]
+#[no_mangle]
+pub extern "C" fn svm_callprof_dump() {
+    let counts = bytecode::callprof_snapshot();
+    let mut bytes = Vec::with_capacity(counts.len() * 8);
+    for c in counts {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(CALLPROF), bytes) };
+}
+#[cfg(feature = "callprof")]
+#[no_mangle]
+pub extern "C" fn svm_callprof_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(CALLPROF)).0 }
+}
+#[cfg(feature = "callprof")]
+#[no_mangle]
+pub extern "C" fn svm_callprof_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(CALLPROF)).1 }
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **powerbox** (see

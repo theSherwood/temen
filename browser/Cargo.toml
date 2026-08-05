@@ -27,6 +27,9 @@ path = "src/gencorpus.rs"
 # console/clock-bound variant. See BROWSER.md.
 [features]
 live = []
+# Opt-in per-function call profiler (tier-up break-even measurement) — surfaces `svm_callprof_*`
+# and enables the interp's counter. Never in a shipped build; a measurement cdylib only.
+callprof = ["svm-interp/callprof"]
 
 [dependencies]
 svm-interp = { path = "../crates/svm-interp" }

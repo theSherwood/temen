@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Opt-in per-function call profiler (tier-up break-even measurement). Off by default → the hot
+# interpreter path compiles byte-identical; on → `Op::Call` increments a thread-local counter the
+# host reads back (see `callprof_*`). Never enabled in a shipped build.
+callprof = []
+
 [dependencies]
 svm-ir.workspace = true
 svm-encode.workspace = true
