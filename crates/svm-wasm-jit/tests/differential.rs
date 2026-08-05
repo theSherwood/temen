@@ -891,6 +891,55 @@ fn out_of_fuel() {
     diff("out_of_fuel", SPIN, &[0], 100_000);
 }
 
+/// **Exact fuel parity** (INVARIANTS.md #9). The wasm tier charges at the *same* IR safepoints as
+/// the tree-walk oracle — one per function entry, one per taken back-edge — so for *any* budget it
+/// completes-or-traps identically, not merely "both eventually trap on an infinite loop". Measure
+/// the oracle's exact consumption at a bounded arg, then pin the wasm's complete↔`OutOfFuel` boundary
+/// to it (and check agreement across a window straddling the boundary). `alu` exercises back-edge
+/// safepoints; `call` (a loop that calls a leaf every iteration) exercises function-entry safepoints
+/// too — the two charge kinds that used to be metered as a coarser once-per-dispatch-iteration debit.
+#[test]
+fn fuel_parity_exact() {
+    for (name, src, arg) in [("alu", ALU, 40i64), ("call", CALL, 25i64)] {
+        let m = svm_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+        svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
+        let wasm = compile_module(&m).unwrap_or_else(|e| panic!("{name}: emit: {e}"));
+        let args = vec![Value::I64(arg)];
+
+        // The oracle's exact consumption at this arg (fuel is decremented in place).
+        let mut fuel = FUEL;
+        assert!(
+            svm_interp::run(&m, 0, &args, &mut fuel).is_ok(),
+            "{name}: oracle should complete with ample fuel"
+        );
+        let consumed = FUEL - fuel;
+        assert!(
+            consumed > 4,
+            "{name}: consumption {consumed} too small to test a boundary"
+        );
+
+        // Straddle the boundary: oracle and wasm must agree exactly (complete vs OutOfFuel) at every
+        // budget — the strong form of parity, impossible under the old per-dispatch-iteration metering.
+        for b in (consumed - 3)..=(consumed + 3) {
+            assert_eq!(
+                oracle(&m, &args, b),
+                wasm_run(&m, &wasm, &args, b),
+                "{name}: fuel parity mismatch at budget {b} (oracle consumes {consumed})"
+            );
+        }
+        // And the flip is at the identical budget on the wasm tier.
+        assert!(
+            matches!(wasm_run(&m, &wasm, &args, consumed), Outcome::Vals(_)),
+            "{name}: wasm should complete at exactly {consumed}"
+        );
+        assert_eq!(
+            wasm_run(&m, &wasm, &args, consumed - 1),
+            Outcome::Trap(TrapKind::OutOfFuel),
+            "{name}: wasm should trap OutOfFuel at {consumed}-1"
+        );
+    }
+}
+
 /// Multi-result returns end-to-end (wasm multi-value + reverse result pops at the call site).
 const MULTI: &str = r#"
 func (i64) -> (i64) {

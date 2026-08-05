@@ -18,8 +18,10 @@
 //!   longer debits (see below); it stays reserved so the scratch layout is unchanged.
 //!
 //! **Fuel is debited from a mutable wasm `i64` global** (`FuelMode::Global`, exported `"fuel"`),
-//! once per dispatcher iteration — coarser than the interpreter's per-op fuel, a bound not an
-//! observable (DESIGN.md §5), trapped on exhaustion. A global (not a linear-memory cell) because no
+//! at the **IR-anchored safepoints** — one per function entry and one per taken back-edge — matching
+//! the tree-walk/bytecode/Cranelift oracle exactly (INVARIANTS.md #9), so the emitted wasm traps
+//! `OutOfFuel` at the *identical* safepoint for any budget (`tests/differential.rs` asserts exact
+//! parity, not just the trap kind). A global (not a linear-memory cell) because no
 //! guest memory store can alias it, so V8/TurboFan keeps the counter in a register across a hot
 //! loop instead of reloading it every iteration — measured **1.5–2.8× on hot integer loops**, up to
 //! the no-fuel bound (BROWSER.md § "Fuel in a global"). The global self-initializes to the standard
@@ -2405,11 +2407,19 @@ fn emit_func(
         uleb(&mut code, cx.local_of[0][i] as u64);
     }
 
-    // The dispatcher: loop { fuel; block .. block { br_table $next } code_0 .. code_{N-1} }.
+    // Fuel unification (INVARIANTS.md #9): charge one fuel for the **function-entry** safepoint,
+    // once, before the dispatcher loop — the oracle's per-entry charge (top-level entry and each
+    // `call`/`call_indirect`/`return_call` into an emitted function, whose body runs this on entry).
+    // The rest of the budget is charged at taken back-edges inside `emit_edge`; forward branches and
+    // `return` are free. This matches the oracle safepoint-for-safepoint (not the old coarser
+    // once-per-dispatch-iteration debit), so the emitted wasm traps `OutOfFuel` at the *identical*
+    // point for any budget, not merely "both eventually trap".
+    emit_fuel_check(&mut cx, &mut code);
+
+    // The dispatcher: loop { block .. block { br_table $next } code_0 .. code_{N-1} }.
     code.push(OP_LOOP);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_fuel_check(&mut cx, &mut code);
     let n = f.blocks.len();
     for _ in 0..n {
         code.push(OP_BLOCK);
@@ -2469,10 +2479,11 @@ fn emit_func(
 }
 
 /// Debit one fuel unit from the counter (`FuelMode::Global` global, or the legacy `env` cell) and
-/// trap `TRAP_OUT_OF_FUEL` when it goes negative. Runs once per dispatcher iteration — a coarser
-/// debit than the interpreter's per-op fuel, deliberately (fuel is a §5 bound, not an observable).
-/// The debited value and the `< 0` trap are identical across modes, so the `OutOfFuel` differential
-/// is placement-insensitive.
+/// trap `TRAP_OUT_OF_FUEL` when it goes negative. Emitted at the IR-anchored safepoints — once at
+/// function entry and once per taken back-edge (`emit_edge`), matching the tree-walk/bytecode/
+/// Cranelift oracle exactly (INVARIANTS.md #9), so a run traps `OutOfFuel` at the identical
+/// safepoint for any budget. The debited value and the `< 0` trap are identical across placement
+/// modes, so the differential is placement-insensitive.
 fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
     match cx.fuel_mode {
         FuelMode::None => {}
@@ -2684,12 +2695,20 @@ fn emit_win_addr(code: &mut Vec<u8>, base_local: u32) {
 /// Push branch args onto the operand stack, then pop them into the target block's param locals in
 /// reverse — stack copies make a param-permuting self-branch safe.
 fn emit_edge(
-    cx: &FnCtx,
+    cx: &mut FnCtx,
     code: &mut Vec<u8>,
     from_block: usize,
     target: u32,
     args: &[svm_ir::ValIdx],
 ) {
+    // Fuel unification (INVARIANTS.md #9): charge one fuel per **taken back-edge** — a branch whose
+    // target block index is `<= from_block`, the oracle's exact definition (svm-interp `drive`).
+    // Both indices are static per edge, so the charge is unconditional here (Br) or lands inside the
+    // taken arm (BrIf/BrTable's per-target `emit_edge`); forward branches are free. Stack-neutral, so
+    // it precedes the arg shuffle cleanly.
+    if (target as usize) <= from_block {
+        emit_fuel_check(cx, code);
+    }
     for a in args {
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[from_block][*a as usize] as u64);
