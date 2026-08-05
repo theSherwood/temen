@@ -883,6 +883,7 @@ dependencies = [
 name = "svm-wasm-jit"
 version = "0.0.0"
 dependencies = [
+ "svm-encode",
  "svm-interp",
  "svm-ir",
  "svm-jit",

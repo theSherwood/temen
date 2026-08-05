@@ -55,6 +55,48 @@ use super::{
     Value, VarValue, DEFAULT_RESERVED_LOG2,
 };
 
+// ---- Per-function call profiler (opt-in `callprof` feature; tier-up break-even measurement) -------
+// A thread-local histogram indexed by primary-module function index, bumped once per `Op::Call`. Off
+// by default: with the feature disabled these items don't exist and the hot path is byte-identical.
+#[cfg(feature = "callprof")]
+mod callprof {
+    use std::cell::RefCell;
+    thread_local! {
+        static COUNTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+    /// Arm the profiler with a zeroed histogram of `n` functions (call before the run).
+    pub fn reset(n: usize) {
+        COUNTS.with(|c| {
+            let mut c = c.borrow_mut();
+            c.clear();
+            c.resize(n, 0);
+        });
+    }
+    /// Record one call to `func` (a no-op if the histogram is smaller — non-primary-module callees).
+    #[inline]
+    pub fn hit(func: usize) {
+        COUNTS.with(|c| {
+            if let Some(slot) = c.borrow_mut().get_mut(func) {
+                *slot += 1;
+            }
+        });
+    }
+    /// Snapshot the per-function call counts.
+    pub fn snapshot() -> Vec<u64> {
+        COUNTS.with(|c| c.borrow().clone())
+    }
+}
+/// Arm the per-function call profiler with a zeroed `n`-function histogram (opt-in `callprof`).
+#[cfg(feature = "callprof")]
+pub fn callprof_reset(n: usize) {
+    callprof::reset(n);
+}
+/// Snapshot per-function call counts since the last [`callprof_reset`].
+#[cfg(feature = "callprof")]
+pub fn callprof_snapshot() -> Vec<u64> {
+    callprof::snapshot()
+}
+
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
 /// a precomputed `aliasing` flag. A **non-aliasing** edge — the common case (an induction variable /
 /// accumulator reads distinct value slots and writes the successor's param slots) — is applied by a
@@ -11710,6 +11752,10 @@ impl Vm {
                 Op::Call { callee, args, dst } => {
                     step(fuel, None)?; // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
+                    #[cfg(feature = "callprof")]
+                    if module == 0 {
+                        callprof::hit(callee);
+                    }
                     // wasm-JIT tier-up: a module-0 direct call to an eligible function surfaces to the
                     // host, which runs the emitted region and delivers the results. `argv` is the raw
                     // i64 arg slots; the host reads them per the callee's signature. Suspension-free by
@@ -11820,6 +11866,10 @@ impl Vm {
                 Op::TailCall { callee, args } => {
                     step(fuel, None)?; // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
+                    #[cfg(feature = "callprof")]
+                    if module == 0 {
+                        callprof::hit(callee);
+                    }
                     let need = base + c.progs[callee].nslots as usize;
                     if self.regs.len() < need {
                         self.regs.resize(need, Reg::default());
