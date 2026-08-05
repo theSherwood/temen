@@ -57,6 +57,45 @@ five `Instantiator` ops, the child-suspension plumbing only coroutine children u
 relevant tiers); a **benchmark pin on the fault-service path** — the collapse must not regress
 lazy-paging latency vs the bespoke coroutine ops (bench harness is the arbiter, AGENTS.md).
 
+### §2 status (2026-08-05, after PR #622)
+
+Landed: **2.0** (`paging_bench` pin: bespoke interp ~1.4–2.1 µs/fault, bespoke JIT ~29 µs —
+every fault switch pays `sync_committed` mirroring both ways across the carve); **2.1**
+(coroutine-as-provider vertical, `coroutine_offer_bench`); **2.1b** (`RunConfig::handoff`
+default-on — the 4d direct-handoff lane was built but unreachable from `svm-run`, so 2.1's 9–10×
+reading measured the queued transport; with handoff on, interp offers ~740 ns); **2.2**
+(`Instantiator` op 16 `spawn_process_demand`: pager-serviced demand paging as a call on the
+spawner's own impl export, eval-loop tier; bytecode vetoes to the oracle, JIT folds via
+`module_demand_spawns`).
+
+The gate reading (`paging_bench`, offer lane vs bespoke, identical checksum), **after the
+§2.2 fast lane** (dispatch loops instead of requeuing an inline-serviced faulter — the
+run-queue round trip per fault was the dominant residual): **JIT 12.4× FASTER** (28.8 µs →
+2.3 µs — the per-switch mirroring cost is deleted by construction, the collapse thesis
+vindicated on the tier that matters); **interp tiers 1.3–1.65×** (TreeWalk 1.43 → 2.36 µs,
+Bytecode 1.83 → 2.41 µs; was 1.8–2.8× before the fast lane). The remaining residual is
+largely the price of a genuinely concurrent child (enqueue/ticket under the provider lock,
+provider vCPU enter/exit per serve) vs an inline-driven coroutine's direct in-Rust resume.
+The 2.1b-profiled cached-handler lane (~300–450 ns floor) could shave further but touches
+the most sensitive scheduler code — priced, not queued. The resume/yield round-trip
+(`coroutine_offer_bench`) is unchanged at ~740 ns interp / 0.22× JIT (already inline).
+The **fourth backend** (wasm-JIT tier) fails closed on both lanes today — the entries fold
+to bytecode, pinned by `wasm_jit_lane_folds_closed_today` so the tier is never silently
+forgotten in this table.
+
+**2.3 landed (owner-approved 2026-08-05)**: deleted `Binding::Yielder` (+ durable variant,
+snapshot tag retired, guest-facing cap id 7), Instantiator ops 2/3/4/6/7 across **all four
+tiers** (tree-walker arms; bytecode `Op`/`Outcome`/`VcpuStop` variants, drivers, debug
+step-into + checkpoint/restore coroutine plumbing; Cranelift lowering arms + the whole
+native coroutine runtime — `coro_spawn`/`coro_resume`/`coro_cap_thunk`, `sync_committed`
+mirroring, guard/demand fault-recovery shims in `svm-jit/mem.rs`; the wasm-JIT tier never
+had the arms), the `Coro`/`CoroSnapshot` structs in both engines, `fault_yields`,
+`Inner::CoYield`/`CoFault`, `Pending::CoResume`, and the SharedRegion op-4
+grant-into-suspended-coroutine arm. `paging_bench` and `coroutine_offer_bench` keep the
+offer lanes as absolute pins with the deletion-time records in their headers. The
+PROCESS.md §0 gap ("a guest-serviced capability exists only as the special-cased Yielder")
+is closed: every guest-serviced capability is now an offer.
+
 ## 3. Instantiator: config-record spawn; Budget swallows the fuel scalars
 
 With §2 done, de-proliferate what remains of the op table (~16 ops today):

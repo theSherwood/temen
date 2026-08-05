@@ -1,8 +1,7 @@
 //! §14 **separate-module children** — the "plugin-in-plugin" story (interpreter side; the interp↔JIT
 //! differential lives in `jit_separate_module.rs`). The host verifies a *different* module and grants
 //! the parent a **`Module` capability** (iface 8); the parent passes it to the `Instantiator`'s
-//! module ops (5 `instantiate_module` / 6 `spawn_coroutine_module` / 7
-//! `spawn_demand_coroutine_module`) to spawn a child domain running *that* module, confined to a
+//! module op (5 `instantiate_module`) to spawn a child domain running *that* module, confined to a
 //! carve of the parent's window. The child's **data segments materialize into the carve at spawn**
 //! (its string literals just work), the carve must **equal the module's declared memory** (§14
 //! transparency: the plugin behaves exactly as it would standalone), and a forged module handle is an
@@ -13,9 +12,6 @@
 use svm_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use svm_text::parse_module;
 use svm_verify::verify_module;
-
-const RETURNED: i64 = 1;
-const FAULTED: i64 = 2;
 
 /// The child ("plugin") module: 64 KiB window, a data segment `"VM"` at offset 100. Its entry
 /// (`(i64) -> (i64)`, the starter-cap convention) loads its own data byte at 100, stores a marker at
@@ -282,44 +278,5 @@ block 0 (v0: i32, v1: i32) {
         res.expect("run ok"),
         vec![Value::I64(-14)],
         "an out-of-window name buffer must resolve to -EFAULT"
-    );
-}
-
-#[test]
-fn demand_module_child_gets_data_segments_lazily() {
-    // spawn_demand_coroutine_module: the child's data segments are in the shared backing, but its
-    // pages start unmapped — its first read of the segment FAULTs to the parent, which supplies the
-    // page by simply resuming (the bytes are already there). Lazy plugin loading, for free.
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = cap.call 6 7 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v6, v3)
-  v9, v10 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v6, v3)
-  v11 = i64.extend_i32_s v7
-  v12 = i64.const 1000000
-  v13 = i64.mul v11 v12
-  v14 = i64.extend_i32_s v9
-  v15 = i64.const 100000
-  v16 = i64.mul v14 v15
-  v17 = i64.add v10 v13
-  v18 = i64.add v17 v16
-  return v18
-  }
-}
-";
-    let (res, _mem) = run_with_child(parent);
-    // First resume: FAULTED (status 2) at the child's first touched page; second: RETURNED (1) with
-    // the child's result 1086 ('V' + 1000) — the segment byte arrived lazily. The fault *address*
-    // (v8) is intentionally unasserted here; the interp↔JIT differential pins it byte-exactly.
-    let want = 1086 + FAULTED * 1_000_000 + RETURNED * 100_000;
-    assert_eq!(
-        res.expect("run ok"),
-        vec![Value::I64(want)],
-        "lazy module-child data supply"
     );
 }

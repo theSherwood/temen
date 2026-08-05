@@ -4767,7 +4767,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     }
     // Phase 4 (IMPORTS.md §2.5): the module's bytes are never rewritten — every import must bind
     // to an interface the slot dispatch serves. An executor-dispatch interface (`Instantiator`,
-    // `Yielder`, …) is a dynamic-mode capability: dispatch on the interface handle at the call
+    // …) is a dynamic-mode capability: dispatch on the interface handle at the call
     // site (§2.2/§2.3), not through a manifest slot. A §3.2 offer binding is exempt: it is
     // served by the generic dispatch under its per-host interned id.
     if let Some(name) = order.iter().find(|n| {
@@ -4836,7 +4836,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
 
 /// Whether `type_id` is serviced entirely by the host's **generic** capability dispatch
 /// (`Host::cap_dispatch_slots`) — the slot-binding precondition for a registry-bound import
-/// ([`instantiate_with_imports`]). The executor capability variants (`Instantiator`, `Yielder`,
+/// ([`instantiate_with_imports`]). The executor capability variants (`Instantiator`,
 /// `SharedRegion` grant) are special-cased in each backend's eval/compile loop; per IMPORTS.md
 /// §2.3 they are dynamic-mode capabilities, never manifest slots.
 fn generic_dispatch_iface(type_id: u32) -> bool {

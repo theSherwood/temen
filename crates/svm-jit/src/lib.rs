@@ -2860,8 +2860,6 @@ impl CompiledModule {
                 nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
                 instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
                 join_thunk: instantiator_rt::join as *const () as i64,
-                coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
-                coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
                 poll_thunk: instantiator_rt::poll as *const () as i64,
                 detach_thunk: instantiator_rt::detach as *const () as i64,
                 kill_thunk: instantiator_rt::kill as *const () as i64,
@@ -4595,8 +4593,6 @@ pub(crate) unsafe fn compile_child_and_run(
             nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
             instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
             join_thunk: instantiator_rt::join as *const () as i64,
-            coro_spawn_thunk: instantiator_rt::coro_spawn as *const () as i64,
-            coro_resume_thunk: instantiator_rt::coro_resume as *const () as i64,
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
@@ -5598,8 +5594,6 @@ struct InstEnv {
     nursery_addr: i64,
     instantiate_thunk: i64,
     join_thunk: i64,
-    coro_spawn_thunk: i64,
-    coro_resume_thunk: i64,
     // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
     poll_thunk: i64,
     detach_thunk: i64,
@@ -5623,8 +5617,6 @@ impl InstEnv {
             nursery_addr: 0,
             instantiate_thunk: 0,
             join_thunk: 0,
-            coro_spawn_thunk: 0,
-            coro_resume_thunk: 0,
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
@@ -8327,14 +8319,12 @@ fn lower_instantiator(
     // prefix are tolerated exactly like the interpreter (it never indexes past the op's arity).
     use ValType::{I32 as VI32, I64 as VI64};
     let contract: Option<(&[ValType], &[ValType])> = match op {
-        // instantiate / spawn_coroutine / spawn_demand_coroutine: (entry, off, size_log2, fuel)
-        0 | 2 | 4 => Some((&[VI64, VI64, VI64, VI64], &[VI32])),
-        // *_module variants: a leading `Module` handle (i64 slot), then the same four
-        5..=7 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // instantiate: (entry, off, size_log2, fuel)
+        0 => Some((&[VI64, VI64, VI64, VI64], &[VI32])),
+        // instantiate_module: a leading `Module` handle (i64 slot), then the same four
+        5 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // join(child) -> result
         1 => Some((&[VI32], &[VI64])),
-        // coro_resume(child, value) -> (status, value)
-        3 => Some((&[VI32, VI64], &[VI32, VI64])),
         // S3 lifecycle: poll / detach / kill (child) -> i32 status
         9 | 10 | 12 => Some((&[VI32], &[VI32])),
         // S2 instantiate_granted: (grant_handle, entry, off, size_log2, quota) -> child handle — the
@@ -8448,75 +8438,6 @@ fn lower_instantiator(
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
-        }
-        2 | 4 | 6 | 7 => {
-            // coro_spawn(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,
-            //            size_log2:i64, fuel:i64, demand:i32, trap_out:i64) -> child_handle:i32 —
-            // §14 co-fiber spawn. ops 2/4 are **self** children (module = -1); ops 6/7
-            // (`spawn[_demand]_coroutine_module`) pass a `Module` handle first and shift the rest.
-            // ops 4/7 demand-page the child's window for fault-driven yield.
-            let h = slot_i32(b, get(vals, handle)?);
-            let (modh, a0) = if op >= 6 {
-                (
-                    slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?),
-                    1,
-                )
-            } else {
-                (b.ins().iconst(I64, -1), 0)
-            };
-            let entry = slot_i64(b, get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?);
-            let off = slot_i64(b, get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?);
-            let size_log2 = slot_i64(b, get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?);
-            let fuel = slot_i64(b, get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?);
-            let demand = b.ins().iconst(I32, if op == 4 || op == 7 { 1 } else { 0 });
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I64, I64, I64, I64, I64, I32, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.coro_spawn_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery, mem_base, h, modh, entry, off, size_log2, fuel, demand, trap_out,
-                ],
-            );
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
-        3 => {
-            // coro_resume(nursery, mem_base, handle:i32, child:i32, value:i64, status_out:*i64,
-            //             trap_out:i64) -> value:i64. Results are appended `(status:i32, value:i64)`
-            // to match the op's two-result shape (like `cont.resume`).
-            let ss =
-                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
-            let status_ptr = b.ins().stack_addr(I64, ss, 0);
-            let h = slot_i32(b, get(vals, handle)?);
-            let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let value = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.coro_resume_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[nursery, mem_base, h, child, value, status_ptr, trap_out],
-            );
-            emit_trap_propagate(b, lower);
-            let value_out = b.inst_results(call)[0];
-            let status64 = b.ins().stack_load(I64, ss, 0);
-            let status32 = b.ins().ireduce(I32, status64);
-            let status = result_as(b, status32, sig.results[0]);
-            let value_out = result_as(b, value_out, sig.results[1]);
-            vals.push(status);
-            vals.push(value_out);
         }
         9 | 10 | 12 => {
             // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.

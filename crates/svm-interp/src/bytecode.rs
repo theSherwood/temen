@@ -510,47 +510,6 @@ enum Op {
         count: u32,
         dst: u32,
     },
-    /// §14 `Instantiator.spawn_coroutine(entry, off, size_log2, fuel)` (op 2): spawn a cooperative
-    /// coroutine child confined to `[off, off+2^size_log2)` of the holder's range, with a Yielder-only
-    /// powerbox; its handle (or `EINVAL`) lands at `dst`. `handle` is the Instantiator cap (authority).
-    SpawnCoroutine {
-        handle: u32,
-        entry: u32,
-        off: u32,
-        size_log2: u32,
-        dst: u32,
-        /// op 4 `spawn_demand_coroutine`: the child window starts unmapped (fault-driven yield).
-        demand: bool,
-    },
-    /// §14 `Instantiator.spawn_coroutine_module(module, entry, off, size_log2, fuel)` (op 6): like
-    /// [`Op::SpawnCoroutine`], but the cooperative child runs a host-granted **separate** `Module`
-    /// (`module` is its handle, the first i64 arg). The driver resolves + compiles the module and
-    /// materializes its data into the carve; thereafter it is `resume`d inline like any coroutine.
-    /// `demand` selects op 7 `spawn_demand_coroutine_module` (data segments supplied lazily).
-    SpawnCoroutineModule {
-        handle: u32,
-        module: u32,
-        entry: u32,
-        off: u32,
-        size_log2: u32,
-        dst: u32,
-        demand: bool,
-    },
-    /// §14 `Instantiator.resume(ch, value)` (op 3): drive coroutine `ch` inline until it yields or
-    /// returns; `(status, value)` land at `dst`/`dst+1`. `handle` is the Instantiator cap.
-    CoResume {
-        handle: u32,
-        ch: u32,
-        value: u32,
-        dst: u32,
-    },
-    /// §14 `Yielder.yield(value)` (op 0): suspend this coroutine, hand `value` to the resumer; the
-    /// next resume's value lands at `dst`. `handle` is the Yielder cap (authority).
-    CoYield {
-        handle: u32,
-        value: u32,
-        dst: u32,
-    },
     /// §22 `Jit.install(code)` (op 3): compile the unit named by code-handle `code` to bytecode and
     /// install it into the domain's dispatch table; the slot (or `-ENOSPC`) lands at `dst`. `handle`
     /// is the `Jit` domain cap (authority).
@@ -934,7 +893,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR | super::cap_id::YIELDER,
+                        type_id: super::cap_id::INSTANTIATOR,
                         ..
                     } => s.has_coro = true,
                     // I38's **timed** `svc.wait` (op 10 with the optional timeout arg) needs
@@ -1526,20 +1485,6 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     dst,
                     grants: Some((g(args[1]), g(args[2]))),
                 },
-                // op 6/7 = spawn_coroutine_module / spawn_demand_coroutine_module: a coroutine child
-                // running a granted `Module` (the first arg); the carve args (entry/off/size_log2/fuel)
-                // follow. op 7 demand-pages the child's window (data segments supplied lazily).
-                (cap_id::INSTANTIATOR, op @ (6 | 7)) if args.len() >= 4 => {
-                    Op::SpawnCoroutineModule {
-                        handle: g(*handle),
-                        module: g(args[0]),
-                        entry: g(args[1]),
-                        off: g(args[2]),
-                        size_log2: g(args[3]),
-                        dst,
-                        demand: op == 7,
-                    }
-                }
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export. The mint needs the child's live env, so the op surfaces to the
                 // driver; the compile only marshals `(child, export)`.
@@ -1547,27 +1492,6 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     handle: g(*handle),
                     child: g(args[0]),
                     export: g(args[1]),
-                    dst,
-                },
-                // §14 cooperative coroutine round-trip — spawn_coroutine (op 2) / spawn_demand_coroutine
-                // (op 4, window starts unmapped) / resume / yield.
-                (cap_id::INSTANTIATOR, op @ (2 | 4)) if args.len() >= 3 => Op::SpawnCoroutine {
-                    handle: g(*handle),
-                    entry: g(args[0]),
-                    off: g(args[1]),
-                    size_log2: g(args[2]),
-                    dst,
-                    demand: op == 4,
-                },
-                (cap_id::INSTANTIATOR, 3) if args.len() >= 2 => Op::CoResume {
-                    handle: g(*handle),
-                    ch: g(args[0]),
-                    value: g(args[1]),
-                    dst,
-                },
-                (cap_id::YIELDER, 0) if !args.is_empty() => Op::CoYield {
-                    handle: g(*handle),
-                    value: g(args[0]),
                     dst,
                 },
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
@@ -1593,7 +1517,7 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     params: sig.params.get(1..).unwrap_or(&[]).to_vec().into(),
                     results: sig.results.clone().into(),
                 },
-                (cap_id::INSTANTIATOR, _) | (cap_id::YIELDER, _) => return None,
+                (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
                 // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
                 // shape compiles to the native serve-loop-core op — the module-level veto in
@@ -3021,27 +2945,6 @@ impl<'p> Vcpu<'p> {
                         results,
                     };
                 }
-                // §14 `spawn_coroutine_module` — serviced **internally** against this vCPU's own
-                // powerbox (which resolved the `Instantiator` authority in-Vm to reach here): resolve
-                // the granted module, build the inline `Coro`, then loop (the coroutine runs inline via
-                // `resume`, no host round-trip). A bad carve/entry/module sets `EINVAL`/traps in place.
-                Ok(VcpuStop::SpawnCoroutineModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    dst,
-                    demand,
-                }) => {
-                    self.service_coroutine_module(
-                        ibase, isz, mh, entry, off, size_log2, demand, dst,
-                    );
-                    if let Some(t) = self.trap.take() {
-                        return VcpuEvent::Trapped(t);
-                    }
-                }
                 // §14 executor children (THREADS.md 4c-domain §14-D2): this vCPU does all the
                 // authority-bearing validation/preparation, then surfaces a mechanical
                 // [`VcpuEvent::Instantiate`] for the host (a bad carve/entry lands `-EINVAL` in place
@@ -3240,122 +3143,6 @@ impl<'p> Vcpu<'p> {
             size_log2: size_log2 as u8,
             fuel,
         }))
-    }
-
-    /// Build a §14 `spawn_coroutine_module` coroutine **inline** in this vCPU's coroutine set (the
-    /// resumable-path counterpart of the parallel driver's arm): resolve the granted module from this
-    /// vCPU's own powerbox, compile + push it to the shared source, materialize its data segments into
-    /// the carve (demand-page for op 7), and register the `Coro` (Yielder-only powerbox) — its handle
-    /// written to `dst`. `EINVAL` on a bad entry/carve/memory mismatch; a resolve failure sets `trap`.
-    #[allow(clippy::too_many_arguments)]
-    fn service_coroutine_module(
-        &mut self,
-        ibase: u64,
-        isize: u64,
-        mh: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        demand: bool,
-        dst: u32,
-    ) {
-        let isz = isize;
-        // Resolve the granted module from the run's powerbox — the shared one when attached, else
-        // this vCPU's own (forged/closed handle → trap).
-        let resolved = match self.shared_host {
-            Some(m) => {
-                let g = m.lock().unwrap_or_else(|e| e.into_inner());
-                g.resolve_module(mh)
-                    .map(|g| (g.funcs.clone(), g.memory_log2, g.data.clone()))
-            }
-            None => self
-                .host
-                .resolve_module(mh)
-                .map(|g| (g.funcs.clone(), g.memory_log2, g.data.clone())),
-        };
-        let (cfuncs, cmem_log2, cdata) = match resolved {
-            Ok(parts) => parts,
-            Err(t) => {
-                self.trap = Some(t);
-                return;
-            }
-        };
-        let child_compiled = match compile_module(&cfuncs) {
-            Some(c) => c,
-            None => {
-                self.trap = Some(Trap::Malformed);
-                return;
-            }
-        };
-        let ok_entry = child_compiled
-            .sigs
-            .get(entry as usize)
-            .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
-        let child_size = if (0..64).contains(&size_log2) {
-            1u64 << size_log2
-        } else {
-            0
-        };
-        let off_u = off as u64;
-        let fits = child_size != 0
-            && child_size <= isz
-            && off_u & (child_size - 1) == 0
-            && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-        let mod_ok = cmem_log2 == Some(size_log2 as u8);
-        if !ok_entry || !fits || !mod_ok {
-            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            return;
-        }
-        let pbase = self.mem.as_ref().map_or(0, |m| m.window.base());
-        let abs_base = pbase + ibase + off_u;
-        let child_mem = {
-            if let Some(m) = self.mem.as_ref() {
-                for d in cdata.iter() {
-                    if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                        for (k, &b) in d.bytes.iter().enumerate() {
-                            m.set_byte(abs_base + d.offset + k as u64, b);
-                        }
-                    }
-                }
-            }
-            self.mem.as_ref().map(|m| {
-                let cm = m.nested_view(abs_base, size_log2 as u8);
-                if demand {
-                    cm.demand_page();
-                }
-                cm
-            })
-        };
-        let mut child_host = Host::new();
-        let cy = child_host.grant_yielder();
-        // `self.prog` is a `Copy` shared reference — copy it out so the `&prog.dom` borrow is
-        // independent of the `&mut self.vt` push below.
-        let prog = self.prog;
-        let progs_len = child_compiled.progs.len();
-        let cm = prog.dom.source.push(child_compiled);
-        let child_table = build_table_for(progs_len, 0, cm as u32);
-        let cunit = prog.dom.source.get(cm);
-        let mut child_vm =
-            match cunit.and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok()) {
-                Some(v) => v,
-                None => {
-                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                    return;
-                }
-            };
-        child_vm.module = cm;
-        self.vt.coroutines.push(Some(Coro {
-            vm: child_vm,
-            mem: child_mem,
-            host: child_host,
-            table: child_table,
-            awaiting: None,
-            fault_yields: demand,
-            faulted_page: None,
-            mod_debug: None, // production vCPU never inspects
-        }));
-        let h = (self.vt.coroutines.len() - 1) as i32;
-        self.vt.active.set(dst, Reg::from_i32(h));
     }
 
     /// Deliver a `thread.spawn` handle (after `Spawn`).
@@ -3889,10 +3676,6 @@ pub struct DebugRunSnapshot {
     chain: Vec<(usize, Vm, u32)>,
     /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
     fibers: Vec<FiberState>,
-    /// The §14 coroutine children (handle = index; `None` = finished). See [`CoroSnapshot`].
-    coroutines: Vec<Option<CoroSnapshot>>,
-    /// While stepping inside a coroutine body: `(handle, parent resume-result slot, parent depth)`.
-    active_coro: Option<(usize, u32, usize)>,
     /// The non-primary [`ModuleSource`] units (a §14 **separate-module** coroutine's pushed program), so
     /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
     /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
@@ -3907,88 +3690,10 @@ pub struct DebugRunSnapshot {
     host: super::HostReplaySubstate,
 }
 
-/// A §14 coroutine child inside a [`DebugRunSnapshot`]. The coroutine's window is a `nested_view`
-/// sub-view sharing the parent's backing region, so its bytes are already in the parent `mem` snapshot;
-/// only the view geometry (`win_base`/`size_log2`) is stored, and `restore` rebuilds the view over the
-/// restored parent. The host is a fresh Yielder-only powerbox on restore, so only its replay substate is
-/// carried. The coroutine's `module` rides in `vm.module` (`0` = same-module; `>= 1` = a **separate**
-/// module, whose pushed source unit is captured in the run snapshot's `extra_units`); its own §6
-/// metadata (`mod_debug`) is carried so a step-into resolves the separate module's source variables after
-/// restore. The coroutine's own page-protection map (`prot`) is captured too, admitting a **demand**
-/// (`fault_yields`) coroutine — whose pages are `Unmapped` until the parent supplies them — and a
-/// coroutine that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the parent snapshot.
-struct CoroSnapshot {
-    vm: Vm,
-    win_base: u64,
-    size_log2: u8,
-    host: super::HostReplaySubstate,
-    awaiting: Option<u32>,
-    faulted_page: Option<u64>,
-    /// Whether this is a **demand** child (its page faults suspend to the parent to be supplied, rather
-    /// than trapping) — reinstated so a mid-demand coroutine resumes with the same fault semantics.
-    fault_yields: bool,
-    /// The coroutine's own page-protection map ([`Mem::prot_snapshot`]) — which pages are supplied
-    /// (`Rw`)/`Ro`/`Unmapped` in its `nested_view`. Reinstalled with [`Mem::install_prot`] on restore
-    /// (its bytes ride in the parent snapshot). Empty for a pristine coroutine.
-    prot: Vec<(u64, super::PageProt)>,
-    /// A separate-module coroutine's own §6 debug metadata (`None` for a same-module coroutine), cloned
-    /// so `read_var`/`var_addr` resolve inside its body after restore.
-    mod_debug: Option<ModuleDebug>,
-}
-
 impl DebugRunSnapshot {
     /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
     pub fn clock(&self) -> u64 {
         self.clock
-    }
-}
-
-/// Capture a live **same-module** coroutine into a [`CoroSnapshot`]: its `Vm`, its window geometry (the
-/// `nested_view`'s absolute base + size, so `restore` can recreate the view), and its host replay
-/// substate. The coroutine's bytes are *not* copied here — they live in the parent's backing region
-/// (shared via `nested_view`) and ride in the parent window snapshot.
-fn coro_snapshot(c: &Coro) -> CoroSnapshot {
-    CoroSnapshot {
-        vm: c.vm.clone(),
-        win_base: c.mem.as_ref().map_or(0, |m| m.window.base()),
-        size_log2: c
-            .mem
-            .as_ref()
-            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
-        host: c.host.replay_substate(),
-        awaiting: c.awaiting,
-        faulted_page: c.faulted_page,
-        fault_yields: c.fault_yields,
-        prot: c.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
-        mod_debug: c.mod_debug.clone(),
-    }
-}
-
-/// Rebuild a live [`Coro`] from a [`CoroSnapshot`] on restore — the inverse of [`coro_snapshot`]:
-/// recreate its `nested_view` over the (already reseeded) `parent_mem` window so its bytes (shared via
-/// the backing region) are correct, a fresh Yielder-only host carrying the captured replay substate, and
-/// its natural dispatch table over its own `module` (`0` = primary; a separate module resolves against
-/// the just-restored `source`, whose `extra_units` were re-pushed first). Shared by the single-vCPU and
-/// scheduled `restore` paths.
-fn rebuild_coro(cs: &CoroSnapshot, parent_mem: Option<&Mem>, source: &ModuleSource) -> Coro {
-    let module = cs.vm.module;
-    let progs_len = source.get(module).map_or(0, |u| u.progs.len());
-    let mem = parent_mem.map(|m| m.nested_view(cs.win_base, cs.size_log2));
-    if let Some(m) = &mem {
-        m.install_prot(&cs.prot); // its supplied/`Ro`/`Unmapped` pages (bytes rode in the parent reseed)
-    }
-    let mut host = Host::new();
-    host.grant_yielder();
-    host.restore_replay_substate(&cs.host);
-    Coro {
-        vm: cs.vm.clone(),
-        mem,
-        host,
-        table: build_table_for(progs_len, 0, module as u32),
-        awaiting: cs.awaiting,
-        fault_yields: cs.fault_yields,
-        faulted_page: cs.faulted_page,
-        mod_debug: cs.mod_debug.clone(),
     }
 }
 
@@ -4228,16 +3933,12 @@ fn debug_advance_fiber(
     host: &mut Host,
 ) -> FiberStep {
     // Step-into a §14 coroutine body (single-vCPU `DebugRun` only): while a coroutine child is the
-    // active continuation — set by a `resume` under `coro_step_into` — drive *that child* one op over
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
     // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
     // Stepping *inside* a §22 `Jit.invoke`d unit (single-vCPU step-into): drive it one op over the
     // caller's shared window/table (the §22 counterpart of `active_coro`), so a breakpoint fires inside.
     if vt.active_invoke.is_some() {
         return step_active_invoke(vt, source, table, fuel, mem, host);
-    }
-    if vt.active_coro.is_some() {
-        return step_active_coro(vt, source, fuel);
     }
     match vt
         .active
@@ -4323,122 +4024,6 @@ fn debug_advance_fiber(
             vt.active.set(rdst + 1, Reg::from_i64(value));
             FiberStep::Stepped
         }
-        // §14 **coroutines** are cooperative and driven **inline** here (never via the thread
-        // scheduler), exactly as production `run_inner` drives them — the debug counterpart. A
-        // same-module `spawn_coroutine`/`resume`/`yield` round-trip therefore runs correctly under the
-        // debugger; on the single-vCPU `DebugRun` the body is then stepped **op-by-op** (step-into) via
-        // `active_coro`/`step_active_coro` (slice 14b), while the scheduled engine keeps it opaque. A
-        // *separate-module* coroutine (`SpawnCoroutineModule`) is handled just below (slice 14c) — it
-        // pushes the granted module to the shared source, then resumes/steps like any coroutine.
-        Ok(Outcome::SpawnCoroutine {
-            ibase,
-            isize: isz,
-            entry,
-            off,
-            size_log2,
-            dst,
-            demand,
-        }) => {
-            let h = spawn_coroutine(
-                &mut vt.coroutines,
-                mem,
-                &source.primary(),
-                entry,
-                (ibase, isz, off, size_log2),
-                demand,
-            );
-            vt.active.set(dst, Reg::from_i32(h));
-            FiberStep::Stepped
-        }
-        Ok(Outcome::CoResume { ch, value, dst }) => {
-            // Deliver this resume's effect (supply a demand-fault page and re-run the rewound access,
-            // or hand the value to the parked `yield`) to the child before it runs again — identical
-            // whether the child is then stepped op-by-op (step-into) or run opaquely.
-            if let Some(coro) = vt.coroutines.get_mut(ch as usize).and_then(|c| c.as_mut()) {
-                if let Some(addr) = coro.faulted_page.take() {
-                    if let Some(m) = coro.mem.as_ref() {
-                        m.supply_page(addr);
-                    }
-                } else if let Some(yd) = coro.awaiting.take() {
-                    coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
-                }
-            } else {
-                // Forged / finished slot: an inert `CapFault` (propagates), same as production.
-                return FiberStep::Trapped(Trap::CapFault);
-            }
-            // Step-into path: hand the child to op-by-op stepping. The parent stays parked at `dst`;
-            // `step_active_coro` fills it when the child next yields / faults / returns. `parent_depth`
-            // lets the stepping predicate treat the child's frames as *deeper* than the parent's, so a
-            // step-over of this `resume` runs the child to completion.
-            if vt.coro_step_into {
-                let parent_depth = vt.active.stack.len() + 1;
-                vt.active_coro = Some((ch as usize, dst, parent_depth));
-                return FiberStep::Stepped;
-            }
-            // Opaque path (scheduled engine): drive the child to its next yield/return in one step, so
-            // a coroutine stays atomic w.r.t. other vCPUs.
-            let mut coro = vt.coroutines[ch as usize]
-                .take()
-                .expect("resumable coroutine");
-            match resume_coro(&mut coro, source, fuel) {
-                Ok(CoStop::Yield(yv)) => {
-                    vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
-                    vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
-                    vt.active.set(dst + 1, Reg::from_i64(yv));
-                    FiberStep::Stepped
-                }
-                Ok(CoStop::Fault(addr)) => {
-                    // A demand child faulted: remember the page to supply, report (FAULTED, addr).
-                    coro.faulted_page = Some(addr);
-                    vt.coroutines[ch as usize] = Some(coro);
-                    vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
-                    vt.active.set(dst + 1, Reg::from_i64(addr as i64));
-                    FiberStep::Stepped
-                }
-                Ok(CoStop::Done(vals)) => {
-                    // Finished — the slot stays `None` (a later resume is inert/CapFault).
-                    vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
-                    let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    vt.active.set(dst + 1, Reg::from_value(v));
-                    FiberStep::Stepped
-                }
-                Err(t) => FiberStep::Trapped(t),
-            }
-        }
-        // A `Yielder.yield` only resolves inside an inline coroutine child (consumed by `resume_coro`);
-        // at the top level the yielder handle is ungranted, so any leak here is a fault.
-        Ok(Outcome::CoYield { .. }) => FiberStep::Trapped(Trap::FiberFault),
-        // §14 **separate-module** coroutine (`spawn_coroutine_module`, op 6 / demand op 7) — on the
-        // single-vCPU `DebugRun` (`coro_step_into`) only. Resolve + compile + push the granted module and
-        // register the child inline; thereafter it is `resume`d and stepped exactly like a same-module
-        // coroutine (slice 14b). The scheduled engine keeps declining it (falls through to `Other`).
-        Ok(Outcome::SpawnCoroutineModule {
-            ibase,
-            isize: isz,
-            mh,
-            entry,
-            off,
-            size_log2,
-            dst,
-            demand,
-        }) if vt.coro_step_into => {
-            match spawn_coroutine_module(
-                &mut vt.coroutines,
-                source,
-                mem,
-                host,
-                mh,
-                entry,
-                (ibase, isz, off, size_log2),
-                demand,
-            ) {
-                Ok(h) => {
-                    vt.active.set(dst, Reg::from_i32(h));
-                    FiberStep::Stepped
-                }
-                Err(t) => FiberStep::Trapped(t),
-            }
-        }
         // §22 guest-JIT install / uninstall / invoke: self-contained host-side ops (they mutate only
         // `vt.active` + the shared dispatch table, spawning no scheduler task), so — like the coroutine
         // arms above — they are serviced **inline** here, which is why BOTH the single-vCPU `DebugRun`
@@ -4486,124 +4071,6 @@ fn debug_advance_fiber(
         // dispatches its subset).
         Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
-    }
-}
-
-/// Advance the **active §14 coroutine child** (`vt.active_coro`) by exactly one op — the op-by-op,
-/// debugger-facing counterpart of [`resume_coro`]'s inner loop. Same confined child (`vm`/`mem`/`host`/
-/// `table`) and the same op set (`Done`/`Suspended`/`CoYield`/`GcRoots`; anything else, e.g. a fiber or
-/// nested coroutine op, is unsupported inside a child and traps — matching `resume_coro`), only surfaced
-/// one op at a time so a breakpoint can fire inside the body and the frame stays inspectable.
-///
-/// When the child yields, faults (a demand child), or returns, the child stops being active: the
-/// parent's `resume` result slot (`dst`) is filled with `(status, value)` and control returns to the
-/// parent, exactly as the opaque path does. Stepping the child with `budget = 1` matches the demand
-/// path's per-op cursor persistence (so a recoverable fault re-runs the rewound access) and is
-/// computationally identical to the plain path's unmetered run — just finer-grained for the debugger.
-fn step_active_coro(vt: &mut VTask, source: &ModuleSource, fuel: &mut u64) -> FiberStep {
-    /// What one child op produced, decoupled from the `coro` borrow so the parent slot can be filled
-    /// after it ends.
-    enum CoStep {
-        /// A plain op ran (budget boundary) — the child stays active, the clock ticks.
-        Ran,
-        /// `Yielder.yield`: the child suspends to the parent with `(FIBER_SUSPENDED, value)`.
-        Yield(i64),
-        /// A demand child hit a recoverable page fault: `(CORO_FAULTED, addr)`; the parent supplies it.
-        Fault(u64),
-        /// The child function returned: `(FIBER_RETURNED, value)`; the slot is retired.
-        Done(Value),
-        /// The child trapped — it propagates to the resumer (the run's trap).
-        Trap(Trap),
-    }
-    let (ch, dst, _) = vt.active_coro.expect("active coroutine");
-    let step = {
-        let coro = vt.coroutines[ch]
-            .as_mut()
-            .expect("active coroutine present");
-        match coro.vm.resume(
-            source,
-            &coro.table,
-            fuel,
-            &mut coro.mem,
-            &mut HostCell::Excl(&mut coro.host),
-            1,
-        ) {
-            Ok(Outcome::Suspended) => CoStep::Ran, // budget boundary — one op done, keep stepping
-            Ok(Outcome::Done(vals)) => CoStep::Done(vals.first().copied().unwrap_or(Value::I64(0))),
-            Ok(Outcome::CoYield { value, dst: yd }) => {
-                coro.awaiting = Some(yd); // the next resume delivers its value here
-                CoStep::Yield(value)
-            }
-            // A coroutine child is its own confined domain (holds no `Instantiator`, no fibers/threads);
-            // its `gc.roots` scans just its own continuation. Resolve it inline and stay in the child —
-            // identical to `resume_coro`, one debug op.
-            Ok(Outcome::GcRoots {
-                lo,
-                hi,
-                mask,
-                buf,
-                cap,
-                dst: gdst,
-            }) => {
-                let mut roots = std::collections::BTreeSet::new();
-                {
-                    let mut consider = |w: u64| {
-                        let m = w & mask;
-                        if m >= lo && m < hi {
-                            roots.insert(m);
-                        }
-                    };
-                    scan_vm_roots(&coro.vm, source, &mut consider);
-                }
-                match gc_write(&mut coro.mem, buf, cap, roots) {
-                    Ok(total) => {
-                        coro.vm.set(gdst, Reg::from_i64(total));
-                        CoStep::Ran
-                    }
-                    Err(t) => CoStep::Trap(t),
-                }
-            }
-            // A fiber / nested-coroutine / thread op inside a child is unsupported (as in `resume_coro`).
-            Ok(_) => CoStep::Trap(Trap::FiberFault),
-            // A demand child's *recoverable* in-window fault suspends to the parent; an out-of-window
-            // fault (`take_fault` → `None`) is a real trap that propagates.
-            Err(Trap::MemoryFault) if coro.fault_yields => {
-                match coro.mem.as_ref().and_then(|m| m.take_fault()) {
-                    Some(addr) => {
-                        coro.faulted_page = Some(addr);
-                        CoStep::Fault(addr)
-                    }
-                    None => CoStep::Trap(Trap::MemoryFault),
-                }
-            }
-            Err(t) => CoStep::Trap(t),
-        }
-    };
-    match step {
-        CoStep::Ran => FiberStep::Stepped,
-        CoStep::Yield(v) => {
-            vt.active_coro = None; // back to the parent; the child stays parked (slot still `Some`)
-            vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
-            vt.active.set(dst + 1, Reg::from_i64(v));
-            FiberStep::Stepped
-        }
-        CoStep::Fault(addr) => {
-            vt.active_coro = None;
-            vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
-            vt.active.set(dst + 1, Reg::from_i64(addr as i64));
-            FiberStep::Stepped
-        }
-        CoStep::Done(v) => {
-            vt.active_coro = None;
-            vt.coroutines[ch] = None; // finished — a later resume is inert / `CapFault`
-            vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
-            vt.active.set(dst + 1, Reg::from_value(v));
-            FiberStep::Stepped
-        }
-        CoStep::Trap(t) => {
-            vt.active_coro = None;
-            FiberStep::Trapped(t)
-        }
     }
 }
 
@@ -4713,7 +4180,7 @@ fn apply_due_writes(
                 width,
                 ..
             } => {
-                if vt.active_coro.is_none() && vt.active_invoke.is_none() {
+                if vt.active_invoke.is_none() {
                     let target = FrameReader {
                         vm: &vt.active,
                         source,
@@ -4764,7 +4231,7 @@ fn apply_due_writes_sched(
                 width,
             } => {
                 if let Some(t) = tasks.get_mut(*task) {
-                    if t.vt.active_coro.is_none() {
+                    {
                         let target = FrameReader {
                             vm: &t.vt.active,
                             source,
@@ -4955,17 +4422,17 @@ impl DebugRun {
     /// A [`FrameReader`] over this single-vCPU session's currently-stepping `Vm` + debug metadata —
     /// the active §14 coroutine child (over its own confined `mem`) during step-into, else the parent.
     fn reader(&self) -> FrameReader<'_> {
-        let (vm, coro) = self.vt.debug_active();
+        let vm = self.vt.debug_active();
         FrameReader {
             vm,
             source: &self.source,
-            mem: coro.map_or(&self.mem, |c| &c.mem),
+            mem: &self.mem,
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
             // A separate-module coroutine carries its own §6 metadata; a same-module one leaves it `None`
             // (its frames are module 0, read against the session fields above).
-            coro_debug: coro.and_then(|c| c.mod_debug.as_ref()),
+            coro_debug: None,
         }
     }
 
@@ -4997,7 +4464,7 @@ impl DebugRun {
         let c = compile_module_unfused(&m.funcs)?; // unfused: debug stepping (Slice 5a)
         let dom = Domain::new(c, host.jit_table_log2());
         let mem = build_mem(m);
-        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?; // coro_step_into on by default
+        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
         vt.invoke_step_into = true; // single-vCPU engine steps *into* §22 Jit.invoke (scheduled = leaf)
         let Domain { source, table } = dom;
         Some(DebugRun {
@@ -5108,12 +4575,6 @@ impl DebugRun {
                 .fibers
                 .iter()
                 .any(|f| matches!(f, FiberState::WaitParked { .. }))
-            && self
-                .vt
-                .coroutines
-                .iter()
-                .flatten()
-                .all(|c| child_checkpointable(c.mem.as_ref(), self.mem.as_ref()))
     }
 
     /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
@@ -5131,13 +4592,6 @@ impl DebugRun {
             active_id: self.vt.active_id,
             chain: self.vt.chain.clone(),
             fibers: self.fibers.clone(),
-            coroutines: self
-                .vt
-                .coroutines
-                .iter()
-                .map(|c| c.as_ref().map(coro_snapshot))
-                .collect(),
-            active_coro: self.vt.active_coro,
             extra_units: self.source.extra_units(),
             mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
             host: self.host.replay_substate(),
@@ -5155,7 +4609,6 @@ impl DebugRun {
         self.vt.active = snap.active.clone();
         self.vt.active_id = snap.active_id;
         self.vt.chain = snap.chain.clone();
-        self.vt.active_coro = snap.active_coro;
         self.fibers = snap.fibers.clone();
         // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
         // indices resolve against the source).
@@ -5163,16 +4616,6 @@ impl DebugRun {
         if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
             m.restore_layout(layout);
         }
-        // Rebuild each coroutine: a fresh `nested_view` over the just-reseeded parent window (so its
-        // bytes — shared via the backing region — are already correct) + a fresh Yielder host + a table
-        // over its own module.
-        let parent_mem = self.mem.as_ref();
-        let source = &*self.source;
-        self.vt.coroutines = snap
-            .coroutines
-            .iter()
-            .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, parent_mem, source)))
-            .collect();
         self.host.restore_replay_substate(&snap.host);
         self.op_clock = snap.clock;
         self.done = None;
@@ -5220,7 +4663,7 @@ impl DebugRun {
             fn_block_types,
         );
         if let Some(sink) = access_sink.as_mut() {
-            let (cur_vm, _) = vt.debug_active();
+            let cur_vm = vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
         }
         match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
@@ -5295,7 +4738,7 @@ impl DebugRun {
                 fn_block_types,
             );
             if let Some(sink) = access_sink.as_mut() {
-                let (cur_vm, _) = vt.debug_active();
+                let cur_vm = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
             }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
@@ -5326,8 +4769,8 @@ impl DebugRun {
             // confined window) during step-into, else the parent. A same-module child is module 0, so
             // its ops share the parent's pc space; a breakpoint on the child's function fires here.
             let hit = {
-                let (cur_vm, coro) = vt.debug_active();
-                let cur_mem = coro.map_or(&*mem, |c| &c.mem);
+                let cur_vm = vt.debug_active();
+                let cur_mem = &*mem;
                 match cur_vm.cur_ir_pc(source) {
                     Some(pc) if bps.contains(&pc) => Some((pc, None)),
                     Some(pc) if !watchpoints.is_empty() && pc.module == 0 => watch_hit_before(
@@ -5364,7 +4807,7 @@ impl DebugRun {
                 fn_block_types,
             );
             if let Some(sink) = access_sink.as_mut() {
-                let (cur_vm, _) = vt.debug_active();
+                let cur_vm = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
             }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
@@ -5437,7 +4880,7 @@ impl DebugRun {
                 fn_block_types,
             );
             if let Some(sink) = access_sink.as_mut() {
-                let (cur_vm, _) = vt.debug_active();
+                let cur_vm = vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
             }
             match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
@@ -5466,13 +4909,12 @@ impl DebugRun {
             // resume frame (`parent_depth + child stack`), so step-over of a `resume` (target =
             // parent depth) runs the child to completion, and step-out of the child body lands back in
             // the parent — while stepping *within* the child compares child-local frames as usual.
-            let (cur_vm, _) = vt.debug_active();
+            let cur_vm = vt.debug_active();
             // Cumulative across a coroutine *or* §22-invoke boundary: the child's frames sit above the
             // parent's resume/invoke frame (`parent_depth + child stack`).
-            let depth = match (&vt.active_invoke, vt.active_coro) {
-                (Some(iv), _) => iv.parent_depth + cur_vm.stack.len() + 1,
-                (None, Some((_, _, pd))) => pd + cur_vm.stack.len() + 1,
-                (None, None) => cur_vm.stack.len() + 1,
+            let depth = match &vt.active_invoke {
+                Some(iv) => iv.parent_depth + cur_vm.stack.len() + 1,
+                None => cur_vm.stack.len() + 1,
             };
             if max_depth.is_none_or(|m| depth <= m) {
                 if let Some(pc) = cur_vm.cur_ir_pc(source) {
@@ -5521,10 +4963,9 @@ impl DebugRun {
     /// when the parent itself is running.
     fn step_depth(&self) -> usize {
         let d = self.reader().depth();
-        match (&self.vt.active_invoke, self.vt.active_coro) {
-            (Some(iv), _) => iv.parent_depth + d,
-            (None, Some((_, _, pd))) => pd + d,
-            (None, None) => d,
+        match &self.vt.active_invoke {
+            Some(iv) => iv.parent_depth + d,
+            None => d,
         }
     }
 
@@ -5565,8 +5006,7 @@ impl DebugRun {
     /// pointer. Reads the active §14 coroutine child's confined window during step-into, else the
     /// parent's. Errs if the range is unmapped or the module has no memory.
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        let (_, coro) = self.vt.debug_active();
-        match coro.map_or(self.mem.as_ref(), |c| c.mem.as_ref()) {
+        match self.mem.as_ref() {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
@@ -5579,9 +5019,6 @@ impl DebugRun {
     /// never a guess. The DAP backend records successful writes and re-applies them at the same
     /// clock on every seek replay, so time travel stays truthful.
     pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
-        if self.vt.active_coro.is_some() {
-            return false; // parent-frame writes only this slice
-        }
         let Some(target) = self.reader().write_target(depth, name) else {
             return false;
         };
@@ -5744,8 +5181,6 @@ struct DbgTaskSnapshot {
     active: Vm,
     active_id: usize,
     chain: Vec<(usize, Vm, u32)>,
-    coroutines: Vec<Option<CoroSnapshot>>,
-    active_coro: Option<(usize, u32, usize)>,
     root_shadow_sp: u64,
     threads: Vec<Option<usize>>,
     env: Option<usize>,
@@ -6679,7 +6114,8 @@ fn forced_at(forced: &[(u64, usize)], turn: u64) -> Option<usize> {
 /// (a task can only enter a coroutine while running, and a pinned task runs alone), so the first match
 /// is the pin.
 fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
-    tasks.iter().position(|t| t.vt.active_coro.is_some())
+    let _ = tasks;
+    None
 }
 
 /// Pick the next thread to run under the session's **schedule policy** (slice 7): a forced-switch
@@ -6954,13 +6390,10 @@ impl ScheduledDebugRun {
             // body on the right thread.
             if !tasks[ti].at_bp {
                 let hit = {
-                    let (cur_vm, coro) = tasks[ti].vt.debug_active();
-                    let cur_mem: &Option<Mem> = match coro {
-                        Some(c) => &c.mem,
-                        None => match tasks[ti].env {
-                            None => &*mem,
-                            Some(k) => &extra_envs[k].mem,
-                        },
+                    let cur_vm = tasks[ti].vt.debug_active();
+                    let cur_mem: &Option<Mem> = match tasks[ti].env {
+                        None => &*mem,
+                        Some(k) => &extra_envs[k].mem,
                     };
                     match cur_vm.cur_ir_pc(source) {
                         Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
@@ -7004,7 +6437,7 @@ impl ScheduledDebugRun {
                 fn_block_types,
             );
             if let Some(sink) = access_sink.as_mut() {
-                let (cur_vm, _) = tasks[ti].vt.debug_active();
+                let cur_vm = tasks[ti].vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
@@ -7122,11 +6555,8 @@ impl ScheduledDebugRun {
             // coroutine body compares child-local frames — mirroring the single-vCPU `DebugRun::step_to`.
             if let Some((st, max_depth)) = step {
                 if ti == st && matches!(tasks[st].state, DbgTaskState::Runnable) {
-                    let (cur_vm, _) = tasks[st].vt.debug_active();
-                    let depth = match tasks[st].vt.active_coro {
-                        Some((_, _, pd)) => pd + cur_vm.stack.len() + 1,
-                        None => cur_vm.stack.len() + 1,
-                    };
+                    let cur_vm = tasks[st].vt.debug_active();
+                    let depth = cur_vm.stack.len() + 1;
                     if max_depth.is_none_or(|m| depth <= m) {
                         if let Some(pc) = cur_vm.cur_ir_pc(source) {
                             *stopped = Some(st);
@@ -7163,12 +6593,8 @@ impl ScheduledDebugRun {
     /// frame while it is mid-coroutine — see [`DebugRun::step_depth`]). Used by the depth-bounded verbs so
     /// they treat a coroutine `resume` boundary like an ordinary call.
     fn step_depth(&self, s: usize) -> usize {
-        let (cur_vm, _) = self.tasks[s].vt.debug_active();
-        let d = cur_vm.stack.len() + 1;
-        match self.tasks[s].vt.active_coro {
-            Some((_, _, pd)) => pd + d,
-            None => d,
-        }
+        let cur_vm = self.tasks[s].vt.debug_active();
+        cur_vm.stack.len() + 1
     }
 
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
@@ -7240,7 +6666,7 @@ impl ScheduledDebugRun {
             fn_block_types,
         );
         if let Some(sink) = access_sink.as_mut() {
-            let (cur_vm, _) = tasks[ti].vt.debug_active();
+            let cur_vm = tasks[ti].vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
         let trace_turn = *turn;
@@ -7396,12 +6822,6 @@ impl ScheduledDebugRun {
                 .fibers
                 .iter()
                 .any(|f| matches!(f, FiberState::WaitParked { .. }))
-            && self.tasks.iter().all(|t| {
-                t.vt.coroutines
-                    .iter()
-                    .flatten()
-                    .all(|c| child_checkpointable(c.mem.as_ref(), self.mem.as_ref()))
-            })
             && self.extra_envs.iter().all(|e| {
                 e.host.checkpoint_safe() && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
             })
@@ -7426,13 +6846,6 @@ impl ScheduledDebugRun {
                     active: t.vt.active.clone(),
                     active_id: t.vt.active_id,
                     chain: t.vt.chain.clone(),
-                    coroutines: t
-                        .vt
-                        .coroutines
-                        .iter()
-                        .map(|c| c.as_ref().map(coro_snapshot))
-                        .collect(),
-                    active_coro: t.vt.active_coro,
                     root_shadow_sp: t.vt.root_shadow_sp,
                     threads: t.threads.clone(),
                     env: t.env,
@@ -7491,20 +6904,12 @@ impl ScheduledDebugRun {
             .tasks
             .iter()
             .map(|ts| {
-                let coroutines = ts
-                    .coroutines
-                    .iter()
-                    .map(|c| c.as_ref().map(|cs| rebuild_coro(cs, shared_mem, source)))
-                    .collect();
                 DbgTask {
                     vt: VTask {
                         active: ts.active.clone(),
                         active_id: ts.active_id,
                         chain: ts.chain.clone(),
-                        coroutines,
                         root_shadow_sp: ts.root_shadow_sp,
-                        coro_step_into: true,
-                        active_coro: ts.active_coro,
                         active_invoke: None, // scheduled engine keeps invoke a leaf (never steps in)
                         invoke_step_into: false,
                     },
@@ -7571,24 +6976,20 @@ impl ScheduledDebugRun {
     }
 
     /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
-    /// the active §14 coroutine child (over its confined window) when that thread is mid-`resume`, else the
-    /// thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
+    /// the thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
     fn reader(&self) -> FrameReader<'_> {
-        let (vm, coro) = self.tasks[self.focus].vt.debug_active();
+        let vm = self.tasks[self.focus].vt.debug_active();
         FrameReader {
             vm,
             source: &self.source,
-            mem: match coro {
-                Some(c) => &c.mem,
-                None => self.task_mem(self.focus),
-            },
+            mem: self.task_mem(self.focus),
             debug: self.debug.as_ref(),
             fn_block_base: &self.fn_block_base,
             fn_block_types: &self.fn_block_types,
             // A separate-module coroutine on the scheduled engine carries its own §6 metadata (built at
             // spawn); a same-module one leaves it `None` (its frames are module 0, read against the fields
             // above).
-            coro_debug: coro.and_then(|c| c.mod_debug.as_ref()),
+            coro_debug: None,
         }
     }
 
@@ -7615,11 +7016,7 @@ impl ScheduledDebugRun {
     /// Write a source variable in the **focused** thread's frame — see `DebugRun::write_var`.
     pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
         let focus = self.focus;
-        if self
-            .tasks
-            .get(focus)
-            .is_none_or(|t| t.vt.active_coro.is_some())
-        {
+        if self.tasks.get(focus).is_none() {
             return false;
         }
         let Some(target) = self.reader().write_target(depth, name) else {
@@ -7659,12 +7056,7 @@ impl ScheduledDebugRun {
     /// confined window when mid-`resume`, else the thread's own window (its confined `instantiate`
     /// window or the shared mem).
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        let (_, coro) = self.tasks[self.focus].vt.debug_active();
-        let m = match coro {
-            Some(c) => c.mem.as_ref(),
-            None => self.task_mem(self.focus).as_ref(),
-        };
-        match m {
+        match self.task_mem(self.focus).as_ref() {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
@@ -7830,40 +7222,6 @@ enum Outcome {
         count: i32,
         dst: u32,
     },
-    /// §14 `spawn_coroutine`: the Instantiator authority `(ibase, isize)` is resolved; build a child
-    /// confined to `[ibase+off, +2^size_log2)` (`dst` ← handle or `EINVAL`).
-    SpawnCoroutine {
-        ibase: u64,
-        isize: u64,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        dst: u32,
-        demand: bool,
-    },
-    /// §14 `spawn_coroutine_module`: like [`Outcome::SpawnCoroutine`], plus the resolved `Module`
-    /// handle `mh` whose granted program the coroutine child runs (the driver resolves + compiles it).
-    SpawnCoroutineModule {
-        ibase: u64,
-        isize: u64,
-        mh: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        dst: u32,
-        demand: bool,
-    },
-    /// §14 `resume`: drive coroutine `ch` (authority already checked); `(status, value)` → `dst`.
-    CoResume {
-        ch: i32,
-        value: i64,
-        dst: u32,
-    },
-    /// §14 `yield`: this coroutine hands `value` to its resumer; the next resume's value → `dst`.
-    CoYield {
-        value: i64,
-        dst: u32,
-    },
     /// §22 `install`: the `Jit` cap `h` is authority for code-handle `code`; the driver compiles +
     /// installs the unit and writes the slot (or `-ENOSPC`) to `dst`.
     JitInstall {
@@ -8008,11 +7366,6 @@ struct VTask {
     active_id: usize,
     /// Parked resumers: `(fiber id, its Vm, the `cont.resume` result slot awaiting (status, value))`.
     chain: Vec<(usize, Vm, u32)>,
-    /// §14 coroutine children this vCPU spawned (handle = index). `None` once finished. A coroutine
-    /// is cooperative and driven *inline* by `resume` — never via the thread scheduler — so it lives
-    /// here, not in the task set. (Coroutine modules are single-vCPU, no fibers/threads — see
-    /// `compile_module` — so this and `chain` are never both non-empty.)
-    coroutines: Vec<Option<Coro>>,
     /// DURABILITY.md §12.8 (D-fiber-cont option A): the root computation's (context 0's) saved durable
     /// shadow-stack pointer, swapped with the in-window active word ([`super::SHADOW_SP_OFF`]) on each
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
@@ -8022,19 +7375,10 @@ struct VTask {
     /// default: the single-vCPU [`DebugRun`] *and* the multi-vCPU [`ScheduledDebugRun`], where the
     /// coroutine's vCPU is pinned across the body so the op-by-op stepping stays atomic w.r.t. other
     /// vCPUs). When set, a `resume` defers the child to op-by-op stepping via
-    /// [`active_coro`](VTask::active_coro) instead of running it opaquely to its next yield/return.
+    /// the §22 invoked unit instead of running it opaquely to its next return.
     /// Only ever read by [`debug_advance_fiber`] (the debug driver); production's `step_vcpu` ignores it,
     /// so a production `VTask` carrying `true` is inert.
-    coro_step_into: bool,
-    /// While the debugger is stepping *inside* a coroutine child (only when `coro_step_into`), the
-    /// active continuation is that child, not `active`. `(handle, resume-result slot, parent depth)`:
-    /// which coroutine, the parent's `resume` `(status, value)` slot to fill when the child next yields
-    /// or returns, and the parent's call depth at the resume (so the stepping predicate sees a
-    /// *cumulative* depth across the boundary — step-over a `resume` runs the child to completion).
-    /// Coroutine children hold no `Instantiator`, so they never nest — one level suffices. `None` when
-    /// the parent itself is running. Reconstructed deterministically on a reverse-`seek` replay.
-    active_coro: Option<(usize, u32, usize)>,
-    /// Step-into of a §22 `Jit.invoke`d unit (single-vCPU [`DebugRun`] only, gated on `coro_step_into`;
+    /// Step-into of a §22 `Jit.invoke`d unit (single-vCPU [`DebugRun`] only;
     /// the scheduled engine keeps invoke an opaque leaf, as it does coroutines). `None` when not stepping
     /// inside an invoke. Mutually exclusive with `active_coro` — an invoked unit is seam-free (a coroutine
     /// child holds no `Jit` cap, and a `cont.*`/`spawn` inside an invoked unit `CapFault`s).
@@ -8069,35 +7413,20 @@ impl VTask {
             active: Vm::new(c, entry, args)?,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            coroutines: Vec::new(),
             root_shadow_sp: super::SHADOW_BASE,
-            coro_step_into: true,
-            active_coro: None,
             active_invoke: None,
             invoke_step_into: false, // DebugRun::new_with_host flips this on for the single-vCPU engine
         })
     }
 
-    /// The continuation the single-vCPU debugger is currently stepping: the active §14 coroutine child
-    /// (during **step-into**, over its own confined `mem`) or, normally, `active`. The backtrace,
-    /// breakpoint scan, and value/variable reads all resolve against this.
-    fn debug_active(&self) -> (&Vm, Option<&Coro>) {
-        // A §22 invoked unit shares the caller's window/table (no confined `Coro`), so it surfaces as
-        // `(its Vm, None)` — the reader resolves its frames against the session `mem`/`source`. Its
-        // module-≥1 SSA metadata is not plumbed (value reads there resolve to `None`, like an installed
-        // unit's frame), but its `IrPc`s — hence breakpoints, stepping, and backtrace — resolve via
-        // `source`, so they are correct. Mutually exclusive with `active_coro`.
-        if let Some(iv) = &self.active_invoke {
-            return (&iv.vm, None);
-        }
-        match self.active_coro {
-            Some((ch, _, _)) => {
-                let c = self.coroutines[ch]
-                    .as_ref()
-                    .expect("active coroutine present");
-                (&c.vm, Some(c))
-            }
-            None => (&self.active, None),
+    /// The continuation the single-vCPU debugger is currently stepping: a §22 invoked unit's `Vm`
+    /// (which shares the caller's window/table — the reader resolves its frames against the session
+    /// `mem`/`source`; its module-≥1 SSA metadata is not plumbed, but its `IrPc`s — hence
+    /// breakpoints, stepping, and backtrace — resolve via `source`) or, normally, `active`.
+    fn debug_active(&self) -> &Vm {
+        match &self.active_invoke {
+            Some(iv) => &iv.vm,
+            None => &self.active,
         }
     }
 }
@@ -8201,10 +7530,7 @@ fn freeze_drive(
             active: vm,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            coroutines: Vec::new(),
             root_shadow_sp: root_sp,
-            coro_step_into: false,
-            active_coro: None,
             active_invoke: None,
             invoke_step_into: false,
         };
@@ -8231,108 +7557,6 @@ fn freeze_drive(
         m.durable_set_sp(root_word, root_sp);
     }
     Ok(frozen)
-}
-
-/// A §14 coroutine child: its own `Vm` continuation over a **confined** window (`nested_view`) and a
-/// Yielder-only powerbox. Driven inline by `resume_coro` until it yields or returns. `awaiting` is the
-/// `yield`'s result slot, set while suspended — the next `resume` writes the delivered value there.
-/// `table` is the child's natural dispatch table: it maps into module 0 for a same-module coroutine
-/// (op 2) or into the child's own pushed module index for a separate-module coroutine (op 6); the
-/// `vm`'s `module` field selects which (no installed §22 units either way).
-struct Coro {
-    vm: Vm,
-    mem: Option<Mem>,
-    host: Host,
-    table: SharedSlots,
-    awaiting: Option<u32>,
-    /// §14 **demand** coroutine (ops 4/7): its window starts fully unmapped, so an in-window access to
-    /// an unsupplied page is a *recoverable* fault that suspends to the parent (which supplies the
-    /// page) instead of trapping. A plain coroutine (ops 2/6) leaves this `false`.
-    fault_yields: bool,
-    /// Set while suspended on a recoverable page fault: the confined address to **supply** on the next
-    /// `resume` (which then re-runs the rewound access). `None` otherwise.
-    faulted_page: Option<u64>,
-    /// A §14 **separate-module** child's own §6 debug metadata (`Some`, keyed by its pushed source index),
-    /// so `read_var`/`var_addr` resolve source variables inside its body during step-into. `None` for a
-    /// **same-module** coroutine (its frames are module 0, read against the session's own metadata) and
-    /// for every production (non-debug) coroutine, which never inspects.
-    mod_debug: Option<ModuleDebug>,
-}
-
-/// Why [`resume_coro`] returned: the coroutine yielded a value, hit a recoverable page fault (a
-/// **demand** child — the parent must supply the page), or its function returned.
-enum CoStop {
-    Yield(i64),
-    Fault(u64),
-    Done(Vec<Value>),
-}
-
-/// Drive a coroutine child inline until it yields (`Yielder.yield` → [`Outcome::CoYield`]) or its
-/// function returns. The child runs over its **own** confined `mem` and Yielder-only `host`; since it
-/// holds no Instantiator, its own `spawn_coroutine`/`resume` resolve to `CapFault` inside
-/// [`Vm::resume`] (never reaching here), and coroutine modules carry no fibers/threads — so the only
-/// outcomes possible are `Done`/`Suspended`/`CoYield`. A child trap propagates to the resumer.
-fn resume_coro(coro: &mut Coro, source: &ModuleSource, fuel: &mut u64) -> Result<CoStop, Trap> {
-    // The coroutine child runs over its **own natural** table (built at spawn): it holds no `Jit`
-    // cap, so it cannot reach installed §22 units (matching the tree-walker, where a coroutine child
-    // gets a fresh `DomainTable::new(&cfuncs, 0)`). `coro.vm.module` selects its program (module 0 for
-    // a same-module coroutine, its own pushed index for a separate-module one).
-    //
-    // A **demand** child (`fault_yields`) is stepped **one op at a time** (`budget = 1`): the budget
-    // boundary persists the cursor *at* the next op before running it, so when that op faults the
-    // cursor already points at it — re-running after the parent supplies the page retries exactly that
-    // access, the §14 rewind, with **no** change to the hot loop (a plain coroutine runs unmetered).
-    let budget = if coro.fault_yields { 1 } else { u64::MAX };
-    loop {
-        match coro.vm.resume(
-            source,
-            &coro.table,
-            fuel,
-            &mut coro.mem,
-            &mut HostCell::Excl(&mut coro.host),
-            budget,
-        ) {
-            Ok(Outcome::Done(vals)) => return Ok(CoStop::Done(vals)),
-            Ok(Outcome::Suspended) => {} // budget exhausted (demand stepping) or normal — keep going
-            Ok(Outcome::CoYield { value, dst }) => {
-                coro.awaiting = Some(dst);
-                return Ok(CoStop::Yield(value));
-            }
-            // A coroutine child is its own confined domain (no fibers/threads, holds no Instantiator),
-            // so its `gc.roots` scans just its own continuation. Handle it inline and keep stepping.
-            Ok(Outcome::GcRoots {
-                lo,
-                hi,
-                mask,
-                buf,
-                cap,
-                dst,
-            }) => {
-                let mut roots = std::collections::BTreeSet::new();
-                {
-                    let mut consider = |w: u64| {
-                        let m = w & mask;
-                        if m >= lo && m < hi {
-                            roots.insert(m);
-                        }
-                    };
-                    scan_vm_roots(&coro.vm, source, &mut consider);
-                }
-                let total = gc_write(&mut coro.mem, buf, cap, roots)?;
-                coro.vm.set(dst, Reg::from_i64(total));
-            }
-            Ok(_) => return Err(Trap::FiberFault),
-            // A demand child's *recoverable* in-window page fault suspends to the parent; an
-            // out-of-window fault (`take_fault` → `None`) is a real trap that propagates.
-            Err(Trap::MemoryFault) if coro.fault_yields => {
-                match coro.mem.as_ref().and_then(|m| m.take_fault()) {
-                    Some(addr) => return Ok(CoStop::Fault(addr)),
-                    None => return Err(Trap::MemoryFault),
-                }
-            }
-            Err(t) => return Err(t),
-        }
-    }
 }
 
 /// Scan every live activation of `vm`'s continuation — the active window plus each suspended caller
@@ -8475,19 +7699,6 @@ enum VcpuStop {
         /// op 13 `instantiate_module_named`: resolved `(grants_ptr, grants_n)` window coordinates of
         /// the child's by-name grant list (op 5 is `None`).
         grants: Option<(u64, u64)>,
-    },
-    /// §14 `Instantiator.spawn_coroutine_module` — the driver resolves + compiles the host-granted
-    /// `Module` (`mh`), builds a coroutine `Coro` over it, and registers it in the spawner's coroutine
-    /// set (thereafter `resume`d inline). Unlike `instantiate_module`, it creates no scheduler task.
-    SpawnCoroutineModule {
-        ibase: u64,
-        isize: u64,
-        mh: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        dst: u32,
-        demand: bool,
     },
     Wait {
         base: u64,
@@ -8882,92 +8093,6 @@ fn step_vcpu(
                     results,
                 })
             }
-            // §14 coroutines are cooperative and driven **inline** here (never via the thread
-            // scheduler), exactly as `run_inner` recurses for `resume`.
-            Outcome::SpawnCoroutine {
-                ibase,
-                isize: isz,
-                entry,
-                off,
-                size_log2,
-                dst,
-                demand,
-            } => {
-                let h = spawn_coroutine(
-                    &mut vt.coroutines,
-                    ctx.mem,
-                    &dom.source.primary(),
-                    entry,
-                    (ibase, isz, off, size_log2),
-                    demand,
-                );
-                vt.active.set(dst, Reg::from_i32(h));
-            }
-            // A separate-**module** coroutine spawn must compile + push the granted module (which
-            // needs the mutable `Domain`), so it escapes to the driver; once built, it is `resume`d
-            // inline like any coroutine.
-            Outcome::SpawnCoroutineModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                dst,
-                demand,
-            } => {
-                return Ok(VcpuStop::SpawnCoroutineModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    dst,
-                    demand,
-                })
-            }
-            Outcome::CoResume { ch, value, dst } => {
-                // Take the coroutine; a forged/finished slot is an inert CapFault (propagates).
-                let mut coro = vt
-                    .coroutines
-                    .get_mut(ch as usize)
-                    .and_then(|c| c.take())
-                    .ok_or(Trap::CapFault)?;
-                if let Some(addr) = coro.faulted_page.take() {
-                    // Resuming after a recoverable page fault: **supply** the page (keeping the
-                    // parent's bytes), then re-run the rewound access — the value arg is unused.
-                    if let Some(m) = coro.mem.as_ref() {
-                        m.supply_page(addr);
-                    }
-                } else if let Some(yd) = coro.awaiting.take() {
-                    coro.vm.set(yd, Reg::from_i64(value)); // deliver the resume value to the `yield`
-                }
-                match resume_coro(&mut coro, &dom.source, &mut *ctx.fuel)? {
-                    CoStop::Yield(yv) => {
-                        vt.coroutines[ch as usize] = Some(coro); // suspended — re-parked for next resume
-                        vt.active.set(dst, Reg::from_i32(super::FIBER_SUSPENDED));
-                        vt.active.set(dst + 1, Reg::from_i64(yv));
-                    }
-                    CoStop::Fault(addr) => {
-                        // A demand child faulted: remember the page to supply, report (FAULTED, addr).
-                        coro.faulted_page = Some(addr);
-                        vt.coroutines[ch as usize] = Some(coro);
-                        vt.active.set(dst, Reg::from_i32(super::CORO_FAULTED));
-                        vt.active.set(dst + 1, Reg::from_i64(addr as i64));
-                    }
-                    CoStop::Done(vals) => {
-                        // Finished — the slot stays `None` (a later resume is inert/CapFault).
-                        vt.active.set(dst, Reg::from_i32(super::FIBER_RETURNED));
-                        let v = vals.first().copied().unwrap_or(Value::I64(0));
-                        vt.active.set(dst + 1, Reg::from_value(v));
-                    }
-                }
-            }
-            // A `Yielder.yield` only resolves (and thus only reaches a driver) inside an inline
-            // coroutine child — `resume_coro` consumes it. At the top level the yielder handle is
-            // ungranted, so `resume` CapFaults before producing this; treat any leak as a fault.
-            Outcome::CoYield { .. } => return Err(Trap::FiberFault),
             // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
             // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
             // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
@@ -9002,183 +8127,12 @@ fn step_vcpu(
                             scan_vm_roots(vm, &dom.source, &mut consider);
                         }
                     }
-                    for coro in vt.coroutines.iter().flatten() {
-                        scan_vm_roots(&coro.vm, &dom.source, &mut consider);
-                    }
                 }
                 let total = gc_write(ctx.mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }
         }
     }
-}
-
-/// Build a §14 coroutine child confined to `[ibase+off, ibase+off+2^size_log2)` of the parent's
-/// window, with a Yielder-only powerbox, and register it. Returns its handle, or `EINVAL` if the
-/// entry signature / size / alignment is invalid (mirrors the tree-walker's validation).
-fn spawn_coroutine(
-    coroutines: &mut Vec<Option<Coro>>,
-    mem: &Option<Mem>,
-    c: &Compiled,
-    entry: i64,
-    // The Instantiator-relative carve geometry: `(holder base, holder size, offset, size_log2)`.
-    carve: (u64, u64, i64, i64),
-    // §14 op 4 `spawn_demand_coroutine`: start every page unmapped (lazy paging / fault-driven yield).
-    demand: bool,
-) -> i32 {
-    let (ibase, isz, off, size_log2) = carve;
-    // Coroutine entry is a fixed `(i64 yielder) -> (i64)`.
-    let ok_entry = c
-        .sigs
-        .get(entry as u64 as usize)
-        .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= isz);
-    if !ok_entry || !fits {
-        return super::EINVAL as i32;
-    }
-    // Holder-relative `ibase`/`off` → backing-absolute base (adds the holder's own window base, so
-    // nesting composes); the child sees a zero-based `[0, child_size)` confined view.
-    let abs_base = mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
-    let child_mem = mem.as_ref().map(|m| {
-        let cm = m.nested_view(abs_base, size_log2 as u8);
-        if demand {
-            cm.demand_page(); // every page starts unmapped — faults suspend to us (lazy paging)
-        }
-        cm
-    });
-    let mut child_host = Host::new();
-    let cy = child_host.grant_yielder(); // the child's handle to suspend back to us
-    let child_vm = match Vm::new(c, entry as u64 as usize, &[Value::I64(cy as i64)]) {
-        Ok(v) => v,
-        Err(_) => return super::EINVAL as i32,
-    };
-    coroutines.push(Some(Coro {
-        vm: child_vm,
-        mem: child_mem,
-        host: child_host,
-        table: build_table(c.progs.len(), 0), // same-module coroutine: natural table over module 0
-        awaiting: None,
-        fault_yields: demand,
-        faulted_page: None,
-        mod_debug: None, // same-module: frames are module 0, read against the session's own metadata
-    }));
-    (coroutines.len() - 1) as i32
-}
-
-/// Build a §14 **separate-module** coroutine child (`spawn_coroutine_module`, op 6 / demand op 7) inline
-/// in `coroutines` — the debug-engine counterpart of [`Vcpu::service_coroutine_module`]. Resolve the
-/// host-granted `Module` (handle `mh`) from the powerbox, compile it, **push it to the shared `source`**
-/// (so it dispatches by index — the mutable-`Domain` step that previously kept this op declined under the
-/// debugger), materialize its data segments into the carve, and register the `Coro` over its own natural
-/// table + a Yielder-only powerbox. Returns the child handle, `EINVAL` for a bad entry / carve / memory
-/// mismatch, or a `Trap` for a forged/closed module handle or a module the engine can't lower.
-#[allow(clippy::too_many_arguments)]
-fn spawn_coroutine_module(
-    coroutines: &mut Vec<Option<Coro>>,
-    source: &ModuleSource,
-    mem: &Option<Mem>,
-    host: &Host,
-    mh: i32,
-    entry: i64,
-    // `(holder base, holder size, offset, size_log2)` — the Instantiator-relative carve geometry.
-    carve: (u64, u64, i64, i64),
-    demand: bool,
-) -> Result<i32, Trap> {
-    let (ibase, isz, off, size_log2) = carve;
-    // Resolve + clone the granted module from the powerbox (a forged/closed/wrong-type handle traps).
-    // `gmod` is the whole granted `Module` (retained for its §6 `-g` info + funcs), so a step-into can
-    // resolve the child's source variables by name — the module-0-gate follow-up (DEBUGGING.md §14).
-    let (cfuncs, cmem_log2, cdata, gmod) = {
-        let g = host.resolve_module(mh)?;
-        (
-            g.funcs.clone(),
-            g.memory_log2,
-            g.data.clone(),
-            std::sync::Arc::clone(&g.module),
-        )
-    };
-    // Compile to bytecode **unfused** (like module 0 in `DebugRun::new`): the child is single-stepped under
-    // the debugger, so every IR inst must stay a distinct op/src position — a breakpoint or `read_var` can
-    // land on any of them. A module using an op the engine can't lower is `Malformed` (as for install).
-    let child_compiled = match compile_module_unfused(&cfuncs) {
-        Some(c) => c,
-        None => return Err(Trap::Malformed),
-    };
-    let ok_entry = child_compiled
-        .sigs
-        .get(entry as u64 as usize)
-        .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off_u = off as u64;
-    let fits = child_size != 0
-        && child_size <= isz
-        && off_u & (child_size - 1) == 0
-        && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-    // A separate-module child's carve must equal its declared memory (§14 transparency).
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
-    if !ok_entry || !fits || !mod_ok {
-        return Ok(super::EINVAL as i32);
-    }
-    let pbase = mem.as_ref().map_or(0, |m| m.window.base());
-    let abs_base = pbase + ibase + off_u;
-    // Materialize the module's data segments into the carve before the child runs, then the view.
-    let child_mem = {
-        if let Some(m) = mem.as_ref() {
-            for d in cdata.iter() {
-                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                    for (k, &b) in d.bytes.iter().enumerate() {
-                        m.set_byte(abs_base + d.offset + k as u64, b);
-                    }
-                }
-            }
-        }
-        mem.as_ref().map(|m| {
-            let cm = m.nested_view(abs_base, size_log2 as u8);
-            if demand {
-                cm.demand_page();
-            }
-            cm
-        })
-    };
-    let mut child_host = Host::new();
-    let cy = child_host.grant_yielder();
-    let progs_len = child_compiled.progs.len();
-    let cm = source.push(child_compiled); // the mutable-Domain step: the child dispatches by index
-    let child_table = build_table_for(progs_len, 0, cm as u32);
-    let mut child_vm = match source
-        .get(cm)
-        .and_then(|u| Vm::new(&u, entry as u64 as usize, &[Value::I64(cy as i64)]).ok())
-    {
-        Some(v) => v,
-        None => return Ok(super::EINVAL as i32),
-    };
-    child_vm.module = cm; // the child runs its own pushed module, not module 0
-    coroutines.push(Some(Coro {
-        vm: child_vm,
-        mem: child_mem,
-        host: child_host,
-        table: child_table,
-        awaiting: None,
-        fault_yields: demand,
-        faulted_page: None,
-        // The child's own §6 metadata, keyed by its pushed index `cm`, so a step-into resolves its
-        // source variables against its funcs (not module 0's) — position-level reads worked already.
-        mod_debug: Some(ModuleDebug::build(&gmod, cm)),
-    }));
-    Ok((coroutines.len() - 1) as i32)
 }
 
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.
@@ -9969,132 +8923,6 @@ fn drive(
                 let handle = tasks[ti].threads.len() as i32;
                 tasks[ti].threads.push(Some(cidx));
                 tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-            }
-            Ok(VcpuStop::SpawnCoroutineModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                dst,
-                demand,
-            }) => {
-                // Resolve + compile the granted module (forged handle → CapFault; uncoverable op →
-                // Malformed), exactly as for `instantiate_module`. `gmod` is the whole granted `Module`,
-                // kept for its §6 `-g` info + funcs so a step-into resolves the child's source variables.
-                let (cfuncs, cmem_log2, cdata, gmod) = match host.resolve_module(mh) {
-                    Ok(g) => (
-                        g.funcs.clone(),
-                        g.memory_log2,
-                        g.data.clone(),
-                        std::sync::Arc::clone(&g.module),
-                    ),
-                    Err(t) => {
-                        complete(&mut tasks, ti, Err(t));
-                        continue;
-                    }
-                };
-                // Unfused (like module 0): the child is single-stepped under the debugger, so every IR inst
-                // stays a distinct op/src position a breakpoint or `read_var` can land on.
-                let child_compiled = match compile_module_unfused(&cfuncs) {
-                    Some(c) => c,
-                    None => {
-                        complete(&mut tasks, ti, Err(Trap::Malformed));
-                        continue;
-                    }
-                };
-                // A coroutine entry is `(i64 yielder) -> (i64)`; the carve must equal the module's
-                // declared memory (§14 transparency).
-                let ok_entry = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
-                if !ok_entry || !fits || !mod_ok {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
-                }
-                let pbase = match tasks[ti].env {
-                    None => mem.as_ref().map_or(0, |m| m.window.base()),
-                    Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-                };
-                let abs_base = pbase + ibase + off_u;
-                // Build the child window and materialize the module's data segments into the carve
-                // (as for `instantiate_module`).
-                let child_mem = {
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    if let Some(m) = pm {
-                        for d in cdata.iter() {
-                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                for (k, &b) in d.bytes.iter().enumerate() {
-                                    m.set_byte(abs_base + d.offset + k as u64, b);
-                                }
-                            }
-                        }
-                    }
-                    pm.map(|m| {
-                        let cm = m.nested_view(abs_base, size_log2 as u8);
-                        if demand {
-                            // op 7: every page starts unmapped — the materialized data segments are in
-                            // the shared backing but **supplied lazily** as the child first touches them.
-                            cm.demand_page();
-                        }
-                        cm
-                    })
-                };
-                // A coroutine gets a Yielder-only powerbox (its single entry arg); it holds no
-                // Instantiator, so its own spawn/resume CapFault inside `Vm::resume`.
-                let mut child_host = Host::new();
-                let cy = child_host.grant_yielder();
-                let progs_len = child_compiled.progs.len();
-                let cm = dom.source.push(child_compiled);
-                let child_table = build_table_for(progs_len, 0, cm as u32);
-                let cunit = dom.source.get(cm);
-                let mut child_vm = match cunit
-                    .and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok())
-                {
-                    Some(v) => v,
-                    None => {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                };
-                child_vm.module = cm;
-                // The coroutine lives in the spawning vCPU's coroutine set, driven inline by `resume`.
-                tasks[ti].vt.coroutines.push(Some(Coro {
-                    vm: child_vm,
-                    mem: child_mem,
-                    host: child_host,
-                    table: child_table,
-                    awaiting: None,
-                    fault_yields: demand,
-                    faulted_page: None,
-                    // The child's own §6 metadata, keyed by its pushed index `cm`, so a step-into on the
-                    // scheduled engine resolves its source variables against its funcs (not module 0's).
-                    mod_debug: Some(ModuleDebug::build(&gmod, cm)),
-                }));
-                let h = (tasks[ti].vt.coroutines.len() - 1) as i32;
-                tasks[ti].vt.active.set(dst, Reg::from_i32(h));
             }
             Ok(VcpuStop::Join { handle, dst }) => {
                 let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
@@ -11012,109 +9840,6 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let handle = threads.len() as i32;
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
-            }
-            // §14 `Instantiator.spawn_coroutine_module` (op 6 / demand op 7) — a separate-module
-            // **coroutine**: resolve + compile + push the granted module (as for `instantiate_module`),
-            // materialize its data segments, then build a `Coro` (Yielder-only powerbox) and register
-            // it in **this** vCPU's coroutine set. Unlike instantiate, a coroutine is driven **inline**
-            // by `resume` (no thread) — so once built it runs on this vCPU exactly as a same-module
-            // coroutine already does in this driver; only the build (which needs the granted module)
-            // escaped here.
-            Ok(VcpuStop::SpawnCoroutineModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                dst,
-                demand,
-            }) => {
-                let (cfuncs, cmem_log2, cdata) = {
-                    let g = host.lock().unwrap_or_else(|e| e.into_inner());
-                    match g.resolve_module(mh) {
-                        Ok(grant) => (grant.funcs.clone(), grant.memory_log2, grant.data.clone()),
-                        Err(t) => return (Err(t), mem),
-                    }
-                };
-                let child_compiled = match compile_module(&cfuncs) {
-                    Some(c) => c,
-                    None => return (Err(Trap::Malformed), mem),
-                };
-                // A coroutine entry is `(i64 yielder) -> (i64)`; the carve must equal the module's
-                // declared memory (§14 transparency).
-                let ok_entry = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, r)| p[..] == [ValType::I64] && r[..] == [ValType::I64]);
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = child_size != 0
-                    && child_size <= isz
-                    && off_u & (child_size - 1) == 0
-                    && off_u.checked_add(child_size).is_some_and(|e| e <= isz);
-                let mod_ok = cmem_log2 == Some(size_log2 as u8);
-                if !ok_entry || !fits || !mod_ok {
-                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
-                }
-                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
-                let abs_base = pbase + ibase + off_u;
-                let child_mem = {
-                    if let Some(m) = mem.as_ref() {
-                        for d in cdata.iter() {
-                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                for (k, &b) in d.bytes.iter().enumerate() {
-                                    m.set_byte(abs_base + d.offset + k as u64, b);
-                                }
-                            }
-                        }
-                    }
-                    mem.as_ref().map(|m| {
-                        let cm = m.nested_view(abs_base, size_log2 as u8);
-                        if demand {
-                            // op 7: every page starts unmapped — the data segments are in the shared
-                            // backing but supplied lazily as the child first touches them.
-                            cm.demand_page();
-                        }
-                        cm
-                    })
-                };
-                // Yielder-only powerbox (its single entry arg): it holds no Instantiator, so its own
-                // spawn/resume CapFaults inside `Vm::resume`.
-                let mut child_host = Host::new();
-                let cy = child_host.grant_yielder();
-                let progs_len = child_compiled.progs.len();
-                let cm = dom.source.push(child_compiled);
-                let child_table = build_table_for(progs_len, 0, cm as u32);
-                let cunit = dom.source.get(cm);
-                let mut child_vm = match cunit
-                    .and_then(|u| Vm::new(&u, entry as usize, &[Value::I64(cy as i64)]).ok())
-                {
-                    Some(v) => v,
-                    None => {
-                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                };
-                child_vm.module = cm;
-                // The coroutine lives in this vCPU's coroutine set, driven inline by `resume`.
-                vt.coroutines.push(Some(Coro {
-                    vm: child_vm,
-                    mem: child_mem,
-                    host: child_host,
-                    table: child_table,
-                    awaiting: None,
-                    fault_yields: demand,
-                    faulted_page: None,
-                    mod_debug: None, // production parallel scheduler never inspects
-                }));
-                let h = (vt.coroutines.len() - 1) as i32;
-                vt.active.set(dst, Reg::from_i32(h));
             }
         }
     }
@@ -12416,95 +11141,6 @@ impl Vm {
                         count,
                         dst,
                     });
-                }
-                // §14 coroutine ops — the cap authority is resolved here (a forged/ungranted handle
-                // is an inert CapFault in place), then the switch is handed to the driver.
-                Op::SpawnCoroutine {
-                    handle,
-                    entry,
-                    off,
-                    size_log2,
-                    dst,
-                    demand,
-                } => {
-                    let ih = r!(*handle).i32();
-                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
-                    let entry = r!(*entry).i64();
-                    let off = r!(*off).i64();
-                    let size_log2 = r!(*size_log2).i64();
-                    let (dst, demand) = (*dst, *demand);
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::SpawnCoroutine {
-                        ibase,
-                        isize: isz,
-                        entry,
-                        off,
-                        size_log2,
-                        dst,
-                        demand,
-                    });
-                }
-                Op::SpawnCoroutineModule {
-                    handle,
-                    module: module_reg,
-                    entry,
-                    off,
-                    size_log2,
-                    dst,
-                    demand,
-                } => {
-                    let ih = r!(*handle).i32();
-                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
-                    let mh = r!(*module_reg).i64() as i32;
-                    let entry = r!(*entry).i64();
-                    let off = r!(*off).i64();
-                    let size_log2 = r!(*size_log2).i64();
-                    let (dst, demand) = (*dst, *demand);
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::SpawnCoroutineModule {
-                        ibase,
-                        isize: isz,
-                        mh,
-                        entry,
-                        off,
-                        size_log2,
-                        dst,
-                        demand,
-                    });
-                }
-                Op::CoResume {
-                    handle,
-                    ch,
-                    value,
-                    dst,
-                } => {
-                    let ih = r!(*handle).i32();
-                    host.with(|p| p.resolve_instantiator(ih))?; // authority
-                    let ch = r!(*ch).i32();
-                    let value = r!(*value).i64();
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::CoResume { ch, value, dst });
-                }
-                Op::CoYield { handle, value, dst } => {
-                    let yh = r!(*handle).i32();
-                    host.with(|p| p.resolve_yielder(yh))?; // authority
-                    let value = r!(*value).i64();
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::CoYield { value, dst });
                 }
                 // §22 install/uninstall escape to the driver, which owns the (mutable) dispatch table
                 // and module set. Authority is resolved there (a forged handle is an inert CapFault).

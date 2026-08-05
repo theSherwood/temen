@@ -13,9 +13,6 @@ use svm_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use svm_text::parse_module;
 use svm_verify::verify_module;
 
-const RETURNED: i64 = 1;
-const FAULTED: i64 = 2;
-
 type BothOut = (Result<Vec<Value>, Trap>, Vec<u8>, JitOutcome, Vec<u8>);
 
 /// The child ("plugin") module — see `separate_module.rs`: 64 KiB window, `data 100 "VM"`, an entry
@@ -233,53 +230,6 @@ block 0 (v0: i32, v1: i32) {
             "module child escaped to parent byte {i}"
         );
     }
-}
-
-/// Demand-paged module child: its data segments live in the carve, its pages start unmapped — the
-/// first touch FAULTs to the parent (the reported address must match across backends: the segment's
-/// page), the parent resumes without writing anything, and the child reads its lazily supplied
-/// segment byte. Lazy plugin loading, identical on both backends.
-#[test]
-fn jit_demand_module_child_matches_interp() {
-    if !svm_jit::fiber_supported() {
-        return;
-    }
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = cap.call 6 7 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7, v8 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v6, v3)
-  v9, v10 = cap.call 6 3 (i32, i64) -> (i32, i64) v0 (v6, v3)
-  v11 = i64.extend_i32_s v7
-  v12 = i64.const 1000000000
-  v13 = i64.mul v11 v12
-  v14 = i64.extend_i32_s v9
-  v15 = i64.const 100000000
-  v16 = i64.mul v14 v15
-  v17 = i64.const 1000000
-  v18 = i64.mul v8 v17
-  v19 = i64.add v10 v13
-  v20 = i64.add v19 v16
-  v21 = i64.add v20 v18
-  return v21
-  }
-}
-";
-    let (ir, imem, jo, jmem) = both(parent);
-    // status1 = FAULTED at the child's first touched page (its data read at child offset 100 →
-    // parent address 64 KiB + 100 = 65636), status2 = RETURNED with 1086 ('V' + 1000).
-    let want = 1086 + FAULTED * 1_000_000_000 + RETURNED * 100_000_000 + 65636 * 1_000_000;
-    let ival = ir.expect("interp ran ok").pop().expect("one result");
-    assert_eq!(ival, Value::I64(want), "interp lazy module-child");
-    assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[want]),
-        "jit: {jo:?}"
-    );
-    assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
 }
 
 /// Validation parity: a carve that doesn't equal the module's declared memory is `-EINVAL`, and a
