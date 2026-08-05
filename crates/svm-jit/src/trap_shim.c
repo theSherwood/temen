@@ -29,30 +29,6 @@ static _Thread_local volatile int g_armed = 0;
 static _Thread_local volatile uintptr_t g_lo = 0;
 static _Thread_local volatile uintptr_t g_hi = 0;
 
-/* §14 fault-driven yield (demand paging): while a demand-paged coroutine child runs, its window's
- * committed range is registered here. A fault inside it is *recoverable*: the callback suspends the
- * child's fiber to its parent (which supplies the page and resumes); when it returns nonzero the
- * handler simply returns, re-executing the faulting access against the now-mapped page. A zero
- * return (no live coroutine) falls through to the armed-window detect-and-kill below. */
-static _Thread_local volatile uintptr_t g_demand_lo = 0;
-static _Thread_local volatile uintptr_t g_demand_hi = 0;
-static _Thread_local int (*g_demand_cb)(uintptr_t, void *) = 0;
-static _Thread_local void *g_demand_ctx = 0;
-
-void svm_set_demand(uintptr_t lo, uintptr_t hi, int (*cb)(uintptr_t, void *), void *ctx) {
-    g_demand_lo = lo;
-    g_demand_hi = hi;
-    g_demand_ctx = ctx;
-    g_demand_cb = cb;
-}
-
-void svm_clear_demand(void) {
-    g_demand_cb = 0;
-    g_demand_lo = 0;
-    g_demand_hi = 0;
-    g_demand_ctx = 0;
-}
-
 /* The trap-time backtrace capture *state* and the frame-pointer walk live in `trap_capture.c` (shared
  * with the windows VEH and the explicit-trap helper). The signal handler below extracts the faulting
  * `(pc, fp)` from the ucontext and hands them to `svm_store_trap_frame`, which walks the chain and
@@ -122,15 +98,6 @@ static void svm_handler(int sig, siginfo_t *info, void *uc) {
         svm_chain(&g_old_ill, sig, info, uc);
         return;
     }
-    /* Recoverable demand fault first (the demand range lies inside the armed child window, so this
-     * check must precede detect-and-kill). The callback suspends the child's fiber to its parent
-     * *from this handler frame* (on the child's fiber stack — it stays live across the suspension);
-     * when the parent resumes the child, the callback returns here and the plain return re-executes
-     * the faulting access against the freshly supplied page. */
-    if (g_demand_cb && addr >= g_demand_lo && addr < g_demand_hi) {
-        if (g_demand_cb(addr, g_demand_ctx))
-            return;
-    }
     if (g_armed && addr >= g_lo && addr < g_hi) {
         g_armed = 0;
         svm_capture_frame(uc); /* stash the faulting frame before the stack unwinds (§5 W3) */
@@ -194,38 +161,3 @@ int svm_run_guarded(void (*fn)(const long *, long *, unsigned char *, const void
     return 0;
 }
 
-/* ---- Guard-state snapshots (§14 co-fibers) -------------------------------------------------
- *
- * A coroutine child runs its own guarded call on a *separate fiber stack*; a suspend switches
- * stacks from inside that call, leaving the thread-local recovery state armed for the child while
- * the parent runs. The parent therefore swaps the whole recovery state (jmp_buf + armed + range)
- * around every switch: save the child's state at suspend-return, restore the parent's; reinstall
- * the child's at the next resume. The state is an opaque heap blob (C-side, for sigjmp_buf size
- * and alignment); a freshly boxed state is all-zero = disarmed. Same-thread only: a sigjmp_buf
- * must be longjmp'd on the thread that captured it.
- */
-typedef struct {
-    sigjmp_buf buf;
-    int armed;
-    uintptr_t lo, hi;
-} svm_guard_state;
-
-void *svm_guard_box(void) { return calloc(1, sizeof(svm_guard_state)); }
-
-void svm_guard_unbox(void *p) { free(p); }
-
-void svm_guard_save(void *p) {
-    svm_guard_state *s = (svm_guard_state *)p;
-    memcpy(&s->buf, &g_buf, sizeof s->buf);
-    s->armed = g_armed;
-    s->lo = g_lo;
-    s->hi = g_hi;
-}
-
-void svm_guard_restore(const void *p) {
-    const svm_guard_state *s = (const svm_guard_state *)p;
-    memcpy(&g_buf, &s->buf, sizeof g_buf);
-    g_armed = s->armed;
-    g_lo = s->lo;
-    g_hi = s->hi;
-}

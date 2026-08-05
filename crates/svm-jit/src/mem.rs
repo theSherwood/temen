@@ -716,32 +716,12 @@ mod pal {
         TRAP_VALID.with(|c| c.set(true));
     }
 
-    #[cfg(fiber_rt)]
-    thread_local! {
-        // The §14 demand-fault registration `(lo, hi, callback, ctx)` — the *recoverable* fault
-        // window of the demand-paged coroutine child currently running on this thread (see
-        // `mem::set_demand`). Checked by the VEH before detect-and-kill.
-        pub(super) static DEMAND: Cell<Option<(usize, usize, super::DemandCb, *mut c_void)>> =
-            const { Cell::new(None) };
-    }
-
     unsafe extern "system" fn veh(ep: *mut EXCEPTION_POINTERS) -> i32 {
         let ep = &*ep;
         let rec = &*ep.ExceptionRecord;
         if rec.ExceptionCode == STATUS_ACCESS_VIOLATION {
             // ExceptionInformation[1] is the faulting address for an access violation.
             let addr = rec.ExceptionInformation[1];
-            // §14 fault-driven yield: a fault in the registered demand range is *recoverable* (it
-            // lies inside the armed child window, so this check precedes detect-and-kill). The
-            // callback suspends the child's fiber to its parent from this VEH frame (on the child's
-            // fiber stack, live across the suspension); when the parent resumes, the callback
-            // returns and CONTINUE_EXECUTION re-runs the faulting access on the supplied page.
-            #[cfg(fiber_rt)]
-            if let Some((lo, hi, cb, ctx)) = DEMAND.with(|d| d.get()) {
-                if addr >= lo && addr < hi && cb(addr, ctx) != 0 {
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            }
             if let Some(f) = GUARD.with(|g| g.get()) {
                 if addr >= f.lo && addr < f.hi {
                     TRIPPED.with(|t| t.set(true));
@@ -769,27 +749,6 @@ mod pal {
             }
         }
         EXCEPTION_CONTINUE_SEARCH
-    }
-
-    /// A snapshot of the thread's guard frame (§14 co-fibers): the parent swaps this around every
-    /// fiber switch so the child's armed frame survives a suspend and the parent's is reinstated.
-    /// The captured `Frame::ctx` points into a `run_guarded` stack frame — on a *fiber* stack for a
-    /// child, which stays live while the fiber is suspended.
-    #[cfg(fiber_rt)]
-    pub(super) struct GuardSnap(Option<Frame>);
-    #[cfg(fiber_rt)]
-    impl GuardSnap {
-        pub(super) fn disarmed() -> GuardSnap {
-            GuardSnap(None)
-        }
-    }
-    #[cfg(fiber_rt)]
-    pub(super) fn guard_snapshot() -> GuardSnap {
-        GuardSnap(GUARD.with(|g| g.get()))
-    }
-    #[cfg(fiber_rt)]
-    pub(super) fn guard_install(s: &GuardSnap) {
-        GUARD.with(|g| g.set(s.0))
     }
 
     static INSTALL: Once = Once::new();
