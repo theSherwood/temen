@@ -3789,6 +3789,28 @@ fn module_nests(m: &svm_ir::Module) -> bool {
     })
 }
 
+/// CONSOLIDATION.md §2.2: the module spawns a demand process child (`Instantiator` op 16 —
+/// pager-serviced faults). The JIT has no native arm for the fault seam yet, so these modules
+/// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
+/// transport itself is what makes this cheap to defer: JIT callers already reach providers
+/// through the cap-thunk handoff at interp cost.
+fn module_demand_spawns(m: &svm_ir::Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    svm_ir::Inst::CapCall {
+                        type_id: 6,
+                        op: 16,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 fn module_serves(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -4985,9 +5007,10 @@ impl Instance {
         // (the cap thunk's `serve_native` arm). Everything else `module_serves` catches — op-14
         // offer mints, serving modules whose handlers could park — still folds to the oracle.
         let backend = if matches!(backend, Backend::Jit)
-            && module_serves(m)
-            && !svm_interp::bytecode::serve_qualifies(&m.funcs)
-            && !module_nests(m)
+            && (module_demand_spawns(m)
+                || (module_serves(m)
+                    && !svm_interp::bytecode::serve_qualifies(&m.funcs)
+                    && !module_nests(m)))
         {
             Backend::TreeWalk
         } else {
