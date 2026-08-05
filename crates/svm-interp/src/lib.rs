@@ -17429,6 +17429,12 @@ impl Host {
             .map_or(0, |d| d.units.len() as u32)
     }
 
+    /// The number of granted `Jit` domains (append-only, indexed `0..count`). The reconstruct-on-thaw
+    /// embedder (DURABILITY.md §12.5 Slice 3) walks these to re-compile each restored domain's units.
+    pub fn jit_domain_count(&self) -> u32 {
+        self.jit_domains.len() as u32
+    }
+
     /// The units of `domain` still reachable through a **live `CompiledCode` handle** (a
     /// `Binding::JitCode` entry the guest can still `invoke`/`install`/`release`). Compaction must
     /// carry these (their trampoline pointers move, so the handle would dangle otherwise); a unit

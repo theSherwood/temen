@@ -185,9 +185,18 @@ guest that compiled a unit **keeps it across a checkpoint** instead of draining 
 no longer closes JIT handles). Pinned by `svm-snapshot/tests/jit_roundtrip.rs` (byte-identical
 re-serialize; JIT-free elision; fail-closed on a corrupt/tampered unit) and
 `durable_guest_jit.rs::durable_jit_domain_survives_freeze_and_invokes` (compile → freeze → restore →
-invoke ≡ 42). *Slice-3 follow-on:* the **native/wasm** code pointers are process-local, so they
-restore to `0` — a native `invoke` of a not-yet-recompiled unit fails closed until a reconstruct-on-thaw
-re-compile lands (the interpreter is the reference, JIT parity is the follow-up). The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
+invoke ≡ 42). **Native reconstruct-on-thaw now lands (Slice 3).** The **native/wasm** code pointers are
+process-local, so they restore to `0`; `svm_run::reconstruct_jit_units` re-compiles each restored
+**live-handled** unit into the thaw run's `CompiledModule` (`define_extra` + `set_jit_unit_native`) —
+the cold-start twin of `recompact_into`. `jit_cap_run` runs it transparently after compiling the
+module and before re-entering the guest (a no-op for a fresh run, which holds no restored units), so a
+native `invoke` of a restored unit runs its **own** code, matching the interpreter thaw (the §12.6
+cross-backend contract). Pinned by
+`durable_guest_jit.rs::durable_jit_domain_reconstructs_and_invokes_native` (freeze → restore →
+`jit_cap_run` reconstructs + invokes natively ≡ 42). *Follow-on:* reproducing a B2-`install`ed unit's
+`call_indirect` **table slot** across a thaw (Slice 2 captured the unit IR + install type id, not the
+slot occupancy — the `invoke` handle still resolves, only a funcref through the old slot would miss).
+The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).

@@ -16,7 +16,8 @@
 use svm_durable::{init_durable_window, transform_module, write_state, STATE_NORMAL};
 use svm_encode::encode_module;
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
-use svm_run::{grant_jit, grant_jit_durable};
+use svm_jit::JitOutcome;
+use svm_run::{grant_jit, grant_jit_durable, jit_cap_run};
 use svm_snapshot::{freeze, restore};
 use svm_text::parse_module;
 use svm_verify::verify_module;
@@ -237,4 +238,62 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
         vec![Value::I64(42)],
         "the restored, re-verified unit invokes to 42 through the re-pinned handle"
     );
+}
+
+/// **Slice 3, native reconstruct-on-thaw.** The same freeze/restore as above, but the thaw runs on
+/// the **Cranelift** backend: `jit_cap_run` re-compiles the restored unit into the fresh
+/// `CompiledModule` (`reconstruct_jit_units`) before re-entering the guest, so the invoke runs the
+/// unit's *own native code*, not the interpreter reference. Proves the code pointers — dropped at
+/// freeze because they are process-local — are re-established on thaw. The result matches the interp
+/// thaw (42), the cross-backend durability contract (§12.6).
+#[test]
+fn durable_jit_domain_reconstructs_and_invokes_native() {
+    let unit = blob(
+        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+    );
+    let invoker_src = "memory 17\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
+         v2 = cap.call 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
+    let invoker = parse_module(invoker_src).expect("parse invoker");
+    verify_module(&invoker).expect("verify invoker");
+
+    // Durable domain: grant + compile the unit (host-API).
+    let mut hd = Host::new();
+    hd.set_durable(true);
+    let jd = grant_jit_durable(&mut hd, &invoker, 0);
+    let code = match hd.jit_compile(jd, &unit) {
+        Ok(Ok(c)) => c,
+        _ => panic!("durable compile must admit the instrumented unit"),
+    };
+
+    // Freeze (NORMAL) + serialize.
+    let win = {
+        let mut w = init_durable_window(WINDOW);
+        write_state(&mut w, STATE_NORMAL);
+        w
+    };
+    let artifact = freeze(&invoker, &win, &hd).expect("freeze admits the durable JIT domain");
+
+    // Restore into a fresh host, then thaw on the **native** backend. `jit_cap_run` compiles the
+    // invoker, reconstructs the restored unit into that module, and the guest invokes it natively.
+    let mut th = Host::new();
+    th.set_durable(true);
+    let window = restore(&artifact, &invoker, &mut th).expect("restore");
+    let (out, _mem) = jit_cap_run(
+        &invoker,
+        0,
+        &[jd as i64, code.handle as i64],
+        &window,
+        SIZE_LOG2,
+        0,
+        &mut th,
+    )
+    .expect("native thaw run");
+    match out {
+        JitOutcome::Returned(slots) => assert_eq!(
+            slots,
+            vec![42],
+            "native invoke of the reconstructed unit → 42 (matches the interp thaw)"
+        ),
+        other => panic!("expected Returned(42) from the native thaw, got {other:?}"),
+    }
 }
