@@ -181,3 +181,92 @@ fn cold_path_indirects_are_where_we_expect() {
         );
     }
 }
+
+/// Functions reachable from `f` under **direct** calls, with the predecessor on a shortest path — a
+/// BFS so a reachability result comes with a witnessing chain to print.
+fn reach_with_pred(m: &Module, f: u32) -> BTreeMap<u32, u32> {
+    use std::collections::VecDeque;
+    let mut pred: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut q = VecDeque::from([f]);
+    let mut seen = BTreeSet::from([f]);
+    while let Some(cur) = q.pop_front() {
+        for b in &m.funcs[cur as usize].blocks {
+            for inst in &b.insts {
+                if let Inst::Call { func, .. } = inst {
+                    if seen.insert(*func) {
+                        pred.insert(*func, cur);
+                        q.push_back(*func);
+                    }
+                }
+            }
+        }
+    }
+    pred
+}
+
+/// The specializer's wall, pinned as a fact. `luaV_execute` has **no `SetJmp` of its own**, so the
+/// blocker is a callee — and it is on the **hot** path, not a cold error arm: the `OP_VARARGPREP`
+/// handler `luaT_adjustvarargs` (every `luaL_loadbuffer` chunk is vararg, so this is the *first*
+/// opcode) reaches a `SetJmp` through `luaD_growstack → luaD_throw`. That is why
+/// `lua_futamura_specialize.rs` cannot project past the prologue: the specializer refuses any
+/// spec-time-reachable `SetJmp`, and this one is gated on the mutable pointer fields
+/// `L->top`/`L->stack_last` (the stack-overflow check) which the const-overlay + single-rename model
+/// can't fold. If a fixture regen or a Lua change moves this, the projection story changes with it.
+#[test]
+fn vararg_prologue_reaches_setjmp_on_the_hot_path() {
+    let m = lua_module();
+    let luav = luav_execute(&m);
+    let byname = |n: &str| {
+        m.exports
+            .iter()
+            .find(|e| e.name == n)
+            .unwrap_or_else(|| panic!("no export {n}"))
+            .func
+    };
+    let name = |f: u32| {
+        m.exports
+            .iter()
+            .find(|e| e.func == f)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| format!("f{f}"))
+    };
+    let has_setjmp = |f: u32| {
+        m.funcs[f as usize]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::SetJmp { .. }))
+    };
+
+    // luaV_execute carries no SetJmp itself — the wall is always in an inlined callee.
+    assert!(!has_setjmp(luav), "luaV_execute gained a SetJmp of its own");
+
+    // From the VARARGPREP handler, a SetJmp is reachable via direct calls — the hot-path wall.
+    let adjust = byname("luaT_adjustvarargs");
+    let pred = reach_with_pred(&m, adjust);
+    let sj = *pred
+        .keys()
+        .find(|&&f| has_setjmp(f))
+        .expect("luaT_adjustvarargs no longer reaches a SetJmp — the prologue wall moved");
+
+    // Reconstruct + print the witnessing chain, and assert luaD_growstack is on the route to it.
+    let mut chain = vec![sj];
+    let mut c = sj;
+    while let Some(&p) = pred.get(&c) {
+        chain.push(p);
+        c = p;
+        if p == adjust {
+            break;
+        }
+    }
+    chain.reverse();
+    eprintln!("\nluaT_adjustvarargs -> SetJmp ({} hops):", chain.len() - 1);
+    for f in &chain {
+        eprintln!("  {}", name(*f));
+    }
+    assert!(
+        chain.iter().any(|&f| name(f) == "luaD_growstack"),
+        "the VARARGPREP→SetJmp path no longer goes through luaD_growstack: {:?}",
+        chain.iter().map(|&f| name(f)).collect::<Vec<_>>()
+    );
+}
