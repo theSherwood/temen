@@ -58,7 +58,13 @@ const BYTECODE: [u32; 11] = [
     0x0101_00c6, // [10] RETURN A=1
 ];
 
-const BYTECODE_BASE: u64 = 4096;
+// The bytecode segment is `readonly`, and `init_data` RO-protects it at **whole-page** granularity
+// (the host page: 4 KiB on Linux, 16 KiB on macOS/ARM64, the 64 KiB allocation granularity on
+// Windows). So it must sit on its own page, clear of the writable register file below it — otherwise
+// the RO page rounds down to include the registers and their stores fault (a real macOS/Windows-only
+// `MemoryFault`). Placing it at a 64 KiB boundary keeps the registers (which live in [0, 64)) writable
+// under every host page size. The window is then 2 pages (`memory 17` = 128 KiB).
+const BYTECODE_BASE: u64 = 65536;
 const LOOP_TRIPS: i64 = 50;
 
 // Lua 5.4 opcode numbers we route to real handlers; every other index → the trap default.
@@ -102,7 +108,7 @@ fn skeleton_src() -> String {
     let edges = dispatch_edges();
     format!(
         r#"
-memory 16
+memory 17
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   v64 = i64.const 64
