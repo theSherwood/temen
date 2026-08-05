@@ -21,6 +21,17 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I67 — `svm-llvm` CI job: `apt-get update` dies on unrelated `packages.microsoft.com` 403 before any Rust runs (S4, flaky CI infra) — recorded 2026-08-05 on PR #627
+
+The Linux-only `svm-llvm` job installs LLVM/clang via apt; on a GitHub runner the
+`apt-get update` step failed with `403 Forbidden` from `packages.microsoft.com`
+(azure-cli / ubuntu-prod repos, unrelated to anything we install) and the job died with
+exit 100 before the checkout was even compiled. Pure runner-image/mirror flake — no tree
+change can affect it. Rerun-once policy applies (like I53/I66). A robust fix, if it recurs:
+prefix the apt step with `sudo rm /etc/apt/sources.list.d/microsoft-prod.list
+azure-cli.sources || true` (the job needs nothing from those repos), via
+`.github/workflows_src/` per the CI-editing protocol.
+
 ### I64 — the binary format's v9→v10 bump carries a one-version decoder compatibility window; retire it when the committed `.svmb` assets regenerate (S3, tracked debt) — recorded 2026-08-05, CALLS.md 7.4 (PR #612)
 
 v10 added the impl-export policy byte (CALLS.md 7.4). The bump surfaced that the format's
