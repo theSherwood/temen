@@ -4119,6 +4119,9 @@ struct OfferBinding {
     /// provider instance, so backends stay in differential lockstep). `None` = a v1 pure
     /// offer ([`HostCap::offer_func`]).
     provider: Option<Arc<Module>>,
+    /// CALLS.md increment 7 — the instanced offer's concurrency policy (`Single` unless wired via
+    /// [`HostCap::offer_proc_threaded`]); inert for a pure offer.
+    policy: svm_interp::OfferPolicy,
 }
 
 impl HostCap {
@@ -4289,6 +4292,7 @@ impl HostCap {
                 ops: e.ops.clone().into(),
                 op,
                 provider: None,
+                policy: svm_interp::OfferPolicy::Single, // inert: pure offers race nothing
             }),
             iface: None,
         })
@@ -4302,6 +4306,22 @@ impl HostCap {
     ///
     /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
     pub fn offer_proc(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+        Self::offer_proc_with_policy(provider, offer, op, svm_interp::OfferPolicy::Single)
+    }
+
+    /// CALLS.md increment 7 — like [`HostCap::offer_proc`] but the instance admits callers under
+    /// the **`Threaded`** policy: no admission gate, concurrent handler animations over the
+    /// shared provider world, provider-owned synchronization (§12).
+    pub fn offer_proc_threaded(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
+        Self::offer_proc_with_policy(provider, offer, op, svm_interp::OfferPolicy::Threaded)
+    }
+
+    fn offer_proc_with_policy(
+        provider: &Module,
+        offer: &str,
+        op: u32,
+        policy: svm_interp::OfferPolicy,
+    ) -> Option<HostCap> {
         let e = provider.resolve_impl_export(offer)?;
         if op as usize >= e.ops.len() {
             return None;
@@ -4316,6 +4336,7 @@ impl HostCap {
                 ops: e.ops.clone().into(),
                 op,
                 provider: Some(Arc::new(provider.clone())),
+                policy,
             }),
             iface: None,
         })
@@ -5049,7 +5070,7 @@ impl Instance {
                         let handle = match &off.provider {
                             // §3.2 v2 instanced offer: a fresh provider instance from the
                             // module's initial image, per host — backends stay in lockstep.
-                            Some(m) => h.wire_offer_proc(m, &off.ops),
+                            Some(m) => h.wire_offer_proc_with_policy(m, &off.ops, off.policy),
                             None => h.wire_offer_func(&off.funcs, &off.ops),
                         }
                         .expect("offer validated at instantiation");

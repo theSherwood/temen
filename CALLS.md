@@ -816,9 +816,9 @@ simplification of the execution path, not a collapse to a single mechanism.
      paths branch on a `threaded` flag carried by `OfferAnim`/`OfferParked`: no `busy` clear, no
      window restore (the fork drops), no `admit_wake` (nothing can park on an ungated instance),
      and no `strong_count` leak guard (concurrent clones are the declared regime). The host-side
-     arm **refuses `Threaded` probeably** (`-EAGAIN`): its checkout takes the world out by value,
-     which would gut the shared cell under in-flight animations — so durable/JIT callers observe
-     `-EAGAIN` until the 7.3 tier arm. **Pin correction (found in build):** the planned
+     arm **refused `Threaded` probeably** (`-EAGAIN`) this slice: its checkout takes the world out
+     by value, which would gut the shared cell under in-flight animations — closed by 7.3's
+     shared-cell sub-run arm. **Pin correction (found in build):** the planned
      "self-recursion vs `-EAGAIN`" observable was wrong — 4c.2 makes a *top-of-stack* self-call
      recurse under both policies. The real single-threaded observable is a **buried** re-entry
      (`X → Y → X`, X on the animation stack but not the top): `threaded` X admits a second
@@ -829,9 +829,28 @@ simplification of the execution path, not a collapse to a single mechanism.
      sibling shape) writing distinct cells; the joiner reads both back through the same offer.
      Asserts concurrent cross-vCPU admission and one shared instance window — safety, not timing.
      Plus a state-persistence pin (policy changes admission, never shared-instance semantics).
-   - **7.3 — the non-eval-loop tiers.** The host-side `drive_arc` arm and the JIT thunk arm admit a
-     `threaded` provider without the `busy` gate (concurrent host-side/JIT callers). Deferrable; the
-     eval loop is the oracle.
+   - **7.3 — the non-eval-loop tiers. DONE.** Two pieces. **(a) The lock-order fix 7.1 owed:**
+     under `Threaded`, two translation-edge scopes can hold *crossed* cells (T1 animating X→Y while
+     T2 animates Y→X — a vCPU's current host is itself a provider cell mid-animation), so the
+     semantic-order dual acquisition (`hg` then cell) was a latent AB-BA deadlock; `single` could
+     never cross (its `busy` gate keeps an instance on one vCPU, checked before any edge lock). All
+     dual-`Host` acquisitions now go through `lock_host_pair` — **stable address order**, guards
+     returned in argument order; the degenerate same-cell pair (an offer self-wired into its own
+     powerbox) refuses probeably at admission. **(b) The tier arm:** `drive_arc` split into a core
+     (`drive_over_cell`) that runs the M:N executor over any `Arc<Mutex<Host>>` cell, an owned
+     wrapper (`drive_arc`, wrap + unwrap as before — byte-identical), and **`drive_arc_shared`**,
+     which runs the sub-run over the instance's **live 6d.4.1 cell** (durable refused fail-closed;
+     thaw seeds empty by construction). The host-side `Threaded` arm replaces 7.1's `-EAGAIN`
+     refusal: fork the window view, run `drive_arc_shared` over the cell at flat `OFFER_FUEL`, and
+     translate the edges (edge 1 `try_lock` + probeable `-EAGAIN`; edge 2 blocking — sound because
+     no path can enter this arm holding a provider cell: `IoRing` is not regrantable into a
+     powerbox and durable sub-runs are refused). `busy` survives on a `Threaded` instance only as
+     the **host-side gate**: one sub-run per instance at a time (the sub-run wires transient run
+     hooks onto the cell that concurrent sub-runs would clobber), while eval-loop admission stays
+     ungated alongside it. JIT and durable callers get the arm for free through the
+     `cap_thunk` → `cap_dispatch_slots` fall-through. Pins: the three-backend threaded state test
+     (`imports_impl` — the JIT lane exercises this arm) and the direct host-side dispatch +
+     gate-reopen pin (`threaded_offers`).
    - **7.4 — guest-facing declaration.** An IR/interface attribute so a guest module declares
      `threaded` itself, rather than the host wiring param 7.1 uses. Rounds out "policy is the
      provider's declaration" (§10.1).

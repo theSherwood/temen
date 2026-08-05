@@ -409,3 +409,34 @@ fn a_grouped_host_interface_from_the_preseeded_builtin_shape_dispatches() {
         );
     }
 }
+
+/// CALLS.md 7.3 — the same stateful instanced offer wired **`Threaded`** keeps its semantics on
+/// all three backends: the eval-loop tier animates with no admission gate (7.1), and the
+/// JIT/host-side tier runs the handler in a sub-run **over the instance's live shared cell**
+/// (`drive_arc_shared`) instead of refusing `-EAGAIN` — the 7.3 arm this pins. Sequential calls,
+/// so the pin is pure tier parity: `Exited(3)` everywhere, exactly as the `Single` wire above.
+#[test]
+fn a_threaded_offer_keeps_state_across_calls_on_all_three_backends() {
+    let provider = parse_module(STATEFUL_PROVIDER).expect("provider parses");
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "bump",
+            HostCap::offer_proc_threaded(&provider, "counter", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: a Threaded instance's window state persists across calls on every tier"
+        );
+    }
+}

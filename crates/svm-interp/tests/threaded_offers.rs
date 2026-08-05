@@ -222,3 +222,29 @@ fn a_threaded_instance_keeps_state_across_calls() {
         "a later call reads what an earlier call wrote — one persistent instance"
     );
 }
+
+/// CALLS.md 7.3 — the **host-side tier** (a direct `cap_dispatch_slots`, the embedder/JIT/durable
+/// route) admits a `Threaded` instance by running the handler in a sub-run over the instance's
+/// live shared cell (`drive_arc_shared`) — under 7.1 this exact dispatch answered `-EAGAIN`.
+/// Two sequential dispatches also pin that the host-side gate (one sub-run per instance at a
+/// time) reopens after each settle.
+#[test]
+fn the_host_side_tier_admits_a_threaded_instance() {
+    let provider = module(CELL_STORE);
+    let mut h = Host::new();
+    let offer = h
+        .wire_offer_proc_with_policy(&provider, &[0, 1], OfferPolicy::Threaded)
+        .expect("threaded offer");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 0, offer, &[40, 5], None),
+        Ok(vec![5]),
+        "store(40, 5) ran host-side over the shared cell"
+    );
+    assert_eq!(
+        h.cap_dispatch_slots(tid, 1, offer, &[40], None),
+        Ok(vec![5]),
+        "load(40) sees the store — one persistent instance, gate reopened"
+    );
+}

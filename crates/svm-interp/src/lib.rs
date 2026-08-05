@@ -1963,17 +1963,133 @@ fn drive_arc(
     // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
     // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
     let thaw_root_sp = host.frozen_root_sp.take();
-    // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
-    let sched = {
-        let mut s = Scheduler::new(quota.max_vcpus, workers);
-        s.handoff = host.handoff();
-        Arc::new(s)
-    };
+    let handoff = host.handoff();
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
     // each child), then unwrap it back into the caller after every vCPU is gone. The root still owns
     // the run's `mem`/`fuel`, read back from its outcome.
     let host_shared = Arc::new(Mutex::new(std::mem::take(host)));
+    let r = drive_over_cell(
+        funcs,
+        entry,
+        args,
+        fuel,
+        mem,
+        Arc::clone(&host_shared),
+        workers,
+        quota,
+        jit_table_log2,
+        offer_table_demand,
+        durable,
+        thaw_fibers,
+        thaw_vcpus,
+        thaw_nested,
+        thaw_child_state,
+        thaw_root_sp,
+        handoff,
+    );
+    // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is
+    // uniquely owned — unwrap it back into the caller so it observes the run's effects (stdout,
+    // grants, clock…).
+    *host = Arc::try_unwrap(host_shared)
+        .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    r
+}
+
+/// CALLS.md 7.3 — [`drive_arc`] over an offer instance's **persistent shared powerbox cell**
+/// (the 6d.4.1 `Arc<Mutex<Host>>`), for the host-side `Threaded` arm: the sub-run's vCPUs share
+/// the live cell (their mutations land in the instance directly, exactly as an eval-loop
+/// animation's do), so concurrent eval-loop animations keep working while the sub-run is in
+/// flight — where the by-value take would gut the cell under them. The cell persists after the
+/// run (no unwrap-back); the sub-run's transient `async_notify` hook is cleared by the core's
+/// teardown. Durable providers are refused upstream (a durable world can't be sub-run over a
+/// live shared cell — the freeze/thaw seeds assume exclusive ownership), so the thaw seeds are
+/// empty by construction.
+fn drive_arc_shared(
+    funcs: Arc<[Func]>,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    cell: &Arc<Mutex<Host>>,
+) -> TracedRun {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_WORKERS);
+    let (quota, jit_table_log2, offer_table_demand, durable, handoff) = {
+        let h = cell.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            h.quota(),
+            h.jit_table_log2(),
+            h.offer_table_demand(),
+            h.is_durable(),
+            h.handoff(),
+        )
+    };
+    if durable {
+        // Fail closed: the shared-cell sub-run has no exclusive world to freeze/thaw over.
+        return (Err(Trap::CapFault), Vec::new(), None);
+    }
+    // Fuel unification: the top-level-entry charge, exactly as `drive_arc` (never a thaw here).
+    match fuel.checked_sub(1) {
+        Some(f) => *fuel = f,
+        None => return (Err(Trap::OutOfFuel), Vec::new(), None),
+    }
+    drive_over_cell(
+        funcs,
+        entry,
+        args,
+        fuel,
+        mem,
+        Arc::clone(cell),
+        workers,
+        quota,
+        jit_table_log2,
+        offer_table_demand,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        handoff,
+    )
+}
+
+/// The executor core shared by [`drive_arc`] (owned host, wrapped and unwrapped around the run)
+/// and [`drive_arc_shared`] (a persistent instance cell): stand up the M:N scheduler, seed the
+/// root vCPU (and any thaw residue) over `host_shared`, run to completion, and read the root's
+/// outcome back into `fuel`/`mem`. Never unwraps `host_shared` — ownership is the wrappers'
+/// concern.
+#[allow(clippy::too_many_arguments)]
+fn drive_over_cell(
+    funcs: Arc<[Func]>,
+    entry: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    mem: &mut Option<Mem>,
+    host_shared: Arc<Mutex<Host>>,
+    workers: usize,
+    quota: Quota,
+    jit_table_log2: u8,
+    offer_table_demand: usize,
+    durable: bool,
+    thaw_fibers: Vec<FrozenFiber>,
+    thaw_vcpus: Vec<FrozenVCpu>,
+    thaw_nested: Vec<FrozenNested>,
+    thaw_child_state: Vec<FrozenChildState>,
+    thaw_root_sp: Option<u64>,
+    handoff: bool,
+) -> TracedRun {
+    // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
+    let sched = {
+        let mut s = Scheduler::new(quota.max_vcpus, workers);
+        s.handoff = handoff;
+        Arc::new(s)
+    };
     // §9/§12 async ring: wire the completion `notify` hook to this run's M:N scheduler, so an offload
     // worker waking a vCPU parked in `wait` is a `Scheduler::notify` on the confined counter key.
     {
@@ -2439,12 +2555,6 @@ fn drive_arc(
     };
     *fuel = out.fuel;
     *mem = out.mem;
-    // Every vCPU (which held an Arc clone) is finished and dropped now, so the shared host is uniquely
-    // owned — unwrap it back into the caller so it observes the run's effects (stdout, grants, clock…).
-    *host = Arc::try_unwrap(host_shared)
-        .unwrap_or_else(|_| unreachable!("all vCPUs dropped before host readback"))
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
     // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
     // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
@@ -8313,18 +8423,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Adm::OutOfFuel
                                     } else {
                                         // Edge 1 — cap args caller→provider, as the single arm.
+                                        // 7.3: address-ordered dual lock (see `lock_host_pair`) —
+                                        // under `Threaded` two edges can hold crossed cells.
                                         let mut arg_slots_ = args_.to_vec();
-                                        {
-                                            let mut hg =
-                                                host.lock().unwrap_or_else(|e| e.into_inner());
-                                            let mut ph_g =
-                                                st_.host.lock().unwrap_or_else(|e| e.into_inner());
-                                            translate_cap_slots(
-                                                &mut hg,
-                                                &mut ph_g,
-                                                &osig_.params,
-                                                &mut arg_slots_,
-                                            )?;
+                                        match lock_host_pair(host, &st_.host) {
+                                            Some((mut hg, mut ph_g)) => {
+                                                translate_cap_slots(
+                                                    &mut hg,
+                                                    &mut ph_g,
+                                                    &osig_.params,
+                                                    &mut arg_slots_,
+                                                )?;
+                                            }
+                                            // Degenerate self-wiring (the provider cell IS this
+                                            // vCPU's current host): refuse probeably.
+                                            None => {
+                                                frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                                continue;
+                                            }
                                         }
                                         let budget_ = *fuel;
                                         let pm_ = st_.mem.as_ref().map(|m| m.fork_for_thread());
@@ -8366,19 +8482,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 } else {
                                     // Edge 1 — cap args caller→provider (caller `hg` held only
                                     // here); a forged/dead cap fails closed as 3a's edge-1 `?`,
-                                    // with no world checked out yet.
+                                    // with no world checked out yet. 7.3: address-ordered dual
+                                    // lock — uniform with the threaded edge (see `lock_host_pair`;
+                                    // `single` alone cannot cross, but one discipline for all
+                                    // edges needs no policy reasoning to audit).
                                     let mut arg_slots_ = args_.to_vec();
-                                    {
-                                        let mut hg =
-                                            host.lock().unwrap_or_else(|e| e.into_inner());
-                                        let mut ph_g =
-                                            st_.host.lock().unwrap_or_else(|e| e.into_inner());
-                                        translate_cap_slots(
-                                            &mut hg,
-                                            &mut ph_g,
-                                            &osig_.params,
-                                            &mut arg_slots_,
-                                        )?;
+                                    match lock_host_pair(host, &st_.host) {
+                                        Some((mut hg, mut ph_g)) => {
+                                            translate_cap_slots(
+                                                &mut hg,
+                                                &mut ph_g,
+                                                &osig_.params,
+                                                &mut arg_slots_,
+                                            )?;
+                                        }
+                                        None => {
+                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                            continue;
+                                        }
                                     }
                                     // CALLS.md 5b caller-pays: the handler runs on the caller's whole
                                     // remaining fuel (no per-call `OFFER_FUEL` cap — that cap is the
@@ -11831,12 +11952,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // cell.
                                 st.busy = false;
                             }
-                            let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                             // 6d.4.1 — the provider powerbox is the shared cell; lock it for the
                             // result edge. Uncontended for `single` (the ProviderState guard `st`
                             // serializes this instance's edges); briefly contended under
                             // `threaded` (concurrent settles), which is exactly the §12 regime.
-                            let mut ph_g = st.host.lock().unwrap_or_else(|e| e.into_inner());
+                            // 7.3: address-ordered dual lock — crossed settles must not AB-BA.
+                            // `None` (self-wired cell as own caller) is unreachable here because
+                            // the admission edge refused it; fail closed if it ever appears.
+                            let (mut hg, mut ph_g) =
+                                lock_host_pair(host, &st.host).ok_or(Trap::CapFault)?;
                             translate_cap_slots(
                                 &mut ph_g,
                                 &mut hg,
@@ -14442,6 +14566,42 @@ struct OfferParked {
 /// is inert). The re-grant policy is [`Host::regrant_into_child`]'s — an offer is adopted one
 /// domain-hop deeper (§3.1 provenance), a pipe end aliases its shared backing, a coordinate-free
 /// cap copies.
+/// CALLS.md 7.3 — lock two powerbox mutexes in **stable address order**, whatever the semantic
+/// (caller, provider) direction. The animation's translation edges are the only scopes that hold
+/// two `Host` locks at once, and under `Threaded` two such scopes can run concurrently with their
+/// cells crossed (T1 animating X→Y while T2 animates Y→X — each vCPU's *current* host is itself a
+/// provider cell mid-animation), so semantic-order acquisition is an AB-BA deadlock. Address order
+/// makes every dual acquisition globally consistent. (`single` cannot cross: its `busy` gate keeps
+/// each instance on at most one vCPU, and the busy check precedes any edge lock.) Returns the
+/// guards in **argument order**, not lock order. `None` iff the two `Arc`s are the same cell — a
+/// degenerate self-wiring (an offer adopted into its own provider powerbox, called from a fresh
+/// context) that a caller refuses fail-closed rather than self-deadlocks on.
+#[allow(clippy::type_complexity)]
+fn lock_host_pair<'a>(
+    a: &'a Arc<Mutex<Host>>,
+    b: &'a Arc<Mutex<Host>>,
+) -> Option<(
+    std::sync::MutexGuard<'a, Host>,
+    std::sync::MutexGuard<'a, Host>,
+)> {
+    if Arc::ptr_eq(a, b) {
+        return None;
+    }
+    let unpoison = |r: std::sync::LockResult<std::sync::MutexGuard<'a, Host>>| match r {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if (Arc::as_ptr(a) as usize) < (Arc::as_ptr(b) as usize) {
+        let ga = unpoison(a.lock());
+        let gb = unpoison(b.lock());
+        Some((ga, gb))
+    } else {
+        let gb = unpoison(b.lock());
+        let ga = unpoison(a.lock());
+        Some((ga, gb))
+    }
+}
+
 fn translate_cap_slots(
     src: &mut Host,
     dst: &mut Host,
@@ -18117,16 +18277,102 @@ impl Host {
                     // drain. The eval-loop tier is caller-pays (5b); this host-side tier keeps
                     // the flat bounded price until the arm itself retires (6d residues).
                     Some(state) => {
-                        // CALLS.md increment 7 (7.1) — a `Threaded` provider is **eval-loop only**
-                        // for now: this arm's checkout takes the world out by value (window +
-                        // inner `Host`), which would gut the shared cell under any in-flight
-                        // concurrent animation (they hold forks of the window and clones of the
-                        // cell). Refuse probeably (`-EAGAIN`) rather than race them; the
-                        // tier-native concurrent admission is the recorded 7.3 residue. Durable
-                        // and JIT callers reach a `Threaded` offer through here, so they observe
-                        // `-EAGAIN` until 7.3.
+                        // CALLS.md 7.3 — the host-side `Threaded` arm: run the handler in a
+                        // sub-run **over the instance's live shared cell** (`drive_arc_shared`)
+                        // instead of taking the world out by value — a by-value take would gut
+                        // the cell under in-flight eval-loop animations (they hold forks of the
+                        // window and clones of the cell), while the shared sub-run coexists with
+                        // them. `busy` serves here as a **host-side-only gate**: one sub-run per
+                        // instance at a time (a second host-side caller answers `-EAGAIN`,
+                        // probeable) because the sub-run wires transient run hooks
+                        // (`async_notify`) onto the cell that two concurrent sub-runs would
+                        // clobber. The eval-loop threaded arm ignores `busy` entirely, so
+                        // eval-loop admission stays unbounded alongside one host-side sub-run —
+                        // exactly the tier split §10.1 orders (gate = the provider's declaration,
+                        // never the runtime's convenience).
                         if entry.policy == OfferPolicy::Threaded {
-                            return Ok(vec![EAGAIN]);
+                            let (fork, cell) = {
+                                let mut st = match state.try_lock() {
+                                    Ok(g) => g,
+                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                                    Err(std::sync::TryLockError::WouldBlock) => {
+                                        return Ok(vec![EAGAIN]);
+                                    }
+                                };
+                                if st.busy {
+                                    return Ok(vec![EAGAIN]);
+                                }
+                                st.busy = true;
+                                st.busy_owner = 0;
+                                // The window is a `fork_for_thread` **view** (shared backing,
+                                // never taken) — eval-loop animations fork the same backing.
+                                (
+                                    st.mem.as_ref().map(|m| m.fork_for_thread()),
+                                    Arc::clone(&st.host),
+                                )
+                            };
+                            let mut fork = fork;
+                            let outcome: Result<Vec<i64>, Trap> = (|| {
+                                // Edge 1 — cap args caller→provider. `try_lock` on the cell: the
+                                // only long holder is impossible (the busy gate above excludes a
+                                // second sub-run), so contention is a brief animation edge —
+                                // refuse probeably rather than block while `self`'s own lock is
+                                // held somewhere upstream (fail-closed, never a lock-order bet).
+                                let mut arg_slots = args.to_vec();
+                                {
+                                    let mut ph = match cell.try_lock() {
+                                        Ok(g) => g,
+                                        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                                        Err(std::sync::TryLockError::WouldBlock) => {
+                                            return Ok(vec![EAGAIN]);
+                                        }
+                                    };
+                                    translate_cap_slots(
+                                        self,
+                                        &mut ph,
+                                        &sig.params,
+                                        &mut arg_slots,
+                                    )?;
+                                }
+                                let vals: Vec<Value> = sig
+                                    .params
+                                    .iter()
+                                    .zip(&arg_slots)
+                                    .map(|(ty, &s)| slot_to_val(*ty, s))
+                                    .collect();
+                                // 6b — the flat deterministic per-call budget, as the single arm.
+                                let mut impl_fuel = OFFER_FUEL;
+                                let (res, _, _) = drive_arc_shared(
+                                    entry.funcs.clone(),
+                                    f,
+                                    &vals,
+                                    &mut impl_fuel,
+                                    &mut fork,
+                                    &cell,
+                                );
+                                let mut result_slots: Vec<i64> =
+                                    res?.iter().map(|v| val_to_slot(*v)).collect();
+                                // Edge 2 — results provider→caller. Blocking is sound here: no
+                                // path holds a provider cell while entering this arm (IoRing is
+                                // not regrantable into a powerbox, and durable sub-runs are
+                                // refused), so the only contention is brief edge scopes.
+                                let mut ph = cell.lock().unwrap_or_else(|e| e.into_inner());
+                                translate_cap_slots(
+                                    &mut ph,
+                                    self,
+                                    &sig.results,
+                                    &mut result_slots,
+                                )?;
+                                Ok(result_slots)
+                            })();
+                            // Check-in: reopen the host-side gate whatever the outcome; the fork
+                            // drops (the instance kept its window; mutations shared the backing).
+                            {
+                                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                st.busy = false;
+                                st.busy_owner = 0;
+                            }
+                            return outcome;
                         }
                         // Checkout: reserve the instance under one brief lock, then release it. A
                         // busy instance (any owner) or a momentarily-held short critical section is
