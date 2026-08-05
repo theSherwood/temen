@@ -41,6 +41,7 @@ fn config() -> RunConfig {
         // files.lua's first assert: `type(os.getenv"PATH") == "string"` (via the synthesized
         // env-blob getenv), so seed a PATH like any hosted process would see.
         env: vec![b"PATH=/usr/bin".to_vec()],
+        ..RunConfig::default()
     }
 }
 

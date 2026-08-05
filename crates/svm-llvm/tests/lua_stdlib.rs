@@ -46,6 +46,7 @@ fn stdout_of(backend: Backend) -> Vec<u8> {
         memory_size_log2: None,
         args: vec![],
         env: vec![],
+        ..RunConfig::default()
     };
     inst.run(backend, &config)
         .expect("run Lua stdlib through the powerbox")
