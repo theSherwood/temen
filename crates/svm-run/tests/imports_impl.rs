@@ -440,3 +440,38 @@ fn a_threaded_offer_keeps_state_across_calls_on_all_three_backends() {
         );
     }
 }
+
+/// CALLS.md 7.4 — the module's **own** `threaded` declaration flows through the plain
+/// [`HostCap::offer_proc`] wire (no host-side policy override): the wired instance runs under the
+/// declared policy on every backend. Sequential calls, so the pin is that the declaration parses,
+/// wires, and keeps three-backend parity — the policy-distinguishing observables live in
+/// `svm-interp`'s `threaded_offers` (buried re-entry, host-side arm).
+#[test]
+fn a_module_declared_threaded_offer_wires_and_runs_on_all_three_backends() {
+    let threaded_src = STATEFUL_PROVIDER.replace(
+        "export 0 interface \"counter\" 1",
+        "export 0 interface \"counter\" threaded 1",
+    );
+    let provider = parse_module(&threaded_src).expect("provider parses");
+    svm_verify::verify_module(&provider).expect("provider verifies");
+    let consumer = parse_module(STATEFUL_CONSUMER).expect("consumer parses");
+
+    let registry = Imports::new()
+        .provide(
+            "bump",
+            HostCap::offer_proc(&provider, "counter", 0).expect("offer resolves"),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: the declared-threaded instance keeps state and parity on every tier"
+        );
+    }
+}

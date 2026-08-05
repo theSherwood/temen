@@ -174,6 +174,7 @@ pub fn dead_func_elim(m: &Module) -> Module {
             name: e.name.clone(),
             interface: e.interface, // interface indices are untouched by func renumbering
             ops: e.ops.iter().map(|&f| map[f as usize]).collect(),
+            threaded: e.threaded,
         })
         .collect();
 

@@ -248,3 +248,43 @@ fn the_host_side_tier_admits_a_threaded_instance() {
         "load(40) sees the store — one persistent instance, gate reopened"
     );
 }
+
+/// CALLS.md 7.4 — the **guest-facing declaration**: a module marks its own offer export
+/// `threaded` (`export N interface "name" threaded T { … }`), and reifying that export
+/// (`reify_export`, the `cap.self` route) mints the offer under the declared policy — §10.1's
+/// "policy is a declaration by the provider" made literal. The undeclared control stays `Single`.
+#[test]
+fn a_module_declared_threaded_export_reifies_threaded() {
+    let src = "\
+memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { store: 0 }
+export 0 interface \"cells\" threaded 1 { store: 0 }
+
+func (i64, i64) -> (i64) {
+block 0 (vaddr: i64, vval: i64) {
+  i64.store vaddr vval
+  return vval
+  }
+}
+";
+    let m = std::sync::Arc::new(module(src));
+    let mut h = Host::new();
+    h.set_self_module(&m);
+    let handle = h.reify_export(0).expect("reify");
+    assert_eq!(
+        h.resolve_offer(handle).unwrap().policy,
+        OfferPolicy::Threaded,
+        "the module's own declaration is the minted policy"
+    );
+
+    let undeclared = std::sync::Arc::new(module(&src.replace(" threaded 1 ", " 1 ")));
+    let mut h2 = Host::new();
+    h2.set_self_module(&undeclared);
+    let handle2 = h2.reify_export(0).expect("reify");
+    assert_eq!(
+        h2.resolve_offer(handle2).unwrap().policy,
+        OfferPolicy::Single,
+        "undeclared stays single"
+    );
+}

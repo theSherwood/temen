@@ -16932,8 +16932,13 @@ impl Host {
             type_id,
             depth: 1,
             state: Some(state),
-            // The self-reified offer is `Single` today; a guest-declared policy rides 7.4.
-            policy: OfferPolicy::Single,
+            // CALLS.md 7.4 — the module's own declaration (the `threaded` keyword on its offer
+            // export) is the policy: reifying one's own export honors what one declared.
+            policy: if e.threaded {
+                OfferPolicy::Threaded
+            } else {
+                OfferPolicy::Single
+            },
         });
         let h = self.grant(type_id, Binding::Offer(idx));
         self.self_reified.insert(k, h);

@@ -550,6 +550,7 @@ fn directed_rule_rejects() {
         name: "logger".into(),
         interface,
         ops,
+        threaded: false,
     };
     let mut m = offer_module();
     m.impl_exports.push(offer(1, vec![0]));

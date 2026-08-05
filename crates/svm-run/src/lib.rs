@@ -4305,27 +4305,37 @@ impl HostCap {
     /// three backends stay in differential lockstep.
     ///
     /// `None` if `provider` has no offer named `offer` or `op` is outside its op list.
+    /// The instance's concurrency policy is the provider module's **own declaration** (CALLS.md
+    /// 7.4: the `threaded` keyword on its offer export — §10.1, policy is the provider's to
+    /// declare); an undeclared offer is `Single`.
     pub fn offer_proc(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
-        Self::offer_proc_with_policy(provider, offer, op, svm_interp::OfferPolicy::Single)
+        Self::offer_proc_with_policy(provider, offer, op, None)
     }
 
-    /// CALLS.md increment 7 — like [`HostCap::offer_proc`] but the instance admits callers under
-    /// the **`Threaded`** policy: no admission gate, concurrent handler animations over the
-    /// shared provider world, provider-owned synchronization (§12).
+    /// CALLS.md increment 7 — like [`HostCap::offer_proc`] but the wirer **forces** the
+    /// **`Threaded`** policy regardless of the module's declaration: no admission gate,
+    /// concurrent handler animations over the shared provider world, provider-owned
+    /// synchronization (§12). (The declaration-driven route is plain [`HostCap::offer_proc`]
+    /// over a module that says `threaded` itself.)
     pub fn offer_proc_threaded(provider: &Module, offer: &str, op: u32) -> Option<HostCap> {
-        Self::offer_proc_with_policy(provider, offer, op, svm_interp::OfferPolicy::Threaded)
+        Self::offer_proc_with_policy(provider, offer, op, Some(svm_interp::OfferPolicy::Threaded))
     }
 
     fn offer_proc_with_policy(
         provider: &Module,
         offer: &str,
         op: u32,
-        policy: svm_interp::OfferPolicy,
+        force: Option<svm_interp::OfferPolicy>,
     ) -> Option<HostCap> {
         let e = provider.resolve_impl_export(offer)?;
         if op as usize >= e.ops.len() {
             return None;
         }
+        let policy = force.unwrap_or(if e.threaded {
+            svm_interp::OfferPolicy::Threaded
+        } else {
+            svm_interp::OfferPolicy::Single
+        });
         Some(HostCap {
             type_id: 0, // unused: the real interface id is interned per-host at wiring
             op,

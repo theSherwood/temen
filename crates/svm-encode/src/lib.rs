@@ -240,6 +240,9 @@ mod op {
 }
 
 const MAGIC: [u8; 4] = *b"SVM\x00";
+// v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
+// concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
+// list. Any other value is a decode error (fail-closed, like every reserved encoding).
 // v9 adds the **flags byte** (directly after the version) and the **object dialect** (flag bit 0):
 // a serialized *link unit* — the binary twin of a pre-link text unit (named consumer: the external
 // toolchain blocked on format standardization, owner-approved 2026-07-30). An object file may carry
@@ -273,7 +276,7 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 
 /// Header flags byte, bit 0 (v9): this file is an **object** (a pre-link unit, `decode_unit`
 /// dialect). All other bits are reserved and must be zero (fail-closed).
@@ -293,6 +296,8 @@ pub enum DecodeError {
     ObjectInput,
     /// A `data.ptr` relocation's target tag byte was neither 0 (self) nor 1 (sym).
     BadDataPtrTag(u8),
+    /// An impl-export's policy byte (v10, CALLS.md 7.4) was neither 0 (single) nor 1 (threaded).
+    BadOfferPolicy(u64),
     BadType(u8),
     BadOpcode(u8),
     /// A LEB128-encoded integer did not fit its target width.
@@ -517,6 +522,8 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         for &f in &e.ops {
             write_uleb(&mut out, f as u64);
         }
+        // v10 (CALLS.md 7.4): the provider's declared concurrency policy.
+        write_uleb(&mut out, e.threaded as u64);
     }
     write_uleb(&mut out, m.funcs.len() as u64);
     for f in &m.funcs {
@@ -1951,10 +1958,18 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         for _ in 0..nops {
             ops.push(c.uleb()? as FuncIdx);
         }
+        // v10 (CALLS.md 7.4): the declared concurrency policy — any value past the two defined
+        // ones is a malformed module (fail-closed, never a guessed policy).
+        let threaded = match c.uleb()? {
+            0 => false,
+            1 => true,
+            v => return Err(DecodeError::BadOfferPolicy(v)),
+        };
         impl_exports.push(svm_ir::ImplExport {
             name,
             interface,
             ops,
+            threaded,
         });
     }
     let nfuncs = c.count()?;
@@ -3151,11 +3166,13 @@ mod debug_tests {
                 name: "logger".to_string(),
                 interface: 1,
                 ops: vec![1, 2],
+                threaded: true, // v10: the declared policy round-trips
             },
             svm_ir::ImplExport {
                 name: "sink".to_string(),
                 interface: 2,
                 ops: vec![0],
+                threaded: false,
             },
         ];
         let decoded = decode_module(&encode_module(&m)).expect("decode");

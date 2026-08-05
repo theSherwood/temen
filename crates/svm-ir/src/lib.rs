@@ -3549,6 +3549,14 @@ pub struct ImplExport {
     /// verify error, not a wiring surprise.
     pub interface: u32,
     pub ops: Vec<FuncIdx>,
+    /// CALLS.md increment 7 (7.4) — the provider's own **concurrency-policy declaration**
+    /// (§10.1: policy is a declaration by the provider, never an inference): `true` ⇒ when this
+    /// offer is wired as an instance, handlers admit **concurrently** with no gate (the
+    /// `Threaded` policy) and the module synchronizes its own state with atomics/futexes (§12).
+    /// `false` (default, text omits it) ⇒ `single`: run-to-park atomicity, admissions serialized.
+    /// Text: the `threaded` keyword between the offer name and its interface index. Like the rest
+    /// of this declaration it confers nothing by itself — the wiring party mints the entry.
+    pub threaded: bool,
 }
 
 /// A capability binding resolved from an import name at link time (§7 / DESIGN.md §22): the
@@ -3990,6 +3998,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
                 name: e.name.clone(),
                 interface: tbase + e.interface,
                 ops: e.ops.iter().map(|&f| fbase + f).collect(),
+                threaded: e.threaded,
             });
         }
     }

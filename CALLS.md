@@ -851,9 +851,17 @@ simplification of the execution path, not a collapse to a single mechanism.
      `cap_thunk` → `cap_dispatch_slots` fall-through. Pins: the three-backend threaded state test
      (`imports_impl` — the JIT lane exercises this arm) and the direct host-side dispatch +
      gate-reopen pin (`threaded_offers`).
-   - **7.4 — guest-facing declaration.** An IR/interface attribute so a guest module declares
-     `threaded` itself, rather than the host wiring param 7.1 uses. Rounds out "policy is the
-     provider's declaration" (§10.1).
+   - **7.4 — guest-facing declaration. DONE.** `ImplExport.threaded`: a module marks its own offer
+     export `threaded` — text `export N interface "name" threaded T { … }` (parses, prints,
+     round-trips; the header prescan skips it), binary **v10** (a policy uleb after each offer's op
+     list, values ≥ 2 a fail-closed `BadOfferPolicy` decode error; the version-locked format makes
+     the bump clean). The declaration is what §10.1 means by "policy is a declaration by the
+     provider": `HostCap::offer_proc` wires the **declared** policy (the explicit
+     `offer_proc_threaded`/`wire_offer_proc_with_policy` remain as host-side overrides), and
+     `reify_export` (the `cap.self` route) mints one's own export under one's own declaration.
+     The linker and interproc-opt carry the flag. Pins: text + binary round-trips, the
+     reify-under-declaration pin (threaded vs undeclared control), and the three-backend
+     declared-threaded parity run.
    - **Quiesce interaction (§10.3):** `threaded`'s only per-call check is the closed bit; folds in
      whenever the §10.3 closed bit lands (it is not yet a field on `ProviderState`), tracked with
      that work, not 7.1.
