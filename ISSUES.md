@@ -21,6 +21,19 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I68 — macOS `fork_manager::a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs` can HANG (not fail), holding `build · test (macos-latest)` until the workflow-timeout cancel (S4, flaky CI) — recorded 2026-08-05 on PR #627
+
+Observed once on head 258a0182: the test printed the 60-second warning, then nothing until
+the job was cancelled at ~45 min and the orphaned `fork_manager` test process was terminated
+in cleanup. Same run: the test passed on Linux and Windows; locally it completes in
+milliseconds. The head's diff (§3a/§3b record-spawn) is behavior-neutral on the legacy spawn
+paths this test uses (record locals are `None`; the new `fits` conjunct short-circuits without
+locking), so this is the macOS fork(2)+threads flake family (I52/I53): a real fork on a loaded
+runner with live sibling threads can deadlock the child (lock held across fork). Rerun-once
+policy applies. If it recurs: audit locks held at `fork_twin`'s fork point on macOS
+(pthread_atfork discipline or single-threaded fork window), and consider a per-test timeout so
+a hang fails fast instead of eating the job's 45-minute budget.
+
 ### I67 — `svm-llvm` CI job: `apt-get update` dies on unrelated `packages.microsoft.com` 403 before any Rust runs (S4, flaky CI infra) — recorded 2026-08-05 on PR #627
 
 The Linux-only `svm-llvm` job installs LLVM/clang via apt; on a GitHub runner the
