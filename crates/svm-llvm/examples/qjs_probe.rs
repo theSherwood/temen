@@ -1,16 +1,28 @@
-//! Scratch: translate QuickJS and analyze `JS_CallInternal`'s dispatch structure — the static
-//! generality check for peval (does the Lua dispatch-fold approach apply to a stack VM with JSValues?).
-//! Usage: cargo run --release --example qjs_probe -- /tmp/qjs_full/qjs_full.ll
+//! **peval generality probe on QuickJS** — is the Lua dispatch-fold/roll approach Lua-specific, or does
+//! it apply to a completely different real interpreter (a stack VM with NaN-boxed `JSValue`s)?
+//!
+//! Translates the unmodified QuickJS engine, locates `JS_CallInternal` (the bytecode VM), and checks
+//! the two structural preconditions the specializer relies on — a `br_table` opcode dispatch (the fold
+//! target) and a memory-backed operand stack (the rename target) — plus that the running engine can be
+//! captured at `JS_CallInternal` entry (the roll harness's entry point), all with **no engine change**.
+//! The finding: QuickJS's `JS_CallInternal` has the same peval-targetable shape as Lua's `luaV_execute`
+//! (a huge `br_table` dispatch + a window-resident operand stack + a `js_binary_arith_slow` cold arm
+//! for guard-and-deopt), and captures identically — the peval mechanism is not Lua-fitted.
+//!
+//! Build the input (fetched-not-vendored; needs clang/llvm-link + network, like the QuickJS demo test):
+//!   - QuickJS engine:  `crates/svm-run/demos/quickjs/build_bitcode.sh`
+//!   - full runnable link (engine + openlibm + printf/strtod/libc shims) → `qjs_full.ll`: see the
+//!     `quickjs_diff` recipe in `crates/svm-llvm/tests/translate.rs`.
+//!
+//! Usage: `cargo run --release --example qjs_probe -- /path/to/qjs_full.ll`
 
 use svm_ir::{Inst, Terminator};
 
 fn main() {
     let p = std::env::args().nth(1).expect("usage: qjs_probe <ll>");
-    let opts = svm_llvm::TranslateOptions {
-        stub_unresolved_externs: true,
-        ..Default::default()
-    };
-    let t = match svm_llvm::translate_ll_path_with_options(&p, opts) {
+    // Plain translate (no extern stubbing) — the same runnable pipeline `quickjs_diff` uses, so the
+    // instantiated engine is complete (stubs would trap during JS_NewRuntime setup).
+    let t = match svm_llvm::translate_ll_path(&p) {
         Ok(t) => t,
         Err(e) => {
             println!("TRANSLATE ERR: {e:?}");
@@ -28,12 +40,19 @@ fn main() {
             .map(|e| (e.func, e.name.clone()))
             .collect()
     };
-    for n in ["JS_CallInternal", "js_call_c_function", "JS_NewFloat64", "js_binary_arith_slow"] {
+    for n in [
+        "JS_CallInternal",
+        "js_call_c_function",
+        "JS_NewFloat64",
+        "js_binary_arith_slow",
+    ] {
         println!("  {n}: {:?}", named(n));
     }
 
     let Some((jci, _)) = named("JS_CallInternal").into_iter().next() else {
-        println!("JS_CallInternal not found (not exported?) — scanning for the biggest br_table func");
+        println!(
+            "JS_CallInternal not found (not exported?) — scanning for the biggest br_table func"
+        );
         // Fallback: the dispatch loop is the function with the largest br_table.
         let mut best = (0u32, 0usize);
         for (fi, f) in m.funcs.iter().enumerate() {
@@ -50,7 +69,10 @@ fn main() {
                 best = (fi as u32, maxbt);
             }
         }
-        println!("  biggest br_table: func {} with {} targets", best.0, best.1);
+        println!(
+            "  biggest br_table: func {} with {} targets",
+            best.0, best.1
+        );
         return;
     };
 
@@ -77,10 +99,53 @@ fn main() {
         }
     }
     println!("\nJS_CallInternal (func {jci}):");
-    println!("  {} blocks, params={:?} results={:?}", f.blocks.len(), f.params.len(), f.results.len());
-    println!("  br_table terminators: {brtabs}  (max targets = {max_targets})  <- the opcode dispatch");
+    println!(
+        "  {} blocks, params={:?} results={:?}",
+        f.blocks.len(),
+        f.params.len(),
+        f.results.len()
+    );
+    println!(
+        "  br_table terminators: {brtabs}  (max targets = {max_targets})  <- the opcode dispatch"
+    );
     println!("  loads={loads} stores={stores} calls={calls} call_indirect={indirect}");
-    println!("  {} functions in its direct-call closure", closure_size(m, jci));
+    println!(
+        "  {} functions in its direct-call closure",
+        closure_size(m, jci)
+    );
+
+    // Feasibility gate: can we breakpoint JS_CallInternal in the *running* engine and read its state?
+    println!("\n=== capture feasibility gate ===");
+    let inst = match svm_run::instantiate(m.clone()) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("  instantiate failed: {e:?}");
+            return;
+        }
+    };
+    let mut insp = inst.debug_attach(Vec::new(), 200_000_000);
+    insp.set_breakpoint(svm_interp::IrPc {
+        module: 0,
+        func: jci,
+        block: 0,
+        inst: 0,
+    });
+    match insp.run_until_stop() {
+        svm_interp::Stop::Break {
+            reason: svm_interp::StopReason::Breakpoint,
+            ..
+        } => {
+            print!("  BROKE at JS_CallInternal entry — params: ");
+            for i in 0..f.params.len() {
+                match insp.read_ir_value(0, i) {
+                    Some(svm_interp::Value::I64(v)) => print!("a{i}={v:#x} "),
+                    other => print!("a{i}={other:?} "),
+                }
+            }
+            println!("\n  ✓ capture works — the roll harness is reachable");
+        }
+        other => println!("  did not break: {other:?}"),
+    }
 }
 
 fn closure_size(m: &svm_ir::Module, f: u32) -> usize {
