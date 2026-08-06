@@ -187,6 +187,88 @@ fn concurrent_callers_share_one_threaded_instance() {
     );
 }
 
+/// **I69 regression.** Many concurrent callers on distinct vCPUs each store to their **own** cell
+/// through one `Threaded` instance; after joining, the main thread sums every cell back. The pin is
+/// that **no caller is silently dropped**: before the fix, two concurrent admissions could collide
+/// on the provider's brief snapshot lock (`state_.try_lock()`), and the loser was handed a spurious
+/// `-EAGAIN` — its `store` never ran, its cell stayed `0`, and the sum came up short (the observed
+/// `left: 10, right: 21` on the two-caller pin). A `Threaded` provider promises **no admission
+/// gate** (§10.1), so every one of the N stores must land. Ten callers widen the collision window so
+/// a regression fails deterministically under the parallel suite rather than ~1-in-many.
+#[test]
+fn concurrent_callers_never_lose_an_admission() {
+    const N: i64 = 10;
+    let provider = module(CELL_STORE);
+    let expected = N * (N + 1) / 2;
+
+    // Build the consumer once the offer handle/type-id are known: root spawns N vCPUs (each `func 1`
+    // stores `i + 1` into cell `16 + 8i`), joins them all, then sums the cells back.
+    let build_consumer = |offer: i32, tid: u32| -> svm_ir::Module {
+        let mut body = String::from(
+            "memory 16\n\
+             func () -> (i64) {\n\
+             block 0 () {\n\
+               vsp = i64.const 4096\n",
+        );
+        for i in 0..N {
+            body.push_str(&format!(
+                "               va{i} = i64.const {i}\n               vt{i} = thread.spawn 1 vsp va{i}\n"
+            ));
+        }
+        for i in 0..N {
+            body.push_str(&format!("               vj{i} = thread.join vt{i}\n"));
+        }
+        body.push_str(&format!("               vh = i32.const {offer}\n"));
+        body.push_str("               vacc0 = i64.const 0\n");
+        for i in 0..N {
+            let addr = 16 + 8 * i;
+            let next = i + 1;
+            body.push_str(&format!(
+                "               vc{i} = i64.const {addr}\n               vr{i} = cap.call {tid} 1 (i64) -> (i64) vh (vc{i})\n               vacc{next} = i64.add vacc{i} vr{i}\n"
+            ));
+        }
+        body.push_str(&format!("               return vacc{N}\n"));
+        body.push_str(
+            "               }\n\
+             }\n\
+             func (i64, i64) -> (i64) {\n\
+             block 0 (vsp: i64, vi: i64) {\n\
+               vone = i64.const 1\n\
+               vval = i64.add vi vone\n\
+               veight = i64.const 8\n\
+               voff = i64.mul vi veight\n\
+               vbase = i64.const 16\n\
+               vaddr = i64.add vbase voff\n",
+        );
+        body.push_str(&format!(
+            "               vh = i32.const {offer}\n\
+               vr = cap.call {tid} 0 (i64, i64) -> (i64) vh (vaddr, vval)\n\
+               return vr\n\
+               }}\n\
+             }}\n"
+        ));
+        module(&body)
+    };
+
+    // Rerun with a fresh host to widen the odds of hitting the concurrent-admission window at least
+    // once (`Host` is not `Clone`, so re-wire each iteration — the ids are deterministic).
+    for _ in 0..50 {
+        let mut h = Host::new();
+        let offer = h
+            .wire_offer_proc_with_policy(&provider, &[0, 1], OfferPolicy::Threaded)
+            .expect("threaded offer");
+        let tid = h.resolve_offer(offer).unwrap().type_id;
+        let consumer = build_consumer(offer, tid);
+        let mut fuel = 100_000_000u64;
+        let r = run_with_host(&consumer, 0, &[], &mut fuel, &mut h);
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(expected)]),
+            "every concurrent threaded caller's write must land — none dropped to -EAGAIN"
+        );
+    }
+}
+
 /// Repeated sequential calls through a `Threaded` instance keep state across calls exactly as a
 /// `single` instance does — the policy changes admission, never the shared-instance semantics
 /// (§10.1: what is admitted is a dispatch; the world is the same one world).
