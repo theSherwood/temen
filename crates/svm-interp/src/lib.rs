@@ -13787,7 +13787,14 @@ pub enum StreamRole {
 /// memory); it is selected only by a *granted* handle index.
 #[derive(Clone, Copy, Debug)]
 enum Binding {
-    Stream(StreamRole),
+    Stream {
+        role: StreamRole,
+        /// §7c — `Some(i)`: this entry's writes route to [`Host::sinks`]`[i]`, the shared sink a
+        /// parent aliased in when re-granting its stdout/stderr ([`Host::regrant_into_child`]).
+        /// Inherited-stdio authority is the table entry itself — never a host-field side channel.
+        /// `None`: this host's own stdio (the local buffer, or its own promoted sink).
+        sink: Option<u32>,
+    },
     /// §3.6 slice 3 — a **live-callee offer**: a capability whose provider is another *running*
     /// domain (a §14 child), carried as an index into [`Host::live_impls`] (the entry holds the
     /// callee's live powerbox Arc + target impl-export — index-carried to keep `Binding: Copy`,
@@ -13865,12 +13872,11 @@ enum Binding {
         unit: u32,
     },
     /// An **embedder-registered** host-function capability (iface 13): carries the index of its
-    /// handler closure in [`Host::host_procs`] (out-of-line so `Binding` stays `Copy`, like
-    /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`.
+    /// [`HostProcEntry`] in [`Host::host_procs`] (out-of-line so `Binding` stays `Copy`, like
+    /// [`Binding::Blocking`]). All ops dispatch to that one closure, which interprets `op`. The
+    /// entry records the §4b mmap-capable registration (the handler is handed a [`RegionMinter`])
+    /// and the FORK.md fork factory — one kind, per-entry powers (CONSOLIDATION §7).
     HostProc(u32),
-    /// An mmap-capable host-function capability (§4b): like [`Binding::HostProc`] but its handler in
-    /// [`Host::host_procs_region`] is also handed a [`RegionMinter`]. Resolves under the same iface 13.
-    HostProcRegion(u32),
     /// A **wired interface offer** (IMPORTS.md §3.2): a guest-implemented capability, carrying the
     /// index of its [`OfferEntry`] in [`Host::offers`] (out-of-line so `Binding` stays
     /// `Copy`, like [`Binding::HostProc`]). Op `i` dispatches to the offer's `ops[i]` function via
@@ -14325,8 +14331,20 @@ impl AsyncCounter for RegionCounter {
 /// the operation and returns its result slots — or a [`Trap`] (e.g. `Trap::Exit`). This is how a
 /// host adds a capability (e.g. an `svm-wasi` shim) **without** touching this crate: the semantics
 /// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
-pub type HostProc =
-    Box<dyn FnMut(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send>;
+///
+/// The last parameter is the §4b [`RegionMinter`] escape hatch — `Some` **only** for a handler
+/// registered mmap-capable ([`Host::grant_host_proc_region`]), `None` for a plain registration
+/// (CONSOLIDATION §7: one closure shape, the *registration* decides the extra authority — a plain
+/// handler is never silently handed the minter).
+pub type HostProc = Box<
+    dyn FnMut(
+            u32,
+            &[i64],
+            Option<&mut dyn GuestMem>,
+            Option<&mut dyn RegionMinter>,
+        ) -> Result<Vec<i64>, Trap>
+        + Send,
+>;
 
 /// FORK.md PR 5 — a host proc's **fork factory**: mints a fresh [`HostProc`] closure for a `fork()`
 /// twin's powerbox. The runtime can never fork a `HostProc` itself (the closure's captured state is
@@ -14349,20 +14367,21 @@ pub trait RegionMinter {
     fn grant_region(&mut self, backing: RegionBacking) -> i32;
 }
 
-/// Like [`HostProc`] but the handler is also handed a [`RegionMinter`] — the escape hatch for the
-/// zero-copy file-mmap bridge (§4b): an mmap-capable fs handler opens a file, mints a file-backed
-/// `SharedRegion` over it, and returns the handle so the guest aliases the real file into its window.
-/// Registered with [`Host::grant_host_proc_region`]; resolves under the same [`cap_id::HOST_PROC`] as a
-/// plain `HostProc`, so a guest reaches it identically.
-pub type HostProcRegion = Box<
-    dyn FnMut(
-            u32,
-            &[i64],
-            Option<&mut dyn GuestMem>,
-            &mut dyn RegionMinter,
-        ) -> Result<Vec<i64>, Trap>
-        + Send,
->;
+/// One registered host-capability handler (CONSOLIDATION §7: the fold of the former
+/// `host_procs`/`host_proc_forks`/`host_procs_region` parallel tables into a single struct — the
+/// tables can no longer desync because there is only one). Indexed by the id a
+/// [`Binding::HostProc`] carries.
+struct HostProcEntry {
+    /// The handler closure ([`HostProc`]). A dispatch takes it out, runs it, and restores it.
+    handler: HostProc,
+    /// FORK.md PR 5 — the provider-supplied fork factory ([`Host::grant_host_proc_forkable`]):
+    /// `Some` = [`Host::fork_powerbox`] carries this capability into a twin by minting a fresh
+    /// closure; `None` = non-forkable (fail closed).
+    fork: Option<HostProcFork>,
+    /// §4b — whether the handler was registered mmap-capable
+    /// ([`Host::grant_host_proc_region`]) and so receives `Some(minter)` on each call.
+    mints: bool,
+}
 
 /// A **wired interface offer**'s host-side state (IMPORTS.md §3.2), indexed by the id a
 /// [`Binding::Offer`] carries: the offering module's functions, the offer's per-op funcidx
@@ -14773,6 +14792,9 @@ pub struct Host {
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
     out_sink: Option<Arc<Mutex<Vec<u8>>>>,
     err_sink: Option<Arc<Mutex<Vec<u8>>>>,
+    /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
+    /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
+    sinks: Vec<Arc<Mutex<Vec<u8>>>>,
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
@@ -14815,16 +14837,10 @@ pub struct Host {
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
     /// §7 embedder-registered host-capability handlers, indexed by the id a [`Binding::HostProc`]
-    /// carries ([`Host::grant_host_proc`]). A dispatch takes the closure out, runs it, and restores it.
-    host_procs: Vec<HostProc>,
-    /// FORK.md PR 5 — per-`host_procs` entry fork factories, parallel by index. `Some` = the provider
-    /// supplied a [`HostProcFork`] ([`Host::grant_host_proc_forkable`]) and [`Host::fork_powerbox`]
-    /// carries the cap into a twin by minting a fresh closure; `None` = non-forkable (fail closed).
-    host_proc_forks: Vec<Option<HostProcFork>>,
-    /// §4b mmap-capable host-capability handlers (indexed by the id a [`Binding::HostProcRegion`]
-    /// carries, [`Host::grant_host_proc_region`]) — a `HostProc` plus a [`RegionMinter`]. Same
-    /// take-out/run/restore dispatch as `host_procs`.
-    host_procs_region: Vec<HostProcRegion>,
+    /// carries — one [`HostProcEntry`] per registration (handler + fork factory + §4b mints flag;
+    /// CONSOLIDATION §7 folded the former parallel tables). A dispatch takes the closure out, runs
+    /// it, and restores it.
+    host_procs: Vec<HostProcEntry>,
     /// Wired interface offers (IMPORTS.md §3.2), indexed by the id a [`Binding::Offer`]
     /// carries ([`Host::wire_offer_func`]).
     offers: Vec<OfferEntry>,
@@ -15295,6 +15311,7 @@ impl Host {
             stderr: Vec::new(),
             out_sink: None,
             err_sink: None,
+            sinks: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
             region_hook: None,
@@ -15305,8 +15322,6 @@ impl Host {
             region_factory: None,
             blockings: Vec::new(),
             host_procs: Vec::new(),
-            host_proc_forks: Vec::new(),
-            host_procs_region: Vec::new(),
             offers: Vec::new(),
             iface_intern: Vec::new(),
             import_remaps: Vec::new(),
@@ -15381,11 +15396,9 @@ impl Host {
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
         // entry fails the whole fork closed (the pre-PR-5 behavior).
-        let procs_forkable = self.host_procs.len() == self.host_proc_forks.len() // parallel-table sanity
-                && self.host_proc_forks.iter().all(|f| f.is_some());
+        let procs_forkable = self.host_procs.iter().all(|e| e.fork.is_some());
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
         let simple = procs_forkable
-            && self.host_procs_region.is_empty()
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
             && self.rings.is_empty()
@@ -15423,14 +15436,21 @@ impl Host {
         // (shared or duplicated) state, at the same index so the copied table's `HostProc(i)` slots
         // resolve; the factories themselves ride along, so the twin remains forkable (fork-of-fork).
         twin.host_procs = self
-            .host_proc_forks
+            .host_procs
             .iter()
-            .map(|f| (f.as_ref().unwrap())())
+            .map(|e| {
+                let factory = e.fork.as_ref().unwrap();
+                HostProcEntry {
+                    handler: factory(),
+                    fork: Some(Arc::clone(factory)),
+                    mints: e.mints,
+                }
+            })
             .collect();
-        twin.host_proc_forks = self.host_proc_forks.clone();
         // Shared stdout/stderr sinks — fork shares stdout/stderr.
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
+        twin.sinks = self.sinks.clone();
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -15833,7 +15853,6 @@ impl Host {
             && self.blockings.is_empty()
             && self.rings.is_empty()
             && self.host_procs.is_empty()
-            && self.host_procs_region.is_empty()
             && self.jit_domains.is_empty()
     }
 
@@ -16127,7 +16146,9 @@ impl Host {
         for (slot, s) in self.table.iter().enumerate() {
             let Some(binding) = s.entry else { continue };
             let binding = match binding {
-                Binding::Stream(role) => DurableBinding::Stream(role),
+                // The sink association (inherited stdio) is not durable — same as the
+                // pre-§7c field it replaced; a thawed stream writes to the thawing host's stdio.
+                Binding::Stream { role, .. } => DurableBinding::Stream(role),
                 Binding::Exit => DurableBinding::Exit,
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
@@ -16145,7 +16166,7 @@ impl Host {
                 // rebuilt positionally on thaw, so the binding's index re-resolves.
                 Binding::JitDomain(idx) => DurableBinding::JitDomain { idx },
                 Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
-                Binding::HostProc(_) | Binding::HostProcRegion(_) => {
+                Binding::HostProc(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostProc))
                 }
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
@@ -16207,7 +16228,7 @@ impl Host {
             };
             let kind = match binding {
                 // Durable (value-typed) — re-grantable on restore, so keep them.
-                Binding::Stream(_)
+                Binding::Stream { .. }
                 | Binding::Exit
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
@@ -16220,7 +16241,7 @@ impl Host {
                 Binding::Module(_) => NonDurableKind::Module,
                 Binding::IoRing(_) => NonDurableKind::IoRing,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
-                Binding::HostProc(_) | Binding::HostProcRegion(_) => NonDurableKind::HostProc,
+                Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
@@ -16253,7 +16274,7 @@ impl Host {
     pub fn restore_durable_handles(&mut self, handles: &[DurableHandle]) {
         for h in handles {
             let binding = match h.binding {
-                DurableBinding::Stream(role) => Binding::Stream(role),
+                DurableBinding::Stream(role) => Binding::Stream { role, sink: None },
                 DurableBinding::Exit => Binding::Exit,
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
@@ -16393,7 +16414,7 @@ impl Host {
 
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
-        self.grant(cap_id::STREAM, Binding::Stream(role))
+        self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
     }
 
     /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
@@ -16542,9 +16563,18 @@ impl Host {
     /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
     pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: f,
+            fork: None,
+            mints: false,
+        })
+    }
+
+    /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
+    /// public `grant_host_proc*` faces share (CONSOLIDATION §7).
+    fn grant_host_proc_entry(&mut self, entry: HostProcEntry) -> i32 {
         let idx = self.host_procs.len() as u32;
-        self.host_procs.push(f);
-        self.host_proc_forks.push(None);
+        self.host_procs.push(entry);
         self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
     }
 
@@ -16554,22 +16584,25 @@ impl Host {
     /// never inspects the closure's state — forking it is the provider's job, expressed by this
     /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
     pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
-        let idx = self.host_procs.len() as u32;
-        self.host_procs.push(f);
-        self.host_proc_forks.push(Some(fork));
-        self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: f,
+            fork: Some(fork),
+            mints: false,
+        })
     }
 
     /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
     /// (also iface [`cap_id::HOST_PROC`], so a guest resolves it exactly like a plain [`grant_host_proc`]).
-    /// Identical to `grant_host_proc` except the handler is additionally handed a [`RegionMinter`] on
-    /// each call, so it can mint a file-backed `SharedRegion` and return the handle — the delivery
-    /// mechanism for the zero-copy file-mmap bridge. The extra authority is exactly region-minting
-    /// (nothing else of the `Host` is reachable).
-    pub fn grant_host_proc_region(&mut self, f: HostProcRegion) -> i32 {
-        let idx = self.host_procs_region.len() as u32;
-        self.host_procs_region.push(f);
-        self.grant(cap_id::HOST_PROC, Binding::HostProcRegion(idx))
+    /// Identical to `grant_host_proc` except the handler receives `Some(minter)` on each call
+    /// (a plain registration gets `None`), so it can mint a file-backed `SharedRegion` and return
+    /// the handle — the delivery mechanism for the zero-copy file-mmap bridge. The extra authority
+    /// is exactly region-minting (nothing else of the `Host` is reachable).
+    pub fn grant_host_proc_region(&mut self, f: HostProc) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: f,
+            fork: None,
+            mints: true,
+        })
     }
 
     /// Intern an interface's op-signature list and return its id (IMPORTS.md §3.2): structurally
@@ -18074,7 +18107,7 @@ impl Host {
         let s = &self.table[slot];
         match s.entry {
             Some(b) if (s.generation & GEN_MASK) == gen => match b {
-                Binding::Stream(_) | Binding::Exit | Binding::Clock => Ok((s.type_id, b)),
+                Binding::Stream { .. } | Binding::Exit | Binding::Clock => Ok((s.type_id, b)),
                 _ => Err(Trap::CapFault),
             },
             _ => Err(Trap::CapFault),
@@ -18134,13 +18167,14 @@ impl Host {
     /// handler over the shared provider state). A factory-less/opaque host proc cannot be re-granted.
     fn forkable_host_proc(&self, handle: i32) -> bool {
         matches!(self.resolve(handle, cap_id::HOST_PROC), Ok(Binding::HostProc(idx))
-            if self.host_proc_forks.get(idx as usize).is_some_and(|f| f.is_some()))
+            if self.host_procs.get(idx as usize).is_some_and(|e| e.fork.is_some()))
     }
 
     /// Re-grant `handle` from this (parent) host into `child` — the §14 child-powerbox re-grant policy:
     /// a **pipe end** aliases its shared FIFO backing into the child (so parent and child share the same
-    /// queue — the cross-domain pipe); a stdout/stderr `Stream` shares the parent's sink (stdio
-    /// inheritance); every other coordinate-free cap copies its binding as-is. Returns the child handle,
+    /// queue — the cross-domain pipe); a stdout/stderr `Stream` carries the parent's shared sink in the
+    /// granted entry itself (stdio inheritance rides the table, §7c — no child host field is touched);
+    /// every other coordinate-free cap copies its binding as-is. Returns the child handle,
     /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
     /// so `resolve_copyable` would refuse it.)
     fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
@@ -18185,23 +18219,29 @@ impl Host {
         // a cap the parent keeps. This is the deep-copy path `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
             return self
-                .host_proc_forks
+                .host_procs
                 .get(idx as usize)
-                .and_then(|f| f.clone())
+                .and_then(|e| e.fork.clone())
                 .map(|factory| child.grant_host_proc_forkable(factory(), factory));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
-        if let Binding::Stream(r @ (StreamRole::Out | StreamRole::Err)) = binding {
-            let sink = if r == StreamRole::Out {
-                self.shared_stdout()
-            } else {
-                self.shared_stderr()
+        if let Binding::Stream {
+            role: r @ (StreamRole::Out | StreamRole::Err),
+            sink,
+        } = binding
+        {
+            // §7c: stdio inheritance rides the table entry. Alias this host's sink — the one THIS
+            // handle writes to (its own carried sink if it was itself inherited, else this host's
+            // promoted buffer) — into the child's sink table, and grant a `Stream` carrying it.
+            // No child host field is touched: revoking the entry revokes the authority.
+            let shared = match sink {
+                Some(i) => Arc::clone(self.sinks.get(i as usize)?),
+                None if r == StreamRole::Out => self.shared_stdout(),
+                None => self.shared_stderr(),
             };
-            if r == StreamRole::Out {
-                child.out_sink = Some(sink);
-            } else {
-                child.err_sink = Some(sink);
-            }
+            let idx = child.sinks.len() as u32;
+            child.sinks.push(shared);
+            return Some(child.grant(tid, Binding::Stream { role: r, sink: Some(idx) }));
         }
         Some(child.grant(tid, binding))
     }
@@ -18586,11 +18626,11 @@ impl Host {
             // Handled here rather than in `stream_op` because closing needs the *handle*,
             // which the per-role op body deliberately never sees. Uniform across backends —
             // every backend routes through this one dispatch.
-            Binding::Stream(_) if op == 2 => {
+            Binding::Stream { .. } if op == 2 => {
                 self.close(handle);
                 Ok(vec![0])
             }
-            Binding::Stream(role) => self.stream_op(role, op, args, mem),
+            Binding::Stream { role, sink } => self.stream_op(role, sink, op, args, mem),
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
             // dispatch**. The op executes as a fresh reference run over the offer's own function
@@ -18841,29 +18881,21 @@ impl Host {
                 }
             }
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
-            // out for the call so the closure can't alias `self.host_procs` (it doesn't need `Host`),
-            // then restore it — a panic would only poison this one slot, never the host.
+            // out for the call so the closure can't alias `self.host_procs` (it doesn't need `Host`;
+            // taking it out first also makes the §4b `&mut dyn RegionMinter` borrow of `self` sound),
+            // then restore it — a panic would only poison this one slot, never the host. An entry
+            // registered mmap-capable (`mints`) is handed `self` as the minter; a plain one gets
+            // `None` — the registration, not the call, decides the extra authority.
             Binding::HostProc(idx) => {
-                let mut f = match self.host_procs.get_mut(idx as usize) {
-                    Some(slot) => std::mem::replace(slot, Box::new(|_, _, _| Err(Trap::CapFault))),
+                let (mut f, mints) = match self.host_procs.get_mut(idx as usize) {
+                    Some(e) => (
+                        std::mem::replace(&mut e.handler, Box::new(|_, _, _, _| Err(Trap::CapFault))),
+                        e.mints,
+                    ),
                     None => return Err(Trap::CapFault),
                 };
-                let r = f(op, args, mem);
-                self.host_procs[idx as usize] = f;
-                r
-            }
-            // §4b mmap-capable host-cap: same take-out/run/restore as `HostProc`, but also hand the
-            // handler `self` as the `RegionMinter`. Taking the closure out first means `self` is no
-            // longer aliased by `host_procs_region[idx]`, so the `&mut dyn RegionMinter` borrow is sound.
-            Binding::HostProcRegion(idx) => {
-                let mut f = match self.host_procs_region.get_mut(idx as usize) {
-                    Some(slot) => {
-                        std::mem::replace(slot, Box::new(|_, _, _, _| Err(Trap::CapFault)))
-                    }
-                    None => return Err(Trap::CapFault),
-                };
-                let r = f(op, args, mem, self);
-                self.host_procs_region[idx as usize] = f;
+                let r = f(op, args, mem, if mints { Some(self) } else { None });
+                self.host_procs[idx as usize].handler = f;
                 r
             }
             Binding::Exit => {
@@ -19578,6 +19610,7 @@ impl Host {
     fn stream_op(
         &mut self,
         role: StreamRole,
+        sink: Option<u32>,
         op: u32,
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
@@ -19623,14 +19656,24 @@ impl Host {
                 let Some(bytes) = m.read_bytes(ptr, len) else {
                     return ret(EFAULT);
                 };
-                // S2: a re-granted stdout/stderr routes to a shared sink (so a child's output reaches
-                // the embedder that granted it); otherwise to this host's local buffer.
-                let sink = if role == StreamRole::Out {
+                // §7c: a re-granted stdout/stderr carries its shared sink in the table entry (so a
+                // child's output reaches the embedder that granted it); a host's own stream routes
+                // to its promoted sink if a child shares it, else the local buffer.
+                if let Some(i) = sink {
+                    let Some(s) = self.sinks.get(i as usize) else {
+                        return ret(EINVAL);
+                    };
+                    s.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&bytes);
+                    return ret(len as i64);
+                }
+                let own = if role == StreamRole::Out {
                     &self.out_sink
                 } else {
                     &self.err_sink
                 };
-                match sink {
+                match own {
                     Some(s) => s
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -21718,6 +21761,7 @@ mod region_minter_tests {
         let h = host.grant_host_proc_region(Box::new(|op, _args, _mem, minter| {
             if op == 0 {
                 let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
+                let minter = minter.expect("a region-registered handler is handed the minter");
                 Ok(vec![minter.grant_region(backing) as i64])
             } else {
                 Ok(vec![-22])
@@ -21751,7 +21795,7 @@ mod region_minter_tests {
     #[test]
     fn region_and_plain_host_proc_are_distinct_handles_under_the_same_iface() {
         let mut host = Host::new();
-        let plain = host.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
+        let plain = host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
         let region = host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(plain >= 0 && region >= 0 && plain != region);
     }
@@ -21788,7 +21832,10 @@ mod fork_powerbox_tests {
         assert!(
             matches!(
                 twin.resolve(h_out, cap_id::STREAM),
-                Ok(Binding::Stream(StreamRole::Out))
+                Ok(Binding::Stream {
+                    role: StreamRole::Out,
+                    ..
+                })
             ),
             "the stdout stream handle resolves in the twin"
         );
@@ -21827,15 +21874,15 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_refuses_a_domain_with_a_factory_less_host_proc() {
         let mut host = Host::new();
-        host.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
+        host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(
             host.fork_powerbox().is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
         );
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc_forkable(
-            Box::new(|_, _, _| Ok(vec![1])),
-            Arc::new(|| Box::new(|_, _, _| Ok(vec![1]))),
+            Box::new(|_, _, _, _| Ok(vec![1])),
+            Arc::new(|| Box::new(|_, _, _, _| Ok(vec![1]))),
         );
         assert!(
             host.fork_powerbox().is_none(),
@@ -21854,7 +21901,7 @@ mod fork_powerbox_tests {
             let counter = Arc::clone(&counter);
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
-                Box::new(move |_op, _args, _mem| {
+                Box::new(move |_op, _args, _mem, _| {
                     let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
                     *c += 1;
                     Ok(vec![*c])
@@ -21895,7 +21942,7 @@ mod fork_powerbox_tests {
             let counter = Arc::clone(&counter);
             move || -> HostProc {
                 let counter = Arc::clone(&counter);
-                Box::new(move |_op, _args, _mem| {
+                Box::new(move |_op, _args, _mem, _| {
                     let mut c = counter.lock().unwrap_or_else(|e| e.into_inner());
                     *c += 1;
                     Ok(vec![*c])
@@ -21923,7 +21970,7 @@ mod fork_powerbox_tests {
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.
-        let opaque = parent.grant_host_proc(Box::new(|_, _, _| Ok(vec![0])));
+        let opaque = parent.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"

@@ -106,7 +106,7 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0 — durable
     a.grant_io_ring(); // slot 1 — non-durable
-    a.grant_host_proc(Box::new(|_op, _args, _mem| Ok(vec![0]))); // slot 2 — non-durable
+    a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // slot 2 — non-durable
 
     assert!(
         a.capture_durable_handles().is_err(),

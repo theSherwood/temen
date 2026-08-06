@@ -66,7 +66,7 @@ fn run_armed(n: i64) -> (u64, bool) {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
         sink.fetch_add(1, Ordering::Relaxed);
         Ok(vec![0])
     }));
@@ -123,7 +123,7 @@ fn an_unarmed_durable_run_is_untouched() {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
         sink.fetch_add(1, Ordering::Relaxed);
         Ok(vec![0])
     }));

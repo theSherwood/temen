@@ -1425,6 +1425,16 @@ something new is a capability**:
   leak. The boundary is sharp: enumerating **your own** granted set is fine; there is still
   **no "list everything the host could offer" call** — *that* would be ambient authority.
 
+  *Naming the two `cap.self` families* (CONSOLIDATION §7): the op space today holds
+  **reflection** (`count`/`get`/`resolve`/`label`/`attest`/`provenance`/`type_id`/`covers` —
+  the read-only, authority-neutral intrinsic this section defines) and the **domain-runtime
+  verbs** (`svc.*`, `clone_caller`, `fuel.remaining` — operations *on the current domain's
+  runtime*, not reads of its grant table). The verbs live under `cap.self` only because it
+  was the op space needing no wire change when they landed, not because they are reflection.
+  Keep the families distinct in prose and docs; an actual op-space split is deliberately
+  deferred to a wire rev that happens anyway (same policy as `call.sym`'s vestigial handle
+  operand).
+
 - **Acquisition = a granted `Resolver` capability** (host-layer, outside the TCB). When a
   guest must *obtain* a not-yet-held capability at runtime (plugin host, service mesh), the
   ocap-correct answer is unchanged: a granted registry interface, e.g.

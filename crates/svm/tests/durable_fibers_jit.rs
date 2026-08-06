@@ -119,7 +119,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     let probes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&probes);
     let mut host = Host::new();
-    let hf = host.grant_host_proc(Box::new(move |_op, args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, args, _mem, _| {
         sink.lock().unwrap().push(args[0] as u64);
         Ok(vec![0])
     }));

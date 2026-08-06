@@ -651,7 +651,7 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
 /// Build the POSIX [`HostProc`] handler over shared `inner`. Dispatches on the op number; an unknown op
 /// on this handle is a `CapFault` (as for any capability).
 fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
-    Box::new(move |op, args, mem| {
+    Box::new(move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
         let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
         match op {
             OP_WRITE => st.write(args, mem),

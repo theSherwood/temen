@@ -172,7 +172,7 @@ pub fn scripted_exec_handler(
         let table = Arc::clone(&table);
         let mut jobs = JobTable::default();
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![scripted_dispatch(&table, &mut jobs, op, args, mem)])
             },
         ) as HostProc

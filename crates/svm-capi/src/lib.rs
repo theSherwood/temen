@@ -365,7 +365,7 @@ pub unsafe extern "C" fn svm_imports_provide_host_proc(
     // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
     let cap = HostCap::host_proc(op, move || -> HostProc {
         let ctx = ctx;
-        Box::new(move |op, args, mem| {
+        Box::new(move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
             // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
             // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
             let ctx = ctx;

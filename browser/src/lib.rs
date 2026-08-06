@@ -2286,7 +2286,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     {
         let frame = std::sync::Arc::clone(&frame);
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
             if op != 0 {
                 return Ok(vec![-1]); // only present(0) is defined
             }
@@ -2317,7 +2317,7 @@ fn grant_onramp_caps(
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     {
         let keys = std::sync::Arc::clone(&keys);
-        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
             if op != 0 {
                 return Ok(vec![-1]); // only poll(0) is defined
             }
@@ -2336,7 +2336,7 @@ fn grant_onramp_caps(
     // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
     #[cfg(target_arch = "wasm32")]
     {
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem| {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
             match op {
                 // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
                 0 => {
@@ -2373,7 +2373,7 @@ fn grant_onramp_caps(
     // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
     if let Some((name, data)) = fs {
         let mut cursors: Vec<u64> = Vec::new();
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem| match op {
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| match op {
             0 => {
                 let requested = mem
                     .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
@@ -5789,7 +5789,7 @@ pub extern "C" fn svm_mem_profile(
     let feed = Arc::clone(&model);
     let mut host = Host::new();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
-    let h = host.grant_host_proc(Box::new(move |op, args, _mem| {
+    let h = host.grant_host_proc(Box::new(move |op, args, _mem, _| {
         if let Some(ev) = decode_mem_event(op, args) {
             n += 1;
             feed.lock()
@@ -6050,7 +6050,7 @@ pub fn reflect_exec(m: &svm_ir::Module, arg: i64) -> (i32, i64) {
     let mut host = Host::new();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
-    let _ = host.grant_host_proc(Box::new(|_op, _args, _mem| Ok(vec![0]))); // handle 2, type_id 13
+    let _ = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // handle 2, type_id 13
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: Vec<Value> = if arity >= 1 {
         vec![Value::I32(arg as i32)]
@@ -7064,7 +7064,7 @@ pub mod live {
         };
         let mut host = Host::new();
         // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
-        let console: HostProc = Box::new(|op, args, mem| {
+        let console: HostProc = Box::new(|op, args, mem, _| {
             if op != 1 {
                 return Ok(vec![EINVAL]);
             }
@@ -7085,7 +7085,7 @@ pub mod live {
             }
         });
         // clock (param 2): op 0 = now() → real host time.
-        let clock: HostProc = Box::new(|op, _args, _mem| {
+        let clock: HostProc = Box::new(|op, _args, _mem, _| {
             if op != 0 {
                 return Ok(vec![EINVAL]);
             }

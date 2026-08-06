@@ -76,7 +76,7 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
     host.clock_ns = 42;
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
         sig.store(true, Ordering::SeqCst);
         Ok(vec![0])
     }));
@@ -127,7 +127,7 @@ fn thaw(
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
     // The host fn is granted (handle order preserved) but never called on the thaw path.
-    let _ = thost.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m| Ok(vec![0])));
+    let _ = thost.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
     let (tout, tfinal, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
         inst,
         0,
@@ -1099,7 +1099,7 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
     let mut host = Host::new();
     host.clock_ns = 42;
     let clk = host.grant_clock();
-    let _ = host.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m| Ok(vec![0])));
+    let _ = host.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
     let (out, win, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
         inst,
         0,

@@ -749,7 +749,7 @@ pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostProc + Send + Sync + 'st
             ..MemFsState::default()
         };
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
         ) as HostProc
@@ -775,7 +775,7 @@ pub fn mem_fs_seeded_handler(
             st.dirs.insert(norm(d));
         }
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
         ) as HostProc
@@ -825,7 +825,7 @@ pub fn mem_fs_seeded_shared(
     let shared = Arc::new(Mutex::new(st));
     let handle = MemFsHandle(shared.clone());
     let hostfn: HostProc = Box::new(
-        move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+        move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
             Ok(vec![shared
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -975,7 +975,7 @@ mod tests {
         mem.0[..6].copy_from_slice(b"base/2");
         mem.0[16..21].copy_from_slice(b"hello");
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
-            fs(op, args, Some(mem)).expect("host fn")[0]
+            fs(op, args, Some(mem), None).expect("host fn")[0]
         };
 
         // Create + write a new file through the granted handler (O_CREATE|O_WRITE).
