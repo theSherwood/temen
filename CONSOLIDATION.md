@@ -181,6 +181,33 @@ variants become one of each.
 **Independent of §1** — mechanical, can land any time. **Gate:** the existing `Memory`
 tests re-pointed, grant-site migration, one deprecation note for the cap_id.
 
+### §4 status (2026-08-06): DONE
+
+Landed in one slice (asset scan first: **no committed `.svmb` uses cap iface 3**, so the
+retirement is asset-safe — `asset_op_scan` now reports every cap iface per asset):
+
+- **The whole-window spelling** is `AddressSpace { base: 0, size: u64::MAX }` — "the window,
+  whatever its size" (`Host::grant_memory`, now sugar). Chosen over a sized grant because the
+  embedder grants before the window exists and the window can grow into the reserved tail; the
+  dispatch arm skips the sub-range bound for it (the backend's `mem` does the real bounding —
+  byte-identical to the old `Memory` arm), and `binding_in_window` passes it as payload-free
+  (exact-match only; it never feeds the §14 carve path, which reads `Instantiator` bindings).
+- **The growth cap (`mem_map_limit`) moved into the unified arm** and now meters *every*
+  `AddressSpace` map on the Host, carved or whole — previously carve maps bypassed the knob.
+- **Deleted:** `Binding::Memory`, `DurableBinding::Memory`, the dispatch arm, `cap_id::MEMORY`
+  (id 3 reserved, comment in `cap_id`), snapshot tag `B_MEMORY` (fails decode closed, the
+  B_YIELDER precedent). Loader symbol tables (`vm_map` family → iface 5 ops 0–3, svm-run /
+  svm-dap / browser / tests) and the generator/text-IR test fleet re-pointed; colliding
+  `(iface, _)` powerbox-binding match arms are now **op-keyed** like Stream (ops 0–3 → the
+  whole-window grant, 4/5 → the sized carve grant). `generic_dispatch_iface` gained
+  `ADDRESS_SPACE` (it was already `validate_powerbox_manifest`-bindable — a latent
+  inconsistency the fold flushed out).
+- **Freeze gained the restore boundary's `binding_in_window` gate** (`FreezeError::
+  BindingOutOfWindow`): a beyond-window range (e.g. a `sub` child minted off the whole-window
+  form) fails closed at freeze instead of emitting an artifact restore would reject. The
+  restore-reject pins now forge their artifact by byte-tampering (the actual threat model —
+  bindings ride outside the digest).
+
 ## 5. `Blocking` and `IoRing`
 
 - **5a. `Blocking` is a mock** (its own doc says so: "a *mock* synchronous-only/blocking host

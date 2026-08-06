@@ -61,7 +61,9 @@ fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
                 (cap_id::STREAM, 1) => hv(0),
                 (cap_id::STREAM, _) => hv(1),
                 (cap_id::EXIT, _) => hv(2),
-                (cap_id::MEMORY, _) => hv(3),
+                // One kind post-§4 (op-keyed like Stream): vm_map family → the whole-window
+                // grant, sub/region_create → the sized one.
+                (cap_id::ADDRESS_SPACE, 0..=3) => hv(3),
                 (cap_id::ADDRESS_SPACE, _) => hv(4),
                 (cap_id::IO_RING, _) => hv(5),
                 (cap_id::BLOCKING, _) => hv(6),

@@ -156,7 +156,8 @@ const TAG_JIT: u64 = 5;
 const B_STREAM: u8 = 0;
 const B_EXIT: u8 = 1;
 const B_CLOCK: u8 = 2;
-const B_MEMORY: u8 = 3;
+// B_MEMORY (3) retired with the CONSOLIDATION §4 Memory→AddressSpace fold — whole-window
+// authority now rides B_ADDRESS_SPACE `{0, u64::MAX}`; the tag stays reserved.
 // B_YIELDER (4) retired with the §2.3 coroutine deletion; the tag stays reserved.
 const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
@@ -194,6 +195,11 @@ pub enum FreezeError {
     WindowGeometry(usize),
     /// The supplied per-page protection map's length doesn't match the window's page count.
     ProtCount { pages: usize, prots: usize },
+    /// A live `AddressSpace`/`Instantiator` binding names a range outside the window being
+    /// frozen (e.g. a guest `sub`-minted a beyond-window child off the whole-window form) —
+    /// restore would reject the artifact (`RestoreError::BindingOutOfWindow`), so freeze fails
+    /// closed at the same line rather than producing an unrestorable snapshot.
+    BindingOutOfWindow { slot: u32 },
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -238,6 +244,15 @@ pub enum RestoreError {
 /// always pass.
 fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
     let (base, size) = match *binding {
+        // The whole-window `AddressSpace` form (`{0, u64::MAX}` — the retired `Memory` kind,
+        // CONSOLIDATION §4) carries no concrete range: nothing consumes it as pointer
+        // arithmetic (the dispatch arm defers to the backend's `mem` bounding), so like the
+        // other address-payload-free bindings it always passes. Exact-match only — a
+        // `u64::MAX` size at any other base is malformed and falls through to the checks.
+        DurableBinding::AddressSpace {
+            base: 0,
+            size: u64::MAX,
+        } => return true,
         DurableBinding::AddressSpace { base, size }
         | DurableBinding::Instantiator { base, size } => (base, size),
         _ => return true,
@@ -280,6 +295,15 @@ pub fn freeze_with_prots(
     let handles = host
         .capture_durable_handles()
         .map_err(FreezeError::NonDurableHandle)?;
+    // Freeze-side twin of the restore boundary's `binding_in_window` gate: refuse to emit an
+    // artifact restore would reject, so out-of-window authority fails at freeze with a clear
+    // error instead of surfacing as a Malformed artifact later.
+    if let Some(h) = handles
+        .iter()
+        .find(|h| !binding_in_window(&h.binding, window.len() as u64))
+    {
+        return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+    }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);
@@ -1041,7 +1065,6 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         }
         DurableBinding::Exit => b.push(B_EXIT),
         DurableBinding::Clock => b.push(B_CLOCK),
-        DurableBinding::Memory => b.push(B_MEMORY),
         DurableBinding::AddressSpace { base, size } => {
             b.push(B_ADDRESS_SPACE);
             write_uleb(b, base);
@@ -1079,9 +1102,9 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         }),
         B_EXIT => DurableBinding::Exit,
         B_CLOCK => DurableBinding::Clock,
-        B_MEMORY => DurableBinding::Memory,
-        // B_YIELDER (5): retired with the §2.3 coroutine deletion — a pre-2.3 artifact carrying
+        // B_MEMORY (3): retired with the §4 Memory→AddressSpace fold — a pre-§4 artifact carrying
         // one fails decode closed rather than resurrecting a dead cap kind.
+        // B_YIELDER (4): retired with the §2.3 coroutine deletion — same fail-closed treatment.
         B_ADDRESS_SPACE => DurableBinding::AddressSpace {
             base: r.uleb()?,
             size: r.uleb()?,
@@ -1198,8 +1221,30 @@ mod binding_window_tests {
         assert!(!ok(0, 0));
         assert!(!ok(0, 3 << 12));
         assert!(!ok(1 << 11, 1 << 12));
-        // Address-payload-free bindings always pass (nothing to confine).
+        // Address-payload-free bindings always pass (nothing to confine) — including the
+        // whole-window AddressSpace form (§4: the retired Memory kind), but only at base 0:
+        // a u64::MAX size anywhere else is malformed, not whole-window.
         assert!(binding_in_window(&DurableBinding::Exit, mapped));
-        assert!(binding_in_window(&DurableBinding::Memory, mapped));
+        assert!(binding_in_window(
+            &DurableBinding::AddressSpace {
+                base: 0,
+                size: u64::MAX
+            },
+            mapped
+        ));
+        assert!(!binding_in_window(
+            &DurableBinding::AddressSpace {
+                base: 1 << 12,
+                size: u64::MAX
+            },
+            mapped
+        ));
+        assert!(!binding_in_window(
+            &DurableBinding::Instantiator {
+                base: 0,
+                size: u64::MAX
+            },
+            mapped
+        ));
     }
 }

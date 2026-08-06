@@ -3357,10 +3357,10 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         // Exit (noreturn).
         "exit" => (cap_id::EXIT, 0),
         // Memory management (§3e/§4).
-        "vm_map" => (cap_id::MEMORY, 0),
-        "vm_unmap" => (cap_id::MEMORY, 1),
-        "vm_protect" => (cap_id::MEMORY, 2),
-        "vm_page_size" => (cap_id::MEMORY, 3),
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
         // AddressSpace / SharedRegion aliasing (§13/§14).
         "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
         "vm_region_map" => (cap_id::SHARED_REGION, 0),
@@ -4332,15 +4332,16 @@ impl HostCap {
             iface: None,
         }
     }
-    /// The `Memory` capability: `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` are ops 0/1/2/3 on the
-    /// guest window. `op` selects which — so `HostCap::memory(0)` binds a `vm_map` import and
-    /// `HostCap::memory(3)` a `vm_page_size` import. Granting it twice (once per name) is fine: the
-    /// capability acts on the single shared window, not per-handle state, so both handles see the same
-    /// growth. This is the name-keyed ([`instantiate_with_imports`]) counterpart to the fixed powerbox's
-    /// one Memory grant serving all four names by `(type_id, op)`.
+    /// Whole-window memory authority (an `AddressSpace` over the full window — CONSOLIDATION §4):
+    /// `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` are ops 0/1/2/3 on the guest window. `op`
+    /// selects which — so `HostCap::memory(0)` binds a `vm_map` import and `HostCap::memory(3)` a
+    /// `vm_page_size` import. Granting it twice (once per name) is fine: the capability acts on the
+    /// single shared window, not per-handle state, so both handles see the same growth. This is the
+    /// name-keyed ([`instantiate_with_imports`]) counterpart to the fixed powerbox's one whole-window
+    /// grant serving all four names by `(type_id, op)`.
     pub fn memory(op: u32) -> HostCap {
         HostCap {
-            type_id: cap_id::MEMORY,
+            type_id: cap_id::ADDRESS_SPACE,
             op,
             grant: Arc::new(|h, _| h.grant_memory()),
             unbound: false,
@@ -4722,7 +4723,6 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
             cap.type_id,
             cap_id::STREAM
                 | cap_id::EXIT
-                | cap_id::MEMORY
                 | cap_id::ADDRESS_SPACE
                 | cap_id::IO_RING
                 | cap_id::BLOCKING
@@ -4878,7 +4878,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
 fn generic_dispatch_iface(type_id: u32) -> bool {
     matches!(
         type_id,
-        cap_id::STREAM | cap_id::EXIT | cap_id::CLOCK | cap_id::MEMORY | cap_id::HOST_PROC
+        cap_id::STREAM | cap_id::EXIT | cap_id::CLOCK | cap_id::ADDRESS_SPACE | cap_id::HOST_PROC
     )
 }
 
@@ -5309,7 +5309,10 @@ impl Instance {
                                 (cap_id::STREAM, 1) => stdout, // write
                                 (cap_id::STREAM, _) => stdin,  // read
                                 (cap_id::EXIT, _) => exit,
-                                (cap_id::MEMORY, _) => memory,
+                                // One kind post-§4: the vm_map family (ops 0–3) binds the
+                                // whole-window grant; sub/region_create bind the sized one
+                                // (op-keyed, like Stream above).
+                                (cap_id::ADDRESS_SPACE, 0..=3) => memory,
                                 (cap_id::ADDRESS_SPACE, _) => addrspace,
                                 (cap_id::IO_RING, _) => ioring,
                                 (cap_id::BLOCKING, _) => blocking,

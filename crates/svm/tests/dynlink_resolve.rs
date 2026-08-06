@@ -132,18 +132,18 @@ fn symbol_table_resolves_a_capability_import_by_name() {
                 }\n";
     let blob = encode_module(&parse_module(unit).expect("parse cap-importing unit"));
 
-    // The loader binds "write" to a host capability (type_id 3, op 1) via the symbol table's Cap kind.
+    // The loader binds "write" to a host capability (type_id 5, op 1) via the symbol table's Cap kind.
     let symtab =
-        encode_symbol_table(&[("write", Resolved::Cap(ResolvedCap { type_id: 3, op: 1 }))]);
+        encode_symbol_table(&[("write", Resolved::Cap(ResolvedCap { type_id: 5, op: 1 }))]);
     let funcs = jit_blob_validator(&blob, None, &symtab)
         .expect("the capability import resolves by name and re-verifies");
 
-    // Resolution lowered `call.sym "write"` to a concrete `cap.call 3 1` (no import survives).
+    // Resolution lowered `call.sym "write"` to a concrete `cap.call 5 1` (no import survives).
     let lowered_to_cap_call = funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,
             Inst::CapCall {
-                type_id: 3,
+                type_id: 5,
                 op: 1,
                 ..
             }
@@ -151,6 +151,6 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     });
     assert!(
         lowered_to_cap_call,
-        "the named capability import must lower to `cap.call 3 1`"
+        "the named capability import must lower to `cap.call 5 1`"
     );
 }
