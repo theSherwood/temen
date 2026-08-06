@@ -2889,8 +2889,6 @@ impl CompiledModule {
                 poll_thunk: instantiator_rt::poll as *const () as i64,
                 detach_thunk: instantiator_rt::detach as *const () as i64,
                 kill_thunk: instantiator_rt::kill as *const () as i64,
-                instantiate_granted_thunk: instantiator_rt::instantiate_granted as *const () as i64,
-                instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
                 instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
                 instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
                     as *const () as i64,
@@ -4636,10 +4634,8 @@ pub(crate) unsafe fn compile_child_and_run(
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
-            // A durable nested child never installs grant hooks, and the thunks fail durable spawns
-            // closed anyway — wired only so the `InstEnv` is fully populated (ops 8/11 → EINVAL/CapFault).
-            instantiate_granted_thunk: instantiator_rt::instantiate_granted as *const () as i64,
-            instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
+            // A durable nested child never installs grant hooks, and the thunks fail durable
+            // spawns closed anyway — wired only so the `InstEnv` is fully populated.
             instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
                 as i64,
             instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
@@ -5642,8 +5638,6 @@ struct InstEnv {
     // PROCESS.md S2 grant thunks — parity with the interpreter's re-grant of caps into a child's
     // powerbox: op 8 (`instantiate_granted`, single positional cap) and op 11 (`instantiate_named`,
     // multi-cap by name).
-    instantiate_granted_thunk: i64,
-    instantiate_named_thunk: i64,
     // STAGE1.md — op 13 (`instantiate_module_named`): run a separate `Module` *and* re-grant caps by
     // name (the shell "exec" primitive — union of op 5 + op 11).
     instantiate_module_named_thunk: i64,
@@ -5663,8 +5657,6 @@ impl InstEnv {
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
-            instantiate_granted_thunk: 0,
-            instantiate_named_thunk: 0,
             instantiate_module_named_thunk: 0,
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
@@ -8371,12 +8363,8 @@ fn lower_instantiator(
         1 => Some((&[VI32], &[VI64])),
         // S3 lifecycle: poll / detach / kill (child) -> i32 status
         9 | 10 | 12 => Some((&[VI32], &[VI32])),
-        // S2 instantiate_granted: (grant_handle, entry, off, size_log2, quota) -> child handle — the
-        // grant handle rides an i64 slot (the guest widens its i32 handle), like every other arg.
-        8 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // S2 instantiate_named: (grants_ptr, grants_n, entry, off, size_log2, quota) -> child handle
-        11 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn
+        // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn (§3d: the
+        // scalar granted/named spawns, ops 8/11, died into it — grants are record data now)
         17 => Some((&[VI64], &[VI32])),
         // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
         // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
@@ -8505,68 +8493,6 @@ fn lower_instantiator(
             let call = b
                 .ins()
                 .call_indirect(tref, thunk, &[nursery, child, trap_out]);
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
-        8 => {
-            // S2 instantiate_granted(nursery, mem_base, handle:i32, grant_handle:i32, entry:i64,
-            //   off:i64, size_log2:i64, fuel:i64, trap_out:i64) -> child_handle:i32. Like `instantiate`
-            // (op 0) but re-grants a coordinate-free cap (arg 0) into the child's powerbox; the child
-            // is a same-module child so there is no `Module` handle.
-            let h = slot_i32(b, get(vals, handle)?); // the Instantiator handle (resolved for authority)
-                                                     // The grant handle rides an i64 slot in the guest sig; the thunk takes it as i32.
-            let grant = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let entry = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
-            let off = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
-            let size_log2 = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
-            let fuel = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64, I64, I64, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.instantiate_granted_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery, mem_base, h, grant, entry, off, size_log2, fuel, trap_out,
-                ],
-            );
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
-        11 => {
-            // S2 instantiate_named(nursery, mem_base, mem_size:i64, handle:i32, grants_ptr:i64,
-            //   grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64, trap_out:i64) -> handle:i32.
-            // Like op 8 but the child's caps come from a grant-record list in the window (`mem_size`
-            // bounds the host-side reads); no positional grant arg, same-module child.
-            let h = slot_i32(b, get(vals, handle)?);
-            let mem_size = b.ins().iconst(I64, lower.mapped as i64);
-            let grants_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let grants_n = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
-            let entry = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
-            let off = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
-            let size_log2 = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
-            let fuel = slot_i64(b, get(vals, *args.get(5).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.instantiate_named_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery, mem_base, mem_size, h, grants_ptr, grants_n, entry, off, size_log2,
-                    fuel, trap_out,
-                ],
-            );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

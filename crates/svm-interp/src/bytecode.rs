@@ -889,17 +889,17 @@ fn scan_seams(funcs: &[Func]) -> Seams {
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
-                    // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 11 =
-                    // instantiate_named, op 13 = instantiate_module_named (all executor children,
-                    // scheduler-driven — the named variants re-grant caps but spawn the same kind of
-                    // confined task); everything else on INSTANTIATOR/YIELDER is the inline coroutine
-                    // round-trip. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
+                    // instantiate_module_named, op 17 = instantiate_rec (all executor children,
+                    // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
+                    // kind of confined task); everything else on INSTANTIATOR is the legacy coroutine
+                    // residue. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
                     // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
                     // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 11 | 13 | 14 | 17,
+                        op: 0 | 1 | 5 | 13 | 14 | 17,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -1504,19 +1504,6 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     quota: g(args[3]),
                     dst,
                     grants: None,
-                },
-                // op 11 = instantiate_named: op 0 + a by-name grant list. Args:
-                // (grants_ptr, grants_n, entry, off, size_log2, quota). The child runs the holder's own
-                // program (same module as op 0); the driver reads the grant records from the parent
-                // window and re-grants each cap into the child powerbox.
-                (cap_id::INSTANTIATOR, 11) if args.len() >= 6 => Op::Instantiate {
-                    handle: g(*handle),
-                    entry: g(args[2]),
-                    off: g(args[3]),
-                    size_log2: g(args[4]),
-                    quota: g(args[5]),
-                    dst,
-                    grants: Some((g(args[0]), g(args[1]))),
                 },
                 (cap_id::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),

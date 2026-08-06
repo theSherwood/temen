@@ -9259,14 +9259,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (drained) only at spawn commit.
                     let mut rec_budget_h: Option<i32> = None;
                     #[allow(clippy::type_complexity)]
-                    // `grant`/`named` carry the re-grant **handles** (not pre-resolved bindings): a pipe
+                    // `named` carries the re-grant **handles** (not pre-resolved bindings): a pipe
                     // end must alias its shared backing into the child, not copy a parent-local index, so
                     // resolution happens at child construction via `regrant_into_child`. Validated here.
-                    let (op, child_mod, askip, grant, named): (
+                    let (op, child_mod, askip, named): (
                         u32,
                         Option<ChildMod>,
                         usize,
-                        Option<i32>,
                         Vec<(String, i32)>,
                     ) = match *op {
                         5 => {
@@ -9292,64 +9291,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 0, // instantiate_module → instantiate
                                 Some(g),
                                 1,
-                                None,
                                 Vec::new(),
                             )
-                        }
-                        // §14 `instantiate_granted(grant_handle, entry, off, size_log2, quota)`
-                        // (PROCESS.md S2): exactly `instantiate` (op 0), except the first arg is a
-                        // handle to one of the parent's own coordinate-free capabilities (`Stream` /
-                        // `Exit` / `Clock`) that is **re-granted into the child's powerbox**, so a
-                        // child can do I/O instead of being born destitute. The child receives its
-                        // handle as a **third** entry arg (after `Instantiator`, `AddressSpace`); a
-                        // forged / non-copyable handle is a `CapFault`.
-                        8 => {
-                            let gh =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as i32;
-                            // Validate the grant is re-grantable now (coordinate-free cap or pipe end);
-                            // a forged / non-grantable handle fails the spawn closed.
-                            {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
-                            }
-                            (0, None, 1, Some(gh), Vec::new())
-                        }
-                        // §14 `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
-                        // (PROCESS.md S2): `instantiate` (op 0) plus a **grant list** — `grants_n`
-                        // 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
-                        // window-relative `grants_ptr`. Each record's `handle` (one of the parent's own
-                        // coordinate-free caps) is re-granted into the child's powerbox **under its
-                        // name**, so the child discovers it by `cap.self.resolve(name)` — the general
-                        // multi-cap, name-based form of op 8 (no fixed arg-slot coupling). A forged /
-                        // non-copyable handle, an out-of-window record/name, or non-UTF-8 name fails the
-                        // whole spawn closed (`CapFault` / `MemoryFault`); `flags` is reserved-zero.
-                        11 => {
-                            let grants_ptr =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let grants_n =
-                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
-                                }
-                                list.push((name, handle));
-                            }
-                            (0, None, 2, None, list)
                         }
                         // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr)` (op 17): the
                         // config-record spawn. One record subsumes every spawn variant as data —
@@ -9459,59 +9402,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 None
                             };
                             rec_geo = Some((entry, off, size_log2, quota));
-                            (0, g, 0, None, list)
-                        }
-                        // CONSOLIDATION.md §2.2 — `spawn_process_demand(grants_ptr, grants_n,
-                        // entry, off, size_log2, quota, pager_export)` (op 16): an op-11 process
-                        // child whose window starts demand-paged and whose recoverable faults
-                        // call op 0 of the **spawner's own impl export** `pager_export` — served
-                        // by the spawner's live serve loop (`svc.wait`) over its real window,
-                        // exactly as it serves any provider dispatch. The binding (own cell +
-                        // export index) is held substrate-side on the child vCPU: the child can
-                        // neither name nor call it (userfaultfd-style).
-                        16 => {
-                            let grants_ptr =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let grants_n =
-                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let pager_k =
-                                get_i64(&frames[top].vals, *args.get(6).ok_or(Trap::Malformed)?)?
-                                    as u32;
-                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
-                                }
-                                list.push((name, handle));
-                            }
-                            {
-                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                // A missing/empty pager export fails the spawn closed — before
-                                // any child code runs (§3.3 withhold discipline).
-                                let ok = hg
-                                    .self_module
-                                    .as_ref()
-                                    .and_then(|m| m.impl_exports.get(pager_k as usize))
-                                    .is_some_and(|e| !e.ops.is_empty());
-                                if !ok {
-                                    return Err(Trap::CapFault);
-                                }
-                                pager_ref = Some((Arc::clone(host), pager_k));
-                            }
-                            (0, None, 2, None, list)
+                            (0, g, 0, list)
                         }
                         // §14 `instantiate_module_named(module, grants_ptr, grants_n, entry, off,
                         // size_log2, quota)` (STAGE1.md — the shell "exec" primitive): the union of op 5
@@ -9564,9 +9455,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                                 list.push((name, handle));
                             }
-                            (0, Some(g), 3, None, list)
+                            (0, Some(g), 3, list)
                         }
-                        o => (o, None, 0, None, Vec::new()),
+                        o => (o, None, 0, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
                     let cfs: &[Func] = child_mod.as_ref().map_or(fs, |cm| &cm.funcs);
@@ -9587,21 +9478,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 None => (argn(0)? as u64, argn(1)? as u64, argn(2)?, argn(3)?),
                             };
                             // The child entry returns one `i64` and takes its starter capabilities as
-                            // `i64` args, in order: `Instantiator`, then (if 2+ params) `AddressSpace`,
-                            // then (S2 `instantiate_granted`, 3 params) the re-granted `Stream`/`Exit`/
-                            // `Clock`. A missing/mistyped entry is rejected, not run. When a grant is
-                            // supplied the entry **must** be the 3-arg form (so the child actually
-                            // receives the handle); without one, 1- or 2-arg as before.
+                            // `i64` args, in order: `Instantiator`, then (if 2 params)
+                            // `AddressSpace`. A missing/mistyped entry is rejected, not run. (The
+                            // op-8 positional 3-arg grant form died with §3d — a child discovers
+                            // re-granted caps by name, via the record's grant list.)
                             let want_as =
                                 cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
                             let ok_entry = cfs.get(entry as usize).is_some_and(|f| {
                                 f.results == [ValType::I64]
                                     && f.params.iter().all(|p| *p == ValType::I64)
-                                    && if grant.is_some() {
-                                        f.params.len() == 3
-                                    } else {
-                                        f.params.len() == 1 || f.params.len() == 2
-                                    }
+                                    && (f.params.len() == 1 || f.params.len() == 2)
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19). A
@@ -9691,17 +9577,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_attestation(catt);
                                 let cinst = ch.grant_instantiator(0, child_size);
                                 let cas = ch.grant_address_space(0, child_size);
-                                // S2: re-grant the parent capability into the child's fresh powerbox —
-                                // a coordinate-free cap (`Stream`/`Exit`/`Clock`, a stdout/stderr stream
-                                // sharing the parent's sink) or a **pipe end** (aliasing its shared FIFO,
-                                // the cross-domain `cmd1 | cmd2` grant). Its handle is guest-visible data
-                                // the child receives as its third entry arg. Pre-validated above, so the
-                                // regrant cannot fail. `regrant_into_child` is the same helper the JIT's
-                                // `spawn_granted_child` uses, so both backends stay in lockstep.
-                                let cgrant = grant.and_then(|gh| {
-                                    let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                                    hg.regrant_into_child(gh, &mut ch)
-                                });
                                 // S2 named grant list (op 11): install each re-granted cap into the child
                                 // **under its name** (so the child resolves it by `cap.self.resolve`).
                                 // Empty for every other op.
@@ -9751,9 +9626,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let mut child_args = vec![Value::I64(cinst as i64)];
                                     if want_as {
                                         child_args.push(Value::I64(cas as i64));
-                                    }
-                                    if let Some(cg) = cgrant {
-                                        child_args.push(Value::I64(cg as i64));
                                     }
                                     // Quota: the child's fuel, sub-allocated from (and capped
                                     // by) ours. §3b: a budget-funded spawn draws fuel from the

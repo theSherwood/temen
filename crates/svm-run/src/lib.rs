@@ -3844,9 +3844,9 @@ fn module_demand_spawns(m: &svm_ir::Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
             b.insts.iter().any(|i| match i {
-                svm_ir::Inst::CapCall {
-                    type_id: 6, op: 16, ..
-                } => true,
+                // §3d: op 16 died into the record; the fold key is now purely "could this
+                // module build a pager record" — op 17 + impl exports (an export-less module
+                // cannot name a pager, and its pager records CapFault identically everywhere).
                 svm_ir::Inst::CapCall {
                     type_id: 6, op: 17, ..
                 } => !m.impl_exports.is_empty(),

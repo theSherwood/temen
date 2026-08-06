@@ -136,6 +136,16 @@ as a **conditional** import — existing modules keep their exact import set).
   on any guest memory op), so a *durable* parent cannot build the op-17 record in its window;
   `durable_nesting{,_jit}.rs` stay on the scalar ops until relocation lifts that restriction.
   Ops **8/11/16** have no such user and delete with 3d.1; ops 0/5 join op 13 as gated arms.
+  - **3d.1c (landed)** — ops **8/11/16 are deleted** across the tiers: the tree-walker's three
+    arms (and the op-8 positional-grant plumbing — the `grant` tuple slot, `cgrant` regrant, the
+    3-arg entry form), the Cranelift contract rows + lowering arms + the `instantiate_granted`
+    thunk (`instantiate_named` stays — the record delegates to it), the bytecode op-11 compile
+    arm, and svm-run's op-16 fold clause. An op-8/11/16 `cap.call` now fails closed (`CapFault`)
+    on every tier, like any unknown op. Callers were migrated first: the stage1 op-11 trio, the
+    paging op-16 pair (the record's pager field), and the op-8 quartet re-spelled as one-entry
+    named-grant records (children resolve `"g"` — the positional 3rd-entry-arg ABI died;
+    compiled-C applets get handles through the import-manifest binding, see
+    `stage1_granted_argv_applet.rs`'s header).
   - **3d.1a (landed)** — the record is **native on the bytecode tier** (`Op::InstantiateRec`):
     the 56-byte record is runtime data, so it is parsed at exec time (confined `read_window`)
     and folds onto the existing `Outcome::Instantiate`/`InstantiateModule` driver plumbing
