@@ -39,23 +39,42 @@ so it is not self-contained and was never *executed*. That masked this gap.
   the metamethod cluster (`luaT_trybinTM`/`callbinTM`/`luaT_gettmbyobj`/`luaV_equalobj`/…). Both
   full-reload and `selective` diverge, so the 2-frame case is a *caller-resume* problem, not a tag one.
 
-**Root cause (partial).** Two distinct sub-problems: (a) the **selective-reload result** (`value`
-dynamic, `tag` pinned integer) flows into `OP_MUL`'s fast path, but the arithmetic handler drags in an
-inlined helper that returns `Unsupported` — needs that helper cut (like the GC barriers in slice 1) or
-the access supported; (b) **nested returns**: after a Lua callee returns, the caller re-enters
-`startfunc` and re-reads `ci->savedpc`; each frame is captured at its own first dispatch, but composing
-two live frames still diverges — likely the caller's post-call resume `pc` (savedpc mem-cell vs
-overlay) or a per-frame `ci` field read via `read_const_mem` (the overlay) instead of the live pinned
-cell. Also note **two *sequential* distinct callees reuse one cached `CallInfo`** (`ci->next`), which a
-single const overlay can't represent — a third facet of the same area.
+**Root cause — traced 2026-08-06 (follow-up investigation).** The original read of facet (a) ("cut one
+`OP_MUL` helper") was too shallow; the real chain is two layered problems.
 
-**Fix sketch.** (1) Add an execution test for the single-call-arithmetic case; identify `f661`'s
-unsupported op and cut it (extend the read/touch cut lists) or support the access. (2) For nested,
-instrument the caller-resume `pc` at the first `startfunc` re-entry after a callee return; make
-`emit_poscall` derive `ci->func`/`savedpc` from the live mem cell, not `read_const_mem`. (3) For
-sequential distinct callees, model the reused `CallInfo` (per-call-site pinned `ci` fields rather than a
-fixed overlay). The capture harness for all three is written and working (distinct-frame capture, ra
-keying); the blocker is the engine-side return/arith composition, not the test plumbing.
+*Layer 1 — the cut set is missing the allocation/GC/string primitives.* `f661` is not an arith helper;
+it is the **arena allocator grow path** (`l_alloc → f663 → f661`), whose `CallImport import:3` is the
+host `vm_map`. It is reached because `l_alloc` (`f531`, no direct callers) is the `frealloc` pointer,
+devirtualized by `indirect_targets_cap` and projected. Cutting `l_alloc` alone just moves the wall: its
+`Dyn` result makes "did the alloc succeed?" dynamic, so the fold explores the **alloc-failure cold
+subtree** — `luaM_realloc_ → luaC_fullgc` (emergency GC) → retry → `fread`/`fwrite`/`strstr` and a
+second `l_alloc.777` clone. These are all stateful host-backed machinery that must be **cut like the GC
+barriers already are**. The needed additions (confirmed): `luaM_realloc_`, `luaM_saferealloc_`,
+`luaM_malloc_`, `luaM_growaux_`, `luaS_resize`, `luaS_newlstr`, `luaC_fullgc`. With those cut,
+**`print(add(2,3))` (no arithmetic on the result) projects and executes correctly** — so the cut-set is
+necessary and, for the plain-return case, sufficient.
+
+*Layer 2 (the real blocker) — the caller's frame base goes dynamic after a Lua-call return.* With the
+cut-set in place, `print(add(2,3) * 10)` still fails: the fold reaches `callbinTM` (the `OP_MULK`
+**metamethod** slow path) → `luaD_throw` (the `longjmp`, unsupported). It gets there because the MULK
+fast-path guard `ttisinteger(R[B])` **does not fold**: instrumenting `eval_load` shows **no
+constant-base access to the caller's register file at all after the return** (`R[B] = base + B*16` has a
+`Dyn` `base`). So even though the selective reload pins the result *tag* at the right in-region address
+(`ra_add+8 = VNUMINT`, verified), the MULK never reads that cell — it reads a dynamic address. The
+caller frame **base** (`base = ci->func + 1`), a loop-carried SSA value threaded through the shared
+dispatch / post-return block, is materialized to `Dyn` across the return, defeating every
+constant-address register read the caller makes afterwards. This is the **same root as facet (b)**
+(nested caller-resume): the caller's post-return frame state isn't reconstructed as constant.
+
+**Fix sketch (revised).** (1) Land the cut-set additions above (necessary regardless). (2) The core fix
+is making the caller's **`base` fold to a constant after `emit_poscall`**: `L->ci` is already re-pinned
+to the caller `ci` (const), so `base = ci->func + 1` *should* reduce — the failure is that `base` is
+carried as a threaded block param and materialized, not re-derived. Options: have the poscall re-seed
+the caller's `base`/`ci` SSA cells from the pinned const `L->ci`, or specialize the post-return/dispatch
+block per-frame so `base` isn't a shared `Dyn` param. (3) Sequential distinct callees reusing one cached
+`CallInfo` (`ci->next`) remain a separate facet (per-call-site pinned `ci` fields vs a fixed overlay).
+The capture harness for all cases works; the blocker is engine-side post-return frame reconstruction.
+Repro kept in the session scratchpad (`diag_arith.rs`).
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
