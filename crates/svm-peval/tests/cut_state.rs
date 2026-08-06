@@ -478,6 +478,133 @@ fn a_deopt_edge_receives_the_threaded_entry_argument() {
     }
 }
 
+// =============================================================================================
+// Slice 4: edge-level deopt — deopt ONE incoming edge of a SHARED block, leaving the block
+// projected for its other predecessors.
+//
+// This is the shape the real `OP_CALL` divergence needs: an interpreter's dispatch block is
+// reached from many opcodes; one cold opcode arm re-enters dispatch in a way that diverges
+// (the Lua-function re-dispatch after a C-function call), but every other edge into dispatch is
+// a live fast path that must still be projected. `deopt_targets` can't express that — it would
+// deopt the whole block, killing the fast paths too. `deopt_edges` deopts the single
+// `(from_block -> to_block)` CFG edge.
+//
+// Toy: input x → window@16. Block 1 splits (dynamic) into a fast pred (block 2) and a cold pred
+// (block 3); BOTH branch to the shared block 4, which returns `x*3`. We mark ONLY the cold edge
+// `(3 -> 4)` as a deopt edge. So x<50 flows 2→4 and PROJECTS block 4 (a residual multiply
+// survives), while x>=50 flows 3→4 and DEOPTS to the handler (`() -> i64`, also `x*3`). Both
+// arms compute x*3, so the residual matches the source for every input — and the projected
+// multiply proves the shared block was NOT deopted wholesale, only the one edge.
+const SHARED_BLOCK_EDGE_DEOPT: &str = r#"
+memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v16 = i64.const 16
+  i64.store v16 v0
+  br 1()
+}
+block 1 () {
+  v16 = i64.const 16
+  vx = i64.load v16
+  v50 = i64.const 50
+  vlt = i64.lt_s vx v50
+  br_if vlt 2() 3()
+}
+block 2 () {
+  br 4()
+}
+block 3 () {
+  br 4()
+}
+block 4 () {
+  v16 = i64.const 16
+  vx = i64.load v16
+  v3 = i64.const 3
+  vr = i64.mul vx v3
+  return vr
+}
+}
+func () -> (i64) {
+block 0 () {
+  v16 = i64.const 16
+  vx = i64.load v16
+  v3 = i64.const 3
+  vr = i64.mul vx v3
+  return vr
+}
+}
+"#;
+
+fn n_muls(f: &svm_ir::Func) -> usize {
+    f.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| {
+            matches!(
+                i,
+                Inst::IntBin {
+                    op: svm_ir::BinOp::Mul,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+#[test]
+fn one_edge_of_a_shared_block_deopts_while_the_block_still_projects() {
+    let m = parse_module(SHARED_BLOCK_EDGE_DEOPT).expect("parse");
+    verify_module(&m).expect("source verifies");
+
+    // Edge deopt: only the cold edge (3 -> 4) bails; the fast edge (2 -> 4) projects block 4.
+    let cfg = SpecConfig {
+        rename: Some((16, 24)),
+        rename_is_private: true,
+        deopt_edges: vec![(0, 3, 4)],
+        deopt_handler: Some(1),
+        ..SpecConfig::default()
+    };
+    let r = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg).expect("specializes");
+    verify_module(&r).expect("residual verifies");
+
+    assert_eq!(r.funcs.len(), 2, "entry + the carried resume handler");
+    assert_eq!(
+        n_return_calls(&r.funcs[0]),
+        1,
+        "exactly the one cold edge deopts via a tail-call to the handler"
+    );
+    assert_eq!(
+        n_muls(&r.funcs[0]),
+        1,
+        "the shared block is still PROJECTED via the fast edge (its multiply survives) — \
+         edge-deopt did not kill the whole block"
+    );
+
+    for x in [0i64, 1, 49, 50, 51, 100, -7] {
+        assert_eq!(run(&r, x), run(&m, x), "diverged at x={x}");
+        assert_eq!(run(&r, x), Ok(vec![Value::I64(x * 3)]), "x={x}");
+    }
+
+    // Contrast: deopt_targets on the same block (0, 4) deopts BOTH edges — the multiply is gone.
+    let cfg_target = SpecConfig {
+        rename: Some((16, 24)),
+        rename_is_private: true,
+        deopt_targets: vec![(0, 4)],
+        deopt_handler: Some(1),
+        ..SpecConfig::default()
+    };
+    let rt = specialize_with_config(&m, 0, &[SpecArg::Dynamic], &cfg_target).expect("specializes");
+    verify_module(&rt).expect("residual verifies");
+    assert_eq!(
+        n_muls(&rt.funcs[0]),
+        0,
+        "target-deopt kills the whole block — no projected multiply survives (the edge vs target distinction)"
+    );
+    for x in [0i64, 49, 50, 100] {
+        assert_eq!(run(&rt, x), run(&m, x), "target-deopt diverged at x={x}");
+    }
+}
+
 #[test]
 fn a_no_arg_handler_still_resumes_from_the_window() {
     // The `() -> R` shape is unchanged by arg threading: same program, but the handler ignores args
