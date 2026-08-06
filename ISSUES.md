@@ -21,7 +21,7 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I69 — `threaded_offers::concurrent_callers_share_one_threaded_instance` intermittently loses one caller's increment under full-suite parallel load (S4, flaky — likely a real lost-update window in the threaded-offer admission) — recorded 2026-08-06 on PR #634
+### I69 — `threaded_offers::concurrent_callers_share_one_threaded_instance` intermittently loses one caller's increment under full-suite parallel load (S4→S2, real lost-caller window in the threaded-offer admission) — recorded 2026-08-06 on PR #634 — **FIX LANDED 2026-08-06** (`claude/i69-issues-luifte`)
 
 **Symptom.** Under `cargo test -p svm-interp` with the full suite running in parallel, the test
 fails with `left: Ok([I64(10)]) right: Ok([I64(21)])` — one of the two spawned callers' writes
@@ -29,11 +29,27 @@ fails with `left: Ok([I64(10)]) right: Ok([I64(21)])` — one of the two spawned
 observed once (Linux, local, suite under load). The file was untouched by the change under test
 (§3d.1 record migration), so this is pre-existing.
 
-**Reading.** `10` (not `11`, not `0`) means exactly one handler's read-modify-write was lost —
-the classic lost-update interleaving, which points at the §7.x threaded-offer admission
-(`drive_arc_shared` over the cell) rather than test scaffolding. If it recurs, treat it as a
-real S3 race in the threaded lane and stress it like I68 (`--test-threads 1` × N under load);
-until then, rerun-once policy (I53/I66 class).
+**Root cause (not a lost *update* — a lost *caller*).** The earlier "lost read-modify-write /
+`drive_arc_shared`" reading was wrong: the two writes are to **distinct** cells (16, 24) with no
+byte-level race, and the host-side `drive_arc_shared` tier isn't on this test's path (it goes
+`thread.spawn` → guest `cap.call` → the **eval-loop** admission). The real defect is in that
+eval-loop arm (`crates/svm-interp/src/lib.rs`): admission opens with `state_.try_lock()`, and the
+`Err(WouldBlock)` arm answered `-EAGAIN` **before** the policy was even checked. Two concurrent
+callers on distinct vCPUs collide on that brief snapshot lock; the loser is handed a spurious
+`-EAGAIN`, so its `store` handler **never runs** and its cell stays `0`. The thread's return value
+(`-11`) is discarded by the consumer, so the only visible effect is the short sum (`10 + 0 = 10`).
+This violates the `Threaded` contract (CALLS.md §10.1: **no admission gate**) — the `-EAGAIN`-on-held
+-lock is correct *only* for the `single`/`drive_arc` tiers.
+
+**Fix.** For `entry_.policy == OfferPolicy::Threaded`, the `WouldBlock` arm now **blocks** to acquire
+the state lock instead of refusing. Bounded and deadlock-free: a threaded provider's critical section
+holds `state_` only to fork the window + clone the powerbox cell and drops it **before** the handler
+runs (it never spans a sub-run — a threaded offer is never durable, so the long-holding 3a fallback
+can't apply, and the lock is released before any nested `cap.call`). Every other tier keeps the 3a
+`-EAGAIN` semantics. Regression: `concurrent_callers_never_lose_an_admission` fans out 10 concurrent
+threaded callers and sums every cell; it failed **8/8** (short sums 35–53 vs 55) before the fix and
+passes **8/8** after (plus the full `svm-interp` suite, fmt, clippy green). Reclassified S4→S2 — a
+silently-dropped guest dispatch is a wrong result, not a flake.
 
 ### I68 — `fork_manager` guest-fork race: intermittent HANG or wrong result in the FORK.md fork/join path (S3, real race — reclassified from S4 after recurrence + Linux repro) — recorded 2026-08-05 on PR #627, updated 2026-08-06 on PR #629 — **FIX LANDED 2026-08-06** (`claude/i68-issue-fix-sxghke`)
 
