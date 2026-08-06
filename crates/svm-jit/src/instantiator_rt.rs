@@ -325,6 +325,8 @@ pub(crate) struct Nursery {
     /// param threads through the compile pipeline.
     grant_build: std::sync::atomic::AtomicUsize,
     grant_build_named: std::sync::atomic::AtomicUsize,
+    /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
+    grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
     grant_bind_imports: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
@@ -380,6 +382,7 @@ impl Nursery {
             child_code: Mutex::new(HashMap::new()),
             grant_build: std::sync::atomic::AtomicUsize::new(0),
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
+            grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
             grant_register_serve: std::sync::atomic::AtomicUsize::new(0),
@@ -392,6 +395,11 @@ impl Nursery {
     /// powerbox (positional op 8 / by-name op 11) and release it after the run. Called once at run entry
     /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
     /// `None` leaves them `0` (both ops stay an inert `CapFault`).
+    /// §3c.2 — install/clear the Budget taker (see [`crate::CompiledModule::set_budget_taker`]).
+    pub(crate) fn set_budget_take(&self, addr: usize) {
+        self.grant_budget_take.store(addr, Ordering::Release);
+    }
+
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
         let (b, bn, r, bi, m, t, rs) = match hooks {
             Some(h) => (
@@ -1198,12 +1206,48 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
+    let mut quota = quota;
     if budget != 0 {
         if quota != 0 {
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
-        return EINVAL as i32; // §3c.2: Budget-funded spawn on the JIT is a parity follow-up
+        let taker_addr = (*rt).grant_budget_take.load(Ordering::Acquire);
+        if taker_addr == 0 {
+            // No taker installed (bare harnesses): the §3c gap — probeable, budget untouched.
+            return EINVAL as i32;
+        }
+        let taker: crate::BudgetTaker = core::mem::transmute(taker_addr);
+        if !(0..64).contains(&size_log2) {
+            return EINVAL as i32; // same refusal the delegate would give, before any drain
+        }
+        let child_size = 1u64 << size_log2;
+        let mut taken = crate::BudgetTaken {
+            fuel: -1,
+            spawn: -1,
+        };
+        // Peek first (validate + mem-quota gate, budget intact on refusal)…
+        match taker((*rt).cap_ctx, budget, child_size, 0, &mut taken, trap_out) {
+            1 => {}
+            2 => return EINVAL as i32,
+            _ => return 0, // CapFault set
+        }
+        if taken.spawn >= 0 || taken.fuel == 0 {
+            // Bounded spawn ceilings and bounded-zero fuel need child-quota threading this
+            // tier doesn't have yet — the narrowed §3c.2 gap (probeable, budget intact; the
+            // interpreter is the reference).
+            return EINVAL as i32;
+        }
+        // …then drain at commit: past every local guard, the delegate's own guards repeat the
+        // peek's (same size/entry/carve math), so a post-drain refusal is unreachable in
+        // practice; a same-domain sibling racing `split` between peek and drain gets
+        // either-or (its own doing — the armed fuel is the peeked value).
+        match taker((*rt).cap_ctx, budget, child_size, 1, &mut taken, trap_out) {
+            1 => {}
+            2 => return EINVAL as i32,
+            _ => return 0,
+        }
+        quota = if taken.fuel < 0 { 0 } else { taken.fuel };
     }
     match (modh >= 0, grants_n > 0) {
         (false, false) => instantiate(

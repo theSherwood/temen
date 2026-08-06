@@ -682,6 +682,32 @@ pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 /// through the compile pipeline next to [`ModuleResolver`]; `None` ⇒ `instantiate_granted` (op 8) and
 /// `instantiate_named` (op 11) are inert `CapFault`s (a host that re-grants nothing), exactly as a
 /// missing module resolver makes the module ops a `CapFault`.
+/// §3c.2 — one Budget read/consume for the record spawn (op 17), host-side. `mode` 0 = **peek**
+/// (validate: resolve the handle, check `child_size` against the mem quota, report fuel/spawn —
+/// budget untouched); `mode` 1 = **drain** (consume to zero at spawn commit). Returns 1 = ok
+/// (`out` filled), 2 = refused (mem over a bounded quota — the spawn is a probeable `-EINVAL`,
+/// budget intact), 0 = `CapFault` set in `*trap_out` (dangling/mistyped handle). Mirrors the
+/// interpreter's peek-then-drain discipline at its op-17 arm.
+///
+/// # Safety
+/// `ctx` is the run's parent-`Host` pointer (the cap thunk's ctx); `out`/`trap_out` writable.
+pub type BudgetTaker = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    handle: i32,
+    child_size: u64,
+    mode: i32,
+    out: *mut BudgetTaken,
+    trap_out: *mut i64,
+) -> i32;
+
+/// §3c.2 — the Budget fields a record spawn consumes: `fuel` / `spawn` with the Budget object's
+/// `-1` = unbounded convention (`mem` is enforced inside the taker against `child_size`).
+#[repr(C)]
+pub struct BudgetTaken {
+    pub fuel: i64,
+    pub spawn: i64,
+}
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
@@ -3430,6 +3456,19 @@ impl CompiledModule {
         }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
+    }
+
+    /// §3c.2 — install the [`BudgetTaker`] the record spawn (op 17) consumes a Budget through.
+    /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
+    /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
+    /// many existing hook constructors stay source-compatible.
+    pub fn set_budget_taker(&self, taker: Option<BudgetTaker>) {
+        #[cfg(fiber_rt)]
+        if let Some(n) = &self._nursery {
+            n.set_budget_take(taker.map_or(0, |t| t as usize));
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = taker;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {

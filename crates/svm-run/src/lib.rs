@@ -1763,6 +1763,35 @@ pub unsafe extern "C" fn module_resolver(
 /// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
 /// CALLS.md 5c.1c — the production granted-child hook set (`powerbox_compile_run` installs it on
 /// every JIT run whose module nests): the same callbacks the test harnesses wire by hand.
+/// §3c.2 — the production [`svm_jit::BudgetTaker`]: peek/drain a Budget on the run's parent
+/// `Host` for a record spawn, mirroring the interpreter's op-17 discipline exactly (see
+/// [`svm_interp::Host::budget_for_spawn`]).
+///
+/// # Safety
+/// `ctx` is the run's live `*mut Host` (the cap thunk's ctx); `out`/`trap_out` are writable.
+pub unsafe extern "C" fn budget_take(
+    ctx: *mut core::ffi::c_void,
+    handle: i32,
+    child_size: u64,
+    mode: i32,
+    out: *mut svm_jit::BudgetTaken,
+    trap_out: *mut i64,
+) -> i32 {
+    let host = &mut *(ctx as *mut Host);
+    match host.budget_for_spawn(handle, child_size, mode == 1) {
+        None => {
+            *trap_out = svm_jit::TrapKind::CapFault as i64;
+            0
+        }
+        Some(Err(())) => 2,
+        Some(Ok((fuel, spawn))) => {
+            (*out).fuel = fuel;
+            (*out).spawn = spawn;
+            1
+        }
+    }
+}
+
 pub fn production_grant_hooks() -> svm_jit::GrantChildHooks {
     svm_jit::GrantChildHooks {
         build: grant_child_build,
@@ -3445,6 +3474,8 @@ unsafe fn powerbox_compile_run(
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
         // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
         cm.set_grant_child_hooks(Some(production_grant_hooks()));
+        cm.set_budget_taker(Some(budget_take));
+        cm.set_budget_taker(Some(budget_take));
         if let Some(ip) = interrupt_ptr {
             m.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3487,6 +3518,7 @@ unsafe fn powerbox_compile_run(
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks()));
+    cm.set_budget_taker(Some(budget_take));
     if let Some(ip) = interrupt_ptr {
         host.set_epoch_cell(ip as usize);
     }

@@ -17570,6 +17570,29 @@ impl Host {
         }
     }
 
+    /// §3c.2 — the one Budget read/consume a record spawn performs, exposed for the JIT tier's
+    /// `BudgetTaker` callback (the interpreter's op-17 arm does the same peek-then-drain
+    /// inline). `drain = false` peeks (validates the handle and gates `child_size` against the
+    /// mem quota; budget untouched); `drain = true` consumes to zero at spawn commit. Returns
+    /// `None` for a dangling/mistyped handle (CapFault), `Some(Err(()))` when a bounded mem
+    /// quota refuses the carve (probeable `-EINVAL`, budget intact), else `Some(Ok((fuel,
+    /// spawn)))` with the Budget's `-1` = unbounded convention.
+    pub fn budget_for_spawn(
+        &mut self,
+        handle: i32,
+        child_size: u64,
+        drain: bool,
+    ) -> Option<Result<(i64, i64), ()>> {
+        let b = self.peek_budget(handle)?;
+        if b.mem >= 0 && child_size > b.mem as u64 {
+            return Some(Err(()));
+        }
+        if drain {
+            self.take_budget(handle)?;
+        }
+        Some(Ok((b.fuel, b.spawn)))
+    }
+
     pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
         let id = self.budgets.len() as u32;
         self.budgets.push(BudgetState { fuel, mem, spawn });
