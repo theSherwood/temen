@@ -48,10 +48,10 @@ fn io_cap(name: &str) -> Option<(u32, u32)> {
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
         "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::MEMORY, 0),
-        "vm_unmap" => (cap_id::MEMORY, 1),
-        "vm_protect" => (cap_id::MEMORY, 2),
-        "vm_page_size" => (cap_id::MEMORY, 3),
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
         "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
         _ => return None,
     })
@@ -91,7 +91,9 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
                     (cap_id::STREAM, 1) => handles[0],
                     (cap_id::STREAM, _) => handles[1],
                     (cap_id::EXIT, _) => handles[2],
-                    (cap_id::MEMORY, _) => handles[3],
+                    // One kind post-§4: the vm_map family (ops 0–3) binds the whole-window
+                    // grant; sub/region_create bind the sized one (op-keyed, like Stream).
+                    (cap_id::ADDRESS_SPACE, 0..=3) => handles[3],
                     (cap_id::ADDRESS_SPACE, _) => handles[4],
                     _ => return BoundImport::rebindable(0, 0, None),
                 };

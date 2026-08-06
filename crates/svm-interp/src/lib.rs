@@ -635,7 +635,7 @@ struct HostReplaySubstate {
     svc_queue: Vec<SvcDispatch>,
     svc_results: Vec<(u64, i64)>,
     svc_next_ticket: u64,
-    /// The Memory-cap growth-cap accounting at the checkpoint (slice 5) — without it, a restore
+    /// The memory growth-cap accounting at the checkpoint (slice 5) — without it, a restore
     /// would zero the count and the limit would go lenient after a seek.
     mem_mapped_bytes: u64,
 }
@@ -13355,22 +13355,23 @@ pub mod cap_id {
     pub const EXIT: u32 = 1;
     /// `Clock` — op 0 `now(clock_id) -> i64` nanoseconds.
     pub const CLOCK: u32 = 2;
-    /// `Memory` — op 0 `map`, 1 `unmap`, 2 `protect`, 3 `page_size` (§3e; real page protection —
-    /// see `Mem`).
-    pub const MEMORY: u32 = 3;
+    // 3: retired `Memory` (CONSOLIDATION §4, 2026-08-06). It was `AddressSpace` over the whole
+    // window minus `sub` — the degenerate form. Whole-window memory authority is now an
+    // `ADDRESS_SPACE` grant with the whole-window range (`Host::grant_memory`); the id stays
+    // reserved so an old artifact or guest naming it fails closed rather than aliasing a new kind.
     /// `SharedRegion` — a host-backed memory object aliased into the window (§13). op 0
     /// `map(window_offset, region_offset, len, prot)` aliases the region's pages into the window
     /// (the same backing may be mapped at *multiple* window offsets → zero-overhead aliasing, the
     /// magic-ring-buffer primitive); op 1 `unmap(window_offset, len)` drops the alias; op 2
     /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`. Granting the handle is how
     /// two domains come to share memory; `create`/`grant` (guest-minted regions, cross-domain) are a
-    /// §14 follow-up — today regions are host-granted, like `Memory`. A backing may be a fresh OS
+    /// §14 follow-up — today regions are host-granted. A backing may be a fresh OS
     /// shared object (`memfd`) **or a real host file** (`svm-run`'s `FileBacking`, minted by an
     /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
     /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).
     pub const SHARED_REGION: u32 = 4;
     /// `AddressSpace` — the §14 memory-management capability, **attenuable to a power-of-two
-    /// window sub-range** `[base, base+size)`. Like `Memory` but every op is confined to the
+    /// window sub-range** `[base, base+size)`. Every op is confined to the
     /// holder's sub-range (offsets are sub-range-relative, shifted by `base`): op 0 `map(off,len,prot)`,
     /// 1 `unmap(off,len)`, 2 `protect(off,len,prot)`, 3 `page_size() -> i64`, and 4
     /// **`sub(off, size_log2) -> handle`** — the **attenuation** primitive: mint a child `AddressSpace`
@@ -13792,7 +13793,6 @@ enum Binding {
     WindowMinter(u32),
     Exit,
     Clock,
-    Memory,
     /// A §13 `SharedRegion` handle, carrying the index of its backing in [`Host::regions`]. The
     /// backing (not the index) is the shared object; mapping it at several window offsets aliases.
     SharedRegion(u32),
@@ -13801,6 +13801,13 @@ enum Binding {
     /// `[0, its size)` regardless of where its window sits in an ancestor's. Every op is confined to
     /// it; `sub` mints a further-attenuated child. The bounds live in the host-owned slot — the guest
     /// names only the forgeable handle.
+    ///
+    /// `{ base: 0, size: u64::MAX }` is the **whole-window form** (CONSOLIDATION §4 — the retired
+    /// `Memory` kind folded in here): "the window, whatever its size". A host grants it before it
+    /// knows the window ([`Host::grant_memory`]); the dispatch arm skips the sub-range bound (the
+    /// backend's `mem` does the real bounding, exactly as `Memory` worked) and the durable check
+    /// passes it as payload-free. It is the one non-power-of-two spelling, minted only whole —
+    /// never by `sub`.
     AddressSpace {
         base: u64,
         size: u64,
@@ -13926,7 +13933,7 @@ pub enum DurableBinding {
     Stream(StreamRole),
     Exit,
     Clock,
-    Memory,
+    // Memory: retired (CONSOLIDATION §4) — whole-window authority is `AddressSpace { 0, u64::MAX }`.
     AddressSpace {
         base: u64,
         size: u64,
@@ -14724,14 +14731,14 @@ pub struct Host {
     /// Transient: the last `Stream{In}` `read` parked (buffer empty under [`Self::stdin_block`]). The
     /// bytecode `CapCall` arm takes this to yield [`Outcome::StdinPark`] instead of completing the read.
     stdin_parked: bool,
-    /// The **Memory-capability growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
-    /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` may hold through
-    /// this cap — a map past it fails probeably (`-ENOMEM`, invariant 5), so a guest allocator
-    /// returns NULL. Policy lives here at the cap, never in `Mem`/the TCB. `None` (default) =
-    /// unbounded, zero-cost.
+    /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
+    /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
+    /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
+    /// (`-ENOMEM`, invariant 5), so a guest allocator returns NULL. Policy lives here at the cap,
+    /// never in `Mem`/the TCB. `None` (default) = unbounded, zero-cost.
     mem_map_limit: Option<u64>,
-    /// Bytes currently mapped through the Memory cap while a limit is set (map adds, unmap
-    /// subtracts). Rebuilt naturally by a from-0 replay (Memory is a live, untaped cap); carried
+    /// Bytes currently mapped through `AddressSpace` `map` while a limit is set (map adds, unmap
+    /// subtracts). Rebuilt naturally by a from-0 replay (a live, untaped cap); carried
     /// by [`HostReplaySubstate`] so a checkpoint restore keeps the accounting.
     mem_mapped_bytes: u64,
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
@@ -15669,7 +15676,7 @@ impl Host {
         self.stdin.extend_from_slice(bytes);
     }
 
-    /// Set (or clear) the **Memory-capability growth cap** — see [`Host::mem_map_limit`]. With a
+    /// Set (or clear) the **memory growth cap** — see [`Host::mem_map_limit`]. With a
     /// limit, a `vm_map` whose committed total would exceed it returns `-ENOMEM` (probeable; a
     /// guest `malloc` over `vm_map` returns NULL), and `vm_unmap` returns its bytes to the budget.
     pub fn set_mem_map_limit(&mut self, limit: Option<u64>) {
@@ -16102,7 +16109,6 @@ impl Host {
                 Binding::Stream(role) => DurableBinding::Stream(role),
                 Binding::Exit => DurableBinding::Exit,
                 Binding::Clock => DurableBinding::Clock,
-                Binding::Memory => DurableBinding::Memory,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
                 Binding::SharedRegion(_) => {
@@ -16183,7 +16189,6 @@ impl Host {
                 Binding::Stream(_)
                 | Binding::Exit
                 | Binding::Clock
-                | Binding::Memory
                 | Binding::AddressSpace { .. }
                 | Binding::Instantiator { .. }
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
@@ -16230,7 +16235,6 @@ impl Host {
                 DurableBinding::Stream(role) => Binding::Stream(role),
                 DurableBinding::Exit => Binding::Exit,
                 DurableBinding::Clock => Binding::Clock,
-                DurableBinding::Memory => Binding::Memory,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
                 DurableBinding::LiveImpl { slot, export } => {
@@ -16466,8 +16470,19 @@ impl Host {
     pub fn grant_clock(&mut self) -> i32 {
         self.grant(cap_id::CLOCK, Binding::Clock)
     }
+    /// Grant **whole-window** memory authority: an `AddressSpace` over `{ base: 0, size: u64::MAX }`
+    /// — "the window, whatever its size" (the sentinel is resolved by the backend's `mem` at each
+    /// op, so the grant needs no window size and survives window growth). This is the retired
+    /// `Memory` capability folded onto the general kind (CONSOLIDATION §4): same ops 0–3 at the
+    /// same numbers, plus the kind's `sub`/`create_region`.
     pub fn grant_memory(&mut self) -> i32 {
-        self.grant(cap_id::MEMORY, Binding::Memory)
+        self.grant(
+            cap_id::ADDRESS_SPACE,
+            Binding::AddressSpace {
+                base: 0,
+                size: u64::MAX,
+            },
+        )
     }
     /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s
     /// (synchronously via op 0, or asynchronously via op 1 `submit_async` + op 2 `reap`).
@@ -18841,44 +18856,6 @@ impl Host {
                 self.clock_ns = self.clock_ns.wrapping_add(1);
                 Ok(vec![now])
             }
-            Binding::Memory => {
-                // map(off,len,prot) / unmap(off,len) / protect(off,len,prot) on the window's
-                // pages (§3e). With no window there is nothing to address (-EINVAL); the effect
-                // is applied to whichever backend's memory `mem` wraps (interp `Mem` here, a
-                // JIT's flat window via its own impl), keeping the two in differential lockstep.
-                let Some(mem) = mem else {
-                    return Ok(vec![EINVAL]);
-                };
-                let off = *args.first().unwrap_or(&0) as u64;
-                let len = *args.get(1).unwrap_or(&0) as u64;
-                let prot = *args.get(2).unwrap_or(&0) as i32;
-                Ok(vec![match op {
-                    0 => {
-                        // The growth cap (slice 5): at the limit, map fails probeably — the
-                        // OOM-teaching knob. Accounting only runs with a limit set.
-                        if let Some(limit) = self.mem_map_limit {
-                            if self.mem_mapped_bytes.saturating_add(len) > limit {
-                                return Ok(vec![ENOMEM]);
-                            }
-                        }
-                        let r = mem.map(off, len, prot);
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
-                        }
-                        r
-                    }
-                    1 => {
-                        let r = mem.unmap(off, len);
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
-                        }
-                        r
-                    }
-                    2 => mem.protect(off, len, prot),
-                    3 => mem.page_size(),
-                    _ => EINVAL,
-                }])
-            }
             Binding::SharedRegion(region) => {
                 // §13: alias the host-backed region into the window. `map` (op 0) at several offsets
                 // aliases the same bytes; loads/stores then go through the ordinary masked path.
@@ -19049,8 +19026,12 @@ impl Host {
                         .try_grant_shared_region_backed(backing)
                         .map_or(EMFILE, |h| h as i64)]);
                 }
-                // map/unmap/protect/page_size — same shapes as `Memory`, but bounded to `[0, size)`
-                // and shifted by `base` (a buffer/range straddling the sub-range boundary is -EINVAL).
+                // map/unmap/protect/page_size (§3e) — bounded to `[0, size)` and shifted by `base`
+                // (a buffer/range straddling the sub-range boundary is -EINVAL). The whole-window
+                // form (`{0, u64::MAX}`, the retired `Memory` kind) skips the sub-range bound: the
+                // effect is applied to whichever backend's memory `mem` wraps (interp `Mem` here, a
+                // JIT's flat window via its own impl), and *it* does the real bounding — keeping the
+                // two in differential lockstep.
                 let Some(mem) = mem else {
                     return Ok(vec![EINVAL]);
                 };
@@ -19061,12 +19042,33 @@ impl Host {
                 let len = *args.get(1).unwrap_or(&0) as u64;
                 let prot = *args.get(2).unwrap_or(&0) as i32;
                 // The decisive confinement check: the range must be wholly within this sub-window.
+                // (`size == u64::MAX` admits everything but overflow — mem bounds, as above.)
                 if off.checked_add(len).is_none_or(|end| end > size) {
                     return Ok(vec![EINVAL]);
                 }
                 Ok(vec![match op {
-                    0 => mem.map(base + off, len, prot),
-                    1 => mem.unmap(base + off, len),
+                    0 => {
+                        // The growth cap (§3e slice 5): at the limit, map fails probeably — the
+                        // OOM-teaching knob. Accounting only runs with a limit set; it meters
+                        // every AddressSpace `map` on this Host, whole-window or carved.
+                        if let Some(limit) = self.mem_map_limit {
+                            if self.mem_mapped_bytes.saturating_add(len) > limit {
+                                return Ok(vec![ENOMEM]);
+                            }
+                        }
+                        let r = mem.map(base + off, len, prot);
+                        if r >= 0 && self.mem_map_limit.is_some() {
+                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
+                        }
+                        r
+                    }
+                    1 => {
+                        let r = mem.unmap(base + off, len);
+                        if r >= 0 && self.mem_map_limit.is_some() {
+                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
+                        }
+                        r
+                    }
                     2 => mem.protect(base + off, len, prot),
                     _ => EINVAL,
                 }])

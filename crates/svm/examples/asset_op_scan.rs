@@ -25,15 +25,27 @@ fn main() {
             }
         };
         let mut ops = std::collections::BTreeSet::new();
+        let mut ifaces = std::collections::BTreeMap::new();
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
-                    if let svm_ir::Inst::CapCall { type_id: 6, op, .. } = i {
-                        ops.insert(*op);
+                    if let svm_ir::Inst::CapCall { type_id, op, .. } = i {
+                        if *type_id == 6 {
+                            ops.insert(*op);
+                        }
+                        ifaces
+                            .entry(*type_id)
+                            .or_insert_with(std::collections::BTreeSet::new)
+                            .insert(*op);
                     }
                 }
             }
         }
-        println!("{}: instantiator ops {:?}", p.display(), ops);
+        println!(
+            "{}: instantiator ops {:?} | all cap ifaces {:?}",
+            p.display(),
+            ops,
+            ifaces
+        );
     }
 }

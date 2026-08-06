@@ -1005,8 +1005,11 @@ attenuation later) — **D43**:
 |---|---|---|
 | 0 | `now(clock_id: i32) -> i64` | nanoseconds; `clock_id` 0 = monotonic, 1 = realtime (Unix epoch); non-blocking |
 
-**`Memory`** (the §14 `AddressSpace` capability, attenuable to a window sub-range;
-window-relative, page-aligned offsets):
+**`Memory`** — since the CONSOLIDATION §4 fold this *is* the §14 `AddressSpace` capability
+(cap_id 5; the standalone kind at cap_id 3 is retired, the id reserved): the host's
+whole-window grant is `AddressSpace { 0, u64::MAX }` ("the window, whatever its size"),
+and the same interface attenuates to window sub-ranges via `sub`. Window-relative,
+page-aligned offsets:
 | op | signature | semantics |
 |---|---|---|
 | 0 | `map(offset, len, prot: i32) -> i64` | commit pages; `prot` = `READ\|WRITE` (no `EXEC` — guest data is never executed as code, §3c) |

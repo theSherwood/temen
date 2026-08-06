@@ -1193,7 +1193,7 @@ fn jit_cap_memory_escape_oracle_grown_tail() {
          \x20 v1 = i64.const {OFF}\n\
          \x20 v2 = i64.const 4096\n\
          \x20 v3 = i32.const 3\n\
-         \x20 v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)\n\
+         \x20 v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)\n\
          \x20 v5 = i64.const {OFF}\n\
          \x20 v6 = i64.const {MARKER}\n\
          \x20 i64.store v5 v6\n\
@@ -1509,7 +1509,7 @@ block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 4096
   v3 = i32.const 1
-  v4 = cap.call 3 2 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v4 = cap.call 5 2 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
   v5 = i64.const 0
   v6 = i32.const 123
   i32.store8 v5 v6
@@ -1556,7 +1556,7 @@ memory 16
 func (i32) -> (i32) {
 block 0 (v0: i32) {
   v1 = call 1(v0)
-  v2 = cap.call 3 3 () -> (i64) v0 ()
+  v2 = cap.call 5 3 () -> (i64) v0 ()
   return v1
   }
 }
@@ -1632,7 +1632,7 @@ block 0 (v0: i32) {
                     let pr = fresh(&mut body, format!("i32.const {prot}"));
                     fresh(
                         &mut body,
-                        format!("cap.call 3 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                        format!("cap.call 5 2 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
                     );
                 }
                 2 => {
@@ -1642,7 +1642,7 @@ block 0 (v0: i32) {
                     let len = fresh(&mut body, "i64.const 4096".into());
                     fresh(
                         &mut body,
-                        format!("cap.call 3 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
+                        format!("cap.call 5 1 (i64, i64) -> (i64) v0 (v{off}, v{len})"),
                     );
                 }
                 3 => {
@@ -1654,7 +1654,7 @@ block 0 (v0: i32) {
                     let pr = fresh(&mut body, format!("i32.const {prot}"));
                     fresh(
                         &mut body,
-                        format!("cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
+                        format!("cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v{off}, v{len}, v{pr})"),
                     );
                 }
                 4 => {
@@ -1717,7 +1717,7 @@ block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
-  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
   v5 = i64.const 1048576
   v6 = i64.const 43981
   i64.store v5 v6
@@ -1752,8 +1752,8 @@ block 0 (v0: i32) {
   v1 = i64.const 1048576
   v2 = i64.const 4096
   v3 = i32.const 3
-  v4 = cap.call 3 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
-  v5 = cap.call 3 1 (i64, i64) -> (i64) v0 (v1, v2)
+  v4 = cap.call 5 0 (i64, i64, i32) -> (i64) v0 (v1, v2, v3)
+  v5 = cap.call 5 1 (i64, i64) -> (i64) v0 (v1, v2)
   v6 = i64.load v1
   return v6
   }
