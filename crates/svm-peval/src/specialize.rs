@@ -500,6 +500,25 @@ pub struct PrecallModel {
     /// `NULL` (the C call is handled in place inside the opaque `precall`, so its effects still happen)
     /// and the branch folds to the continue edge; the register cells are reloaded (the C function ran).
     pub c_sites: Vec<u64>,
+    /// **Return side** (see [`PoscallModel`]). `None` ⇒ the callee return is not modeled and must bail
+    /// via a deopt (slice 1); `Some` ⇒ `poscall` pops the frame in the abstract state so folding
+    /// continues in the caller.
+    pub poscall: Option<PoscallModel>,
+}
+
+/// The return side of the call model: how a `luaD_poscall` cut updates the abstract frame so folding
+/// continues in the **caller** instead of bailing. `poscall` moves results down, pops `L->ci` to
+/// `ci->previous`, and returns; the shared post-return block then re-reads `L->ci` to resume the
+/// caller (or, for the entry frame, exits `luaV_execute` — which folds because the frame's
+/// `callstatus` is a constant overlay). The model reads the returning frame's `ci` (a constant in the
+/// fold — `L->ci` was pinned to it at the matching `precall`), computes the caller `ci` from its
+/// `previous` field, and installs that at `L->ci`.
+#[derive(Clone, Debug)]
+pub struct PoscallModel {
+    /// The cut callee that pops a call frame (`luaD_poscall`). Must also be in a cut set.
+    pub poscall: u32,
+    /// Byte offset from a `CallInfo` to its `previous` pointer (the caller frame).
+    pub ci_previous_off: u64,
 }
 
 /// One Lua call site for the [`PrecallModel`]. On a `precall` whose `ra` matches, the result (`newci`)
@@ -1406,6 +1425,15 @@ impl Spec<'_> {
                         env.extend(results);
                         continue;
                     }
+                    if let Some(po) = &pm.poscall {
+                        if callee == po.poscall {
+                            let ridx = self.cut[&callee];
+                            let results = self
+                                .emit_poscall(ridx, callee, &args_abs, pm, po, mem, out, rnext)?;
+                            env.extend(results);
+                            continue;
+                        }
+                    }
                 }
                 // Cut set: a call-out we deliberately keep opaque (see [`SpecConfig::cut_calls`]).
                 // Emit it as a residual `call` to the carried callee and treat its results as
@@ -1642,14 +1670,22 @@ impl Spec<'_> {
         let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
-        // Result 0 is the `CallInfo*`; bind it per the classification, leaving any further results fresh.
+        // Result 0 is the `CallInfo*`; bind it per the classification, leaving any further results
+        // fresh. The emitted IR `Call` produces all `nres` result values regardless of the abstract
+        // binding, so a value slot is consumed for *every* result (result 0's slot is discarded when it
+        // is bound to a constant) — otherwise `rnext` desyncs from the residual's value numbering and
+        // later operands in the block reference the wrong value.
         let bind = |first: Abs, rnext: &mut u32| -> Vec<Abs> {
-            let mut r = Vec::with_capacity(nres);
-            r.push(first);
-            for _ in 1..nres {
-                r.push(Abs::Dyn(bump(rnext)));
-            }
-            r
+            (0..nres)
+                .map(|k| {
+                    let slot = Abs::Dyn(bump(rnext));
+                    if k == 0 {
+                        first
+                    } else {
+                        slot
+                    }
+                })
+                .collect()
         };
         if let Some(site) = lua_site {
             // Lua callee: bind newci and install L->ci, pin the callee-frame structural cells; keep the
@@ -1671,6 +1707,58 @@ impl Spec<'_> {
             self.reload_cells_natural(mem, out, rnext)?;
             Ok(r)
         }
+    }
+
+    /// Emit a `luaD_poscall` cut with the **return post-state model** ([`PoscallModel`]). The call is
+    /// emitted opaquely and the register cells reload (the callee's results are written down into the
+    /// caller's frame — fresh unknowns), but `L->ci` is then re-pinned to the **caller** frame: the
+    /// returning frame's `ci` is a constant here (`L->ci` was pinned to it at the matching `precall`),
+    /// so the caller `ci = *(ci->previous)` folds and the shared post-return block resumes the caller's
+    /// dispatch (or exits `luaV_execute` at the entry frame — its `callstatus` is a constant overlay).
+    /// If the returning `ci` isn't a constant, fall back to plain touch-state (the caller can't be
+    /// pinned, so the return still bails at the post-return block if that is a deopt target).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_poscall(
+        &self,
+        ridx: u32,
+        callee: u32,
+        args_abs: &[Abs],
+        pm: &PrecallModel,
+        po: &PoscallModel,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Vec<Abs>, SpecError> {
+        // The returning frame's `ci` — pinned to a constant at the matching precall (else fall back).
+        let cur_ci = mem
+            .get(&pm.l_ci_addr)
+            .and_then(|&(_, a)| match a {
+                Abs::Const(k) => k.as_i64().map(|v| v as u64),
+                Abs::Dyn(_) => None,
+            })
+            .or_else(|| {
+                read_const_mem(self.config, self.module, pm.l_ci_addr, 0, LoadOp::I64)?
+                    .as_i64()
+                    .map(|v| v as u64)
+            });
+        let caller_ci = cur_ci.and_then(|ci| {
+            read_const_mem(self.config, self.module, ci, po.ci_previous_off, LoadOp::I64)?
+                .as_i64()
+                .map(|v| v as u64)
+        });
+
+        // Touch-state: spill, call, reload (poscall moved results down into the caller's registers).
+        self.write_back_cells(mem, out, rnext)?;
+        let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
+        out.push(Inst::Call { func: ridx, args });
+        let nres = self.module.funcs[callee as usize].results.len();
+        let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
+        self.reload_cells_natural(mem, out, rnext)?;
+        // Re-pin L->ci to the caller frame so folding continues there (the reload above set it dynamic).
+        if let Some(caller) = caller_ci {
+            mem.insert(pm.l_ci_addr, (8, Abs::Const(Known::I64(caller as i64))));
+        }
+        Ok(results)
     }
 
     /// Reload every rename cell from the window at its canonical width (`i32.load8_u`/`load16_u`/

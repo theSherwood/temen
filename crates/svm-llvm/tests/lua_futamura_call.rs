@@ -21,7 +21,7 @@
 
 use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_interp::{IrPc, Stop, StopReason, Value};
-use svm_peval::{specialize_with_config, LuaSite, PrecallModel, SpecArg, SpecConfig};
+use svm_peval::{specialize_with_config, LuaSite, PoscallModel, PrecallModel, SpecArg, SpecConfig};
 
 const SCRIPT: &str = "local function add(a, b) return a + b end\nprint(add(40, 2))\n";
 const CAPTURE_LEN: usize = 8 << 20;
@@ -158,21 +158,45 @@ fn capture_callee_frame(m: &Module, luav: u32, dispatch: u32, outer_proto: u64) 
     panic!("callee frame not reached in 2000 dispatch hits");
 }
 
-#[test]
-fn project_through_a_lua_call() {
+/// Everything the two projections share: the module (with a pristine baseline copy of `luaV_execute`
+/// appended), the discovered blocks/indices, and the captured overlays + call-site addresses.
+struct Cap {
+    m: Module,
+    luav: u32,
+    baseline: u32,
+    precall: u32,
+    poscall: u32,
+    post_return: u32,
+    sp: i64,
+    l: u64,
+    outer_ci: u64,
+    ra_add: u64,
+    ra_print: u64,
+    callee_ci: u64,
+    callee_func: u64,
+    callee_cl: u64,
+    ci_previous_off: u64,
+    /// The full `const_overlays` list, `rename`, and `rename_extra` — identical for both projections.
+    overlays: Vec<(u64, Vec<u8>)>,
+    rename: (u64, u64),
+    rename_extra: Vec<(u64, u64)>,
+    read: Vec<u32>,
+    touch: Vec<u32>,
+}
+
+fn capture_all() -> Cap {
     let mut m = lua_module();
     let luav = luav_execute(&m);
-    // The callee return still bails to baseline (slice 1). The residual will *replace* `luaV_execute`
-    // at index `luav`, so the deopt handler can't be `luav` itself (that would tail-call the residual
-    // and recurse forever). Append a pristine copy of `luaV_execute` and deopt to *that*.
+    // Append a pristine copy of `luaV_execute`: the residual replaces index `luav`, so a deopt handler
+    // (slice-1 return) must resume *this* copy, not the residual (which would recurse forever).
     let baseline = m.funcs.len() as u32;
     m.funcs.push(m.funcs[luav as usize].clone());
     let precall = byname(&m, "luaD_precall").expect("luaD_precall");
+    let poscall = byname(&m, "luaD_poscall").expect("luaD_poscall");
     let dispatch = dispatch_block(&m, luav);
     let (pblock, ra_val) = precall_site(&m, luav, precall);
     // The shared post-return block: where every `luaD_poscall` block branches (the "return to caller or
-    // exit luaV_execute" logic). Slice 1 deopts it — the callee return bails to baseline.
-    let poscall = byname(&m, "luaD_poscall").expect("luaD_poscall");
+    // exit luaV_execute" logic).
     let post_return = {
         let mut t = None;
         for b in &m.funcs[luav as usize].blocks {
@@ -185,9 +209,8 @@ fn project_through_a_lua_call() {
         }
         t.expect("a poscall block branching to the post-return block")
     };
-    println!("luaV_execute=f{luav} precall=f{precall} dispatch=block{dispatch} precall_site=block{pblock} ra=v{ra_val} post_return=block{post_return}");
+    println!("luaV_execute=f{luav} precall=f{precall} poscall=f{poscall} dispatch=block{dispatch} precall_site=block{pblock} ra=v{ra_val} post_return=block{post_return}");
 
-    // ---- Capture ----
     let (sp, l, outer_ci, w) = capture_entry(&m, luav);
     let stack_lo = rd_u64(&w, l + L_STACK);
     let stack_hi = rd_u64(&w, l + L_STACK_LAST);
@@ -197,9 +220,8 @@ fn project_through_a_lua_call() {
     let outer_proto = rd_u64(&w, outer_cl + LCLOSURE_P);
     let outer_code = rd_u64(&w, outer_proto + PROTO_CODE);
     let outer_sizecode = rd_i32(&w, outer_proto + PROTO_SIZECODE) as usize;
-    // The sub-proto pointer array (`outer_proto->p`): `OP_CLOSURE` reads `p = proto->p[bx]` to find the
-    // callee proto, and folds its `sizeupvalues` to bound the upvalue-init loop. Without this overlay
-    // that pointer is dynamic and the loop unrolls forever.
+    // The sub-proto pointer array (`outer_proto->p`): `OP_CLOSURE` reads `p = proto->p[bx]` and folds its
+    // `sizeupvalues` to bound the upvalue-init loop; without this overlay that loop unrolls forever.
     let outer_pp = rd_u64(&w, outer_proto + PROTO_P);
     let outer_sizep = rd_i32(&w, outer_proto + PROTO_SIZEP) as usize;
 
@@ -212,14 +234,31 @@ fn project_through_a_lua_call() {
     let callee_proto = rd_u64(&wb, callee_cl + LCLOSURE_P);
     let callee_code = rd_u64(&wb, callee_proto + PROTO_CODE);
     let callee_sizecode = rd_i32(&wb, callee_proto + PROTO_SIZECODE) as usize;
-    println!(
-        "callee: ci={callee_ci:#x} func_slot={callee_func:#x} cl={callee_cl:#x} proto={callee_proto:#x} code={callee_code:#x} sizecode={callee_sizecode}"
-    );
     assert_eq!(callee_func, ra_add, "the callee ci->func should be the add call's ra slot");
+    // Discover the CallInfo `previous` offset: the callee frame's `previous` points at the outer ci.
+    let ci_previous_off = (0..CI_SIZE as u64)
+        .step_by(8)
+        .find(|&off| rd_u64(&wb, callee_ci + off) == outer_ci)
+        .expect("callee ci->previous should equal the outer ci");
+    println!(
+        "callee: ci={callee_ci:#x} func_slot={callee_func:#x} cl={callee_cl:#x} proto={callee_proto:#x} code={callee_code:#x} sizecode={callee_sizecode} ci_previous_off={ci_previous_off}"
+    );
 
     let slice = |src: &[u8], a: u64, n: usize| src[a as usize..a as usize + n].to_vec();
-
-    // ---- Config ----
+    let overlays = vec![
+        (l, slice(&w, l, LUA_STATE_SIZE)),
+        (stack_lo, slice(&w, stack_lo, stack_len)),
+        (outer_ci, slice(&w, outer_ci, CI_SIZE)),
+        (outer_code, slice(&w, outer_code, 4 * outer_sizecode)),
+        (outer_cl, slice(&w, outer_cl, 48)),
+        (outer_proto, slice(&w, outer_proto, 128)),
+        (outer_pp, slice(&w, outer_pp, 8 * outer_sizep)),
+        // Callee (add) frame — captured post-precall from the profiling run (deterministic arena).
+        (callee_ci, slice(&wb, callee_ci, CI_SIZE)),
+        (callee_cl, slice(&wb, callee_cl, 48)),
+        (callee_proto, slice(&wb, callee_proto, 128)),
+        (callee_code, slice(&wb, callee_code, 4 * callee_sizecode)),
+    ];
     let read_names = [
         "luaH_get", "luaH_getshortstr", "luaH_getstr", "luaH_getint", "luaV_finishget",
         "luaC_step", "luaC_newobj", "luaH_new", "luaH_resize", "luaF_newLclosure", "luaF_newCclosure",
@@ -231,84 +270,26 @@ fn project_through_a_lua_call() {
         "luaD_precall", "precallC", "luaD_call", "luaD_callnoyield", "luaD_poscall",
         "luaD_growstack", "luaD_reallocstack",
     ];
-    let read: Vec<u32> = read_names.iter().filter_map(|n| byname(&m, n)).collect();
-    let touch: Vec<u32> = touch_names.iter().filter_map(|n| byname(&m, n)).collect();
+    let read = read_names.iter().filter_map(|n| byname(&m, n)).collect();
+    let touch = touch_names.iter().filter_map(|n| byname(&m, n)).collect();
 
-    let cfg = SpecConfig {
-        const_overlays: vec![
-            (l, slice(&w, l, LUA_STATE_SIZE)),
-            (stack_lo, slice(&w, stack_lo, stack_len)),
-            (outer_ci, slice(&w, outer_ci, CI_SIZE)),
-            (outer_code, slice(&w, outer_code, 4 * outer_sizecode)),
-            (outer_cl, slice(&w, outer_cl, 48)),
-            (outer_proto, slice(&w, outer_proto, 128)),
-            (outer_pp, slice(&w, outer_pp, 8 * outer_sizep)),
-            // Callee (add) frame — captured post-precall from the profiling run (deterministic arena).
-            (callee_ci, slice(&wb, callee_ci, CI_SIZE)),
-            (callee_cl, slice(&wb, callee_cl, 48)),
-            (callee_proto, slice(&wb, callee_proto, 128)),
-            (callee_code, slice(&wb, callee_code, 4 * callee_sizecode)),
-        ],
-        rename: Some((l, l + LUA_STATE_SIZE as u64)),
+    Cap {
+        m, luav, baseline, precall, poscall, post_return, sp, l, outer_ci, ra_add, ra_print,
+        callee_ci, callee_func, callee_cl, ci_previous_off,
+        overlays, rename: (l, l + LUA_STATE_SIZE as u64),
         rename_extra: vec![
             (stack_lo, stack_hi),
             (outer_ci, outer_ci + CI_SIZE as u64),
             (callee_ci, callee_ci + CI_SIZE as u64),
         ],
-        rename_is_private: true,
-        rename_seed_from_image: true,
-        cut_calls_read_state: read,
-        cut_calls_touch_state: touch,
-        // Slice 1 does not yet model the callee's return (`poscall`): the post-return block bails to the
-        // carried baseline, which resumes from the written-back window state and finishes the run.
-        deopt_targets: vec![(luav, post_return)],
-        deopt_handler: Some(baseline),
-        carry_whole_module: true,
-        carry_keep_imports: true,
-        indirect_targets_cap: Some(16),
-        precall_model: Some(PrecallModel {
-            precall,
-            ra_arg: 2,
-            l_ci_addr: l + L_CI,
-            lua_sites: vec![LuaSite {
-                ra: ra_add,
-                callee_ci,
-                pins: vec![(callee_func, callee_cl)],
-            }],
-            c_sites: vec![ra_print],
-        }),
-        ..SpecConfig::default()
-    };
-    let args = [
-        SpecArg::ConstI64(sp),
-        SpecArg::ConstI64(l as i64),
-        SpecArg::ConstI64(outer_ci as i64),
-    ];
-    let mut residual =
-        specialize_with_config(&m, luav, &args, &cfg).expect("project through the lua call");
-    let entry = (residual.funcs.len() - 1) as u32;
-    let f = &residual.funcs[entry as usize];
-    let brt = f
-        .blocks
-        .iter()
-        .filter(|b| matches!(b.term, Terminator::BrTable { .. }))
-        .count();
-    // `carry_whole_module` keeps every source function at its original index, so `precall`'s residual
-    // index is still `precall`.
-    let calls_precall = f
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::Call { func, .. } if *func == precall));
-    println!("PROJECTED: entry {} blocks, br_table={brt}", f.blocks.len());
-    // The dispatch folded across the main chunk *and* through the `add` call into the callee's own
-    // dispatch — no interpreter loop survives. `precall` stays an opaque cut call-out.
-    assert_eq!(brt, 0, "the dispatch folded through the Lua call (no br_table left)");
-    assert!(calls_precall, "the opaque precall cut survives as a residual call");
+        read, touch,
+    }
+}
 
-    // ---- End to end: embed + diff stdout ----
-    residual.imports = m.imports.clone();
-    residual.types = m.types.clone();
+/// Embed `residual`'s specialized `entry` in place of `luaV_execute` and diff stdout against baseline.
+fn embed_and_diff(mut residual: Module, src: &Module, luav: u32, entry: u32) {
+    residual.imports = src.imports.clone();
+    residual.types = src.types.clone();
     residual.funcs[luav as usize] = Func {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
@@ -319,8 +300,7 @@ fn project_through_a_lua_call() {
         }],
     };
     svm_verify::verify_module(&residual).expect("embedded residual verifies");
-
-    let baseline = svm_run::run_powerbox(&m, SCRIPT.as_bytes()).expect("baseline run");
+    let baseline = svm_run::run_powerbox(src, SCRIPT.as_bytes()).expect("baseline run");
     let embedded = svm_run::run_powerbox(&residual, SCRIPT.as_bytes()).expect("embedded residual run");
     println!(
         "baseline stdout={:?}  embedded stdout={:?}",
@@ -332,5 +312,90 @@ fn project_through_a_lua_call() {
         embedded.stdout, baseline.stdout,
         "the embedded residual must print byte-identically to the interpreter"
     );
-    println!("  ✓ projected through a Lua-to-Lua call — stdout byte-identical to the interpreter");
 }
+
+fn brtable_count(f: &Func) -> usize {
+    f.blocks.iter().filter(|b| matches!(b.term, Terminator::BrTable { .. })).count()
+}
+
+/// Slice 1: the call-in projects (dispatch folds through the `add` call into the callee), the callee's
+/// *return* bails to the pristine baseline copy.
+#[test]
+fn project_through_a_lua_call() {
+    let c = capture_all();
+    let cfg = SpecConfig {
+        const_overlays: c.overlays.clone(),
+        rename: Some(c.rename),
+        rename_extra: c.rename_extra.clone(),
+        rename_is_private: true,
+        rename_seed_from_image: true,
+        cut_calls_read_state: c.read.clone(),
+        cut_calls_touch_state: c.touch.clone(),
+        // Slice 1 does not model the callee's return (`poscall`): the post-return block bails to the
+        // carried baseline, which resumes from the written-back window state and finishes the run.
+        deopt_targets: vec![(c.luav, c.post_return)],
+        deopt_handler: Some(c.baseline),
+        carry_whole_module: true,
+        carry_keep_imports: true,
+        indirect_targets_cap: Some(16),
+        precall_model: Some(PrecallModel {
+            precall: c.precall,
+            ra_arg: 2,
+            l_ci_addr: c.l + L_CI,
+            lua_sites: vec![LuaSite { ra: c.ra_add, callee_ci: c.callee_ci, pins: vec![(c.callee_func, c.callee_cl)] }],
+            c_sites: vec![c.ra_print],
+            poscall: None,
+        }),
+        ..SpecConfig::default()
+    };
+    let args = [SpecArg::ConstI64(c.sp), SpecArg::ConstI64(c.l as i64), SpecArg::ConstI64(c.outer_ci as i64)];
+    let residual = specialize_with_config(&c.m, c.luav, &args, &cfg).expect("project through the lua call");
+    let entry = (residual.funcs.len() - 1) as u32;
+    let f = &residual.funcs[entry as usize];
+    let calls_precall = f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Call { func, .. } if *func == c.precall));
+    println!("SLICE 1 PROJECTED: entry {} blocks, br_table={}", f.blocks.len(), brtable_count(f));
+    assert_eq!(brtable_count(f), 0, "the dispatch folded through the Lua call (no br_table left)");
+    assert!(calls_precall, "the opaque precall cut survives as a residual call");
+    embed_and_diff(residual, &c.m, c.luav, entry);
+    println!("  ✓ slice 1: projected through the Lua call-in — stdout byte-identical");
+}
+
+/// Slice 2: model `poscall` so the callee *return* composes into the caller — no deopt, no baseline
+/// copy needed. The whole `print(add(40,2))` folds to a single dispatch-free residual.
+#[test]
+fn project_through_a_lua_call_and_return() {
+    let c = capture_all();
+    let cfg = SpecConfig {
+        const_overlays: c.overlays.clone(),
+        rename: Some(c.rename),
+        rename_extra: c.rename_extra.clone(),
+        rename_is_private: true,
+        rename_seed_from_image: true,
+        cut_calls_read_state: c.read.clone(),
+        cut_calls_touch_state: c.touch.clone(),
+        // No deopt — the return is modeled (poscall pops the frame in the abstract state).
+        carry_whole_module: true,
+        carry_keep_imports: true,
+        indirect_targets_cap: Some(16),
+        precall_model: Some(PrecallModel {
+            precall: c.precall,
+            ra_arg: 2,
+            l_ci_addr: c.l + L_CI,
+            lua_sites: vec![LuaSite { ra: c.ra_add, callee_ci: c.callee_ci, pins: vec![(c.callee_func, c.callee_cl)] }],
+            c_sites: vec![c.ra_print],
+            poscall: Some(PoscallModel { poscall: c.poscall, ci_previous_off: c.ci_previous_off }),
+        }),
+        ..SpecConfig::default()
+    };
+    let args = [SpecArg::ConstI64(c.sp), SpecArg::ConstI64(c.l as i64), SpecArg::ConstI64(c.outer_ci as i64)];
+    let residual = specialize_with_config(&c.m, c.luav, &args, &cfg).expect("project through the lua call and return");
+    let entry = (residual.funcs.len() - 1) as u32;
+    let f = &residual.funcs[entry as usize];
+    let returns = f.blocks.iter().filter(|b| matches!(b.term, Terminator::Return(_))).count();
+    println!("SLICE 2 PROJECTED: entry {} blocks, br_table={}, returns={returns}", f.blocks.len(), brtable_count(f));
+    assert_eq!(brtable_count(f), 0, "the dispatch folded through the call and the return");
+    assert!(returns > 0, "the residual returns from luaV_execute (the modeled return reached the entry frame)");
+    embed_and_diff(residual, &c.m, c.luav, entry);
+    println!("  ✓ slice 2: projected through the Lua call-in AND return — stdout byte-identical");
+}
+

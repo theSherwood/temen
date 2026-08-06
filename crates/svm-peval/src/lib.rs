@@ -28,8 +28,8 @@ mod lower_indirect;
 mod specialize;
 pub use lower_indirect::lower_indirect_dispatch;
 pub use specialize::{
-    specialize, specialize_with, specialize_with_config, LuaSite, PrecallModel, SpecArg, SpecConfig,
-    SpecError,
+    specialize, specialize_with, specialize_with_config, LuaSite, PoscallModel, PrecallModel,
+    SpecArg, SpecConfig, SpecError,
 };
 
 // The generic optimizer + remap helpers moved to `svm-opt` (see `OPT.md` Phase 0). Re-exported so
