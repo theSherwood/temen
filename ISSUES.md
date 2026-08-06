@@ -21,7 +21,7 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** is not yet execution-correct (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
+### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** — **facet (a) FIXED 2026-08-06** (`lua_futamura_call_arith`); nested (b) / sequential-shared-`CallInfo` (c) still open (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
 
 PR #637 landed projecting *through* a Lua-to-Lua call (`SpecConfig::precall_model` + `PoscallModel`):
 slice 1 (call-in) and slice 2 (return) run end-to-end and diff stdout for `print(add(40,2))`, and
@@ -54,27 +54,29 @@ barriers already are**. The needed additions (confirmed): `luaM_realloc_`, `luaM
 **`print(add(2,3))` (no arithmetic on the result) projects and executes correctly** — so the cut-set is
 necessary and, for the plain-return case, sufficient.
 
-*Layer 2 (the real blocker) — the caller's frame base goes dynamic after a Lua-call return.* With the
-cut-set in place, `print(add(2,3) * 10)` still fails: the fold reaches `callbinTM` (the `OP_MULK`
-**metamethod** slow path) → `luaD_throw` (the `longjmp`, unsupported). It gets there because the MULK
-fast-path guard `ttisinteger(R[B])` **does not fold**: instrumenting `eval_load` shows **no
-constant-base access to the caller's register file at all after the return** (`R[B] = base + B*16` has a
-`Dyn` `base`). So even though the selective reload pins the result *tag* at the right in-region address
-(`ra_add+8 = VNUMINT`, verified), the MULK never reads that cell — it reads a dynamic address. The
-caller frame **base** (`base = ci->func + 1`), a loop-carried SSA value threaded through the shared
-dispatch / post-return block, is materialized to `Dyn` across the return, defeating every
-constant-address register read the caller makes afterwards. This is the **same root as facet (b)**
-(nested caller-resume): the caller's post-return frame state isn't reconstructed as constant.
+*Layer 2 (the actual root) — the proto **constant pool (`proto->k`) was not overlaid.* With the cut-set
+in place, `print(add(2,3) * 10)` still fell into `OP_MMBINK` → `luaT_trybinassocTM` → `luaD_throw`
+because the `OP_MULK` fast-path guard `ttisinteger(v1) && ttisinteger(v2)` didn't fold. **A prior
+"caller `base` goes dynamic" reading was a red herring** — instrumenting `eval_load` showed the register
+operand `v1 = R[B]` *does* load at a constant base and resolves to the pinned `VNUMINT` tag. The operand
+that stayed dynamic was `v2 = KC(i)` — the **constant `10`**, read from `proto->k[C]`. The overlays
+covered the proto struct and the code/upvalue arrays but **not the `k` array it points to**, so the
+constant's tag was unresolved and the guard couldn't reduce. `print(add(40,2))` never hit this because
+small integer literals compile to `OP_LOADI` **immediates** (baked into the instruction word), never
+touching `k`. Fix: overlay each frame's `proto->k` (`PROTO_K = 56`, `PROTO_SIZEK = 20`, `16 * sizek`
+bytes) alongside the code array. The `k` pool is static program data — it belongs in the const image
+exactly like the bytecode.
 
-**Fix sketch (revised).** (1) Land the cut-set additions above (necessary regardless). (2) The core fix
-is making the caller's **`base` fold to a constant after `emit_poscall`**: `L->ci` is already re-pinned
-to the caller `ci` (const), so `base = ci->func + 1` *should* reduce — the failure is that `base` is
-carried as a threaded block param and materialized, not re-derived. Options: have the poscall re-seed
-the caller's `base`/`ci` SSA cells from the pinned const `L->ci`, or specialize the post-return/dispatch
-block per-frame so `base` isn't a shared `Dyn` param. (3) Sequential distinct callees reusing one cached
-`CallInfo` (`ci->next`) remain a separate facet (per-call-site pinned `ci` fields vs a fixed overlay).
-The capture harness for all cases works; the blocker is engine-side post-return frame reconstruction.
-Repro kept in the session scratchpad (`diag_arith.rs`).
+**Resolution (facet a).** `crates/svm-llvm/tests/lua_futamura_call_arith.rs` projects
+`print(add(2,3) * 10)` and executes it **byte-identical to the interpreter (`50`)**, 172 residual
+blocks, no deopt — a call result flowing into `OP_MULK`, the exact shape a real call-bearing loop needs
+(`x = add(x, k)`). Both ingredients are config the `SpecConfig` API already supports (no engine change):
+the `k`-pool overlay + the alloc/GC/string cut-set. **Still open:** (b) the **nested** 2-frame case
+(`outer(y) = inner(y) * 2`) — note it *also* uses `OP_MULK`, so the missing `k` overlay was likely a
+contributor to its `Budget` divergence too; re-test with the `k` overlay + per-frame window capture
+before assuming a deeper caller-resume defect. (c) two **sequential** distinct callees reuse one cached
+`CallInfo` (`ci->next`), which a single const overlay can't represent — per-call-site pinned `ci` fields
+vs a fixed overlay. Repro/harness for all cases is in the arith test and the session scratchpad.
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
