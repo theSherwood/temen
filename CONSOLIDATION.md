@@ -115,6 +115,28 @@ With §2 done, de-proliferate what remains of the op table (~16 ops today):
 
 **End state:** `Instantiator` at ~6 ops, one resource-accounting object in the system.
 
+### §3 status (2026-08-06, after PRs #627/#629/#633)
+
+Landed: **3a** (op 17 `instantiate_rec` — one 56-byte record subsumes every spawn shape as
+data; differentials vs ops 0/5/11/16), **3b** (the record's Budget field charges the spawn on
+fuel/mem/spawn with peek-then-drain), **3c** (native Cranelift record thunk delegating to the
+existing spawn bodies; pager soundness via the impl-exports fold), **3c.2** (the `BudgetTaker`
+host hook — budget records fund natively on the JIT; narrowed gap = bounded spawn ceilings /
+bounded-zero fuel, pinned by a flip-when-fixed test), **3c.3** (wasm-JIT `env.instantiate_rec`
+as a **conditional** import — existing modules keep their exact import set).
+
+**3d, fact-based split** (asset scan: `svm/examples/asset_op_scan.rs` decodes every committed
+`.svmb`; only `shell.svmb` contains legacy spawn ops — `{1, 13}`):
+
+- **3d.1** — migrate the in-tree text-IR callers (survey: op 0 in 34 files, op 5 in 16,
+  op 8 in 4, op 11 in 15, op 16 in 2, across tests/bench/fuzz) to the record, then delete
+  the **five** arms (0/5/8/11/16) across all tiers. No committed asset uses any of them.
+- **3d.2** — op 13 (`instantiate_module_named`, the STAGE1 shell's exec) is **asset-gated**:
+  deleting it breaks the committed `shell.svmb`, which only regenerates through the
+  heavyweight STAGE1 on-ramp — the same regeneration event ISSUES.md I64 already tracks for
+  the v9→v10 retirement. Fold op 13's deletion into that event; until then it is the one
+  legacy spawn arm that stays.
+
 **Gates:** §2 first (otherwise the record schema is designed twice); the JIT
 `instantiator_rt` thunks migrate in the same change (no tier-split of the spawn ABI) — that
 set now also includes the wasm-JIT tier's `env.instantiate`/`env.join` imports
