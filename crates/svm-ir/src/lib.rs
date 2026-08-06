@@ -2783,15 +2783,16 @@ pub const POWERBOX_ARGS_END: u64 = 16384;
 /// The canonical **names** of the fixed §3e powerbox capabilities, in `VM_CAP_*` / grant order (the
 /// same order/names `svm_run` grants + registers). A powerbox guest's manifest imports resolve
 /// against this vocabulary (and `cap.self.resolve` re-finds them by name); `[..n]` is the prefix a
-/// program granted `n` capabilities uses.
-pub const POWERBOX_CAP_NAMES: [&str; 8] = [
+/// program granted `n` capabilities uses. (`"blocking"` left this vocabulary with CONSOLIDATION §5a
+/// — the mock `Blocking` cap is test-only wiring now; a test harness that grants it registers the
+/// name itself, and an unregistered resolve fails closed.)
+pub const POWERBOX_CAP_NAMES: [&str; 7] = [
     "stdout",
     "stdin",
     "exit",
     "memory",
     "addrspace",
     "ioring",
-    "blocking",
     "jit",
 ];
 /// The guest heap's bump-pointer word (`i64`) at window offset 32 (page 0 is reserved scratch).

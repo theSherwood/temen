@@ -1611,8 +1611,8 @@ impl JitSession {
 }
 
 /// The §9/D45 **devirtualized `cap.call` fast-path resolver** for the production powerbox. It claims
-/// only the **window-independent, authority-checked** hot ops — `Clock.now` and `Blocking.work` — so
-/// they take the register-to-register fast path; every other op (all *window-touching* ones —
+/// only the **window-independent, authority-checked** hot op — `Clock.now` — so
+/// it takes the register-to-register fast path; every other op (all *window-touching* ones —
 /// `Memory`/`Stream`/`SharedRegion`/`IoRing` — and any multi-result or arity-mismatched op) returns
 /// `null`, so the generic [`cap_thunk`] handles it unchanged.
 ///
@@ -1639,7 +1639,6 @@ pub unsafe extern "C" fn fast_cap_resolver(
     use svm_interp::cap_id;
     match (type_id, op, n_args, n_res) {
         (cap_id::CLOCK, 0, 0, 1) => fast_clock_now as *const c_void,
-        (cap_id::BLOCKING, 0, 1, 1) => fast_blocking_work as *const c_void,
         _ => std::ptr::null(),
     }
 }
@@ -1673,28 +1672,6 @@ unsafe extern "C" fn fast_clock_now(
         // A W1 tape is active — take the full path so the input is recorded/replayed.
         None => fast_dispatch(ctx, svm_interp::cap_id::CLOCK, 0, handle, &[], trap_out),
     }
-}
-
-/// `Blocking.work(a0) -> i64` (iface 10, op 0, one arg) on the fast path.
-///
-/// # Safety
-/// As [`fast_clock_now`].
-unsafe extern "C" fn fast_blocking_work(
-    ctx: *mut c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    handle: i32,
-    trap_out: *mut i64,
-    a0: i64,
-) -> i64 {
-    fast_dispatch(
-        ctx,
-        svm_interp::cap_id::BLOCKING,
-        0,
-        handle,
-        &[a0],
-        trap_out,
-    )
 }
 
 /// Shared body for the fast-path fns: drive the **same** [`Host::cap_dispatch_slots`] the generic
@@ -3713,11 +3690,13 @@ fn value_slot(v: Value) -> i64 {
     }
 }
 
-/// Grant the full §3e powerbox — the eight fixed `VM_CAP_*` capabilities in canonical order
-/// (stdout, stdin, exit, memory, addrspace, ioring, blocking, jit) — returning the handles in that
+/// Grant the full §3e powerbox — the seven fixed `VM_CAP_*` capabilities in canonical order
+/// (stdout, stdin, exit, memory, addrspace, ioring, jit) — returning the handles in that
 /// order for the manifest slot binding. Grants are deterministic, so two backends' hosts granted
-/// identically see matching handle values (the differential paths rely on this).
-fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
+/// identically see matching handle values (the differential paths rely on this). (The mock
+/// `Blocking` cap left this set with CONSOLIDATION §5a — test harnesses that exercise the
+/// offload pool grant it themselves and register the `"blocking"` name.)
+fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
@@ -3738,7 +3717,6 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
         h.grant_memory(),
         h.grant_address_space(0, win),
         h.grant_io_ring(),
-        h.grant_blocking(std::time::Duration::ZERO, None),
         // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
         // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
         h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
@@ -3751,19 +3729,11 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 8] {
     v
 }
 
-/// The canonical names of the eight fixed §3e powerbox capabilities, in grant order — the vocabulary a
+/// The canonical names of the seven fixed §3e powerbox capabilities, in grant order — the vocabulary a
 /// powerbox guest resolves against via `cap.self` (F7). A name-bound guest
-/// ([`instantiate_with_imports`]) instead resolves its own import names.
-const POWERBOX_CAP_NAMES: [&str; 8] = [
-    "stdout",
-    "stdin",
-    "exit",
-    "memory",
-    "addrspace",
-    "ioring",
-    "blocking",
-    "jit",
-];
+/// ([`instantiate_with_imports`]) instead resolves its own import names. One list, shared with the
+/// frontends: re-exported from `svm_ir` so the grant order and the emitters' vocabulary cannot drift.
+const POWERBOX_CAP_NAMES: [&str; 7] = svm_ir::POWERBOX_CAP_NAMES;
 
 /// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
 /// whose results are `results`: assert the two backends agree (the differential oracle of
@@ -4721,12 +4691,7 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
         };
         let bindable = matches!(
             cap.type_id,
-            cap_id::STREAM
-                | cap_id::EXIT
-                | cap_id::ADDRESS_SPACE
-                | cap_id::IO_RING
-                | cap_id::BLOCKING
-                | cap_id::JIT
+            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::IO_RING | cap_id::JIT
         );
         if !bindable {
             return Err(format!(
@@ -5292,7 +5257,7 @@ impl Instance {
                 // vestigial handle: the slot binding IS the dispatch. A name outside the fixed
                 // policy leaves its slot unbound (a dispatch through it is a fail-closed
                 // `CapFault`).
-                let [stdout, stdin, exit, memory, addrspace, ioring, blocking, jit] =
+                let [stdout, stdin, exit, memory, addrspace, ioring, jit] =
                     grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
                     use svm_interp::cap_id;
@@ -5315,7 +5280,6 @@ impl Instance {
                                 (cap_id::ADDRESS_SPACE, 0..=3) => memory,
                                 (cap_id::ADDRESS_SPACE, _) => addrspace,
                                 (cap_id::IO_RING, _) => ioring,
-                                (cap_id::BLOCKING, _) => blocking,
                                 (cap_id::JIT, _) => jit,
                                 // e.g. SharedRegion: dynamic-mode only — never a manifest slot.
                                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),

@@ -213,6 +213,20 @@ retirement is asset-safe — `asset_op_scan` now reports every cap iface per ass
 - **5a. `Blocking` is a mock** (its own doc says so: "a *mock* synchronous-only/blocking host
   capability"). Demote it to test-only wiring so it stops reading as a product primitive in
   the public cap_id space. Independent; land any time.
+
+  **§5a status (2026-08-06): DONE.** The fact base first (asset scan: no committed `.svmb`
+  touches iface 10; `default_cap_resolver` never resolved a blocking name — so no manifest
+  guest could ever import it, and the `BLOCKING` arm in `validate_powerbox_manifest`'s
+  bindable list was dead code, the mirror image of the `ADDRESS_SPACE` inconsistency §4
+  found). What changed: the §3e powerbox is **seven** capabilities (the `grant_blocking`
+  grant, the `"blocking"` name, the dead bindable arm, and the `fast_blocking_work` JIT
+  fast-path row all left `svm-run`); `svm_ir::POWERBOX_CAP_NAMES` is 7 names and `svm-run`
+  now re-exports it instead of keeping a drift-prone copy. The cap itself (cap_id 10,
+  `Binding::Blocking`, `AsyncState`, the dispatch + io_ring SQE arms) **stays in
+  `svm-interp` as the documented offload-pool test fixture** until §5b's re-measure decides
+  the ring's fate — test harnesses (io_ring, the async C demos in c_frontend/translate.rs,
+  wasm imports) grant it themselves and register the name; `__vm_blocking_handle` resolves
+  by name at runtime, so an ungranted guest fails closed at the resolve, no frontend change.
 - **5b. `IoRing` gets a post-increment-5 re-measure.** Its two jobs are boundary-crossing
   amortization and overlapping blocking host ops on the offload pool. Once promotion lands
   everywhere, a blocking host op can simply **park the fiber** — the offload pool becomes

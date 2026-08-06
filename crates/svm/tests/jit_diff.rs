@@ -2074,8 +2074,11 @@ block 3 (v15: i64) {
         assert_eq!(got, 28);
     }
 
-    /// `Blocking.work` (iface 10 op 0, one arg) is fast-pathed: a loop-sum of `mix(i)` for i in 0..8
-    /// agrees across all three execution paths (exercises the register-arg path, the `hostcall` shape).
+    /// `Blocking.work` (iface 10 op 0, one arg) is **not** fast-path-claimed since §5a demoted the
+    /// mock out of the production powerbox — `fast_cap_resolver` returns null for it, so the
+    /// JIT-fast run exercises the **fallback seam**: an unclaimed op must take the generic
+    /// `cap_thunk` with behavior identical to the generic run and the interp (the loop-sum of
+    /// `mix(i)` agrees across all three).
     #[test]
     fn blocking_work_fast_matches_generic_and_interp() {
         let ir = "\

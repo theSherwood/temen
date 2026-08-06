@@ -599,11 +599,10 @@ fn translate_impl(
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
     // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
-    // for the async ring, blocking(6) for `__vm_blocking_handle`, jit(7) for the guest-driven-JIT
-    // builtins.
+    // for the async ring, jit(6) for the guest-driven-JIT builtins. (`blocking` left the powerbox
+    // with CONSOLIDATION §5a: `__vm_blocking_handle` resolves the name at runtime, so it needs no
+    // slot — a harness that grants + registers it serves the resolve; anything else fails closed.)
     let max_cap_index = if uses_vm_jit {
-        7
-    } else if uses_blocking {
         6
     } else if uses_vm_io {
         5

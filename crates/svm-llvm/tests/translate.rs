@@ -7213,8 +7213,21 @@ fn grant_powerbox(
         h.grant_jit(mem_log2),
     ];
     // Register each granted cap under its canonical name (`cap.self.resolve` — the discovery tier;
-    // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`.
-    for (name, &handle) in svm_ir::POWERBOX_CAP_NAMES.iter().zip(&all[..n]) {
+    // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`. This is the
+    // *test* powerbox: the product's seven names (`svm_ir::POWERBOX_CAP_NAMES`) plus the test-only
+    // `Blocking` mock at its historical slot 6 (§5a — the async demos exercise the offload pool
+    // through it, so this harness grants and names it itself).
+    const TEST_NAMES: [&str; 8] = [
+        "stdout",
+        "stdin",
+        "exit",
+        "memory",
+        "addrspace",
+        "ioring",
+        "blocking",
+        "jit",
+    ];
+    for (name, &handle) in TEST_NAMES.iter().zip(&all[..n]) {
         h.register_cap_name(name, handle);
     }
     all[..n].iter().map(|&x| Value::I32(x)).collect()

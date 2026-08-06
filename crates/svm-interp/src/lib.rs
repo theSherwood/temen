@@ -13423,6 +13423,11 @@ pub mod cap_id {
     /// whose op 0 `work(arg) -> mix(arg)` is **window-independent and `&mut Host`-free**, so a
     /// `submit` batch can hand it to the offload pool instead of the guest's vCPU thread. Op 0 is also
     /// a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
+    ///
+    /// **Test-only since CONSOLIDATION §5a:** no product powerbox grants it — it is the offload-pool
+    /// *exerciser* (io_ring/async tests and the C async demos), retained until the §5b IoRing
+    /// re-measure decides the ring's fate. A harness that needs it calls [`Host::grant_blocking`]
+    /// (and registers the `"blocking"` name if its guest resolves by name).
     pub const BLOCKING: u32 = 10;
     /// `Jit` — the guest-driven JIT capability (DESIGN.md §22): submit serialized IR at runtime to
     /// be validated (decode + verify + the memory-match precondition, via the host-injected
