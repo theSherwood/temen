@@ -20,9 +20,11 @@
 //! server (a same-module `svc.wait` loop whose handler runs pid-mode `clone_caller`), mints a
 //! `child_offer` over its `fork` export, then spawns the **guest module** via op 13 re-granting BOTH the
 //! fork offer (named `"fork"`, the guest's import name) and the forkable posix libc (named `"libc"`), and
-//! joins. The guest calls `fork()` **through its import**, both copies `write(1, &ret, 8)` through the
-//! shared libc, and it returns the fork result. Parent sees the twin's pid (3), the twin sees 0; both
-//! writes land in the ONE shared libc memfs. Interp only (the serve substrate is eval-loop-only).
+//! joins. The guest calls `fork()` **through its import** (retrying on the `-EAGAIN` serve/park race —
+//! the `while ((pid = fork()) < 0)` shell idiom, see ISSUES.md I68/I53), both copies `write(1, &ret, 8)`
+//! through the shared libc, and it returns the fork result. Parent sees the twin's pid (3), the twin
+//! sees 0; both writes land in the ONE shared libc memfs. Interp only (the serve substrate is
+//! eval-loop-only).
 
 use std::sync::Arc;
 
@@ -79,9 +81,12 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
   vz = i32.const 0
   vn = cap.call 4294967295 10 () -> (i64) vz ()
-  return vn
+  br 1()
   }
 }
 func (i64) -> (i64) {
@@ -95,7 +100,8 @@ block 0 (vx: i64) {
 "#;
 
 /// The guest program (its own module, entry 0): resolve `"libc"` by name, call `fork()` **through the
-/// named import**, write the 8-byte result through libc fd 1, return it.
+/// named import** (retrying while it returns `< 0` — the `-EAGAIN` serve/park race, I68), write the
+/// 8-byte result through libc fd 1, return it.
 const GUEST: &str = r#"
 memory 12
 type 0 func (i64) -> (i64)
@@ -108,8 +114,16 @@ block 0 (v0: i64) {
   vp0 = i64.const 0
   vl4 = i64.const 4
   vlibc = cap.self.resolve vp0 vl4
+  br 1(vlibc)
+  }
+block 1 (vlibc: i32) {
   varg = i64.const 0
   vr = call.import 0 (varg)
+  vzero = i64.const 0
+  vforkfail = i64.lt_s vr vzero
+  br_if vforkfail 1(vlibc) 2(vlibc, vr)
+  }
+block 2 (vlibc: i32, vr: i64) {
   vp16 = i64.const 16
   i64.store vp16 vr
   vfd1 = i64.const 1
