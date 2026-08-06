@@ -1249,7 +1249,16 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         }
         quota = if taken.fuel < 0 { 0 } else { taken.fuel };
     }
-    match (modh >= 0, grants_n > 0) {
+    // §3d: the record folds the plain and named spawn shapes onto one op — and the interpreter
+    // retains EVERY child's powerbox (its `child_offer`, op 14, mints over any live child), so
+    // when the embedder installed the grant hooks (svm-run always does, at both production
+    // sites) an empty grant list still routes through the NAMED path: the retained,
+    // interpreter-parity shape. A bare hookless harness keeps the plain path — its children
+    // cannot mint offers, the documented hookless gap
+    // (`jit_child_offer.rs::child_offer_on_a_hookless_child_refuses` pins it).
+    let hooked = (*rt).grant_build_named.load(Ordering::Acquire) != 0
+        && (*rt).grant_release.load(Ordering::Acquire) != 0;
+    match (modh >= 0, grants_n > 0 || hooked) {
         (false, false) => instantiate(
             rt, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
         ),

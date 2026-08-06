@@ -130,7 +130,12 @@ as a **conditional** import — existing modules keep their exact import set).
 
 - **3d.1** — migrate the in-tree text-IR callers (survey: op 0 in 34 files, op 5 in 16,
   op 8 in 4, op 11 in 15, op 16 in 2, across tests/bench/fuzz) to the record, then delete
-  the **five** arms (0/5/8/11/16) across all tiers. No committed asset uses any of them.
+  the legacy arms across all tiers. No committed asset uses any of them. **Deletion scope
+  revised by a migration fact (2026-08-06): ops 0/5 are additionally gated on §12.7** — an
+  R9-instrumented guest is pure SSA + `cap.call` (`transform_module` fails `GuestUsesMemory`
+  on any guest memory op), so a *durable* parent cannot build the op-17 record in its window;
+  `durable_nesting{,_jit}.rs` stay on the scalar ops until relocation lifts that restriction.
+  Ops **8/11/16** have no such user and delete with 3d.1; ops 0/5 join op 13 as gated arms.
   - **3d.1a (landed)** — the record is **native on the bytecode tier** (`Op::InstantiateRec`):
     the 56-byte record is runtime data, so it is parsed at exec time (confined `read_window`)
     and folds onto the existing `Outcome::Instantiate`/`InstantiateModule` driver plumbing

@@ -21,6 +21,20 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I69 — `threaded_offers::concurrent_callers_share_one_threaded_instance` intermittently loses one caller's increment under full-suite parallel load (S4, flaky — likely a real lost-update window in the threaded-offer admission) — recorded 2026-08-06 on PR #634
+
+**Symptom.** Under `cargo test -p svm-interp` with the full suite running in parallel, the test
+fails with `left: Ok([I64(10)]) right: Ok([I64(21)])` — one of the two spawned callers' writes
+(10 / 11) did not land in the shared instance window. 8/8 green when the binary runs alone;
+observed once (Linux, local, suite under load). The file was untouched by the change under test
+(§3d.1 record migration), so this is pre-existing.
+
+**Reading.** `10` (not `11`, not `0`) means exactly one handler's read-modify-write was lost —
+the classic lost-update interleaving, which points at the §7.x threaded-offer admission
+(`drive_arc_shared` over the cell) rather than test scaffolding. If it recurs, treat it as a
+real S3 race in the threaded lane and stress it like I68 (`--test-threads 1` × N under load);
+until then, rerun-once policy (I53/I66 class).
+
 ### I68 — `fork_manager` guest-fork race: intermittent HANG or wrong result in the FORK.md fork/join path (S3, real race — reclassified from S4 after recurrence + Linux repro) — recorded 2026-08-05 on PR #627, updated 2026-08-06 on PR #629 — **FIX LANDED 2026-08-06** (`claude/i68-issue-fix-sxghke`)
 
 **FIX LANDED (2026-08-06) — not a substrate race: the three fork tests didn't honor FORK.md §8.6's
