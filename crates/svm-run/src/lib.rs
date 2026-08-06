@@ -3799,23 +3799,26 @@ fn module_nests(m: &svm_ir::Module) -> bool {
 }
 
 /// CONSOLIDATION.md §2.2/§3: the module spawns a demand process child (`Instantiator` op 16 —
-/// pager-serviced faults) or uses the §3 config-record spawn (op 17 — §3c migrates the spawn
-/// ABI to the JIT). The JIT has no native arm for either yet, so these modules
+/// pager-serviced faults), or uses the §3 config-record spawn (op 17) **and declares impl
+/// exports** — the record's `pager` field is runtime data, so any module that could name one of
+/// its own exports as a pager folds; an export-less module cannot build a valid pager record
+/// (the interpreter fails that validation identically), so §3c runs it natively via the
+/// `instantiate_rec` thunk. The JIT has no native arm for the fault seam itself, so pager-capable
+/// modules
 /// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
 /// transport itself is what makes this cheap to defer: JIT callers already reach providers
 /// through the cap-thunk handoff at interp cost.
 fn module_demand_spawns(m: &svm_ir::Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    svm_ir::Inst::CapCall {
-                        type_id: 6,
-                        op: 16 | 17,
-                        ..
-                    }
-                )
+            b.insts.iter().any(|i| match i {
+                svm_ir::Inst::CapCall {
+                    type_id: 6, op: 16, ..
+                } => true,
+                svm_ir::Inst::CapCall {
+                    type_id: 6, op: 17, ..
+                } => !m.impl_exports.is_empty(),
+                _ => false,
             })
         })
     })

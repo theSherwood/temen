@@ -643,3 +643,109 @@ fn budget_plus_raw_quota_fails_closed() {
         "budget XOR quota: {res:?}"
     );
 }
+
+/// §3c canary — the **native-JIT budget record**: a Budget-funded record spawn is
+/// interpreter-first (§3b); the JIT thunk returns probeable `-EINVAL` until §3c.2 adds the
+/// budget callback (the durable-nesting parity precedent). TreeWalk/Bytecode complete the
+/// budget-funded child (exit 42); the native JIT lane (this module has no impl exports, so it
+/// does NOT fold) reports `100000 + 22`. When §3c.2 lands this test flips — update it to
+/// assert 42 everywhere rather than deleting it.
+#[test]
+fn budget_record_on_native_jit_is_the_documented_parity_gap() {
+    let src = format!(
+        r#"memory 17
+data 0 "vm"
+data 8 "bgt"
+import 0 "exit" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 0
+  vl = i64.const 2
+  vh = cap.self.resolve vp vl
+  vbp = i64.const 8
+  vbl = i64.const 3
+  vbud = cap.self.resolve vbp vbl
+  vf0 = i64.const {f0}
+  vf8 = i64.const 65536
+  vf16 = i64.const {f16}
+  vmask = i64.const 4294967295
+  vb64 = i64.extend_i32_s vbud
+  vbm = i64.and vb64 vmask
+  vsh = i64.const 32
+  vbs = i64.shl vbm vsh
+  vmod = i64.const 4294967295
+  vf24 = i64.or vmod vbs
+  vf32 = i64.const 0
+  vf40 = i64.const 0
+  vf48 = i64.const 0
+{stores}
+  vrp = i64.const 1024
+  vch = cap.call 6 17 (i64) -> (i32) vh (vrp)
+  vzero = i32.const 0
+  visneg = i32.lt_s vch vzero
+  br_if visneg 2(vch) 1(vh, vch)
+}}
+block 1 (vh1: i32, vch1: i32) {{
+  vj = cap.call 6 1 (i32) -> (i64) vh1 (vch1)
+  vc = i32.wrap_i64 vj
+  call.import 0 (vc)
+  unreachable
+}}
+block 2 (verr: i32) {{
+  vk = i32.const 100000
+  vn = i32.sub vk verr
+  call.import 0 (vn)
+  unreachable
+  }}
+}}
+
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vr = i64.const 42
+  return vr
+  }}
+}}
+"#,
+        f0 = (1u64 << 32) as i64,
+        f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
+        stores = store_record(1024),
+    );
+    let run_b = |backend: Backend| -> i32 {
+        let m = parse_module(&src).expect("parse");
+        verify_module(&m).expect("verify");
+        let registry = Imports::new().provide("exit", HostCap::exit());
+        let inst = instantiate_with_imports(m, registry).expect("instantiate");
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[
+                    (
+                        "vm",
+                        HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                    ),
+                    (
+                        "bgt",
+                        HostCap::custom(14, 0, |h, _| h.grant_budget(-1, -1, -1)),
+                    ),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        match r.outcome {
+            Outcome::Exited(code) => code,
+            other => panic!("{backend:?}: unexpected outcome {other:?}"),
+        }
+    };
+    assert_eq!(
+        run_b(Backend::TreeWalk),
+        42,
+        "interp: budget funds the child"
+    );
+    assert_eq!(run_b(Backend::Bytecode), 42, "bytecode (vetoes to oracle)");
+    assert_eq!(
+        run_b(Backend::Jit),
+        100_022,
+        "native JIT: -EINVAL until §3c.2 (this flipping to 42 means the parity gap closed)"
+    );
+}

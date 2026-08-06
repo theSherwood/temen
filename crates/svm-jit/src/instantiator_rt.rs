@@ -1142,6 +1142,105 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     )
 }
 
+/// CONSOLIDATION.md §3c — the **config-record spawn** (`Instantiator` op 17,
+/// `instantiate_rec(record_ptr)`) on the native JIT tier: parse + validate the 56-byte record
+/// from the guest window, then **delegate to the existing spawn thunks** (the same bodies
+/// ops 0/5/11/13 call), so there is exactly one spawn implementation per shape on this tier
+/// too. Field handling mirrors the tree-walker's op-17 arm:
+///
+/// - `version != 0` → `CapFault` (fail closed).
+/// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `svm-run` folds op-17 modules
+///   **with** impl exports to the oracle, so a natively-running module has none — and the
+///   interpreter fails its pager validation (`self_module.impl_exports.get(..)`) identically.
+/// - `budget != 0` → probeable `-EINVAL`: the Budget-funded spawn is an interpreter-first
+///   feature (§3b); JIT parity is a follow-up (§3c.2), exactly like durable nesting above —
+///   the interpreter is the reference. `budget` and `quota` are mutually exclusive either way.
+/// - module `-1` = self / else a granted `Module` handle; named grants `(grants_ptr, grants_n)`.
+///
+/// # Safety
+/// Same contract as [`instantiate_module_named`]: called from JITted code on the spawning
+/// vCPU's thread with the run's live nursery, window base/size, and a writable `trap_out`.
+pub(crate) unsafe extern "C" fn instantiate_rec(
+    rt: *const Nursery,
+    mem_base: u64,
+    mem_size: u64,
+    handle: i32,
+    record_ptr: i64,
+    trap_out: *mut i64,
+) -> i32 {
+    let rp = record_ptr as u64;
+    if rp.checked_add(56).is_none_or(|e| e > mem_size) {
+        *trap_out = TrapKind::MemoryFault as i64;
+        return 0;
+    }
+    let base = (mem_base + rp) as *const u8;
+    let u32_at = |o: usize| -> u32 {
+        let mut b = [0u8; 4];
+        core::ptr::copy_nonoverlapping(base.add(o), b.as_mut_ptr(), 4);
+        u32::from_le_bytes(b)
+    };
+    let u64_at = |o: usize| -> u64 {
+        let mut b = [0u8; 8];
+        core::ptr::copy_nonoverlapping(base.add(o), b.as_mut_ptr(), 8);
+        u64::from_le_bytes(b)
+    };
+    let version = u32_at(0);
+    let entry = u32_at(4) as i64;
+    let off = u64_at(8) as i64;
+    let size_log2 = u32_at(16) as i64;
+    let pager = u32_at(20);
+    let modh = u32_at(24) as i32;
+    let budget = u32_at(28) as i32;
+    let quota = u64_at(32) as i64;
+    let grants_ptr = u64_at(40) as i64;
+    let grants_n = u64_at(48) as i64;
+    if version != 0 || pager != u32::MAX {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+    if budget != 0 {
+        if quota != 0 {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+        return EINVAL as i32; // §3c.2: Budget-funded spawn on the JIT is a parity follow-up
+    }
+    match (modh >= 0, grants_n > 0) {
+        (false, false) => instantiate(
+            rt, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
+        ),
+        (true, false) => instantiate(
+            rt,
+            mem_base,
+            handle,
+            modh as i64,
+            entry,
+            off,
+            size_log2,
+            quota,
+            trap_out,
+        ),
+        (false, true) => instantiate_named(
+            rt, mem_base, mem_size, handle, grants_ptr, grants_n, entry, off, size_log2, quota,
+            trap_out,
+        ),
+        (true, true) => instantiate_module_named(
+            rt,
+            mem_base,
+            mem_size,
+            handle,
+            modh as i64,
+            grants_ptr,
+            grants_n,
+            entry,
+            off,
+            size_log2,
+            quota,
+            trap_out,
+        ),
+    }
+}
+
 /// STAGE1.md — `instantiate_module_named(module, grants_ptr, grants_n, entry, off, size_log2, quota)`
 /// (Instantiator op 13): the **shell exec** primitive — the union of [`instantiate`]'s separate-module
 /// path (op 5: resolve + compile a host-granted `Module`, materialize its data into the carve) and
