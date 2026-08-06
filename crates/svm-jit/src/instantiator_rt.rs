@@ -858,154 +858,6 @@ pub(crate) unsafe extern "C" fn instantiate(
     slot as i32
 }
 
-/// PROCESS.md S2 (JIT parity) — `instantiate_granted(grant_handle, entry, off, size_log2, quota)`
-/// (Instantiator op 8): exactly [`instantiate`] (a **same-module** child confined to the carve), but
-/// the child's powerbox is not empty — one of the parent's own coordinate-free capabilities
-/// (`Stream`/`Exit`/`Clock`, named by `grant_handle`) is re-granted into a fresh child `Host`, which
-/// the child receives as its **third** entry arg (after `Instantiator`, `AddressSpace`). The child
-/// `Host` is built host-side by [`Nursery::grant_build`] (svm-run knows the `Host` type; svm-jit keeps
-/// it opaque, exactly as the [`crate::ModuleResolver`] seam does for module storage), the child runs
-/// against the run's own `cap.call` thunk with that host as its ctx, and the host is freed with
-/// [`Nursery::grant_release`] afterwards.
-///
-/// A granted child is **not** cached (its baked per-spawn child-host ctx makes the code un-shareable —
-/// the same exclusion the durable child takes) and, like every non-durable JIT child today, gets no
-/// nesting `InstEnv` — its `Instantiator` arg is inert (recursive nesting of a *granted* child is a
-/// follow-up, tied to JIT async children, S1c). A durable run fails closed (`-EINVAL`), a run that
-/// re-grants nothing / a forged-or-non-copyable handle is a `CapFault`, and a bad carve/entry is
-/// `-EINVAL` — all matching the interpreter's op-8 path.
-///
-/// # Safety
-/// As [`instantiate`]: `rt`/`mem_base`/`trap_out` are the baked nursery, live parent window base, and
-/// run trap cell, valid for the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn instantiate_granted(
-    rt: *const Nursery,
-    mem_base: u64,
-    handle: i32,
-    grant_handle: i32,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    fuel: i64,
-    trap_out: *mut i64,
-) -> i32 {
-    let rt = &*rt;
-    // §4: a durable run can't yet freeze a granted child's separate powerbox host — fail closed, like
-    // the durable separate-module child. Guest-reachable errno.
-    if rt.durable.load(Ordering::Acquire) {
-        return EINVAL as i32;
-    }
-    // The host callbacks that build/free the child powerbox. A run that installed none re-grants
-    // nothing → an inert `CapFault` (matching a host with no such capability to give).
-    let build_addr = rt.grant_build.load(Ordering::Acquire);
-    let release_addr = rt.grant_release.load(Ordering::Acquire);
-    if build_addr == 0 || release_addr == 0 {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
-    let build: crate::GrantChildBuilder = core::mem::transmute(build_addr);
-    let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
-    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
-    // code must synchronize its cap.calls once the parent can reach the same powerbox. Fall back
-    // to the run's thunk only for a legacy non-sharing builder.
-    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
-    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
-        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
-    } else {
-        rt.cap_thunk
-    };
-
-    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
-        return 0; // `*trap_out` already holds the CapFault
-    };
-    // A granted child is a **same-module** child (its funcs are the parent's own); its entry must be
-    // the 3-arg form `(i64, i64, i64) -> (i64)` so it actually receives the re-granted handle.
-    let child_funcs = &rt.funcs;
-    let entry = entry as u64;
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off = off as u64;
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && f.params.len() == 3
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
-    let fits = child_size != 0
-        && child_size <= size
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size);
-    if !ok_entry || !fits {
-        return EINVAL as i32;
-    }
-
-    // Build the child powerbox host-side (resolve the copyable grant against the parent host, mint the
-    // child's `Instantiator`/`AddressSpace`/grant handles, share stdout/stderr sinks). A forged or
-    // non-copyable handle fails the whole spawn closed.
-    let mut gc = crate::GrantChild {
-        ctx: core::ptr::null_mut(),
-        retained_ctx: core::ptr::null_mut(),
-        inst_handle: 0,
-        as_handle: 0,
-        grant_handle: 0,
-    };
-    if build(rt.cap_ctx, grant_handle, child_size, &mut gc) == 0 {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
-
-    // Compile the child against the run's own `cap.call` thunk with the **child host** as ctx (so its
-    // `Stream`/`Exit`/`Clock` cap.calls reach the re-granted cap, not the parent's powerbox), then run
-    // it **asynchronously** on its own OS thread (S1c — granted children are concurrent, so a spawned
-    // pair can pipeline). Uncached — the per-spawn child ctx is baked into the code. The child gets no
-    // nesting `InstEnv` (like every non-durable JIT child today).
-    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
-    let compiled = crate::compile_child(
-        child_funcs,
-        entry as FuncIdx,
-        size_log2 as u8,
-        child_thunk,
-        gc.ctx,
-        rt.epoch_addr,
-        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
-        rt.futex_sched,  // wait/notify against the parent domain's shared futex
-        crate::InstEnv::null(),
-        &rt.serve_handlers,
-    );
-    let code = match compiled {
-        Ok(code) => code,
-        Err(_) => {
-            // An un-compilable child (fibers/threads/setjmp, or a backend error) is a CapFault, like
-            // the plain `instantiate` path. Free the powerbox host it will never run against.
-            release(gc.ctx);
-            release(gc.retained_ctx);
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
-    };
-    let args = vec![
-        gc.inst_handle as i64,
-        gc.as_handle as i64,
-        gc.grant_handle as i64,
-    ];
-    let n_results = child_funcs[entry as usize].results.len();
-    spawn_granted_child(
-        rt,
-        code,
-        base + off,
-        size_log2 as u8,
-        mem_base as *mut u8,
-        args,
-        n_results,
-        release,
-        gc.ctx,
-        gc.retained_ctx,
-    )
-}
-
 /// PROCESS.md S2 (JIT parity) — `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
 /// (Instantiator op 11): the multi-cap, by-name form of [`instantiate_granted`]. The child powerbox is
 /// built host-side by [`Nursery::grant_build_named`], which reads `grants_n` 16-byte grant records from
@@ -1249,7 +1101,16 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         }
         quota = if taken.fuel < 0 { 0 } else { taken.fuel };
     }
-    match (modh >= 0, grants_n > 0) {
+    // §3d: the record folds the plain and named spawn shapes onto one op — and the interpreter
+    // retains EVERY child's powerbox (its `child_offer`, op 14, mints over any live child), so
+    // when the embedder installed the grant hooks (svm-run always does, at both production
+    // sites) an empty grant list still routes through the NAMED path: the retained,
+    // interpreter-parity shape. A bare hookless harness keeps the plain path — its children
+    // cannot mint offers, the documented hookless gap
+    // (`jit_child_offer.rs::child_offer_on_a_hookless_child_refuses` pins it).
+    let hooked = (*rt).grant_build_named.load(Ordering::Acquire) != 0
+        && (*rt).grant_release.load(Ordering::Acquire) != 0;
+    match (modh >= 0, grants_n > 0 || hooked) {
         (false, false) => instantiate(
             rt, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
         ),

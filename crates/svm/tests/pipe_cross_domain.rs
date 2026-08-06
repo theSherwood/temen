@@ -1,11 +1,12 @@
 //! PROCESS.md §4 / S4 — a **cross-domain pipe**: a parent mints a pipe (`grant_pipe`), keeps the read
-//! end, and re-grants the **write end** into a §14 child (`instantiate_granted`, op 8). The child
-//! writes bytes to its granted end; after `join` the parent reads them from its read end. The FIFO is
+//! end, and re-grants the **write end** into a §14 child via the op-17 record's named-grant list
+//! (§3d; the old positional op 8 is deleted) — the child resolves it as `"g"`. The child writes
+//! bytes to its granted end; after `join` the parent reads them from its read end. The FIFO is
 //! `Arc`-shared, so the two domains see the same queue — the substrate half of `cmd1 | cmd2`.
 //!
-//! Both backends re-grant the pipe end through the **same** `Host::regrant_into_child` (the interp op-8
-//! path and the JIT's `svm_run::grant_child_build` both route through it), so this is a cross-backend
-//! differential.
+//! Both backends re-grant the pipe end through the **same** `Host::regrant_into_child` (the interp
+//! grant-list path and the JIT's `svm_run::grant_named_child_build` both route through it), so this
+//! is a cross-backend differential.
 
 use svm_interp::{run_capture_reserved_with_host, Host, Value};
 use svm_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
@@ -18,17 +19,46 @@ use svm_verify::verify_module;
 /// (`'h'=104`, `'i'=105`), so the parent reads count `2` and those bytes → `2*65536 + 104*256 + 105`
 /// = `157801` — proving the bytes crossed the domain boundary through the shared FIFO.
 ///
-/// func 1 (child, `(Instantiator, AddressSpace, Stream)`): write `"hi"` into its own window and
-/// `Stream.write(0, 2)` through the **granted write end**, then return 7.
+/// func 1 (child, `(Instantiator, AddressSpace)`): write `"hi"` into its own window, resolve the
+/// granted write end as `"g"`, `Stream.write(0, 2)` through it, then return 7.
 const SRC: &str = "memory 17\n\
 func (i32, i32, i32) -> (i64) {\n\
 block 0 (vinst: i32, vread: i32, vwrite: i32) {\n\
-  vwrite64 = i64.extend_i32_u vwrite\n\
-  ventry = i64.const 1\n\
-  voff = i64.const 0\n\
-  vsl = i64.const 12\n\
-  vq = i64.const 0\n\
-  vch = cap.call 6 8 (i64, i64, i64, i64, i64) -> (i32) vinst (vwrite64, ventry, voff, vsl, vq)\n\
+  vg = i32.const 103\n\
+  vnp1 = i64.const 4096\n\
+  i32.store8 vnp1 vg\n\
+  vgr0 = i64.const 4104\n\
+  vno = i32.const 4096\n\
+  i32.store vgr0 vno\n\
+  vgr1 = i64.const 4108\n\
+  vnl1 = i32.const 1\n\
+  i32.store vgr1 vnl1\n\
+  vgr2 = i64.const 4112\n\
+  i32.store vgr2 vwrite\n\
+  vgr3 = i64.const 4116\n\
+  vz32 = i32.const 0\n\
+  i32.store vgr3 vz32\n\
+  rrv0 = i64.const 4294967296\n\
+  rrvz = i64.const 0\n\
+  rrv2 = i64.const -4294967284\n\
+  rrv3 = i64.const 4294967295\n\
+  rrgp = i64.const 4104\n\
+  rrgn = i64.const 1\n\
+  rra0 = i64.const 4160\n\
+  i64.store rra0 rrv0\n\
+  rra1 = i64.const 4168\n\
+  i64.store rra1 rrvz\n\
+  rra2 = i64.const 4176\n\
+  i64.store rra2 rrv2\n\
+  rra3 = i64.const 4184\n\
+  i64.store rra3 rrv3\n\
+  rra4 = i64.const 4192\n\
+  i64.store rra4 rrvz\n\
+  rra5 = i64.const 4200\n\
+  i64.store rra5 rrgp\n\
+  rra6 = i64.const 4208\n\
+  i64.store rra6 rrgn\n\
+  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)\n\
   vcr = cap.call 6 1 (i32) -> (i64) vinst (vch)\n\
   a16 = i64.const 16\n\
   vlen = i64.const 2\n\
@@ -47,15 +77,19 @@ block 0 (vinst: i32, vread: i32, vwrite: i32) {\n\
   return vresult\n\
   }\n\
 }\n\
-func (i64, i64, i64) -> (i64) {\n\
-block 0 (vci: i64, vca: i64, vcw: i64) {\n\
+func (i64, i64) -> (i64) {\n\
+block 0 (vci: i64, vca: i64) {\n\
   a0 = i64.const 0\n\
   ch = i32.const 104\n\
   i32.store8 a0 ch\n\
   a1 = i64.const 1\n\
   ci = i32.const 105\n\
   i32.store8 a1 ci\n\
-  vwh = i32.wrap_i64 vcw\n\
+  vg = i32.const 103\n\
+  vnp = i64.const 512\n\
+  i32.store8 vnp vg\n\
+  vnl = i64.const 1\n\
+  vwh = cap.self.resolve vnp vnl\n\
   vlen = i64.const 2\n\
   vw = cap.call 0 1 (i64, i64) -> (i64) vwh (a0, vlen)\n\
   v7 = i64.const 7\n\

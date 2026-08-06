@@ -38,13 +38,27 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32) -> (i64) {
 block 0 (vinst: i32) {
-  gp = i64.const 0
-  gn = i64.const 0
-  ent = i64.const 1
-  off = i64.const 65536
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 65536
+  q0v2 = i64.const -4294967280
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vch = cap.call 6 17 (i64) -> (i32) vinst (q0a0)
   vexp = i64.const 0
   vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
   r = i64.extend_i32_s vh
@@ -74,13 +88,27 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32) -> (i64) {
 block 0 (vinst: i32) {
-  gp = i64.const 0
-  gn = i64.const 0
-  ent = i64.const 1
-  off = i64.const 65536
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q1v0 = i64.const 4294967296
+  q1v1 = i64.const 65536
+  q1v2 = i64.const -4294967280
+  q1v3 = i64.const 4294967295
+  q1v4 = i64.const 0
+  q1a0 = i64.const 1216
+  i64.store q1a0 q1v0
+  q1a1 = i64.const 1224
+  i64.store q1a1 q1v1
+  q1a2 = i64.const 1232
+  i64.store q1a2 q1v2
+  q1a3 = i64.const 1240
+  i64.store q1a3 q1v3
+  q1a4 = i64.const 1248
+  i64.store q1a4 q1v4
+  q1a5 = i64.const 1256
+  i64.store q1a5 q1v4
+  q1a6 = i64.const 1264
+  i64.store q1a6 q1v4
+  vch = cap.call 6 17 (i64) -> (i32) vinst (q1a0)
   vexp = i64.const 0
   vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
   va = i64.const 40
@@ -104,8 +132,9 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// A parent that spawns a **plain** (op 0) child — no grant hooks involved, no shared powerbox —
-/// then tries op 14 on it: must refuse `-EINVAL`, fail-closed (nothing retained to offer).
+/// A parent that spawns a grant-free record child, then tries op 14 on it. With the grant hooks
+/// installed the record routes through the named path (retained → mints, interp parity); on a
+/// hookless harness nothing is retained and op 14 refuses `-EINVAL` fail-closed.
 const PLAIN_SRC: &str = r#"memory 17
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
@@ -113,11 +142,27 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32) -> (i64) {
 block 0 (vinst: i32) {
-  ent = i64.const 1
-  off = i64.const 65536
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ent, off, sl, q)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q2v0 = i64.const 4294967296
+  q2v1 = i64.const 65536
+  q2v2 = i64.const -4294967280
+  q2v3 = i64.const 4294967295
+  q2v4 = i64.const 0
+  q2a0 = i64.const 1280
+  i64.store q2a0 q2v0
+  q2a1 = i64.const 1288
+  i64.store q2a1 q2v1
+  q2a2 = i64.const 1296
+  i64.store q2a2 q2v2
+  q2a3 = i64.const 1304
+  i64.store q2a3 q2v3
+  q2a4 = i64.const 1312
+  i64.store q2a4 q2v4
+  q2a5 = i64.const 1320
+  i64.store q2a5 q2v4
+  q2a6 = i64.const 1328
+  i64.store q2a6 q2v4
+  vch = cap.call 6 17 (i64) -> (i32) vinst (q2a0)
   vexp = i64.const 0
   vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
   r = i64.extend_i32_s vh
@@ -166,6 +211,33 @@ fn run_jit_i64_knob(src: &str, handoff: bool) -> i64 {
 
 fn run_jit_i64(src: &str) -> i64 {
     run_jit_i64_knob(src, false)
+}
+
+/// Like [`run_jit_i64`] but with NO grant hooks installed — the bare-embedder shape: record
+/// spawns take the plain thunk, children are not retained, op 14 refuses.
+fn run_jit_i64_hookless(src: &str) -> i64 {
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let am = Arc::new(m);
+    let mut host = Host::new();
+    host.set_self_module(&am);
+    let ih = host.grant_instantiator(0, 128 << 10);
+    let (jo, _jmem) = compile_and_run_capture_reserved_with_host_ex(
+        &am,
+        0,
+        &[ih as i64],
+        &[0u8; 128 << 10],
+        0,
+        svm_run::cap_thunk,
+        &mut host as *mut Host as *mut core::ffi::c_void,
+        None,
+        None,
+    )
+    .expect("jit");
+    match jo {
+        JitOutcome::Returned(v) => v.first().copied().unwrap_or(i64::MIN),
+        other => panic!("jit did not return cleanly: {other:?}"),
+    }
 }
 
 fn run_interp_i64(src: &str) -> i64 {
@@ -219,11 +291,22 @@ fn call_through_minted_offer_completes_on_both_backends() {
     );
 }
 
-/// Op 14 on a **plain** (op 0) child stays `-EINVAL` fail-closed on the JIT: nothing was shared,
-/// nothing is offered.
+/// §3d flipped this pin to **interp parity**: the record spawn routes through the named path
+/// whenever the grant hooks are installed (this harness installs them), so the child is retained
+/// and op 14 mints — exactly the interpreter, which retains every child's powerbox. The
+/// fail-closed edge that remains is the **hookless** embedder: with no grant hooks there is no
+/// shared powerbox, nothing is retained, and op 14 stays `-EINVAL`.
 #[test]
-fn child_offer_on_a_plain_child_refuses() {
-    assert_eq!(run_jit_i64(PLAIN_SRC), -22);
+fn child_offer_on_a_hooked_record_child_mints_hookless_refuses() {
+    assert!(
+        run_jit_i64(PLAIN_SRC) >= 0,
+        "hooked harness: record children are retained (interp parity)"
+    );
+    assert_eq!(
+        run_jit_i64_hookless(PLAIN_SRC),
+        -22,
+        "hookless: fail closed"
+    );
 }
 
 /// CALLS.md 5c.2 — the **settlement** module: the parent calls `add(40,2)` through the minted
@@ -237,13 +320,27 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32) -> (i64) {
 block 0 (vinst: i32) {
-  gp = i64.const 0
-  gn = i64.const 0
-  ent = i64.const 1
-  off = i64.const 65536
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q3v0 = i64.const 4294967296
+  q3v1 = i64.const 65536
+  q3v2 = i64.const -4294967280
+  q3v3 = i64.const 4294967295
+  q3v4 = i64.const 0
+  q3a0 = i64.const 1344
+  i64.store q3a0 q3v0
+  q3a1 = i64.const 1352
+  i64.store q3a1 q3v1
+  q3a2 = i64.const 1360
+  i64.store q3a2 q3v2
+  q3a3 = i64.const 1368
+  i64.store q3a3 q3v3
+  q3a4 = i64.const 1376
+  i64.store q3a4 q3v4
+  q3a5 = i64.const 1384
+  i64.store q3a5 q3v4
+  q3a6 = i64.const 1392
+  i64.store q3a6 q3v4
+  vch = cap.call 6 17 (i64) -> (i32) vinst (q3a0)
   vexp = i64.const 0
   vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
   vspin = i32.const 2000000
@@ -291,13 +388,27 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32) -> (i64) {
 block 0 (vinst: i32) {
-  gp = i64.const 0
-  gn = i64.const 0
-  ent = i64.const 1
-  off = i64.const 65536
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q4v0 = i64.const 4294967296
+  q4v1 = i64.const 65536
+  q4v2 = i64.const -4294967280
+  q4v3 = i64.const 4294967295
+  q4v4 = i64.const 0
+  q4a0 = i64.const 1408
+  i64.store q4a0 q4v0
+  q4a1 = i64.const 1416
+  i64.store q4a1 q4v1
+  q4a2 = i64.const 1424
+  i64.store q4a2 q4v2
+  q4a3 = i64.const 1432
+  i64.store q4a3 q4v3
+  q4a4 = i64.const 1440
+  i64.store q4a4 q4v4
+  q4a5 = i64.const 1448
+  i64.store q4a5 q4v4
+  q4a6 = i64.const 1456
+  i64.store q4a6 q4v4
+  vch = cap.call 6 17 (i64) -> (i32) vinst (q4a0)
   vexp = i64.const 0
   vh = cap.call 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
   vspin = i32.const 2000000

@@ -152,11 +152,26 @@ fn carve_must_equal_declared_memory() {
 const PARENT_FORGED: &str = r#"memory 17
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 999
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = cap.call 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  ; spawn via record (op 17): entry=0 off=65536 sl=16 quota=0
+  q0v0 = i64.const 0
+  q0v1 = i64.const 65536
+  q0v2 = i64.const -4294967280
+  q0v3 = i64.const 999
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v0
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v0
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v0
+  v6 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
   v7 = i64.extend_i32_s v6
   return v7
   }

@@ -14,6 +14,13 @@
 //!   control); and a durable domain's guest-driven `Jit.compile` (§22 — also a module
 //!   installation) fails closed until a host-side instrumentation hook exists.
 
+//!
+//! **§3d note (2026-08-06):** these parents stay on the scalar spawn ops **deliberately**: an
+//! R9-instrumented guest is pure SSA + `cap.call` (`transform_module` refuses any guest memory
+//! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
+//! The record migration (CONSOLIDATION.md §3d) therefore gates the op-0/5 arm deletion on the
+//! §12.7 relocation work that lifts that restriction — do not migrate this file until then.
+
 use std::sync::Arc;
 use svm_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,

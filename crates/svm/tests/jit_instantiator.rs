@@ -136,11 +136,27 @@ fn jit_instantiator_rejects_out_of_range_carve() {
     let src = "memory 17\n\
          func (i32) -> (i64) {\n\
          block 0 (v0: i32) {\n\
-         \x20 v1 = i64.const 1\n\
-         \x20 v2 = i64.const 131072\n\
-         \x20 v3 = i64.const 12\n\
-         \x20 v4 = i64.const 0\n\
-         \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+         \x20 ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0\n\
+         \x20 q0v0 = i64.const 4294967296\n\
+         \x20 q0v1 = i64.const 131072\n\
+         \x20 q0v2 = i64.const -4294967284\n\
+         \x20 q0v3 = i64.const 4294967295\n\
+         \x20 q0v4 = i64.const 0\n\
+         \x20 q0a0 = i64.const 1152\n\
+         \x20 i64.store q0a0 q0v0\n\
+         \x20 q0a1 = i64.const 1160\n\
+         \x20 i64.store q0a1 q0v1\n\
+         \x20 q0a2 = i64.const 1168\n\
+         \x20 i64.store q0a2 q0v2\n\
+         \x20 q0a3 = i64.const 1176\n\
+         \x20 i64.store q0a3 q0v3\n\
+         \x20 q0a4 = i64.const 1184\n\
+         \x20 i64.store q0a4 q0v4\n\
+         \x20 q0a5 = i64.const 1192\n\
+         \x20 i64.store q0a5 q0v4\n\
+         \x20 q0a6 = i64.const 1200\n\
+         \x20 i64.store q0a6 q0v4\n\
+         \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
          \x20 v6 = i64.extend_i32_s v5\n\
          \x20 return v6\n\
            }\n\
@@ -178,11 +194,27 @@ fn jit_instantiator_child_trap_propagates() {
             "memory 18\n\
              func (i32) -> (i64) {{\n\
              block 0 (v0: i32) {{\n\
-             \x20 v1 = i64.const 1\n\
-             \x20 v2 = i64.const 65536\n\
-             \x20 v3 = i64.const 16\n\
-             \x20 v4 = i64.const 0\n\
-             \x20 v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)\n\
+             \x20 ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0\n\
+             \x20 q1v0 = i64.const 4294967296\n\
+             \x20 q1v1 = i64.const 65536\n\
+             \x20 q1v2 = i64.const -4294967280\n\
+             \x20 q1v3 = i64.const 4294967295\n\
+             \x20 q1v4 = i64.const 0\n\
+             \x20 q1a0 = i64.const 1216\n\
+             \x20 i64.store q1a0 q1v0\n\
+             \x20 q1a1 = i64.const 1224\n\
+             \x20 i64.store q1a1 q1v1\n\
+             \x20 q1a2 = i64.const 1232\n\
+             \x20 i64.store q1a2 q1v2\n\
+             \x20 q1a3 = i64.const 1240\n\
+             \x20 i64.store q1a3 q1v3\n\
+             \x20 q1a4 = i64.const 1248\n\
+             \x20 i64.store q1a4 q1v4\n\
+             \x20 q1a5 = i64.const 1256\n\
+             \x20 i64.store q1a5 q1v4\n\
+             \x20 q1a6 = i64.const 1264\n\
+             \x20 i64.store q1a6 q1v4\n\
+             \x20 v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
              \x20 v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)\n\
              \x20 return v6\n\
                }}\n\

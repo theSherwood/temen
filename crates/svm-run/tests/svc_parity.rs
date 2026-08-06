@@ -30,13 +30,27 @@ block 0 () {
   vp = i64.const 0
   vl = i64.const 2
   vh = cap.self.resolve vp vl
-  vgp = i64.const 0
-  vgn = i64.const 0
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vh (vgp, vgn, v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 65536
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  v5 = cap.call 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0
   v7 = cap.call 6 14 (i32, i64) -> (i32) vh (v5, v6)
   va = i64.const 40

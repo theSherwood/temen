@@ -45,11 +45,27 @@ fn check(src: &str, want: Result<Vec<Value>, ()>) {
 const SHARED_MEM: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 65536
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  v5 = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   v7 = i64.const 65543
   v8 = i32.load8_u v7
@@ -82,11 +98,27 @@ fn instantiate_join_shares_backing() {
 const DEPTH_TWO: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
+  q1v0 = i64.const 4294967296
+  q1v1 = i64.const 65536
+  q1v2 = i64.const -4294967284
+  q1v3 = i64.const 4294967295
+  q1v4 = i64.const 0
+  q1a0 = i64.const 1216
+  i64.store q1a0 q1v0
+  q1a1 = i64.const 1224
+  i64.store q1a1 q1v1
+  q1a2 = i64.const 1232
+  i64.store q1a2 q1v2
+  q1a3 = i64.const 1240
+  i64.store q1a3 q1v3
+  q1a4 = i64.const 1248
+  i64.store q1a4 q1v4
+  q1a5 = i64.const 1256
+  i64.store q1a5 q1v4
+  q1a6 = i64.const 1264
+  i64.store q1a6 q1v4
+  v5 = cap.call 6 17 (i64) -> (i32) v0 (q1a0)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
@@ -97,11 +129,27 @@ block 0 (v0: i64) {
   v2 = i64.const 0
   v3 = i32.const 171
   i32.store8 v2 v3
-  v4 = i64.const 2
-  v5 = i64.const 2048
-  v6 = i64.const 10
-  v7 = i64.const 0
-  v8 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
+  ; spawn via record (op 17): entry=2 off=2048 sl=10 quota=0
+  q2v0 = i64.const 8589934592
+  q2v1 = i64.const 2048
+  q2v2 = i64.const -4294967286
+  q2v3 = i64.const 4294967295
+  q2v4 = i64.const 0
+  q2a0 = i64.const 1280
+  i64.store q2a0 q2v0
+  q2a1 = i64.const 1288
+  i64.store q2a1 q2v1
+  q2a2 = i64.const 1296
+  i64.store q2a2 q2v2
+  q2a3 = i64.const 1304
+  i64.store q2a3 q2v3
+  q2a4 = i64.const 1312
+  i64.store q2a4 q2v4
+  q2a5 = i64.const 1320
+  i64.store q2a5 q2v4
+  q2a6 = i64.const 1328
+  i64.store q2a6 q2v4
+  v8 = cap.call 6 17 (i64) -> (i32) v1 (q2a0)
   v9 = cap.call 6 1 (i32) -> (i64) v1 (v8)
   return v9
   }
@@ -128,11 +176,27 @@ fn nesting_composes_to_depth_two() {
 const ADDRESS_SPACE: &str = r#"memory 18
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 16
-  v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
+  q3v0 = i64.const 4294967296
+  q3v1 = i64.const 65536
+  q3v2 = i64.const -4294967280
+  q3v3 = i64.const 4294967295
+  q3v4 = i64.const 0
+  q3a0 = i64.const 1344
+  i64.store q3a0 q3v0
+  q3a1 = i64.const 1352
+  i64.store q3a1 q3v1
+  q3a2 = i64.const 1360
+  i64.store q3a2 q3v2
+  q3a3 = i64.const 1368
+  i64.store q3a3 q3v3
+  q3a4 = i64.const 1376
+  i64.store q3a4 q3v4
+  q3a5 = i64.const 1384
+  i64.store q3a5 q3v4
+  q3a6 = i64.const 1392
+  i64.store q3a6 q3v4
+  v5 = cap.call 6 17 (i64) -> (i32) v0 (q3a0)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
@@ -158,11 +222,27 @@ fn two_arg_child_manages_its_own_pages() {
 const BAD_CARVE: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 131072
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0
+  q4v0 = i64.const 4294967296
+  q4v1 = i64.const 131072
+  q4v2 = i64.const -4294967284
+  q4v3 = i64.const 4294967295
+  q4v4 = i64.const 0
+  q4a0 = i64.const 1408
+  i64.store q4a0 q4v0
+  q4a1 = i64.const 1416
+  i64.store q4a1 q4v1
+  q4a2 = i64.const 1424
+  i64.store q4a2 q4v2
+  q4a3 = i64.const 1432
+  i64.store q4a3 q4v3
+  q4a4 = i64.const 1440
+  i64.store q4a4 q4v4
+  q4a5 = i64.const 1448
+  i64.store q4a5 q4v4
+  q4a6 = i64.const 1456
+  i64.store q4a6 q4v4
+  v5 = cap.call 6 17 (i64) -> (i32) v0 (q4a0)
   v6 = i64.extend_i32_s v5
   return v6
   }
@@ -185,11 +265,26 @@ fn out_of_range_carve_rejected() {
 const CHILD_TRAP: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 0
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0
+  q5v0 = i64.const 4294967296
+  q5v1 = i64.const 0
+  q5v2 = i64.const -4294967284
+  q5v3 = i64.const 4294967295
+  q5a0 = i64.const 4416
+  i64.store q5a0 q5v0
+  q5a1 = i64.const 4424
+  i64.store q5a1 q5v1
+  q5a2 = i64.const 4432
+  i64.store q5a2 q5v2
+  q5a3 = i64.const 4440
+  i64.store q5a3 q5v3
+  q5a4 = i64.const 4448
+  i64.store q5a4 q5v1
+  q5a5 = i64.const 4456
+  i64.store q5a5 q5v1
+  q5a6 = i64.const 4464
+  i64.store q5a6 q5v1
+  v5 = cap.call 6 17 (i64) -> (i32) v0 (q5a0)
   v6 = cap.call 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }

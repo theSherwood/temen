@@ -75,11 +75,26 @@ fn run_jit(src: &str) -> i64 {
 const POLL_LOOP_RETURNS: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ventry = i64.const 1\n\
-  voff = i64.const 0\n\
-  vsl = i64.const 12\n\
-  vq = i64.const 0\n\
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)\n\
+  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  q0v0 = i64.const 4294967296\n\
+  q0v1 = i64.const 0\n\
+  q0v2 = i64.const -4294967284\n\
+  q0v3 = i64.const 4294967295\n\
+  q0a0 = i64.const 4096\n\
+  i64.store q0a0 q0v0\n\
+  q0a1 = i64.const 4104\n\
+  i64.store q0a1 q0v1\n\
+  q0a2 = i64.const 4112\n\
+  i64.store q0a2 q0v2\n\
+  q0a3 = i64.const 4120\n\
+  i64.store q0a3 q0v3\n\
+  q0a4 = i64.const 4128\n\
+  i64.store q0a4 q0v1\n\
+  q0a5 = i64.const 4136\n\
+  i64.store q0a5 q0v1\n\
+  q0a6 = i64.const 4144\n\
+  i64.store q0a6 q0v1\n\
+  vch = cap.call 6 17 (i64) -> (i32) v0 (q0a0)\n\
   br 1(v0, vch)\n\
 }\n\
 block 1 (v0a: i32, vcha: i32) {\n\
@@ -115,11 +130,26 @@ block 0 (vci: i64) {\n\
 const POLL_LOOP_TRAPS: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (v0: i32) {\n\
-  ventry = i64.const 1\n\
-  voff = i64.const 0\n\
-  vsl = i64.const 12\n\
-  vq = i64.const 0\n\
-  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vsl, vq)\n\
+  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0\n\
+  q1v0 = i64.const 4294967296\n\
+  q1v1 = i64.const 0\n\
+  q1v2 = i64.const -4294967284\n\
+  q1v3 = i64.const 4294967295\n\
+  q1a0 = i64.const 4160\n\
+  i64.store q1a0 q1v0\n\
+  q1a1 = i64.const 4168\n\
+  i64.store q1a1 q1v1\n\
+  q1a2 = i64.const 4176\n\
+  i64.store q1a2 q1v2\n\
+  q1a3 = i64.const 4184\n\
+  i64.store q1a3 q1v3\n\
+  q1a4 = i64.const 4192\n\
+  i64.store q1a4 q1v1\n\
+  q1a5 = i64.const 4200\n\
+  i64.store q1a5 q1v1\n\
+  q1a6 = i64.const 4208\n\
+  i64.store q1a6 q1v1\n\
+  vch = cap.call 6 17 (i64) -> (i32) v0 (q1a0)\n\
   br 1(v0, vch)\n\
 }\n\
 block 1 (v0a: i32, vcha: i32) {\n\

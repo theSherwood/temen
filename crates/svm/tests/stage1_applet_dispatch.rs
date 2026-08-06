@@ -24,6 +24,7 @@ const CARVE: u64 = 64 << 10;
 /// `echo` (resolve `stdout`, write 3 seeded bytes, →3). The parent seeds `token` into the applet's
 /// carve, lays a `stdout` grant record, spawns applet `entry`, joins, and returns its status.
 fn src(entry: u64, token: &[u8; 3]) -> String {
+    let f0 = (entry << 32) as i64;
     let seed: String = token
         .iter()
         .enumerate()
@@ -64,13 +65,28 @@ block 0 (vinst: i32, vout: i32) {{
   i32.store8 p104 cu
   p105 = i64.const 105
   i32.store8 p105 ct
-{seed}  gp = i64.const 0
-  gn = i64.const 1
-  ent = i64.const {entry}
-  off = i64.const {CARVE}
-  sl = i64.const 16
-  q = i64.const 0
-  vch = cap.call 6 11 (i64, i64, i64, i64, i64, i64) -> (i32) vinst (gp, gn, ent, off, sl, q)
+{seed}  ; spawn via record (op 17): off=CARVE sl=16 quota=0, one named grant record at 0
+  rrv0 = i64.const {f0}
+  rrv1 = i64.const {CARVE}
+  rrv2 = i64.const -4294967280
+  rrv3 = i64.const 4294967295
+  rrvz = i64.const 0
+  rrv1n = i64.const 1
+  rra0 = i64.const 1152
+  i64.store rra0 rrv0
+  rra1 = i64.const 1160
+  i64.store rra1 rrv1
+  rra2 = i64.const 1168
+  i64.store rra2 rrv2
+  rra3 = i64.const 1176
+  i64.store rra3 rrv3
+  rra4 = i64.const 1184
+  i64.store rra4 rrvz
+  rra5 = i64.const 1192
+  i64.store rra5 rrvz
+  rra6 = i64.const 1200
+  i64.store rra6 rrv1n
+  vch = cap.call 6 17 (i64) -> (i32) vinst (rra0)
   r = cap.call 6 1 (i32) -> (i64) vinst (vch)
   return r
   }}

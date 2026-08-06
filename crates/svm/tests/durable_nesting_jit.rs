@@ -22,6 +22,13 @@
 //!
 //! Separate-module durable children and `coro_spawn` are follow-ups.
 
+//!
+//! **§3d note (2026-08-06):** these parents stay on the scalar spawn ops **deliberately**: an
+//! R9-instrumented guest is pure SSA + `cap.call` (`transform_module` refuses any guest memory
+//! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
+//! The record migration (CONSOLIDATION.md §3d) therefore gates the op-0/5 arm deletion on the
+//! §12.7 relocation work that lifts that restriction — do not migrate this file until then.
+
 use core::ffi::c_void;
 use svm_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,

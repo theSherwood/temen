@@ -115,6 +115,56 @@ With §2 done, de-proliferate what remains of the op table (~16 ops today):
 
 **End state:** `Instantiator` at ~6 ops, one resource-accounting object in the system.
 
+### §3 status (2026-08-06, after PRs #627/#629/#633)
+
+Landed: **3a** (op 17 `instantiate_rec` — one 56-byte record subsumes every spawn shape as
+data; differentials vs ops 0/5/11/16), **3b** (the record's Budget field charges the spawn on
+fuel/mem/spawn with peek-then-drain), **3c** (native Cranelift record thunk delegating to the
+existing spawn bodies; pager soundness via the impl-exports fold), **3c.2** (the `BudgetTaker`
+host hook — budget records fund natively on the JIT; narrowed gap = bounded spawn ceilings /
+bounded-zero fuel, pinned by a flip-when-fixed test), **3c.3** (wasm-JIT `env.instantiate_rec`
+as a **conditional** import — existing modules keep their exact import set).
+
+**3d, fact-based split** (asset scan: `svm/examples/asset_op_scan.rs` decodes every committed
+`.svmb`; only `shell.svmb` contains legacy spawn ops — `{1, 13}`):
+
+- **3d.1** — migrate the in-tree text-IR callers (survey: op 0 in 34 files, op 5 in 16,
+  op 8 in 4, op 11 in 15, op 16 in 2, across tests/bench/fuzz) to the record, then delete
+  the legacy arms across all tiers. No committed asset uses any of them. **Deletion scope
+  revised by a migration fact (2026-08-06): ops 0/5 are additionally gated on §12.7** — an
+  R9-instrumented guest is pure SSA + `cap.call` (`transform_module` fails `GuestUsesMemory`
+  on any guest memory op), so a *durable* parent cannot build the op-17 record in its window;
+  `durable_nesting{,_jit}.rs` stay on the scalar ops until relocation lifts that restriction.
+  Ops **8/11/16** have no such user and delete with 3d.1; ops 0/5 join op 13 as gated arms.
+  - **3d.1c (landed)** — ops **8/11/16 are deleted** across the tiers: the tree-walker's three
+    arms (and the op-8 positional-grant plumbing — the `grant` tuple slot, `cgrant` regrant, the
+    3-arg entry form), the Cranelift contract rows + lowering arms + the `instantiate_granted`
+    thunk (`instantiate_named` stays — the record delegates to it), the bytecode op-11 compile
+    arm, and svm-run's op-16 fold clause. An op-8/11/16 `cap.call` now fails closed (`CapFault`)
+    on every tier, like any unknown op. Callers were migrated first: the stage1 op-11 trio, the
+    paging op-16 pair (the record's pager field), and the op-8 quartet re-spelled as one-entry
+    named-grant records (children resolve `"g"` — the positional 3rd-entry-arg ABI died;
+    compiled-C applets get handles through the import-manifest binding, see
+    `stage1_granted_argv_applet.rs`'s header).
+  - **3d.1a (landed)** — the record is **native on the bytecode tier** (`Op::InstantiateRec`):
+    the 56-byte record is runtime data, so it is parsed at exec time (confined `read_window`)
+    and folds onto the existing `Outcome::Instantiate`/`InstantiateModule` driver plumbing
+    (grants pass through; a new `budget` field reaches the drivers). Prerequisite for the
+    migration: without it, every migrated bytecode-native test would silently fall back to the
+    oracle and the tier would lose its spawn coverage. Boundaries: pager-capable modules
+    (op 17 + impl exports) **decline whole** (`compile_module_for`, the bytecode twin of
+    svm-run's `module_demand_spawns` fold); budgets fund at the drivers' commit sites
+    (`take_spawn_budget`, peek-then-drain — refusals leave the budget intact); a bounded
+    spawn ceiling / bounded-zero fuel is the same narrowed gap as the Cranelift thunk
+    (`-EINVAL`, flip-when-fixed pins); the debugger and OS-thread-parallel paths refuse
+    budget records exactly as they refuse grant lists. Pinned by
+    `svm-interp/tests/bytecode_rec.rs` (native-compile non-vacuity + oracle differentials).
+- **3d.2** — op 13 (`instantiate_module_named`, the STAGE1 shell's exec) is **asset-gated**:
+  deleting it breaks the committed `shell.svmb`, which only regenerates through the
+  heavyweight STAGE1 on-ramp — the same regeneration event ISSUES.md I64 already tracks for
+  the v9→v10 retirement. Fold op 13's deletion into that event; until then it is the one
+  legacy spawn arm that stays.
+
 **Gates:** §2 first (otherwise the record schema is designed twice); the JIT
 `instantiator_rt` thunks migrate in the same change (no tier-split of the spawn ABI) — that
 set now also includes the wasm-JIT tier's `env.instantiate`/`env.join` imports

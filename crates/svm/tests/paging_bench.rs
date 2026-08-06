@@ -68,12 +68,27 @@ block 0 () {{
   br 1(vh, vs0, vacc0)
 }}
 block 1 (vh1: i32, vs: i64, vacc: i64) {{
-  vz64 = i64.const 0
-  ventry = i64.const 1
-  voff = i64.const {off}
-  vsl = i64.const {sl}
-  vpk = i64.const 0
-  vch = cap.call 6 16 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vh1 (vz64, vz64, ventry, voff, vsl, vz64, vpk)
+  ; spawn a demand child via record (op 17): pager = impl export 0 (f16 hi), entry 1
+  rrv0 = i64.const 4294967296
+  rrv1 = i64.const {off}
+  rrv2 = i64.const {sl}
+  rrv3 = i64.const 4294967295
+  rrvz = i64.const 0
+  rra0 = i64.const 1152
+  i64.store rra0 rrv0
+  rra1 = i64.const 1160
+  i64.store rra1 rrv1
+  rra2 = i64.const 1168
+  i64.store rra2 rrv2
+  rra3 = i64.const 1176
+  i64.store rra3 rrv3
+  rra4 = i64.const 1184
+  i64.store rra4 rrvz
+  rra5 = i64.const 1192
+  i64.store rra5 rrvz
+  rra6 = i64.const 1200
+  i64.store rra6 rrvz
+  vch = cap.call 6 17 (i64) -> (i32) vh1 (rra0)
   vsrv0 = i64.const 0
   br 2(vh1, vs, vacc, vch, vsrv0)
 }}
