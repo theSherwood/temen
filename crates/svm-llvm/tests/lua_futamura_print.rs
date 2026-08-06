@@ -1,33 +1,39 @@
-//! **Toward a real end-to-end: a whole chunk with a `print` — and the first engine wall it hits.**
+//! **A real Lua script, end to end, through a peval residual — stdout byte-identical to the interpreter.**
 //!
-//! `lua_futamura_e2e.rs` runs a residual and diffs its memory effect, but notes stdout is uncrossable
-//! for a folding projection (`print` is a capability call *inside* `luaV_execute`). The cut machinery
-//! changes that: cut the `print`/table-lookup/allocator/growstack call path and the residual *calls
-//! the real print*, so stdout becomes a valid oracle again. This drives a whole-chunk projection from
-//! `luaV_execute`'s real entry — the first step to running a real script through a residual.
+//! This is the depth-first milestone: a whole real chunk (`local x=0; for i=1,50 do x=x+3 end; print(x)`)
+//! is captured at `luaV_execute`'s real entry, projected into a single residual, embedded back in place
+//! of `luaV_execute`, and run under `run_powerbox` — and it prints `150\n`, exactly what the baseline
+//! interpreter prints. No memory-effect diff proxy: the oracle is real stdout.
 //!
-//! **Progress + the current wall (this file is the record).** With the C-call machinery split into
-//! read-state cuts (`luaH_get*`/`luaV_finishget`/GC — read the heap, don't rewrite registers) and
-//! touch-state cuts (the `precall`/`poscall` path — mutate the stack), the projection clears the loop,
-//! the `_ENV["print"]` lookup, the `OP_GETTABUP` value move, **and the `OP_CALL` to `print`** — the
-//! first two of which needed the **narrow dynamic rename cell** engine feature this PR adds: the
-//! interpreter moves a looked-up value by storing its **1-byte `TValue` tag** (dynamic, since `print`
-//! came from a cut lookup) into a renamed register, and the touch-state cut of `luaD_precall` spills/
-//! reloads those tag bytes. Both were previously refused (the rename model only carried 4/8-byte
-//! dynamic cells); now a dynamic cell is renamed at a sub-natural 1/2-byte width too.
+//! What made the whole chunk project and run:
+//!   - **Cut the un-projectable runtime**, split by how it touches the register file. Read-state cuts
+//!     (`luaH_get*`/`luaV_finishget`/GC — read the heap, scan the stack, don't rewrite registers):
+//!     spill-but-don't-reload, so the folded `TValue` tags stay folded. Touch-state cuts (the
+//!     `precall`/`poscall`/`growstack` path — push args, write results): spill **and** reload.
+//!   - **Narrow dynamic rename cells** (landed earlier): the `_ENV["print"]` value move stores a dynamic
+//!     1-byte `TValue` tag into a renamed register; the rename model carries dynamic cells at 1/2-byte
+//!     widths, i32-canonical.
+//!   - **Edge-level deopt** for the `OP_CALL` callee-type divergence: an `OP_CALL` handler calls
+//!     `luaD_precall` (cut → dynamic result) and branches on "was the callee a Lua function?". The
+//!     Lua-function edge re-enters dispatch (block 1) with a dynamic new frame and would diverge — but
+//!     it is **dead** for a C-function call (`print`). `deopt_edges` deopts exactly that one
+//!     `precall-block → dispatch` edge to the carried baseline `luaV_execute` (which resumes from
+//!     savedpc), leaving the shared dispatch block projected for every live opcode.
+//!   - **`carry_whole_module` + `carry_keep_imports`**: carry the runtime at original indices (so
+//!     indirect calls resolve) and keep the I/O layer so `print`'s `write` capability works when the
+//!     residual is embedded and re-attached to the imports/types manifest.
 //!
-//! The remaining blocker is a different class — `SpecError::Budget`: past the `CALL`, the projection
-//! **diverges** (the dynamic callee from the cut lookup makes `OP_CALL`'s callee-type checks explore
-//! unboundedly). That is a convergence problem, not a capability gap, and the next investigation
-//! (bound the callee type, or deopt the non-fast call kinds). This test asserts the *current* wall as
-//! a regression guard (the pattern `lua_futamura_specialize` uses for the VARARGPREP wall); update it
-//! when the divergence is bounded and the chunk projects through to `RETURN` + embedding + the diff.
+//! `project_whole_print_chunk_from_entry` is the end-to-end: dispatch folds across the *entire* chunk
+//! (`br_table == 0`), the only surviving calls are the opaque cut call-outs (the table lookup, the
+//! allocator/GC, and the C-call path that actually runs `print`), and the embedded residual's stdout
+//! equals the baseline's. `dump_print_chunk` prints the chunk bytecode + the cut/deopt machinery for
+//! reference. The deterministic arena allocator (see the `lua_eval` fixture) reproduces the captured
+//! addresses on a fresh run, so the residual's baked constants hold under re-execution.
 //!
 //! Run: `cargo test -p svm-llvm --test lua_futamura_print -- --nocapture`
-//! (`--features svm-peval/trace` shows the trace up to the divergence).
 
 use svm_interp::{IrPc, Stop, StopReason, Value};
-use svm_ir::{Inst, Module, Terminator};
+use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_peval::{specialize_with_config, SpecArg, SpecConfig};
 
 const SCRIPT: &str = "local x = 0\nfor i = 1, 50 do x = x + 3 end\nprint(x)\n";
@@ -260,6 +266,35 @@ fn project_whole_print_chunk_from_entry() {
     let read: Vec<u32> = read_names.iter().filter_map(|n| byname(&m, n)).collect();
     let touch: Vec<u32> = touch_names.iter().filter_map(|n| byname(&m, n)).collect();
 
+    // The divergent edge: an OP_CALL/OP_TAILCALL handler calls `luaD_precall` (cut, so its result is
+    // dynamic) and branches on "was the callee a Lua function?"; the Lua-function edge re-enters the
+    // dispatch loop (block 1) with a dynamic new frame and diverges. For a C-function call (`print`)
+    // that edge is dead. Mark every `precall`-block → dispatch(block 1) edge a cold deopt edge.
+    let precall = byname(&m, "luaD_precall").expect("luaD_precall");
+    let dispatch = 1u32; // luaV_execute's main br_table dispatch (the loop header)
+    let mut deopt_edges: Vec<(u32, u32, u32)> = Vec::new();
+    for (bi, b) in m.funcs[luav as usize].blocks.iter().enumerate() {
+        let calls_precall = b
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Call { func, .. } if *func == precall));
+        if !calls_precall {
+            continue;
+        }
+        if let Terminator::BrIf {
+            then_blk, else_blk, ..
+        } = b.term
+        {
+            if then_blk == dispatch {
+                deopt_edges.push((luav, bi as u32, then_blk));
+            }
+            if else_blk == dispatch {
+                deopt_edges.push((luav, bi as u32, else_blk));
+            }
+        }
+    }
+    println!("deopt edges (precall → dispatch): {deopt_edges:?}");
+
     let cfg = SpecConfig {
         const_overlays: vec![
             (l, slice(l, LUA_STATE_SIZE)),
@@ -275,7 +310,10 @@ fn project_whole_print_chunk_from_entry() {
         rename_seed_from_image: true,
         cut_calls_read_state: read,
         cut_calls_touch_state: touch,
+        deopt_edges,
+        deopt_handler: Some(luav), // the carried baseline luaV_execute resumes from savedpc
         carry_whole_module: true,
+        carry_keep_imports: true, // keep the I/O layer (read/write) so print works when embedded
         indirect_targets_cap: Some(16),
         ..SpecConfig::default()
     };
@@ -284,36 +322,71 @@ fn project_whole_print_chunk_from_entry() {
         SpecArg::ConstI64(l as i64),
         SpecArg::ConstI64(ci as i64),
     ];
-    let r = specialize_with_config(&m, luav, &args, &cfg);
-    match &r {
-        Ok(res) => {
-            let f = &res.funcs[res.funcs.len() - 1];
-            let brt = f
-                .blocks
-                .iter()
-                .filter(|b| matches!(b.term, Terminator::BrTable { .. }))
-                .count();
-            let calls: usize = f
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .filter(|i| matches!(i, Inst::Call { .. }))
-                .count();
-            println!(
-                "\nPROJECTED whole print-chunk: entry {} blocks, br_table={brt}, calls={calls}",
-                f.blocks.len()
-            );
-        }
-        Err(e) => println!("\nblocked at the {e:?} wall (see the file header)"),
-    }
+    let mut residual =
+        specialize_with_config(&m, luav, &args, &cfg).expect("whole print-chunk projects");
+    let entry = (residual.funcs.len() - 1) as u32; // carry_whole_module appends the specialized entry
+    let f = &residual.funcs[entry as usize];
+    let brt = f
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.term, Terminator::BrTable { .. }))
+        .count();
+    let calls: usize = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Call { .. }))
+        .count();
+    println!(
+        "\nPROJECTED whole print-chunk: entry {} blocks, br_table={brt}, calls={calls}",
+        f.blocks.len()
+    );
+    // The dispatch folded across the *entire* chunk (loop + GETTABUP + CALL + RETURN); the residual's
+    // only calls are the opaque cut call-outs (the table lookup, the allocator/GC, and the C-call path
+    // that actually runs `print`). The Lua-function call edge deopts to the baseline (dead for `print`).
+    assert_eq!(brt, 0, "the whole-chunk dispatch folded");
+    assert!(calls > 0, "print/lookup survive as opaque call-outs");
 
-    // THE WALL (see the file header). Narrow dynamic rename cells (this PR) cleared the GETTABUP value
-    // move and the touch-state spill/reload of the CALL, so the projection now reaches *past* the CALL
-    // and stops on `Budget` — the dynamic callee makes OP_CALL's callee-type dispatch diverge.
-    // Regression guard: when that divergence is bounded, the chunk projects to RETURN and this flips.
-    assert!(
-        r.is_err(),
-        "whole print-chunk projected past the callee-type divergence — the projection now converges; \
-         update this characterization and push on to RETURN + embedding + the stdout diff"
+    // ---- End to end: embed the residual in place of luaV_execute and diff stdout ----
+    // carry_whole_module kept the runtime at its original indices and (carry_keep_imports) kept the I/O
+    // layer, but left the imports manifest empty; re-attach it so read/write resolve under the host.
+    residual.imports = m.imports.clone();
+    residual.types = m.types.clone(); // the import sigs reference the type section
+                                      // Replace luaV_execute (index `luav`) with a same-signature wrapper that calls the specialized
+                                      // entry. The main chunk is the only luaV_execute activation (print is a C call), so every dispatch
+                                      // goes through the folded residual; the deterministic arena reproduces the captured addresses on a
+                                      // fresh run, so the residual's baked constants hold.
+    residual.funcs[luav as usize] = Func {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
+        results: vec![],
+        blocks: vec![Block {
+            params: vec![ValType::I64, ValType::I64, ValType::I64],
+            insts: vec![Inst::Call {
+                func: entry,
+                args: vec![],
+            }],
+            term: Terminator::Return(vec![]),
+        }],
+    };
+    // (`run_powerbox` resolves the import manifest to capability calls and verifies internally, the
+    // same path the original module takes — a raw `verify_module` on an unresolved-import module is not
+    // the right gate here.)
+    svm_verify::verify_module(&residual).expect("embedded residual verifies");
+
+    let baseline = svm_run::run_powerbox(&m, SCRIPT.as_bytes()).expect("baseline run");
+    let embedded =
+        svm_run::run_powerbox(&residual, SCRIPT.as_bytes()).expect("embedded residual run");
+    println!(
+        "baseline stdout={:?}  embedded stdout={:?}",
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&embedded.stdout)
+    );
+    assert_eq!(baseline.stdout, b"150\n", "baseline prints 150");
+    assert_eq!(
+        embedded.stdout, baseline.stdout,
+        "the embedded residual must print byte-identically to the interpreter"
+    );
+    println!(
+        "  ✓ real Lua script ran through the residual — stdout byte-identical to the interpreter"
     );
 }

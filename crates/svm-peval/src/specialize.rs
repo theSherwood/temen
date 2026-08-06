@@ -184,6 +184,12 @@ struct Task {
     /// Always `false` unless the deopt handler takes the entry's arguments, so it leaves every other
     /// residual's memo partition unchanged.
     seed: bool,
+    /// **Edge deopt** (see [`SpecConfig::deopt_edges`]): this context was reached by a branch edge the
+    /// caller marked cold, so instead of *projecting* the target block (which would diverge — e.g. a
+    /// dynamic-callee re-dispatch), [`Spec::build_block`] spills the live rename cells and tail-calls
+    /// the deopt handler, exactly like a block-level [`SpecConfig::deopt_targets`] bail. Part of the
+    /// memo key so a deopt-edge context is distinct from a normal one reaching the same block/state.
+    deopt: bool,
 }
 
 /// A frame with its SSA values resolved to concrete abstract values (constants or residual SSA
@@ -392,8 +398,18 @@ pub struct SpecConfig {
     ///   passes them to the handler, so an interpreter whose input arrives as parameters (not only via
     ///   the window) can resume. Constant entry arguments are baked in; dynamic ones are threaded.
     ///
-    /// `None` unless [`deopt_targets`] is used.
+    /// `None` unless [`deopt_targets`] / [`deopt_edges`](Self::deopt_edges) is used.
     pub deopt_handler: Option<u32>,
+    /// **Guard-and-deopt on a control-flow *edge*** — `(func, from_block, to_block)` triples. Like
+    /// [`deopt_targets`](Self::deopt_targets), but the bail is keyed on a *branch edge* rather than a
+    /// block, so a **shared** target block can be deopted on one cold in-edge while still projected on
+    /// its hot ones. The motivating case: `OP_CALL` branches on whether the (dynamic, cut-looked-up)
+    /// callee was a Lua function; the "Lua function" edge re-enters the dispatch loop with a dynamic
+    /// new frame and **diverges** (an unknown function projected), while the shared dispatch block is
+    /// the hot loop header — so the block can't be a `deopt_targets`. Marking just that edge cold bails
+    /// it to the baseline (it is dead for a C-function call like `print`) and bounds the projection.
+    /// Requires [`deopt_handler`](Self::deopt_handler). Empty by default.
+    pub deopt_edges: Vec<(u32, u32, u32)>,
     /// **Carry the whole source module at its original function indices** (for cut call-outs whose
     /// closure contains *indirect* calls). The normal cut carry (`cut_calls*`) renumbers the carried
     /// closure to compact residual indices — which is unsound the moment a carried function dispatches
@@ -410,6 +426,13 @@ pub struct SpecConfig {
     /// (it contains the whole runtime), but only the appended entry is the rolled fast path; the rest
     /// is the cold runtime, reached only through the opaque cut calls. Inline mode only. Off by default.
     pub carry_whole_module: bool,
+    /// With [`carry_whole_module`](Self::carry_whole_module): keep the **import-bearing** function
+    /// bodies (the guest I/O layer) verbatim instead of replacing them with trap stubs. Off by default
+    /// (a standalone residual can't verify an unresolved import, so it stubs). Set it when the residual
+    /// will be **embedded back into a runnable module** and its host binds the imports — then the caller
+    /// must re-attach the source module's `imports` manifest (this pass leaves it empty, to keep
+    /// `String`-cloning the manifest out of the on-ramped `svm-peval` guest build).
+    pub carry_keep_imports: bool,
     /// **Runtime-input cells — the Futamura "dynamic input" for a rolled residual.** Rename-region
     /// cells `(address, width)` whose entry value is *not* known at specialization time: instead of
     /// reading its seed from the constant image (as [`rename_seed_from_image`](Self::rename_seed_from_image)
@@ -528,9 +551,11 @@ pub fn specialize_with_config(
     // When outlining, the renamed region's live abstract cells are threaded across each residual call
     // boundary (passed in as extra arguments, returned as extra results); see `outline_call`. The
     // single-function inline path keeps the region entirely internal (no threading).
-    // Deopt targets require a handler; reject early so the config can't be silently ignored (with no
-    // cut callees and no handler, `carry_roots` would be empty and the plain inline path taken).
-    if !config.deopt_targets.is_empty() && config.deopt_handler.is_none() {
+    // Deopt targets/edges require a handler; reject early so the config can't be silently ignored (with
+    // no cut callees and no handler, `carry_roots` would be empty and the plain inline path taken).
+    if (!config.deopt_targets.is_empty() || !config.deopt_edges.is_empty())
+        && config.deopt_handler.is_none()
+    {
         return Err(SpecError::Unsupported);
     }
     // Functions carried verbatim into the residual: every cut callee (opaque and state-touching) plus
@@ -581,11 +606,17 @@ pub fn specialize_with_config(
         // standalone residual can't verify an unresolved import, and such functions are never on the
         // cut closure's execution path (they are the guest's I/O layer, not its allocator/GC). Their
         // slots stay filled so every other function's indices — and the identity table — are unchanged.
+        // With [`SpecConfig::carry_keep_imports`] the import-bearing bodies are kept verbatim instead
+        // of stubbed — for a residual meant to be **embedded back into a runnable module** (whose host
+        // binds the imports), where the I/O layer must still work. The caller then re-attaches the
+        // source `imports` manifest (svm-peval itself leaves it empty — cloning the `String`-named
+        // manifest here would pull `String::clone` into the on-ramped guest build).
+        let keep = config.carry_keep_imports;
         let mut funcs: Vec<Func> = module
             .funcs
             .iter()
             .map(|f| {
-                if imports_a_boundary(f) {
+                if !keep && imports_a_boundary(f) {
                     trap_stub(f)
                 } else {
                     f.clone()
@@ -793,6 +824,7 @@ fn build_func(
         }],
         mem_pat.clone(),
         deopt_pass_args,
+        false, // the entry is never itself a deopt edge
     );
 
     let mut blocks = Vec::new();
@@ -1026,7 +1058,7 @@ struct Spec<'a> {
     out_cells: Option<CellSig>,
     /// `(call stack, memory pattern) → residual block id`. The memo that makes the loop terminate
     /// and that closes residual loops.
-    memo: BTreeMap<(Vec<Frame>, MemPattern, bool), u32>,
+    memo: BTreeMap<(Vec<Frame>, MemPattern, bool, bool), u32>,
     queue: VecDeque<Task>,
     next_id: u32,
 }
@@ -1037,8 +1069,8 @@ impl Spec<'_> {
     /// so id == position in the output `blocks`. `seed` is the deopt entry-seed flag (see
     /// [`Task::seed`]); it is `false` for every non-initial context and always `false` unless deopt
     /// argument threading is active, so it leaves the memo partition unchanged in the common case.
-    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern, seed: bool) -> u32 {
-        let key = (frames, mem, seed);
+    fn intern(&mut self, frames: Vec<Frame>, mem: MemPattern, seed: bool, deopt: bool) -> u32 {
+        let key = (frames, mem, seed, deopt);
         if let Some(&id) = self.memo.get(&key) {
             return id;
         }
@@ -1048,6 +1080,7 @@ impl Spec<'_> {
             frames: key.0.clone(),
             mem: key.1.clone(),
             seed,
+            deopt,
         });
         self.memo.insert(key, id);
         id
@@ -1084,6 +1117,7 @@ impl Spec<'_> {
 
     fn build_block(&mut self, task: Task) -> Result<svm_ir::Block, SpecError> {
         let module = self.module;
+        let task_is_deopt_edge = task.deopt;
 
         // Reconstruct every frame's env and the memory cells from the context, assigning a fresh
         // residual block parameter to each dynamic lane. The canonical order — frames outermost→
@@ -1168,7 +1202,11 @@ impl Spec<'_> {
         // call the handler, which resumes from that state (and, for a `<entry params> -> R` handler,
         // from the threaded entry arguments). Deopt targets are only set on the inline entry.
         if let Some(handler) = self.deopt_handler {
-            if self.deopt_targets.contains(&(active_func, active_block)) {
+            // Bail to the resume handler either because this *block* is a cold target
+            // ([`SpecConfig::deopt_targets`]) or because this context was reached by a cold *edge*
+            // ([`SpecConfig::deopt_edges`], carried on the task) — both spill the live rename cells to
+            // the window (a valid resume image) and tail-call the baseline.
+            if task_is_deopt_edge || self.deopt_targets.contains(&(active_func, active_block)) {
                 let mut out: Vec<Inst> = Vec::new();
                 self.write_back_cells(&mem, &mut out, &mut rnext)?;
                 let args = self.deopt_handler_args(&mut out, &mut rnext);
@@ -1225,13 +1263,14 @@ impl Spec<'_> {
                     env: args,
                     entry: callee_entry,
                 });
-                let (target, args) = self.branch_to(&frames, &mem);
+                let (target, args) = self.branch_to(&frames, &mem, false);
                 Terminator::Br { target, args }
             }
             Exec::Done => self.finish_term(
                 &src.term,
                 frames,
                 active_func,
+                active_block,
                 &active_entry,
                 &env,
                 &mut mem,
@@ -2242,6 +2281,7 @@ impl Spec<'_> {
         term: &Terminator,
         outer: Vec<FrameAbs>,
         func: u32,
+        active_block: u32,
         active_entry: &ParamPattern,
         env: &[Abs],
         mem: &mut BTreeMap<u64, (u32, Abs)>,
@@ -2255,8 +2295,9 @@ impl Spec<'_> {
                 self.return_from(outer, &results, mem, out, rnext)?
             }
             Terminator::Br { target, args } => {
+                let d = self.is_deopt_edge(func, active_block, *target);
                 let stack = succ_stack(&outer, func, *target, args, env, active_entry.clone());
-                let (target, args) = self.branch_to(&stack, mem);
+                let (target, args) = self.branch_to(&stack, mem, d);
                 Terminator::Br { target, args }
             }
             Terminator::BrIf {
@@ -2274,12 +2315,15 @@ impl Spec<'_> {
                     } else {
                         (*else_blk, else_args)
                     };
+                    let d = self.is_deopt_edge(func, active_block, blk);
                     let stack = succ_stack(&outer, func, blk, args, env, active_entry.clone());
-                    let (target, args) = self.branch_to(&stack, mem);
+                    let (target, args) = self.branch_to(&stack, mem, d);
                     Terminator::Br { target, args }
                 }
                 // Dynamic condition: specialize both successors and keep the branch.
                 Abs::Dyn(cond) => {
+                    let then_d = self.is_deopt_edge(func, active_block, *then_blk);
+                    let else_d = self.is_deopt_edge(func, active_block, *else_blk);
                     let then_stack = succ_stack(
                         &outer,
                         func,
@@ -2288,7 +2332,7 @@ impl Spec<'_> {
                         env,
                         active_entry.clone(),
                     );
-                    let (then_blk, then_args) = self.branch_to(&then_stack, mem);
+                    let (then_blk, then_args) = self.branch_to(&then_stack, mem, then_d);
                     let else_stack = succ_stack(
                         &outer,
                         func,
@@ -2297,7 +2341,7 @@ impl Spec<'_> {
                         env,
                         active_entry.clone(),
                     );
-                    let (else_blk, else_args) = self.branch_to(&else_stack, mem);
+                    let (else_blk, else_args) = self.branch_to(&else_stack, mem, else_d);
                     Terminator::BrIf {
                         cond,
                         then_blk,
@@ -2315,19 +2359,22 @@ impl Spec<'_> {
                 Abs::Const(c) => {
                     let i = c.as_i32().ok_or(SpecError::Unsupported)? as u32 as usize;
                     let (blk, args) = targets.get(i).unwrap_or(default);
+                    let d = self.is_deopt_edge(func, active_block, *blk);
                     let stack = succ_stack(&outer, func, *blk, args, env, active_entry.clone());
-                    let (target, args) = self.branch_to(&stack, mem);
+                    let (target, args) = self.branch_to(&stack, mem, d);
                     Terminator::Br { target, args }
                 }
                 Abs::Dyn(idx) => {
                     let targets = targets
                         .iter()
                         .map(|(blk, args)| {
+                            let d = self.is_deopt_edge(func, active_block, *blk);
                             let stack =
                                 succ_stack(&outer, func, *blk, args, env, active_entry.clone());
-                            self.branch_to(&stack, mem)
+                            self.branch_to(&stack, mem, d)
                         })
                         .collect();
+                    let default_d = self.is_deopt_edge(func, active_block, default.0);
                     let default_stack = succ_stack(
                         &outer,
                         func,
@@ -2336,7 +2383,7 @@ impl Spec<'_> {
                         env,
                         active_entry.clone(),
                     );
-                    let default = self.branch_to(&default_stack, mem);
+                    let default = self.branch_to(&default_stack, mem, default_d);
                     Terminator::BrTable {
                         idx,
                         targets,
@@ -2456,7 +2503,7 @@ impl Spec<'_> {
                 env: args_abs,
                 entry: pat,
             });
-            let (target, args) = self.branch_to(&stack, mem);
+            let (target, args) = self.branch_to(&stack, mem, false);
             return Ok(Terminator::Br { target, args });
         }
         match self.try_straightline(callee, &args_abs, mem, out, rnext, fuel)? {
@@ -2470,7 +2517,7 @@ impl Spec<'_> {
                     env: args_abs,
                     entry: Vec::new(),
                 });
-                let (target, args) = self.branch_to(&stack, mem);
+                let (target, args) = self.branch_to(&stack, mem, false);
                 Ok(Terminator::Br { target, args })
             }
         }
@@ -2524,7 +2571,7 @@ impl Spec<'_> {
             Some(mut caller) => {
                 caller.env.extend_from_slice(results);
                 outer.push(caller);
-                let (target, args) = self.branch_to(&outer, mem);
+                let (target, args) = self.branch_to(&outer, mem, false);
                 Terminator::Br { target, args }
             }
         })
@@ -2589,10 +2636,24 @@ impl Spec<'_> {
     /// lanes are passed as residual block arguments in the canonical order (frames outermost→
     /// innermost, each frame's dynamic env slots in order, then dynamic memory cells by address —
     /// matching [`Self::build_block`]'s parameter declaration).
+    /// Whether a branch from `(func, block)` to `target` is a cold **deopt edge**
+    /// ([`SpecConfig::deopt_edges`]): the successor is interned as a deopt task (spill + resume the
+    /// baseline) rather than projected — bounding a divergent target (e.g. a dynamic-callee
+    /// re-dispatch) without deopting the shared block on its other, hot, in-edges. Only with a handler.
+    fn is_deopt_edge(&self, func: u32, block: u32, target: u32) -> bool {
+        self.deopt_handler.is_some()
+            && self
+                .config
+                .deopt_edges
+                .iter()
+                .any(|&(f, b, t)| f == func && b == block && t == target)
+    }
+
     fn branch_to(
         &mut self,
         stack: &[FrameAbs],
         mem: &BTreeMap<u64, (u32, Abs)>,
+        deopt: bool,
     ) -> (u32, Vec<u32>) {
         let mut frames = Vec::with_capacity(stack.len());
         let mut dyn_args = Vec::new();
@@ -2636,7 +2697,7 @@ impl Spec<'_> {
                 Abs::Const(_) => unreachable!("threaded entry args are always dynamic"),
             });
         }
-        let id = self.intern(frames, mem_pat, false);
+        let id = self.intern(frames, mem_pat, false, deopt);
         (id, dyn_args)
     }
 }
@@ -2737,9 +2798,12 @@ fn bump(rnext: &mut u32) -> u32 {
 
 /// The block-parameter type of a renameable memory cell of the given byte width.
 fn cell_type(width: u32) -> ValType {
+    // The canonical SSA type of a rename cell, matching `writeback_store_op` and the narrow-cell
+    // handling in `eval_store`/`eval_load`: a full-width 8-byte cell is `i64`; every sub-8 cell
+    // (1/2/4 bytes — including a dynamic `TValue` tag byte) is `i32` holding its zero-extended content.
     match width {
-        4 => ValType::I32,
-        _ => ValType::I64,
+        8 => ValType::I64,
+        _ => ValType::I32,
     }
 }
 
@@ -2781,7 +2845,7 @@ fn cut_roots(config: &SpecConfig) -> Vec<u32> {
     for &f in &config.cut_calls_read_state {
         push(f);
     }
-    if !config.deopt_targets.is_empty() {
+    if !config.deopt_targets.is_empty() || !config.deopt_edges.is_empty() {
         if let Some(h) = config.deopt_handler {
             push(h);
         }
@@ -2800,7 +2864,7 @@ fn resolve_deopt_handler(
     entry: u32,
     cut: &BTreeMap<u32, u32>,
 ) -> Result<Option<(u32, bool)>, SpecError> {
-    if config.deopt_targets.is_empty() {
+    if config.deopt_targets.is_empty() && config.deopt_edges.is_empty() {
         return Ok(None);
     }
     let handler = config.deopt_handler.ok_or(SpecError::Unsupported)?;
