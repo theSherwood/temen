@@ -1680,7 +1680,10 @@ impl Spec<'_> {
 
         // Spill live cells so the opaque callee observes the current state, then emit the call.
         self.write_back_cells(mem, out, rnext)?;
-        let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
+        let args: Vec<u32> = args_abs
+            .iter()
+            .map(|&a| materialize(a, out, rnext))
+            .collect();
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
         // Result 0 is the `CallInfo*`; bind it per the classification, leaving any further results
@@ -1755,9 +1758,15 @@ impl Spec<'_> {
                     .map(|v| v as u64)
             });
         let caller_ci = cur_ci.and_then(|ci| {
-            read_const_mem(self.config, self.module, ci, po.ci_previous_off, LoadOp::I64)?
-                .as_i64()
-                .map(|v| v as u64)
+            read_const_mem(
+                self.config,
+                self.module,
+                ci,
+                po.ci_previous_off,
+                LoadOp::I64,
+            )?
+            .as_i64()
+            .map(|v| v as u64)
         });
 
         // Is this a selective-reload return (result value dynamic, tag pinned, other cells folded)?
@@ -1770,7 +1779,10 @@ impl Spec<'_> {
 
         // Spill so the opaque poscall observes the current state, then emit the call.
         self.write_back_cells(mem, out, rnext)?;
-        let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
+        let args: Vec<u32> = args_abs
+            .iter()
+            .map(|&a| materialize(a, out, rnext))
+            .collect();
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
@@ -1786,7 +1798,10 @@ impl Spec<'_> {
                         .map(|v| v as u64);
                 if let Some(func_slot) = func_slot {
                     self.reload_one(func_slot, 8, mem, out, rnext);
-                    mem.insert(func_slot + po.tag_off, (1, Abs::Const(Known::I32(tag as i32))));
+                    mem.insert(
+                        func_slot + po.tag_off,
+                        (1, Abs::Const(Known::I32(tag as i32))),
+                    );
                 }
             }
             _ => {
@@ -1814,7 +1829,12 @@ impl Spec<'_> {
         let op = reload_load_op(width).expect("natural reload width");
         out.push(Inst::ConstI64(eff as i64));
         let addr = bump(rnext);
-        out.push(Inst::Load { op, addr, offset: 0, align: 0 });
+        out.push(Inst::Load {
+            op,
+            addr,
+            offset: 0,
+            align: 0,
+        });
         mem.insert(eff, (width, Abs::Dyn(bump(rnext))));
     }
 
