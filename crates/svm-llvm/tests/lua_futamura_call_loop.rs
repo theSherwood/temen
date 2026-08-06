@@ -20,11 +20,9 @@
 //!
 //! Run: `cargo test -p svm-llvm --test lua_futamura_call_loop -- --nocapture`
 
-use svm_ir::{Inst, Module, Terminator};
 use svm_interp::{IrPc, Stop, StopReason, Value};
-use svm_peval::{
-    specialize_with_config, LuaSite, PoscallModel, PrecallModel, SpecArg, SpecConfig,
-};
+use svm_ir::{Inst, Module, Terminator};
+use svm_peval::{specialize_with_config, LuaSite, PoscallModel, PrecallModel, SpecArg, SpecConfig};
 
 const SCRIPT: &str = "local function add(a, b) return a + b end\n\
                       local x = 0\n\
@@ -49,7 +47,10 @@ const TAG_OFF: u64 = 8; // TValue tag byte
 const VNUMINT: u8 = 0x03;
 
 fn lua_module() -> Module {
-    let p = format!("{}/tests/fixtures/lua/lua_eval.ll", env!("CARGO_MANIFEST_DIR"));
+    let p = format!(
+        "{}/tests/fixtures/lua/lua_eval.ll",
+        env!("CARGO_MANIFEST_DIR")
+    );
     svm_llvm::translate_ll_path(&p).expect("translate").module
 }
 fn byname(m: &Module, n: &str) -> Option<u32> {
@@ -100,7 +101,12 @@ fn precall_ra_val(m: &Module, luav: u32, pblock: u32, precall: u32) -> u32 {
 
 /// Capture at `luaV_execute` entry: `(sp, L, ci)`.
 fn entry_regs(insp: &mut svm_interp::Inspector, luav: u32) -> (i64, u64, u64) {
-    let pc = IrPc { module: 0, func: luav, block: 0, inst: 0 };
+    let pc = IrPc {
+        module: 0,
+        func: luav,
+        block: 0,
+        inst: 0,
+    };
     insp.set_breakpoint(pc);
     let r = match insp.run_until_stop() {
         Stop::Break { .. } => {
@@ -125,7 +131,9 @@ fn a_call_bearing_loop_rolls() {
     let dispatch = dispatch_block(&m, luav);
     let pblock = precall_block(&m, luav, precall);
     let ra_val = precall_ra_val(&m, luav, pblock, precall);
-    println!("luav=f{luav} precall=f{precall} poscall=f{poscall} dispatch=b{dispatch} pblock=b{pblock}");
+    println!(
+        "luav=f{luav} precall=f{precall} poscall=f{poscall} dispatch=b{dispatch} pblock=b{pblock}"
+    );
 
     // ---- Pass 1: loop-body safepoint (break at the precall — the add call — and read the register
     // file + ra). The precall block is entered once per iteration; the first hit is the first call, at
@@ -137,10 +145,18 @@ fn a_call_bearing_loop_rolls() {
         let w0 = insp.read_window(0, CAP).expect("w");
         rd_u64(&w0, ci + CI_FUNC) + SV
     };
-    let pbp = IrPc { module: 0, func: luav, block: pblock as usize, inst: 0 };
+    let pbp = IrPc {
+        module: 0,
+        func: luav,
+        block: pblock as usize,
+        inst: 0,
+    };
     insp.set_breakpoint(pbp);
     let (w, ra_add) = match insp.run_until_stop() {
-        Stop::Break { reason: StopReason::Breakpoint, .. } => {
+        Stop::Break {
+            reason: StopReason::Breakpoint,
+            ..
+        } => {
             let ra = match insp.read_ir_value(0, ra_val as usize) {
                 Some(Value::I64(v)) => v as u64,
                 o => panic!("ra: {o:?}"),
@@ -173,19 +189,30 @@ fn a_call_bearing_loop_rolls() {
         rd_u64(&w, i_reg),
         rd_u64(&w, counter)
     );
-    assert!(stack_lo <= counter && counter < stack_hi, "counter on stack");
+    assert!(
+        stack_lo <= counter && counter < stack_hi,
+        "counter on stack"
+    );
 
     // ---- Pass 2: the callee (add) frame, captured at its first dispatch (deterministic arena). ----
     let (callee_ci, wb) = {
         let inst2 = svm_run::instantiate(m.clone()).expect("inst2");
         let mut in2 = inst2.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
         let (_sp, l2, _ci2) = entry_regs(&mut in2, luav);
-        let dbp = IrPc { module: 0, func: luav, block: dispatch as usize, inst: 0 };
+        let dbp = IrPc {
+            module: 0,
+            func: luav,
+            block: dispatch as usize,
+            inst: 0,
+        };
         in2.set_breakpoint(dbp);
         let mut found = None;
         for _ in 0..4000 {
             match in2.run_until_stop() {
-                Stop::Break { reason: StopReason::Breakpoint, .. } => {
+                Stop::Break {
+                    reason: StopReason::Breakpoint,
+                    ..
+                } => {
                     let wv = in2.read_window(0, CAP).expect("w");
                     let cci = rd_u64(&wv, l2 + L_CI);
                     let cfunc = rd_u64(&wv, cci + CI_FUNC);
@@ -206,21 +233,38 @@ fn a_call_bearing_loop_rolls() {
     let callee_proto = rd_u64(&wb, callee_cl + LCLOSURE_P);
     let callee_code = rd_u64(&wb, callee_proto + PROTO_CODE);
     let callee_sizecode = rd_i32(&wb, callee_proto + PROTO_SIZECODE) as usize;
-    println!("callee: ci={callee_ci:#x} func={callee_func:#x} cl={callee_cl:#x} proto={callee_proto:#x}");
+    println!(
+        "callee: ci={callee_ci:#x} func={callee_func:#x} cl={callee_cl:#x} proto={callee_proto:#x}"
+    );
     assert_eq!(callee_func, ra_add, "callee ci->func == the add call ra");
 
     let slice = |src: &[u8], a: u64, n: usize| src[a as usize..a as usize + n].to_vec();
     let read: Vec<u32> = [
-        "luaH_get", "luaH_getshortstr", "luaH_getstr", "luaH_getint", "luaV_finishget",
-        "luaC_step", "luaC_newobj", "luaH_new", "luaH_resize", "luaF_newLclosure", "luaF_newCclosure",
-        "luaC_barrier_", "luaC_barrierback_",
+        "luaH_get",
+        "luaH_getshortstr",
+        "luaH_getstr",
+        "luaH_getint",
+        "luaV_finishget",
+        "luaC_step",
+        "luaC_newobj",
+        "luaH_new",
+        "luaH_resize",
+        "luaF_newLclosure",
+        "luaF_newCclosure",
+        "luaC_barrier_",
+        "luaC_barrierback_",
     ]
     .iter()
     .filter_map(|n| byname(&m, n))
     .collect();
     let touch: Vec<u32> = [
-        "luaD_precall", "precallC", "luaD_call", "luaD_callnoyield", "luaD_poscall",
-        "luaD_growstack", "luaD_reallocstack",
+        "luaD_precall",
+        "precallC",
+        "luaD_call",
+        "luaD_callnoyield",
+        "luaD_poscall",
+        "luaD_growstack",
+        "luaD_reallocstack",
     ]
     .iter()
     .filter_map(|n| byname(&m, n))
@@ -306,9 +350,9 @@ fn a_call_bearing_loop_rolls() {
         .count();
     let has_backedge = f.blocks.iter().enumerate().any(|(bi, b)| match &b.term {
         Terminator::Br { target, .. } => (*target as usize) <= bi,
-        Terminator::BrIf { then_blk, else_blk, .. } => {
-            (*then_blk as usize) <= bi || (*else_blk as usize) <= bi
-        }
+        Terminator::BrIf {
+            then_blk, else_blk, ..
+        } => (*then_blk as usize) <= bi || (*else_blk as usize) <= bi,
         _ => false,
     });
     println!(
@@ -319,11 +363,17 @@ fn a_call_bearing_loop_rolls() {
     // Rolled, not unrolled: dispatch folded, a bounded residual with a loop back-edge, taking the
     // loop-carried cells as dynamic params, and the call surviving as opaque cut call-outs.
     assert_eq!(brt, 0, "the dispatch folded through the in-loop call");
-    assert!(has_backedge, "the loop rolled (a residual back-edge closes it)");
+    assert!(
+        has_backedge,
+        "the loop rolled (a residual back-edge closes it)"
+    );
     // Rolled, not unrolled: the residual holds a *single* iteration's worth of cut call-outs (precall,
     // poscall, and the allocator/GC), reached through the back-edge — a 5×-unrolled loop would have ~5×
     // as many. The counter is dynamic, so the residual is independent of the (captured) trip count.
-    assert!(calls > 0, "the in-loop call survives as opaque cut call-outs");
+    assert!(
+        calls > 0,
+        "the in-loop call survives as opaque cut call-outs"
+    );
     assert!(
         calls <= 10,
         "one iteration's worth of cut calls (got {calls}) — not a 5×-unrolled body"
@@ -333,6 +383,11 @@ fn a_call_bearing_loop_rolls() {
         "the loop rolled to a bounded block count (got {})",
         f.blocks.len()
     );
-    assert!(f.params.len() >= 3, "residual takes the loop-carried cells as dynamic params");
-    println!("  ✓ slice 3: a loop that calls a Lua function each iteration rolls (br_table=0, bounded)");
+    assert!(
+        f.params.len() >= 3,
+        "residual takes the loop-carried cells as dynamic params"
+    );
+    println!(
+        "  ✓ slice 3: a loop that calls a Lua function each iteration rolls (br_table=0, bounded)"
+    );
 }

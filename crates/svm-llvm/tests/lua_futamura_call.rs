@@ -19,8 +19,8 @@
 //!
 //! Run: `cargo test -p svm-llvm --test lua_futamura_call -- --nocapture`
 
-use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_interp::{IrPc, Stop, StopReason, Value};
+use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_peval::{specialize_with_config, LuaSite, PoscallModel, PrecallModel, SpecArg, SpecConfig};
 
 const SCRIPT: &str = "local function add(a, b) return a + b end\nprint(add(40, 2))\n";
@@ -43,7 +43,9 @@ fn lua_module() -> Module {
         "{}/tests/fixtures/lua/lua_eval.ll",
         env!("CARGO_MANIFEST_DIR")
     );
-    svm_llvm::translate_ll_path(&path).expect("translate").module
+    svm_llvm::translate_ll_path(&path)
+        .expect("translate")
+        .module
 }
 fn byname(m: &Module, n: &str) -> Option<u32> {
     m.exports.iter().find(|e| e.name == n).map(|e| e.func)
@@ -93,7 +95,12 @@ fn precall_site(m: &Module, luav: u32, precall: u32) -> (u32, u32) {
 fn capture_entry(m: &Module, luav: u32) -> (i64, u64, u64, Vec<u8>) {
     let inst = svm_run::instantiate(m.clone()).expect("instantiate");
     let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    insp.set_breakpoint(IrPc { module: 0, func: luav, block: 0, inst: 0 });
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: 0,
+        inst: 0,
+    });
     match insp.run_until_stop() {
         Stop::Break { .. } => {
             let g = |i| match insp.read_ir_value(0, i) {
@@ -111,11 +118,19 @@ fn capture_entry(m: &Module, luav: u32) -> (i64, u64, u64, Vec<u8>) {
 fn capture_ra_values(m: &Module, luav: u32, pblock: u32, ra_val: u32) -> (u64, u64) {
     let inst = svm_run::instantiate(m.clone()).expect("instantiate");
     let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    insp.set_breakpoint(IrPc { module: 0, func: luav, block: pblock as usize, inst: 0 });
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: pblock as usize,
+        inst: 0,
+    });
     let mut ras = Vec::new();
     while ras.len() < 2 {
         match insp.run_until_stop() {
-            Stop::Break { reason: StopReason::Breakpoint, .. } => match insp.read_ir_value(0, ra_val as usize) {
+            Stop::Break {
+                reason: StopReason::Breakpoint,
+                ..
+            } => match insp.read_ir_value(0, ra_val as usize) {
                 Some(Value::I64(v)) => ras.push(v as u64),
                 o => panic!("read ra v{ra_val}: {o:?}"),
             },
@@ -130,7 +145,12 @@ fn capture_callee_frame(m: &Module, luav: u32, dispatch: u32, outer_proto: u64) 
     let inst = svm_run::instantiate(m.clone()).expect("instantiate");
     let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
     // Grab L once (stable) from the entry break.
-    insp.set_breakpoint(IrPc { module: 0, func: luav, block: 0, inst: 0 });
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: 0,
+        inst: 0,
+    });
     let l = match insp.run_until_stop() {
         Stop::Break { .. } => match insp.read_ir_value(0, 1) {
             Some(Value::I64(v)) => v as u64,
@@ -138,11 +158,24 @@ fn capture_callee_frame(m: &Module, luav: u32, dispatch: u32, outer_proto: u64) 
         },
         o => panic!("no entry break: {o:?}"),
     };
-    insp.clear_breakpoint(IrPc { module: 0, func: luav, block: 0, inst: 0 });
-    insp.set_breakpoint(IrPc { module: 0, func: luav, block: dispatch as usize, inst: 0 });
+    insp.clear_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: 0,
+        inst: 0,
+    });
+    insp.set_breakpoint(IrPc {
+        module: 0,
+        func: luav,
+        block: dispatch as usize,
+        inst: 0,
+    });
     for _ in 0..2000 {
         match insp.run_until_stop() {
-            Stop::Break { reason: StopReason::Breakpoint, .. } => {
+            Stop::Break {
+                reason: StopReason::Breakpoint,
+                ..
+            } => {
                 let w = insp.read_window(0, CAPTURE_LEN).expect("window");
                 let ci = rd_u64(&w, l + L_CI);
                 let func = rd_u64(&w, ci + CI_FUNC);
@@ -200,7 +233,10 @@ fn capture_all() -> Cap {
     let post_return = {
         let mut t = None;
         for b in &m.funcs[luav as usize].blocks {
-            if b.insts.iter().any(|i| matches!(i, Inst::Call { func, .. } if *func == poscall)) {
+            if b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { func, .. } if *func == poscall))
+            {
                 if let Terminator::Br { target, .. } = b.term {
                     t = Some(target);
                     break;
@@ -234,7 +270,10 @@ fn capture_all() -> Cap {
     let callee_proto = rd_u64(&wb, callee_cl + LCLOSURE_P);
     let callee_code = rd_u64(&wb, callee_proto + PROTO_CODE);
     let callee_sizecode = rd_i32(&wb, callee_proto + PROTO_SIZECODE) as usize;
-    assert_eq!(callee_func, ra_add, "the callee ci->func should be the add call's ra slot");
+    assert_eq!(
+        callee_func, ra_add,
+        "the callee ci->func should be the add call's ra slot"
+    );
     // Discover the CallInfo `previous` offset: the callee frame's `previous` points at the outer ci.
     let ci_previous_off = (0..CI_SIZE as u64)
         .step_by(8)
@@ -260,29 +299,59 @@ fn capture_all() -> Cap {
         (callee_code, slice(&wb, callee_code, 4 * callee_sizecode)),
     ];
     let read_names = [
-        "luaH_get", "luaH_getshortstr", "luaH_getstr", "luaH_getint", "luaV_finishget",
-        "luaC_step", "luaC_newobj", "luaH_new", "luaH_resize", "luaF_newLclosure", "luaF_newCclosure",
+        "luaH_get",
+        "luaH_getshortstr",
+        "luaH_getstr",
+        "luaH_getint",
+        "luaV_finishget",
+        "luaC_step",
+        "luaC_newobj",
+        "luaH_new",
+        "luaH_resize",
+        "luaF_newLclosure",
+        "luaF_newCclosure",
         // GC write barriers — fired when the new `add` closure is stored; their `reallymarkobject`
         // marker is recursive and must stay opaque (a non-moving mark: spill for the scan, no reload).
-        "luaC_barrier_", "luaC_barrierback_",
+        "luaC_barrier_",
+        "luaC_barrierback_",
     ];
     let touch_names = [
-        "luaD_precall", "precallC", "luaD_call", "luaD_callnoyield", "luaD_poscall",
-        "luaD_growstack", "luaD_reallocstack",
+        "luaD_precall",
+        "precallC",
+        "luaD_call",
+        "luaD_callnoyield",
+        "luaD_poscall",
+        "luaD_growstack",
+        "luaD_reallocstack",
     ];
     let read = read_names.iter().filter_map(|n| byname(&m, n)).collect();
     let touch = touch_names.iter().filter_map(|n| byname(&m, n)).collect();
 
     Cap {
-        m, luav, baseline, precall, poscall, post_return, sp, l, outer_ci, ra_add, ra_print,
-        callee_ci, callee_func, callee_cl, ci_previous_off,
-        overlays, rename: (l, l + LUA_STATE_SIZE as u64),
+        m,
+        luav,
+        baseline,
+        precall,
+        poscall,
+        post_return,
+        sp,
+        l,
+        outer_ci,
+        ra_add,
+        ra_print,
+        callee_ci,
+        callee_func,
+        callee_cl,
+        ci_previous_off,
+        overlays,
+        rename: (l, l + LUA_STATE_SIZE as u64),
         rename_extra: vec![
             (stack_lo, stack_hi),
             (outer_ci, outer_ci + CI_SIZE as u64),
             (callee_ci, callee_ci + CI_SIZE as u64),
         ],
-        read, touch,
+        read,
+        touch,
     }
 }
 
@@ -295,13 +364,17 @@ fn embed_and_diff(mut residual: Module, src: &Module, luav: u32, entry: u32) {
         results: vec![],
         blocks: vec![Block {
             params: vec![ValType::I64, ValType::I64, ValType::I64],
-            insts: vec![Inst::Call { func: entry, args: vec![] }],
+            insts: vec![Inst::Call {
+                func: entry,
+                args: vec![],
+            }],
             term: Terminator::Return(vec![]),
         }],
     };
     svm_verify::verify_module(&residual).expect("embedded residual verifies");
     let baseline = svm_run::run_powerbox(src, SCRIPT.as_bytes()).expect("baseline run");
-    let embedded = svm_run::run_powerbox(&residual, SCRIPT.as_bytes()).expect("embedded residual run");
+    let embedded =
+        svm_run::run_powerbox(&residual, SCRIPT.as_bytes()).expect("embedded residual run");
     println!(
         "baseline stdout={:?}  embedded stdout={:?}",
         String::from_utf8_lossy(&baseline.stdout),
@@ -315,7 +388,10 @@ fn embed_and_diff(mut residual: Module, src: &Module, luav: u32, entry: u32) {
 }
 
 fn brtable_count(f: &Func) -> usize {
-    f.blocks.iter().filter(|b| matches!(b.term, Terminator::BrTable { .. })).count()
+    f.blocks
+        .iter()
+        .filter(|b| matches!(b.term, Terminator::BrTable { .. }))
+        .count()
 }
 
 /// Slice 1: the call-in projects (dispatch folds through the `add` call into the callee), the callee's
@@ -342,20 +418,44 @@ fn project_through_a_lua_call() {
             precall: c.precall,
             ra_arg: 2,
             l_ci_addr: c.l + L_CI,
-            lua_sites: vec![LuaSite { ra: c.ra_add, callee_ci: c.callee_ci, pins: vec![(c.callee_func, c.callee_cl)] }],
+            lua_sites: vec![LuaSite {
+                ra: c.ra_add,
+                callee_ci: c.callee_ci,
+                pins: vec![(c.callee_func, c.callee_cl)],
+            }],
             c_sites: vec![c.ra_print],
             poscall: None,
         }),
         ..SpecConfig::default()
     };
-    let args = [SpecArg::ConstI64(c.sp), SpecArg::ConstI64(c.l as i64), SpecArg::ConstI64(c.outer_ci as i64)];
-    let residual = specialize_with_config(&c.m, c.luav, &args, &cfg).expect("project through the lua call");
+    let args = [
+        SpecArg::ConstI64(c.sp),
+        SpecArg::ConstI64(c.l as i64),
+        SpecArg::ConstI64(c.outer_ci as i64),
+    ];
+    let residual =
+        specialize_with_config(&c.m, c.luav, &args, &cfg).expect("project through the lua call");
     let entry = (residual.funcs.len() - 1) as u32;
     let f = &residual.funcs[entry as usize];
-    let calls_precall = f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Call { func, .. } if *func == c.precall));
-    println!("SLICE 1 PROJECTED: entry {} blocks, br_table={}", f.blocks.len(), brtable_count(f));
-    assert_eq!(brtable_count(f), 0, "the dispatch folded through the Lua call (no br_table left)");
-    assert!(calls_precall, "the opaque precall cut survives as a residual call");
+    let calls_precall = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::Call { func, .. } if *func == c.precall));
+    println!(
+        "SLICE 1 PROJECTED: entry {} blocks, br_table={}",
+        f.blocks.len(),
+        brtable_count(f)
+    );
+    assert_eq!(
+        brtable_count(f),
+        0,
+        "the dispatch folded through the Lua call (no br_table left)"
+    );
+    assert!(
+        calls_precall,
+        "the opaque precall cut survives as a residual call"
+    );
     embed_and_diff(residual, &c.m, c.luav, entry);
     println!("  ✓ slice 1: projected through the Lua call-in — stdout byte-identical");
 }
@@ -381,7 +481,11 @@ fn project_through_a_lua_call_and_return() {
             precall: c.precall,
             ra_arg: 2,
             l_ci_addr: c.l + L_CI,
-            lua_sites: vec![LuaSite { ra: c.ra_add, callee_ci: c.callee_ci, pins: vec![(c.callee_func, c.callee_cl)] }],
+            lua_sites: vec![LuaSite {
+                ra: c.ra_add,
+                callee_ci: c.callee_ci,
+                pins: vec![(c.callee_func, c.callee_cl)],
+            }],
             c_sites: vec![c.ra_print],
             poscall: Some(PoscallModel {
                 poscall: c.poscall,
@@ -393,15 +497,34 @@ fn project_through_a_lua_call_and_return() {
         }),
         ..SpecConfig::default()
     };
-    let args = [SpecArg::ConstI64(c.sp), SpecArg::ConstI64(c.l as i64), SpecArg::ConstI64(c.outer_ci as i64)];
-    let residual = specialize_with_config(&c.m, c.luav, &args, &cfg).expect("project through the lua call and return");
+    let args = [
+        SpecArg::ConstI64(c.sp),
+        SpecArg::ConstI64(c.l as i64),
+        SpecArg::ConstI64(c.outer_ci as i64),
+    ];
+    let residual = specialize_with_config(&c.m, c.luav, &args, &cfg)
+        .expect("project through the lua call and return");
     let entry = (residual.funcs.len() - 1) as u32;
     let f = &residual.funcs[entry as usize];
-    let returns = f.blocks.iter().filter(|b| matches!(b.term, Terminator::Return(_))).count();
-    println!("SLICE 2 PROJECTED: entry {} blocks, br_table={}, returns={returns}", f.blocks.len(), brtable_count(f));
-    assert_eq!(brtable_count(f), 0, "the dispatch folded through the call and the return");
-    assert!(returns > 0, "the residual returns from luaV_execute (the modeled return reached the entry frame)");
+    let returns = f
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.term, Terminator::Return(_)))
+        .count();
+    println!(
+        "SLICE 2 PROJECTED: entry {} blocks, br_table={}, returns={returns}",
+        f.blocks.len(),
+        brtable_count(f)
+    );
+    assert_eq!(
+        brtable_count(f),
+        0,
+        "the dispatch folded through the call and the return"
+    );
+    assert!(
+        returns > 0,
+        "the residual returns from luaV_execute (the modeled return reached the entry frame)"
+    );
     embed_and_diff(residual, &c.m, c.luav, entry);
     println!("  ✓ slice 2: projected through the Lua call-in AND return — stdout byte-identical");
 }
-
