@@ -4924,10 +4924,11 @@ impl Instance {
         let mut hook = (hooks.make)();
         let handle = h.grant_host_proc(Box::new(
             move |op, args, _mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
-            hook(ev)?;
-            Ok(vec![])
-        }));
+                let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
+                hook(ev)?;
+                Ok(vec![])
+            },
+        ));
         assert_eq!(
             handle, hooks.handle,
             "mem-hook grant must be the first grant on a fresh Host (deterministic handles)"

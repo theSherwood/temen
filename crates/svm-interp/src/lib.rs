@@ -18241,7 +18241,13 @@ impl Host {
             };
             let idx = child.sinks.len() as u32;
             child.sinks.push(shared);
-            return Some(child.grant(tid, Binding::Stream { role: r, sink: Some(idx) }));
+            return Some(child.grant(
+                tid,
+                Binding::Stream {
+                    role: r,
+                    sink: Some(idx),
+                },
+            ));
         }
         Some(child.grant(tid, binding))
     }
@@ -18889,7 +18895,10 @@ impl Host {
             Binding::HostProc(idx) => {
                 let (mut f, mints) = match self.host_procs.get_mut(idx as usize) {
                     Some(e) => (
-                        std::mem::replace(&mut e.handler, Box::new(|_, _, _, _| Err(Trap::CapFault))),
+                        std::mem::replace(
+                            &mut e.handler,
+                            Box::new(|_, _, _, _| Err(Trap::CapFault)),
+                        ),
                         e.mints,
                     ),
                     None => return Err(Trap::CapFault),

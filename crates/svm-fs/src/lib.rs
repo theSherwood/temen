@@ -749,7 +749,10 @@ pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostProc + Send + Sync + 'st
             ..MemFsState::default()
         };
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
         ) as HostProc
@@ -775,7 +778,10 @@ pub fn mem_fs_seeded_handler(
             st.dirs.insert(norm(d));
         }
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem)])
             },
         ) as HostProc
@@ -825,7 +831,10 @@ pub fn mem_fs_seeded_shared(
     let shared = Arc::new(Mutex::new(st));
     let handle = MemFsHandle(shared.clone());
     let hostfn: HostProc = Box::new(
-        move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+        move |op: u32,
+              args: &[i64],
+              mem: Option<&mut dyn GuestMem>,
+              _minter: Option<&mut dyn svm_interp::RegionMinter>| {
             Ok(vec![shared
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

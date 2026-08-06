@@ -659,7 +659,10 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
             crash: crashy.then(CrashCtl::default),
         };
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem, None)])
             },
         ) as HostProc

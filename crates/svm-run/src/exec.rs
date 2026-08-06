@@ -64,7 +64,10 @@ pub fn domain_exec(programs: Vec<DomainProgram>) -> HostCap {
         let programs = Arc::clone(&programs);
         let mut jobs = JobTable::default();
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![domain_dispatch(&programs, &mut jobs, op, args, mem)])
             },
         ) as HostProc
@@ -123,7 +126,10 @@ fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostProc + Send + 
         let allow = Arc::clone(&allow);
         let mut jobs = JobTable::default();
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![host_dispatch(&allow, &mut jobs, op, args, mem)])
             },
         ) as HostProc

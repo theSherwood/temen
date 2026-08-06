@@ -152,7 +152,10 @@ int main(int argc, char **argv){
 /// look a command name up). Returns handle values valid in the shell's own cap table.
 fn exec_host(out_h: i32, echo_h: i32) -> svm_interp::HostProc {
     Box::new(
-        move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>, _minter: Option<&mut dyn svm_interp::RegionMinter>| match op {
+        move |op: u32,
+              args: &[i64],
+              mem: Option<&mut dyn GuestMem>,
+              _minter: Option<&mut dyn svm_interp::RegionMinter>| match op {
             0 => Ok(vec![out_h as i64]),
             1 => {
                 let mem = mem.ok_or(Trap::Malformed)?;

@@ -651,48 +651,50 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
 /// Build the POSIX [`HostProc`] handler over shared `inner`. Dispatches on the op number; an unknown op
 /// on this handle is a `CapFault` (as for any capability).
 fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
-    Box::new(move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-        let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
-        match op {
-            OP_WRITE => st.write(args, mem),
-            OP_READ => st.read(args, mem),
-            OP_MALLOC => Ok(vec![st.malloc(args)]),
-            OP_FREE => {
-                st.free(args);
-                Ok(vec![0])
+    Box::new(
+        move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
+            match op {
+                OP_WRITE => st.write(args, mem),
+                OP_READ => st.read(args, mem),
+                OP_MALLOC => Ok(vec![st.malloc(args)]),
+                OP_FREE => {
+                    st.free(args);
+                    Ok(vec![0])
+                }
+                OP_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
+                OP_OPEN => st.open(args, mem),
+                OP_CLOSE => Ok(vec![st.close(args)]),
+                OP_LSEEK => Ok(vec![st.lseek(args)]),
+                OP_UNLINK => st.unlink(args, mem),
+                OP_STAT => st.stat(args, mem),
+                OP_OPENDIR => st.opendir(args, mem),
+                OP_READDIR => st.readdir(args, mem),
+                OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
+                OP_ARGC => Ok(vec![st.args.len() as i64]),
+                OP_ARGV => st.argv(args, mem),
+                OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
+                OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
+                OP_EXEC_STDIN => st.exec_stdin(args, mem),
+                OP_EXEC_WIN => st.exec_win(args),
+                OP_PIPE => st.pipe(args, mem),
+                OP_DUP2 => Ok(vec![st.dup2(args)]),
+                OP_DUP => Ok(vec![st.dup(args)]),
+                OP_FCNTL => Ok(vec![st.fcntl(args)]),
+                OP_SPAWN => st.spawn(args, mem),
+                OP_WAITPID => st.waitpid(args, mem),
+                OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
+                OP_SIGNAL => Ok(vec![st.signal(args)]),
+                OP_KILL => Ok(vec![st.kill(args)]),
+                OP_SIGCHECK => Ok(vec![st.sigcheck()]),
+                OP_GETCWD => st.getcwd(args, mem),
+                OP_CHDIR => st.chdir(args, mem),
+                OP_GETENV => st.getenv(args, mem),
+                OP_SETENV => st.setenv(args, mem),
+                _ => Err(Trap::CapFault),
             }
-            OP_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
-            OP_OPEN => st.open(args, mem),
-            OP_CLOSE => Ok(vec![st.close(args)]),
-            OP_LSEEK => Ok(vec![st.lseek(args)]),
-            OP_UNLINK => st.unlink(args, mem),
-            OP_STAT => st.stat(args, mem),
-            OP_OPENDIR => st.opendir(args, mem),
-            OP_READDIR => st.readdir(args, mem),
-            OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
-            OP_ARGC => Ok(vec![st.args.len() as i64]),
-            OP_ARGV => st.argv(args, mem),
-            OP_EXEC_LOOKUP => st.exec_lookup(args, mem),
-            OP_EXEC_STDOUT => Ok(vec![st.exec_stdout_handle as i64]),
-            OP_EXEC_STDIN => st.exec_stdin(args, mem),
-            OP_EXEC_WIN => st.exec_win(args),
-            OP_PIPE => st.pipe(args, mem),
-            OP_DUP2 => Ok(vec![st.dup2(args)]),
-            OP_DUP => Ok(vec![st.dup(args)]),
-            OP_FCNTL => Ok(vec![st.fcntl(args)]),
-            OP_SPAWN => st.spawn(args, mem),
-            OP_WAITPID => st.waitpid(args, mem),
-            OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
-            OP_SIGNAL => Ok(vec![st.signal(args)]),
-            OP_KILL => Ok(vec![st.kill(args)]),
-            OP_SIGCHECK => Ok(vec![st.sigcheck()]),
-            OP_GETCWD => st.getcwd(args, mem),
-            OP_CHDIR => st.chdir(args, mem),
-            OP_GETENV => st.getenv(args, mem),
-            OP_SETENV => st.setenv(args, mem),
-            _ => Err(Trap::CapFault),
-        }
-    })
+        },
+    )
 }
 
 impl Inner {
