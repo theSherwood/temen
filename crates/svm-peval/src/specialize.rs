@@ -450,6 +450,76 @@ pub struct SpecConfig {
     /// in SSA, spilled on deopt, written back on exit); a dynamic cell outside every region is
     /// rejected. Widths are the natural 4/8. Empty by default.
     pub dynamic_cells: Vec<(u64, u32)>,
+    /// **Project *through* a Lua-to-Lua call — the precall post-state model.** In Lua 5.4 an `OP_CALL`
+    /// does `newci = luaD_precall(L, ra, nres); ci = newci; goto startfunc`, re-entering the *same*
+    /// dispatch loop with the callee's frame; `newci` is the **return value** of the (cut) `precall`,
+    /// and the shared dispatch block folds `cl = *ci->func`, `proto`, `code` from it. Left to the plain
+    /// [`cut_calls_touch_state`](Self::cut_calls_touch_state) treatment `precall`'s result is a fresh
+    /// unknown, so the "was the callee a Lua function?" branch stays dynamic and the Lua edge must
+    /// deopt ([`deopt_edges`](Self::deopt_edges)).
+    ///
+    /// With this set, at each `precall` cut the specializer reads the callee closure from `ra` (a
+    /// constant stack slot in the fold) and **binds the result statically**: a C closure / light-C
+    /// function ⇒ `NULL` (the C call is handled in place, the branch folds to the continue edge); a Lua
+    /// closure whose `Proto` is one of [`PrecallModel::frames`] ⇒ the deterministic `CallInfo` address
+    /// `precall` will (re)use for it, and `L->ci` is set to that address — so the branch folds to the
+    /// Lua re-dispatch edge and the callee's own dispatch folds *inline* (the register cells are left
+    /// folded: Lua's callee base reuses the in-place argument slots, which `precall` does not clobber).
+    /// An unrecognized callee (dynamic `ra`, or a Lua proto not listed) falls back to the plain
+    /// touch-state spill+reload. The callee frame's bytes (its `CallInfo`, `Proto`, code, closure) must
+    /// be supplied via [`const_overlays`](Self::const_overlays), captured from a profiling run (the
+    /// arena is deterministic and the `CallInfo` is loop-invariant once Lua caches `ci->next`).
+    ///
+    /// `precall` must also appear in a cut set (so it is carried and emitted opaquely). `None` by
+    /// default. The paired return side (`poscall`) is not yet modeled — a callee return still bails via
+    /// a [`deopt_edges`](Self::deopt_edges) / [`deopt_targets`](Self::deopt_targets) to the baseline.
+    pub precall_model: Option<PrecallModel>,
+}
+
+/// The static description a [`SpecConfig::precall_model`] needs to bind a `luaD_precall` cut's result
+/// (and, for a Lua callee, install the callee frame). Call sites are keyed by `ra` — the callee's
+/// **stack-slot address**, which is a constant in the fold (`base + A·sizeof(TValue)`, both constant)
+/// and distinct per call site — *not* by the callee closure, which `OP_CLOSURE` allocates at runtime
+/// (an opaque cut) so its pointer is dynamic. The addresses come from the caller's capture; nothing
+/// here is Lua-specific to the engine beyond the `ra` argument position.
+#[derive(Clone, Debug)]
+pub struct PrecallModel {
+    /// The cut callee that sets up a call frame (`luaD_precall`). Must also be in a cut set.
+    pub precall: u32,
+    /// Which argument of the `precall` call is the callee's stack slot `ra` (0-based index into the
+    /// call's argument list).
+    pub ra_arg: usize,
+    /// The address of the `L->ci` field — the rename cell set to the callee `CallInfo` on a Lua call,
+    /// so the callee frame is active for the folded dispatch (and a later spill/deopt is a valid
+    /// resume image).
+    pub l_ci_addr: u64,
+    /// **Lua call sites** (see [`LuaSite`]) — at a `precall` whose `ra` matches, the callee frame is
+    /// installed and the branch folds to the Lua re-dispatch edge.
+    pub lua_sites: Vec<LuaSite>,
+    /// **C call sites**: `ra` values at which the callee is a C function — the result is bound to
+    /// `NULL` (the C call is handled in place inside the opaque `precall`, so its effects still happen)
+    /// and the branch folds to the continue edge; the register cells are reloaded (the C function ran).
+    pub c_sites: Vec<u64>,
+}
+
+/// One Lua call site for the [`PrecallModel`]. On a `precall` whose `ra` matches, the result (`newci`)
+/// is bound to `callee_ci` (so the "was it a Lua function?" branch folds to the re-dispatch edge),
+/// `L->ci` is set to it, and each `pin` cell is set to its constant value; the register cells are left
+/// folded (Lua's callee base reuses the in-place argument slots, untouched by `precall`) so the
+/// callee's own dispatch folds inline. All addresses/values come from a profiling capture; the callee
+/// frame's bytes (its `CallInfo`, closure, `Proto`, code) must be supplied via
+/// [`SpecConfig::const_overlays`].
+#[derive(Clone, Debug)]
+pub struct LuaSite {
+    /// The callee stack slot `ra` that identifies this call site (constant in the fold).
+    pub ra: u64,
+    /// The deterministic `CallInfo` address `precall` (re)uses for this callee — bound as the result
+    /// and installed at `L->ci`.
+    pub callee_ci: u64,
+    /// Extra `(addr, value)` cells to fold at the call — structural pointers the dispatch setup needs
+    /// that are otherwise dynamic (e.g. the callee's function stack slot → its `LClosure` pointer,
+    /// which `OP_CLOSURE` allocated opaquely). Each is written into the abstract memory as a constant.
+    pub pins: Vec<(u64, u64)>,
 }
 
 /// Specialize with no caller memory hints (only readonly data segments fold).
@@ -1196,6 +1266,20 @@ impl Spec<'_> {
         }
         self.cur_thread = thread_abs;
 
+        // Diagnostic (under the `trace` feature): one line per residual block built, naming the active
+        // source `(func, block)`, the symbolic call-stack depth, and the live memory-cell count. This is
+        // how a runaway fold (a loop unrolling instead of rolling, or unbounded inline recursion) is
+        // spotted — the divergent frame shows up as a repeating/growing pattern before the budget trips.
+        trace_unsup!(
+            "BLOCK id~{} active=({},{}) ip={} nframes={} memcells={}",
+            self.next_id,
+            active_func,
+            active_block,
+            active_ip,
+            frames.len() + 1,
+            mem.len()
+        );
+
         // Guard-and-deopt: entering a cold target block bails to the resume handler instead of
         // projecting the block (which would drag in the interpreter's cold, stateful machinery). Spill
         // all live rename cells to the window — making it a valid interpreter resume image — then tail-
@@ -1310,6 +1394,19 @@ impl Spec<'_> {
     ) -> Result<Exec, SpecError> {
         for (k, inst) in insts.iter().enumerate().skip(start_ip) {
             if let Some((callee, args_abs)) = self.callee_of(inst, env)? {
+                // Precall post-state model (see [`SpecConfig::precall_model`]): the `luaD_precall` cut is
+                // projected specially — its result is bound to the callee frame the branch that follows
+                // will switch on, instead of a blind unknown. It is still a cut (carried + emitted
+                // opaquely); this only chooses the abstract post-state.
+                if let Some(pm) = &self.config.precall_model {
+                    if callee == pm.precall {
+                        let ridx = self.cut[&callee];
+                        let results =
+                            self.emit_precall(ridx, callee, &args_abs, pm, mem, out, rnext)?;
+                        env.extend(results);
+                        continue;
+                    }
+                }
                 // Cut set: a call-out we deliberately keep opaque (see [`SpecConfig::cut_calls`]).
                 // Emit it as a residual `call` to the carried callee and treat its results as
                 // unknowns — never inline or fold through it. Only *explicitly listed* callees are cut;
@@ -1506,6 +1603,74 @@ impl Spec<'_> {
             self.reload_cells_natural(mem, out, rnext)?;
         }
         Ok(results)
+    }
+
+    /// Emit a `luaD_precall` cut with the **precall post-state model** ([`SpecConfig::precall_model`]).
+    /// The call is emitted opaquely (like a cut), but its result — the new `CallInfo*` the following
+    /// branch switches on — is bound to a **static** value chosen by the call site `ra` (a constant in
+    /// the fold), so the "was it a Lua function?" branch folds and the Lua edge projects, not deopts:
+    ///
+    /// - **Lua site** (`ra` in [`PrecallModel::lua_sites`]): the result is the deterministic callee
+    ///   `CallInfo` address and `L->ci` is set to it. The register cells are left folded (no reload) —
+    ///   Lua's callee base reuses the in-place argument slots, which `precall` does not clobber — so
+    ///   the callee's own dispatch folds inline.
+    /// - **C site** (`ra` in [`PrecallModel::c_sites`]): the result is `NULL` (the C call is handled in
+    ///   place inside the opaque call); the register cells are reloaded (the C function ran).
+    /// - **Unrecognized** (dynamic `ra`, or `ra` in neither list): fall back to plain touch-state
+    ///   (unknown result, spill + reload) — the pre-existing behavior.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_precall(
+        &self,
+        ridx: u32,
+        callee: u32,
+        args_abs: &[Abs],
+        pm: &PrecallModel,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Vec<Abs>, SpecError> {
+        // The call site is identified by its (constant) callee stack slot `ra`.
+        let ra = match args_abs.get(pm.ra_arg) {
+            Some(Abs::Const(k)) => k.as_i64().map(|v| v as u64),
+            _ => None,
+        };
+        let lua_site = ra.and_then(|ra| pm.lua_sites.iter().find(|s| s.ra == ra));
+        let is_c = ra.is_some_and(|ra| pm.c_sites.contains(&ra));
+
+        // Spill live cells so the opaque callee observes the current state, then emit the call.
+        self.write_back_cells(mem, out, rnext)?;
+        let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
+        out.push(Inst::Call { func: ridx, args });
+        let nres = self.module.funcs[callee as usize].results.len();
+        // Result 0 is the `CallInfo*`; bind it per the classification, leaving any further results fresh.
+        let bind = |first: Abs, rnext: &mut u32| -> Vec<Abs> {
+            let mut r = Vec::with_capacity(nres);
+            r.push(first);
+            for _ in 1..nres {
+                r.push(Abs::Dyn(bump(rnext)));
+            }
+            r
+        };
+        if let Some(site) = lua_site {
+            // Lua callee: bind newci and install L->ci, pin the callee-frame structural cells; keep the
+            // register cells folded (no reload).
+            let ci = site.callee_ci as i64;
+            mem.insert(pm.l_ci_addr, (8, Abs::Const(Known::I64(ci))));
+            for &(addr, val) in &site.pins {
+                mem.insert(addr, (8, Abs::Const(Known::I64(val as i64))));
+            }
+            Ok(bind(Abs::Const(Known::I64(ci)), rnext))
+        } else if is_c {
+            // C callee: result is NULL; reload the register cells (the C function ran).
+            let r = bind(Abs::Const(Known::I64(0)), rnext);
+            self.reload_cells_natural(mem, out, rnext)?;
+            Ok(r)
+        } else {
+            // Unrecognized: plain touch-state (unknown result, reload).
+            let r = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
+            self.reload_cells_natural(mem, out, rnext)?;
+            Ok(r)
+        }
     }
 
     /// Reload every rename cell from the window at its canonical width (`i32.load8_u`/`load16_u`/
