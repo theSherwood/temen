@@ -4691,11 +4691,7 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
         };
         let bindable = matches!(
             cap.type_id,
-            cap_id::STREAM
-                | cap_id::EXIT
-                | cap_id::ADDRESS_SPACE
-                | cap_id::IO_RING
-                | cap_id::JIT
+            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::IO_RING | cap_id::JIT
         );
         if !bindable {
             return Err(format!(
