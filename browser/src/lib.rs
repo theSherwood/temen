@@ -5747,7 +5747,7 @@ pub extern "C" fn svm_mem_profile(
     // grants the hook first, so a scratch first-grant yields the exact baked-in value).
     let handle = {
         let mut scratch = Host::new();
-        scratch.grant_host_proc(Box::new(|_, _, _| Ok(vec![])))
+        scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
     };
     let spec = svm_opt::instrument::MemHookSpec {
         type_id: svm_interp::cap_id::HOST_PROC,
