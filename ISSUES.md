@@ -13,6 +13,14 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I72 — `fiber-scaling features (macos-latest)` failed at *action download* with `Service Unavailable` (S4, GitHub Actions infra flake) — recorded 2026-08-06 on PR #642
+
+Run 31119236467: the job died in **Prepare all required actions** — `Failed to resolve action
+download info. Error: Service Unavailable`, retried twice (21 s, 17 s) then `##[error]Service
+Unavailable`. No project code ran; the commit was test-only (`lua_futamura_call_arith` + ISSUES).
+GitHub's action-registry was transiently down. Sibling of I67/I70 (GitHub-hosted infra flakes);
+rerun-once policy applies — a fresh push re-triggers and clears it. No code fix.
+
 > **I36–I40 (2026-07-23):** the §3.6 serving-substrate review, recorded at the owner's request
 > after a design walkthrough. Two further items from the same review were **already tracked** and
 > are not duplicated here: fiber-level `svc.wait`/`Join` parks (TODO.md §3.6 residue,
@@ -71,12 +79,26 @@ exactly like the bytecode.
 `print(add(2,3) * 10)` and executes it **byte-identical to the interpreter (`50`)**, 172 residual
 blocks, no deopt — a call result flowing into `OP_MULK`, the exact shape a real call-bearing loop needs
 (`x = add(x, k)`). Both ingredients are config the `SpecConfig` API already supports (no engine change):
-the `k`-pool overlay + the alloc/GC/string cut-set. **Still open:** (b) the **nested** 2-frame case
-(`outer(y) = inner(y) * 2`) — note it *also* uses `OP_MULK`, so the missing `k` overlay was likely a
-contributor to its `Budget` divergence too; re-test with the `k` overlay + per-frame window capture
-before assuming a deeper caller-resume defect. (c) two **sequential** distinct callees reuse one cached
-`CallInfo` (`ci->next`), which a single const overlay can't represent — per-call-site pinned `ci` fields
-vs a fixed overlay. Repro/harness for all cases is in the arith test and the session scratchpad.
+the `k`-pool overlay + the alloc/GC/string cut-set.
+
+**Facet (b) — nested 2-frame (`outer(y) = inner(y) * 2`), progressed 2026-08-06, still open**
+(`lua_futamura_call_nested`, `#[ignore]`d). With the `k` overlay + cut-set from (a) **plus** a new
+**upvalue-machinery cut** (`outer` captures `inner`, so `OP_CLOSURE` calls `luaF_findupval`, which
+walks/mutates the open-upvalue list — cut `luaF_findupval`/`luaF_closeupval`/`luaF_close`/
+`luaF_initupvals`), the fold now **descends the full 2-deep stack** (main → `outer` → `inner`, confirmed
+via `startfunc` re-entries) — the earlier attempt couldn't get past the closures. The remaining blocker
+is **engine-level, not config**: a *callee* frame's register base is dynamic in the fold. `inner`'s
+`x + 1` (`OP_ADDI`) falls to `OP_MMBINI` because the operand tag never folds, and `eval_load` shows *no
+constant-base access to either callee's register file*. The base is `ci->func + 1` where `ci` is the
+precall's constant result and `ci->func` seeds from the frame overlay — so it *should* reduce, but 2-deep
+it doesn't, and the fold walks off `inner`'s code into the metamethod/GC cold subtree (`Budget`). (This
+*is* the "dynamic base" shape — a red herring for facet (a), but real here, for a callee frame.) Next:
+instrument the callee `startfunc` base computation to see why `ci->func + 1` doesn't fold, or have the
+precall re-seed the callee's base SSA from the pinned `ci`.
+
+**Facet (c) — still open:** two **sequential** distinct callees reuse one cached `CallInfo` (`ci->next`),
+which a single const overlay can't represent — per-call-site pinned `ci` fields vs a fixed overlay.
+Repro/harness for (a) and (b) is committed; (c)'s is in the session scratchpad.
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
