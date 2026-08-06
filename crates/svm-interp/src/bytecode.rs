@@ -487,6 +487,16 @@ enum Op {
         /// inherited `stdout` by name — the shell "exec" primitive.
         grants: Option<(u32, u32)>,
     },
+    /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
+    /// The 56-byte record is **runtime data** (entry, carve, module, budget, grants — see the
+    /// tree-walker's op-17 arm for the layout), so unlike the scalar spawns above the fields are
+    /// read from the vCPU's confined window at **exec** time; the op then folds onto the same
+    /// [`Outcome::Instantiate`] / [`Outcome::InstantiateModule`] the drivers already service.
+    InstantiateRec {
+        handle: u32,
+        rec: u32,
+        dst: u32,
+    },
     /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
     /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
     /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
@@ -889,7 +899,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 11 | 13 | 14,
+                        op: 0 | 1 | 5 | 11 | 13 | 14 | 17,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -961,6 +971,59 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 
 /// Lower every function (fast path — superinstruction-**fused**, Slice 5a), or `None` if any uses an
 /// op outside this slice's subset. This is what every production/runtime path calls.
+/// CONSOLIDATION.md §3d — the **module-level** admission for the record spawn (op 17): a module
+/// that could build a *pager* record (it has impl exports) declines to the tree-walk oracle, which
+/// owns demand paging; with no impl exports every pager record `CapFault`s identically on every
+/// tier, so the exec arm's fail-closed pager check is exact. This mirrors svm-run's
+/// `module_demand_spawns` fold on the Cranelift tier — one predicate per tier boundary, consulted
+/// by every `&Module` compile entry (INVARIANTS.md §9).
+fn compile_module_for(m: &Module) -> Option<Compiled> {
+    let uses_rec = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::CapCall {
+                    type_id: super::cap_id::INSTANTIATOR,
+                    op: 17,
+                    ..
+                }
+            )
+        })
+    });
+    if uses_rec && !m.impl_exports.is_empty() {
+        return None;
+    }
+    compile_module(&m.funcs)
+}
+
+/// §3d — validate + **drain** a spawn record's `Budget` at a driver's commit site, returning the
+/// child's funded fuel. `Ok(None)` = refuse the spawn `-EINVAL` with the budget **intact** (mem
+/// quota short, or the compiled-tier narrowed gap: a bounded spawn ceiling / bounded-zero fuel,
+/// which this tier — like the Cranelift thunk — cannot represent; flip those when child vCPU
+/// quotas / zero-fuel children land here). `Err(CapFault)` = the handle vanished since the exec
+/// arm's peek (a shared-powerbox race). The fund rule is the tree-walker's: bounded fuel is
+/// `min(budget, parent_remaining)`, unbounded inherits the parent's remaining.
+fn take_spawn_budget(
+    host: &mut Host,
+    budget: i32,
+    child_size: u64,
+    parent_fuel: u64,
+) -> Result<Option<u64>, Trap> {
+    let b = host.peek_budget(budget).ok_or(Trap::CapFault)?;
+    if b.mem >= 0 && child_size > b.mem as u64 {
+        return Ok(None); // mem quota short — refuse, budget intact
+    }
+    if b.spawn >= 0 || b.fuel == 0 {
+        return Ok(None); // narrowed gap (see doc) — refuse, budget intact
+    }
+    let b = host.take_budget(budget).ok_or(Trap::CapFault)?;
+    Ok(Some(if b.fuel >= 0 {
+        (b.fuel as u64).min(parent_fuel)
+    } else {
+        parent_fuel
+    }))
+}
+
 pub fn compile_module(funcs: &[Func]) -> Option<Compiled> {
     compile_module_with(funcs, true)
 }
@@ -1485,6 +1548,13 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     dst,
                     grants: Some((g(args[1]), g(args[2]))),
                 },
+                // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
+                // arg; every other spawn parameter is data in the record, read at exec time.
+                (cap_id::INSTANTIATOR, 17) if !args.is_empty() => Op::InstantiateRec {
+                    handle: g(*handle),
+                    rec: g(args[0]),
+                    dst,
+                },
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export. The mint needs the child's live env, so the op surfaces to the
                 // driver; the compile only marshals `(child, export)`.
@@ -1782,7 +1852,7 @@ pub fn compile_and_run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -1819,7 +1889,7 @@ pub fn compile_and_run_with_host_traced(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Option<TracedRun> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
@@ -1922,7 +1992,7 @@ pub fn compile_and_run_capture(
     fuel: &mut u64,
     init_mem: &[u8],
 ) -> Option<Capture> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -1959,7 +2029,7 @@ pub fn compile_and_run_capture_over(
     init_mem: &[u8],
     back: std::sync::Arc<super::Region>,
 ) -> Option<Capture> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -2003,7 +2073,7 @@ pub fn compile_and_run_over_shared_with_host(
     host: &mut Host,
     seed_data: bool,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -2034,7 +2104,7 @@ pub struct SharedProgram {
 impl SharedProgram {
     /// Compile `m` once (`None` if it uses an op outside the engine's subset).
     pub fn compile(m: &Module) -> Option<SharedProgram> {
-        let c = compile_module(&m.funcs)?;
+        let c = compile_module_for(m)?;
         let n_funcs = c.progs.len();
         Some(SharedProgram {
             source: std::sync::Arc::new(ModuleSource::new(c)),
@@ -2096,7 +2166,7 @@ pub fn compile_and_run_capture_over_parallel(
     init_mem: &[u8],
     back: std::sync::Arc<super::Region>,
 ) -> Option<Capture> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -2120,7 +2190,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: std::sync::Arc<super::Region>,
     host: &mut Host,
 ) -> Option<Capture> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -2177,7 +2247,7 @@ impl VcpuProgram {
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
     pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
-        let c = compile_module(&m.funcs)?;
+        let c = compile_module_for(m)?;
         let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
             dom,
@@ -2217,7 +2287,7 @@ impl Reactor {
     /// Open a reactor over a freshly compiled `m` (`None` if `m` uses an op outside the engine's
     /// subset): build the guest window once (its data segments applied) and keep it live.
     pub fn open(m: &Module) -> Option<Reactor> {
-        let c = compile_module(&m.funcs)?;
+        let c = compile_module_for(m)?;
         let n_funcs = c.progs.len();
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
@@ -2958,6 +3028,7 @@ impl<'p> Vcpu<'p> {
                     quota,
                     dst,
                     grants,
+                    budget,
                 }) => {
                     // op 11 (named grants) is driven by the scheduler `drive` arm (the browser's
                     // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
@@ -2965,10 +3036,12 @@ impl<'p> Vcpu<'p> {
                     if grants.is_some() {
                         return VcpuEvent::Trapped(Trap::Malformed);
                     }
-                    if let Some(ev) =
-                        self.event_instantiate(ibase, isz, entry, off, size_log2, quota, dst)
+                    match self
+                        .event_instantiate(ibase, isz, entry, off, size_log2, quota, budget, dst)
                     {
-                        return ev;
+                        Ok(Some(ev)) => return ev,
+                        Ok(None) => {} // -EINVAL landed in place — keep running
+                        Err(t) => return VcpuEvent::Trapped(t),
                     }
                 }
                 Ok(VcpuStop::InstantiateModule {
@@ -2981,6 +3054,7 @@ impl<'p> Vcpu<'p> {
                     quota,
                     dst,
                     grants,
+                    budget,
                 }) => {
                     // op 13 (named grants) is driven by the scheduler `drive` arm (the browser's
                     // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
@@ -2988,9 +3062,9 @@ impl<'p> Vcpu<'p> {
                     if grants.is_some() {
                         return VcpuEvent::Trapped(Trap::Malformed);
                     }
-                    match self
-                        .event_instantiate_module(ibase, isz, mh, entry, off, size_log2, quota, dst)
-                    {
+                    match self.event_instantiate_module(
+                        ibase, isz, mh, entry, off, size_log2, quota, budget, dst,
+                    ) {
                         Ok(Some(ev)) => return ev,
                         Ok(None) => {} // -EINVAL landed in place — keep running
                         Err(t) => return VcpuEvent::Trapped(t),
@@ -3004,9 +3078,12 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// Validate + prepare a §14 `instantiate` (op 0, same-module child) and produce its
-    /// [`VcpuEvent::Instantiate`], or land `-EINVAL` in place (`None`) on a bad entry/carve —
-    /// identical checks to the cooperative and parallel drivers' arms.
+    /// Validate + prepare a §14 `instantiate` (op 0 — or a §3d op-17 record with no module) and
+    /// produce its [`VcpuEvent::Instantiate`], or land `-EINVAL` in place (`Ok(None)`) on a bad
+    /// entry/carve — identical checks to the cooperative and parallel drivers' arms. A record's
+    /// `budget` (`0` = none) is funded here — the commit site — via [`take_spawn_budget`]
+    /// (peek-then-drain: every `-EINVAL` above leaves it intact); a handle that vanished since the
+    /// exec arm's peek (a shared-powerbox race) is the one `Err` (`CapFault`).
     #[allow(clippy::too_many_arguments)]
     fn event_instantiate(
         &mut self,
@@ -3016,8 +3093,9 @@ impl<'p> Vcpu<'p> {
         off: i64,
         size_log2: i64,
         quota: i64,
+        budget: i32,
         dst: u32,
-    ) -> Option<VcpuEvent> {
+    ) -> Result<Option<VcpuEvent>, Trap> {
         // The child runs in the CALLING frame's module — module 0 for a root/plain guest, the granted
         // module for an `instantiate_module` child whose entry itself instantiates (§14 nesting
         // composes across `instantiate_module`). Validating against `primary()` here used to send a
@@ -3026,7 +3104,7 @@ impl<'p> Vcpu<'p> {
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let Some(cm) = dom.source.get(cur_module) else {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            return None;
+            return Ok(None);
         };
         let ok_entry = cm.sigs.get(entry as usize).is_some_and(|(p, r)| {
             r[..] == [ValType::I64]
@@ -3044,25 +3122,41 @@ impl<'p> Vcpu<'p> {
             && off_u.checked_add(child_size).is_some_and(|e| e <= isize);
         if !ok_entry || !fits {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            return None;
+            return Ok(None);
         }
         // Window-relative carve (`window.base()` is 0 for this path's top-level region windows; the
         // term keeps exact parity with the drive/parallel arms' backing-absolute math).
         let pbase = self.mem.as_ref().map_or(0, |m| m.window.base());
         let carve = pbase + ibase + off_u;
-        let fuel = if quota <= 0 {
+        let fuel = if budget != 0 {
+            let pf = self.fuel;
+            let take = match self.shared_host {
+                Some(m) => {
+                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    take_spawn_budget(&mut g, budget, child_size, pf)?
+                }
+                None => take_spawn_budget(&mut self.host, budget, child_size, pf)?,
+            };
+            match take {
+                Some(f) => f,
+                None => {
+                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    return Ok(None);
+                }
+            }
+        } else if quota <= 0 {
             self.fuel
         } else {
             (quota as u64).min(self.fuel)
         };
         self.pending = Some(dst);
-        Some(VcpuEvent::Instantiate {
+        Ok(Some(VcpuEvent::Instantiate {
             module: cur_module as u32,
             entry: entry as u32,
             carve,
             size_log2: size_log2 as u8,
             fuel,
-        })
+        }))
     }
 
     /// Validate + prepare a §14 `instantiate_module` (op 5, separate-module child) and produce its
@@ -3081,6 +3175,7 @@ impl<'p> Vcpu<'p> {
         off: i64,
         size_log2: i64,
         quota: i64,
+        budget: i32,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
         // Resolve the granted module from the run's powerbox (the shared one when attached).
@@ -3130,7 +3225,24 @@ impl<'p> Vcpu<'p> {
             }
         }
         let cm = self.prog.dom.source.push(child_compiled);
-        let fuel = if quota <= 0 {
+        // A record's budget funds the child at this commit site (see `event_instantiate`).
+        let fuel = if budget != 0 {
+            let pf = self.fuel;
+            let take = match self.shared_host {
+                Some(m) => {
+                    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                    take_spawn_budget(&mut g, budget, child_size, pf)?
+                }
+                None => take_spawn_budget(&mut self.host, budget, child_size, pf)?,
+            };
+            match take {
+                Some(f) => f,
+                None => {
+                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                    return Ok(None);
+                }
+            }
+        } else if quota <= 0 {
             self.fuel
         } else {
             (quota as u64).min(self.fuel)
@@ -3418,7 +3530,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // driver flattens idle parked fibers into their regions, and thaw seeding re-creates them from the
     // artifact residue. So a single-vCPU `cont.*` module is driven here in any window state (NORMAL /
     // UNWINDING freeze / REWINDING thaw); only multi-vCPU `thread.*` (above) still falls back.
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -6506,10 +6618,12 @@ impl ScheduledDebugRun {
                         quota,
                         dst,
                         grants,
+                        budget,
                     } => {
                         *turn += 1;
-                        // op 11 (named-grant spawn) is not driven by the debugger path.
-                        if grants.is_some() {
+                        // op 11 (named-grant spawn) / a §3d budget record is not driven by the
+                        // debugger path.
+                        if grants.is_some() || budget != 0 {
                             dbg_complete(tasks, ti, Err(Trap::Malformed));
                         } else if let Err(t) = dbg_instantiate(
                             tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
@@ -6529,10 +6643,12 @@ impl ScheduledDebugRun {
                         quota,
                         dst,
                         grants,
+                        budget,
                     } => {
                         *turn += 1;
-                        // op 13 (named-grant spawn) is not driven by the debugger path.
-                        if grants.is_some() {
+                        // op 13 (named-grant spawn) / a §3d budget record is not driven by the
+                        // debugger path.
+                        if grants.is_some() || budget != 0 {
                             dbg_complete(tasks, ti, Err(Trap::Malformed));
                         } else if let Err(t) = dbg_instantiate_module(
                             tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
@@ -6720,9 +6836,11 @@ impl ScheduledDebugRun {
                     quota,
                     dst,
                     grants,
+                    budget,
                 } => {
-                    // op 11 (named-grant spawn) is not driven by the debugger replay path.
-                    if grants.is_some() {
+                    // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger
+                    // replay path.
+                    if grants.is_some() || budget != 0 {
                         dbg_complete(tasks, ti, Err(Trap::Malformed));
                     } else if let Err(t) = dbg_instantiate(
                         tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off,
@@ -6743,9 +6861,11 @@ impl ScheduledDebugRun {
                     quota,
                     dst,
                     grants,
+                    budget,
                 } => {
-                    // op 13 (named-grant spawn) is not driven by the debugger replay path.
-                    if grants.is_some() {
+                    // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger
+                    // replay path.
+                    if grants.is_some() || budget != 0 {
                         dbg_complete(tasks, ti, Err(Trap::Malformed));
                     } else if let Err(t) = dbg_instantiate_module(
                         tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry,
@@ -7075,7 +7195,7 @@ pub fn compile_and_run_sliced(
     fuel: &mut u64,
     slice: u64,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module(&m.funcs)?;
+    let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -7191,6 +7311,9 @@ enum Outcome {
         /// op 11 (`instantiate_named`): the grant-list `(ptr, count)` (op 0 is `None`), read from the
         /// register operands so the driver can re-grant the named caps into the child's powerbox.
         grants: Option<(u64, u64)>,
+        /// §3d (op 17): the record's `Budget` handle (`0` = none). The driver **funds** the child
+        /// from it at its commit site — peek-then-drain, so a refused spawn leaves it intact.
+        budget: i32,
     },
     /// §14 `Instantiator.instantiate_module`: like [`Outcome::Instantiate`], plus the resolved
     /// `Module` handle `mh` whose granted program the child runs (the driver resolves + compiles it).
@@ -7206,6 +7329,8 @@ enum Outcome {
         /// op 13 `instantiate_module_named`: the resolved `(grants_ptr, grants_n)` window coordinates
         /// of the child's by-name grant list (op 5 is `None`).
         grants: Option<(u64, u64)>,
+        /// §3d (op 17): the record's `Budget` handle (`0` = none) — see [`Outcome::Instantiate`].
+        budget: i32,
     },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
@@ -7684,6 +7809,8 @@ enum VcpuStop {
         /// op 11 `instantiate_named`: resolved `(grants_ptr, grants_n)` window coordinates of the
         /// child's by-name grant list (op 0 is `None`).
         grants: Option<(u64, u64)>,
+        /// §3d (op 17): the record's `Budget` handle (`0` = none) — funded at the driver's commit.
+        budget: i32,
     },
     /// §14 `Instantiator.instantiate_module` — the driver additionally resolves + compiles the
     /// host-granted `Module` (`mh`) and runs it as the confined child's program.
@@ -7699,6 +7826,8 @@ enum VcpuStop {
         /// op 13 `instantiate_module_named`: resolved `(grants_ptr, grants_n)` window coordinates of
         /// the child's by-name grant list (op 5 is `None`).
         grants: Option<(u64, u64)>,
+        /// §3d (op 17): the record's `Budget` handle (`0` = none) — see above.
+        budget: i32,
     },
     Wait {
         base: u64,
@@ -8015,6 +8144,7 @@ fn step_vcpu(
                 quota,
                 dst,
                 grants,
+                budget,
             } => {
                 return Ok(VcpuStop::Instantiate {
                     ibase,
@@ -8025,6 +8155,7 @@ fn step_vcpu(
                     quota,
                     dst,
                     grants,
+                    budget,
                 })
             }
             Outcome::InstantiateModule {
@@ -8037,6 +8168,7 @@ fn step_vcpu(
                 quota,
                 dst,
                 grants,
+                budget,
             } => {
                 return Ok(VcpuStop::InstantiateModule {
                     ibase,
@@ -8048,6 +8180,7 @@ fn step_vcpu(
                     quota,
                     dst,
                     grants,
+                    budget,
                 })
             }
             Outcome::MemoryWait {
@@ -8560,6 +8693,7 @@ fn drive(
                 quota,
                 dst,
                 grants,
+                budget,
             }) => {
                 // Validate the child entry signature against module 0 (a same-module child): it
                 // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
@@ -8688,7 +8822,24 @@ fn drive(
                 } else {
                     vec![Value::I64(cinst as i64)]
                 };
-                let child_fuel = if quota <= 0 {
+                // §3d: a record's budget funds the child here — the commit site, after every
+                // other refusal (geometry, grants), so a refused spawn leaves it intact.
+                let child_fuel = if budget != 0 {
+                    match take_spawn_budget(host, budget, child_size, pfuel) {
+                        Err(t) => {
+                            complete(&mut tasks, ti, Err(t));
+                            continue;
+                        }
+                        Ok(None) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }
+                        Ok(Some(f)) => f,
+                    }
+                } else if quota <= 0 {
                     pfuel
                 } else {
                     (quota as u64).min(pfuel)
@@ -8726,6 +8877,7 @@ fn drive(
                 quota,
                 dst,
                 grants,
+                budget,
             }) => {
                 // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
                 let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
@@ -8892,7 +9044,24 @@ fn drive(
                 } else {
                     vec![Value::I64(cinst as i64)]
                 };
-                let child_fuel = if quota <= 0 {
+                // §3d: a record's budget funds the child here — the commit site, after every
+                // other refusal (module resolve, geometry, grants, manifest binding).
+                let child_fuel = if budget != 0 {
+                    match take_spawn_budget(host, budget, child_size, pfuel) {
+                        Err(t) => {
+                            complete(&mut tasks, ti, Err(t));
+                            continue;
+                        }
+                        Ok(None) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }
+                        Ok(Some(f)) => f,
+                    }
+                } else if quota <= 0 {
                     pfuel
                 } else {
                     (quota as u64).min(pfuel)
@@ -9607,10 +9776,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                 quota,
                 dst,
                 grants,
+                budget,
             }) => {
-                // op 11 (named-grant spawn) is driven only by the cooperative single-thread `drive`
-                // path (the browser's wasm-safe entry); the OS-thread parallel driver declines it.
-                if grants.is_some() {
+                // op 11 (named-grant spawn) / a §3d budget record is driven only by the cooperative
+                // single-thread `drive` path (the browser's wasm-safe entry); the OS-thread parallel
+                // driver declines them.
+                if grants.is_some() || budget != 0 {
                     return (Err(Trap::Malformed), mem);
                 }
                 // Validate the child entry signature against module 0 and the power-of-two-aligned
@@ -9717,10 +9888,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                 quota,
                 dst,
                 grants,
+                budget,
             }) => {
-                // op 13 (named-grant spawn) is driven only by the cooperative single-thread `drive`
-                // path (the browser's wasm-safe entry); the OS-thread parallel driver declines it.
-                if grants.is_some() {
+                // op 13 (named-grant spawn) / a §3d budget record is driven only by the cooperative
+                // single-thread `drive` path (the browser's wasm-safe entry); the OS-thread parallel
+                // driver declines them.
+                if grants.is_some() || budget != 0 {
                     return (Err(Trap::Malformed), mem);
                 }
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
@@ -11038,6 +11211,7 @@ impl Vm {
                         quota,
                         dst,
                         grants,
+                        budget: 0,
                     });
                 }
                 // §14 separate-module executor child — like `Instantiate`, but the first arg is a
@@ -11077,6 +11251,84 @@ impl Vm {
                         quota,
                         dst,
                         grants,
+                        budget: 0,
+                    });
+                }
+                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from
+                // this vCPU's confined window and fail closed exactly as the tree-walker's arm does
+                // (bad version / pager / budget-quota mix / dangling budget handle → `CapFault`).
+                // This tier never natively demand-pages: the module-level entries decline any
+                // op-17 module with impl exports ([`compile_module_for`]), so a surviving pager
+                // field can only come from an export-less module — which `CapFault`s identically
+                // on the tree-walker. Geometry validation and the budget **drain** stay at the
+                // drivers' commit sites (`event_instantiate*` / the drive arms) so a refused spawn
+                // leaves the budget intact — the tree-walker's peek-then-drain discipline. (One
+                // known error-order seam, shared with ops 11/13: an invalid grant list *plus* bad
+                // geometry lands `-EINVAL` here but `CapFault` on the tree-walker, because grant
+                // records are parsed at the drivers' construction step.)
+                Op::InstantiateRec { handle, rec, dst } => {
+                    let ih = r!(*handle).i32();
+                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
+                    let rp = r!(*rec).i64() as u64;
+                    let bytes = mem.as_ref().ok_or(Trap::Malformed)?.read_window(rp, 56)?;
+                    let u32_at = |o: usize| {
+                        u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+                    };
+                    let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+                    if u32_at(0) != 0 {
+                        return Err(Trap::CapFault); // version — fail closed
+                    }
+                    let entry = u32_at(4) as i64;
+                    let off = u64_at(8) as i64;
+                    let size_log2 = u32_at(16) as i64;
+                    let pager = u32_at(20);
+                    let modh = u32_at(24) as i32;
+                    let budget = u32_at(28) as i32;
+                    let quota = u64_at(32) as i64;
+                    if pager != u32::MAX {
+                        return Err(Trap::CapFault); // no impl exports here (see above) — fail closed
+                    }
+                    if budget != 0 {
+                        if quota != 0 {
+                            return Err(Trap::CapFault); // budget + raw quota is ambiguous
+                        }
+                        // Validate the handle now (dangling → CapFault, as the tree-walker);
+                        // the drain waits for the drivers' commit.
+                        host.with(|p| p.peek_budget(budget).map(|_| ()).ok_or(Trap::CapFault))?;
+                    }
+                    let gp = u64_at(40);
+                    let gn = u64_at(48);
+                    let grants = (gn > 0).then_some((gp, gn));
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(if modh >= 0 {
+                        Outcome::InstantiateModule {
+                            ibase,
+                            isize: isz,
+                            mh: modh,
+                            entry,
+                            off,
+                            size_log2,
+                            quota,
+                            dst,
+                            grants,
+                            budget,
+                        }
+                    } else {
+                        Outcome::Instantiate {
+                            ibase,
+                            isize: isz,
+                            entry,
+                            off,
+                            size_log2,
+                            quota,
+                            dst,
+                            grants,
+                            budget,
+                        }
                     });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery

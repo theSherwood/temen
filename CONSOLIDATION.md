@@ -131,6 +131,19 @@ as a **conditional** import — existing modules keep their exact import set).
 - **3d.1** — migrate the in-tree text-IR callers (survey: op 0 in 34 files, op 5 in 16,
   op 8 in 4, op 11 in 15, op 16 in 2, across tests/bench/fuzz) to the record, then delete
   the **five** arms (0/5/8/11/16) across all tiers. No committed asset uses any of them.
+  - **3d.1a (landed)** — the record is **native on the bytecode tier** (`Op::InstantiateRec`):
+    the 56-byte record is runtime data, so it is parsed at exec time (confined `read_window`)
+    and folds onto the existing `Outcome::Instantiate`/`InstantiateModule` driver plumbing
+    (grants pass through; a new `budget` field reaches the drivers). Prerequisite for the
+    migration: without it, every migrated bytecode-native test would silently fall back to the
+    oracle and the tier would lose its spawn coverage. Boundaries: pager-capable modules
+    (op 17 + impl exports) **decline whole** (`compile_module_for`, the bytecode twin of
+    svm-run's `module_demand_spawns` fold); budgets fund at the drivers' commit sites
+    (`take_spawn_budget`, peek-then-drain — refusals leave the budget intact); a bounded
+    spawn ceiling / bounded-zero fuel is the same narrowed gap as the Cranelift thunk
+    (`-EINVAL`, flip-when-fixed pins); the debugger and OS-thread-parallel paths refuse
+    budget records exactly as they refuse grant lists. Pinned by
+    `svm-interp/tests/bytecode_rec.rs` (native-compile non-vacuity + oracle differentials).
 - **3d.2** — op 13 (`instantiate_module_named`, the STAGE1 shell's exec) is **asset-gated**:
   deleting it breaks the committed `shell.svmb`, which only regenerates through the
   heavyweight STAGE1 on-ramp — the same regeneration event ISSUES.md I64 already tracks for
