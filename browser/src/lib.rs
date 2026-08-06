@@ -2158,10 +2158,10 @@ fn onramp_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
         "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::MEMORY, 0),
-        "vm_unmap" => (cap_id::MEMORY, 1),
-        "vm_protect" => (cap_id::MEMORY, 2),
-        "vm_page_size" => (cap_id::MEMORY, 3),
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
         "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
         "vm_region_map" => (cap_id::SHARED_REGION, 0),
         "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
@@ -2266,7 +2266,9 @@ fn grant_onramp_caps(
                     (cap_id::STREAM, 1) => handles[0],
                     (cap_id::STREAM, _) => handles[1],
                     (cap_id::EXIT, _) => handles[2],
-                    (cap_id::MEMORY, _) => handles[3],
+                    // One kind post-§4 (op-keyed like Stream): vm_map family → the
+                    // whole-window grant, sub/region_create → the sized one.
+                    (cap_id::ADDRESS_SPACE, 0..=3) => handles[3],
                     (cap_id::ADDRESS_SPACE, _) => handles[4],
                     (cap_id::JIT, _) => match jit_h {
                         Some(h) => h,
@@ -2690,7 +2692,7 @@ fn pg_setup(
                     (cap_id::STREAM, 1) => out,
                     (cap_id::STREAM, _) => inp,
                     (cap_id::EXIT, _) => exit,
-                    (cap_id::MEMORY, _) => memory,
+                    (cap_id::ADDRESS_SPACE, _) => memory,
                     _ => return svm_interp::BoundImport::rebindable(0, 0, None),
                 };
                 svm_interp::BoundImport::required(cap.type_id, cap.op, handle)

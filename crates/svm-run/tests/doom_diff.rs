@@ -24,10 +24,10 @@ fn onramp_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
         "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::MEMORY, 0),
-        "vm_unmap" => (cap_id::MEMORY, 1),
-        "vm_protect" => (cap_id::MEMORY, 2),
-        "vm_page_size" => (cap_id::MEMORY, 3),
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
         _ => return None,
     };
     Some(svm_ir::ResolvedCap { type_id, op })

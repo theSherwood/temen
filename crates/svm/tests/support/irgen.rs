@@ -467,14 +467,14 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 if op == 3 {
                     // page_size() -> i64: a pure query — no args, no window effect — so both
                     // backends report the same host page and it always agrees. Exercises the
-                    // 0-arg / 1-result cap.call marshalling for the Memory cap.
+                    // 0-arg / 1-result cap.call marshalling for the whole-window AddressSpace cap.
                     let sig = FuncType {
                         params: vec![],
                         results: results.clone(),
                     };
                     bb.push_multi(
                         Inst::CapCall {
-                            type_id: 3,
+                            type_id: 5,
                             op,
                             sig,
                             handle,
@@ -489,7 +489,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     };
                     bb.push_multi(
                         Inst::CapCall {
-                            type_id: 3,
+                            type_id: 5,
                             op,
                             sig,
                             handle,
@@ -507,7 +507,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     };
                     bb.push_multi(
                         Inst::CapCall {
-                            type_id: 3,
+                            type_id: 5,
                             op,
                             sig,
                             handle,
