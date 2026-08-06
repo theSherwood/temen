@@ -95,7 +95,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use svm_ir::{
-    Block, CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType,
+    BinOp, Block, CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType,
 };
 use svm_verify::func_value_types;
 
@@ -1430,9 +1430,11 @@ impl Spec<'_> {
     ) -> Result<Vec<Abs>, SpecError> {
         match mode {
             CutMode::TouchState => {
-                // Spill the live state to the window so the opaque callee sees it. (Reload happens
-                // after the call, below — the cells must survive `mem` until then.)
-                self.spill_cells_natural(mem, out, rnext)?;
+                // Spill the live state to the window so the opaque callee sees it (any natural width —
+                // the register tag bytes spill too, so a callee that rewrites a register writes a
+                // well-typed `TValue`). Reload happens after the call, below — the cells must survive
+                // `mem` until then.
+                self.write_back_cells(mem, out, rnext)?;
             }
             CutMode::ReadState => {
                 // The callee reads the state but does not rewrite its cells: spill every live cell
@@ -1467,33 +1469,12 @@ impl Spec<'_> {
         Ok(results)
     }
 
-    /// Spill every live rename cell to the window at its natural 4/8-byte width (a `store`), leaving
-    /// `mem` intact — the caller reloads afterward. Non-natural widths fail closed.
-    fn spill_cells_natural(
-        &self,
-        mem: &BTreeMap<u64, (u32, Abs)>,
-        out: &mut Vec<Inst>,
-        rnext: &mut u32,
-    ) -> Result<(), SpecError> {
-        for (&eff, &(width, val)) in mem.iter() {
-            let op = natural_store_op(width).ok_or(SpecError::Unsupported)?;
-            out.push(Inst::ConstI64(eff as i64));
-            let addr = bump(rnext);
-            let value = materialize(val, out, rnext);
-            out.push(Inst::Store {
-                op,
-                addr,
-                value,
-                offset: 0,
-                align: 0,
-            });
-        }
-        Ok(())
-    }
-
-    /// Reload every rename cell from the window at its natural 4/8-byte width, replacing its abstract
-    /// value with a fresh unknown backed by the `load`. The inverse of [`Self::spill_cells_natural`],
-    /// run after an opaque state-touching call so its writes become visible.
+    /// Reload every rename cell from the window at its canonical width (`i32.load8_u`/`load16_u`/
+    /// `i32.load`/`i64.load` for 1/2/4/8), replacing its abstract value with a fresh unknown backed by
+    /// the `load` — the inverse of the spill ([`Self::write_back_cells`]), run after an opaque
+    /// state-touching call so its writes become visible. A narrow cell reloads as its `i32`-canonical
+    /// zero-extended bytes (the same shape [`Self::eval_store`] records), so a later same-width load
+    /// reads it back. Non-1/2/4/8 widths fail closed.
     fn reload_cells_natural(
         &self,
         mem: &mut BTreeMap<u64, (u32, Abs)>,
@@ -1502,7 +1483,7 @@ impl Spec<'_> {
     ) -> Result<(), SpecError> {
         let addrs: Vec<(u64, u32)> = mem.iter().map(|(&a, &(w, _))| (a, w)).collect();
         for (eff, width) in addrs {
-            let op = natural_load_op(width).ok_or(SpecError::Unsupported)?;
+            let op = reload_load_op(width).ok_or(SpecError::Unsupported)?;
             out.push(Inst::ConstI64(eff as i64));
             let addr = bump(rnext);
             out.push(Inst::Load {
@@ -1908,13 +1889,32 @@ impl Spec<'_> {
                                 out.push(Inst::Cast { op: cast, a: i });
                                 Abs::Dyn(bump(rnext))
                             }
-                            Abs::Dyn(_) => {
-                                trace_unsup!(
-                                    "load: unrenamable dynamic cell eff={:#x} op={:?}",
-                                    eff,
-                                    op
-                                );
-                                return Err(SpecError::Unsupported);
+                            // A **narrow** dynamic cell (sub-natural width, `i32`-canonical from the
+                            // store side) read back at its own width by an **unsigned** integer load:
+                            // the cell already holds the zero-extended low `width` bytes, so the read
+                            // is the identity (an `i32` result) or a zero-extend (an `i64` result).
+                            // Signed sub-word reads and float reads stay refused — the interpreter's
+                            // tag/field moves that reach here are unsigned.
+                            Abs::Dyn(i) => {
+                                let (_, vt, _w, signed) = op.info();
+                                if signed || !matches!(vt, ValType::I32 | ValType::I64) {
+                                    trace_unsup!(
+                                        "load: unrenamable dynamic cell eff={:#x} op={:?}",
+                                        eff,
+                                        op
+                                    );
+                                    return Err(SpecError::Unsupported);
+                                }
+                                match vt {
+                                    ValType::I32 => Abs::Dyn(i),
+                                    _ => {
+                                        out.push(Inst::Convert {
+                                            op: ConvOp::ExtendI32U,
+                                            a: i,
+                                        });
+                                        Abs::Dyn(bump(rnext))
+                                    }
+                                }
                             }
                         }));
                     }
@@ -2017,7 +2017,43 @@ impl Spec<'_> {
                         out.push(Inst::Cast { op: cast, a: i });
                         Abs::Dyn(bump(rnext))
                     }
-                    // A narrow dynamic store would need residual masking to read back — refuse.
+                    // A **narrow** dynamic integer store (a sub-natural width — the `TValue` tag byte
+                    // the interpreter moves via `i32.store8`, or a 2-byte field): canonicalize the
+                    // value to an `i32` holding the **zero-extended low `width` bytes** — the cell's
+                    // physical content (matching `cell_const`/`writeback_store_op`, where a sub-8 cell
+                    // is `i32`). A same-width load reads it back exactly (`eval_load`); a wider or
+                    // overlapping access is refused by the straddle guard below (`mem.retain` +
+                    // `within_region`/straddle checks) — which is precisely the masking-soundness
+                    // condition (no other access can observe the untruncated high bits). This is what
+                    // lets the renamer carry a **dynamic tagged value** (a looked-up function/table/
+                    // string), whose tag is dynamic, instead of refusing every non-integer move.
+                    Abs::Dyn(i) if is_int && width < 8 => {
+                        let src32 = if matches!(op.info().1, ValType::I32) {
+                            i
+                        } else {
+                            out.push(Inst::Convert {
+                                op: ConvOp::WrapI64,
+                                a: i,
+                            });
+                            bump(rnext)
+                        };
+                        // Widths 1/2 mask to the low bytes; width 4 already *is* the full i32.
+                        let masked = if width >= 4 {
+                            src32
+                        } else {
+                            out.push(Inst::ConstI32(((1i64 << (8 * width)) - 1) as i32));
+                            let m = bump(rnext);
+                            out.push(Inst::IntBin {
+                                ty: IntTy::I32,
+                                op: BinOp::And,
+                                a: src32,
+                                b: m,
+                            });
+                            bump(rnext)
+                        };
+                        Abs::Dyn(masked)
+                    }
+                    // A narrow dynamic **float** store (no natural interpreter shape) — refuse.
                     Abs::Dyn(_) => {
                         trace_unsup!("store: unrenamable dynamic cell eff={:#x} op={:?}", eff, op);
                         return Err(SpecError::Unsupported);
@@ -3029,21 +3065,14 @@ fn writeback_store_op(width: u32) -> Option<StoreOp> {
 }
 
 /// The full-width store op for a natural 4/8-byte cell — the spill side of a state-touching cut call
-/// ([`Spec::spill_cells_natural`]). Narrow cells aren't round-trip-reloadable as identity, so only the
-/// two natural widths are supported; anything else fails closed.
-fn natural_store_op(width: u32) -> Option<StoreOp> {
+/// The reload op that reads a spilled cell back after a state-touching cut call
+/// ([`Spec::reload_cells_natural`]), matching [`writeback_store_op`]'s canonical widths: a narrow cell
+/// reloads **zero-extended** (`load8_u`/`load16_u`) as its `i32`-canonical bytes — the same shape
+/// [`Spec::eval_store`] records — so a later same-width load reads it back. Non-1/2/4/8 fails closed.
+fn reload_load_op(width: u32) -> Option<LoadOp> {
     Some(match width {
-        4 => StoreOp::I32,
-        8 => StoreOp::I64,
-        _ => return None,
-    })
-}
-
-/// The full-width load op matching [`natural_store_op`] — the reload side ([`Spec::reload_cells_natural`]).
-/// Loads the whole cell back as its natural integer type (`i32` for width 4, `i64` for width 8), which
-/// is the cell's [`cell_type`], so the reloaded value re-renames as the identity.
-fn natural_load_op(width: u32) -> Option<LoadOp> {
-    Some(match width {
+        1 => LoadOp::I32_8U,
+        2 => LoadOp::I32_16U,
         4 => LoadOp::I32,
         8 => LoadOp::I64,
         _ => return None,
