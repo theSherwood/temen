@@ -21,7 +21,34 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I68 — `fork_manager` guest-fork race: intermittent HANG or wrong result in the FORK.md fork/join path (S3, real race — reclassified from S4 after recurrence + Linux repro) — recorded 2026-08-05 on PR #627, updated 2026-08-06 on PR #629
+### I68 — `fork_manager` guest-fork race: intermittent HANG or wrong result in the FORK.md fork/join path (S3, real race — reclassified from S4 after recurrence + Linux repro) — recorded 2026-08-05 on PR #627, updated 2026-08-06 on PR #629 — **FIX LANDED 2026-08-06** (`claude/i68-issue-fix-sxghke`)
+
+**FIX LANDED (2026-08-06) — not a substrate race: the three fork tests didn't honor FORK.md §8.6's
+serve/park-race contract.** Reproduced on Linux (~1 hang in 150, ~1 wrong-result in 400) and diagnosed
+with a scheduler-quiesce dump + a fork/reply/park event trace. The `-EAGAIN` on the serve/park race
+(`svc_enqueue` wakes the server *before* the caller registers its `CapReply` waiter, so a handler can
+run `clone_caller` before the caller is parked and there is no parked vCPU to clone) is **by design**
+(FORK.md §8.6) — the contract is a **long-lived server** plus a **guest that retries** `while ((pid =
+fork()) < 0)`, exactly what the reference `clone_caller.rs::SRC_FORK_PID` does. All three
+manager-topology tests violated it two ways:
+
+- **The HANG.** Every server (`func 1`) was a **single-shot** `svc.wait` (`svc.wait; return`), not the
+  `svc.wait` **loop** its own doc comment claimed. When the guest's first `fork()` lost the serve/park
+  race, the server replied `-EAGAIN`, then **exited**; the guest's retry enqueued on the now-dead server
+  and parked in `ticket_waiters` forever (workers idle, `live > 0`, `shutdown` never set → the 45-min CI
+  cancel). Trace: `FORK miss-none (2,0)` → `REPLY stash (2,0)=-11` → `PARK early-hit (2,0)=-11` →
+  `FINISH id=1` (server exits) → `PARK insert (2,1)` (retry strands). **Fix:** loop the server
+  (`br 1(); … br 1()`), matching `SRC_FORK_PID` and the doc.
+- **The WRONG RESULT (`left: [I64(-11)]`).** `fork_import`'s IR guest and `c_fork`'s C guest
+  (`slot = fork();`) called `fork()` **once, with no retry**, so a raced first attempt returned `-EAGAIN`
+  straight to the caller. (`fork_manager`'s guest already retried — which is why it only ever hung, never
+  returned wrong.) **Fix:** add the retry — `br_if vforkfail` in the IR guest, `while ((slot = fork()) <
+  0);` in the C guest (the realistic shell idiom, §8.6).
+
+Test-only change (no `crates/svm-interp` edit — the substrate's `-EAGAIN` is correct). After: all three
+pass **1000/1000** under the same stress that reproduced both failure modes; `clone_caller.rs` (7 tests)
+stays green. Note this refines the I53 sighting that claimed these three "do not flake" — they did, via
+the missing-retry / single-shot-server path, not the root-is-forker artifact I53 tracked.
 
 **Update 2026-08-06 (PR #629, head 45fc6a19):** recurred on macOS (same signature — 60s
 warning, silent until the ~45 min workflow cancel, orphan `fork_manager` terminated), so

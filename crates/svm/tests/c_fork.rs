@@ -77,17 +77,18 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// The guest: `fork()` (through the `__fork` import → the fork offer), then write the 8-byte fork return
-/// to fd 1 (the granted stdout stream) — in BOTH the original and the twin. `slot` is a `static` so its
-/// address is a plain data pointer (no stack-array codegen). `__fork` takes a leading dummy arg chibicc
-/// drops, so the lowered call is `(i64)->(i64)` — matching the fork offer op.
+/// The guest: `fork()` (through the `__fork` import → the fork offer), retrying while it returns `< 0`
+/// (the `-EAGAIN` serve/park race — the `while ((pid = fork()) < 0)` shell idiom, ISSUES.md I68), then
+/// write the 8-byte fork return to fd 1 (the granted stdout stream) — in BOTH the original and the twin.
+/// `slot` is a `static` so its address is a plain data pointer (no stack-array codegen). `__fork` takes a
+/// leading dummy arg chibicc drops, so the lowered call is `(i64)->(i64)` — matching the fork offer op.
 const GUEST_SRC: &str = r#"
 long write(long fd, void *buf, long n);
 long __fork(int h, long a);
 long fork(void) { return __fork(0, 0); }
 static long slot;
 int main(int argc, char **argv) {
-  slot = fork();
+  while ((slot = fork()) < 0);
   write(1, &slot, 8);
   return slot;
 }
@@ -139,9 +140,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
   vz = i32.const 0
   vn = cap.call 4294967295 10 () -> (i64) vz ()
-  return vn
+  br 1()
   }
 }
 func (i64) -> (i64) {

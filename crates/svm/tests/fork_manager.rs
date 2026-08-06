@@ -76,9 +76,12 @@ block 0 (v0: i32, vlibc: i32) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
   vz = i32.const 0
   vn = cap.call 4294967295 10 () -> (i64) vz ()
-  return vn
+  br 1()
   }
 }
 func (i64) -> (i64) {
