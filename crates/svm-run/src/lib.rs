@@ -1763,6 +1763,35 @@ pub unsafe extern "C" fn module_resolver(
 /// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
 /// CALLS.md 5c.1c — the production granted-child hook set (`powerbox_compile_run` installs it on
 /// every JIT run whose module nests): the same callbacks the test harnesses wire by hand.
+/// §3c.2 — the production [`svm_jit::BudgetTaker`]: peek/drain a Budget on the run's parent
+/// `Host` for a record spawn, mirroring the interpreter's op-17 discipline exactly (see
+/// [`svm_interp::Host::budget_for_spawn`]).
+///
+/// # Safety
+/// `ctx` is the run's live `*mut Host` (the cap thunk's ctx); `out`/`trap_out` are writable.
+pub unsafe extern "C" fn budget_take(
+    ctx: *mut core::ffi::c_void,
+    handle: i32,
+    child_size: u64,
+    mode: i32,
+    out: *mut svm_jit::BudgetTaken,
+    trap_out: *mut i64,
+) -> i32 {
+    let host = &mut *(ctx as *mut Host);
+    match host.budget_for_spawn(handle, child_size, mode == 1) {
+        None => {
+            *trap_out = svm_jit::TrapKind::CapFault as i64;
+            0
+        }
+        Some(Err(())) => 2,
+        Some(Ok((fuel, spawn))) => {
+            (*out).fuel = fuel;
+            (*out).spawn = spawn;
+            1
+        }
+    }
+}
+
 pub fn production_grant_hooks() -> svm_jit::GrantChildHooks {
     svm_jit::GrantChildHooks {
         build: grant_child_build,
@@ -3445,6 +3474,8 @@ unsafe fn powerbox_compile_run(
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
         // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
         cm.set_grant_child_hooks(Some(production_grant_hooks()));
+        cm.set_budget_taker(Some(budget_take));
+        cm.set_budget_taker(Some(budget_take));
         if let Some(ip) = interrupt_ptr {
             m.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3487,6 +3518,7 @@ unsafe fn powerbox_compile_run(
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks()));
+    cm.set_budget_taker(Some(budget_take));
     if let Some(ip) = interrupt_ptr {
         host.set_epoch_cell(ip as usize);
     }
@@ -3799,23 +3831,26 @@ fn module_nests(m: &svm_ir::Module) -> bool {
 }
 
 /// CONSOLIDATION.md §2.2/§3: the module spawns a demand process child (`Instantiator` op 16 —
-/// pager-serviced faults) or uses the §3 config-record spawn (op 17 — §3c migrates the spawn
-/// ABI to the JIT). The JIT has no native arm for either yet, so these modules
+/// pager-serviced faults), or uses the §3 config-record spawn (op 17) **and declares impl
+/// exports** — the record's `pager` field is runtime data, so any module that could name one of
+/// its own exports as a pager folds; an export-less module cannot build a valid pager record
+/// (the interpreter fails that validation identically), so §3c runs it natively via the
+/// `instantiate_rec` thunk. The JIT has no native arm for the fault seam itself, so pager-capable
+/// modules
 /// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
 /// transport itself is what makes this cheap to defer: JIT callers already reach providers
 /// through the cap-thunk handoff at interp cost.
 fn module_demand_spawns(m: &svm_ir::Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    svm_ir::Inst::CapCall {
-                        type_id: 6,
-                        op: 16 | 17,
-                        ..
-                    }
-                )
+            b.insts.iter().any(|i| match i {
+                svm_ir::Inst::CapCall {
+                    type_id: 6, op: 16, ..
+                } => true,
+                svm_ir::Inst::CapCall {
+                    type_id: 6, op: 17, ..
+                } => !m.impl_exports.is_empty(),
+                _ => false,
             })
         })
     })

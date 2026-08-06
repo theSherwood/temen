@@ -21,7 +21,19 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I68 — macOS `fork_manager::a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs` can HANG (not fail), holding `build · test (macos-latest)` until the workflow-timeout cancel (S4, flaky CI) — recorded 2026-08-05 on PR #627
+### I68 — `fork_manager` guest-fork race: intermittent HANG or wrong result in the FORK.md fork/join path (S3, real race — reclassified from S4 after recurrence + Linux repro) — recorded 2026-08-05 on PR #627, updated 2026-08-06 on PR #629
+
+**Update 2026-08-06 (PR #629, head 45fc6a19):** recurred on macOS (same signature — 60s
+warning, silent until the ~45 min workflow cancel, orphan `fork_manager` terminated), so
+rerun-once is exhausted. Local stress on Linux **reproduces it**: ~1 hang in 150 runs
+(10s timeout) and, separately, ~1 outright test FAILURE (exit 101 — wrong result) in 400
+runs — the same race manifesting two ways. Not macOS-specific and not OS fork(2): the
+"real libc fork" is FORK.md's guest-level `fork_twin` (vCPU duplication on the M:N
+scheduler), so this is an order-sensitivity/lost-wakeup race in the fork/join/memfs-share
+path, the I52/I53 family. **Escalation:** a dedicated slice with a loom model of
+`fork_twin`'s park/wake (the parallel-scheduler loom harness exists; add the fork shape),
+plus the per-test timeout so a hang fails in seconds. Until then this test can hang any
+`build · test` leg — treat a `fork_manager` orphan in the cancel log as this issue.
 
 Observed once on head 258a0182: the test printed the 60-second warning, then nothing until
 the job was cancelled at ~45 min and the orphaned `fork_manager` test process was terminated

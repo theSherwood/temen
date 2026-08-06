@@ -682,6 +682,32 @@ pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 /// through the compile pipeline next to [`ModuleResolver`]; `None` ⇒ `instantiate_granted` (op 8) and
 /// `instantiate_named` (op 11) are inert `CapFault`s (a host that re-grants nothing), exactly as a
 /// missing module resolver makes the module ops a `CapFault`.
+/// §3c.2 — one Budget read/consume for the record spawn (op 17), host-side. `mode` 0 = **peek**
+/// (validate: resolve the handle, check `child_size` against the mem quota, report fuel/spawn —
+/// budget untouched); `mode` 1 = **drain** (consume to zero at spawn commit). Returns 1 = ok
+/// (`out` filled), 2 = refused (mem over a bounded quota — the spawn is a probeable `-EINVAL`,
+/// budget intact), 0 = `CapFault` set in `*trap_out` (dangling/mistyped handle). Mirrors the
+/// interpreter's peek-then-drain discipline at its op-17 arm.
+///
+/// # Safety
+/// `ctx` is the run's parent-`Host` pointer (the cap thunk's ctx); `out`/`trap_out` writable.
+pub type BudgetTaker = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    handle: i32,
+    child_size: u64,
+    mode: i32,
+    out: *mut BudgetTaken,
+    trap_out: *mut i64,
+) -> i32;
+
+/// §3c.2 — the Budget fields a record spawn consumes: `fuel` / `spawn` with the Budget object's
+/// `-1` = unbounded convention (`mem` is enforced inside the taker against `child_size`).
+#[repr(C)]
+pub struct BudgetTaken {
+    pub fuel: i64,
+    pub spawn: i64,
+}
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
@@ -2865,6 +2891,7 @@ impl CompiledModule {
                 kill_thunk: instantiator_rt::kill as *const () as i64,
                 instantiate_granted_thunk: instantiator_rt::instantiate_granted as *const () as i64,
                 instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
+                instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
                 instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
                     as *const () as i64,
                 child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
@@ -3429,6 +3456,19 @@ impl CompiledModule {
         }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
+    }
+
+    /// §3c.2 — install the [`BudgetTaker`] the record spawn (op 17) consumes a Budget through.
+    /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
+    /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
+    /// many existing hook constructors stay source-compatible.
+    pub fn set_budget_taker(&self, taker: Option<BudgetTaker>) {
+        #[cfg(fiber_rt)]
+        if let Some(n) = &self._nursery {
+            n.set_budget_take(taker.map_or(0, |t| t as usize));
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = taker;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
@@ -4602,6 +4642,7 @@ pub(crate) unsafe fn compile_child_and_run(
             instantiate_named_thunk: instantiator_rt::instantiate_named as *const () as i64,
             instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
                 as i64,
+            instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
         },
         None => InstEnv::null(),
@@ -5606,6 +5647,8 @@ struct InstEnv {
     // STAGE1.md — op 13 (`instantiate_module_named`): run a separate `Module` *and* re-grant caps by
     // name (the shell "exec" primitive — union of op 5 + op 11).
     instantiate_module_named_thunk: i64,
+    // §3c — the config-record spawn (op 17): parse + delegate to the shapes above.
+    instantiate_rec_thunk: i64,
     // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
     // child's nursery-retained shared powerbox.
     child_offer_thunk: i64,
@@ -5623,6 +5666,7 @@ impl InstEnv {
             instantiate_granted_thunk: 0,
             instantiate_named_thunk: 0,
             instantiate_module_named_thunk: 0,
+            instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
         }
     }
@@ -8332,6 +8376,8 @@ fn lower_instantiator(
         8 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // S2 instantiate_named: (grants_ptr, grants_n, entry, off, size_log2, quota) -> child handle
         11 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn
+        17 => Some((&[VI64], &[VI32])),
         // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
         // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
@@ -8520,6 +8566,32 @@ fn lower_instantiator(
                     nursery, mem_base, mem_size, h, grants_ptr, grants_n, entry, off, size_log2,
                     fuel, trap_out,
                 ],
+            );
+            emit_trap_propagate(b, lower);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
+        }
+        17 => {
+            // §3c instantiate_rec(nursery, mem_base, mem_size:i64, handle:i32, record_ptr:i64,
+            //   trap_out:i64) -> handle:i32 — the config-record spawn: the thunk parses the
+            //   56-byte record from the window (`mem_size` bounds the read) and delegates to
+            //   the op-0/5/11/13 bodies. Pager records CapFault (sound: modules with impl
+            //   exports fold to the oracle); budget records are the §3c.2 parity follow-up
+            //   (probeable -EINVAL, the durable-nesting precedent).
+            let h = slot_i32(b, get(vals, handle)?);
+            let mem_size = b.ins().iconst(I64, lower.mapped as i64);
+            let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let mut tsig = module.make_signature();
+            for t in [I64, I64, I64, I32, I64, I64] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.instantiate_rec_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, mem_size, h, record_ptr, trap_out],
             );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
