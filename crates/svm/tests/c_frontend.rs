@@ -76,8 +76,10 @@ fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
     h.set_import_bindings(bindings);
 }
 
-/// The fixed **8-handle powerbox** — stdout, stdin, exit, memory, addrspace (§14), ioring + blocking
-/// (§9/§12), jit (DESIGN.md §22) — granted in that order so the handle values are deterministic (and
+/// The **8-handle test powerbox** — the product's seven (stdout, stdin, exit, memory, addrspace
+/// (§14), ioring (§9/§12), jit (DESIGN.md §22)) **plus the test-only `Blocking` mock** (§5a: no
+/// product powerbox grants it; this harness does, because the async demos exercise the offload
+/// pool through it) — granted in a fixed order so the handle values are deterministic (and
 /// identical across two hosts), and **registered under their canonical names** (S15 (c2)): the
 /// paramless `_start` resolves each by name (`cap.self.resolve`), so callers run function 0 with
 /// `&[]`, not these as positional args. Every guest gets the same set (one `_start` shape); one that

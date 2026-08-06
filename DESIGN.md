@@ -762,7 +762,8 @@ Consequences:
     `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
     runtime `(type_id, op)` dispatch), never the authority check. The resolver is gated on arity
     (`n_args`/`n_res`) so an odd-signature `cap.call` can't C-ABI-mismatch the fn. The production
-    powerbox (`svm-run`) fast-paths the window-independent hot ops (`Clock.now`, `Blocking.work`).
+    powerbox (`svm-run`) fast-paths the window-independent hot op (`Clock.now`; `Blocking.work`
+    rode the same path until the mock left the product powerbox — CONSOLIDATION §5a).
     **Measured: hostcall ~1.24×→ ≈0.67× (≈1.5× *faster* than a Wasmtime import)** — the register-ABI
     win was larger than the "~parity ceiling" predicted, since it also drops the generic `i64`-array
     marshalling *and* the host-side dispatch. See HANDOFF §10 (Benchmarking "D45") + `jit_diff::fast_cap`.
