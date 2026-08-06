@@ -6,26 +6,25 @@
 //! the real print*, so stdout becomes a valid oracle again. This drives a whole-chunk projection from
 //! `luaV_execute`'s real entry — the first step to running a real script through a residual.
 //!
-//! **Finding (this file is the record).** With the C-call machinery split into read-state cuts
-//! (`luaH_get*`/`luaV_finishget`/GC — read the heap, don't rewrite registers) and touch-state cuts
-//! (the `precall`/`poscall` path — mutate the stack), the projection clears the loop and the
-//! `_ENV["print"]` lookup, then stops in the `OP_GETTABUP` handler (block 51) at the *value move*: it
-//! stores the looked-up value's **1-byte `TValue` tag** — dynamic, since `print` came back from a cut
-//! lookup — into a renamed register. The rename model refuses a **narrow (sub-natural) dynamic store**
-//! (`is_full_natural_store` allows only 4/8-byte dynamic cells; a dynamic byte would need residual
-//! masking to read back).
+//! **Progress + the current wall (this file is the record).** With the C-call machinery split into
+//! read-state cuts (`luaH_get*`/`luaV_finishget`/GC — read the heap, don't rewrite registers) and
+//! touch-state cuts (the `precall`/`poscall` path — mutate the stack), the projection clears the loop,
+//! the `_ENV["print"]` lookup, the `OP_GETTABUP` value move, **and the `OP_CALL` to `print`** — the
+//! first two of which needed the **narrow dynamic rename cell** engine feature this PR adds: the
+//! interpreter moves a looked-up value by storing its **1-byte `TValue` tag** (dynamic, since `print`
+//! came from a cut lookup) into a renamed register, and the touch-state cut of `luaD_precall` spills/
+//! reloads those tag bytes. Both were previously refused (the rename model only carried 4/8-byte
+//! dynamic cells); now a dynamic cell is renamed at a sub-natural 1/2-byte width too.
 //!
-//! This is not harness tuning — it is the first **general engine gap** on the path to real scripts:
-//! any script that moves a *non-integer* value (a looked-up function, a table, a string) needs the
-//! rename model to carry a **dynamic narrow cell** (the `TValue` tag byte). The fix (a focused, sound
-//! rename-lowering change): allow a dynamic cell at a sub-natural 1/2-byte width when every access to
-//! it is that same width — the existing straddle/overlap guard already refuses any wider or
-//! overlapping access, which is exactly the masking-soundness condition. This test asserts the wall as
-//! a regression guard (the pattern `lua_futamura_specialize` uses for the VARARGPREP wall); flip it
-//! when narrow dynamic cells land.
+//! The remaining blocker is a different class — `SpecError::Budget`: past the `CALL`, the projection
+//! **diverges** (the dynamic callee from the cut lookup makes `OP_CALL`'s callee-type checks explore
+//! unboundedly). That is a convergence problem, not a capability gap, and the next investigation
+//! (bound the callee type, or deopt the non-fast call kinds). This test asserts the *current* wall as
+//! a regression guard (the pattern `lua_futamura_specialize` uses for the VARARGPREP wall); update it
+//! when the divergence is bounded and the chunk projects through to `RETURN` + embedding + the diff.
 //!
 //! Run: `cargo test -p svm-llvm --test lua_futamura_print -- --nocapture`
-//! (`--features svm-peval/trace` prints the blocker: `build_block failed at (372, 51, ...)`).
+//! (`--features svm-peval/trace` shows the trace up to the divergence).
 
 use svm_interp::{IrPc, Stop, StopReason, Value};
 use svm_ir::{Inst, Module, Terminator};
@@ -305,17 +304,16 @@ fn project_whole_print_chunk_from_entry() {
                 f.blocks.len()
             );
         }
-        Err(e) => println!("\nblocked at the narrow-dynamic-tag wall: Err({e:?})"),
+        Err(e) => println!("\nblocked at the {e:?} wall (see the file header)"),
     }
 
-    // THE WALL (see the file header). The loop and the `_ENV["print"]` lookup project — the read/touch
-    // cut split cleared the register-file spill/reload — but the `OP_GETTABUP` value move stores the
-    // looked-up value's dynamic 1-byte tag into a renamed register, which the rename model refuses.
-    // Regression guard: when narrow dynamic rename cells land, this projects further (next: the CALL
-    // to `print`, then RETURN) and the assertion flips.
+    // THE WALL (see the file header). Narrow dynamic rename cells (this PR) cleared the GETTABUP value
+    // move and the touch-state spill/reload of the CALL, so the projection now reaches *past* the CALL
+    // and stops on `Budget` — the dynamic callee makes OP_CALL's callee-type dispatch diverge.
+    // Regression guard: when that divergence is bounded, the chunk projects to RETURN and this flips.
     assert!(
         r.is_err(),
-        "whole print-chunk projected past the narrow-dynamic-tag wall — the rename model gained \
-         narrow dynamic cells; update this characterization and push on to embedding + the stdout diff"
+        "whole print-chunk projected past the callee-type divergence — the projection now converges; \
+         update this characterization and push on to RETURN + embedding + the stdout diff"
     );
 }

@@ -1595,7 +1595,7 @@ fn narrow_store_overwrites_overlapping_cell() {
 }
 
 #[test]
-fn narrow_dynamic_and_overlap_loads_are_unsupported() {
+fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
     let region = (STACK_LO, STACK_LO + 8);
     let st = |op, addr, value| Inst::Store {
         op,
@@ -1611,8 +1611,11 @@ fn narrow_dynamic_and_overlap_loads_are_unsupported() {
         align: 0,
     };
 
-    // A narrow store of a *dynamic* value can't be renamed (reading it back needs residual masking).
-    let dyn_narrow_store = Module {
+    // A narrow store of a *dynamic* value renames as an `i32`-canonical narrow cell (the `TValue` tag
+    // move): storing the low byte and reading it back **unsigned** round-trips to `x & 0xFF`. Both the
+    // 1-byte cell and an `i64` widened read are exercised, and the residual has no residual memory op
+    // (fully renamed) yet matches the interpreter.
+    let dyn_narrow_roundtrip = Module {
         funcs: vec![Func {
             params: vec![ValType::I64],
             results: vec![ValType::I64],
@@ -1620,19 +1623,32 @@ fn narrow_dynamic_and_overlap_loads_are_unsupported() {
                 params: vec![ValType::I64], // 0: x
                 insts: vec![
                     Inst::ConstI64(STACK_LO as i64), // 1
-                    st(StoreOp::I64_8, 1, 0),        // [A] = low byte of x (dynamic)
+                    st(StoreOp::I64_8, 1, 0),        // [A] = low byte of x (dynamic, 1-byte cell)
+                    ld(LoadOp::I64_8U, 1),           // 2: read it back, zero-extended to i64
                 ],
-                term: Terminator::Return(vec![0]),
+                term: Terminator::Return(vec![2]),
             }],
         }],
         memory: Some(Memory { size_log2: 16 }),
         ..Default::default()
     };
-    verify_module(&dyn_narrow_store).expect("verifies");
-    assert_eq!(
-        specialize_with(&dyn_narrow_store, 0, &[SpecArg::Dynamic], Some(region)),
-        Err(svm_peval::SpecError::Unsupported)
-    );
+    verify_module(&dyn_narrow_roundtrip).expect("verifies");
+    let residual = specialize_with(&dyn_narrow_roundtrip, 0, &[SpecArg::Dynamic], Some(region))
+        .expect("specializes");
+    verify_module(&residual).expect("residual re-verifies");
+    assert_no_memory_ops(&residual); // the narrow cell is renamed, not spilled
+    for x in [0i64, 0xAB, 0x1FF, -1, 0x1234_5678_9ABC_DEF0u64 as i64] {
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            run(&dyn_narrow_roundtrip, &[Value::I64(x)]),
+            "narrow-cell residual diverged at x={x:#x}"
+        );
+        assert_eq!(
+            run(&residual, &[Value::I64(x)]),
+            Ok(vec![Value::I64(x & 0xFF)]),
+            "narrow cell must round-trip to x & 0xFF"
+        );
+    }
 
     // A full-width dynamic cell read back at a narrower width is a partial overlap — refused.
     let narrow_load_of_wide_cell = Module {
