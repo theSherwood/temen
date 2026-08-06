@@ -383,7 +383,13 @@ fn project_through_a_lua_call_and_return() {
             l_ci_addr: c.l + L_CI,
             lua_sites: vec![LuaSite { ra: c.ra_add, callee_ci: c.callee_ci, pins: vec![(c.callee_func, c.callee_cl)] }],
             c_sites: vec![c.ra_print],
-            poscall: Some(PoscallModel { poscall: c.poscall, ci_previous_off: c.ci_previous_off }),
+            poscall: Some(PoscallModel {
+                poscall: c.poscall,
+                ci_previous_off: c.ci_previous_off,
+                ci_func_off: CI_FUNC,
+                tag_off: 8,
+                selective: vec![],
+            }),
         }),
         ..SpecConfig::default()
     };

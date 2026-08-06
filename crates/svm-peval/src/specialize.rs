@@ -519,6 +519,19 @@ pub struct PoscallModel {
     pub poscall: u32,
     /// Byte offset from a `CallInfo` to its `previous` pointer (the caller frame).
     pub ci_previous_off: u64,
+    /// Byte offset from a `CallInfo` to its `func` slot (the caller's call slot `ra`, where `poscall`
+    /// writes the results). Only read when [`selective`](Self::selective) applies.
+    pub ci_func_off: u64,
+    /// Byte offset from a result slot's base to its `TValue` tag byte. Only read for `selective`.
+    pub tag_off: u64,
+    /// **Selective reload** — the lever that lets a *call-bearing loop roll*. Each `(ci, tag)` names a
+    /// returning frame whose single result is a value with the (promised, captured) tag `tag`: instead
+    /// of reloading **every** cell as an unknown (which would turn the caller's folded register tags
+    /// dynamic and force the loop to unroll), only the result **value** cell (`ci->func`, 8 bytes) is
+    /// reloaded dynamic and its **tag** cell (`ci->func + tag_off`) is pinned to `tag` — every other
+    /// caller cell stays folded. A returning `ci` not listed here gets the plain full reload. Empty by
+    /// default (the whole-frame reload of the non-rolling case).
+    pub selective: Vec<(u64, u8)>,
 }
 
 /// One Lua call site for the [`PrecallModel`]. On a `precall` whose `ra` matches, the result (`newci`)
@@ -1747,18 +1760,62 @@ impl Spec<'_> {
                 .map(|v| v as u64)
         });
 
-        // Touch-state: spill, call, reload (poscall moved results down into the caller's registers).
+        // Is this a selective-reload return (result value dynamic, tag pinned, other cells folded)?
+        let selective = cur_ci.and_then(|ci| {
+            po.selective
+                .iter()
+                .find(|(c, _)| *c == ci)
+                .map(|&(_, tag)| tag)
+        });
+
+        // Spill so the opaque poscall observes the current state, then emit the call.
         self.write_back_cells(mem, out, rnext)?;
         let args: Vec<u32> = args_abs.iter().map(|&a| materialize(a, out, rnext)).collect();
         out.push(Inst::Call { func: ridx, args });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
-        self.reload_cells_natural(mem, out, rnext)?;
-        // Re-pin L->ci to the caller frame so folding continues there (the reload above set it dynamic).
+
+        match (selective, cur_ci) {
+            (Some(tag), Some(ci)) => {
+                // Selective: reload only the result value cell (at ci->func) as a fresh unknown and pin
+                // its tag to the promised constant; leave every other caller cell folded so the loop
+                // rolls. `reload_one` emits the load and updates the abstract cell.
+                let func_slot =
+                    read_const_mem(self.config, self.module, ci, po.ci_func_off, LoadOp::I64)
+                        .and_then(|k| k.as_i64())
+                        .map(|v| v as u64);
+                if let Some(func_slot) = func_slot {
+                    self.reload_one(func_slot, 8, mem, out, rnext);
+                    mem.insert(func_slot + po.tag_off, (1, Abs::Const(Known::I32(tag as i32))));
+                }
+            }
+            _ => {
+                // Non-rolling: the callee wrote results down through memory — reload every cell.
+                self.reload_cells_natural(mem, out, rnext)?;
+            }
+        }
+        // Re-pin L->ci to the caller frame so folding continues there.
         if let Some(caller) = caller_ci {
             mem.insert(pm.l_ci_addr, (8, Abs::Const(Known::I64(caller as i64))));
         }
         Ok(results)
+    }
+
+    /// Reload a single rename cell from the window at `width`, replacing its abstract value with a fresh
+    /// unknown backed by the emitted `load` (a one-cell [`Self::reload_cells_natural`]).
+    fn reload_one(
+        &self,
+        eff: u64,
+        width: u32,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) {
+        let op = reload_load_op(width).expect("natural reload width");
+        out.push(Inst::ConstI64(eff as i64));
+        let addr = bump(rnext);
+        out.push(Inst::Load { op, addr, offset: 0, align: 0 });
+        mem.insert(eff, (width, Abs::Dyn(bump(rnext))));
     }
 
     /// Reload every rename cell from the window at its canonical width (`i32.load8_u`/`load16_u`/
