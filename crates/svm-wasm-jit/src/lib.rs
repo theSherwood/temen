@@ -753,7 +753,29 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// emitted code just marshals the args to an `env.instantiate`/`env.join` import. Other §14 ops
 /// (address-space, coroutines) are not lowered yet — they stay out-of-subset (fail-closed).
 fn is_nested_cap(type_id: u32, op: u32) -> bool {
-    type_id == 6 && (op == 0 || op == 1)
+    type_id == 6 && (op == 0 || op == 1 || op == 17)
+}
+
+/// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
+/// When it does (and only then), nested mode appends the `env.instantiate_rec` import as func
+/// import 8, shifting the emitted-function base to 9 for that module alone: existing modules
+/// keep their exact import set, so no driver (wasmi harness or browser JS) changes until it
+/// actually loads an op-17 module.
+fn module_uses_rec(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: 6,
+                        op: 17,
+                        ..
+                    }
+                )
+            })
+        })
+    })
 }
 
 /// The §14 ADDRESS_SPACE (iface 5) ops a nested unit may reach as **outlined cross-tier leaves**
@@ -1233,6 +1255,9 @@ const MEM_NOTIFY_IMPORT_IDX: u32 = 7;
 /// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.instantiate`,
 /// `env.join`, `env.thread_spawn`, `env.thread_join`, `env.mem_wait`, `env.mem_notify`).
 const NESTED_IMPORTED_FUNCS: u32 = 8;
+/// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
+/// func import 8 only when [`module_uses_rec`]; the emitted-function base is then 9.
+const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
 /// `env.call_interp` scratch: the cross-tier call marshals its i64 arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1301,7 +1326,8 @@ pub fn compile_module_nested_with_eligibility(
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
         if nested_ok(f) {
-            wasm_of[i] = Some(NESTED_IMPORTED_FUNCS + emitted.len() as u32);
+            wasm_of[i] =
+                Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
             emitted.push(i);
         } else if int_sig(f) {
             interp_leaf[i] = true;
@@ -1886,6 +1912,8 @@ fn emit_module(
     //   env.instantiate: (i32 win, i32 inst, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32
     //   env.join:        (i32 inst, i32 child) -> i64
     let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
+    let uses_rec = nested_caps && module_uses_rec(m);
+    let mut instantiate_rec_ty = 0u32;
     let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
         (0u32, 0u32, 0u32, 0u32);
     if nested_caps {
@@ -1893,6 +1921,11 @@ fn emit_module(
         types.push((vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e], vec![0x7f]));
         join_ty = types.len() as u32;
         types.push((vec![0x7f, 0x7f], vec![0x7e]));
+        if uses_rec {
+            // §3c.3 env.instantiate_rec: (i32 win, i32 inst, i64 record_ptr) -> i32 child handle
+            instantiate_rec_ty = types.len() as u32;
+            types.push((vec![0x7f, 0x7f, 0x7e], vec![0x7f]));
+        }
         // §11 thread/futex bounces:
         //   env.thread_spawn: (i32 func, i64 sp, i64 arg) -> i32 handle
         //   env.thread_join:  (i32 handle) -> i64 result
@@ -2000,7 +2033,11 @@ fn emit_module(
         // data-segment pointer hits a trap stub ("null function or function signature mismatch") the
         // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
         // monster thinker fires an `A_*` action loaded from `states[]`.)
-        let mut next_widx = IMPORTED_FUNCS + emitted.len() as u32;
+        let mut next_widx = if nested_caps {
+            NESTED_IMPORTED_FUNCS + uses_rec as u32
+        } else {
+            IMPORTED_FUNCS
+        } + emitted.len() as u32;
         for fi in 0..m.funcs.len() {
             if wasm_of[fi].is_none() && interp_leaf[fi] {
                 let f = &m.funcs[fi];
@@ -2073,7 +2110,10 @@ fn emit_module(
     // shared-reserved (B2) mode — the shared funcref table, and — in §14 `nested_caps` mode —
     // env.instantiate + env.join (the VM-in-VM host bounce).
     let mut sec = Vec::new();
-    let n_imports = 3 + reserved_table_log2.is_some() as u64 + if nested_caps { 6 } else { 0 };
+    let n_imports = 3
+        + reserved_table_log2.is_some() as u64
+        + if nested_caps { 6 } else { 0 }
+        + uses_rec as u64;
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
@@ -2115,6 +2155,12 @@ fn emit_module(
         import_name(&mut sec, "env", "mem_notify");
         sec.push(0x00); // func
         uleb(&mut sec, mem_notify_ty as u64);
+        if uses_rec {
+            // §3c.3 — appended last (func import 8), so no existing import index shifts.
+            import_name(&mut sec, "env", "instantiate_rec");
+            sec.push(0x00); // func
+            uleb(&mut sec, instantiate_rec_ty as u64);
+        }
     }
     if reserved_table_log2.is_some() {
         // The shared reserved funcref table (§22 Model B2). Imported (not declared), so every
@@ -3192,6 +3238,18 @@ fn emit_block_body(
                     }
                     code.push(OP_CALL);
                     uleb(code, INSTANTIATE_IMPORT_IDX as u64);
+                } else if *op == 17 {
+                    // §3c.3 env.instantiate_rec(win, inst, record_ptr) -> i32 child handle — the
+                    // config-record spawn; the servicer reads + validates the 56-byte record from
+                    // linear memory at win + record_ptr (window-relative, like every §14 pointer).
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, 0); // win
+                    get(code, cx, *handle);
+                    for a in args {
+                        get(code, cx, *a); // record_ptr
+                    }
+                    code.push(OP_CALL);
+                    uleb(code, INSTANTIATE_REC_IMPORT_IDX as u64);
                 } else {
                     // env.join(inst, child) -> i64 result
                     get(code, cx, *handle); // the Instantiator handle
