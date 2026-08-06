@@ -8546,10 +8546,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                                     // Held only by the 3a fallback (durable providers) or a
                                     // wiring/introspection API; the animated path releases it and
-                                    // guards with `busy`. A held lock reads as busy: -EAGAIN.
+                                    // guards with `busy`.
                                     Err(std::sync::TryLockError::WouldBlock) => {
-                                        frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                        continue;
+                                        // CALLS.md increment 7 (§10.1) — a `Threaded` provider
+                                        // promises **no admission gate**, so contention on this
+                                        // brief snapshot lock must NOT read as busy. The threaded
+                                        // critical section holds `state_` only to fork the window
+                                        // and clone the powerbox cell, and drops it before the
+                                        // handler runs (it never spans a sub-run — a threaded offer
+                                        // is never durable, so the long-holding 3a fallback cannot
+                                        // apply). Blocking to acquire it is therefore bounded, and
+                                        // it closes I69's lost-caller window: two concurrent callers
+                                        // colliding here used to hand the loser a spurious `-EAGAIN`,
+                                        // silently dropping its dispatch. Every other tier keeps the
+                                        // 3a semantics — a held lock reads as busy: `-EAGAIN`.
+                                        if entry_.policy == OfferPolicy::Threaded {
+                                            state_.lock().unwrap_or_else(|e| e.into_inner())
+                                        } else {
+                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
+                                            continue;
+                                        }
                                     }
                                 };
                                 let st_ = &mut *guard_;
