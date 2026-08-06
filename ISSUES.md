@@ -21,6 +21,19 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
+
+Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
+entire 10-minute step budget inside `apt-get install` of the recommended font set —
+`fonts-ipafont-gothic` (3.5 MB) alone took 100 s from `azure.archive.ubuntu.com` — and the
+step's `timeout-minutes: 10` killed it before any project code compiled or ran. Sibling of
+I67 (same apt-mirror substrate, different failure spelling: slow instead of 403). Rerun-once
+policy applies (I53/I66/I67 class). A robust fix, if it recurs: cache
+`~/.cache/ms-playwright` keyed on the Playwright version (`actions/cache`), and drop
+`--with-deps` in favor of a one-time `playwright install-deps` layer or the runner image's
+preinstalled Chromium — the deps apt set is what's exposed to the mirror. Workflow edits go
+through `.github/workflows_src/` (session tokens lack the `workflow` scope).
+
 ### I69 — `threaded_offers::concurrent_callers_share_one_threaded_instance` intermittently loses one caller's increment under full-suite parallel load (S4, flaky — likely a real lost-update window in the threaded-offer admission) — recorded 2026-08-06 on PR #634
 
 **Symptom.** Under `cargo test -p svm-interp` with the full suite running in parallel, the test
