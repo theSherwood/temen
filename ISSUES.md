@@ -21,6 +21,42 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
+### I70 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** is not yet execution-correct (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
+
+PR #637 landed projecting *through* a Lua-to-Lua call (`SpecConfig::precall_model` + `PoscallModel`):
+slice 1 (call-in) and slice 2 (return) run end-to-end and diff stdout for `print(add(40,2))`, and
+slice 3 shows a call-bearing loop `for i=1,5 do x=add(x,3) end` **rolls** — but slice 3's check is
+**structural only** (`br_table=0`, a back-edge, bounded blocks); the residual keeps its cut call-outs
+so it is not self-contained and was never *executed*. That masked this gap.
+
+**Symptom.** When a Lua call's result is consumed by **arithmetic in the caller** (not by a C call like
+`print`, which is opaque to tags), the executed projection fails:
+- **single call** `print(add(2,3) * 10)` → `SpecError::Unsupported`, reached while inlining an unnamed
+  3-block arithmetic helper (source `f661`, block 1 ip 0 in the current `lua_eval.ll`) — an
+  `OP_MUL`/integer-arith slow-path callee that isn't in the cut set and hits an unsupported access.
+- **nested** `local function inner(x) return x+1 end local function outer(y) return inner(y)*2 end
+  print(outer(10))` → `Budget` (divergence): the fold walks off a frame's code into garbage and inlines
+  the metamethod cluster (`luaT_trybinTM`/`callbinTM`/`luaT_gettmbyobj`/`luaV_equalobj`/…). Both
+  full-reload and `selective` diverge, so the 2-frame case is a *caller-resume* problem, not a tag one.
+
+**Root cause (partial).** Two distinct sub-problems: (a) the **selective-reload result** (`value`
+dynamic, `tag` pinned integer) flows into `OP_MUL`'s fast path, but the arithmetic handler drags in an
+inlined helper that returns `Unsupported` — needs that helper cut (like the GC barriers in slice 1) or
+the access supported; (b) **nested returns**: after a Lua callee returns, the caller re-enters
+`startfunc` and re-reads `ci->savedpc`; each frame is captured at its own first dispatch, but composing
+two live frames still diverges — likely the caller's post-call resume `pc` (savedpc mem-cell vs
+overlay) or a per-frame `ci` field read via `read_const_mem` (the overlay) instead of the live pinned
+cell. Also note **two *sequential* distinct callees reuse one cached `CallInfo`** (`ci->next`), which a
+single const overlay can't represent — a third facet of the same area.
+
+**Fix sketch.** (1) Add an execution test for the single-call-arithmetic case; identify `f661`'s
+unsupported op and cut it (extend the read/touch cut lists) or support the access. (2) For nested,
+instrument the caller-resume `pc` at the first `startfunc` re-entry after a callee return; make
+`emit_poscall` derive `ci->func`/`savedpc` from the live mem cell, not `read_const_mem`. (3) For
+sequential distinct callees, model the reused `CallInfo` (per-call-site pinned `ci` fields rather than a
+fixed overlay). The capture harness for all three is written and working (distinct-frame capture, ra
+keying); the blocker is the engine-side return/arith composition, not the test plumbing.
+
 ### I69 — `threaded_offers::concurrent_callers_share_one_threaded_instance` intermittently loses one caller's increment under full-suite parallel load (S4→S2, real lost-caller window in the threaded-offer admission) — recorded 2026-08-06 on PR #634 — **FIX LANDED 2026-08-06** (`claude/i69-issues-luifte`)
 
 **Symptom.** Under `cargo test -p svm-interp` with the full suite running in parallel, the test
