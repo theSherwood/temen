@@ -1384,6 +1384,52 @@ static int gen_builtin_region_page_size(Node *node) {
   return r;
 }
 
+// FORK.md §8.6 — `__vm_resolve(name_ptr, len) -> handle`: resolve a re-granted powerbox cap by name
+// (`cap.self.resolve`), so the guest can read the raw handle a re-grant registered — a `Stream` handle
+// to place in an `__vm_exec_module` grant list, or the command-module handle to `execve` into. The i32
+// handle is sign-extended to the i64 the C wrapper returns (a negative result is "not found").
+static int gen_builtin_resolve(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_resolve(name, len) expects 2 arguments");
+  int p, l;
+  eval2(a, a->next, &p, &l);
+  p = widen_i64(p, a->ty);
+  l = widen_i64(l, a->next->ty);
+  int r = nv++;
+  cg("  v%d = cap.self.resolve v%d v%d\n", r, p, l);
+  int w = nv++;
+  cg("  v%d = i64.extend_i32_s v%d\n", w, r);
+  return w;
+}
+
+// FORK.md §8.6 — `__vm_exec_module(mod, grants_ptr, grants_n, entry, size_log2)`: **true cross-module
+// `execve`** (image-replace). Lowers to the self-namespace op `cap.call 4294967295 14` — the calling
+// vCPU *becomes* the granted command module in place, keeping its task, so a parent's `wait` reaps the
+// command's exit. Never returns on success (the caller's image is gone); returns `-errno` on failure
+// (POSIX `execve` returns only on failure). All five args are i64. Like the region builtins, the args
+// are simple expressions evaluated sequentially — a caller must not pass branching args.
+static int gen_builtin_exec_module(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 5)
+    error_tok(node->tok,
+              "codegen_ir: __vm_exec_module(mod, grants, n, entry, size_log2) expects 5 arguments");
+  Node *a = node->args;
+  int mod = widen_i64(gen_expr(a), a->ty);
+  int gp = widen_i64(gen_expr(a->next), a->next->ty);
+  int gn = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int en = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
+  int sl = widen_i64(gen_expr(a->next->next->next->next), a->next->next->next->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = cap.call 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d, "
+     "v%d)\n",
+     r, h, mod, gp, gn, en, sl);
+  return r;
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1720,6 +1766,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_stream_raw(node, "stream_write");
         if (!strcmp(fname, "__vm_stream_read"))
           return gen_builtin_stream_raw(node, "stream_read");
+        if (!strcmp(fname, "__vm_resolve"))
+          return gen_builtin_resolve(node);
+        if (!strcmp(fname, "__vm_exec_module"))
+          return gen_builtin_exec_module(node);
         if (!strcmp(fname, "__vm_fs"))
           return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
