@@ -228,6 +228,22 @@ compile:exec ratio. This is what turns the 11.5× per-iteration execution win in
 a built residual (or the bare interpreter) amortizes its compile across a batch instead of re-paying
 it every invocation.
 
+**Auto-rolled residual, slice 1 (2026-08-07, `lua_futamura_auto_rolled`)** — the rolled residual (the
+shape that delivers the 11.5×) built with **zero hardcoded register offsets**. The hand path
+(`lua_futamura_rolled`) hardcodes the FORLOOP counter (R[3]) and carried registers (x=R[1], i=R[2]);
+this discovers them by observing the running VM. Key finding from the probe: `ci->savedpc` is synced
+*lazily* (it sticks at the loop-body pc while the body re-executes), so it is not a per-bytecode PC —
+but the **loop body is the savedpc value with the longest run of consecutive dispatch hits**, its
+first hit is a clean resume safepoint, and the **carried cells are the frame registers that vary
+across the loop region** (prologue hits excluded, else pre-FORPREP garbage corrupts the diff); the
+trip counter is the carried cell whose loop-region series is monotone-decreasing. Auto-discovery
+recovers exactly the hand set {R[1],R[2],R[3]} (plus a harmless internal loop register), and
+specializing with the discovered cells rolls the real `luaV_execute` **841 → 53 blocks, br_table=0,
+4 dynamic params** — identical roll to the hand build — correct across a trip sweep on tree-walk and
+JIT. This is a standalone test (doesn't touch the shared `futamura::auto` driver yet); folding it in,
+and identifying the accumulator generically for write-back, are the next slices toward an end-to-end
+auto-rolled win.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
