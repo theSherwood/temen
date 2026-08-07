@@ -299,6 +299,19 @@ entry-roots rather than safepoint-roots — cell discovery transfers, but *rooti
 target-specific. Next: extract the `TargetDesc` abstraction so the Lua and regVM capture paths share
 one parameterized driver, and (harder) a second interpreter that itself needs safepoint rooting.
 
+**De-overfitting: the shared `TargetDesc` driver (2026-08-07, `tests/peval_capture/mod.rs`)** — "same
+technique, parallel code" is now "same code, two interpreters". The near-identical Lua and regVM
+discovery code was extracted into one interpreter-agnostic `discover()`, parameterized by a static
+`TargetDesc` (register stride, count, optional value-tag filter) and a per-run `Located` (register
+base, optional in-memory pc address). One unified predicate reproduces both prior behaviours: a
+carried cell is a register that takes **≥3 distinct values** over the loop region (Lua's "varies in
+the loop region" and the regVM's "distinct ≥ 3 over the whole stream" collapse to this), the safepoint
+is the longest in-memory-pc run when a pc address is given (Lua) or hit 0 otherwise (the regVM's
+register-pc), and the counter is peak-based monotone-decreasing. Both `lua_futamura_auto_rolled`
+(841→53 blocks, rolled + correct) and `peval_second_interp` (R0/R1 discovered, counter=R0) now call
+the shared driver and stay green. The Lua↔regVM difference is now entirely data: two structs, no
+branching in the driver.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the

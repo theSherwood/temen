@@ -23,9 +23,12 @@
 //!
 //! Run: `cargo test -p svm-llvm --test peval_second_interp -- --nocapture`
 
+mod peval_capture;
+
 use std::process::Command;
 
-use svm_interp::{IrPc, Stop, StopReason, Value};
+use peval_capture::{discover, dispatch_block, Located, TargetDesc};
+use svm_interp::Value;
 use svm_ir::{Module, Terminator};
 
 // A pure accumulator loop, register-VM style: apply `reg[1] += 7` a runtime-`n` times, counting down
@@ -139,104 +142,6 @@ fn build() -> Option<Built> {
     })
 }
 
-fn rd_u64(w: &[u8], a: u64) -> u64 {
-    u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap())
-}
-
-fn dispatch_block(m: &Module, func: u32) -> u32 {
-    let mut best = (0u32, 0usize);
-    for (bi, b) in m.funcs[func as usize].blocks.iter().enumerate() {
-        if let Terminator::BrTable { targets, .. } = &b.term {
-            if targets.len() > best.1 {
-                best = (bi as u32, targets.len());
-            }
-        }
-    }
-    best.0
-}
-
-const CAP_LEN: usize = 1 << 20;
-const OBSERVE_HITS: usize = 48;
-
-/// Discovered loop-carried cells in the register region — the SAME technique as the Lua auto-rolled
-/// path, parameterized only by `(reg_base, n_regs, stride)`.
-struct Discovered {
-    varying: Vec<u64>, // addresses of registers whose value varies across the loop
-    counter: u64,      // the monotone-decreasing one
-}
-
-fn discover_loop_cells(built: &Built, reg_base: u64, n_regs: u64, stride: u64) -> Discovered {
-    let input: i64 = 8;
-    let mut insp = svm_interp::Inspector::attach(
-        &built.module,
-        built.run,
-        &[
-            Value::I64(built.sp),
-            Value::I64(built.prog_addr),
-            Value::I64(input),
-        ],
-        u64::MAX,
-    );
-    let disp = dispatch_block(&built.module, built.run);
-    let disp_pc = IrPc {
-        module: 0,
-        func: built.run,
-        block: disp as usize,
-        inst: 0,
-    };
-    insp.set_breakpoint(disp_pc);
-    let mut series: Vec<Vec<u64>> = vec![Vec::new(); n_regs as usize];
-    for _ in 0..OBSERVE_HITS {
-        match insp.run_until_stop() {
-            Stop::Break {
-                reason: StopReason::Breakpoint,
-                ..
-            } => {
-                let w = insp.read_window(0, CAP_LEN).expect("window");
-                for (r, s) in series.iter_mut().enumerate() {
-                    s.push(rd_u64(&w, reg_base + r as u64 * stride));
-                }
-            }
-            Stop::Finished { .. } => break,
-            o => panic!("unexpected: {o:?}"),
-        }
-    }
-    // Skip the prologue hits (LOADIN/LOADI setting up reg0..reg2) so pre-loop writes don't count as
-    // "loop variation": start the analysis once the register file stops its initial churn — i.e., from
-    // the first hit at which no register has changed vs the previous hit is fragile; simpler and robust
-    // for this VM is to analyse the whole stream but treat a cell as carried only if it takes ≥3
-    // distinct values (a one-time prologue write yields 2).
-    let mut varying = Vec::new();
-    let mut counter = 0u64;
-    for (r, s) in series.iter().enumerate() {
-        let distinct = {
-            let mut v = s.clone();
-            v.sort_unstable();
-            v.dedup();
-            v.len()
-        };
-        if distinct >= 3 {
-            let addr = reg_base + r as u64 * stride;
-            varying.push(addr);
-            // Counter = a cell that, from its peak onward, is monotone non-increasing and net-decreases
-            // (the FORLOOP-style countdown). Analysing from the peak — not the raw stream — skips the
-            // prologue's ramp-up (a `LOADIN` writing the initial count) that a raw check would trip on.
-            let argmax = s
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, v)| **v)
-                .map(|(i, _)| i)
-                .unwrap();
-            let tail = &s[argmax..];
-            let monotone_down = tail.windows(2).all(|w| w[1] <= w[0]) && tail.first() > tail.last();
-            if monotone_down && counter == 0 {
-                counter = addr;
-            }
-        }
-    }
-    Discovered { varying, counter }
-}
-
 #[test]
 fn discovery_generalizes_to_a_register_vm() {
     let Some(built) = build() else {
@@ -253,8 +158,35 @@ fn discovery_generalizes_to_a_register_vm() {
         "the regVM dispatches through a table"
     );
 
+    // The regVM's `TargetDesc`: registers are 8-byte `long`s in the `reg` global (no frame), untagged,
+    // and the pc lives in a machine register (no in-memory pc → `Located::pc_addr = None`, so the
+    // shared driver analyses from the first hit rather than seeking a savedpc safepoint).
     let stride = 8u64;
-    let d = discover_loop_cells(&built, built.reg_addr, 16, stride);
+    let input: i64 = 8;
+    let make_insp = || {
+        svm_interp::Inspector::attach(
+            &built.module,
+            built.run,
+            &[
+                Value::I64(built.sp),
+                Value::I64(built.prog_addr),
+                Value::I64(input),
+            ],
+            u64::MAX,
+        )
+    };
+    let loc = Located {
+        reg_base: built.reg_addr,
+        pc_addr: None,
+    };
+    let desc = TargetDesc {
+        reg_stride: stride,
+        n_regs: 16,
+        tag: None,
+        capture_len: 1 << 20,
+        observe_hits: 48,
+    };
+    let d = discover(&make_insp, built.run, disp, &loc, &desc);
 
     let as_reg = |a: u64| (a as i64 - built.reg_addr as i64) / stride as i64;
     println!(
