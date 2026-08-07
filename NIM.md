@@ -7,8 +7,10 @@ compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOS
 libc-as-capabilities (`POSIX.md`), and the frontend trust model (`FRONTEND.md` §1,
 `DESIGN.md` §2a). This doc is the *what/how/when*; it does not restate those.
 
-Fold completed sections into `DESIGN.md` and drop this file once the actionable gaps
-close — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
+This doc stays its own file — it is **not** folded into `DESIGN.md`. `DESIGN.md` describes
+SVM itself; NIM.md describes a *guest* project that runs **on** SVM (nimony, a consumer of the
+substrate). The two never merge: svm's design and the design of something built atop it are
+separate concerns, even where they touch the same seams.
 
 ## 0. TL;DR
 
@@ -758,6 +760,99 @@ in** via `svm_ir::link`, binding each named import to a shim function. So the wh
 code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
 and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
 the shim is the placeholder the real compiled `system` module (Path A) will replace.
+
+## 3c. W4 scope — the multi-binary driver (the unknown is retired: svm already has both seams)
+
+W4 asked (`## 3a` above): nimony is not one binary — `nifmake` spawns `nifler` → `nimony` →
+`hexer` → `lengc` as OS subprocesses, so running the compiler on svm means "either driving those
+phases in-process **or** giving svm a subprocess/exec personality," flagged as "the biggest
+unknown." **Both halves of that dichotomy already exist as landed seams, and neither is new
+substrate** (INVARIANTS §1/§4, §4 below). W4 is no longer an open architecture question; it is a
+build-out on proven mechanism, exactly like W3 turned out to be.
+
+**The two seams, measured:**
+
+- **In-process — `svm_ir::link`** (`crates/svm-ir/src/lib.rs:3762`). Statically links N units into
+  one import-free module: functions concatenated + reindexed, each unit's data placed in a
+  host-page-aligned non-overlapping window region, cross-unit symbols resolved to direct calls.
+  This is the **W2** seam, already proven on real nimony (`link_units`, §3 above). Its shape:
+  **one** module, **one** window/powerbox, **one** flat export namespace (a collision is
+  `LinkError::DuplicateSymbol`, `lib.rs:3835`).
+- **Subprocess/exec personality — the `exec` capability** (`EXEC.md`, `crates/svm-run/src/exec.rs`).
+  A guest imports one interface `"exec"` (resolved by name like `"fs"`); the wirer picks the
+  backend. The load-bearing one is **`domain_exec`** (`exec.rs:61`, BUILT 2026-07-23): each spawn is
+  **a fresh child svm domain — its own window, powerbox, and fuel** — `argv[0]` resolves through a
+  program registry (a miss is `-EPERM`), the full argv rides the §3e args buffer so an ordinary
+  `main(int, char**)` reads it standalone, wire `stdin` seeds the child, both output streams are
+  captured, and the exit code is the child's entry result verbatim. It is **not** new substrate: it
+  is a `HostCap` composed over the §14 Instantiator machinery svm already has (op 13
+  `instantiate_module_named` + `join`), the same mold as `fs`. Proven byte-for-byte on all three
+  engines (`crates/svm-run/tests/exec_cap.rs:141`), incl. stdin flowing into the child
+  (`exec_cap.rs:219`).
+
+**Recommendation: the phase toolchain is `exec`/`domain_exec` (the subprocess route), not `link`.**
+The reason is granularity. nimony's phases are **separate whole programs** — each has its own
+`main`, its own globals, its own heap, and its own copy of the compiled `system` runtime. Collapsing
+the four into one module with `link` would (a) collide immediately on `DuplicateSymbol` (four
+`main`s, four `system` modules) and (b) force all four to share one window / one powerbox / one
+allocator arena — semantically wrong for processes that nimony deliberately isolates. `link` stays
+the right tool at the **other** granularity — merging the modules *within a single program or phase*
+(that *is* W2, and Path A merges the user program with `system` this way). So the two linkers sit at
+two levels: **`link` = within-program (W2); `exec` = across-phases (W4).** They compose — each phase
+is itself a `link`ed module, and the driver `exec`s the phases in sequence.
+
+There is already a **working precedent at exactly W4's shape**: the compiled-C shell drives
+`instantiate_module_named` (op 13) + `join`, resolving `argv[0]` against a name → `Module` registry,
+running an unmodified `main(argc, argv)` child with inherited stdout and seeded argv, and threading
+each command's exit status into `$?` (`crates/svm/tests/c_shell_exec.rs`,
+`crates/svm/tests/stage1_exec_command.rs`). A `nifmake` driver is that shell with a fixed four-command
+script.
+
+**Passing intermediate files between phases.** nimony's phases hand `.p.nif`/`.s.nif`/`.nif`/`.c`
+files down the chain. Two existing options, no new host op:
+1. **stdout → stdin piping** — free with `domain_exec`: the driver drains phase N's captured output
+   (`read_out`) and seeds it as phase N+1's `stdin` (the `CAT_CONSUMER` pattern, `exec_cap.rs:185`).
+   Fits a streaming `hexer | lengc` shape.
+2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
+   This is the faithful hand-off, and it needs a small **additive** piece of shared infrastructure —
+   no new host op, but new API surface, so it is not free the way piping is. Measured, the gap is two
+   parts: (a) `mem_fs` grants are independent per domain (`svm-fs/src/lib.rs:745`), and the one shared
+   primitive, `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:820`), returns a **single** `HostProc` + a
+   host-side `MemFsHandle` — built for host↔handle session persistence (browser-Postgres), *not* a
+   `Fn() -> HostProc` factory grantable to N domains; a grantable-to-N shared factory has to be added;
+   (b) `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout —
+   so children receive **no `fs` at all** today. Wiring the file hand-off therefore means: surface a
+   grantable shared memfs in `svm-fs`, and teach the child-spawn path to grant it (either a
+   `domain_exec` that runs children with `run_with_caps`, or the §14 Instantiator's `regrant_into_child`
+   at `crates/svm-interp/src/lib.rs:18485`). Both are additive, but both touch **shared capability
+   infrastructure** and decide *what filesystem authority a spawned child inherits* — a security-shaped
+   call (INVARIANTS §1/§4), so it is owner-reviewed infra, not a nimony-lane edit.
+
+**v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
+one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
+run strictly in sequence anyway. And the shared-memfs wiring (option 2) is deliberate, not the
+default grant. Remaining real W4 work is therefore **build-out, not invention**: (i) compile each
+phase (`nifler`/`nimony`/`hexer`/`lengc`) to an svm module — Phase 1's C on-ramp already does this
+for one binary, so it is four applications of a proven step; (ii) write the driver module that
+registers them and chains them with a shared memfs; (iii) the nimony-specific unknowns that remain
+are its **TLS model** onto svm (the on-ramp gap Phase 1 already surfaced) and confirming each phase's
+allocator/`system` runtime boots cleanly as an isolated child.
+
+**First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
+the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
+modules via the `exec` cap in sequence, **passing each phase's output as the next phase's input**,
+and the final result is the composition — the `nifmake` orchestration on svm, decoupled from the real
+toolchain (`crates/svm-run/tests/multibinary.rs`; the driver + stand-in phases are pure SVM modules
+over the `exec` cap, so the proof lives with that seam, not in `svm-leng`). Three cases, all green on
+all three engines: (1) a two-phase hand-off (content-sensitive — `a → aa → aa!` — so it witnesses the
+data flow, not just that two children ran); (2) the **full four-phase depth** (nifler → nimony →
+hexer → lengc), `a → ab → abc → abcd → abcde`; and (3) **run-and-check-exit abort** — the driver reads
+each phase's exit status (`exec` op 3) and `br_if`s to a short-circuit block, so when a phase exits
+non-zero the pipeline stops with that phase's status and the later phases never run (the identical
+driver module, only the phase registry differs — so the abort is the driver reacting to status, the
+real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
+including its failure handling; what's left (above) is compiling the actual phases and — for the
+file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
 
 ## 4. Invariants this must respect
 
