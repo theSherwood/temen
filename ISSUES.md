@@ -170,6 +170,24 @@ unconditional, valid only because the captured run is deterministic).
   asserts both occupancies share the node *and* the `func` slot). `print(outer(10))` where
   `outer(y) = return inner(y)` → `11` byte-identical.
 
+**Capture automation (2026-08-07, `tests/futamura/mod.rs` + `lua_futamura_auto`)** — the pipeline:
+Lua script in → verified residual out, with **zero per-program configuration**. One profiling run
+with breakpoints on the precall/pretailcall branch blocks and the dispatch `br_table` yields an
+event stream; a small state machine classifies sites (Lua / C / tail, loops deduped), captures each
+callee occupancy at its own dispatch, discovers return tags **depth-qualified** (read at the first
+event whose `previous`-chain depth drops below the callee's — correct across nesting), and derives
+the uniform per-site pins, per-occupancy `CallInfo` overlays (with the I71(b) collision assert),
+transitive proto-struct overlays (even *uncalled* definitions — `OP_CLOSURE` bounds its upvalue
+loop by `proto->p[bx]->sizeupvalues`), the cut lists, and the tail/precall models. Seven programs
+pass byte-identical through the one driver, including a combined nested+tail+shared-node+loop
+program. The automation also flushed out a real latent engine bug: **a tail call's moved arguments
+were stale in the fold** (the move happens inside the opaque cut; the hand test had passed by
+value-coincidence — `inner(y)` moves `y` onto a slot that already held `y`). Fix: `TailSite::args`
+reloads each moved value dynamic with its captured tag pinned (the selective-reload discipline at
+the call-in side). Known limits, documented in the driver: one return tag per frame node (mixing
+int/float returns through the same node needs savedpc-keyed selective), no C tail calls, no rolling
+safepoint roots, no multi-value returns.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
