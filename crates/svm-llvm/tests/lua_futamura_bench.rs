@@ -36,11 +36,18 @@
 //!
 //! The economics these numbers pin down: at ~93 ns/iter interpreted vs ~0.6 ms/iter to *build*
 //! unrolled residual blocks, **unrolled specialization can never pay per-run** — it needs either
-//! build-once/run-many with a compiled-module cache (no such API yet: `run_powerbox` compiles per
-//! call and `Instance` holds only the `Module`), or **rolled** loops (N-independent residual size),
-//! which is exactly the deployment shape the rolled/stitching work targets — and which the 11.5×
-//! execution number above confirms actually pays. Meanwhile the pipeline costs nothing at runtime:
-//! residual whole-program time is at parity with the baseline.
+//! build-once/run-many with a compiled-module cache or **rolled** loops (N-independent residual
+//! size), which is exactly the deployment shape the rolled/stitching work targets — and which the
+//! 11.5× execution number above confirms actually pays. Meanwhile the pipeline costs nothing at
+//! runtime: residual whole-program time is at parity with the baseline.
+//!
+//! - **Compiled-module cache (`powerbox_program_amortizes_compile`): the build-once/run-many API.**
+//!   `svm_run::PowerboxProgram` compiles a powerbox module *once* and runs it against many inputs,
+//!   reusing the native code. On the ~690-function Lua module the per-call `run_powerbox` pays its
+//!   full JIT compile every time; `PowerboxProgram` pays it once, so the amortized per-run cost drops
+//!   to just the guest execution. This is the missing piece the numbers above called for: it makes a
+//!   built residual (or the bare interpreter) pay its compile a single time across a batch, turning
+//!   the 11.5× execution win into an end-to-end win instead of one swamped by recompilation.
 //!
 //! Run: `cargo test -p svm-llvm --release --test lua_futamura_bench -- --ignored --nocapture`
 
@@ -365,5 +372,76 @@ fn rolled_residual_vs_interpreter_per_iteration() {
     println!(
         "execution speedup (interpreter / residual): {:.1}x",
         interp_ns / resid_ns
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The compiled-module cache: `svm_run::PowerboxProgram` compiles a powerbox module ONCE and runs it
+// against many inputs, reusing the native code. `run_powerbox` recompiles the whole ~690-function
+// Lua module every call, so a batch of N runs pays N full JIT compiles; the cache pays ONE, dropping
+// the amortized per-run cost to just the guest execution. This is the build-once/run-many API the
+// benchmark economics called for — it lets a built residual (or the bare interpreter) amortize its
+// compile across a batch instead of re-paying it per invocation.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "benchmark; run explicitly with --release -- --ignored --nocapture"]
+fn powerbox_program_amortizes_compile() {
+    let reps = 3;
+    let m = futamura::lua_module();
+    let scripts = [
+        "print(1 + 2)\n",
+        "local s = 0\nfor i = 1, 100 do s = s + i end\nprint(s)\n",
+        "print('hello from lua')\n",
+    ];
+
+    // Correctness on the REAL module: the cache is byte-identical to per-call run_powerbox.
+    let mut prog = svm_run::PowerboxProgram::compile(m.clone()).expect("compile powerbox program");
+    for s in scripts {
+        let want = svm_run::run_powerbox(&m, s.as_bytes())
+            .expect("run_powerbox")
+            .stdout;
+        let got = prog.run(s.as_bytes()).expect("PowerboxProgram::run").stdout;
+        assert_eq!(got, want, "cache diverged from run_powerbox on {s:?}");
+    }
+
+    // Batch of N runs: per-call compile vs compile-once. Use the same script each time so the only
+    // difference measured is who pays the JIT compile.
+    let n = 8usize;
+    let script = scripts[1].as_bytes();
+
+    let mut per_call = Duration::MAX;
+    for _ in 0..reps {
+        let t = Instant::now();
+        for _ in 0..n {
+            black_box(
+                svm_run::run_powerbox(&m, script)
+                    .expect("run_powerbox")
+                    .stdout,
+            );
+        }
+        per_call = per_call.min(t.elapsed());
+    }
+
+    let mut cached = Duration::MAX;
+    for _ in 0..reps {
+        // The honest end-to-end cost of the cache: one compile + N runs, timed together.
+        let t = Instant::now();
+        let mut prog = svm_run::PowerboxProgram::compile(m.clone()).expect("compile");
+        for _ in 0..n {
+            black_box(prog.run(script).expect("run").stdout);
+        }
+        cached = cached.min(t.elapsed());
+    }
+
+    println!(
+        "batch of N={n} runs (Lua module): per-call run_powerbox {per_call:?} ({:?}/run), \
+         compile-once PowerboxProgram {cached:?} ({:?}/run)",
+        per_call / n as u32,
+        cached / n as u32,
+    );
+    println!(
+        "compiled-module cache speedup over the batch: {:.1}x",
+        per_call.as_secs_f64() / cached.as_secs_f64()
     );
 }

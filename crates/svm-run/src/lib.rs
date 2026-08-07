@@ -3509,6 +3509,41 @@ unsafe fn powerbox_compile_run(
     })
 }
 
+/// Run a **prebuilt** single-threaded powerbox `cm` (compiled once by [`PowerboxProgram`]) over
+/// `host` — the compile-once/run-many counterpart of [`powerbox_compile_run`]'s non-locked branch,
+/// with the `CompiledModule::compile` step lifted out so it is paid once, not per run. Only the
+/// single-threaded, non-hosting shape is served here (the caller refuses anything else at
+/// [`PowerboxProgram::compile`] time), so there is no `locked`/fiber/thread-hosting arm.
+///
+/// # Safety
+/// `host` **must** be the same `Host` allocation whose address was baked as the `cap.call` ctx (and
+/// read by [`fast_cap_resolver`]) when `cm` was compiled — [`PowerboxProgram`] keeps it boxed so the
+/// address is stable and only resets its *contents* between runs. `cm` is not moved during the call.
+unsafe fn powerbox_run_prebuilt(
+    cm: &mut CompiledModule,
+    host: &mut Host,
+    slots: &[i64],
+    init_mem: Option<&[u8]>,
+) -> Result<JitRun, svm_jit::JitError> {
+    // Register the live module for the cap thunk's mid-run re-entry, exactly as the one-shot
+    // non-locked path does (`powerbox_compile_run`); cleared after the run so no stale ctx leaks
+    // into the next one. The hooks / budget taker are installed once at compile time.
+    host.set_jit_native_ctx(cm as *mut CompiledModule as usize);
+    host.set_serve_native_ctx(cm as *mut CompiledModule as usize);
+    // `run_raw` allocates a fresh guest window and re-applies the module's data segments every call
+    // (svm-jit `run_raw`), so successive runs over the same `cm` never share guest memory — each is
+    // as independent as a fresh `run_powerbox`.
+    let r = CompiledModule::run_raw(cm, slots, init_mem, None);
+    host.set_jit_native_ctx(0);
+    host.set_serve_native_ctx(0);
+    r.map(|(outcome, snapshot)| JitRun {
+        outcome,
+        backtrace: cm.last_trap_backtrace().to_vec(),
+        trap_fiber: cm.last_trap_fiber(),
+        snapshot,
+    })
+}
+
 /// Run `module`'s entry (function 0) on the JIT under the MVP powerbox (§3e): a writable
 /// `stdout`, a readable `stdin` seeded from `stdin`, and `Exit` — the three handles the
 /// frontend's `_start` expects, granted in declared order. Returns the outcome and captured
@@ -3651,6 +3686,180 @@ fn run_powerbox_inner(
         ..RunConfig::default()
     };
     inst.run(Backend::Jit, &config)
+}
+
+/// **A powerbox program compiled once, run many times** — the build-once/run-many split for the §3e
+/// powerbox path. [`run_powerbox`] JIT-compiles the whole module on *every* call (~ms of Cranelift
+/// codegen, dominating small programs); a caller that runs the same module against many inputs — the
+/// natural shape for a **partial-evaluation residual**, whose whole value is that its module was
+/// already built — pays that compile once here and reuses the native code per input via
+/// [`PowerboxProgram::run`].
+///
+/// Each [`run`](PowerboxProgram::run) is as independent as a fresh [`run_powerbox`]: `run_raw`
+/// allocates a new guest window and re-applies the module's data segments every call, and the
+/// per-run [`Host`] is reset to a fresh powerbox (fresh `stdin`/`stdout`, caps re-granted in the
+/// same deterministic order) — so no guest state leaks between runs. Output is byte-identical to
+/// calling [`run_powerbox`] with the same `stdin` (the `powerbox_program_matches_run_powerbox`
+/// differential test pins this).
+///
+/// **Scope.** Only the single-threaded compute powerbox is cached — the `cap_thunk` + raw-`*mut
+/// Host` + [`fast_cap_resolver`] path (fiber hosting for submitted units is stood up exactly as the
+/// one-shot non-locked branch does). A module that uses §12 concurrency (the locked-thunk arm), or
+/// that folds to the tree-walker (spawns demand children / serves without a native serve arm), is
+/// refused by [`compile`](PowerboxProgram::compile) with an explanatory error; use [`run_powerbox`]
+/// for those (they compile per call anyway). This keeps the reused-native-code TCB surface small and
+/// its soundness argument the same one the one-shot non-locked path already makes.
+pub struct PowerboxProgram {
+    /// The instance whose fixed §3e grants are replayed onto the per-run host (`grant_caps`).
+    inst: Instance,
+    /// Guest window size in bytes (0 when the module declares no memory), for window-scoped grants.
+    win: u64,
+    /// The powerbox host, **boxed so its heap address is stable**: that address was baked as the
+    /// `cap.call` ctx (and is read by [`fast_cap_resolver`]) when `cm` was compiled, so it must not
+    /// move. Only its *contents* are reset between runs.
+    host: Box<Host>,
+    /// The module compiled once against `&*host`. Boxed so its address (registered as the native
+    /// re-entry ctx each run) is stable across moves of the `PowerboxProgram`.
+    cm: Box<CompiledModule>,
+}
+
+impl PowerboxProgram {
+    /// Compile `module`'s `_start` (function 0) once under the §3e powerbox, ready to [`run`] against
+    /// many inputs. Verifies first (the same fail-closed escape gate as [`run_powerbox`]) and refuses
+    /// module shapes outside the cached single-threaded compute path (see the type doc) so the caller
+    /// falls back to [`run_powerbox`] rather than silently getting a different execution path.
+    ///
+    /// [`run`]: PowerboxProgram::run
+    pub fn compile(module: Module) -> Result<PowerboxProgram, String> {
+        // Escape gate (fail-closed, §2a), paid once for all runs — the precondition for the reused
+        // native code to be confinement-sound is that the module verified.
+        svm_verify::verify_module(&module)
+            .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
+        if is_named_powerbox_entry(&module) {
+            validate_powerbox_manifest(&module)?;
+        }
+        // Refuse the shapes the one-shot path routes away from the single-threaded non-locked JIT
+        // arm — the only arm this cache implements. Mirrors `Instance::run_with_caps`'s TreeWalk
+        // fallback predicate plus the concurrency (locked-thunk) case.
+        if module.funcs.iter().any(|f| f.uses_concurrency()) {
+            return Err(
+                "PowerboxProgram: module uses §12 concurrency (cont.*/thread.*/futex); \
+                        use run_powerbox (per-call compile)"
+                    .into(),
+            );
+        }
+        if module_demand_spawns(&module)
+            || (module_serves(&module)
+                && !svm_interp::bytecode::serve_qualifies(&module.funcs)
+                && !module_nests(&module))
+        {
+            return Err(
+                "PowerboxProgram: module folds to the tree-walker (serves / spawns demand \
+                        children); use run_powerbox"
+                    .into(),
+            );
+        }
+        let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let inst = Instance {
+            module,
+            binding: None,
+            hooks: None,
+        };
+        // The powerbox host, boxed for a stable address = the baked `cap.call` ctx (also read by
+        // `fast_cap_resolver`). Granted here so the host is in the same shape the one-shot path
+        // compiles against, and so `jit_hosts_fibers()` is known below. `run` resets these contents
+        // (fresh caps re-granted deterministically) each call, but the box — hence the address — stays.
+        let mut host = Box::new(Host::new());
+        let ctx = &mut *host as *mut Host as *mut c_void;
+        inst.grant_caps(&mut host, win);
+        let quota = svm_jit::Quota::default();
+        let mut cm = Box::new(
+            CompiledModule::compile(
+                &inst.module,
+                0,
+                cap_thunk,
+                ctx,
+                svm_ir::DEFAULT_RESERVED_LOG2,
+                None, // sub
+                None, // resolve_module
+                None, // interrupt (no §5 watchdog in the cached path; see `run`)
+                None, // fuel
+                Some(fast_cap_resolver),
+                quota,
+                CLI_JIT_TABLE_LOG2,
+            )
+            .map_err(|e| format!("JIT compile failed: {e:?}"))?,
+        );
+        // Mirror `powerbox_compile_run`'s non-locked branch: stand up the fiber runtime if the
+        // powerbox grant hosts fibers (so a submitted-unit `cont.*` resolves), install the production
+        // granted-child hooks + budget taker. Done once — the run-many path reuses this `cm`. Thread
+        // hosting is *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency`
+        // modules — the only ones that could reach it — are refused above.
+        if host.jit_hosts_fibers() {
+            cm.enable_fiber_hosting(quota)
+                .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
+        }
+        cm.set_grant_child_hooks(Some(production_grant_hooks()));
+        cm.set_budget_taker(Some(budget_take));
+        Ok(PowerboxProgram {
+            inst,
+            win,
+            host,
+            cm,
+        })
+    }
+
+    /// Run the compiled program against `stdin`, reusing the native code. Returns the same [`Run`]
+    /// (`outcome` + captured `stdout`/`stderr`) that `run_powerbox(module, stdin)` would, but without
+    /// recompiling. The host is reset to a fresh powerbox first, so each call is independent.
+    pub fn run(&mut self, stdin: &[u8]) -> Result<Run, String> {
+        // Reset the powerbox host **in place** — the box (hence the baked ctx address) is preserved,
+        // only the contents change: fresh stdin/stdout/stderr and caps re-granted in the same
+        // deterministic order (so the handle values the guest sees match what it saw when compiled).
+        *self.host = Host::new();
+        self.host.stdin = stdin.to_vec();
+        self.host.set_quota(Quota::default());
+        self.inst.grant_caps(&mut self.host, self.win);
+        // No argv/env buffer: the cached path serves the plain compute powerbox (stdin in, stdout
+        // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
+        // SAFETY: `self.host` is the same boxed allocation whose address was baked as `cm`'s ctx at
+        // compile time; `self.cm` is not moved during the call (we hold `&mut self`). No watchdog is
+        // armed, matching `run_powerbox` (as opposed to `run_powerbox_with_deadline`).
+        let jr = unsafe { powerbox_run_prebuilt(&mut self.cm, &mut self.host, &[], None) };
+        let jr = jr.map_err(|e| format!("JIT run failed: {e:?}"))?;
+        // Fold a guest trap into an `Err` with its backtrace + trapping fiber, exactly as `jit_run`.
+        if let JitOutcome::Trapped(kind) = jr.outcome {
+            let who = match jr.trap_fiber {
+                Some(h) if h >= 0 => format!(" [fiber {h}]"),
+                _ => String::new(),
+            };
+            let msg = format!(
+                "guest trapped ({kind:?}) — detect-and-kill (§5){who}{}",
+                format_backtrace(&jr.backtrace)
+            );
+            return Err(trap_err_with_output(
+                msg,
+                &self.host.stdout,
+                &self.host.stderr,
+            ));
+        }
+        let folded = outcome_from_jit(&self.inst.module.funcs[0].results, jr.outcome);
+        let outcome = match folded {
+            Ok(o) => o,
+            Err(e) => {
+                return Err(trap_err_with_output(
+                    e,
+                    &self.host.stdout,
+                    &self.host.stderr,
+                ))
+            }
+        };
+        Ok(Run {
+            outcome,
+            stdout: std::mem::take(&mut self.host.stdout),
+            stderr: std::mem::take(&mut self.host.stderr),
+        })
+    }
 }
 
 /// Run a bare (non-powerbox) kernel — `module`'s entry on the JIT with `args` and no host

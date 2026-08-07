@@ -212,6 +212,22 @@ interpreter's decode+dispatch removed, the rolled residual runs an order of magn
 iteration — confirming rolled loops are the shape that actually pays, not just the shape that avoids
 the unroll blow-up.
 
+**Compiled-module cache (2026-08-07, `svm_run::PowerboxProgram`)** — the build-once/run-many API the
+benchmark economics called for, now built. `run_powerbox` JIT-compiles the whole module on every
+call; `PowerboxProgram::compile(module)` pays the Cranelift codegen **once** and `run(stdin)` reuses
+the native code per input. Each run stays as independent as a fresh `run_powerbox` — `run_raw`
+allocates a new guest window and re-applies data segments every call, and the boxed host (whose
+stable address is the baked `cap.call` ctx) is reset to a fresh powerbox each run — verified
+byte-identical to `run_powerbox` by the `powerbox_program` differential tests. Scope: the
+single-threaded compute powerbox (the `cap_thunk` + raw-`*mut Host` + `fast_cap_resolver` non-locked
+arm, fiber hosting stood up exactly as the one-shot does); concurrent / tree-walk-folding modules are
+refused with a pointer to `run_powerbox`. Measured on the ~690-function Lua module
+(`powerbox_program_amortizes_compile`): a batch of N=8 runs drops from **≈ 775 ms/run** (per-call
+compile) to **≈ 145 ms/run** (compile once) — a **5.3× batch speedup** that grows with N toward the
+compile:exec ratio. This is what turns the 11.5× per-iteration execution win into an end-to-end win:
+a built residual (or the bare interpreter) amortizes its compile across a batch instead of re-paying
+it every invocation.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
