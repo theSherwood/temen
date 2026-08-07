@@ -244,6 +244,21 @@ JIT. This is a standalone test (doesn't touch the shared `futamura::auto` driver
 and identifying the accumulator generically for write-back, are the next slices toward an end-to-end
 auto-rolled win.
 
+**De-overfitting: discovery on a second interpreter (2026-08-07, `peval_second_interp`)** — evidence
+the runtime cell-discovery is *not* Lua-shaped. The same technique (observe the dispatch block, find
+loop-carried cells as the registers that vary across hits, pick the counter as the one that
+monotone-decreases from its peak) is pointed at a **structurally different** interpreter: a C
+register-machine VM (`clang -O2 → svm-IR`) whose registers are a **global array** (`long reg[16]`, not
+frame-relative), values are **untagged** `long` (no `TValue` tag), and whose program counter is a
+**local in a register** (not `ci->savedpc` in memory). Discovery recovers exactly its counter (R0) and
+accumulator (R1), excluding the invariant R2, with only ONE target-specific input — *where the
+registers live* (the `reg` symbol's address from the on-ramp `data_symbols`; for Lua, `ci->func+16`).
+That register region is the first field of a real `TargetDesc`. One genuine structural finding: the
+regVM's pc-in-a-register means it **cannot be resumed from a memory snapshot** the way Lua can, so it
+entry-roots rather than safepoint-roots — cell discovery transfers, but *rooting strategy* is
+target-specific. Next: extract the `TargetDesc` abstraction so the Lua and regVM capture paths share
+one parameterized driver, and (harder) a second interpreter that itself needs safepoint rooting.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
