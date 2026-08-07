@@ -29,7 +29,7 @@ rerun-once policy applies — a fresh push re-triggers and clears it. No code fi
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** — **facet (a) FIXED 2026-08-06** (`lua_futamura_call_arith`); **facet (b) nested FIXED 2026-08-07** (`lua_futamura_call_nested` — root cause was a `CallInfo` overlay collision, `CI_SIZE` 104 vs the real 64-byte stride, not an engine bug); sequential-shared-`CallInfo` (c) still open (S3) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
+### I71 — peval precall/poscall call projection gaps — **ALL FACETS FIXED** (S3) — recorded 2026-08-06, closed 2026-08-07: **(a)** result-feeds-arithmetic (`lua_futamura_call_arith`), **(b)** nested 2-frame (`lua_futamura_call_nested` — root cause a `CallInfo` overlay collision, `CI_SIZE` 104 vs the real 64-byte stride, not an engine bug), **(c)** sequential distinct callees sharing one cached `CallInfo` (`lua_futamura_call_seq` — per-site `LuaSite::pins` on the shared node's `func`/`savedpc`); plus the call-bearing loop now **executes** (`lua_futamura_call_loop_exec`). All config/test — zero engine changes.
 
 PR #637 landed projecting *through* a Lua-to-Lua call (`SpecConfig::precall_model` + `PoscallModel`):
 slice 1 (call-in) and slice 2 (return) run end-to-end and diff stdout for `print(add(40,2))`, and
@@ -107,12 +107,22 @@ inline `RETURN1` fast path folds as const stores, `(10+1)*2` reduces to a **lite
 in the residual. So any frame of a call tree can be a projection root handling its own body + one
 call boundary; depth-N inlining is an optimization, not a prerequisite for end-to-end peval.
 
-**Facet (c) — still open:** two **sequential** distinct callees reuse one cached `CallInfo`
-(`ci->next`), which a single const overlay can't represent — per-call-site pinned `ci` fields vs a
-fixed overlay. Note the per-function/reroot architecture largely dissolves this facet (no residual
-needs a callee's frame contents, only the call-boundary post-state), and the facet-(b) collision fix
-is prerequisite knowledge for it (the reused node sits 64 bytes after the caller's). Harness for (c)
-is in the session scratchpad.
+**Facet (c) — FIXED 2026-08-07** (`lua_futamura_call_seq`, embeds + stdout-diffs `25`). Two
+sequential distinct callees (`add`, `mul`) reuse one cached `CallInfo` (`main_ci->next` — the test
+asserts the shared address). The fix needed **no engine change**: `LuaSite::pins` is already a
+generic `(address, value)` cell list and mem cells shadow the overlay seed, so each call site pins
+the shared node's per-callee fields itself — `ci->func` (that site's `ra`) and `ci->savedpc` (that
+callee's code start, offset discovered per occupancy) — while ONE overlay carries the fields common
+to both occupancies (previous, callstatus, trap). One shared `selective` entry covers both integer
+returns.
+
+**Call-bearing loop, executed (2026-08-07, `lua_futamura_call_loop_exec`)** — closes slice 3's
+"structural-only" caveat from the other side: an **entry-rooted** projection of
+`for i=1,5 do x=add(x,3) end print(x)` unrolls the constant trip count (five bodies through one
+shared `OP_CALL` site/frame node), embeds wholesale, and prints `15` byte-identically. Together with
+`lua_futamura_call_loop` (safepoint-rooted, rolls) the mechanism is shown to both roll *and* run;
+the remaining un-executed artifact is the rolled residual itself, which needs mid-loop entry
+stitching (same follow-up as the reroot residual).
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
