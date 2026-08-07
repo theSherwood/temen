@@ -25,7 +25,7 @@ use svm_interp::{IrPc, Stop, StopReason, Value};
 use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_peval::{
     specialize_with_config, LuaSite, PoscallModel, PrecallModel, PretailcallModel, SpecArg,
-    SpecConfig,
+    SpecConfig, TailSite,
 };
 
 const SCRIPT: &str = "local function inner(x) return x + 1 end\n\
@@ -49,6 +49,7 @@ const PROTO_K: u64 = 56;
 const PROTO_CODE: u64 = 64;
 const PROTO_P: u64 = 72;
 const VNUMINT: u8 = 0x03;
+const TAG_OFF: u64 = 8;
 
 fn lua_module() -> Module {
     let p = format!(
@@ -367,7 +368,10 @@ fn tail_call_reuses_the_frame() {
             (cci + savedpc_off, outer.code),
         ],
     };
-    let tail_site = LuaSite {
+    // The moved argument: inner's x lands at the reused frame's R0; its captured tag pins, its
+    // value reloads dynamic (the move happens inside the opaque cut).
+    let arg0 = inner.func + 16;
+    let tail_site = TailSite {
         ra: ra_tail,
         callee_ci: cci,
         pins: vec![
@@ -375,6 +379,7 @@ fn tail_call_reuses_the_frame() {
             (cci + CI_FUNC, inner.func),
             (cci + savedpc_off, inner.code),
         ],
+        args: vec![(arg0, inner.w[(arg0 + 8) as usize])],
     };
     let cfg = SpecConfig {
         const_overlays: overlays,
@@ -407,6 +412,7 @@ fn tail_call_reuses_the_frame() {
             pretailcall: pretail,
             ra_arg: 3,
             l_ci_addr: l + L_CI,
+            tag_off: TAG_OFF,
             sites: vec![tail_site],
         }),
         ..SpecConfig::default()

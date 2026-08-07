@@ -557,9 +557,32 @@ pub struct PretailcallModel {
     pub ra_arg: usize,
     /// The address of the `L->ci` field (same cell as [`PrecallModel::l_ci_addr`]).
     pub l_ci_addr: u64,
-    /// Tail-call sites. `callee_ci` is the **reused** frame node; `pins` carry the moved closure slot
-    /// and the per-callee `ci` fields (`savedpc`), exactly like a shared-`CallInfo` sequential site.
-    pub sites: Vec<LuaSite>,
+    /// Byte offset from a stack slot's base to its `TValue` tag byte (same as
+    /// [`PoscallModel::tag_off`]) — used for the moved-argument reloads.
+    pub tag_off: u64,
+    /// Tail-call sites (see [`TailSite`]).
+    pub sites: Vec<TailSite>,
+}
+
+/// One tail-call site. Unlike a [`LuaSite`], a tail call **moves** the callee closure and its
+/// arguments down onto the reused frame *inside the opaque cut* — so the frame's argument cells hold
+/// values the fold last saw at *other* addresses. `pins` carry the moved closure slot and the
+/// per-callee `ci` fields (`savedpc`), exactly like a shared-`CallInfo` sequential site; `args`
+/// apply the selective-reload discipline to the moved arguments so the callee reads the *runtime*
+/// values, not the frame's stale abstract cells.
+#[derive(Clone, Debug)]
+pub struct TailSite {
+    /// The (constant) stack-slot address of the callee's temp position — the site key.
+    pub ra: u64,
+    /// The reused frame node.
+    pub callee_ci: u64,
+    /// `(address, value)` cells pinned constant after the cut (closure slot, `ci` fields).
+    pub pins: Vec<(u64, u64)>,
+    /// The callee's argument slots *after* the move-down: `(value cell address, promised tag)`.
+    /// Each value cell reloads **dynamic** (the cut moved a runtime value into it) and its tag
+    /// pins to the captured constant, so the callee's fast-path tag checks fold while the values
+    /// flow at runtime.
+    pub args: Vec<(u64, u8)>,
 }
 
 /// One Lua call site for the [`PrecallModel`]. On a `precall` whose `ra` matches, the result (`newci`)
@@ -1806,8 +1829,9 @@ impl Spec<'_> {
                 mem.insert(addr, (8, Abs::Const(Known::I64(val as i64))));
             }
             // A value slot is consumed for every result (result 0's is discarded for the constant)
-            // so `rnext` stays in sync with the residual's value numbering — see `emit_precall`.
-            Ok((0..nres)
+            // so `rnext` stays in sync with the residual's value numbering — and the results must be
+            // bound BEFORE any further emission (the call's values precede the reloads' values).
+            let results: Vec<Abs> = (0..nres)
                 .map(|k| {
                     let slot = Abs::Dyn(bump(rnext));
                     if k == 0 {
@@ -1816,7 +1840,15 @@ impl Spec<'_> {
                         slot
                     }
                 })
-                .collect())
+                .collect();
+            // The moved arguments: the cut relocated runtime values onto the frame's arg slots, so
+            // the fold's stale cells there are WRONG — reload each value dynamic and pin its tag
+            // (the selective-reload discipline applied at the call-in side).
+            for &(addr, tag) in &site.args {
+                self.reload_one(addr, 8, mem, out, rnext);
+                mem.insert(addr + tm.tag_off, (1, Abs::Const(Known::I32(tag as i32))));
+            }
+            Ok(results)
         } else {
             let r = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
             self.reload_cells_natural(mem, out, rnext)?;
