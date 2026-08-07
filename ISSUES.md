@@ -13,6 +13,14 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I72 — `fiber-scaling features (macos-latest)` failed at *action download* with `Service Unavailable` (S4, GitHub Actions infra flake) — recorded 2026-08-06 on PR #642
+
+Run 31119236467: the job died in **Prepare all required actions** — `Failed to resolve action
+download info. Error: Service Unavailable`, retried twice (21 s, 17 s) then `##[error]Service
+Unavailable`. No project code ran; the commit was test-only (`lua_futamura_call_arith` + ISSUES).
+GitHub's action-registry was transiently down. Sibling of I67/I70 (GitHub-hosted infra flakes);
+rerun-once policy applies — a fresh push re-triggers and clears it. No code fix.
+
 > **I36–I40 (2026-07-23):** the §3.6 serving-substrate review, recorded at the owner's request
 > after a design walkthrough. Two further items from the same review were **already tracked** and
 > are not duplicated here: fiber-level `svc.wait`/`Join` parks (TODO.md §3.6 residue,
@@ -21,7 +29,7 @@ robustness/quality · **S4** cosmetic/flake.
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** is not yet execution-correct (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
+### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** — **facet (a) FIXED 2026-08-06** (`lua_futamura_call_arith`); nested (b) / sequential-shared-`CallInfo` (c) still open (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
 
 PR #637 landed projecting *through* a Lua-to-Lua call (`SpecConfig::precall_model` + `PoscallModel`):
 slice 1 (call-in) and slice 2 (return) run end-to-end and diff stdout for `print(add(40,2))`, and
@@ -39,23 +47,58 @@ so it is not self-contained and was never *executed*. That masked this gap.
   the metamethod cluster (`luaT_trybinTM`/`callbinTM`/`luaT_gettmbyobj`/`luaV_equalobj`/…). Both
   full-reload and `selective` diverge, so the 2-frame case is a *caller-resume* problem, not a tag one.
 
-**Root cause (partial).** Two distinct sub-problems: (a) the **selective-reload result** (`value`
-dynamic, `tag` pinned integer) flows into `OP_MUL`'s fast path, but the arithmetic handler drags in an
-inlined helper that returns `Unsupported` — needs that helper cut (like the GC barriers in slice 1) or
-the access supported; (b) **nested returns**: after a Lua callee returns, the caller re-enters
-`startfunc` and re-reads `ci->savedpc`; each frame is captured at its own first dispatch, but composing
-two live frames still diverges — likely the caller's post-call resume `pc` (savedpc mem-cell vs
-overlay) or a per-frame `ci` field read via `read_const_mem` (the overlay) instead of the live pinned
-cell. Also note **two *sequential* distinct callees reuse one cached `CallInfo`** (`ci->next`), which a
-single const overlay can't represent — a third facet of the same area.
+**Root cause — traced 2026-08-06 (follow-up investigation).** The original read of facet (a) ("cut one
+`OP_MUL` helper") was too shallow; the real chain is two layered problems.
 
-**Fix sketch.** (1) Add an execution test for the single-call-arithmetic case; identify `f661`'s
-unsupported op and cut it (extend the read/touch cut lists) or support the access. (2) For nested,
-instrument the caller-resume `pc` at the first `startfunc` re-entry after a callee return; make
-`emit_poscall` derive `ci->func`/`savedpc` from the live mem cell, not `read_const_mem`. (3) For
-sequential distinct callees, model the reused `CallInfo` (per-call-site pinned `ci` fields rather than a
-fixed overlay). The capture harness for all three is written and working (distinct-frame capture, ra
-keying); the blocker is the engine-side return/arith composition, not the test plumbing.
+*Layer 1 — the cut set is missing the allocation/GC/string primitives.* `f661` is not an arith helper;
+it is the **arena allocator grow path** (`l_alloc → f663 → f661`), whose `CallImport import:3` is the
+host `vm_map`. It is reached because `l_alloc` (`f531`, no direct callers) is the `frealloc` pointer,
+devirtualized by `indirect_targets_cap` and projected. Cutting `l_alloc` alone just moves the wall: its
+`Dyn` result makes "did the alloc succeed?" dynamic, so the fold explores the **alloc-failure cold
+subtree** — `luaM_realloc_ → luaC_fullgc` (emergency GC) → retry → `fread`/`fwrite`/`strstr` and a
+second `l_alloc.777` clone. These are all stateful host-backed machinery that must be **cut like the GC
+barriers already are**. The needed additions (confirmed): `luaM_realloc_`, `luaM_saferealloc_`,
+`luaM_malloc_`, `luaM_growaux_`, `luaS_resize`, `luaS_newlstr`, `luaC_fullgc`. With those cut,
+**`print(add(2,3))` (no arithmetic on the result) projects and executes correctly** — so the cut-set is
+necessary and, for the plain-return case, sufficient.
+
+*Layer 2 (the actual root) — the proto **constant pool (`proto->k`) was not overlaid.* With the cut-set
+in place, `print(add(2,3) * 10)` still fell into `OP_MMBINK` → `luaT_trybinassocTM` → `luaD_throw`
+because the `OP_MULK` fast-path guard `ttisinteger(v1) && ttisinteger(v2)` didn't fold. **A prior
+"caller `base` goes dynamic" reading was a red herring** — instrumenting `eval_load` showed the register
+operand `v1 = R[B]` *does* load at a constant base and resolves to the pinned `VNUMINT` tag. The operand
+that stayed dynamic was `v2 = KC(i)` — the **constant `10`**, read from `proto->k[C]`. The overlays
+covered the proto struct and the code/upvalue arrays but **not the `k` array it points to**, so the
+constant's tag was unresolved and the guard couldn't reduce. `print(add(40,2))` never hit this because
+small integer literals compile to `OP_LOADI` **immediates** (baked into the instruction word), never
+touching `k`. Fix: overlay each frame's `proto->k` (`PROTO_K = 56`, `PROTO_SIZEK = 20`, `16 * sizek`
+bytes) alongside the code array. The `k` pool is static program data — it belongs in the const image
+exactly like the bytecode.
+
+**Resolution (facet a).** `crates/svm-llvm/tests/lua_futamura_call_arith.rs` projects
+`print(add(2,3) * 10)` and executes it **byte-identical to the interpreter (`50`)**, 172 residual
+blocks, no deopt — a call result flowing into `OP_MULK`, the exact shape a real call-bearing loop needs
+(`x = add(x, k)`). Both ingredients are config the `SpecConfig` API already supports (no engine change):
+the `k`-pool overlay + the alloc/GC/string cut-set.
+
+**Facet (b) — nested 2-frame (`outer(y) = inner(y) * 2`), progressed 2026-08-06, still open**
+(`lua_futamura_call_nested`, `#[ignore]`d). With the `k` overlay + cut-set from (a) **plus** a new
+**upvalue-machinery cut** (`outer` captures `inner`, so `OP_CLOSURE` calls `luaF_findupval`, which
+walks/mutates the open-upvalue list — cut `luaF_findupval`/`luaF_closeupval`/`luaF_close`/
+`luaF_initupvals`), the fold now **descends the full 2-deep stack** (main → `outer` → `inner`, confirmed
+via `startfunc` re-entries) — the earlier attempt couldn't get past the closures. The remaining blocker
+is **engine-level, not config**: a *callee* frame's register base is dynamic in the fold. `inner`'s
+`x + 1` (`OP_ADDI`) falls to `OP_MMBINI` because the operand tag never folds, and `eval_load` shows *no
+constant-base access to either callee's register file*. The base is `ci->func + 1` where `ci` is the
+precall's constant result and `ci->func` seeds from the frame overlay — so it *should* reduce, but 2-deep
+it doesn't, and the fold walks off `inner`'s code into the metamethod/GC cold subtree (`Budget`). (This
+*is* the "dynamic base" shape — a red herring for facet (a), but real here, for a callee frame.) Next:
+instrument the callee `startfunc` base computation to see why `ci->func + 1` doesn't fold, or have the
+precall re-seed the callee's base SSA from the pinned `ci`.
+
+**Facet (c) — still open:** two **sequential** distinct callees reuse one cached `CallInfo` (`ci->next`),
+which a single const overlay can't represent — per-call-site pinned `ci` fields vs a fixed overlay.
+Repro/harness for (a) and (b) is committed; (c)'s is in the session scratchpad.
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
