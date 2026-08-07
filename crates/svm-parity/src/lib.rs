@@ -121,6 +121,74 @@ const HOST_OP: &str = "host cap/handle op — serviced by the oracle, not emitte
 const FIBER_RT: &str = "Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere";
 const SETJMP_RT: &str = "Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere";
 const NO_WASM_OP: &str = "no core-wasm opcode (relaxed-SIMD / scalar-fma only)";
+const SERVE: &str =
+    "native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle";
+const FORK_GAP: &str =
+    "native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1)";
+const FUEL_BC: &str = "declines the module (folds to the oracle) rather than adding a native op";
+
+/// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `cap.call`
+/// IR encoding. These mirror `svm_interp::cap_id` and the `svm_interp::CAP_SELF_*` op constants
+/// (pinned equal by the conformance test `capcall_op_numbers_match_the_interpreter`) — duplicated
+/// here as bare data so the classifier keeps its "no backend dep" property (see `Cargo.toml`).
+pub mod capcall {
+    /// `svm_interp::cap_id::INSTANTIATOR` — the §14 VM-in-VM interface.
+    pub const INSTANTIATOR: u32 = 6;
+    // The self-namespace ops ride `cap.call CAP_SELF_TYPE_ID <op>` (`svm_ir::CAP_SELF_TYPE_ID`).
+    pub const SVC_POLL: u32 = 9;
+    pub const SVC_WAIT: u32 = 10;
+    pub const CLONE_CALLER: u32 = 11;
+    pub const REAP: u32 = 12;
+    pub const FUEL_REMAINING: u32 = 13;
+}
+
+/// Classify a `cap.call` sub-op `(type_id, op)` across the four backends. The generic host-cap case
+/// lowers on both interpreters and Cranelift and leaf-folds on the wasm-JIT; the process / serve /
+/// fork self-namespace ops carve out their real, narrower parity (the load-bearing honesty fix — a
+/// single `cap.call` row used to hide that the fork ops run only on the oracle).
+fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
+    let self_ty = svm_ir::CAP_SELF_TYPE_ID;
+    let leaf = cell(Status::Declines, LEAF);
+    match (type_id, op) {
+        // §14 executor children — instantiate (0) / join (1) / instantiate_module (5) /
+        // instantiate_module_named (13) / child_offer (14) / instantiate_rec (17): native on both
+        // interpreters (`Op::Instantiate`/`InstJoin`/`InstantiateModule`/`ChildOffer`/…) and on
+        // Cranelift (`instantiator_rt`). The wasm-JIT leaf-folds the cap.call to the interp.
+        (capcall::INSTANTIATOR, 0 | 1 | 5 | 13 | 14 | 17) => [F, F, F, leaf],
+
+        // §3.6 service points — `svc.poll` (9) / `svc.wait` (10): both fast backends compile them to
+        // the native serve-loop core *when the module is serve-qualified* (no seam that could park a
+        // handler mid-dispatch, `bytecode::serve_qualifies`); an unqualified module folds whole to
+        // the oracle. (The **timed** `svc.wait` form — op 10 with a timeout arg — is oracle-only and
+        // folds; parity keys on `(type_id, op)`, so this row reflects the common untimed form.)
+        (t, o) if t == self_ty && matches!(o, capcall::SVC_POLL | capcall::SVC_WAIT) => [
+            F,
+            cell(Status::Full, SERVE),
+            cell(Status::Full, SERVE),
+            leaf,
+        ],
+
+        // FORK.md §9 — `clone_caller` (11) / `reap` (12): fork-returns-twice + wait. **Native on the
+        // bytecode engine** (the cooperative serve driver builds the twin over `Mem::fork_private` +
+        // `Host::fork_powerbox` and reaps it; pinned bit-for-bit against the oracle by
+        // `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle`). Still folds on
+        // Cranelift (its serve loop is in svm-run, its twin continuation is a native frame with no
+        // `Clone`) — the next slice (FORK.md §9.1). wasm-JIT leaf-folds like every cap op.
+        (t, o) if t == self_ty && matches!(o, capcall::CLONE_CALLER | capcall::REAP) => {
+            [F, F, cell(Status::NotYet, FORK_GAP), leaf]
+        }
+
+        // `fuel.remaining` (13): Cranelift lowers it inline (it owns the fuel cell's address); the
+        // bytecode engine declines the module rather than add a native op (folds to the oracle).
+        (t, o) if t == self_ty && o == capcall::FUEL_REMAINING => {
+            [F, cell(Status::NotYet, FUEL_BC), F, leaf]
+        }
+
+        // Generic host `cap.call` (Stream / Clock / Memory / host-fn / JIT-compile / …) and every
+        // other cap sub-op: native on both interpreters and Cranelift's cap-call thunk; wasm leaf.
+        _ => [F, F, F, leaf],
+    }
+}
 
 /// **The manifest.** Classify one instruction across the four backends. Exhaustive by design — a new
 /// [`Inst`] variant must be classified here (and rendered by [`catalog`]) before this crate compiles.
@@ -197,15 +265,17 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------
         Inst::Call { .. } | Inst::CallIndirect { .. } => row(F, F),
-        // Host capability calls: Cranelift emits a cap-call thunk into the host; the wasm-JIT is a
-        // leaf accelerator and folds every cap op to the interpreter underneath.
-        Inst::CapCall { .. }
-        | Inst::CallImport { .. }
+        // `cap.call` is a **family**, not one op: generic host caps lower on both interpreters and
+        // Cranelift's cap-call thunk, but the process/serve/fork self-namespace ops (encoded as
+        // `cap.call` sub-ops) have their own, narrower parity — the fork substrate runs only on the
+        // tree-walk oracle today. Classify by `(type_id, op)`. (INVARIANTS.md #9; FORK.md §8.5;
+        // ISSUES.md I36.)
+        Inst::CapCall { type_id, op, .. } => parity_capcall(*type_id, *op),
+        // Other host-boundary calls / link-form data addresses: Cranelift emits a thunk (or `link`
+        // rewrites the data-sym to an `i64.const`); the wasm-JIT leaf-folds every cap op underneath.
+        Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
-        // Link-form data addresses: pure link scaffolding (`link` rewrites them to `i64.const`), so
-        // like `call.sym` they never appear in an executed corpus — classified with the other
-        // link-form ops for exhaustiveness.
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
         | Inst::DataTop

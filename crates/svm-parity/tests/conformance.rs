@@ -109,11 +109,27 @@ fn skip_set_is_small_and_reasoned() {
         .filter(|o| o.conf_skip.is_some())
         .map(|o| o.mnemonic)
         .collect();
-    // Fibers/threads/futex/setjmp/gc (target-conditional) + the cap/import/export host-wired ops.
+    // Fibers/threads/futex/setjmp/gc (target-conditional) + the cap/import/export host-wired ops +
+    // the `process, serve & fork` sub-ops (scheduler/host-wired, exercised by the fork/serve
+    // harnesses).
     assert!(
-        skipped.len() <= 24,
+        skipped.len() <= 33,
         "conf_skip set grew to {} — audit these before raising the bound:\n{:?}",
         skipped.len(),
         skipped,
     );
+}
+
+/// The classifier duplicates the reserved cap-id / self-op numbers as bare data (to stay free of a
+/// backend dep). Pin them equal to the interpreter's own constants so the two can never drift — a
+/// renumbered op would otherwise silently mis-classify its whole matrix row.
+#[test]
+fn capcall_op_numbers_match_the_interpreter() {
+    use svm_parity::capcall;
+    assert_eq!(capcall::INSTANTIATOR, svm_interp::cap_id::INSTANTIATOR);
+    assert_eq!(capcall::SVC_POLL, svm_interp::CAP_SELF_SVC_POLL);
+    assert_eq!(capcall::SVC_WAIT, svm_interp::CAP_SELF_SVC_WAIT);
+    assert_eq!(capcall::CLONE_CALLER, svm_interp::CAP_SELF_CLONE_CALLER);
+    assert_eq!(capcall::REAP, svm_interp::CAP_SELF_REAP);
+    assert_eq!(capcall::FUEL_REMAINING, svm_interp::CAP_SELF_FUEL_REMAINING);
 }

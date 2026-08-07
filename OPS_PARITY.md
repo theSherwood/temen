@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**454 ops.** Across the two JIT columns: 855 ✅ Full · 43 ⛔ Declines · 0 🚧 Not-yet · 10 🔶 Conditional.
+**463 ops.** Across the two JIT columns: 862 ✅ Full · 52 ⛔ Declines · 2 🚧 Not-yet · 10 🔶 Conditional.
 
 ## scalar integer
 
@@ -491,6 +491,20 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `call.import.dyn` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `call.sym` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `durable.shadow_base` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+
+## process, serve & fork
+
+| op | svm-tree-walk | svm-bytecode | svm-jit | svm-wasm-jit | notes |
+|----|:----:|:----:|:----:|:----:|-------|
+| `instantiate` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `join` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `instantiate_module` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `child_offer` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `svc.poll` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `svc.wait` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `fuel.remaining` | ✅ | 🚧 | ✅ | ⛔ | declines the module (folds to the oracle) rather than adding a native op; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## fibers, threads & non-local control
 

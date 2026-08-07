@@ -18,6 +18,64 @@ fn module(text: &str) -> Arc<svm_ir::Module> {
     Arc::new(m)
 }
 
+/// FORK.md §9 / OPS_PARITY.md (`clone_caller`/`reap`) — `serve_qualifies` (svm-run's **Cranelift**
+/// routing predicate) still folds a forking module to the oracle: the Cranelift fork slice is
+/// unbuilt, so it must never compile fork there and answer `-EINVAL` where the oracle forks (a
+/// silent divergence, INVARIANTS.md #9). This pins the *Cranelift* side of the per-backend split —
+/// the **bytecode** engine now serves fork natively (see
+/// `bytecode_forks_the_twin_identically_to_the_oracle`), via the separate `bytecode_serves_fork`
+/// escape, so the two predicates deliberately diverge on fork until Cranelift catches up.
+#[test]
+fn serve_qualifies_still_folds_fork_for_cranelift() {
+    use svm_interp::bytecode::serve_qualifies;
+    use svm_ir::{Block, Func, FuncType, Inst, Terminator, ValType, CAP_SELF_TYPE_ID};
+
+    let self_cap = |op: u32, results: Vec<ValType>| Inst::CapCall {
+        type_id: CAP_SELF_TYPE_ID,
+        op,
+        sig: FuncType {
+            params: vec![],
+            results: results.clone(),
+        },
+        handle: 0,
+        args: vec![],
+    };
+    // A bare `svc.poll` service point is serve-qualified (a fast backend runs the serve loop).
+    let serve_only = vec![Func {
+        params: vec![],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![],
+            insts: vec![self_cap(svm_interp::CAP_SELF_SVC_POLL, vec![ValType::I32])],
+            term: Terminator::Return(vec![0]),
+        }],
+    }];
+    assert!(
+        serve_qualifies(&serve_only),
+        "a bare serve point should qualify for native serving"
+    );
+
+    // Adding a handler that forks (`clone_caller`) or reaps (`reap`) makes `serve_qualifies` (the
+    // Cranelift routing predicate) fold the module — fork is not lowered on Cranelift yet. (The
+    // bytecode gate takes the `bytecode_serves_fork` escape instead; that path is proven separately.)
+    for fork_op in [svm_interp::CAP_SELF_CLONE_CALLER, svm_interp::CAP_SELF_REAP] {
+        let mut funcs = serve_only.clone();
+        funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![self_cap(fork_op, vec![])],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        assert!(
+            !serve_qualifies(&funcs),
+            "serve_qualifies must fold a forking module (self-op {fork_op}) for Cranelift"
+        );
+    }
+}
+
 /// func 0 (root/caller): spawn a server running func 1, mint an offer over export 0 (`svc` → func 2),
 /// call it with `7`, return the reply. func 1 (server entry): serve one dispatch via `svc.wait`
 /// (op 10). func 2 (the handler, bound to the offer): `clone_caller(999, 0)` — the explicit two-reply
@@ -364,6 +422,80 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
         vals,
         vec![100, 200],
         "both the original (100) and the twin (200) wrote their reply — return-twice, one live run"
+    );
+}
+
+/// FORK.md §9 — **native bytecode fork**: the `SRC_TWIN` fork topology now runs on the *bytecode*
+/// engine (not folded to the tree-walk oracle), producing the identical observable result — the run
+/// value plus both replies on the shared stdout sink. This is the differential pin the parity
+/// matrix's bytecode `clone_caller`/`reap` cells rest on (INVARIANTS.md #9; OPS_PARITY.md). The
+/// twin's continuation is the caller's `Vm` cloned at its post-call resume point over a private
+/// window (`Mem::fork_private`) + duplicated powerbox (`Host::fork_powerbox`); the parent `wait`s
+/// the twin (`reap`) so its stdout write is observed deterministically before teardown.
+fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
+    let m = module(SRC_TWIN);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let mut fuel = 40_000_000u64;
+    let r = run_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(out_h)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("oracle run");
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (r, bytes)
+}
+
+#[test]
+fn bytecode_forks_the_twin_identically_to_the_oracle() {
+    let (oracle_r, oracle_bytes) = run_src_twin_oracle();
+
+    // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
+    let m = module(SRC_TWIN);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let mut fuel = 40_000_000u64;
+    let bc_r = svm_interp::bytecode::compile_and_run_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(out_h)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("the fork module runs natively on the bytecode engine (not folded to the oracle)")
+    .expect("bytecode run");
+    let bc_bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    assert_eq!(
+        bc_r, oracle_r,
+        "bytecode fork returns the oracle's value (reply_orig = 100, joined through C)"
+    );
+    let sorted = |b: &[u8]| {
+        let mut v: Vec<i64> = b
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(&bc_bytes),
+        sorted(&oracle_bytes),
+        "bytecode and oracle agree on the shared sink (both replies, order-independent)"
+    );
+    assert_eq!(
+        sorted(&bc_bytes),
+        vec![100, 200],
+        "return-twice on bytecode: original (100) + twin (200) both wrote their reply"
     );
 }
 

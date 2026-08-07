@@ -354,6 +354,32 @@ enum Op {
         /// caller's enqueue re-admits it and the rewound op re-executes the whole drain.
         wait: bool,
     },
+    /// FORK.md §9.2 — `clone_caller` (self-op 11): fork-returns-twice, servicer side. Compiled only
+    /// in a fork-serving module ([`Seams::bytecode_serves_fork`]). From within a serve handler, it
+    /// duplicates the caller parked on this dispatch into a live twin and replies differently to each.
+    /// The twin build needs the driver's task/env set, so the op resolves its reply args here and
+    /// surfaces to the cooperative driver ([`Outcome::CloneCaller`]); the driver reads the running
+    /// handler's `serve_ticket` to name the parked caller. Arity picks the mode (mirrors the oracle):
+    /// 2 args = explicit `(reply_orig, reply_twin)`; 0/1 args = **pid mode** (`fork()`) — the parent
+    /// sees the twin's task id, the child sees the arg (0). `-EINVAL` outside a handler.
+    CloneCaller {
+        /// The reply-value arg registers (0, 1, or 2), resolved to i64s in the driver.
+        args: Box<[u32]>,
+        dst: u32,
+        /// Whether the `cap.call` has a result slot (the twin handle / errno lands here).
+        has_result: bool,
+    },
+    /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
+    /// handler, reap a twin `pid` a prior `clone_caller` minted, on behalf of the caller parked on
+    /// this dispatch — delivering the twin's exit status (now, or when it finishes). Surfaces to the
+    /// driver ([`Outcome::Reap`]), which owns the task set + the `forked_twins` allow-set. `-EINVAL`
+    /// outside a handler; `-ECHILD` for a `pid` this servicer did not mint (never a hang).
+    Reap {
+        /// The `pid` arg register (`None` = no arg → an out-of-range pid → `-ECHILD`).
+        pid: Option<u32>,
+        dst: u32,
+        has_result: bool,
+    },
     /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
     /// running child's impl-export into the wirer's table. The authority check (the Instantiator
     /// handle) runs in the op exec; the mint itself needs the child's env/host, so it surfaces to
@@ -862,6 +888,11 @@ struct Seams {
     has_gc: bool,
     has_svc: bool,
     has_park_seam: bool,
+    /// FORK.md §9 — `clone_caller` (self-op 11) present: the fork-returns-twice servicer primitive.
+    /// A distinct seam because the **bytecode** engine now services it natively ([`bytecode_serves_fork`]),
+    /// while the Cranelift routing still folds it (`svc_park_veto` keeps it). (`reap`, self-op 12, is
+    /// **not** here yet — it stays a `has_park_seam` so fork+wait still folds; that is the next slice.)
+    has_fork: bool,
 }
 
 impl Seams {
@@ -872,6 +903,13 @@ impl Seams {
     /// never drift over which modules serve natively vs. decline to the tree-walk oracle. Adding a
     /// new park-capable seam means extending this one list. (INVARIANTS.md §9: one veto predicate,
     /// one definition.)
+    ///
+    /// **Fork rides this veto for Cranelift** (`has_fork` is in the disjunction), so svm-run's JIT
+    /// routing still folds a forking module to the oracle — the Cranelift fork slice is unbuilt
+    /// (FORK.md §9.1). The **bytecode** engine, in contrast, services `clone_caller`/`reap` natively;
+    /// its compile gate takes the [`bytecode_serves_fork`] escape past this veto (a per-backend split,
+    /// the one the two-predicate structure exists to allow — the bytecode gate and `serve_qualifies`
+    /// legitimately diverge on fork until Cranelift catches up).
     fn svc_park_veto(&self) -> bool {
         self.has_svc
             && (self.has_park_seam
@@ -879,7 +917,27 @@ impl Seams {
                 || self.has_thread
                 || self.has_coro
                 || self.has_instantiate
-                || self.has_gc)
+                || self.has_gc
+                || self.has_fork)
+    }
+
+    /// FORK.md §9.2 — the **bytecode fork-serving escape**: a serving module the bytecode engine can
+    /// run `clone_caller` in natively even though [`svc_park_veto`] folds it (for Cranelift). The
+    /// bounded shape: it serves (`has_svc`) and forks (`has_fork`), the manager may spawn children
+    /// (`has_instantiate` — the fork topology needs it), and **no other** seam that could park a
+    /// *handler* mid-dispatch is present. `clone_caller` itself never parks the handler (it reshapes
+    /// the parked caller and returns), so the serve rewind linkage stays intact; the manager's
+    /// instantiate/join park ordinary tasks, not handlers. Deliberately narrow (fork-shaped modules
+    /// only) to bound the blast radius vs. the general serve+spawn case, which stays folded. A fork
+    /// handler that *also* parked (e.g. joined) is out of this shape and is not admitted here.
+    fn bytecode_serves_fork(&self) -> bool {
+        self.has_svc
+            && self.has_fork
+            && !self.has_park_seam
+            && !self.has_fiber
+            && !self.has_thread
+            && !self.has_coro
+            && !self.has_gc
     }
 }
 
@@ -925,6 +983,16 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                         op: 9 | 10,
                         ..
                     } => s.has_svc = true,
+                    // FORK.md §9 — `clone_caller` (11) / `reap` (12): the fork servicer primitives.
+                    // The bytecode engine services both natively (the [`bytecode_serves_fork`] escape
+                    // admits the fork topology; the `VcpuStop::CloneCaller`/`Reap` driver arms build
+                    // the twin and reap it), so they are the `has_fork` seam — folded for Cranelift
+                    // (`svc_park_veto` keeps `has_fork`) but run natively on bytecode.
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 11 | 12,
+                        ..
+                    } => s.has_fork = true,
                     // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
                     // can be *bound* to one at spawn — either inside a handler would need the
                     // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
@@ -990,7 +1058,13 @@ fn compile_module_for(m: &Module) -> Option<Compiled> {
             )
         })
     });
-    if uses_rec && !m.impl_exports.is_empty() {
+    // §3d pager guard: an op-17 record-spawn module with impl exports *could* build a pager record
+    // (which behaves differently), so it folds to the oracle — **except** a fork-shaped module
+    // (FORK.md §9.2): its op-17 records are ordinary executor spawns (the manager spawning the
+    // server/guest with by-name grants — the only in-module spawn-with-grants the bytecode tier
+    // drives), and its impl export is the fork server. `bytecode_serves_fork` bounds this to the
+    // fork shape; other serving record-spawn modules still fold.
+    if uses_rec && !m.impl_exports.is_empty() && !scan_seams(&m.funcs).bytecode_serves_fork() {
         return None;
     }
     compile_module(&m.funcs)
@@ -1068,9 +1142,11 @@ fn compile_module_with(funcs: &[Func], fuse: bool) -> Option<Compiled> {
     // `longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
     // spawn-bound imports, gc.roots) falls the whole module back to the tree-walk oracle, whose
     // serve arm has the fiber-park machinery (slice 5b).
+    // FORK.md §9.2 — the bytecode fork-serving escape: a fork-shaped module (`bytecode_serves_fork`)
+    // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     if (s.has_coro && (s.has_fiber || s.has_thread))
         || (s.has_instantiate && s.has_fiber)
-        || s.svc_park_veto()
+        || (s.svc_park_veto() && !s.bytecode_serves_fork())
     {
         return None;
     }
@@ -1595,6 +1671,19 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                     }
                 }
                 (svm_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
+                // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
+                // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
+                // The reply/pid args are register operands, resolved in the driver.
+                (svm_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
+                    args: args.iter().map(|a| g(*a)).collect(),
+                    dst,
+                    has_result: !sig.results.is_empty(),
+                },
+                (svm_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
+                    pid: args.first().map(|a| g(*a)),
+                    dst,
+                    has_result: !sig.results.is_empty(),
+                },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
                 // decline the module so it falls back to the tree-walker, which services op 13
@@ -2910,7 +2999,9 @@ impl<'p> Vcpu<'p> {
                 // compile (op-14 implies the drive path); requires a hand-wired live cap.
                 Ok(VcpuStop::LiveCall { .. })
                 | Ok(VcpuStop::SvcWait)
-                | Ok(VcpuStop::ChildOffer { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                | Ok(VcpuStop::ChildOffer { .. })
+                | Ok(VcpuStop::CloneCaller { .. })
+                | Ok(VcpuStop::Reap { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
                 Ok(VcpuStop::TierUp {
@@ -7321,6 +7412,24 @@ enum Outcome {
         export: u32,
         dst: u32,
     },
+    /// FORK.md §9.2 — `clone_caller`: fork the caller parked on the running handler's dispatch into a
+    /// twin. Driver-side (it owns the task/env set + the parked caller). `reply_orig` = `Some` in the
+    /// explicit two-reply form, `None` in pid mode (the parent gets the twin's task id). The driver
+    /// reads the handler's `serve_ticket` to name the caller; the twin handle (or an errno) lands at
+    /// `dst` when `has_result`.
+    CloneCaller {
+        reply_orig: Option<i64>,
+        reply_twin: i64,
+        dst: u32,
+        has_result: bool,
+    },
+    /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
+    /// dispatch ([`Outcome::Reap`]).
+    Reap {
+        pid: i64,
+        dst: u32,
+        has_result: bool,
+    },
     /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
     /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
     /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
@@ -7865,6 +7974,21 @@ enum VcpuStop {
         export: u32,
         dst: u32,
     },
+    /// FORK.md §9.2 — `clone_caller`: fork the caller parked on this handler's dispatch into a twin
+    /// ([`Outcome::CloneCaller`]). The driver reads the running handler's `serve_ticket` to name it.
+    CloneCaller {
+        reply_orig: Option<i64>,
+        reply_twin: i64,
+        dst: u32,
+        has_result: bool,
+    },
+    /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
+    /// dispatch ([`Outcome::Reap`]).
+    Reap {
+        pid: i64,
+        dst: u32,
+        has_result: bool,
+    },
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
@@ -8263,6 +8387,30 @@ fn step_vcpu(
             Outcome::ChildOffer { child, export, dst } => {
                 return Ok(VcpuStop::ChildOffer { child, export, dst })
             }
+            Outcome::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+                has_result,
+            } => {
+                return Ok(VcpuStop::CloneCaller {
+                    reply_orig,
+                    reply_twin,
+                    dst,
+                    has_result,
+                })
+            }
+            Outcome::Reap {
+                pid,
+                dst,
+                has_result,
+            } => {
+                return Ok(VcpuStop::Reap {
+                    pid,
+                    dst,
+                    has_result,
+                })
+            }
             Outcome::Instantiate {
                 ibase,
                 isize: isz,
@@ -8460,6 +8608,13 @@ enum TaskState {
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
     },
+    /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes;
+    /// the settle scan delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A
+    /// trapped twin reaps as a nonzero crash status, never a propagated trap (reap ≠ join).
+    BlockedReap {
+        pid: usize,
+        dst: u32,
+    },
     /// Finished — its result (or trap) is retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -8542,6 +8697,10 @@ fn drive(
     // member's trap/exit — a later live call through one completes with an errno instead of
     // parking forever (D37 death-is-revocation; the tree-walker's dead-callee park probe).
     let mut dead_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned). The
+    // servicer-side `reap` (`wait`) acts only on ids in this allow-set (a foreign/bogus pid is
+    // `-ECHILD`, never a park that hangs); an id is retired when reaped.
+    let mut forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
     loop {
         // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
@@ -8600,6 +8759,26 @@ fn drive(
                 t.vt.active.set(dst, Reg::from_i64(v));
                 t.state = TaskState::Runnable;
             }
+        }
+        // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
+        // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
+        // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
+        // then deliver) so the caller and the twin task are not borrowed at once.
+        let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, t)| match &t.state {
+                TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
+                    TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (ci, dst, status, pid) in reap_wakes {
+            tasks[ci].vt.active.set(dst, Reg::from_i64(status));
+            tasks[ci].state = TaskState::Runnable;
+            forked_twins.remove(&pid);
         }
         let Some(ti) = tasks
             .iter()
@@ -8844,6 +9023,203 @@ fn drive(
                     .vt
                     .active
                     .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
+            }
+            Ok(VcpuStop::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+                has_result,
+            }) => {
+                // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
+                // parked on this handler's dispatch into a live **twin** (private window +
+                // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
+                // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
+                // same fork `cap.call`. Fail-closed to a single reply on any shape the driver can't
+                // duplicate — never a hang, mirroring the oracle's degrade (svm-interp
+                // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
+                let result: i64 = 'fork: {
+                    // The running handler's dispatch ticket names the parked caller; outside a
+                    // handler there is none → `-EINVAL`, exactly as the oracle.
+                    let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                        break 'fork super::EINVAL;
+                    };
+                    // The server (this task) is the callee the caller parked on. In the fork
+                    // topology the server is a spawned child with an `Arc` host (never the root).
+                    let Some(server_env) = tasks[ti].env else {
+                        break 'fork super::EINVAL;
+                    };
+                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
+                    // the caller has already parked (it enqueued + woke us before we ran), so a miss
+                    // is defensive → degrade.
+                    let caller_ti = tasks.iter().position(|t| {
+                        matches!(&t.state,
+                            TaskState::BlockedTicket { ticket: tk, callee, .. }
+                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                    });
+                    let degrade = |tasks: &mut Vec<TaskSlot>, caller_ti: Option<usize>| -> i64 {
+                        // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
+                        // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
+                        let fallback = reply_orig.unwrap_or(super::EAGAIN);
+                        if let Some(cti) = caller_ti {
+                            if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state {
+                                tasks[cti].vt.active.set(cdst, Reg::from_i64(fallback));
+                                tasks[cti].state = TaskState::Runnable;
+                            }
+                        }
+                        reply_orig.map_or(super::EAGAIN, |_| 0)
+                    };
+                    let Some(caller_ti) = caller_ti else {
+                        break 'fork degrade(&mut tasks, None);
+                    };
+                    let TaskState::BlockedTicket {
+                        dst: caller_dst, ..
+                    } = tasks[caller_ti].state
+                    else {
+                        break 'fork super::EINVAL;
+                    };
+                    let caller_env = tasks[caller_ti].env;
+                    // Only a bare root caller (no spawned children/threads, no live fiber chain)
+                    // forks faithfully — the oracle's `bare` gate. Anything else degrades.
+                    let bare = tasks[caller_ti].threads.iter().all(|t| t.is_none())
+                        && tasks[caller_ti].vt.active_id == ROOT_FIBER
+                        && tasks[caller_ti].vt.chain.is_empty();
+                    // Duplicate the caller's window (private copy — fork does not share memory) and
+                    // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
+                    // or a non-forkable window/powerbox fails closed to a single reply.
+                    let forked = if bare {
+                        caller_env.and_then(|ck| {
+                            let twin_mem = match &extra_envs[ck].mem {
+                                Some(m) => Some(m.fork_private()?),
+                                None => None,
+                            };
+                            let twin_host = extra_envs[ck]
+                                .host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .fork_powerbox()?;
+                            Some((ck, twin_mem, twin_host))
+                        })
+                    } else {
+                        None
+                    };
+                    let Some((ck, twin_mem, twin_host)) = forked else {
+                        break 'fork degrade(&mut tasks, Some(caller_ti));
+                    };
+                    // The twin's continuation is the caller's — a bare root `Vm` cloned at its
+                    // post-call resume point (`Vm` derives `Clone`; a bare caller carries no resume
+                    // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
+                    let mut twin_active = tasks[caller_ti].vt.active.clone();
+                    twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                    let twin_vt = VTask {
+                        active: twin_active,
+                        active_id: ROOT_FIBER,
+                        chain: Vec::new(),
+                        root_shadow_sp: super::SHADOW_BASE,
+                        active_invoke: None,
+                        invoke_step_into: false,
+                    };
+                    // The twin is its own domain: a fresh env over the private window + duplicated
+                    // powerbox, a natural table over the caller's (same-)module, the caller's env fuel.
+                    let twin_table = build_table(dom.source.primary().progs.len(), 0);
+                    let twin_eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: twin_mem,
+                        host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
+                        table: twin_table,
+                        fuel: extra_envs[ck].fuel,
+                    });
+                    let twin_ti = tasks.len();
+                    tasks.push(TaskSlot {
+                        vt: twin_vt,
+                        threads: Vec::new(),
+                        env: Some(twin_eidx),
+                        state: TaskState::Runnable,
+                    });
+                    // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
+                    // its exit status to the parent (FORK.md §8.6); retired when reaped.
+                    forked_twins.insert(twin_ti);
+                    // Deliver the original's reply and re-run it: explicit `reply_orig`, or pid mode
+                    // = the twin's task id (parent-sees-pid). The handler's own return still writes
+                    // the ticket's completion cell, but the caller is now `Runnable` (not
+                    // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
+                    let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
+                    tasks[caller_ti]
+                        .vt
+                        .active
+                        .set(caller_dst, Reg::from_i64(orig_reply));
+                    tasks[caller_ti].state = TaskState::Runnable;
+                    twin_ti as i64
+                };
+                if has_result {
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(result));
+                }
+            }
+            Ok(VcpuStop::Reap {
+                pid,
+                dst,
+                has_result,
+            }) => {
+                // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
+                // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
+                // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
+                // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
+                let result: i64 = 'reap: {
+                    let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                        break 'reap super::EINVAL;
+                    };
+                    let Some(server_env) = tasks[ti].env else {
+                        break 'reap super::EINVAL;
+                    };
+                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    let caller_ti = tasks.iter().position(|t| {
+                        matches!(&t.state,
+                            TaskState::BlockedTicket { ticket: tk, callee, .. }
+                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                    });
+                    // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
+                    // handler's own return delivers to the still-parked caller (the normal serve path).
+                    let Some(pid_us) = usize::try_from(pid)
+                        .ok()
+                        .filter(|p| forked_twins.contains(p))
+                    else {
+                        break 'reap super::ECHILD;
+                    };
+                    // The cooperative driver parks the caller before the handler runs, so a miss is
+                    // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
+                    let Some(caller_ti) = caller_ti else {
+                        break 'reap super::EAGAIN;
+                    };
+                    let TaskState::BlockedTicket {
+                        dst: caller_dst, ..
+                    } = tasks[caller_ti].state
+                    else {
+                        break 'reap super::EINVAL;
+                    };
+                    // Twin finished → deliver its status now and retire it; else park the caller on it
+                    // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
+                    // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
+                    // the settle scan never claims it (harmless, mirroring `clone_caller`).
+                    if let TaskState::Done(res) = &tasks[pid_us].state {
+                        let status = super::reap_status(res);
+                        forked_twins.remove(&pid_us);
+                        tasks[caller_ti]
+                            .vt
+                            .active
+                            .set(caller_dst, Reg::from_i64(status));
+                        tasks[caller_ti].state = TaskState::Runnable;
+                        status
+                    } else {
+                        tasks[caller_ti].state = TaskState::BlockedReap {
+                            pid: pid_us,
+                            dst: caller_dst,
+                        };
+                        0
+                    }
+                };
+                if has_result {
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(result));
+                }
             }
             Ok(VcpuStop::Spawn {
                 func,
@@ -9770,7 +10146,9 @@ fn run_vcpu_parallel<'scope, 'env>(
             // does, rather than park unwakeably.
             Ok(VcpuStop::LiveCall { .. })
             | Ok(VcpuStop::SvcWait)
-            | Ok(VcpuStop::ChildOffer { .. }) => return (Err(Trap::ThreadFault), mem),
+            | Ok(VcpuStop::ChildOffer { .. })
+            | Ok(VcpuStop::CloneCaller { .. })
+            | Ok(VcpuStop::Reap { .. }) => return (Err(Trap::ThreadFault), mem),
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
@@ -11426,6 +11804,52 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::ChildOffer { child, export, dst });
+                }
+                Op::CloneCaller {
+                    args,
+                    dst,
+                    has_result,
+                } => {
+                    // Arity picks the mode (mirrors the oracle, `svm-interp` clone_caller arm):
+                    // 2 args = explicit `(reply_orig, reply_twin)`; 0/1 args = pid mode
+                    // (`reply_orig = None` → the parent gets the twin's task id).
+                    let (reply_orig, reply_twin) = if args.len() >= 2 {
+                        (Some(r!(args[0]).i64()), r!(args[1]).i64())
+                    } else {
+                        let twin = args.first().map(|a| r!(*a).i64()).unwrap_or(0);
+                        (None, twin)
+                    };
+                    let dst = *dst;
+                    let has_result = *has_result;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::CloneCaller {
+                        reply_orig,
+                        reply_twin,
+                        dst,
+                        has_result,
+                    });
+                }
+                Op::Reap {
+                    pid,
+                    dst,
+                    has_result,
+                } => {
+                    // The pid to reap (an out-of-range default → the driver answers -ECHILD).
+                    let pid = pid.map(|p| r!(p).i64()).unwrap_or(-1);
+                    let dst = *dst;
+                    let has_result = *has_result;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::Reap {
+                        pid,
+                        dst,
+                        has_result,
+                    });
                 }
                 Op::Instantiate {
                     handle,
