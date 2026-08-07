@@ -13,6 +13,30 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I74 — wasm-JIT single-shot runner emits a fall-through `unreachable` where it should compile-veto (S4; opened 2026-08-07 — correctness already handled by the runtime decline, PR #665)
+
+**What.** Some emitted functions in a chibicc-compiled artifact reach the **trailing function-body
+`unreachable`** (`svm-wasm-jit` `lib.rs:2669`, "every path returned / trapped / re-dispatched") at
+runtime: an emitted block falls through instead of returning or re-dispatching, so the emitted `f0`
+traps mid-run where the tree-walk interpreter completes and prints correctly. Surfaced by the
+`open_memstream` + buffered-`FILE*` stdio path (the memstream card in `browser-play-editor-test.mjs`):
+`printf("A\n")` lands, then the emitted run traps (a wasm `unreachable`, not a cross-tier decline)
+while the interpreter prints the full `[0][1][4] len=9`.
+
+**Correctness is already handled — this is a cleanliness/efficiency gap, not a wrong-result bug.**
+The single-shot runner now reports a trap as `STATUS_TRAP` (not a truncated `STATUS_OK`) and
+`driveJitRun` throws on it, so the caller declines the whole run to the interpreter oracle and shows
+the correct result (the return/exit/trap parity fix, PR #665). The remaining cost is that these
+programs run on the interpreter instead of the wasm-JIT, and emit-then-trap-at-runtime is less clean
+than a veto.
+
+**Why tracked.** Invariant 9 prefers a **compile-time veto** (`Error::Unsupported` → the function
+bounces cross-tier at emit time — decline, don't emit code that traps) over emit-and-trap. The fix:
+diagnose which control-flow / op construct in the memstream functions lowers to a fall-through, then
+either (a) lower it faithfully so the artifact runs fully on the JIT, or (b) decline that function at
+emit time so a run either JITs cleanly or falls back **per-function** rather than **per-run**. Needs a
+wasm-emit + trace loop to map the runtime trap back to the emitted function/block.
+
 ### I73 — punt-inside-a-fiber: the fast backends blocked the vCPU inline where the tree-walk oracle parks the fiber — **CONVERGED 2026-08-07, all three engines** (S3; opened by FIBER_PARK.md F1, closed by F2+F3 on the same arc)
 
 **F2** converged the bytecode cooperative driver (`FiberState::CapParked` + the ordered
