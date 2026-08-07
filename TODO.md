@@ -49,12 +49,6 @@ with rationale, and leave when a BUILT block lands in the owning doc.
 | `domain_exec` trap→exit-code mapping (v1: a trapping child is a failed `run`, `-EINVAL`) | EXEC.md as-built | reserved refinement |
 | Guest-served `"exec"` — a parent serving its child's exec with its own code (the none-the-wiser nested shell) | EXEC.md table row 4 | re-scoped 2026-07-23: self-mint-as-transfer is dropped, but this needs only the **mediation-consistent** form — a parent minting an offer over its *own* export and spawn-granting it to its child (granter has authority over grantee; no new transfer channel) |
 
-## Fiber-park promotion (decomposed 2026-08-07)
-
-| item | owner | status |
-|---|---|---|
-| **Fiber-park promotion** — a punted host call (`Pending`) inside a fiber parks the *fiber* (`FIBER_PARKED` unwind, the slice-5a contract), not the vCPU; restores the single-vCPU compute/host overlap recorded as the IoRing retirement's known loss | FIBER_PARK.md (slices F1–F4), DESIGN.md §12 | decomposed — F1 oracle park, F2 bytecode-cooperative parity, F3 Cranelift-JIT parity, F4 overlap bench + fold |
-
 ## Standing (not scheduled)
 
 | item | owner | status |
