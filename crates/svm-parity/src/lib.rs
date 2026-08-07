@@ -232,6 +232,7 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // the stack-switch substrate exists; the wasm-JIT (leaf) never runs concurrency itself. ---
         Inst::ContNew { .. }
         | Inst::ContResume { .. }
+        | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume on every backend
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }

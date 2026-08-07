@@ -2281,6 +2281,7 @@ pub fn map_operands(inst: &mut Inst, f: &mut impl FnMut(ValIdx) -> ValIdx) {
         }
         | Inst::ContNew { func: a, sp: b }
         | Inst::ContResume { k: a, arg: b }
+        | Inst::ContResumeBlock { k: a, arg: b }
         | Inst::CapSelfResolve {
             name_ptr: a,
             name_len: b,

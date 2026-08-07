@@ -498,6 +498,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 |----|:----:|:----:|:----:|:----:|-------|
 | `cont.new` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `cont.resume` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `cont.resume.block` | ✅ | ✅ | 🔶 | ⛔ | I48 advisory blocking resume: only the tree-walk oracle idles the vCPU; bytecode/Cranelift alias it to `cont.resume` (returning `FIBER_PARKED` conforms) — same parity row as `cont.resume` (DESIGN §12) |
 | `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |

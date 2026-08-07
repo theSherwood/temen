@@ -940,9 +940,10 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     | Inst::CallImport { .. }
                     | Inst::SetJmp { .. }
                     | Inst::LongJmp { .. } => s.has_park_seam = true,
-                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. } => {
-                        s.has_fiber = true
-                    }
+                    Inst::ContNew { .. }
+                    | Inst::ContResume { .. }
+                    | Inst::ContResumeBlock { .. } // I48: advisory alias to cont.resume here
+                    | Inst::Suspend { .. } => s.has_fiber = true,
                     Inst::ThreadSpawn { .. }
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }
@@ -1641,6 +1642,15 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
             dst,
         },
         Inst::ContResume { k, arg } => Op::ContResume {
+            k: g(*k),
+            arg: g(*arg),
+            dst,
+        },
+        // I48 — the blocking variant is **advisory**: returning `FIBER_PARKED` is a conforming
+        // result (the guest loops). The cooperative bytecode driver has no M:N idle core, so it
+        // aliases the op to `cont.resume` — same `(status, value)`, guest keeps polling. Nothing
+        // is vetoed off this backend; the oracle is the tier that actually idles (invariant 9).
+        Inst::ContResumeBlock { k, arg } => Op::ContResume {
             k: g(*k),
             arg: g(*arg),
             dst,

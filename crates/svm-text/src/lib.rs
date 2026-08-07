@@ -573,6 +573,7 @@ fn print_inst(inst: &Inst, m: &Module) -> String {
         // §12 fibers (stack switching).
         Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
         Inst::ContResume { k, arg } => format!("cont.resume v{k} v{arg}"),
+        Inst::ContResumeBlock { k, arg } => format!("cont.resume.block v{k} v{arg}"),
         Inst::Suspend { value } => format!("suspend v{value}"),
         Inst::SetJmp { buf } => format!("setjmp v{buf}"),
         Inst::LongJmp { buf, val } => format!("longjmp v{buf} v{val}"),
@@ -2689,6 +2690,11 @@ impl<'a> Parser<'a> {
             let k = self.value(names)?;
             let arg = self.value(names)?;
             return Ok(Inst::ContResume { k, arg });
+        }
+        if op == "cont.resume.block" {
+            let k = self.value(names)?;
+            let arg = self.value(names)?;
+            return Ok(Inst::ContResumeBlock { k, arg });
         }
         if op == "suspend" {
             return Ok(Inst::Suspend {

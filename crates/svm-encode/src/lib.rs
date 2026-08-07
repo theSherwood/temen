@@ -165,6 +165,7 @@ mod op {
     pub const ATOMIC_CMPXCHG: u8 = 0xC9; // ty, addr, expected, replacement, offset
 
     // §12 fibers (stack switching).
+    pub const CONT_RESUME_BLOCK: u8 = 0xBF; // I48 blocking variant: k, arg (advisory; = CONT_RESUME)
     pub const CONT_NEW: u8 = 0xCA; // func (funcref idx), sp (data-stack base)
     pub const CONT_RESUME: u8 = 0xCB; // k, arg
     pub const SUSPEND: u8 = 0xCC; // value
@@ -1064,6 +1065,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         }
         Inst::ContResume { k, arg } => {
             out.push(op::CONT_RESUME);
+            write_uleb(out, *k as u64);
+            write_uleb(out, *arg as u64);
+        }
+        Inst::ContResumeBlock { k, arg } => {
+            out.push(op::CONT_RESUME_BLOCK);
             write_uleb(out, *k as u64);
             write_uleb(out, *arg as u64);
         }
@@ -2464,6 +2470,10 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             sp: c.idx()?,
         },
         op::CONT_RESUME => Inst::ContResume {
+            k: c.idx()?,
+            arg: c.idx()?,
+        },
+        op::CONT_RESUME_BLOCK => Inst::ContResumeBlock {
             k: c.idx()?,
             arg: c.idx()?,
         },

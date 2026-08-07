@@ -5440,6 +5440,10 @@ fn ensure_supported(f: &Func) -> Result<(), JitError> {
                 // differential harness skips rather than miscompiles.
                 Inst::ContNew { .. }
                 | Inst::ContResume { .. }
+                // I48: the blocking variant lowers to the same resume thunk (advisory — the JIT
+                // vCPU is a real thread, so it returns FIBER_PARKED and the guest loops; the
+                // oracle is the tier that idles). Accepted wherever `cont.resume` is.
+                | Inst::ContResumeBlock { .. }
                 | Inst::Suspend { .. }
                 | Inst::ThreadSpawn { .. }
                 | Inst::ThreadJoin { .. }
@@ -5977,6 +5981,7 @@ fn module_uses_fibers(m: &IrModule) -> bool {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
+                        | Inst::ContResumeBlock { .. } // I48 (advisory alias to the resume thunk)
                         | Inst::Suspend { .. }
                         // `gc.roots` walks the fiber runtime's live stacks, so it needs the runtime
                         // stood up even if the module never explicitly creates a fiber.
@@ -6454,7 +6459,10 @@ fn lower_block(
             ubs.resize(vals.len(), UB_TOP);
             continue;
         }
-        if let Inst::ContResume { k, arg } = inst {
+        // I48: `cont.resume.block` aliases to the same resume thunk. A JIT vCPU is a real OS
+        // thread; the advisory contract lets it return FIBER_PARKED (the guest loops), so no idle
+        // path is needed here — the tree-walk oracle is the tier that actually idles (invariant 9).
+        if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
             // fiber_resume(handle:i64, arg:i64, status_out:*i64, trap_out:i64) -> value:i64.
             // Results are appended (status:i32, value:i64) to match the IR's two-result shape.
             let ss =
