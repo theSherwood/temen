@@ -240,3 +240,83 @@ fn non_zero_tvar_initializer_fails_closed_in_tls_mode() {
         "clean, specific error: {err:?}"
     );
 }
+
+#[test]
+fn tvar_block_offset_agrees_across_modules() {
+    // The cross-module Tier-2 property (NIM.md §3d): a `tvar` defined in one unit and referenced from
+    // another must resolve to the *same* per-vCPU block offset — the TLS analog of a relocated
+    // cross-module global. The linker pools every unit's tvars into one shared layout and hands it to
+    // all, so both sides bake the same `vcpu.tls.get()+off`.
+    //
+    // `mods` defines thread-var `g` and a `peek()` that reads it by its *local* name. `modw`'s `rw(v)`
+    // writes and reads `g` by its *cross-module* name `g.0.mods`. A driver sets a TLS base, then
+    // `rw(42)` writes 42 through modw's offset and `peek()` reads through mods's offset: if the two
+    // offsets agree, `peek` sees 42 (a disagreement would read a different, zeroed slot → 0).
+    // Result = rw*100 + peek = 42*100 + 42 = 4242.
+    //
+    // The filler thread-var `aa` (sorted before `g`) pushes `g`'s shared offset to 8, so the test
+    // proves the *accumulated* layout propagates cross-module — not a coincidental offset-0 match.
+    let mod_s = "\
+(stmts
+ (tvar :aa.0. . (i +64) .)
+ (tvar :g.0. . (i +64) .)
+ (proc :peek.0. . (i +64) . (stmts . (ret g.0.))))";
+    let mod_w = "\
+(stmts
+ (proc :rw.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (asgn g.0.mods v.0)
+   (ret g.0.mods))))";
+
+    // The driver stands in for the thread runtime: `vcpu.tls.set` a block base, then call the
+    // translated procs (imported under their stem-suffixed export names).
+    let driver = svm_text::parse_module(
+        "\
+memory 16
+import 0 \"rw.0.modw\" (i64) -> (i64)
+import 1 \"peek.0.mods\" () -> (i64)
+func 0 () -> (i64) {
+block 0 () {
+  b = i64.const 2048
+  vcpu.tls.set b
+  fortytwo = i64.const 42
+  r1 = call.import 0 (fortytwo)
+  r2 = call.import 1 ()
+  hund = i64.const 100
+  m = i64.mul r1 hund
+  res = i64.add m r2
+  return res
+  }
+}
+export 0 func \"_start\" 0
+",
+    )
+    .expect("driver parses");
+
+    let linked = svm_leng::link_units_tls_with_runtime(
+        &[
+            LengModule {
+                stem: "modw",
+                src: mod_w,
+                names: &["rw.0."],
+            },
+            LengModule {
+                stem: "mods",
+                src: mod_s,
+                names: &["peek.0."],
+            },
+        ],
+        vec![LinkUnit {
+            module: driver,
+            exports: vec![],
+            ..Default::default()
+        }],
+    )
+    .unwrap_or_else(|e| panic!("link_units_tls: {e:?}"));
+    // Funcs: modw.rw=0, mods.peek=1, driver._start=2.
+    assert_eq!(
+        run(&linked, 2, &[]),
+        4242,
+        "cross-module write (modw) and local read (mods) hit the same tvar slot"
+    );
+}

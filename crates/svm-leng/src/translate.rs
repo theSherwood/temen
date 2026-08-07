@@ -299,11 +299,21 @@ pub(crate) struct Translator {
     /// `tvar` collapses to a plain global. The per-thread block itself is established by the runtime
     /// (a `vcpu.tls.set` at thread entry), outside svm-leng, exactly as the C runtime sets fs/gs base.
     tls_mode: bool,
-    /// Thread-vars → their offset **within the TLS block** (populated only in `tls_mode`).
+    /// Thread-vars → their offset **within the TLS block** (populated only in `tls_mode`). Holds both
+    /// a defining unit's local `tvar` names and, when linking, sibling units' stem-suffixed names —
+    /// both mapping to the *same* shared offset, so cross-module accesses agree (NIM.md §3d).
     tls_vars: HashMap<String, (u64, TyDesc)>,
-    /// Running size of the TLS block (bytes): the next `tvar`'s offset, and the block size the
-    /// runtime must allocate + zero per thread.
+    /// Running size of the TLS block (bytes) in **single-module** `tls_mode`: the next `tvar`'s
+    /// offset. Unused when linking — there [`ext_tls_layout`] owns the offsets.
     tls_block_size: u64,
+    /// The **shared cross-module TLS layout** (stem-suffixed `tvar` name → block offset), computed by
+    /// the linker's pre-pass over all units and injected by [`import_tls_layout`]. Empty for a
+    /// single-module `translate_tls`; when non-empty, a `tvar`'s offset comes from here, not the local
+    /// counter, so every unit bakes the same `vcpu.tls.get()+off` for a given thread-var.
+    ext_tls_layout: HashMap<String, u64>,
+    /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
+    /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
+    own_stem: String,
 }
 
 impl Translator {
@@ -327,6 +337,8 @@ impl Translator {
             tls_mode: false,
             tls_vars: HashMap::new(),
             tls_block_size: 0,
+            ext_tls_layout: HashMap::new(),
+            own_stem: String::new(),
         }
     }
 
@@ -493,8 +505,23 @@ impl Translator {
                             }
                         }
                         let sz = self.sizeof(&desc);
-                        self.tls_vars.insert(name, (self.tls_block_size, desc));
-                        self.tls_block_size += sz.max(8);
+                        let off = if self.ext_tls_layout.is_empty() {
+                            // Single-module `translate_tls`: lay the block out locally.
+                            let o = self.tls_block_size;
+                            self.tls_block_size += sz.max(8);
+                            o
+                        } else {
+                            // Linking: the shared layout (keyed by this tvar's stem-suffixed name)
+                            // owns the offset, so every unit agrees — the TLS analog of a relocated
+                            // cross-module global. A tvar the pre-pass didn't see is fail-closed.
+                            let key = format!("{}{}", name, self.own_stem);
+                            *self.ext_tls_layout.get(&key).ok_or_else(|| {
+                                LengError::Unsupported(format!(
+                                    "thread-var `{name}` missing from the shared TLS layout"
+                                ))
+                            })?
+                        };
+                        self.tls_vars.insert(name, (off, desc));
                         continue;
                     }
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
@@ -1171,6 +1198,45 @@ impl Translator {
         for (name, sig) in ext {
             self.ext_funcrefs.insert(name.clone(), sig.clone());
         }
+    }
+
+    /// Enable **Tier-2 TLS linking** with the whole program's **shared TLS layout** (NIM.md §3d):
+    /// `layout` maps each `tvar`'s stem-suffixed global name to its offset in the per-vCPU block,
+    /// computed once by [`export_tls_vars`] across all units. Registering the stem-suffixed names lets
+    /// a unit that *references* a sibling's `tvar` (`counter.0.<sys>`) emit `vcpu.tls.get()+off`
+    /// (scalar i64, as for a cross-module data symbol); the defining unit's own local name binds to
+    /// the same offset in [`collect_globals`], so both sides hit one slot.
+    pub fn import_tls_layout(&mut self, layout: &HashMap<String, u64>, own_stem: &str) {
+        self.tls_mode = true;
+        self.own_stem = own_stem.to_string();
+        for (name, &off) in layout {
+            self.ext_tls_layout.insert(name.clone(), off);
+            self.tls_vars
+                .insert(name.clone(), (off, TyDesc::Scalar(ValType::I64)));
+        }
+    }
+
+    /// Collect a module's **thread-vars** under their stem-suffixed global names, with each one's
+    /// size — the input to the linker's shared TLS layout. Mirrors [`export_funcrefs`]: a throwaway
+    /// `tls_mode` translator resolves each `tvar`'s type (so the size is exact), then [`link_selected`]
+    /// pools these across units and assigns disjoint block offsets before translating any. (Aggregate
+    /// `tvar`s whose type lives in a *sibling* unit resolve only if that type is local here — a
+    /// bounded gap; scalar thread-vars, the allocator/exception state, always resolve.)
+    pub fn export_tls_vars(root: &Node, stem: &str) -> Result<Vec<(String, u64)>, LengError> {
+        let mut t = Translator::new().with_tls();
+        t.collect_types(root)?;
+        t.collect_globals(root)?;
+        let items: Vec<(String, TyDesc)> = t
+            .tls_vars
+            .iter()
+            .map(|(n, (_, d))| (n.clone(), d.clone()))
+            .collect();
+        let mut out: Vec<(String, u64)> = items
+            .iter()
+            .map(|(n, d)| (format!("{n}{stem}"), t.sizeof(d).max(8)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic layout
+        Ok(out)
     }
 
     /// Collect a module's **funcref globals** under their stem-suffixed global names — the form
