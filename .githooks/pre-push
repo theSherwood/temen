@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pre-push hook — fast local mirror of CI's `check` job (build · test · fmt · clippy).
+#
+# Purpose: catch the boring, common failures (formatting, lints, a broken build, a
+# failing test on your host target) *before* they cost a CI round-trip. It is a
+# convenience for fast feedback, NOT the authoritative gate — the CI matrix
+# (Windows/macOS, miri/asan/tsan/loom, fuzz, differential) still runs on the PR and
+# is what actually protects `main`. See AGENTS.md and `.github/workflows_src/README.md`.
+#
+# Enable (opt-in, per-clone):   git config core.hooksPath .githooks
+#   or run:                     scripts/ci/install-git-hooks.sh
+#
+# Escape hatches:
+#   SVM_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
+#   SVM_HOOK_SKIP_TESTS=1  git push   # run fmt+clippy+build, skip the (slower) test step
+set -euo pipefail
+
+if [ "${SVM_HOOK_SKIP:-0}" = "1" ]; then
+  echo "pre-push: SVM_HOOK_SKIP=1 — skipping local checks."
+  exit 0
+fi
+
+# Skip when every ref being pushed is a deletion (nothing to build/test).
+only_deletes=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  case "$local_sha" in
+    0000000000000000000000000000000000000000) : ;;  # branch deletion
+    *) only_deletes=0 ;;
+  esac
+done
+if [ "$only_deletes" = "1" ]; then
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# Match CI's posture: warnings are hard errors (ci.yml sets RUSTFLAGS: "-D warnings").
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
+
+run() {
+  echo "pre-push: \$ $*"
+  "$@"
+}
+
+echo "pre-push: running the fast CI subset (set SVM_HOOK_SKIP=1 to bypass)…"
+run cargo fmt --all --check
+run cargo clippy --workspace --all-targets -- -D warnings
+run cargo build --workspace
+if [ "${SVM_HOOK_SKIP_TESTS:-0}" = "1" ]; then
+  echo "pre-push: SVM_HOOK_SKIP_TESTS=1 — skipping tests."
+else
+  run cargo test --workspace
+fi
+
+echo "pre-push: OK — the CI matrix still runs the full gate on your PR."
