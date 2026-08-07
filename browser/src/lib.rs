@@ -4886,6 +4886,37 @@ pub extern "C" fn svm_onramp_trap_len() -> usize {
     len
 }
 
+// ---- cross-tier `env.call_interp` slot ABI (shared by the three servicers below) ------------------
+//
+// The emitter (svm-wasm-jit `emit_slot_store` / `emit_slot_load`) packs each cross-tier arg/result
+// into one 8-byte scratch slot; these two helpers are the host end of that single encoding, so all
+// three `*_call_interp` servicers decode/encode identically. `i32` fills the slot (widened); `f32`
+// uses its low 4 bytes; `i64`/`f64` the full slot. `v128` needs two slots and is excluded by
+// `marshallable_sig`, so it never appears in a cross-tier signature.
+
+/// Decode one scratch slot (read as a little-endian `u64`) to a [`Value`] of the callee's param type.
+fn slot_to_value(ty: svm_ir::ValType, raw: u64) -> Value {
+    match ty {
+        svm_ir::ValType::I32 => Value::I32(raw as i32),
+        svm_ir::ValType::I64 => Value::I64(raw as i64),
+        svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
+        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
+        _ => Value::I64(raw as i64), // v128 never reaches a cross-tier leaf; decode defensively
+    }
+}
+
+/// Encode a cross-tier result [`Value`] into its 8-byte slot bits. `None` for a `v128` result (not
+/// marshallable — the caller fails the cross-tier call closed).
+fn value_to_slot(v: &Value) -> Option<u64> {
+    match v {
+        Value::I32(x) => Some(*x as u32 as u64),
+        Value::I64(x) => Some(*x as u64),
+        Value::F32(x) => Some(x.to_bits() as u64),
+        Value::F64(x) => Some(x.to_bits()),
+        _ => None,
+    }
+}
+
 // ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
 //
 // Unlike the interpreter reactor (`svm_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
@@ -5041,10 +5072,7 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
     let args: Vec<Value> = params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     match reactor.run_cross_tier(func, &args) {
         Ok(vals) => {
@@ -5052,10 +5080,8 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
                 if i >= results.len() {
                     break;
                 }
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return STATUS_TRAP,
+                let Some(raw) = value_to_slot(v) else {
+                    return STATUS_TRAP;
                 };
                 let b = raw.to_le_bytes();
                 // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
@@ -5350,10 +5376,7 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
     let args: Vec<Value> = params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     match run.run_cross_tier(func, &args) {
         Ok(vals) => {
@@ -5361,10 +5384,8 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
                 if i >= results.len() {
                     break;
                 }
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return STATUS_TRAP,
+                let Some(raw) = value_to_slot(v) else {
+                    return STATUS_TRAP;
                 };
                 let b = raw.to_le_bytes();
                 // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
@@ -6017,20 +6038,15 @@ pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
         .params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     let _ = nparams;
     let mut fuel = u64::MAX;
     match bytecode::compile_and_run(m, func, &args, &mut fuel) {
         Some(Ok(vals)) if vals.len() == nresults => {
             for (i, v) in vals.iter().enumerate() {
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return 1, // non-integer result: an interp leaf has an integer signature
+                let Some(raw) = value_to_slot(v) else {
+                    return 1; // v128 result: not marshallable through the scratch slot
                 };
                 let b = raw.to_le_bytes();
                 unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
