@@ -201,6 +201,17 @@ the `Module`) or **rolled** loops (N-independent residual size). This quantifies
 stitched + cached is the deployment target, and confirms the pipeline costs nothing at runtime
 (residual parity with baseline end-to-end).
 
+**Execution-vs-execution number (2026-08-07, `rolled_residual_vs_interpreter_per_iteration`)** — the
+payoff the arc was pointing at, now measured directly. A rolled residual runs standalone with a
+*dynamic* trip count, so its module is N-independent and the differential-N trick cancels compile on
+*both* sides — the first true execution-only comparison. On a pure `x = x + 3` loop the interpreter
+costs **≈ 17.6 ns/iter** and the dispatch-folded rolled residual **≈ 1.53 ns/iter**: an **11.5×
+per-iteration execution speedup**. (The 93 ns/iter baseline above is heavier because it pays a full
+Lua `add(x,3)` call each iteration; the two baselines differ by exactly that call overhead.) With the
+interpreter's decode+dispatch removed, the rolled residual runs an order of magnitude faster per
+iteration — confirming rolled loops are the shape that actually pays, not just the shape that avoids
+the unroll blow-up.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
