@@ -112,6 +112,7 @@ pub fn catalog() -> Vec<Op> {
     simd(&mut ops);
     control_and_calls(&mut ops);
     caps_and_reflection(&mut ops);
+    process(&mut ops);
     fibers_threads(&mut ops);
     terminators(&mut ops);
     ops
@@ -1172,6 +1173,49 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
     ] {
         // Listed for the matrix; module is a placeholder (never compiled — conf_skip).
         push_skip(ops, name.into(), FAM, inst, Module::default(), skip);
+    }
+}
+
+fn process(ops: &mut Vec<Op>) {
+    const FAM: &str = "process, serve & fork";
+    // Every op here is a `cap.call` sub-op that needs scheduler + host wiring (a live child, a serve
+    // point, a parked caller) to run — so the end-to-end pin is skipped, exactly like the `cap.call`
+    // and import/export rows. Their support is instead exercised by the fork/serve differential
+    // harnesses (`clone_caller.rs`, `svc_serve_loop.rs`, `c_fork.rs`, `fork_manager.rs`); this
+    // section makes their **classification** visible in the matrix, where a single `cap.call` row
+    // used to hide the fork gap. `parity()` classifies each by `(type_id, op)`.
+    let skip = "process/serve substrate — scheduler + host wiring; exercised by the fork/serve \
+                differential harnesses, not auto-synth";
+    let self_ty = svm_ir::CAP_SELF_TYPE_ID;
+    let inst = crate::capcall::INSTANTIATOR;
+    let capcall = |type_id: u32, op: u32| Inst::CapCall {
+        type_id,
+        op,
+        sig: FuncType::default(),
+        handle: 0,
+        args: vec![],
+    };
+    for (name, type_id, op) in [
+        // §14 executor children — the process-spawn nouns.
+        ("instantiate", inst, 0u32),
+        ("join", inst, 1),
+        ("instantiate_module", inst, 5),
+        ("child_offer", inst, 14),
+        // §3.6 service points + the FORK.md self-namespace ops.
+        ("svc.poll", self_ty, crate::capcall::SVC_POLL),
+        ("svc.wait", self_ty, crate::capcall::SVC_WAIT),
+        ("clone_caller", self_ty, crate::capcall::CLONE_CALLER),
+        ("reap", self_ty, crate::capcall::REAP),
+        ("fuel.remaining", self_ty, crate::capcall::FUEL_REMAINING),
+    ] {
+        push_skip(
+            ops,
+            name.into(),
+            FAM,
+            capcall(type_id, op),
+            Module::default(),
+            skip,
+        );
     }
 }
 

@@ -18,6 +18,61 @@ fn module(text: &str) -> Arc<svm_ir::Module> {
     Arc::new(m)
 }
 
+/// FORK.md §8.5 / OPS_PARITY.md (`clone_caller`/`reap`) — the fast-backend fork gap is **fail-
+/// closed**. A serving module whose handler forks or reaps must fold whole to the tree-walk oracle;
+/// it must never compile on a fast backend and answer `-EINVAL` where the oracle forks — that would
+/// be a silent divergence (INVARIANTS.md #9). Pin the shared serve-qualification veto directly: a
+/// bare service point serves natively, but adding a `clone_caller`/`reap` seam declines the module.
+/// Closing the gap (native fast-backend fork) is exactly making these ops stop declining here.
+#[test]
+fn a_serving_module_that_forks_or_reaps_folds_to_the_oracle() {
+    use svm_interp::bytecode::serve_qualifies;
+    use svm_ir::{Block, Func, FuncType, Inst, Terminator, ValType, CAP_SELF_TYPE_ID};
+
+    let self_cap = |op: u32, results: Vec<ValType>| Inst::CapCall {
+        type_id: CAP_SELF_TYPE_ID,
+        op,
+        sig: FuncType {
+            params: vec![],
+            results: results.clone(),
+        },
+        handle: 0,
+        args: vec![],
+    };
+    // A bare `svc.poll` service point is serve-qualified (a fast backend runs the serve loop).
+    let serve_only = vec![Func {
+        params: vec![],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![],
+            insts: vec![self_cap(svm_interp::CAP_SELF_SVC_POLL, vec![ValType::I32])],
+            term: Terminator::Return(vec![0]),
+        }],
+    }];
+    assert!(
+        serve_qualifies(&serve_only),
+        "a bare serve point should qualify for native serving"
+    );
+
+    // Adding a handler that forks (`clone_caller`) or reaps (`reap`) must veto native serving.
+    for fork_op in [svm_interp::CAP_SELF_CLONE_CALLER, svm_interp::CAP_SELF_REAP] {
+        let mut funcs = serve_only.clone();
+        funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![self_cap(fork_op, vec![])],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        assert!(
+            !serve_qualifies(&funcs),
+            "a serving module whose handler uses self-op {fork_op} must fold to the oracle"
+        );
+    }
+}
+
 /// func 0 (root/caller): spawn a server running func 1, mint an offer over export 0 (`svc` → func 2),
 /// call it with `7`, return the reply. func 1 (server entry): serve one dispatch via `svc.wait`
 /// (op 10). func 2 (the handler, bound to the offer): `clone_caller(999, 0)` — the explicit two-reply

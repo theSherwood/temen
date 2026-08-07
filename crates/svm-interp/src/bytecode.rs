@@ -872,6 +872,12 @@ impl Seams {
     /// never drift over which modules serve natively vs. decline to the tree-walk oracle. Adding a
     /// new park-capable seam means extending this one list. (INVARIANTS.md §9: one veto predicate,
     /// one definition.)
+    ///
+    /// The fork substrate rides this veto: `clone_caller` / `reap` register as park seams
+    /// ([`scan_seams`]), so a serving module that forks folds whole to the oracle — the fast
+    /// backends cannot run the fork ops yet (FORK.md §8.5; OPS_PARITY.md `clone_caller`/`reap`), and
+    /// folding fail-closed is what keeps them from silently diverging (answering `-EINVAL` where the
+    /// oracle forks). Landing native fast-backend fork is exactly removing that seam registration.
     fn svc_park_veto(&self) -> bool {
         self.has_svc
             && (self.has_park_seam
@@ -925,6 +931,19 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                         op: 9 | 10,
                         ..
                     } => s.has_svc = true,
+                    // FORK.md — `clone_caller` (11) / `reap` (12): the fork substrate is eval-loop-
+                    // only (it reshapes/forks the parked caller via the scheduler's `fork_twin` /
+                    // `reap_parked_caller`, which the fast backends don't drive yet). A handler that
+                    // calls one could otherwise compile natively and answer `-EINVAL` where the
+                    // oracle forks — a silent divergence (INVARIANTS.md #9). Treat them as park
+                    // seams so a serving module containing one folds whole to the tree-walk oracle
+                    // (fail-closed) until the fast-backend fork track lands native support
+                    // (FORK.md §8.5). Removing an entry here is part of closing that gap.
+                    Inst::CapCall {
+                        type_id: svm_ir::CAP_SELF_TYPE_ID,
+                        op: 11 | 12,
+                        ..
+                    } => s.has_park_seam = true,
                     // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
                     // can be *bound* to one at spawn — either inside a handler would need the
                     // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.

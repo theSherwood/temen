@@ -1,11 +1,16 @@
 # FORK.md — `fork()`-returns-twice, the durable-clone capstone
 
-The plan for POSIX `fork()` on svm (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage) — **landed**
-(PRs 1–5 + track 2; §5/§8 below are the as-built record). The parked call transport fork rides is
-settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork *semantics* — reply-injection
-(§3), the child handle model (§4), the clone spec (§6), invariants (§7), and the fork+wait
-contract (§8.6) — plus the build log the code comments cite. R8 closure (durable `call_indirect`
-to may-suspend targets) was the prereq and is done.
+The plan for POSIX `fork()` on svm (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage) — **landed
+on the tree-walk oracle** (PRs 1–5 + track 2; §5/§8 below are the as-built record). The parked call
+transport fork rides is settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork
+*semantics* — reply-injection (§3), the child handle model (§4), the clone spec (§6), invariants
+(§7), and the fork+wait contract (§8.6) — plus the build log the code comments cite. R8 closure
+(durable `call_indirect` to may-suspend targets) was the prereq and is done.
+
+**Backend parity: fork runs on 1 of 4 backends today** (the tree-walk oracle). This is now visible
+in `OPS_PARITY.md` (`clone_caller`/`reap` are 🚧 on the bytecode + Cranelift columns, ⛔ on the
+wasm-JIT) rather than hidden inside a single `cap.call` row. Closing it is **§9's fast-backend fork
+track** — the "separate track" §8.4/§8.5 deferred. See §9.
 
 ## 1. The mechanism (PROCESS.md §7, verbatim intent)
 
@@ -430,3 +435,59 @@ Interp only, like every fork test.
 -replace on the durable-clone capstone), then wiring `fork`/`wait` end-to-end through a compiled-C
 `sh_spawn` (the `c_fork.rs` guest gains the `wait` import), and job-control `waitpid` flags (`WNOHANG`,
 group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking `results` probe.
+
+## 9. Fast-backend fork parity — the next track (STARTED)
+
+Fork is a real parity gap we intend to close, not a by-design fold (INVARIANTS.md #9: "very few
+gaps we don't want to close" — this is not one of them). The oracle runs `fork()`; the three fast
+backends do not. This section is the convergence plan; the matrix now names the gap.
+
+### 9.0 Where it stands (2026-08-07)
+
+- **Honest matrix.** The process/serve/fork ops are their own `OPS_PARITY.md` family
+  (`process, serve & fork`), classified per-backend by `svm-parity`'s `parity_capcall` — instead of
+  hiding inside the one `cap.call` row that (wrongly) read ✅✅✅. `clone_caller`/`reap` show 🚧 on
+  bytecode + Cranelift (a real gap), ⛔ on the wasm-JIT (leaf accelerator — it folds *every* cap op
+  by design, so fork stays ⛔ there like `cap.call`). `svc.poll`/`svc.wait` are ✅ on the fast
+  backends (native serve loop when serve-qualified); the Instantiator spawn/join ops are ✅ too.
+- **Fail-closed guaranteed.** `clone_caller`/`reap` now register as **park seams** in
+  `bytecode::scan_seams`, so the shared serve-qualification veto (`svc_park_veto`, the one predicate
+  both the bytecode compile gate and svm-run's Cranelift routing consult) folds any *serving* module
+  that forks to the oracle. This closes a latent divergence: a serve handler calling `clone_caller`
+  could previously compile natively and answer `-EINVAL` where the oracle forks. Pinned by
+  `clone_caller.rs::a_serving_module_that_forks_or_reaps_folds_to_the_oracle`. **Landing native
+  support is exactly removing that seam registration**, per backend, as each slice below lands.
+
+### 9.1 Order: bytecode first, then Cranelift, wasm-JIT never
+
+The wasm-JIT is a leaf accelerator (DESIGN §3) — it runs no cap/serve/fiber op itself and folds them
+to the bytecode interp underneath. Fork stays ⛔ there **by design**; "closing the gap" means the two
+engines that *do* run cap ops: the **bytecode interpreter** and the **Cranelift JIT**.
+
+Take **bytecode first** — it is far closer to the oracle: it shares the same `Scheduler`, `Host`,
+`Mem`, and the *entire* fork substrate (`fork_twin`, `fork_parked_caller`, `reap_parked_caller`,
+`forked_twins`) already lives in `svm-interp/src/lib.rs`. The bytecode serve loop (`Op::SvcPoll`,
+the rewind linkage) already admits handlers over the one world; the only missing piece is that a
+handler running `clone_caller`/`reap` can't yet reach `serve_run.ticket` + the scheduler to drive
+that shared machinery. Cranelift is the harder, later slice (its serve loop lives in `svm-run`, its
+handlers are compiled code, and the twin's continuation is a native frame, not an interp `Vec`).
+
+### 9.2 Bytecode slices (proposed — mirrors the oracle's increment arc, §8.1)
+
+1. **Handler→caller linkage.** Give the bytecode serve driver the same `serve_run.ticket` +
+   callee-domain-id it needs to look up the parked caller in `ticket_waiters` — the increment-1
+   primitive, but on the bytecode `Op::SvcPoll` driver. Add `Op::CloneCaller`/`Op::Reap` (compiled
+   from `cap.call CAP_SELF 11/12`, replacing today's decline) that surface to the driver.
+2. **Reply-injection nucleus.** From the bytecode handler, deliver the injected reply to the parked
+   caller via the existing `cap_reply_or_stash` and set `ServeRun.replied` — reusing the oracle's
+   path verbatim (the reply crosses in the same live run; no durable image needed, §8.2).
+3. **The twin + reap.** Wire `fork_twin`/`fork_parked_caller` and `reap_parked_caller` from the
+   bytecode driver — the substrate is shared, so this is *driver plumbing*, not new fork mechanism.
+   Remove the `clone_caller`/`reap` park-seam registration for the bytecode gate as each op lands.
+4. **Differential pin.** Extend `bytecode_diff` with the fork shapes (`SRC_FORK_PID`, fork+wait) so
+   the bytecode fork is proven bit-exact against the oracle — the §18 discipline every backend op
+   already meets. Only then does the matrix flip `clone_caller`/`reap` bytecode → ✅.
+
+Cranelift follows on the same arc once bytecode is proven, reusing `instantiator_rt` + the svm-run
+serve loop; its load-bearing risk is the native-frame twin continuation (the §8 "capture" risk, on
+compiled code). The wasm-JIT column stays ⛔.
