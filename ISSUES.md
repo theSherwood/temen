@@ -179,7 +179,7 @@ eval-loop arm (`crates/svm-interp/src/lib.rs`): admission opens with `state_.try
 callers on distinct vCPUs collide on that brief snapshot lock; the loser is handed a spurious
 `-EAGAIN`, so its `store` handler **never runs** and its cell stays `0`. The thread's return value
 (`-11`) is discarded by the consumer, so the only visible effect is the short sum (`10 + 0 = 10`).
-This violates the `Threaded` contract (CALLS.md §10.1: **no admission gate**) — the `-EAGAIN`-on-held
+This violates the `Threaded` contract (DESIGN.md §12a: **no admission gate**) — the `-EAGAIN`-on-held
 -lock is correct *only* for the `single`/`drive_arc` tiers.
 
 **Fix.** For `entry_.policy == OfferPolicy::Threaded`, the `WouldBlock` arm now **blocks** to acquire

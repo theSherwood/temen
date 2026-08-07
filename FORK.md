@@ -1,8 +1,11 @@
 # FORK.md — `fork()`-returns-twice, the durable-clone capstone
 
-The plan for POSIX `fork()` on svm (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage). This is the
-roadmap's single biggest item; it is a **multi-PR arc**, tracked here so it stays legible across
-sessions. R8 closure (durable `call_indirect` to may-suspend targets) is the prereq and is **done**.
+The plan for POSIX `fork()` on svm (STAGE1.md item 3 / PROCESS.md §7 / the S11 stage) — **landed**
+(PRs 1–5 + track 2; §5/§8 below are the as-built record). The parked call transport fork rides is
+settled as DESIGN.md §12a (was CALLS.md); this file keeps the fork *semantics* — reply-injection
+(§3), the child handle model (§4), the clone spec (§6), invariants (§7), and the fork+wait
+contract (§8.6) — plus the build log the code comments cite. R8 closure (durable `call_indirect`
+to may-suspend targets) was the prereq and is done.
 
 ## 1. The mechanism (PROCESS.md §7, verbatim intent)
 
@@ -78,7 +81,7 @@ must be forkable — no design step may force the forking guest to be top-level.
 > caller — which *is* fork's targeted-clone action. There is no independently-testable whole-run
 > reply-injection nucleus; **the first buildable slice is the targeted clone itself.**
 
-## 5. The PR arc
+## 5. The PR arc  [LANDED — historical]
 
 - **PR 1 — the targeted clone `clone(child_handle)` (was two PRs).** From within a serve handler (the
   servicer), capture the calling fiber's continuation (identified by its reply ticket), spill it at the

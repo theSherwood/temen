@@ -1,4 +1,5 @@
-//! CONSOLIDATION.md §5b — the **IoRing re-measure** (probe is run on demand, not in CI):
+//! The **IoRing re-measure** (was CONSOLIDATION §5b; verdict + the parking plan that retires
+//! the ring live in DESIGN.md §12 "Host-call ABI: async-first"). Run on demand, not in CI:
 //!
 //!   cargo test -p svm --release --test io_ring_bench -- --ignored --nocapture
 //!

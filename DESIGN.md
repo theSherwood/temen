@@ -1668,6 +1668,15 @@ requirement.
 
 ## 11. Open questions / parked items (consolidated)
 
+- **Deliberately left alone** (the CONSOLIDATION sweep's survivors, on purpose): `Exit`/`Clock`
+  as capabilities (authority-shaped — a sandboxer can withhold or interpose them, which a
+  syscall never offers); the `Jit.invoke` (Model A) vs `install` (Model B2) split (both shipped
+  and pinned; invoke = signature-checked entry without table slots, and the split carries the
+  unit concurrency contract — installed units join the caller's concurrency model, invoked
+  units stay seam-free leaves); `SharedRegion` vs `WindowMinter` (distinct authorities:
+  shareable backing vs detached windows — not mechanism duplication). The yardstick that
+  governed the sweep: a distinct authority earns a distinct kind; a distinct *mechanism* for
+  the same authority does not.
 - **Revocation** (§7 PARKED): host-mediated invalidation + generation counters
   vs. capabilities-live-until-close for v1.
 - **Cross-domain channels** (§7 DEFERRED): host-layer feature; zero-copy
@@ -1792,6 +1801,41 @@ JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regressio
   the vCPU); both-as-peers ABI (doubles surface/TCB; async-first's penalty on the
   pure-sync case is negligible).
 
+**As-measured status + the parking plan (CONSOLIDATION §5b, measured 2026-08-07, owner-endorsed;
+probe: `svm/tests/io_ring_bench.rs`, run with `--ignored --nocapture`).** The submit/complete
+*surface* shipped as the `IoRing` capability; the park-the-fiber half was never wired to plain
+`cap.call`s. The re-measure found: batching is measurably negative in-process (Clock SQEs price
+the SQE/CQE ABI alone at ~10.0 µs/op vs ~0.75 µs/op direct — the saved crossing is swamped by SQE
+build/parse); and overlap is **not** subsumed — a blocking dispatch holds the one `Mutex<Host>`,
+so even the threaded parallel tier serializes (`max_active` 1). The ring therefore **stays** as
+the only overlap mechanism until parking lands. The plan that retires it:
+
+1. *Registration declares blockingness* (the `HostProcEntry` per-entry-powers pattern): an
+   **offloadable** handler variant, `Fn(op, &[i64]) -> Vec<i64> + Send + Sync` — scalars only,
+   **no window access** (the pool never touches the window; buffers are read at submit and
+   written at completion on the vCPU thread — the ring's own discipline).
+2. *Dispatch gains a third outcome*: `Ok | Err | Pending(completion_id)`; the handler may decide
+   per call (fast case inline, slow case punts — the io_uring try-nonblocking model); the
+   dispatch releases the host lock before waiting.
+3. *The eval loop maps `Pending` onto existing park machinery* (the `StdinPark` seam, parked
+   offer-call delivery, `wait`/`notify` waking); a single-fiber guest degenerates to a plain
+   wait without the lock; nesting is free (a park is a scheduler event; children run on the
+   caller's eval loop).
+
+Pinned constraints: a parkable registration is **never** `fast_cap_resolver`-claimed (the D45
+register-ABI fast path keeps its exact contract), and **sync ops never pay for parkable ops'
+existence** — no completion id, no table touch unless a handler already returned `Pending`; pin
+the hostcall fast-path number in the bench regression check before the first slice. Determinism:
+cooperative-tier completions deliver at safepoints in submission order (the §18 oracle survives).
+Completion sources are pluggable behind the park (offload pool now; host io_uring for real
+file/net caps; a JS event on the browser tier). Batching belongs to the *transport* — a future
+§9-rung-6 broker coalesces parked completions invisibly; the guest ABI stays sync. Known loss to
+sequence around: ring `submit_async`/`reap` is today's only single-fiber compute/host overlap —
+close it with a guest-facing fiber spawn, not a second host-call ABI. Slice order: registration +
+`Pending` + single-fiber wait; cooperative-tier park/wake with ordered delivery; threaded-tier
+wiring; then re-run `io_ring_bench` and let the numbers retire the ring (SQE format, `RingState`,
+the async completion path).
+
 ### Unified event-parking
 - All blocking = **park a fiber until an event**. Events: `notify` (futex), I/O
   completion, timer, cross-domain/child signal. One composable wait primitive
@@ -1863,6 +1907,107 @@ record-debugging / consensus. Caveat: true determinism is incompatible with
 multicore + relaxed atomics and requires scrubbing every nondeterminism source,
 so it is effectively single-threaded — a real mode with real constraints, not a
 free toggle.
+
+---
+
+## 12a. Cross-domain calls — the unified offer model  [SETTLED — built; was CALLS.md]
+
+Settled with the owner 2026-07-30 (+ the 2026-07-31 addendum), built across CALLS.md
+increments 1–7 (the increment log lives in git history with the tracker; code comments citing
+"CALLS.md §n" refer to it). One amendment stands: `OFFER_TRANSPORT.md` (owner, 2026-08-04) —
+the animated transport for library instances is kept on purpose; see below.
+
+### The semantics (backend-neutral)
+
+> A `cap.call` through an offer **runs that op's handler over the provider's world** and
+> returns its results to the calling fiber. If the handler blocks, the caller waits.
+
+- **Every call is synchronous from the guest's perspective** — `cap.call` in, results out. No
+  futures, promises, or completion tokens in the guest ABI; "sync vs async" is a *transport*
+  distinction, never a semantic one.
+- **Every cross-domain call mints a handler fiber in the callee's world.** Who runs that fiber
+  is a scheduling decision.
+- **Blocking is per-fiber, never per-domain.** A blocked call parks the calling fiber; the
+  calling vCPU runs siblings; the domain's cap surface stays live.
+- **Cycles are legal.** Each inbound call is a fresh handler fiber; parks compose
+  (`A[f1] → B[f2] → A[f3] → B[f4]`); no lock crosses a domain boundary.
+
+### The provider taxonomy (two axes, declared by the provider)
+
+**Axis 1 — does the provider have a `main`?** A **library provider** (no main) is passive
+state — window + powerbox, handlers run only when called, admissible at any time; a call
+borrows the caller's thread (the animated crossing). A **process provider** (has a main) is a
+live domain; calls are admitted at its serve points (`svc.wait`/`svc.poll`). A **pure offer**
+is the degenerate library provider with no window — purity by construction. **Axis 2 —
+concurrency policy:** `single` (default; run-to-park atomicity, admissions serialized against
+each other — never against the domain's own threads) or `threaded` (opt-in; concurrent handler
+fibers, the provider synchronizes with guest atomics/futexes — the same defined-race regime as
+a multi-vCPU domain; the runtime never pays a serialization cost the guest didn't order).
+
+Naming (the house rule, func = pure / proc = effectful): `offer_func` (pure guest function),
+`offer_proc` (stateful guest provider, library or process), `host_proc` (effectful native
+closure — the only cap kind with caller-window access, the only kind owing `fork_ctx`).
+
+### Admission and the per-call transport decision
+
+Admission = letting one inbound call mint a handler fiber. The gate protects `single`'s
+run-to-park atomicity, per provider **domain**; it is not a whole-domain lock — `main`, spawned
+threads, and parked handlers keep running. A handler that parks closes its atomicity window and
+the gate reopens. `threaded` has no gate at all (only the quiesce bit). One decision tree per
+call, replacing "sync vs async" entirely:
+
+1. **Quiesce bit closed** → contended path: enqueue + park (bounded; `-EAGAIN` at the rim).
+2. **`threaded` provider** → mint a concurrent handler fiber, animate inline.
+3. **`single` library provider, try-enter won** → inline animation on the caller's thread.
+4. **`single` process provider parked at `svc.wait`** → **direct handoff**: the caller claims
+   the serve activation and animates the handler on its own thread (the Doors / L4
+   direct-process-switch shape). Handoff-served dispatches count in the callee's serve
+   accounting; handoff-on ≡ handoff-off on observable results (differentially pinned).
+5. **Otherwise** (mid-handler, between serve points) → enqueue + park.
+6. **Handler parks mid-animation** → promotion: the reified handler fiber is filed with a
+   waiter; the caller parks (interp) or thread-blocks (JIT).
+
+**Topology never gates** — grant-graph reachability at grant time is the only "who" check;
+admission state is the entire call-time condition (a call-time gate keyed on caller identity is
+the shape INVARIANTS.md 4 forbids). **Quiesce rides the admission word**: freeze/teardown close
+one bit; no new crossing starts, in-flight handlers drain or park, a caller parked at the gate
+re-issues on thaw (O10 at-least-once).
+
+### Transports per backend
+
+Interp: inline animation (the caller's thread switches worlds and runs the handler fiber — the
+§14 coroutine-drive shape); promotion is free by construction since interp fibers are reified
+data. JIT: direct call through a thunk at native speed; a parked handler thread-blocks the OS
+thread (JIT vCPUs are real threads), under a **per-thread crossing-depth bound** — at the bound
+the call declines to the parked transport (slower-but-correct, never a wrong answer). Bytecode:
+declines to the tree-walker. Observable results and provider state are identical across
+backends (§18 oracle); scheduling interleavings are quarantined in the deterministic explorer.
+The two transports — animated (library) and serve-loop (process/live callee) — are **kept on
+purpose** (`OFFER_TRANSPORT.md`): collapsing library instances onto the serve loop would
+pessimize the common synchronous cross-domain call against the §1a yardstick. The lock-held
+nested sub-interpreter, its acyclicity/deadlock argument, and provider-pays fuel all left the
+TCB; the caller's powerbox lock is held only at the two `cap`-slot translation edges.
+
+### Fuel across the crossing
+
+**Caller-pays, uniformly**: fuel follows the fiber across the crossing — the counter keeps
+draining. The provider owns *what* runs; the caller owns *how much* (it made the calls).
+Provider-pays was a drain-DoS against the provider and broke the amplification bound (total
+computation a domain causes ≤ its budget, D19-attenuating down the grant graph).
+`fuel.remaining` (self-namespace op 12) is the authority-neutral readout — deterministic by
+prior work (fuel is a checked cross-engine quantity), bit-identical on every backend; call
+metering is read-before minus read-after. Deferred, named-consumer-gated: a per-call fuel cap
+(caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
+can't fund a handler).
+
+### Invariants this holds
+
+Confinement untouched (every transport runs verified code over masked windows; the mem/host
+switch is the §14 nested-view shape). Fail-closed (a tier without an arm answers probeable
+errno; full queues refuse at the enqueuer). interp == JIT on observable results for every
+shape; *transport choice — inline, handoff, or parked — may never change observable results*.
+Run-to-park atomicity preserved by default (`single`); no handler's assumptions break without
+its provider opting into `threaded`.
 
 ---
 
@@ -2574,6 +2719,15 @@ submitter, no more (it cannot reach beyond the window or the granted handles) an
 *untrusted* code with *less* authority, the right tool is the §13/§14 `Instantiator` (a child VM with its
 own window and attenuated handles), not `Jit`. **`Jit` adds speed to a guest; it never adds a protection
 domain.**
+
+**Door held open — one inert code-handle kind (CONSOLIDATION §6, deferred).** `Module` and
+`JitCode` are both "code as a capability with no callable ops, named by another capability's
+verbs"; the unit-vs-domain difference is a property of the *verb* (`invoke`/`install` run in the
+caller's world; `instantiate` spawns a child), not of the handle — even the §22 preconditions are
+verb-time checks. Unifying would delete a cap kind and unlock **compile-then-sandbox** (JIT a
+plugin, then instantiate it as a confined child), which today has no bridge. Unlike the landed
+consolidations this *adds* an ability, so it waits per INVARIANTS.md 1 — **gate: a named consumer**
+for compile-then-sandbox.
 
 ### Capability surface (iface 11)
 
