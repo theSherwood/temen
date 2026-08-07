@@ -328,6 +328,23 @@ every bytecode (no *lazy*-savedpc stickiness like Lua), so the safepoint is a bo
 the interpreter itself, not a hand formula; and `resume` had to be `noinline` or `-O2` folds it into
 `run` and the dispatch never appears as its own function.
 
+**Zero-config auto-rolled, folded into the driver + end-to-end number (2026-08-07,
+`tests/lua_rolled/mod.rs`, `lua_futamura_auto_rolled`, `auto_rolled_zero_config_vs_interpreter`)** —
+the rolled residual (the 11.5× shape) is now built by a reusable driver function `auto_rolled(m,
+script)` on top of the shared `peval_capture::discover`: script in → rolled residual + run/verify
+metadata out, no hardcoded offsets. The accumulator is identified generically as the lowest-address
+carried cell that is not the trip counter (the first local declared before the loop; documented as
+the common-shape heuristic). `lua_futamura_auto_rolled` now calls it (recovers x=R1/i=R2/counter=R3,
+841→53 blocks, correct across a sweep). The end-to-end benchmark measures the whole pipeline with no
+hand-config: profile + discover + specialize is one **≈ 0.3 s build** (the cost the compiled-module
+cache amortizes), and the resulting residual runs at **≈ 1.5–1.7 ns/iter** — matching the hand-built
+rolled residual, i.e. **≈ 6–11×** faster than the interpreter (ratio swings only because the
+interpreter baseline is noisy on shared runners, ≈ 10–18 ns/iter; the residual side is stable). This
+closes the arc: a Lua chunk in, a measured per-iteration speedup out, zero hand-configuration.
+Remaining generality gaps for `auto_rolled` (documented in the module): dataflow-based accumulator
+identification for chunks whose result is not the first local, and post-loop code that calls out
+(e.g. `print`) rather than a clean `return`.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
