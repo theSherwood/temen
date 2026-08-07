@@ -575,6 +575,46 @@ The slices, **all landed for the cooperative driver** (each pinned against the o
    `drive_parallel` (fork currently runs on the cooperative single-threaded driver; the parallel
    driver fails closed), and add fork shapes to the `bytecode_diff` fuzz corpus.
 
-**Cranelift is the remaining backend.** It follows the same arc, reusing `instantiator_rt` + the
-svm-run serve loop; its extra risk is the native-frame twin continuation (the §8 capture risk, on
-compiled code, where there is no `Clone`). Until then `serve_qualifies` folds fork for Cranelift.
+### 9.3 The Cranelift capstone (design, 2026-08-07 — grounded in a full JIT durable map)
+
+Cranelift fork does **not** "follow the same arc" as bytecode — that earlier framing was wrong. The
+bytecode twin works because a parked caller is a **reified `Vm` (Clone-derived)** at its post-call
+resume point. On the JIT there is **no reified continuation to clone**: `cap.call` is a synchronous
+host thunk, so a caller mid-call is a **live native OS-thread stack** — either running the handler
+inline (handoff) or thread-blocked on the `live_impl_call` Condvar (`svm-run/src/lib.rs:2270`). The
+JIT's durable machinery reifies a continuation into shadow-stack bytes **only at a poll safepoint,
+which is always *past* a completed `cap.call`** (a `SuspendKind::Leaf` spills + reloads the
+*already-returned* result; `svm-durable/src/lib.rs:888,929`). There is no `Blocked::CapReply` state
+on the JIT at all (`svm-jit/src/fiber_registry.rs` has no cap-park concept), and `freeze_drive`
+(`svm-jit/src/fiber_rt.rs:1121`) walks only voluntarily-suspended `RUNNABLE` fibers, whole-run.
+
+So the capstone is **not** DURABILITY §10 "clone at a quiescent point" (cheap snapshot/restore) — a
+forking caller is *not* quiescent. It is: **make a JIT `cap.call` a suspendable, pre-result durable
+safepoint**, so a forking caller unwinds to a reified continuation (shadow-stack bytes in the window)
+instead of thread-blocking. The snapshot format is already engine-agnostic and cloneable
+(`svm-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
+so the real work is turning the JIT call into a reifiable park. The four items, in dependency order:
+
+1. **A pre-result "cap-reply-pending" suspend kind** (`svm-durable`). A new `SuspendKind` (e.g.
+   `LeafInject`) that spills the **pre-call** live set (`save_end = out − nres`, unlike `Leaf`'s
+   result-inclusive `save_end = out`) and, on thaw, **delivers a supplied reply into the result
+   slot** rather than reloading a captured value (the `Yield`/`ThreadJoin` shape, but for a cap
+   result). This is the durable dual of the interp's inject-the-reply park. Differential-testable in
+   isolation: freeze at such a point, thaw with an injected reply, resume past the call.
+2. **Suspendable `cap.call` on the JIT** (`svm-jit` lowering + `svm-run` serve path). A live-offer
+   `cap.call` from a durable-instrumented guest must, when the servicer withholds the reply, **unwind
+   the caller's shadow stack (pre-result) and park it as a cap-reply-pending continuation** in the
+   window image — instead of thread-blocking in `live_impl_call`. This is the load-bearing change and
+   the sensitive one (it touches the handoff fast path + the confinement-adjacent serve loop); gate
+   it to durable-instrumented forking guests so ordinary cross-domain calls keep the thunk fast path.
+3. **A targeted (single-continuation) freeze on the JIT.** `freeze_drive` is whole-run today; fork
+   freezes only the caller. Add a single-vCPU freeze entry producing that caller's image.
+4. **Return-twice.** Clone the caller's image + window (`fork_private`) + powerbox (`fork_powerbox`),
+   thaw two copies injecting `reply_orig`/`reply_twin` (the snapshot format already carries the
+   per-copy residue). This is the JIT analogue of `fork_parked_caller`, layered on 1–3.
+
+**Scope honesty:** items 1–2 re-architect a core JIT execution path (cross-domain `cap.call`), so
+this is a multi-PR capstone touching the durable transform (the R8 fork-critical instrumentation) and
+the serve path — built TDD-first, differential-pinned against the interp, one increment per PR. Until
+it lands, `serve_qualifies` correctly folds fork for Cranelift (no divergence — a forking module runs
+on a reifiable tier). Item 1 is the first PR: the pre-result inject suspend kind, in isolation.
