@@ -643,7 +643,14 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >   fresh launch didn't). Now `stepIn` advances one source line at a time with a resolvable frame,
 >   and the second vCPU appears in the thread list *while stepping* once the root passes
 >   `thread.spawn`. Gated by `crates/svm-dap/tests/threaded_powerbox.rs`
->   (`threaded_stepping_stops_and_spawns_mid_run`).
+>   (`threaded_stepping_stops_and_spawns_mid_run`), and — the seam the browser threads panel
+>   actually reads — `crates/svm-dap/tests/dap_bytecode.rs`
+>   (`dap_over_bytecode_threaded_step_keeps_a_resolvable_frame`) pins that after each threaded
+>   `stepIn` the stopped thread resolves a source frame (not the pre-`locate()` empty backtrace) and
+>   a spawned worker resolves its own frame mid-step. Line **breakpoints** already stop on the
+>   scheduled engine (`dap_over_bytecode_multithreaded_breakpoint_per_thread`), so the c_interpret
+>   threading-tier ask (powerbox + step + breakpoint-stops) is closed end-to-end on the bytecode
+>   engine.
 > - **Real C11 atomics in the playground.** The playground shipped no `<stdatomic.h>` (a threaded
 >   atomic lesson failed to compile), and the frontend's display-only one maps the ops to plain
 >   `*p += v` — wrong for a *lock-free* counter (it would race under interleaving). Added
