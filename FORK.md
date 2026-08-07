@@ -458,36 +458,61 @@ backends do not. This section is the convergence plan; the matrix now names the 
   `clone_caller.rs::a_serving_module_that_forks_or_reaps_folds_to_the_oracle`. **Landing native
   support is exactly removing that seam registration**, per backend, as each slice below lands.
 
-### 9.1 Order: bytecode first, then Cranelift, wasm-JIT never
+### 9.1 The gating finding (verified 2026-08-07): fork is a *serve-substrate* slice, not a targeted op
 
-The wasm-JIT is a leaf accelerator (DESIGN §3) — it runs no cap/serve/fiber op itself and folds them
-to the bytecode interp underneath. Fork stays ⛔ there **by design**; "closing the gap" means the two
-engines that *do* run cap ops: the **bytecode interpreter** and the **Cranelift JIT**.
+`clone_caller`/`reap` are not an isolated add. The **real fork topology** — a manager that
+`instantiate`s a server + a guest, the server serving `svc.wait`, the guest calling `fork()` — trips
+three coupled `scan_seams` conditions at once: `has_svc` (the server's `svc.wait`), `has_instantiate`
+(the manager's spawns), and the fork self-ops. The shared serve-qualification veto
+(`bytecode::svc_park_veto`) already folds any module where `has_svc` coexists with `has_instantiate`
+(a handler that spawns/joins could park mid-dispatch), so a forking module folds to the oracle
+**before** the fork ops matter. **Closing the gap therefore means making serve + spawn +
+caller-parking + fork all run natively together**, not lowering one op. This is the I36/I37
+serving-substrate track — and the reason FORK.md §8.4/§8.5 called fast-backend fork "a separate
+track." (History note: fork substrate is where the I68 lost-wakeup race lived; rushing it is exactly
+what produced that — so this track is TDD-first, differential-pinned, small increments.)
 
-Take **bytecode first** — it is far closer to the oracle: it shares the same `Scheduler`, `Host`,
-`Mem`, and the *entire* fork substrate (`fork_twin`, `fork_parked_caller`, `reap_parked_caller`,
-`forked_twins`) already lives in `svm-interp/src/lib.rs`. The bytecode serve loop (`Op::SvcPoll`,
-the rewind linkage) already admits handlers over the one world; the only missing piece is that a
-handler running `clone_caller`/`reap` can't yet reach `serve_run.ticket` + the scheduler to drive
-that shared machinery. Cranelift is the harder, later slice (its serve loop lives in `svm-run`, its
-handlers are compiled code, and the twin's continuation is a native frame, not an interp `Vec`).
+**Order: bytecode first, then Cranelift; wasm-JIT never** (it is a leaf accelerator — DESIGN §3 —
+and folds every cap op by design). Bytecode is far closer: `Mem::fork_private` and
+`Host::fork_powerbox` are engine-agnostic and already exist; and the load-bearing continuation copy
+is cheap because the bytecode vCPU (`Vm`) already derives `Clone` — a parked caller is a bare root
+`Vm` at its post-call resume point, so cloning it *is* the twin's continuation.
 
-### 9.2 Bytecode slices (proposed — mirrors the oracle's increment arc, §8.1)
+### 9.2 What the bytecode engine actually needs (the mechanism, reverse-engineered)
 
-1. **Handler→caller linkage.** Give the bytecode serve driver the same `serve_run.ticket` +
-   callee-domain-id it needs to look up the parked caller in `ticket_waiters` — the increment-1
-   primitive, but on the bytecode `Op::SvcPoll` driver. Add `Op::CloneCaller`/`Op::Reap` (compiled
-   from `cap.call CAP_SELF 11/12`, replacing today's decline) that surface to the driver.
-2. **Reply-injection nucleus.** From the bytecode handler, deliver the injected reply to the parked
-   caller via the existing `cap_reply_or_stash` and set `ServeRun.replied` — reusing the oracle's
-   path verbatim (the reply crosses in the same live run; no durable image needed, §8.2).
-3. **The twin + reap.** Wire `fork_twin`/`fork_parked_caller` and `reap_parked_caller` from the
-   bytecode driver — the substrate is shared, so this is *driver plumbing*, not new fork mechanism.
-   Remove the `clone_caller`/`reap` park-seam registration for the bytecode gate as each op lands.
-4. **Differential pin.** Extend `bytecode_diff` with the fork shapes (`SRC_FORK_PID`, fork+wait) so
-   the bytecode fork is proven bit-exact against the oracle — the §18 discipline every backend op
-   already meets. Only then does the matrix flip `clone_caller`/`reap` bytecode → ✅.
+The bytecode engine has its **own** scheduler and vCPU, distinct from the tree-walk `Sched`/`VCpu`
+the oracle's `fork_twin`/`fork_parked_caller` operate on. So this is a *parallel* implementation over
+the bytecode structures, not a reuse of the oracle's scheduler methods:
 
-Cranelift follows on the same arc once bytecode is proven, reusing `instantiator_rt` + the svm-run
-serve loop; its load-bearing risk is the native-frame twin continuation (the §8 "capture" risk, on
-compiled code). The wasm-JIT column stays ⛔.
+- **Parked caller.** A live-offer call parks the caller as a cooperative-driver task in
+  `TaskState::BlockedTicket { ticket, callee, dst }` (`bytecode.rs` `drive`); its continuation is the
+  task's `VTask.active: Vm`, positioned past the `cap.call`, with `dst` the reply slot. The settle
+  scan wakes it by `svc_results[ticket]` → `active.set(dst, reply)` → `Runnable`.
+- **Serve linkage.** The serve driver already carries `serve_ticket` (the `ServeRun.ticket` analog)
+  while a handler runs. That is the handler→caller linkage, already present.
+
+The slices (each lands its own differential pin; the veto seam for that op lifts only when its slice
+is green — §9.0):
+
+1. **`Op::CloneCaller`/`Op::Reap` + driver surface.** Compile `cap.call CAP_SELF 11/12` to native ops
+   (replacing today's decline) that surface to the cooperative `drive` via new `Outcome`/`VcpuStop`
+   variants carrying the served ticket + reply args + dst — the shape `LiveCall`/`SvcWait` already use.
+2. **The twin (cooperative driver).** In `drive`, find the `BlockedTicket` caller for `serve_ticket`;
+   build a twin **env** (`fork_private(caller_env.mem)` + `fork_powerbox(caller_env.host)`, a new
+   `extra_envs` entry) and a twin **task** whose `VTask` is the caller's `Vm.clone()` with
+   `active.set(dst, reply_twin)`; deliver `reply_orig`/twin-pid to the original; mark the dispatch
+   replied so `SvcPoll` doesn't clobber via the `svc_results` cell. Track the twin id in a
+   driver-local `forked_twins` for reap. Fail-closed to a single reply on any non-bare caller (the
+   oracle's degrade), so it never diverges.
+3. **`reap` + the serve+instantiate veto relaxation.** Wire reap over the driver's `forked_twins` +
+   the join/results path; relax `svc_park_veto` so `has_svc && has_instantiate` (+ fork ops) is
+   admitted for the cooperative bytecode path **only** — split the predicate so `serve_qualifies`
+   (svm-run's Cranelift routing) keeps folding fork until Cranelift's own slice lands. This split is
+   the load-bearing correctness step: it is what keeps Cranelift from diverging while bytecode lifts.
+4. **Differential pin + `drive_parallel`.** Extend `bytecode_diff` with the fork shapes (a
+   `SRC_FORK_PID`-shaped module, fork+wait) proving bytecode == oracle, then port the driver arms to
+   `drive_parallel`. Only when green does the matrix flip `clone_caller`/`reap` bytecode → ✅ and the
+   `scan_seams` fork seams lift.
+
+Cranelift follows the same arc, reusing `instantiator_rt` + the svm-run serve loop; its extra risk is
+the native-frame twin continuation (the §8 capture risk, on compiled code, where there is no `Clone`).
