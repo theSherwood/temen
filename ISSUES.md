@@ -188,6 +188,30 @@ the call-in side). Known limits, documented in the driver: one return tag per fr
 int/float returns through the same node needs savedpc-keyed selective), no C tail calls, no rolling
 safepoint roots, no multi-value returns.
 
+**First benchmarks (2026-08-07, `lua_futamura_bench`, `#[ignore]`d; run `--release -- --ignored`)** —
+the arc's first timing numbers, with the compile confound handled by differential-N (the baseline
+module is fixed across trip counts, so `(T(N₂)−T(N₁))/(N₂−N₁)` cancels JIT compile + parse exactly):
+baseline `luaV_execute` costs **≈ 93 ns per iteration** for `x = add(x,3)` + forloop (20M-iteration
+delta); whole-program at N=200 is at **parity** (both ≈ 0.95 s, dominated by JIT-compiling the
+~690-function module); specialization is linear at ≈ 48.5 residual blocks / ≈ 0.6 ms per unrolled
+iteration. The pinned-down economics: **unrolled specialization can never pay per-run** (~0.6 ms/iter
+to build vs ~93 ns/iter to interpret) — the payoff shape requires build-once/run-many with a
+compiled-module cache (no such API today: `run_powerbox` compiles per call, `Instance` holds only
+the `Module`) or **rolled** loops (N-independent residual size). This quantifies why rolled +
+stitched + cached is the deployment target, and confirms the pipeline costs nothing at runtime
+(residual parity with baseline end-to-end).
+
+**Execution-vs-execution number (2026-08-07, `rolled_residual_vs_interpreter_per_iteration`)** — the
+payoff the arc was pointing at, now measured directly. A rolled residual runs standalone with a
+*dynamic* trip count, so its module is N-independent and the differential-N trick cancels compile on
+*both* sides — the first true execution-only comparison. On a pure `x = x + 3` loop the interpreter
+costs **≈ 17.6 ns/iter** and the dispatch-folded rolled residual **≈ 1.53 ns/iter**: an **11.5×
+per-iteration execution speedup**. (The 93 ns/iter baseline above is heavier because it pays a full
+Lua `add(x,3)` call each iteration; the two baselines differ by exactly that call overhead.) With the
+interpreter's decode+dispatch removed, the rolled residual runs an order of magnitude faster per
+iteration — confirming rolled loops are the shape that actually pays, not just the shape that avoids
+the unroll blow-up.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
