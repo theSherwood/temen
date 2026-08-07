@@ -491,7 +491,7 @@ fn auto_rolled_zero_config_vs_interpreter() {
     let ar = lua_rolled::auto_rolled(&m, AUTO_ROLL_SCRIPT);
     let build = t.elapsed();
     let np = ar.dyn_cells.len();
-    let (wm, we) = lua_rolled::with_readback(&ar.residual, ar.acc_addr, np);
+    let (wm, we) = lua_rolled::with_readback(&ar.residual, ar.entry, ar.acc_addr, np);
     svm_verify::verify_module(&wm).expect("wrapped residual verifies");
     println!(
         "auto_rolled build (profile + discover + specialize): {build:?}; residual {} blocks, {np} dyn params",

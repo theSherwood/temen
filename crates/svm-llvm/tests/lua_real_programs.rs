@@ -6,9 +6,12 @@
 //! residual on that program** (differential-N on both sides cancels JIT-compile / parse). Result and
 //! both speeds, side by side.
 //!
-//! Scope wall (documented, not yet crossed): the division family `%` / `//` hits `Unsupported` in the
-//! specializer (a divide-by-zero cold path the auto config does not yet deopt), so programs needing
-//! modulo are excluded here. Everything below is straight-line integer arithmetic per iteration.
+//! The division family `%` / `//` is now in scope too: `auto_rolled` deopts the integer div/mod
+//! divide-by-zero cold arm to the baseline (marking the divisor + result dynamic, and resuming off the
+//! metamethod trailer — see its comments), so `i % d` / `i // d` roll like any other arithmetic on the
+//! hot path. The last two programs below exercise them (divisor a local, so it is a register operand —
+//! the K-form `i % 2` still calls an un-inlined helper and stays a wall) and are checked against the
+//! interpreter the same way. Everything here is straight-line integer arithmetic per iteration.
 //!
 //! Run: `cargo test -p svm-llvm --release --test lua_real_programs -- --ignored --nocapture`
 
@@ -30,7 +33,7 @@ fn jit_run(m: &Module, e: u32, a: &[i64]) -> i64 {
 
 /// Wrap the rolled residual (params = dynamic cells) with a `(cells…) -> i64` that calls it then loads
 /// the accumulator it wrote back.
-fn with_readback(residual: &Module, read_addr: u64, nparams: usize) -> (Module, u32) {
+fn with_readback(residual: &Module, entry: u32, read_addr: u64, nparams: usize) -> (Module, u32) {
     let mut m = residual.clone();
     let wrapper = m.funcs.len() as u32;
     let params: Vec<ValType> = vec![ValType::I64; nparams];
@@ -42,7 +45,7 @@ fn with_readback(residual: &Module, read_addr: u64, nparams: usize) -> (Module, 
             insts: vec![
                 Inst::ConstI64(read_addr as i64),
                 Inst::Call {
-                    func: 0,
+                    func: entry,
                     args: (0..nparams as u32).collect(),
                 },
                 Inst::Load {
@@ -131,6 +134,18 @@ fn real_program_gallery() {
             body: "local t = a + b a = b b = t",
             ret: "b",
         },
+        Prog {
+            name: "count odds (i%d)",
+            decls: "local d = 2\nlocal s = 0",
+            body: "s = s + i % d",
+            ret: "s",
+        },
+        Prog {
+            name: "sum thirds (i//d)",
+            decls: "local d = 3\nlocal s = 0",
+            body: "s = s + i // d",
+            ret: "s",
+        },
     ];
 
     println!(
@@ -143,14 +158,14 @@ fn real_program_gallery() {
         // Zero-config rolled residual (specialized once at a fixed trip count; it is N-independent).
         let ar = auto_rolled(&m, &return_script(p, sample));
         assert!(
-            !has_br_table(&ar.residual.funcs[0]),
+            !has_br_table(&ar.residual.funcs[ar.entry as usize]),
             "{}: dispatch folds",
             p.name
         );
         let np = ar.dyn_cells.len();
         // `ar.acc_addr` is the returned register (decoded from the chunk's RETURN1 bytecode) — correct
         // even for multi-accumulator chunks like fibonacci, whose returned `b` is not the lowest cell.
-        let (wm, we) = with_readback(&ar.residual, ar.acc_addr, np);
+        let (wm, we) = with_readback(&ar.residual, ar.entry, ar.acc_addr, np);
         svm_verify::verify_module(&wm).expect("residual verifies");
 
         // ---- Program output at n=sample: residual vs interpreter must agree. ----
