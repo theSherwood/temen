@@ -10633,7 +10633,35 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                    let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    let mut pending_id = None;
+                    let results = hg.cap_dispatch_slots_pending(
+                        *type_id,
+                        *op,
+                        h,
+                        &argv,
+                        gm,
+                        &mut pending_id,
+                    )?;
+                    // §12 parking-on-blocking: a punted offloadable dispatch — release the host
+                    // lock **before** waiting (the §5b serialization fix), then take the scalar
+                    // completion. This slice is the single-fiber degenerate wait (root and
+                    // non-root alike block this vCPU thread; sibling vCPUs now run because the
+                    // lock is free). Fiber-level parking with ordered delivery is the
+                    // cooperative-tier slice. The placeholder `results` is discarded.
+                    if let Some(id) = pending_id {
+                        let comps = hg.completions();
+                        drop(hg);
+                        let r = comps.wait(id);
+                        if sig.results.len() > 1 {
+                            // Parkable ops carry a single-slot scalar reply (invariant 8) —
+                            // a wider declared signature is a registration bug, fail-closed.
+                            return Err(Trap::CapFault);
+                        }
+                        if let Some(ty) = sig.results.first() {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
+                        }
+                        continue;
+                    }
                     // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
                     // (a) a blocking stream read with no data parks THIS fiber, keyed by the
                     //     handle it is parked through (the dispatch's placeholder result is
@@ -14299,6 +14327,89 @@ impl Drop for OffloadPool {
     }
 }
 
+/// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
+/// offloadable handler punts ([`OffloadOutcome::Offload`]) on the parking-aware dispatch face
+/// ([`Host::cap_dispatch_slots_pending`]), the dispatch mints an id here, hands the job to the
+/// offload pool, and returns `Pending(id)`; the pool worker posts the scalar result via
+/// [`Completions::complete`]. The eval loop then waits **without the host lock**
+/// ([`Completions::wait`] — the single-fiber degenerate path; fiber-level parking is the
+/// cooperative-tier slice). `Send + Sync` (an `Arc` is cloned out of the host before the wait, and
+/// pool workers complete from their own threads).
+///
+/// **Sync ops never pay for this** (the §12 pin): nothing here is touched — no id minted, no map
+/// insert — unless a handler already returned `Offload` on the pending face.
+pub struct Completions {
+    mx: Mutex<CompletionState>,
+    cv: Condvar,
+}
+
+struct CompletionState {
+    /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
+    ready: BTreeMap<u64, i64>,
+    /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
+    in_flight: usize,
+    /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
+    /// tier's ordered-delivery key, §18 determinism).
+    next_id: u64,
+}
+
+impl Completions {
+    fn new() -> Completions {
+        Completions {
+            mx: Mutex::new(CompletionState {
+                ready: BTreeMap::new(),
+                in_flight: 0,
+                next_id: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
+    fn mint(&self) -> u64 {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.next_id;
+        g.next_id += 1;
+        g.in_flight += 1;
+        id
+    }
+
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters.
+    fn complete(&self, id: u64, result: i64) {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        g.ready.insert(id, result);
+        g.in_flight -= 1;
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
+    /// wait** (§12: "a single-fiber guest degenerates to a plain wait without the lock"). The
+    /// caller must have dropped the host lock; this blocks only the calling vCPU thread while the
+    /// pool does the work.
+    pub fn wait(&self, id: u64) -> i64 {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(r) = g.ready.remove(&id) {
+                return r;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Ids minted but not yet completed. A test pins the "sync ops never pay" invariant with
+    /// [`Completions::minted`]; this is the in-flight drain signal.
+    pub fn outstanding(&self) -> usize {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner()).in_flight
+    }
+
+    /// Total completion ids ever minted on this host — `0` proves no dispatch ever touched the
+    /// parking machinery (the §12 "sync ops never pay" pin, asserted by tests).
+    pub fn minted(&self) -> u64 {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner()).next_id
+    }
+}
+
 /// §9/§12 async-ring per-handle state: completions posted by offload workers (or by inline ops) during
 /// a `submit_async`, awaiting the guest's `reap` to flush them into the window. `Send + Sync` so a pool
 /// worker pushes from its own thread; the guest reaps on its vCPU thread. The futex completion counter
@@ -14356,6 +14467,43 @@ pub type HostProc = Box<
 /// a forked domain remains forkable (fork-of-fork, nested guests).
 pub type HostProcFork = Arc<dyn Fn() -> HostProc + Send + Sync>;
 
+/// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
+/// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
+/// what it needs at punt time, sees **no window and no `Host`**, and returns exactly one `i64`
+/// (invariant 8's single-slot scalar reply; errors ride negative errnos, never traps — a pool
+/// job has nothing to forge).
+pub type OffloadWork = Box<dyn FnOnce() -> i64 + Send + 'static>;
+
+/// An **offloadable** handler's per-call decision (the io_uring try-nonblocking model): the fast
+/// case completes inline on the vCPU thread ([`OffloadOutcome::Done`] — data already buffered, a
+/// pure compute); the slow case punts its blocking work to the offload pool
+/// ([`OffloadOutcome::Offload`]) and the *dispatch face* decides what that means — a parking-aware
+/// eval loop gets `Pending(id)` and waits without the host lock; every other caller runs the job
+/// inline, byte-identical to a synchronous handler (decline-never-diverge, INVARIANTS.md 9).
+pub enum OffloadOutcome {
+    /// Completed inline — result slots exactly as a plain [`HostProc`] would return them.
+    Done(Result<Vec<i64>, Trap>),
+    /// Would block: run this job off the vCPU thread. The call's declared signature must have at
+    /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
+    Offload(OffloadWork),
+}
+
+/// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
+/// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
+/// guest window, no region minter — because a punted job outlives the dispatch and the pool must
+/// never touch the window (buffers are read at submit and written at completion on the vCPU
+/// thread — the ring's own discipline, kept as the registration contract).
+pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
+
+/// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
+/// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
+/// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
+/// the right to punt to the offload pool.
+enum ProcHandler {
+    Sync(HostProc),
+    Offloadable(OffloadHostProc),
+}
+
 /// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
 /// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
 /// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
@@ -14372,8 +14520,8 @@ pub trait RegionMinter {
 /// tables can no longer desync because there is only one). Indexed by the id a
 /// [`Binding::HostProc`] carries.
 struct HostProcEntry {
-    /// The handler closure ([`HostProc`]). A dispatch takes it out, runs it, and restores it.
-    handler: HostProc,
+    /// The handler closure ([`ProcHandler`]). A dispatch takes it out, runs it, and restores it.
+    handler: ProcHandler,
     /// FORK.md PR 5 — the provider-supplied fork factory ([`Host::grant_host_proc_forkable`]):
     /// `Some` = [`Host::fork_powerbox`] carries this capability into a twin by minting a fresh
     /// closure; `None` = non-forkable (fail closed).
@@ -14960,6 +15108,11 @@ pub struct Host {
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
     pool: Option<OffloadPool>,
+    /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
+    /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
+    /// without the host lock. Shared out by [`Host::completions`] before the wait. Untouched
+    /// (nothing minted) unless an offloadable handler punts on the parking-aware face.
+    completions: Arc<Completions>,
     /// §9/§12 async-ring per-handle state, indexed by the id a [`Binding::IoRing`] carries — where a
     /// `submit_async` posts completions for the guest's `reap`.
     rings: Vec<Arc<RingState>>,
@@ -15346,6 +15499,7 @@ impl Host {
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
             pool: None,
+            completions: Arc::new(Completions::new()),
             rings: Vec::new(),
             async_notify: None,
             cap_pages: None,
@@ -15441,7 +15595,7 @@ impl Host {
             .map(|e| {
                 let factory = e.fork.as_ref().unwrap();
                 HostProcEntry {
-                    handler: factory(),
+                    handler: ProcHandler::Sync(factory()),
                     fork: Some(Arc::clone(factory)),
                     mints: e.mints,
                 }
@@ -16051,6 +16205,38 @@ impl Host {
         }
     }
 
+    /// §12 parking-on-blocking — the completion store ([`Completions`]). An eval loop clones this
+    /// out **before** dropping the host lock, then waits on it for a `Pending` dispatch's result.
+    pub fn completions(&self) -> Arc<Completions> {
+        Arc::clone(&self.completions)
+    }
+
+    /// §12 — dispose of a punted job per the dispatch face: on the parking face, mint a
+    /// completion id, hand the job to the offload pool (worker posts the result via
+    /// [`Completions::complete`]) and return the id through `pending` (result slots are then a
+    /// placeholder the caller discards); on the sync face, run the job inline on this thread —
+    /// byte-identical to a synchronous handler. Nothing here is reachable unless a handler
+    /// already returned [`OffloadOutcome::Offload`] (the "sync ops never pay" pin).
+    fn punt_or_inline(
+        &mut self,
+        job: OffloadWork,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        match pending {
+            Some(slot) => {
+                let id = self.completions.mint();
+                let comps = Arc::clone(&self.completions);
+                let pool = self
+                    .pool
+                    .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
+                pool.dispatch(vec![Box::new(move || comps.complete(id, job()))]);
+                *slot = Some(id);
+                Ok(Vec::new())
+            }
+            None => Ok(vec![job()]),
+        }
+    }
+
     /// Install a host binding in a free slot and return the guest handle — a forgeable
     /// `i32` index encoding `(generation, slot)`. This is how the powerbox (and, later,
     /// attenuation) hands authority to the guest (§3c). Panics only if the table is
@@ -16564,7 +16750,24 @@ impl Host {
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
     pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
+            fork: None,
+            mints: false,
+        })
+    }
+
+    /// §12 parking-on-blocking — register an **offloadable** host-capability handler (also iface
+    /// [`cap_id::HOST_PROC`]): the registration declares blockingness. The handler decides per call
+    /// (the io_uring try-nonblocking model): [`OffloadOutcome::Done`] completes inline;
+    /// [`OffloadOutcome::Offload`] punts a self-contained scalar job to the offload pool. On a
+    /// parking-aware eval loop the punting call returns `Pending` and the caller waits **without
+    /// the host lock**; everywhere else the job runs inline, byte-identical to a synchronous
+    /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
+    /// minter, no fork factory — the pool must never touch the window (the ring's discipline,
+    /// kept), and a punted call's declared signature carries at most one result (invariant 8).
+    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: ProcHandler::Offloadable(f),
             fork: None,
             mints: false,
         })
@@ -16585,7 +16788,7 @@ impl Host {
     /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
     pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
             fork: Some(fork),
             mints: false,
         })
@@ -16599,7 +16802,7 @@ impl Host {
     /// is exactly region-minting (nothing else of the `Host` is reachable).
     pub fn grant_host_proc_region(&mut self, f: HostProc) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
             fork: None,
             mints: true,
         })
@@ -18339,6 +18542,47 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, None)
+    }
+
+    /// §12 parking-on-blocking — the **parking-aware dispatch face**: identical to
+    /// [`Host::cap_dispatch_slots`] except an offloadable handler's punt returns immediately with
+    /// `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
+    /// running the job inline. The result slots are then a placeholder the caller must discard —
+    /// on `Some`, drop the host lock, then [`Completions::wait`] (via [`Host::completions`]) for
+    /// the scalar result and deliver it as the call's single result slot. Only eval loops that
+    /// implement that discipline may use this face; everything else stays on the sync face and
+    /// gets byte-identical inline semantics (decline-never-diverge, INVARIANTS.md 9). Under a W1
+    /// tape the punt is forced inline so the recorded crossing carries the real result.
+    pub fn cap_dispatch_slots_pending(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: &mut Option<u64>,
+    ) -> Result<Vec<i64>, Trap> {
+        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, Some(pending))
+    }
+
+    fn cap_dispatch_slots_impl(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
+        // placeholder on the tape would replay as a phantom result; the inline run records the
+        // real one (the same reasoning as the parked-stdin tape suppression below).
+        let pending = if self.cap_record.is_some() || self.cap_replay.is_some() {
+            None
+        } else {
+            pending
+        };
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -18456,11 +18700,12 @@ impl Host {
                         handle,
                         args,
                         Some(&mut rec_mem),
+                        pending,
                     );
                     (r, rec_mem.writes)
                 }
                 None => (
-                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None),
+                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None, pending),
                     Vec::new(),
                 ),
             };
@@ -18481,11 +18726,13 @@ impl Host {
             }
             return result;
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending)
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
     /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
+    /// `pending` is the §12 parking out-param ([`Host::cap_dispatch_slots_pending`]); `None` = the
+    /// sync face, where an offloadable punt runs inline.
     fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
@@ -18493,6 +18740,7 @@ impl Host {
         handle: i32,
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -18897,15 +19145,32 @@ impl Host {
                     Some(e) => (
                         std::mem::replace(
                             &mut e.handler,
-                            Box::new(|_, _, _, _| Err(Trap::CapFault)),
+                            ProcHandler::Sync(Box::new(|_, _, _, _| Err(Trap::CapFault))),
                         ),
                         e.mints,
                     ),
                     None => return Err(Trap::CapFault),
                 };
-                let r = f(op, args, mem, if mints { Some(self) } else { None });
+                // §12 offloadable: the handler decides per call — `Done` completed inline (the
+                // fast case pays nothing beyond this match); `Offload` punts the self-contained
+                // job (pool + `Pending` on the parking face, inline on the sync face). The
+                // window/minter are deliberately out of reach of an offloadable handler.
+                let mut punted: Option<OffloadWork> = None;
+                let r = match &mut f {
+                    ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
+                    ProcHandler::Offloadable(f) => match f(op, args) {
+                        OffloadOutcome::Done(r) => r,
+                        OffloadOutcome::Offload(job) => {
+                            punted = Some(job);
+                            Ok(Vec::new()) // replaced below
+                        }
+                    },
+                };
                 self.host_procs[idx as usize].handler = f;
-                r
+                match punted {
+                    Some(job) => self.punt_or_inline(job, pending),
+                    None => r,
+                }
             }
             Binding::Exit => {
                 // op 0: exit(code: i32) — noreturn. Propagate as a (non-error) trap.
@@ -19268,7 +19533,17 @@ impl Host {
                         return Err(Trap::ThreadFault);
                     }
                     let arg = *args.first().unwrap_or(&0);
-                    Ok(vec![self.blockings[idx as usize].run(arg)])
+                    // §12 parking: `Blocking` is the offloadable-registration exerciser — the
+                    // per-call decision inlined. Fast case (nothing to block on) completes on the
+                    // vCPU thread before any `Arc` clone, so the block=0 bench regime pays only
+                    // these two loads; the genuinely-blocking case punts (Pending on the parking
+                    // face, inline on the sync face — today's semantics, byte-identical).
+                    let st = &self.blockings[idx as usize];
+                    if st.block_for.is_zero() && st.rendezvous.is_none() {
+                        return Ok(vec![st.run(arg)]);
+                    }
+                    let st = Arc::clone(st);
+                    self.punt_or_inline(Box::new(move || st.run(arg)), pending)
                 }
                 _ => Ok(vec![EINVAL]),
             },

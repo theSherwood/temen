@@ -1827,6 +1827,14 @@ register-ABI fast path keeps its exact contract), and **sync ops never pay for p
 existence** — no completion id, no table touch unless a handler already returned `Pending`; pin
 the hostcall fast-path number in the bench regression check before the first slice. Determinism:
 cooperative-tier completions deliver at safepoints in submission order (the §18 oracle survives).
+*Slice-1 status (2026-08-07):* **landed** — `Host::grant_host_proc_offloadable` (the registration
+declares blockingness; handler returns `Done` inline or punts an `OffloadWork` job),
+`cap_dispatch_slots_pending` (the parking-aware face; every other call site keeps the sync face and
+runs punts inline — decline-never-diverge), and the single-fiber wait on both interp tiers (the
+eval loop drops the host lock, then `Completions::wait`). The shared-host parallel tier already
+stops serializing (`host_park.rs` pins it by rendezvous, not timing); `fast_cap_resolver` is pinned
+never to claim a parkable iface. Remaining: cooperative-tier fiber park/wake with ordered delivery,
+the JIT locked-thunk wait, then the re-measure.
 Completion sources are pluggable behind the park (offload pool now; host io_uring for real
 file/net caps; a JS event on the browser tier). Batching belongs to the *transport* — a future
 §9-rung-6 broker coalesces parked completions invisibly; the guest ABI stays sync. Known loss to

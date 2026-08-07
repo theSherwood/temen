@@ -1627,6 +1627,13 @@ impl JitSession {
 /// Pass it to [`svm_jit::compile_and_run_with_host_fast`] /
 /// [`svm_jit::compile_and_run_with_host_interruptible_fast`]; [`run_powerbox`] uses it automatically.
 ///
+/// **Parking pin (DESIGN.md §12):** a *parkable* registration — any `cap_id::HOST_PROC` entry, and
+/// the test-only `cap_id::BLOCKING` exerciser — must **never** be claimed here. The D45 contract
+/// bakes the returned address at compile time and completes in registers; a handler that can answer
+/// `Pending` needs the generic thunk's full dispatch (completion mint + park). Adding a `HOST_PROC`
+/// or `BLOCKING` arm to this match is a design violation, not an optimization
+/// (`fast_cap.rs::resolver_never_claims_parkable_ifaces` pins it).
+///
 /// # Safety
 /// Honours the [`svm_jit::FastCapResolver`] contract: `ctx` (passed to the returned fns) is a live
 /// `*mut Host`; the returned fns gate on the supplied arity and stay valid for the run.
