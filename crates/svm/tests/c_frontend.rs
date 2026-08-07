@@ -2586,7 +2586,7 @@ fn generic_extern_capability_import_equals_builtin() {
 /// §7 reflection from C: a guest enumerates the capabilities its host granted and introspects each
 /// one's interface type_id — `__vm_cap_count` / `__vm_cap_at` (`cap.self.count`/`cap.self.get`).
 /// Interp-only (the JIT bails `Unsupported` on `cap.self.*`, like fibers). The c_frontend powerbox
-/// grants 8 capabilities with exactly one Exit (type_id 1), so `n*100 + exits == 801`.
+/// grants 7 capabilities with exactly one Exit (type_id 1), so `n*100 + exits == 701`.
 #[test]
 fn reflection_enumerates_granted_capabilities() {
     let src = r#"
@@ -2600,15 +2600,15 @@ fn reflection_enumerates_granted_capabilities() {
             __vm_cap_at(i, &t);
             if (t == 1) exits++;   /* cap_id::EXIT == 1 */
           }
-          return n * 100 + exits;  /* 8 capabilities, exactly one Exit -> 801 */
+          return n * 100 + exits;  /* 7 capabilities, exactly one Exit -> 701 */
         }
     "#;
     match run_c_interp(src).outcome {
         Outcome::Returned(v) => {
             assert_eq!(
                 v,
-                vec![Value::I32(801)],
-                "8 capabilities granted, exactly one Exit"
+                vec![Value::I32(701)],
+                "7 capabilities granted, exactly one Exit"
             )
         }
         other => panic!("unexpected outcome: {other:?}"),
