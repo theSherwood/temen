@@ -459,9 +459,29 @@ command inits its own state from its data segments); non-durable domains only (d
 image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
 fibers).
 
-**Remaining for the shell loop:** wire `exec_module` into the compiled-C `fork → execve → wait` loop
-(the `c_fork.rs` guest's child calls `execve` on a *separate* command module instead of the multicall
-`applet()` — increment 2), then the increment-1 simplifications above as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and job-control `waitpid` flags
+**Compiled-C `fork → execve → wait` with a *separate* command module. DONE (increment 2).**
+`c_fork.rs::a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command` — an ordinary compiled-C
+guest forks; the child resolves a re-granted command module `"cmd"` and the inherited `"stdout"` by name
+(`__vm_resolve`), builds a grant list, and `__vm_exec_module`s into the command; the parent `wait`s and
+reaps the command's exit. The **separate command module** writes `"EXEC"` and exits `42`, so the sink
+holds exactly `"EXEC"` (a *different program* did that I/O as the child's task) and the run returns `42`.
+Three enablers made it work, each a small correctness fix in its own right:
+
+- **chibicc builtins** `__vm_exec_module` (lowers to the `CAP_SELF_EXEC` self-op) and `__vm_resolve`
+  (`cap.self.resolve`) — the C-level `execve` primitive and the named-cap-handle reader.
+- **Modules are re-grantable into a child** (`can_regrant`/`regrant_into_child` + `ModuleGrant: Clone`):
+  a shell hands a command module to a child it will `execve`. And **`fork_powerbox` carries modules**
+  (was fail-closed on a non-empty module table) — a shell that holds command modules can now fork.
+- **`Mem::snapshot` is window-base-relative** — a real `fork_private`-of-a-nested-carve bug: `byte()`
+  indexes the shared backing *absolutely*, so the twin previously inherited **zeros** for its
+  high-offset globals (past `POWERBOX_ARGS_END`) instead of the parent's data. Latent until a nested
+  twin *read* pre-fork high-offset data — which the `execve` child (resolving `"cmd"`/`"stdout"`) is the
+  first to do.
+
+`__vm_exec_module` is also proven in isolation from fork by
+`a_nested_compiled_c_guest_execs_a_separate_command` (a nested op-13 guest execs a command, no fork/wait).
+
+**Remaining for the shell loop:** the increment-1 simplifications as they're needed (fresh window + BSS
+zero, durable-domain exec, exec from a nested serve context), and job-control `waitpid` flags
 (`WNOHANG`, group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking
 `results` probe.

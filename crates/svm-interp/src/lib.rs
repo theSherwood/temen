@@ -15689,6 +15689,9 @@ const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitt
 /// One §14 module grant: the verified module's functions, declared window size, data segments — what
 /// spawning a child domain of it needs — and its first-class export table, so a parent can resolve a
 /// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx.
+/// `Clone` so a module can be **re-granted into a child** (FORK.md §8.6 — the `funcs`/`data`/`module`
+/// are `Arc`s, so the copy is cheap): a parent hands a command module to a nested guest to `execve`.
+#[derive(Clone)]
 struct ModuleGrant {
     funcs: Arc<[Func]>,
     memory_log2: Option<u8>,
@@ -15874,7 +15877,6 @@ impl Host {
             && self.window_minters.is_empty()
             && self.svc_queue.is_empty()
             && self.svc_results.is_empty()
-            && self.modules.is_empty()
             && self.self_instance.is_none()
             && self.pool.is_none()
             && self.completion_notify.is_none()
@@ -15914,6 +15916,11 @@ impl Host {
                 }
             })
             .collect();
+        // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
+        // copy is cheap): a shell that holds command modules must be able to fork *and* have each twin
+        // still resolve/`execve` them (the twin's copied handle table carries the `Binding::Module`
+        // bindings; the entries they index must exist in the twin too).
+        twin.modules = self.modules.clone();
         // Shared stdout/stderr sinks — fork shares stdout/stderr.
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
@@ -18677,6 +18684,7 @@ impl Host {
             || self.resolve_offer(handle).is_ok()
             || self.resolve_copyable(handle).is_ok()
             || self.forkable_host_proc(handle)
+            || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -18740,6 +18748,17 @@ impl Host {
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
                 .map(|factory| child.grant_host_proc_forkable(factory(), factory));
+        }
+        // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
+        // into the child (cloning the grant entry — its `funcs`/`data`/`module` are `Arc`s, so the copy
+        // is cheap) so a nested guest can `instantiate`/`exec_module` a command its parent handed it by
+        // name. Authority-neutral: the child gains only the ability to run code it was explicitly given
+        // — the mechanism a shell uses to pass a command module to a child it will `execve` into.
+        if let Ok(Binding::Module(id)) = self.resolve(handle, cap_id::MODULE) {
+            let g = self.modules.get(id as usize)?.clone();
+            let cid = child.modules.len() as u32;
+            child.modules.push(g);
+            return Some(child.grant(cap_id::MODULE, Binding::Module(cid)));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream {
@@ -21150,10 +21169,16 @@ impl Mem {
         }
     }
 
-    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent).
+    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent). Reads are
+    /// **window-base-relative**: [`byte`](Mem::byte) indexes the shared backing *absolutely*, so a
+    /// nested view (`window.base() != 0` — a §14 carve) must offset by its base, or the snapshot would
+    /// capture the wrong slice of the backing (e.g. the parent's low memory). For a top-level window
+    /// (`base == 0`) this is identical to the old `byte(i)`. Fixes `fork_private` of a nested guest:
+    /// the twin now inherits the carve's high-offset globals, not zeros (FORK.md §8.6).
     fn snapshot(&self, n: u64) -> Vec<u8> {
         let n = n.min(self.window.mapped());
-        (0..n).map(|i| self.byte(i)).collect()
+        let base = self.window.base();
+        (0..n).map(|i| self.byte(base + i)).collect()
     }
 
     /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)

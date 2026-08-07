@@ -365,6 +365,319 @@ fn a_compiled_c_program_runs_fork_exec_wait_end_to_end() {
     );
 }
 
+/// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
+/// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
+/// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.
+const NEXEC_GUEST_SRC: &str = r#"
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+int main(int argc, char **argv) {
+  long cmd = __vm_resolve(cmd_name, 3);
+  long soh = __vm_resolve(stdout_name, 6);
+  grec.name_off = (int)(long)stdout_name;
+  grec.name_len = 6;
+  grec.handle = (int)soh;
+  __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+  return -1;
+}
+"#;
+
+const NEXEC_MANAGER: &str = r#"
+memory 19
+data 310 "stdout"
+data 330 "cmd"
+func (i32, i32, i64, i64) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
+  vq = i64.const 0
+  vcmod32 = i32.wrap_i64 vcmod
+  va0 = i64.const 256
+  vnp0 = i32.const 310
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 330
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  vthree = i32.const 3
+  i32.store va4 vthree
+  va5 = i64.const 280
+  i32.store va5 vcmod32
+  vgp = i64.const 256
+  vgn = i64.const 2
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+"#;
+
+#[test]
+fn a_nested_compiled_c_guest_execs_a_separate_command() {
+    let manager = Arc::new(parse_module_raw(NEXEC_MANAGER).expect("parse nexec manager"));
+    verify_module(&manager).expect("verify nexec manager");
+    let guest = parse_module_raw(&c_to_ir(NEXEC_GUEST_SRC)).expect("parse nexec guest");
+    verify_module(&guest).expect("verify nexec guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_CMD_SRC)).expect("parse nexec command");
+    verify_module(&cmd).expect("verify nexec command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the nested guest exec'd the command (exit 42)"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"EXEC",
+        "the exec'd separate command wrote through the inherited stdout"
+    );
+}
+
+/// FORK.md §8.6 — **the shell command loop with a *real* `execve`**: `fork()` → **`execve` (image
+/// -replace of a separate command module)** → `wait()`, all in ordinary compiled C. This upgrades the
+/// multicall stand-in above to the true capstone — the forked child *becomes a different program*.
+///
+/// - **fork** through `__fork` (retry on the `-EAGAIN` serve/park race).
+/// - **execve** through `__vm_exec_module` (the `CAP_SELF_EXEC` self-op): the child resolves the
+///   command module `"cmd"` (re-granted to it by name — modules are now regrantable) and the inherited
+///   `"stdout"` handle (`__vm_resolve`), builds a 1-entry grant list, and replaces its image with the
+///   command. Its `TaskId` is preserved, so it *is* the command now.
+/// - **wait** through `__wait` (`reap`): the parent reaps the twin — which is running the command — and
+///   returns the command's exit status.
+///
+/// The **separate command module** writes `"EXEC"` to the inherited stdout and exits `42`. So the sink
+/// holds exactly `"EXEC"` (a different program did that I/O, as the child's task) and the run returns
+/// `42` (the parent reaped the command's exit through the child's pid). Interp only, like every fork test.
+const EXECVE_GUEST_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static long pid;
+static long status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The separate command the child `execve`s into: write `"EXEC"` to the inherited stdout (its `write`
+/// import binds to the regranted `"stdout"` at exec) and exit `42`.
+const EXECVE_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "EXEC";
+int main(int argc, char **argv) {
+  write(1, msg, 4);
+  return 42;
+}
+"#;
+
+/// The manager: like `EXEC_MANAGER` but `main(inst, stream, guestmod, cmdmod)` re-grants a **4th** entry
+/// `{"cmd" → command module}` (a module regrant) so the guest resolves it by name and `execve`s it.
+const EXECVE_MANAGER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "fork" 1 { op: 2 }
+export 1 interface "wait" 1 { op: 3 }
+data 400 "__fork"
+data 410 "stdout"
+data 420 "__wait"
+data 430 "cmd"
+func (i32, i32, i64, i64) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64) {
+  vq = i64.const 0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 262144
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vz0 = i64.const 0
+  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  v1c = i64.const 1
+  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vcmod32 = i32.wrap_i64 vcmod
+  va0 = i64.const 256
+  vnp0 = i32.const 410
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 400
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  i32.store va4 vsix
+  va5 = i64.const 280
+  i32.store va5 vforkoff
+  va6 = i64.const 288
+  vnp2 = i32.const 420
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  i32.store va7 vsix
+  va8 = i64.const 296
+  i32.store va8 vwaitoff
+  va9 = i64.const 304
+  vnp3 = i32.const 430
+  i32.store va9 vnp3
+  va10 = i64.const 308
+  vthree = i32.const 3
+  i32.store va10 vthree
+  va11 = i64.const 312
+  i32.store va11 vcmod32
+  vgp = i64.const 256
+  vgn = i64.const 4
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+"#;
+
+#[test]
+fn a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let guest = parse_module_raw(&c_to_ir(EXECVE_GUEST_SRC)).expect("parse execve guest");
+    verify_module(&guest).expect("verify execve guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_CMD_SRC)).expect("parse execve command");
+    verify_module(&cmd).expect("verify execve command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The parent reaped the twin — which had replaced its image with the command — and returned the
+    // command's exit status (42).
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the parent's wait reaped the exec'd separate command's exit status (42)"
+    );
+    // The separate command module wrote "EXEC" to the inherited stdout, as the child's task.
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"EXEC",
+        "the exec'd separate command did real I/O through the inherited stdout"
+    );
+}
+
 #[test]
 fn a_compiled_c_program_forks_for_real_and_both_copies_write_through_the_shared_stream() {
     let manager = Arc::new(parse_module_raw(MANAGER).expect("parse manager"));
