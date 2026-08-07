@@ -177,14 +177,44 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
     svm_verify::verify_module(&residual).expect("residual verifies");
 
     let counter_ix = d.varying.iter().position(|&a| a == d.counter).unwrap();
-    // Accumulator = the lowest-address carried cell that is not the trip counter (the first local
-    // declared before the loop). `dyn_cells` is ascending, so that is the first non-counter entry.
-    let acc_ix = d
-        .varying
-        .iter()
-        .position(|&a| a != d.counter)
-        .expect("an accumulator cell distinct from the counter");
-    let acc_addr = d.varying[acc_ix];
+    // The **result register**: the chunk's `return <v>` compiles to a `RETURN1 A` (or `RETURN A ...`)
+    // bytecode whose `A` is the returned register. Decoding it (a single lookup in the proto code) is
+    // the generic, dataflow-free way to know which cell holds the program's result — unlike the
+    // "lowest carried cell" heuristic, this is correct for multi-accumulator chunks (fibonacci returns
+    // `b`, not the lowest register). The residual writes the register file back on return even though
+    // it stops before executing the `RETURN`, so reading that register gives the result.
+    // Lua 5.4.7 opcodes: RETURN=70, RETURN0=71, RETURN1=72. `A` is bits 7..15, `B` bits 16..24. The
+    // real `return <v>` is `RETURN1` (always one value) or a `RETURN` with `B != 1` (B-1 values; the
+    // implicit end-of-chunk `RETURN A 1` returns nothing). `A` is in the chunk's own register
+    // numbering; VARARGPREP shifts the runtime frame up by one, so the cell address is
+    // `base + (A + 1)*stride`.
+    let mut result_reg: Option<u64> = None;
+    for pc in 0..sizecode {
+        let word = u32::from_le_bytes(
+            w[(code + pc as u64 * 4) as usize..(code + pc as u64 * 4) as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let op = word & 0x7F;
+        let a = ((word >> 7) & 0xFF) as u64;
+        let b = (word >> 16) & 0xFF;
+        if op == 72 || (op == 70 && b != 1) {
+            result_reg = Some(a);
+            break;
+        }
+    }
+    // Accumulator = the returned register (+1 VARARGPREP shift) if it is a discovered carried cell,
+    // else the lowest carried non-counter cell.
+    let acc_addr = result_reg
+        .map(|a| base + (a + 1) * STACKVALUE_SIZE)
+        .filter(|a| d.varying.contains(a))
+        .unwrap_or_else(|| {
+            *d.varying
+                .iter()
+                .find(|&&a| a != d.counter)
+                .expect("a carried cell distinct from the counter")
+        });
+    let acc_ix = d.varying.iter().position(|&a| a == acc_addr).unwrap_or(0);
     let captured: Vec<i64> = d.varying.iter().map(|&a| rd_u64(w, a) as i64).collect();
 
     AutoRolled {

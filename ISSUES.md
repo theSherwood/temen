@@ -345,6 +345,21 @@ Remaining generality gaps for `auto_rolled` (documented in the module): dataflow
 identification for chunks whose result is not the first local, and post-loop code that calls out
 (e.g. `print`) rather than a clean `return`.
 
+**More-real programs + the result-register decode (2026-08-07, `lua_real_programs`)** — pushed the
+zero-config pipeline past `x = x + 3` onto genuine numeric loops whose body uses the loop variable and
+does real arithmetic. A gallery (`#[ignore]`d bench) runs each and prints the result **plus the
+per-iteration speed of the interpreter and of the residual**: `sum 1..n` (=1275), `sum of squares`
+(=42925), `polynomial i²−i` (=41650), `powers of two` (=2⁵⁰), and **fibonacci** (=fib(51)=20365011074,
+two accumulators + a swap). Residuals ≈ **1–3 ns/iter** vs the interpreter's ≈ 9–26 ns/iter — **≈
+8–15×**, all byte-correct. This retired the "lowest carried cell = accumulator" heuristic: the result
+cell is now decoded from the chunk's `RETURN`/`RETURN1` bytecode (its `A` operand, +1 for the
+VARARGPREP frame shift), which is correct for multi-accumulator chunks like fibonacci (returns `b`,
+not the lowest cell). Two frontier walls found and documented: **`%` and `//` hit `Unsupported`** in
+the specializer (the div/mod divide-by-zero cold path the auto config doesn't yet deopt — bitwise `&`
+works, so it's div/mod-specific; modulo is the highest-value next unlock), and a **conditionally-
+updated accumulator** (`if i>25 then s=s+i`) is mis-discovered when it stays constant through the short
+observation window. Everything that rolls is straight-line integer arithmetic per iteration.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
