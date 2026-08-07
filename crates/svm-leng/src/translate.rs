@@ -438,6 +438,15 @@ impl Translator {
         let mut off = self.globals_base();
         for item in root.args() {
             match item.tag() {
+                // `gvar` (global) and `tvar` (Leng thread-var, nimony's `__thread`) lower the same:
+                // one plain, zero-initialized global at a fixed window offset. This is the committed
+                // **single-threaded** TLS model (NIM.md §3d) — every guest we target (each nimony
+                // compiler phase; each svm domain) runs single-threaded, so a thread-local has exactly
+                // one instance and a plain global *is* that instance. It mirrors the C on-ramp, which
+                // strips `__thread` before clang (`demos/nimony/build_nimony.sh`). A genuinely
+                // multi-threaded Nim guest would need the real per-CPU-block scheme over `vcpu.tls`
+                // (NIM.md §3d Tier 2) — deferred until such a guest exists; the collapse here is sound
+                // *only* under that single-threaded invariant.
                 Some("gvar" | "tvar") => {
                     let a = item.args();
                     if a.len() < 3 {
@@ -629,6 +638,8 @@ impl Translator {
                     }
                 }
                 Some("gvar" | "tvar") => {
+                    // `tvar` (thread-var) exports as a plain data symbol, same as `gvar` — the
+                    // single-threaded TLS model (see `collect_globals`).
                     // `(gvar :name pragmas type init)` — pragmas at index 1.
                     if let Some(cname) = exportc_name(item.args().get(1)) {
                         let local = sym_def(&item.args()[0])?;

@@ -745,8 +745,8 @@ already lowers a named import to a host capability (`Cap`) — that's the seam.
 
 Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
 end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
-model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
-protocol runs correctly against a real allocator.
+model onto svm (now settled — §3d: single-threaded `tvar → plain global`), and confirming the ARC
+destructor protocol runs correctly against a real allocator.
 
 **✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
 end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
@@ -834,9 +834,9 @@ run strictly in sequence anyway. And the shared-memfs wiring (option 2) is delib
 default grant. Remaining real W4 work is therefore **build-out, not invention**: (i) compile each
 phase (`nifler`/`nimony`/`hexer`/`lengc`) to an svm module — Phase 1's C on-ramp already does this
 for one binary, so it is four applications of a proven step; (ii) write the driver module that
-registers them and chains them with a shared memfs; (iii) the nimony-specific unknowns that remain
-are its **TLS model** onto svm (the on-ramp gap Phase 1 already surfaced) and confirming each phase's
-allocator/`system` runtime boots cleanly as an isolated child.
+registers them and chains them with a shared memfs; (iii) confirming each phase's allocator/`system`
+runtime boots cleanly as an isolated child. (The **TLS model** that Phase 1's on-ramp surfaced is now
+settled — see §3d: single-threaded `tvar → plain global`, done and tested.)
 
 **First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
 the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
@@ -853,6 +853,59 @@ driver module, only the phase registry differs — so the abort is the driver re
 real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
 including its failure handling; what's left (above) is compiling the actual phases and — for the
 file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
+
+## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
+
+nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng
+**`tvar`** (thread-var, the sibling of `gvar`). Phase 1's C on-ramp had no `llvm.threadlocal.address`
+lowering, so `demos/nimony/build_nimony.sh` **strips `__thread`** before clang (a `sed` pass with a
+`grep` guard that fails the build if any survives) — valid because the guest is single-threaded. This
+section commits the Phase-2 backend's model. It is a **two-tier** answer, and Tier 1 is done.
+
+**What svm actually offers (measured).** svm has exactly **one** thread-local primitive: a single
+per-vCPU `i64` register, the IR ops `vcpu.tls.get` / `vcpu.tls.set` (§12,
+`crates/svm-ir/src/lib.rs:1935-1959`), seeded to the dense vCPU id (root 0, children distinct;
+`crates/svm-interp/src/lib.rs:7810`) and read *at the execution point* so it tracks the current vCPU
+across fiber migration (D57). It is **not** per-thread global storage — it is one word, meant to hold
+a *thread pointer*. Globals are process-global: a global is just a `Data { offset, readonly, bytes }`
+segment (`crates/svm-ir/src/lib.rs:4338`) in the **one shared window** every thread sees
+(`crates/svm-interp/src/bytecode.rs:8880` — "a thread shares its spawner's window/powerbox"); there
+is **no thread-local storage class** in svm-ir. A real `__thread` is therefore the guest's job:
+allocate a per-CPU block, put its base in `vcpu.tls`, and index thread-locals off it — the native
+fs/gs-base recipe. `DESIGN.md:949` lists `_Thread_local` (with threads) as deferred.
+
+**Tier 1 — `tvar` → plain global (committed, done).** For a single-threaded guest a thread-local has
+exactly one instance, so a plain global *is* that instance. svm-leng lowers `tvar` **identically to
+`gvar`**: one zero-initialized global at a fixed window offset, exported/linked as an ordinary data
+symbol (`translate.rs` `collect_globals`, the `gvar | tvar` arms). This mirrors the on-ramp's
+`__thread`-stripping and needs no new IR. It rests on one **invariant**, stated so it can't rot:
+*every guest we target runs single-threaded* — each nimony compiler phase is a batch process (W4 runs
+them as separate single-threaded domains, §3c), each svm domain is single-threaded, and nimony's own
+concurrency is **CPS/`.passive` → state machines** over a minimal `system.nim` (§1), not OS threads.
+Under that invariant the collapse is exact. Pinned by `crates/svm-leng/tests/thread_var.rs`: a `tvar`
+persists across calls (write-then-read-back), a non-zero `tvar` initializer seeds the window, and a
+`tvar` **links cross-module** like a global (the shape of the real allocator's thread-vars in
+`system`, referenced from user code) — all on both engines. This is also already exercised
+end-to-end: the heap programs of W3/Path A run against the compiled `system` module, whose allocator
+state is thread-vars, and they get the right answer.
+
+**Tier 2 — real per-thread `__thread` over `vcpu.tls` (deferred, spec'd).** The moment a nimony guest
+is genuinely multi-threaded (spawns svm threads *and* relies on per-thread `tvar` state), Tier 1's
+plain global is wrong — all vCPUs would share one copy. The faithful lowering, when it's needed:
+(i) reserve a per-CPU **TLS block** sized to the module's `tvar`s (each `tvar` gets a fixed block
+offset instead of a fixed window offset); (ii) at thread entry, allocate a block (from the same
+Memory-cap heap the allocator already uses) and `vcpu.tls.set` its base — the root vCPU's block set
+up once at `_start`; (iii) lower every `tvar` access to `vcpu.tls.get()` + the tvar's block offset,
+exactly as native code adds to the fs/gs base. svm supplies the base register; the block layout and
+per-thread allocation are the backend's work — no new substrate. This is **deferred on purpose**
+(prime directive: don't build it until a concrete threaded guest demands it), and it is bounded, not
+open: the mechanism above is the whole design, and the single-threaded/multi-threaded switch is local
+to the `tvar` lowering — Tier 1's tests are the differential oracle a Tier 2 implementation must still
+satisfy when run single-threaded.
+
+**Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved
+for the self-host goal** — nimony's compiler is single-threaded, so Tier 1 is the operative model and
+it is implemented and tested. Tier 2 is the recorded plan for if/when a threaded Nim guest appears.
 
 ## 4. Invariants this must respect
 
