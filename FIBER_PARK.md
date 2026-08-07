@@ -124,7 +124,23 @@ Tests (oracle-only, `fiber_parks.rs` style):
   - durable callers and the explorer keep the blocking wait (predicate pins).
 ISSUES.md entry: the interim divergence, enumerated, convergence = F2+F3.
 
-**F2 — bytecode cooperative driver parity.**
+**F2 — bytecode cooperative driver parity. BUILT 2026-08-07.**
+As designed, with two as-built shape changes: (1) the punt surfaces from the `Vm` as a new
+`Outcome::CapPending`/`VcpuStop::CapPending` (the `MemoryWait` channel — the Vm cannot know its
+fiber context, the driver can), so every driver states its posture explicitly: the cooperative
+`drive` parks a punting fiber (`FiberState::CapParked`, non-durable root-env only — a confined
+`instantiate` child's completions live on its own host, so it keeps the inline wait, recorded
+residue), the parallel/browser-session drivers wait inline (the I45 posture), the debug drivers
+wait inline (their sanctioned whole-vCPU shape; checkpointing excludes cap-parked fibers exactly
+as futex-parked ones), and the §22 invoke leaves wait inline (a seam-free atomic leaf). (2)
+Delivery runs through one `drain_cap_parked` — smallest-outstanding-id-first, stop at the first
+not-yet-arrived — at both wake sites (the `cont.resume` poll and driver idle), so submission
+order is enforced by construction, not by timers; driver idle with unwoken cap parks **blocks on
+the store** for the smallest id instead of jumping the logical clock or declaring deadlock (a
+pool completion is pending work). GC root scans cover `CapParked` frames (a root held across a
+punt would otherwise be missed). Pins: `fiber_punt_diff.rs` — all four F1 kernels
+(park/wake composite, the single-vCPU rendezvous overlap, ordered delivery, teardown abandon)
+**TreeWalk ≡ Bytecode bit-exact**, same punt counts; the Cranelift JIT joins in F3 (I73).
 `FiberState` gains a `CapPendingParked` arm mirroring `WaitParked` (bytecode.rs:7443):
 the punt site (bytecode.rs:10910) gains the fiber gate; the resume poll returns
 `FIBER_PARKED`; `drive`'s idle wait must additionally wake on completions — completions

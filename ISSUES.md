@@ -13,7 +13,14 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I73 — punt-inside-a-fiber: the fast backends still block the vCPU inline where the tree-walk oracle parks the fiber (S3, tracked debt with a convergence plan) — opened 2026-08-07 by FIBER_PARK.md F1
+### I73 — punt-inside-a-fiber: the Cranelift JIT still blocks the vCPU inline where the tree-walk oracle parks the fiber (S3, tracked debt with a convergence plan) — opened 2026-08-07 by FIBER_PARK.md F1; **bytecode half CONVERGED 2026-08-07 (F2)**
+
+**F2 update.** The bytecode cooperative driver now mirrors the oracle (`FiberState::CapParked` +
+the ordered `drain_cap_parked`; `fiber_punt_diff.rs` pins all four F1 kernels TreeWalk ≡ Bytecode
+bit-exact). Remaining: the **Cranelift JIT** (`cap_thunk`/`cap_thunk_locked` block the OS thread
+on a punt regardless of fiber context) — F3 on the same arc. The bytecode **parallel** and
+browser-`Vcpu` drivers wait inline by design (the I45 posture, not debt), as do the debug drivers
+(sanctioned tiering) and the §22 invoke leaf.
 
 **What.** F1 extended the §3.6 slice-5a fiber-park contract to punted host calls: on the
 tree-walk oracle, a `Pending` dispatch inside a fiber now unwinds `FIBER_PARKED (3)` to its
