@@ -13,29 +13,45 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I74 — wasm-JIT single-shot runner emits a fall-through `unreachable` where it should compile-veto (S4; opened 2026-08-07 — correctness already handled by the runtime decline, PR #665)
+### I74 — wasm-JIT confines against the **compile-time** `mapped`, so an access into `vm_map`-grown memory faults on the JIT where the interpreter allows it (S3, correctness-of-tier — masking hinge; opened 2026-08-07, root-caused; runtime decline already keeps results correct, PR #665)
 
-**What.** Some emitted functions in a chibicc-compiled artifact reach the **trailing function-body
-`unreachable`** (`svm-wasm-jit` `lib.rs:2669`, "every path returned / trapped / re-dispatched") at
-runtime: an emitted block falls through instead of returning or re-dispatching, so the emitted `f0`
-traps mid-run where the tree-walk interpreter completes and prints correctly. Surfaced by the
-`open_memstream` + buffered-`FILE*` stdio path (the memstream card in `browser-play-editor-test.mjs`):
-`printf("A\n")` lands, then the emitted run traps (a wasm `unreachable`, not a cross-tier decline)
-while the interpreter prints the full `[0][1][4] len=9`.
+**What (root-caused).** The wasm tier's confinement (`emit_confine`, `svm-wasm-jit` `lib.rs:~2792`)
+bounds-checks every access as `eff > mapped - width ⇒ MemoryFault`, where `mapped = 1 << size_log2` is
+the module's **declared** memory size, **baked in at emit time** (`lib.rs:1985`). But a guest grows the
+live mapped region at runtime via `vm_map` (ADDRESS_SPACE op 0). After a grow, an access into
+`[declared_mapped, grown_mapped)` **faults on the JIT** (stale compile-time bound) while the
+interpreter — which tracks the live `Window::mapped` (`svm-mask`) — admits it. Confirmed on the
+`open_memstream` card: `memory 18` (256 KiB declared), the guest's `malloc` calls `vm_map` to extend
+the heap, and the emitted allocator (`IR func 3` = `wasm-function[5]`) traps `TRAP_MEMORY_FAULT`
+(env.trap code `2`) writing the allocation header past 256 KiB. The interpreter prints correctly.
 
-**Correctness is already handled — this is a cleanliness/efficiency gap, not a wrong-result bug.**
-The single-shot runner now reports a trap as `STATUS_TRAP` (not a truncated `STATUS_OK`) and
-`driveJitRun` throws on it, so the caller declines the whole run to the interpreter oracle and shows
-the correct result (the return/exit/trap parity fix, PR #665). The remaining cost is that these
-programs run on the interpreter instead of the wasm-JIT, and emit-then-trap-at-runtime is less clean
-than a veto.
+**Why the existing exclusion misses it.** `map`/`unmap`/`protect` are *deliberately* out-of-subset for
+the mask-only tier (`is_nested_leaf_cap`, `lib.rs:784`) — but only in their `Inst::CapCall` form. The
+on-ramp emits heap growth as `Inst::CallSym "vm_map"` (the `<svm.h>` `__vm_map` builtin,
+`svm-llvm:512`), and the CallSym outliner (`lib.rs:~1560`) rewrites **every** symbolic call into an
+emittable cross-tier leaf wrapper unconditionally, so the page-state-changing `vm_map` slips into the
+emitted subset.
 
-**Why tracked.** Invariant 9 prefers a **compile-time veto** (`Error::Unsupported` → the function
-bounces cross-tier at emit time — decline, don't emit code that traps) over emit-and-trap. The fix:
-diagnose which control-flow / op construct in the memstream functions lowers to a fall-through, then
-either (a) lower it faithfully so the artifact runs fully on the JIT, or (b) decline that function at
-emit time so a run either JITs cleanly or falls back **per-function** rather than **per-run**. Needs a
-wasm-emit + trace loop to map the runtime trap back to the emitted function/block.
+**Correctness is already handled — this is a *which-tier* / efficiency gap, not a wrong-result bug.**
+The runner reports the trap as `STATUS_TRAP` and the caller declines the whole run to the interpreter
+oracle (PR #665), so the output is correct. The cost is that a program which grows memory runs on the
+interpreter instead of the wasm-JIT.
+
+**Why not a simple veto.** A static "module contains `vm_map` ⇒ decline" veto **regresses working
+guests**: `qjs_repl.svmb` contains `vm_map` (heap-growth path) yet runs fully on the JIT today (its
+workload never grows past the declared size, so it never faults). Vetoing on static presence would drop
+qjs/SQLite from the JIT (losing the ~7× speedup). Confining against `reserved` instead would be
+**fail-open** — the JIT would sail through unmapped `[mapped, reserved)` pages the interpreter faults
+(the exact divergence `lib.rs:786` rejects). Neither is acceptable.
+
+**The correct fix is the masking hinge (owner territory, INVARIANT 2).** Confine against the **live**
+`mapped` size read at runtime (e.g. from the env cell the emitted code already holds — no new import,
+per the CONSOLIDATION §0 yardstick — kept in sync by the `vm_map` cross-tier handler), instead of the
+emit-time constant. This is the fuzzed confinement lowering ("the most sensitive code in the tree"), so
+it needs owner sign-off and its own masking-fuzz coverage of the dynamic-`mapped` case before landing.
+Until then the runtime decline (PR #665) is the fail-closed resting point. Severity raised S4→S3: it is
+a real interpreter-vs-JIT semantic divergence (masked today only because the JIT declines on the
+resulting fault).
 
 ### I73 — punt-inside-a-fiber: the fast backends blocked the vCPU inline where the tree-walk oracle parks the fiber — **CONVERGED 2026-08-07, all three engines** (S3; opened by FIBER_PARK.md F1, closed by F2+F3 on the same arc)
 
