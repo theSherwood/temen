@@ -68,6 +68,15 @@ rerun-once policy applies — a fresh push re-triggers and clears it. No code fi
 > Verdict from the review: none of these needs a different design — the model is the actor model
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
+>
+> **I36 update (2026-08-07):** the fork substrate (`clone_caller`/`reap`) was part of this fold.
+> Progress: (a) the parity matrix is now **honest** — the process/serve/fork ops are their own
+> `OPS_PARITY.md` family classified per-backend, no longer hidden in the `cap.call` row; (b) **native
+> bytecode fork landed** — `clone_caller`/`reap` run on the bytecode cooperative serve driver (twin =
+> the parked caller's `Vm` cloned over `fork_private` + `fork_powerbox`; `reap` via a `BlockedReap`
+> state + `forked_twins`), pinned bit-for-bit against the oracle. The per-backend veto split keeps
+> Cranelift folding fork. So fork is now ✅ on tree-walk + bytecode, 🚧 on Cranelift (the remaining
+> slice), ⛔ on the wasm-JIT leaf. Track + Cranelift plan in FORK.md §9.
 
 ### I71 — peval precall/poscall call projection gaps — **ALL FACETS FIXED** (S3) — recorded 2026-08-06, closed 2026-08-07: **(a)** result-feeds-arithmetic (`lua_futamura_call_arith`), **(b)** nested 2-frame (`lua_futamura_call_nested` — root cause a `CallInfo` overlay collision, `CI_SIZE` 104 vs the real 64-byte stride, not an engine bug), **(c)** sequential distinct callees sharing one cached `CallInfo` (`lua_futamura_call_seq` — per-site `LuaSite::pins` on the shared node's `func`/`savedpc`); plus the call-bearing loop now **executes** (`lua_futamura_call_loop_exec`). All config/test — zero engine changes.
 
@@ -344,6 +353,21 @@ closes the arc: a Lua chunk in, a measured per-iteration speedup out, zero hand-
 Remaining generality gaps for `auto_rolled` (documented in the module): dataflow-based accumulator
 identification for chunks whose result is not the first local, and post-loop code that calls out
 (e.g. `print`) rather than a clean `return`.
+
+**More-real programs + the result-register decode (2026-08-07, `lua_real_programs`)** — pushed the
+zero-config pipeline past `x = x + 3` onto genuine numeric loops whose body uses the loop variable and
+does real arithmetic. A gallery (`#[ignore]`d bench) runs each and prints the result **plus the
+per-iteration speed of the interpreter and of the residual**: `sum 1..n` (=1275), `sum of squares`
+(=42925), `polynomial i²−i` (=41650), `powers of two` (=2⁵⁰), and **fibonacci** (=fib(51)=20365011074,
+two accumulators + a swap). Residuals ≈ **1–3 ns/iter** vs the interpreter's ≈ 9–26 ns/iter — **≈
+8–15×**, all byte-correct. This retired the "lowest carried cell = accumulator" heuristic: the result
+cell is now decoded from the chunk's `RETURN`/`RETURN1` bytecode (its `A` operand, +1 for the
+VARARGPREP frame shift), which is correct for multi-accumulator chunks like fibonacci (returns `b`,
+not the lowest cell). Two frontier walls found and documented: **`%` and `//` hit `Unsupported`** in
+the specializer (the div/mod divide-by-zero cold path the auto config doesn't yet deopt — bitwise `&`
+works, so it's div/mod-specific; modulo is the highest-value next unlock), and a **conditionally-
+updated accumulator** (`if i>25 then s=s+i`) is mis-discovered when it stays constant through the short
+observation window. Everything that rolls is straight-line integer arithmetic per iteration.
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 

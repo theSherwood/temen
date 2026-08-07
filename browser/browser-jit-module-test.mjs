@@ -45,28 +45,37 @@ const res = await page.evaluate(async (cases) => {
   for (const { name, stdin } of cases) {
     const bytes = new Uint8Array(await (await fetch(`./assets/${name}.svmb`)).arrayBuffer());
     const stdinBytes = new TextEncoder().encode(stdin);
-    // Interpreter oracle
-    let interpOut, interpMs;
+    // Interpreter oracle: capture stdout AND the guest-observable outcome — status + the returned value
+    // (svm_run_onramp returns the top-level result; svm_status is OK/EXIT). The wasm-JIT must agree on all
+    // three, not just stdout (INVARIANT 9 — same return/exit behavior on every backend).
+    let interpOut, interpMs, interpStatus, interpValue;
     {
       const mp = eng.ex.svm_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, mp);
       let sp = 0; if (stdinBytes.length) { sp = eng.ex.svm_alloc(stdinBytes.length); new Uint8Array(eng.memory.buffer).set(stdinBytes, sp); }
       const t0 = performance.now();
-      eng.ex.svm_run_onramp(mp, bytes.length, sp, stdinBytes.length);
+      interpValue = Number(eng.ex.svm_run_onramp(mp, bytes.length, sp, stdinBytes.length));
+      interpStatus = eng.ex.svm_status();
       interpMs = performance.now() - t0;
       interpOut = readStdout();
       eng.ex.svm_dealloc(mp, bytes.length); if (sp) eng.ex.svm_dealloc(sp, stdinBytes.length);
     }
-    // wasm-JIT
-    let jitOut, jitMs, err = null, status = null;
+    // wasm-JIT: runJitModule returns the finish status (STATUS_OK/EXIT; it THROWS on a trap); svm_run_value
+    // is the returned result — the same slots the interpreter path reads.
+    let jitOut, jitMs, err = null, status = null, jitValue = null;
     try {
       const t0 = performance.now();
       status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      jitValue = Number(eng.ex.svm_run_value());
       jitMs = performance.now() - t0;
       jitOut = readStdout();
     } catch (e) { err = e.message; }
+    const stdoutEq = !err && jitOut === interpOut;
+    const statusEq = !err && status === interpStatus;
+    const valueEq = !err && jitValue === interpValue;
     out[name] = {
-      err, status,
-      identical: !err && jitOut === interpOut,
+      err, status, interpStatus, jitValue, interpValue,
+      stdoutEq, statusEq, valueEq,
+      identical: stdoutEq && statusEq && valueEq,
       stdout: interpOut.slice(0, 60),
       interpMs: Math.round(interpMs), jitMs: Math.round(jitMs),
       speedup: err ? null : +(interpMs / Math.max(jitMs, 0.01)).toFixed(1),
@@ -82,7 +91,7 @@ const names = CASES.map((c) => c.name);
 const ok = errors.length === 0 && names.length > 0 && names.every((n) => res[n] && res[n].identical);
 for (const n of names) {
   const r = res[n] || {};
-  console.log(`  ${n}: ${r.err ? `ERROR ${r.err}` : `stdout≡=${r.identical} · interp ${r.interpMs}ms vs jit ${r.jitMs}ms (${r.speedup}×)`}`);
+  console.log(`  ${n}: ${r.err ? `ERROR ${r.err}` : `stdout≡=${r.stdoutEq} status≡=${r.statusEq}(${r.interpStatus}) value≡=${r.valueEq}(${r.interpValue}) · interp ${r.interpMs}ms vs jit ${r.jitMs}ms (${r.speedup}×)`}`);
 }
-console.log(ok ? 'PASS — module wasm-JIT byte-identical to the interpreter' : 'FAIL');
+console.log(ok ? 'PASS — module wasm-JIT ≡ interpreter (stdout + status + return value)' : 'FAIL');
 process.exit(ok ? 0 : 1);

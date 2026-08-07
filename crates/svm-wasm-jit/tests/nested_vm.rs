@@ -14,7 +14,9 @@
 //! the host imports, not a silent fallback).
 
 use svm_interp::{run, Value};
-use svm_wasm_jit::compile_module_nested;
+use svm_wasm_jit::{
+    compile_module_nested, compile_module_nested_with_eligibility, compile_nested, DriveMode,
+};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: i32 = 0x1_0000;
@@ -390,5 +392,230 @@ fn threaded_unit_matches_oracle() {
         results[0].i64(),
         Some(want),
         "emitted threaded unit != cooperative oracle"
+    );
+}
+
+/// **Track 1 — a `f64`-signature cross-tier leaf in a nested unit.** The entry (func 0) instantiates +
+/// joins a child (so it is nested-emittable) and also calls a float helper `f2: (f64)->(f64)` that does
+/// a scalar `f64.fma` (no core-wasm opcode → not emittable). Before the cross-tier ABI widened to
+/// scalar floats, `f2`'s non-integer signature failed `compile_module_nested` closed
+/// (`v128`/float couldn't be marshalled); now it rides `env.call_interp` as a cross-tier leaf, so the
+/// unit compiles with `f2` unemitted. Compile-level regression — the emit is what gap-1 was blocking.
+const NESTED_FLOAT_LEAF: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vinst = i32.wrap_i64 v0
+  ventry = i64.const 1
+  voff = i64.const 0
+  vslog = i64.const 10
+  vquota = i64.const 0
+  vch = cap.call 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
+  vr = cap.call 6 1 (i32) -> (i64) vinst (vch)
+  vf = f64.convert_i64_s vr
+  vg = call 2 (vf)
+  vi = i64.trunc_sat_f64_s vg
+  return vi
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vr = i64.const 9
+  return vr
+  }
+}
+func (f64) -> (f64) {
+block 0 (v0: f64) {
+  vout = f64.fma v0 v0 v0
+  return vout
+  }
+}
+"#;
+
+#[test]
+fn nested_unit_with_float_signature_leaf_compiles() {
+    let m = parse(NESTED_FLOAT_LEAF);
+    let (_wasm, eligible) =
+        compile_module_nested_with_eligibility(&m, false).expect("float-leaf nested unit compiles");
+    // Entry (0) and the child (1) emit; the `f64.fma` helper (2) is a cross-tier leaf, not emitted.
+    assert_eq!(eligible, vec![true, true, false]);
+}
+
+// ---- Track 2: the `compile_nested` two-mode front door -------------------------------------------
+
+/// A pure `instantiate`/`join` unit (no fiber) takes the **wasm-driven** nested emit — the host calls
+/// `f0` directly and the child spawn/join bounce to the imports. (`NESTED` reused from above.)
+#[test]
+fn compile_nested_pure_instantiator_is_wasm_driven() {
+    let m = parse(NESTED);
+    let a = compile_nested(&m, false).expect("nested compiles");
+    assert_eq!(a.drive, DriveMode::WasmDriven { entry: 0 });
+    assert_eq!(a.emitted, vec![true, true], "entry + child both emit");
+}
+
+/// A **threads/futex** unit is still wasm-driven — only fibers force the interpreter to own the frame.
+/// `thread.spawn`/`join`/`wait`/`notify` lower to host bounces on the emit path. (`THREADED_UNIT`
+/// reused from above.)
+#[test]
+fn compile_nested_threaded_unit_is_wasm_driven() {
+    let m = parse(THREADED_UNIT);
+    let a = compile_nested(&m, false).expect("nested compiles");
+    assert_eq!(a.drive, DriveMode::WasmDriven { entry: 0 });
+    assert_eq!(
+        a.emitted,
+        vec![true, true],
+        "spawn entry + spawned func both emit"
+    );
+}
+
+/// A nested unit whose **entry uses a fiber** (`cont.new`/`cont.resume`) can't be wasm-driven — a wasm
+/// frame can't unwind for a stack switch — so `compile_nested` routes it **interpreter-driven** with a
+/// `nested_caps`-aware tier-up: the fiber entry (func 0) runs on the interpreter (which also services
+/// the child spawn/join natively), while the pure compute helper (func 1) and the fiber body (func 2,
+/// also pure) tier up onto emitted wasm. This is the gap-2 close: before, such a unit hard-`Err`ed.
+const FIBER_ENTRY_UNIT: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vf = ref.func 2
+  varg = i64.const 0
+  vk = cont.new vf varg
+  vin = i64.const 5
+  vtag, vres = cont.resume vk vin
+  vh = call 1 (vres)
+  return vh
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v3 = i64.const 3
+  vr = i64.mul v0 v3
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  return varg
+  }
+}
+"#;
+
+#[test]
+fn compile_nested_fiber_entry_is_interp_driven() {
+    let m = parse(FIBER_ENTRY_UNIT);
+    // The nested emit fails closed on the fiber, and the front door must not surface that as an error.
+    let a = compile_nested(&m, false).expect("fiber-bearing nested unit still yields an artifact");
+    assert_eq!(a.drive, DriveMode::InterpDriven);
+    // Fiber entry stays on the interpreter; the pure helper and the (pure) fiber body tier up.
+    assert_eq!(a.emitted, vec![false, true, true]);
+}
+
+/// The interpreter-driven fallback's tier-up wasm must be **well-formed** (the `nested_caps` import
+/// layout + emitted-function base offset) and its emitted region correct. Instantiate the artifact
+/// with the full eight-import nested linker and run the emitted pure helper `f1` — `v0*3`, matching the
+/// interpreter — proving the `nested_caps`-aware tier-up emits a valid, correct module.
+#[test]
+fn compile_nested_fiber_entry_tierup_emit_runs() {
+    let m = parse(FIBER_ENTRY_UNIT);
+    let a = compile_nested(&m, false).expect("artifact");
+    assert_eq!(a.drive, DriveMode::InterpDriven);
+
+    let engine = Engine::default();
+    let module =
+        WModule::new(&engine, &a.wasm).expect("interp-driven nested tier-up wasm must validate");
+    let mut store: Store<HostState> = Store::new(
+        &engine,
+        HostState {
+            module: m.clone(),
+            children: Vec::new(),
+            saw_bounce: false,
+        },
+    );
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
+    memory
+        .write(&mut store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
+        .unwrap();
+    let mut linker: Linker<HostState> = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    // All eight nested imports present; the emitted `f1`/`f2` are pure, so none fire.
+    linker
+        .func_wrap("env", "trap", |_: Caller<'_, HostState>, _c: i32| {})
+        .unwrap();
+    linker
+        .func_wrap::<_, ()>(
+            "env",
+            "call_interp",
+            |_: Caller<'_, HostState>, _f: i32, _a: i32| {
+                unreachable!("pure emit — no cross-tier call")
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "instantiate",
+            |_: Caller<'_, HostState>,
+             _w: i32,
+             _i: i32,
+             _e: i64,
+             _o: i64,
+             _s: i64,
+             _q: i64|
+             -> i32 { unreachable!() },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "join",
+            |_: Caller<'_, HostState>, _i: i32, _c: i32| -> i64 { unreachable!() },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "thread_spawn",
+            |_: Caller<'_, HostState>, _f: i32, _sp: i64, _a: i64| -> i32 { unreachable!() },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "thread_join",
+            |_: Caller<'_, HostState>, _h: i32| -> i64 { unreachable!() },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "mem_wait",
+            |_: Caller<'_, HostState>, _w: i32, _a: i64, _e: i64, _t: i64, _is64: i32| -> i32 {
+                unreachable!()
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "mem_notify",
+            |_: Caller<'_, HostState>, _w: i32, _a: i64, _c: i32| -> i32 { unreachable!() },
+        )
+        .unwrap();
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .unwrap()
+        .start(&mut store)
+        .unwrap();
+    let f1 = instance.get_func(&store, "f1").expect("f1 emitted");
+    let mut r = [Val::I64(0)];
+    f1.call(
+        &mut store,
+        &[Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(5)],
+        &mut r,
+    )
+    .expect("emitted f1 runs");
+    assert_eq!(
+        r[0].i64(),
+        Some(15),
+        "emitted f1 = v0*3 (interpreter parity)"
     );
 }

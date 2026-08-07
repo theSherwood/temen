@@ -900,23 +900,31 @@ work — no new substrate.
 
 svm-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
 (`translate_tls` / `Translator::with_tls`; the `tvar` arm of `collect_globals` assigns block offsets,
-`lvalue_addr` emits `vcpu.tls.get() + off`). Step (ii) is the runtime's job — the `vcpu.tls.set` at
-thread entry, the same division as the C runtime's fs/gs-base setup — so it stays outside the
-translator (a threaded guest's thread-start shim, the analog of Path B's allocator shim). Proven in
-`crates/svm-leng/tests/thread_var.rs`: the lowering routes a `tvar` through `vcpu.tls`, and — the core
-property — the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base B0 and bumps +3, base B1
-and bumps +5, then reads each back as 3 and 5; a shared global would read 8), on both engines. A
-non-zero `tvar` initializer in `tls_mode` is fail-closed (the per-thread block is zeroed; non-zero
-seeding is a bounded follow-up). Two other bounded follow-ups, both additive: cross-module block-offset
-agreement (so a `tvar` defined in `system` and referenced from user code shares one block layout — the
-TLS analog of the `data.sym` global relocation), and wiring the thread-start block-alloc/`vcpu.tls.set`
-shim for a real threaded guest. Tier 1's tests remain the differential oracle Tier 2 must satisfy when
-a `tls_mode` program runs single-threaded with its base set once.
+`lvalue_addr` emits `vcpu.tls.get() + off`). This holds **across modules**: `link_units_tls_with_runtime`
+runs a linker pre-pass (`export_tls_vars`) that pools every unit's thread-vars into one **shared block
+layout** and hands it to all (`import_tls_layout`), so a `tvar` defined in `system` and referenced from
+user code bakes the same offset on both sides — the TLS analog of the `data.sym` relocation a
+cross-module global gets, except the offset is fixed at translate time (a `vcpu.tls`-relative constant
+the linker can't relocate later). Step (ii) is the runtime's job — the `vcpu.tls.set` at thread entry,
+the same division as the C runtime's fs/gs-base setup — so it stays outside the translator (a threaded
+guest's thread-start shim, the analog of Path B's allocator shim; `link_units_tls_with_runtime` takes
+it as an extra link unit). Proven in `crates/svm-leng/tests/thread_var.rs`, both engines: the lowering
+routes a `tvar` through `vcpu.tls`; the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base
+B0 and bumps +3, base B1 and bumps +5, reads each back as 3 and 5 — a shared global would read 8); and
+a `tvar` **defined in one unit, written cross-module and read via the defining unit's local name, hits
+one slot** (offset agreement, at a non-zero offset). Remaining bounded follow-ups, all additive:
+non-zero `tvar` initializers (fail-closed now — the per-thread block is zeroed, so non-zero state needs
+per-thread seeding by the runtime); cross-module `tvar`s wider than an `i64` scalar (a cross-module
+reference is assumed scalar-`i64`, as a cross-module data symbol is); and wiring the actual
+thread-start block-alloc/`vcpu.tls.set` shim for a real threaded guest. Tier 1's tests remain the
+differential oracle Tier 2 must satisfy when a `tls_mode` program runs single-threaded with its base
+set once.
 
 **Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved**.
 Tier 1 (single-threaded `tvar → global`) is the operative model for the self-host goal — nimony's
 compiler is single-threaded — and both tiers are implemented and tested: Tier 1 is the default, Tier 2
-(`tls_mode`) is ready for when a threaded Nim guest appears, needing only the two additive follow-ups
+(`tls_mode`, single- and cross-module) is ready for when a threaded Nim guest appears, needing only the
+additive follow-ups
 above.
 
 ## 4. Invariants this must respect

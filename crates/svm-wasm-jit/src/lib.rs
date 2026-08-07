@@ -985,9 +985,10 @@ pub struct Analysis {
     /// lowers directly (it becomes an emitted `f{i}`).
     pub in_subset: Vec<bool>,
     /// `interp_leaf[i]` — function `i` is **not** in-subset but is safe to run on the bytecode
-    /// engine as a cross-tier leaf: an all-integer signature (so the call ABI marshals only i64
-    /// slots), **memory-free**, makes no calls (a true leaf, so no transitive window/state to
-    /// share), and no concurrency / capability ops. A JITted caller reaches it via `env.call_interp`.
+    /// engine as a cross-tier leaf: a [`marshallable_sig`] signature (each arg/result fits one
+    /// scratch slot — `i32`/`i64`/`f32`/`f64`, not `v128`), **memory-free**, makes no calls (a true
+    /// leaf, so no transitive window/state to share), and no concurrency / capability ops. A JITted
+    /// caller reaches it via `env.call_interp`.
     pub interp_leaf: Vec<bool>,
     /// `reachable[i]` — function `i` is reachable from func 0 through call edges.
     pub reachable: Vec<bool>,
@@ -1018,6 +1019,13 @@ fn term_in_subset(t: &Terminator) -> bool {
 /// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
 /// single source of truth, plus a type check (all values i32/i64) and the terminator check.
 fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
+    func_in_subset_caps(m, f, atomics_ok, false)
+}
+
+/// [`func_in_subset`] with the `nested_caps` typing switch threaded through: when `true`, the §14
+/// instantiator bounce and §11 thread/futex ops type as in-subset (they lower to host bounces), so a
+/// nesting/threading function counts as emittable. `false` is the plain integer-compute subset.
+fn func_in_subset_caps(m: &Module, f: &Func, atomics_ok: bool, nested_caps: bool) -> bool {
     // §12 atomics lower to a **single-threaded** load/(rmw)/store sequence (see the
     // `block_value_types` note): correct only when no contention is possible. `atomics_ok` is the
     // module-level guarantee of that (no reachable concurrency op ⇒ no second thread) — when it does
@@ -1027,7 +1035,8 @@ fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
         return false;
     }
     f.blocks.iter().all(|b| {
-        block_value_types(m, b, false).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        block_value_types(m, b, nested_caps)
+            .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
 }
@@ -1085,12 +1094,7 @@ fn func_uses_indirect(f: &Func) -> bool {
 
 /// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
 fn interp_leaf(f: &Func) -> bool {
-    let int_sig = f
-        .params
-        .iter()
-        .chain(&f.results)
-        .all(|t| matches!(t, ValType::I32 | ValType::I64));
-    if !int_sig || f.uses_concurrency() {
+    if !marshallable_sig(f) || f.uses_concurrency() {
         return false;
     }
     f.blocks.iter().all(|b| {
@@ -1125,14 +1129,15 @@ fn interp_leaf(f: &Func) -> bool {
 }
 
 /// Classify every function of a **verified** `m` for tiering rooted at func 0 (see [`Analysis`]).
-/// Whether `f`'s signature is entirely `i32`/`i64` — the marshalling the cross-tier `env.call_interp`
-/// ABI handles (each arg/result is one i64 scratch slot the callback widens/narrows per the declared
-/// type). A function with a `v128`/float parameter or result cannot be reached cross-tier.
-fn int_sig(f: &Func) -> bool {
+/// Whether every param/result of `f` fits **one** 8-byte cross-tier scratch slot — the ABI
+/// [`emit_slot_store`]/[`emit_slot_load`] encode and every `env.call_interp` servicer decodes:
+/// `i32` (widened), `i64`, `f32` (low 4 bytes), `f64`. A `v128` needs **two** slots, so it is not
+/// marshallable; such a function cannot be reached cross-tier and stays off the interpreter-leaf path.
+fn marshallable_sig(f: &Func) -> bool {
     f.params
         .iter()
         .chain(&f.results)
-        .all(|t| matches!(t, ValType::I32 | ValType::I64))
+        .all(|t| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64))
 }
 
 pub fn analyze(m: &Module) -> Analysis {
@@ -1329,11 +1334,21 @@ pub fn compile_module_nested_with_eligibility(
             wasm_of[i] =
                 Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
             emitted.push(i);
-        } else if int_sig(f) {
+        } else if f.uses_fibers() {
+            // A fiber (`cont.*`/`suspend`) can't be emitted (no wasm frame unwind) and must not become
+            // a cross-tier leaf: called synchronously from an emitted frame, a suspend across that seam
+            // can't unwind. Fail closed — [`compile_nested`] routes such a unit interpreter-driven,
+            // where the interpreter owns the frame and fibers run correctly.
+            return Err(Error::Unsupported(
+                "fiber op in a nested unit (needs the interp-driven tier)",
+            ));
+        } else if marshallable_sig(f) {
             interp_leaf[i] = true;
         } else {
+            // Not nested-emittable and carries a `v128` (the one type the i64-slot cross-tier ABI
+            // can't marshal), so it can be neither emitted nor run cross-tier — fail closed.
             return Err(Error::Unsupported(
-                "non-leaf function outside the nested subset",
+                "v128-signature function outside the nested subset",
             ));
         }
     }
@@ -1357,6 +1372,44 @@ pub fn compile_module_nested_with_eligibility(
 /// The wasm-only front of [`compile_module_nested_with_eligibility`] (the original signature).
 pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
     compile_module_nested_with_eligibility(m, shared_memory).map(|(w, _)| w)
+}
+
+/// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
+/// from the IR so a nesting parent always yields a runnable [`Artifact`] (never `Err` for a verified
+/// module). Two modes, forced by wasm's inability to unwind a frame across a fiber stack switch:
+///
+/// - **Nothing reachable uses a fiber** → the [`compile_module_nested`] emit: the parent's
+///   `instantiate`/`join`/`thread`/`futex` ops lower to host bounces and the host calls `f{0}`
+///   directly ([`DriveMode::WasmDriven`]). Threads/futex stay on this fast path — only fibers force
+///   the fallback.
+/// - **A fiber is reachable** → an interpreter-driven, `nested_caps`-aware tier-up
+///   ([`compile_module_tierup_caps`]): the interpreter owns the top frame (running the fibers and
+///   servicing `instantiate`/`join` natively), while hot in-subset compute — including any
+///   instantiate/join/thread functions — still tiers up onto emitted wasm with its bounces intact
+///   ([`DriveMode::InterpDriven`]).
+///
+/// Both modes emit the **same** nested import set (`env.instantiate`/`join`/`thread_spawn`/…), so a
+/// host driving this artifact provides that one import layout regardless of the chosen mode. This
+/// folds the browser's hand-rolled nested→threaded fallback into the library. Entry is func 0 (the
+/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `cap.call`s
+/// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
+/// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
+pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
+    if !reachable_fibers(m, 0) {
+        if let Ok((wasm, emitted)) = compile_module_nested_with_eligibility(m, shared_memory) {
+            return Ok(Artifact {
+                wasm,
+                emitted,
+                drive: DriveMode::WasmDriven { entry: 0 },
+            });
+        }
+    }
+    let (wasm, emitted) = compile_module_tierup_caps(m, shared_memory, true)?;
+    Ok(Artifact {
+        wasm,
+        emitted,
+        drive: DriveMode::InterpDriven,
+    })
 }
 
 /// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a
@@ -1588,8 +1641,8 @@ pub fn outline_cap_calls(m: &mut Module) {
 ///
 /// Returns the wasm plus a per-function **emitted** bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the
 /// rest are cross-tier). [`Error::Unsupported`] if the entry isn't in-subset, a reachable function has
-/// a non-integer signature (can't be marshalled cross-tier), or an address-taken indirect target is
-/// itself non-integer-signature (can't be trampolined).
+/// a non-[`marshallable_sig`] signature (a `v128` param/result can't be marshalled cross-tier), or an
+/// address-taken indirect target is itself non-marshallable (can't be trampolined).
 pub fn compile_module_reactor(
     m: &Module,
     entry: u32,
@@ -1597,10 +1650,10 @@ pub fn compile_module_reactor(
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
-    // Cross-tier: reachable, not emitted (not in-subset), and marshallable (integer signature). Runs on
+    // Cross-tier: reachable, not emitted (not in-subset), and marshallable (fits the scratch slots). Runs on
     // the interpreter over the shared window — so, unlike `interp_leaf`, memory/calls/caps are fine.
     let cross: Vec<bool> = (0..n)
-        .map(|i| a.reachable[i] && !a.in_subset[i] && int_sig(&m.funcs[i]))
+        .map(|i| a.reachable[i] && !a.in_subset[i] && marshallable_sig(&m.funcs[i]))
         .collect();
     let ok = (entry as usize) < n
         && a.in_subset[entry as usize]
@@ -1660,11 +1713,11 @@ pub fn compile_module_reactor_keep(
                 && a.in_subset[i]
                 && (i as u32 == entry
                     || keep.get(i).copied().unwrap_or(true)
-                    || !int_sig(&m.funcs[i]))
+                    || !marshallable_sig(&m.funcs[i]))
         })
         .collect();
     let cross: Vec<bool> = (0..n)
-        .map(|i| a.reachable[i] && !emitted_pred[i] && int_sig(&m.funcs[i]))
+        .map(|i| a.reachable[i] && !emitted_pred[i] && marshallable_sig(&m.funcs[i]))
         .collect();
     let ok = (entry as usize) < n
         && emitted_pred[entry as usize]
@@ -1714,17 +1767,37 @@ pub fn compile_module_tierup(
     m: &Module,
     shared_memory: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_caps(m, shared_memory, false)
+}
+
+/// [`compile_module_tierup`] with the `nested_caps` switch: when `true`, the §14 instantiator bounce
+/// and §11 thread/futex ops count as in-subset (they lower to host bounces), and the emitted functions
+/// follow the nested import layout (`NESTED_IMPORTED_FUNCS`). This is the interpreter-driven fallback
+/// [`compile_nested`] uses for a fiber-bearing nested unit: the interpreter owns the frame (fibers and
+/// `instantiate`/`join` run there), and hot in-subset compute — including instantiate/join/thread
+/// functions — still tiers up onto the emitted region with its bounces intact.
+pub fn compile_module_tierup_caps(
+    m: &Module,
+    shared_memory: bool,
+    nested_caps: bool,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let atomics_ok = module_atomics_ok(m);
     let in_subset: Vec<bool> = m
         .funcs
         .iter()
-        .map(|f| func_in_subset(m, f, atomics_ok))
+        .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
         .collect();
     let leaf: Vec<bool> = (0..n)
         .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
         .collect();
     let all_in_subset = in_subset.iter().all(|&s| s);
+    // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.
+    let base = if nested_caps {
+        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32
+    } else {
+        IMPORTED_FUNCS
+    };
 
     // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to any
     // identity-table slot, so a function that uses one is only safe to emit when every function is
@@ -1759,7 +1832,7 @@ pub fn compile_module_tierup(
     let mut emitted: Vec<usize> = Vec::new();
     for (i, e) in emit.iter().enumerate() {
         if *e {
-            wasm_of[i] = Some(IMPORTED_FUNCS + emitted.len() as u32);
+            wasm_of[i] = Some(base + emitted.len() as u32);
             emitted.push(i);
         }
     }
@@ -1770,7 +1843,7 @@ pub fn compile_module_tierup(
         &wasm_of,
         &leaf,
         None,
-        false,
+        nested_caps,
         FuelMode::Global,
     )?;
     Ok((wasm, emit))
@@ -1825,6 +1898,15 @@ pub struct Artifact {
 fn reachable_concurrency(m: &Module, entry: u32) -> bool {
     let a = analyze_from(m, entry);
     (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_concurrency())
+}
+
+/// Whether any function reachable from `entry` uses a **fiber** op (`cont.*`/`suspend`) — the one §12
+/// family the nested emitter cannot lower (a wasm frame can't unwind for a stack switch), unlike
+/// thread/futex ops, which the nested tier *does* emit as host bounces. This is the [`compile_nested`]
+/// two-mode gate: fibers force the interpreter to own the frame (see [`Func::uses_fibers`]).
+fn reachable_fibers(m: &Module, entry: u32) -> bool {
+    let a = analyze_from(m, entry);
+    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_fibers())
 }
 
 /// **The single wasm-JIT front door.** The embedder supplies only the invocation [`Shape`]; the
@@ -2261,6 +2343,35 @@ fn emit_module(
     Ok(out)
 }
 
+/// The cross-tier `env.call_interp` slot ABI, **store half**: with a value already on the stack
+/// (its scratch-slot address pushed beneath it), emit the widen/reinterpret + `store` that packs it
+/// into one 8-byte slot. Paired with [`emit_slot_load`] — the two are the ABI's single encoding, so
+/// the emitter and every host servicer agree byte-for-byte. `i32` widens to the full slot; `f32`
+/// writes its low 4 bytes (the high 4 stay stale, unread); `i64`/`f64` fill the slot. `v128` is not
+/// marshallable (it needs two slots) and never reaches here — see [`marshallable_sig`].
+fn emit_slot_store(code: &mut Vec<u8>, ty: ValType) {
+    match ty {
+        ValType::I32 => code.extend_from_slice(&[0xad, 0x37, 0x03, 0x00]), // i64.extend_i32_u; i64.store a=8
+        ValType::I64 => code.extend_from_slice(&[0x37, 0x03, 0x00]),       // i64.store a=8
+        ValType::F32 => code.extend_from_slice(&[0x38, 0x02, 0x00]),       // f32.store a=4
+        ValType::F64 => code.extend_from_slice(&[0x39, 0x03, 0x00]),       // f64.store a=8
+        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64"),
+    }
+}
+
+/// The cross-tier `env.call_interp` slot ABI, **load half**: with a scratch-slot address on the
+/// stack, emit the `load` (+ narrow) that reads the slot back to `ty`. The inverse of
+/// [`emit_slot_store`]; see that function for the encoding.
+fn emit_slot_load(code: &mut Vec<u8>, ty: ValType) {
+    match ty {
+        ValType::I32 => code.extend_from_slice(&[0x29, 0x03, 0x00, 0xa7]), // i64.load a=8; i32.wrap_i64
+        ValType::I64 => code.extend_from_slice(&[0x29, 0x03, 0x00]),       // i64.load a=8
+        ValType::F32 => code.extend_from_slice(&[0x2a, 0x02, 0x00]),       // f32.load a=4
+        ValType::F64 => code.extend_from_slice(&[0x2b, 0x03, 0x00]),       // f64.load a=8
+        _ => unreachable!("marshallable_sig admits only i32/i64/f32/f64"),
+    }
+}
+
 /// Emit a **cross-tier indirect trampoline** body for SVM function `fi` (its `Func` is `f`): a wasm
 /// function with the env-prepended signature `(win:i32, env:i32, ...params) -> results` that marshals
 /// its params into the env scratch, calls `env.call_interp(fi, args_ptr)`, and returns the result
@@ -2282,10 +2393,7 @@ fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
         code.push(0x6a); // i32.add → slot addr
         code.push(OP_LOCAL_GET);
         uleb(&mut code, (2 + i) as u64); // the i-th SVM param local
-        if *p == ValType::I32 {
-            code.push(0xad); // i64.extend_i32_u
-        }
-        code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+        emit_slot_store(&mut code, *p);
     }
     code.push(OP_I32_CONST);
     sleb32(&mut code, fi as i32);
@@ -2302,10 +2410,7 @@ fn emit_trampoline(f: &Func, fi: u32) -> Result<Vec<u8>, Error> {
         code.push(OP_I32_CONST);
         sleb32(&mut code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
         code.push(0x6a); // i32.add
-        code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
-        if *r == ValType::I32 {
-            code.push(0xa7); // i32.wrap_i64
-        }
+        emit_slot_load(&mut code, *r);
     }
     code.push(OP_END);
     Ok(code)
@@ -3296,7 +3401,7 @@ fn emit_block_body(
                         if args.len().max(n_results) > XCALL_MAX_SLOTS {
                             return Err(Error::Unsupported("cross-tier call arity too large"));
                         }
-                        // Store each arg to env + ENV_SCRATCH_OFF + i*8 (widen an i32 to the slot).
+                        // Store each arg to env + ENV_SCRATCH_OFF + i*8 (widen/reinterpret to the slot).
                         for (i, a) in args.iter().enumerate() {
                             code.push(OP_LOCAL_GET);
                             uleb(code, 1); // env
@@ -3304,10 +3409,7 @@ fn emit_block_body(
                             sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
                             code.push(0x6a); // i32.add → slot addr
                             get(code, cx, *a);
-                            if callee.params[i] == ValType::I32 {
-                                code.push(0xad); // i64.extend_i32_u
-                            }
-                            code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+                            emit_slot_store(code, callee.params[i]);
                         }
                         // env.call_interp(func_svm_idx, args_ptr = env + ENV_SCRATCH_OFF).
                         code.push(OP_I32_CONST);
@@ -3326,10 +3428,7 @@ fn emit_block_body(
                             code.push(OP_I32_CONST);
                             sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
                             code.push(0x6a); // i32.add
-                            code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
-                            if callee.results[i] == ValType::I32 {
-                                code.push(0xa7); // i32.wrap_i64
-                            }
+                            emit_slot_load(code, callee.results[i]);
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
                         }
@@ -3742,10 +3841,7 @@ fn emit_block_body(
                         sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
                         code.push(0x6a); // i32.add → slot addr
                         get(code, cx, *a);
-                        if callee.params[i] == ValType::I32 {
-                            code.push(0xad); // i64.extend_i32_u
-                        }
-                        code.extend_from_slice(&[0x37, 0x03, 0x00]); // i64.store align=8
+                        emit_slot_store(code, callee.params[i]);
                     }
                     code.push(OP_I32_CONST);
                     sleb32(code, *func as i32);
@@ -3762,10 +3858,7 @@ fn emit_block_body(
                         code.push(OP_I32_CONST);
                         sleb32(code, (ENV_SCRATCH_OFF + i as u64 * 8) as i32);
                         code.push(0x6a); // i32.add
-                        code.extend_from_slice(&[0x29, 0x03, 0x00]); // i64.load align=8
-                        if callee.results[i] == ValType::I32 {
-                            code.push(0xa7); // i32.wrap_i64
-                        }
+                        emit_slot_load(code, callee.results[i]);
                     }
                     code.push(OP_RETURN);
                 }

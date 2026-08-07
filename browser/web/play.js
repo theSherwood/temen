@@ -1061,6 +1061,94 @@ const onFetchProgress = (c, label) => (received, total) => {
 };
 const baseName = (url) => url.split('/').pop();
 
+// ---- run instrumentation: structured dev-console logging + stage timing ---------------------------
+// Every Run threads a small *recorder* (`runStart` → `fetchTimed`/`runStage`/`runNote`/`runTier` →
+// `runEnd`). It feeds two audiences: the human-facing status line + in-page log pane (unchanged), and a
+// rich record in the browser dev console — a `▶ start` line naming the demo, its kind, and the tier it
+// begins on (interpreter vs wasm-JIT), then a grouped summary with the per-stage split (fetch / compile
+// / encode / run), byte sizes, what came from cache, the tier actually used (with any wasm-JIT →
+// interpreter fallback called out), status, and result. This is pure UI — it touches no authority and no
+// sandbox surface — so it stays well outside the TCB the verifier guards.
+const clockNow = () => performance.now();
+
+// Begin a run record. `fields` carries whatever is known up front (`tier`, `mode`). Logs the start line
+// (so the console shows a run *beginning* even if it later hangs) and returns the recorder to thread on.
+function runStart(c, fields = {}) {
+  const rec = {
+    demo: c.name,
+    kind: c.ex.kind || 'svm-text',
+    t0: clockNow(),
+    last: clockNow(),
+    stages: [],   // [{ stage, ms }] — the split we print so "where the time went" is visible
+    assets: [],   // [{ name, bytes, cached }] — every fetched .svmb + whether it was a cache hit
+    notes: {},    // free-form extras merged into the summary (workers, frames, sizes, …)
+    ...fields,
+  };
+  console.info(
+    `▶ [SVM playground] ${rec.demo} — start · ${rec.kind}` +
+    `${rec.mode ? ` · ${rec.mode}` : ''} · ${rec.tier || 'interpreter'}`);
+  return rec;
+}
+
+// Record a stage: the ms since the previous mark, or an explicit duration when the caller already timed
+// it. Returns the ms so callers can still fold it into the status line.
+function runStage(rec, stage, ms) {
+  if (!rec) return ms;
+  const dur = ms == null ? clockNow() - rec.last : ms;
+  rec.last = clockNow();
+  rec.stages.push({ stage, ms: +Number(dur).toFixed(1) });
+  return dur;
+}
+
+// Attach free-form key/values (result, worker count, frames, …) to the summary.
+function runNote(rec, obj) { if (rec) Object.assign(rec.notes, obj); return rec; }
+
+// Note the tier actually used; if it differs from the requested tier, record the fallback for the summary.
+function runTier(rec, tier) {
+  if (!rec) return rec;
+  if (rec.tier && rec.tier !== tier) rec.notes.fallback = `${rec.tier} → ${tier}`;
+  rec.tier = tier;
+  return rec;
+}
+
+// Finish a run: emit the grouped console summary in one place — total time, the per-stage split, cache
+// hits, the tier (+ any fallback), asset sizes, status, and result. `ok` picks the ✓/✗ glyph and whether
+// the group starts collapsed (success) or open (failure, so it's visible without a click).
+function runEnd(rec, { ok = true, status, result } = {}) {
+  if (!rec) return 0;
+  const total = clockNow() - rec.t0;
+  const label =
+    `${ok ? '✓' : '✗'} [SVM playground] ${rec.demo} — ${ok ? 'done' : 'FAILED'}` +
+    ` · ${rec.tier || 'interpreter'}${rec.notes.fallback ? ' (fallback)' : ''} · ${total.toFixed(1)}ms`;
+  (ok ? console.groupCollapsed : console.group).call(console, label);
+  console.log('demo:', rec.demo, '· kind:', rec.kind, rec.mode ? `· mode: ${rec.mode}` : '');
+  console.log('tier:', rec.tier || 'interpreter', rec.notes.fallback ? `· fallback: ${rec.notes.fallback}` : '');
+  if (status !== undefined) console.log('status:', status);
+  if (result !== undefined) console.log('result:', result);
+  if (rec.stages.length) { console.log(`stage split (total ${total.toFixed(1)}ms):`); console.table(rec.stages); }
+  else console.log('total:', `${total.toFixed(1)}ms`);
+  if (rec.assets.length) { console.log('assets:'); console.table(rec.assets); }
+  const extra = { ...rec.notes }; delete extra.fallback;
+  if (Object.keys(extra).length) console.log('detail:', extra);
+  console.groupEnd();
+  return total;
+}
+
+// Fetch a module through the shared cache, timing the download and recording its size + whether it was
+// already cached onto the recorder. Called inside each run's existing try/catch (it throws on a fetch
+// failure, which the caller already surfaces). Centralizes the "what was from cache" logging the console
+// summary reports.
+async function fetchTimed(rec, c, url) {
+  const cached = moduleCache.has(url);
+  const t = clockNow();
+  const bytes = await fetchModule(url, onFetchProgress(c, baseName(url)));
+  if (rec) {
+    runStage(rec, `fetch:${baseName(url)}`, clockNow() - t);
+    rec.assets.push({ name: baseName(url), bytes: bytes.length, cached });
+  }
+  return bytes;
+}
+
 // Blit the framebuffer the last run presented (via the `display` capability) to this card's canvas.
 // w/h of 0 ⇒ no frame: hide the canvas. Copies the RGBA out of wasm memory into a fresh
 // Uint8ClampedArray (putImageData rejects a SharedArrayBuffer-backed view, and a later alloc could
@@ -1164,16 +1252,21 @@ function shellInterp(bytes, stdinBytes, cmdsBlob) {
 // Instantiator/SharedRegion cap.calls), so there is no JIT toggle.
 async function runShell(c) {
   const ex = c.ex;
+  // The shell carries Instantiator/SharedRegion cap.calls, so it runs on the bytecode cooperative engine
+  // (no wasm-JIT tier); the recorder still logs its fetch/run split + cache to the console.
+  const rec = runStart(c, { tier: 'interpreter' });
   setState(c, 'running', 'fetching shell…');
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   let bytes;
   try {
-    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    bytes = await fetchTimed(rec, c, ex.url);
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     logTo(c, `fetch failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
     return;
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B shell`);
@@ -1184,7 +1277,7 @@ async function runShell(c) {
   const cmds = [];
   for (const cmd of ex.cmds || []) {
     try {
-      const cb = await fetchModule(cmd.url, onFetchProgress(c, baseName(cmd.url)));
+      const cb = await fetchTimed(rec, c, cmd.url);
       cmds.push({ name: cmd.name, bytes: cb });
       logTo(c, `fetched ${cmd.url}: ${cb.length}B (${cmd.name})`);
     } catch (e) {
@@ -1197,19 +1290,23 @@ async function runShell(c) {
   let script = c.editor.getValue();
   if (!script.endsWith('\n')) script += '\n';
   const stdinBytes = new TextEncoder().encode(script);
+  runNote(rec, { commands: cmds.map((x) => x.name), scriptBytes: stdinBytes.length });
   setState(c, 'running', 'running…');
   const t0 = performance.now();
   const { rv, status, stdout } = shellInterp(bytes, stdinBytes, cmdsBlob);
-  const ms = (performance.now() - t0).toFixed(0);
+  const ms = runStage(rec, 'run:interpreter', performance.now() - t0).toFixed(0);
   c.el.stdout.textContent = stdout;
   c.el.result.textContent = `${rv}`;
+  runNote(rec, { stdoutBytes: stdout.length });
   // 0 = OK, 5 = clean Exit (the `exit` builtin); anything else is a decode error / trap.
   if (status === 0 || status === 5) {
     setState(c, 'done', `done · status ${status} · ${ms}ms`);
     logTo(c, `shell run → ${rv} (status ${status}) in ${ms}ms`);
+    runEnd(rec, { ok: true, status, result: rv });
   } else {
     setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `shell run status ${status}`);
+    runEnd(rec, { ok: false, status, result: rv });
   }
 }
 
@@ -1224,12 +1321,15 @@ async function runModule(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let bytes;
   try {
-    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    bytes = await fetchTimed(rec, c, ex.url);
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     logTo(c, `fetch failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
     return;
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
@@ -1239,19 +1339,23 @@ async function runModule(c) {
     const enc = new TextEncoder().encode(c.editor.getValue());
     if (enc.length > 0) stdinBytes = enc;
   }
+  runNote(rec, { moduleBytes: bytes.length, stdinBytes: stdinBytes ? stdinBytes.length : 0 });
   setState(c, 'running', `running…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
   let rv = 0, status, tier = 'interpreter', stdout = '';
   if (useJit) {
     try {
-      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit into the
-      // shared slots (read back via the usual accessors, exactly like the interpreter path).
+      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit/value into the
+      // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
+      // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
+      // result matches on both tiers (a trap throws → we fall back to the interpreter below).
       status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
-      rv = eng.ex.svm_exit_code();
+      rv = Number(eng.ex.svm_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
+      runNote(rec, { jitFallbackReason: e.message });
       status = undefined;
     }
   }
@@ -1262,16 +1366,21 @@ async function runModule(c) {
     // above are stdout-only, so only the interpreter path blits a frame.
     presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
   }
+  runStage(rec, `run:${tier}`, performance.now() - t0);
+  runTier(rec, tier);
   const ms = (performance.now() - t0).toFixed(0);
   c.el.stdout.textContent = stdout;
   c.el.result.textContent = `${rv}`;
+  runNote(rec, { stdoutBytes: stdout.length });
   // 0 = OK, 5 = clean Exit; anything else is a decode error / trap / unsupported.
   if (status === 0 || status === 5) {
     setState(c, 'done', `done (${tier}) · status ${status} · ${ms}ms`);
     logTo(c, `module run (${tier}) → ${rv} (status ${status}) in ${ms}ms`);
+    runEnd(rec, { ok: true, status, result: rv });
   } else {
     setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `module run (${tier}) status ${status}`);
+    runEnd(rec, { ok: false, status, result: rv });
   }
 }
 
@@ -1293,32 +1402,37 @@ async function runChibicc(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let compiler;
   try {
-    compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    compiler = await fetchTimed(rec, c, ex.url);
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
     logTo(c, `fetch failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
     return;
   }
   const srcBytes = new TextEncoder().encode(c.editor.getValue());
-  if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); return; }
+  if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); runEnd(rec, { ok: false }); return; }
 
   // Pass 1 — compile. On the wasm-JIT, hand the compiler + source to `runJitCompiler` (the cdylib seeds
   // the memfs + argv and emits `_start`); otherwise run chibicc on the bytecode interpreter. Both leave
   // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
   setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
-  const t0 = performance.now();
   // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `svm_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
-  let cstatus, tier = 'interpreter';
+  runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn });
+  const tCompile = performance.now();
+  let cstatus, compileTier = 'interpreter';
   if (useJit) {
     try {
       // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
       cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
-      tier = 'wasm-JIT';
+      compileTier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
+      runNote(rec, { compileJitFallbackReason: e.message });
       cstatus = undefined;
     }
   }
@@ -1335,16 +1449,25 @@ async function runChibicc(c) {
     eng.ex.svm_dealloc(p, compiler.length);
     eng.ex.svm_dealloc(sp, srcBytes.length);
   }
+  const compileMs = runStage(rec, `compile:${compileTier}`, performance.now() - tCompile);
+  // The headline tier is where the *compiler* ran (the wasm-JIT showcase); a wasm-JIT→interpreter note
+  // here means the compile emit was unavailable. The compiled program always runs on the interpreter
+  // oracle (pass 3), shown separately in the stage split.
+  runTier(rec, compileTier);
   const ir = readModuleStdout();
   const cstderr = readModuleStderr();
   c.el.stdout.textContent = ir; // show the emitted SVM IR
-  logTo(c, `compiled (${tier}): ${srcBytes.length}B C → ${ir.length}B SVM IR (status ${cstatus})`);
+  runNote(rec, { compileTier, irBytes: ir.length });
+  logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B SVM IR in ${compileMs.toFixed(0)}ms (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
+    runEnd(rec, { ok: false, status: cstatus });
     return;
   }
 
-  // Pass 2 — encode the IR (svm_parse: parse + verify + encode) into a runnable module, then run it.
+  // Pass 2 — encode the IR (svm_parse: parse + verify + encode) into a runnable module. Timed on its own
+  // so the console split shows how much of "run" is really encode vs. execution.
+  const tEncode = performance.now();
   const irBytes = new TextEncoder().encode(ir);
   const ip = eng.ex.svm_alloc(irBytes.length);
   new Uint8Array(eng.memory.buffer).set(irBytes, ip);
@@ -1354,10 +1477,31 @@ async function runChibicc(c) {
   eng.ex.svm_dealloc(ip, irBytes.length);
   if (ok !== 1) {
     setState(c, 'error', `encode failed: ${new TextDecoder().decode(parsed)}`);
+    runEnd(rec, { ok: false });
     return;
   }
-  const r = moduleInterp(parsed, null);
-  const ms = (performance.now() - t0).toFixed(0);
+  runStage(rec, 'encode', performance.now() - tEncode);
+  runNote(rec, { moduleBytes: parsed.length });
+
+  // Pass 3 — run the compiled .svmb artifact. It rides the wasm-JIT too (not just the compiler): the
+  // runner now reports the guest's returned value (`svm_run_value`, matching the interpreter oracle) and
+  // reports a trap as a trap — so `runJitModule` throws on a trap and we fall back to the interpreter,
+  // which runs it correctly. A clean JIT run is byte-identical to the oracle (INVARIANT 9).
+  const tRun = performance.now();
+  let r, runTierName = 'interpreter';
+  if (useJit) {
+    try {
+      const status = await runJitModule(eng.ex, eng.memory, parsed, null);
+      r = { rv: Number(eng.ex.svm_run_value()), status, stdout: readModuleStdout() };
+      runTierName = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT run of compiled program declined (${e.message}); running it on the interpreter`);
+      runNote(rec, { runJitDeclined: e.message });
+    }
+  }
+  if (!r) r = moduleInterp(parsed, null);
+  const runMs = runStage(rec, `run:${runTierName}`, performance.now() - tRun);
+  runNote(rec, { runTier: runTierName, compileMs: +compileMs.toFixed(1), runMs: +runMs.toFixed(1), progStdoutBytes: (r.stdout || '').length });
   c.el.result.textContent = `${r.rv}`;
   // The stdout pane shows the compiled program's OUTPUT (what a `printf` writes through the
   // powerbox's ambient `write`), with the emitted SVM IR below it as a divider-separated section —
@@ -1365,12 +1509,16 @@ async function runChibicc(c) {
   const progOut = r.stdout || '';
   const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of SVM IR ${'─'.repeat(18)}\n${ir}`;
   c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
+  // Status line now shows the compile/run split by tier, so "where the time went" is visible on-page.
+  const split = `compile ${compileMs.toFixed(0)}ms (${compileTier}) · run ${runMs.toFixed(0)}ms (${runTierName})`;
   if (r.status === 0 || r.status === 5) {
-    setState(c, 'done', `compiled (${tier}) & ran · returned ${r.rv} · ${ms}ms`);
-    logTo(c, `ran compiled program → ${r.rv} (status ${r.status})`);
+    setState(c, 'done', `compiled & ran · returned ${r.rv} · ${split}`);
+    logTo(c, `ran compiled program (${runTierName}) → ${r.rv} (status ${r.status}) in ${runMs.toFixed(0)}ms`);
+    runEnd(rec, { ok: true, status: r.status, result: r.rv });
   } else {
     setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
     logTo(c, `compiled program status ${r.status}`);
+    runEnd(rec, { ok: false, status: r.status, result: r.rv });
   }
 }
 
@@ -1387,13 +1535,16 @@ async function runSelfhost(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let compiler, image;
   try {
-    compiler = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
-    image = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+    compiler = await fetchTimed(rec, c, ex.url);
+    image = await fetchTimed(rec, c, ex.image);
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-selfhost-assets.mjs\` to generate the closure image`);
     logTo(c, `fetch failed: ${e.message}`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
     return;
   }
   // The chosen TU (its memfs-relative path) — the dropdown, or the first TU if the control is absent.
@@ -1401,8 +1552,9 @@ async function runSelfhost(c) {
   const tuBytes = new TextEncoder().encode(tu);
   const short = tu.split('/').pop();
   setState(c, 'running', `compiling ${short}…${useJit ? ' [wasm-JIT]' : ''}`);
-  const t0 = performance.now();
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
+  runNote(rec, { tu: short, debugInfo: !!gOn });
+  const tCompile = performance.now();
   let cstatus, tier = 'interpreter';
   if (useJit) {
     try {
@@ -1410,6 +1562,7 @@ async function runSelfhost(c) {
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);
+      runNote(rec, { jitFallbackReason: e.message });
       cstatus = undefined;
     }
   }
@@ -1428,13 +1581,17 @@ async function runSelfhost(c) {
     eng.ex.svm_dealloc(ip, image.length);
     eng.ex.svm_dealloc(tp, tuBytes.length);
   }
+  const compileMs = runStage(rec, `compile:${tier}`, performance.now() - tCompile);
+  runTier(rec, tier);
   const obj = readModuleStdout();
   const cstderr = readModuleStderr();
-  const ms = (performance.now() - t0).toFixed(0);
-  logTo(c, `self-host (${tier}): ${short} → ${obj.length}B object IR (status ${cstatus})`);
+  const ms = compileMs.toFixed(0);
+  runNote(rec, { objectBytes: obj.length });
+  logTo(c, `self-host (${tier}): ${short} → ${obj.length}B object IR in ${ms}ms (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || obj.length === 0) {
     c.el.stdout.textContent = obj;
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
+    runEnd(rec, { ok: false, status: cstatus });
     return;
   }
   const bar = '─'.repeat(12);
@@ -1442,6 +1599,7 @@ async function runSelfhost(c) {
     `${bar} chibicc compiled its own ${short} → ${obj.length} B linkable SVM-IR object (${tier}) ${bar}\n${obj}`;
   c.el.result.textContent = `${obj.length} B`;
   setState(c, 'done', `compiled ${short} (${tier}) · ${obj.length} B object · ${ms}ms`);
+  runEnd(rec, { ok: true, status: cstatus, result: `${obj.length} B object` });
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `svm_run_pg` entry): fetch the
@@ -1552,6 +1710,9 @@ function persistPg(c) {
 // running transcript; Stop closes the session (`stopDemo`), and the next Run boots fresh.
 async function runPg(c) {
   const ex = c.ex;
+  // Postgres boots + queries on the main engine (no wasm-JIT tier); the recorder logs the boot vs. query
+  // split, whether the session was restored from IndexedDB, and each query's timing to the console.
+  const rec = runStart(c, { tier: 'interpreter' });
   c.el.result.textContent = '';
   c.el.canvas.hidden = true;
   // `\reset` (a bare meta-command in the editor): drop the saved database and close any live session, so
@@ -1566,6 +1727,8 @@ async function runPg(c) {
     setState(c, 'done', 'saved database cleared — the next Run boots a fresh cluster');
     logTo(c, 'reset: cleared the saved session');
     c.el.run.disabled = broken;
+    runNote(rec, { action: 'reset' });
+    runEnd(rec, { ok: true });
     return;
   }
   // 1) Open the session on the first Run. Prefer a **saved** snapshot (a prior session's data dir,
@@ -1576,19 +1739,23 @@ async function runPg(c) {
     let modBytes, imgBytes, restored = false;
     try {
       // Sequential (not Promise.all) so the two large downloads report progress one at a time.
-      modBytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+      modBytes = await fetchTimed(rec, c, ex.url);
       const saved = await pgLoad(pgKey(c));
       if (saved) {
         imgBytes = saved instanceof Uint8Array ? saved : new Uint8Array(saved);
         restored = true;
+        rec.assets.push({ name: 'saved-image (IndexedDB)', bytes: imgBytes.length, cached: true });
       } else {
-        imgBytes = await fetchModule(ex.image, onFetchProgress(c, baseName(ex.image)));
+        imgBytes = await fetchTimed(rec, c, ex.image);
       }
     } catch (e) {
       setState(c, 'error', `${e.message} — run \`node build-pg-assets.mjs\` to stage the Postgres artifacts`);
       logTo(c, `fetch failed: ${e.message}`);
+      runNote(rec, { fetchError: e.message });
+      runEnd(rec, { ok: false });
       return;
     }
+    runNote(rec, { restored });
     setState(c, 'running', restored
       ? 'restoring your saved database… (first Run only — a few seconds)'
       : 'booting postgres… (first Run only — a few seconds; later queries are instant)');
@@ -1602,7 +1769,7 @@ async function runPg(c) {
       view.set(imgBytes, imgP);
       const t0 = performance.now();
       const rc = eng.ex.svm_pg_open(modP, modBytes.length, imgP, imgBytes.length);
-      const ms = (performance.now() - t0).toFixed(0);
+      const ms = runStage(rec, restored ? 'restore' : 'boot', performance.now() - t0).toFixed(0);
       eng.ex.svm_dealloc(modP, modBytes.length);
       eng.ex.svm_dealloc(imgP, imgBytes.length);
       c.el.stdout.textContent += readPgStdout(); // the banner + first prompt
@@ -1614,6 +1781,8 @@ async function runPg(c) {
         }
         setState(c, 'error', `boot failed: status ${eng.ex.svm_status()} (1=decode 3=trap 6=verify)`);
         c.el.run.disabled = broken;
+        runNote(rec, { bootStatus: eng.ex.svm_status() });
+        runEnd(rec, { ok: false });
         return;
       }
       c.pgSession = true;
@@ -1622,6 +1791,8 @@ async function runPg(c) {
     } catch (e) {
       setState(c, 'error', `boot error: ${e.message}`);
       c.el.run.disabled = broken;
+      runNote(rec, { bootError: e.message });
+      runEnd(rec, { ok: false });
       return;
     }
   }
@@ -1630,6 +1801,8 @@ async function runPg(c) {
   if (!sql.trim()) {
     setState(c, 'done', 'session live — type SQL and Run (state persists across reloads · `\\reset` clears it)');
     c.el.run.disabled = broken;
+    runNote(rec, { action: 'open-only (no query)' });
+    runEnd(rec, { ok: true });
     return;
   }
   try {
@@ -1639,16 +1812,18 @@ async function runPg(c) {
     new Uint8Array(eng.memory.buffer).set(b, p);
     const t0 = performance.now();
     const rc = eng.ex.svm_pg_query(p, b.length);
-    const ms = (performance.now() - t0).toFixed(0);
+    const ms = runStage(rec, 'query', performance.now() - t0).toFixed(0);
     eng.ex.svm_dealloc(p, b.length);
     // Append this query's output delta to the running transcript (result blocks → psql-style tables).
     c.el.stdout.textContent += readPgStdout();
     c.el.stdout.scrollTop = c.el.stdout.scrollHeight;
     const status = eng.ex.svm_status();
+    runNote(rec, { sqlBytes: b.length });
     if (rc === 0) {
       setState(c, 'done', `query ran in ${ms}ms · session live · saved (reload to resume)`);
       logTo(c, `svm_pg_query in ${ms}ms`);
       persistPg(c); // snapshot the (possibly mutated) data dir so it survives a reload
+      runEnd(rec, { ok: true, status });
     } else if (status === 5) {
       // The backend exited (e.g. the SQL issued a shutdown) — the session is over. Persist its final
       // state first, so even a clean shutdown is resumable.
@@ -1656,13 +1831,18 @@ async function runPg(c) {
       c.pgSession = false;
       c.el.stop.disabled = true;
       setState(c, 'done', 'backend exited — Run reopens your saved database');
+      runNote(rec, { backendExited: true });
+      runEnd(rec, { ok: true, status });
     } else {
       setState(c, 'error', `query failed: status ${status}`);
       logTo(c, `svm_pg_query status ${status}`);
+      runEnd(rec, { ok: false, status });
     }
   } catch (e) {
     setState(c, 'error', `query error: ${e.message}`);
     logTo(c, `query error: ${e.message}`);
+    runNote(rec, { queryError: e.message });
+    runEnd(rec, { ok: false });
   } finally {
     c.el.run.disabled = broken;
   }
@@ -1674,6 +1854,20 @@ async function runPg(c) {
 let reactorRAF = null; // the pending requestAnimationFrame id while a reactor loop runs (else null)
 let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (else null → interpreter)
 let activeReactorCard = null;
+// Instrumentation for the live reactor loop: the run recorder plus a live frame count / start time, so a
+// user Stop (which cancels the loop out-of-band) can still emit the console summary the loop's own
+// terminal path would. `finalizeReactor` is the single close-out; it no-ops once consumed.
+let reactorRun = null; // { rec, t0, frames } while a reactor is live (else null)
+function finalizeReactor(how) {
+  if (!reactorRun) return;
+  const { rec, t0, frames } = reactorRun;
+  reactorRun = null;
+  const secs = (clockNow() - t0) / 1000;
+  const fps = secs > 0 ? frames / secs : 0;
+  runStage(rec, `run:${rec.tier || 'interpreter'}`, clockNow() - t0);
+  runNote(rec, { frames, seconds: +secs.toFixed(2), avgFps: +fps.toFixed(1), ...how });
+  runEnd(rec, { ok: how.ok !== false, status: how.status });
+}
 
 // Feed one key event to the running reactor guest through the `keyboard` capability (JS keyCode +
 // pressed flag). Shared by the physical-keyboard handler and the on-screen touch dpad; a no-op when no
@@ -1688,9 +1882,10 @@ function sendReactorKey(keyCode, pressed) {
 function stopReactor() {
   teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
   if (activeReactorCard) activeReactorCard.el.gpucanvas.hidden = true;
-  if (reactorRAF === null) { activeReactorCard = null; return; }
+  if (reactorRAF === null) { finalizeReactor({ ended: 'stopped', ok: true }); activeReactorCard = null; return; }
   cancelAnimationFrame(reactorRAF);
   reactorRAF = null;
+  finalizeReactor({ ended: 'stopped', ok: true }); // a live loop was cancelled by the user / a superseding Run
   if (jitReactor) {
     jitReactor.close();
     jitReactor = null;
@@ -1711,11 +1906,14 @@ async function runReactor(c) {
   // The "wasm-JIT" toggle runs an emittable reactor's whole tick() on emitted wasm (near-native) rather
   // than the interpreter. Only offered for JIT-capable examples (Doom); falls back if the emit fails.
   const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let bytes;
   try {
-    bytes = await fetchModule(ex.url, onFetchProgress(c, baseName(ex.url)));
+    bytes = await fetchTimed(rec, c, ex.url);
   } catch (e) {
     setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+    runNote(rec, { fetchError: e.message });
+    runEnd(rec, { ok: false });
     return;
   }
   // A GPU demo: bring up a `navigator.gpu` device + the WebGPU canvas and install the servicer BEFORE
@@ -1723,6 +1921,8 @@ async function runReactor(c) {
   if (ex.webgpu) {
     if (!webgpuAvailable()) {
       setState(c, 'error', 'no WebGPU in this browser — the GPU demo needs it (try Chrome/Edge)');
+      runNote(rec, { webgpu: 'unavailable' });
+      runEnd(rec, { ok: false });
       return;
     }
     try {
@@ -1732,6 +1932,8 @@ async function runReactor(c) {
     } catch (e) {
       setState(c, 'error', `WebGPU init failed: ${e.message}`);
       c.el.gpucanvas.hidden = true;
+      runNote(rec, { webgpuError: e.message });
+      runEnd(rec, { ok: false });
       return;
     }
   }
@@ -1741,9 +1943,11 @@ async function runReactor(c) {
   let wad = null;
   if (ex.wad) {
     try {
-      wad = await fetchModule(ex.wad, onFetchProgress(c, baseName(ex.wad)));
+      wad = await fetchTimed(rec, c, ex.wad);
     } catch (e) {
       setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
+      runNote(rec, { fetchError: e.message });
+      runEnd(rec, { ok: false });
       return;
     }
     logTo(c, `fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
@@ -1751,6 +1955,7 @@ async function runReactor(c) {
   setState(c, 'running',
     ex.wad ? `booting DOOM… (reading the WAD, building the renderer — a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
       : 'running…');
+  const tOpen = performance.now();
   if (useJit) {
     try {
       jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
@@ -1758,6 +1963,7 @@ async function runReactor(c) {
     } catch (e) {
       jitReactor = null;
       logTo(c, `wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
+      runNote(rec, { jitFallbackReason: e.message });
     }
   }
   if (!jitReactor) {
@@ -1785,11 +1991,15 @@ async function runReactor(c) {
       setState(c, 'error', `reactor open failed: status ${eng.ex.svm_status()} (2=unsupported 3=trap)`);
       logTo(c, `svm_onramp_open failed: ${opened}`);
       activeReactorCard = null;
+      runNote(rec, { openStatus: eng.ex.svm_status() });
+      runEnd(rec, { ok: false });
       return;
     }
     logTo(c, `reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
   }
   const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
+  runStage(rec, `open:${tier}`, performance.now() - tOpen);
+  runTier(rec, tier);
   setState(c, 'running', `running (${tier}) — arrow keys to steer, Stop to end`);
   c.el.run.disabled = true;
   c.el.stop.disabled = false;
@@ -1797,10 +2007,13 @@ async function runReactor(c) {
   const t0 = performance.now();
   let fpsFrames = 0;
   let fpsT0 = t0;
+  // Publish the live loop's stats so a user Stop (out-of-band cancel) can still emit the console summary.
+  reactorRun = { rec, t0, frames: 0 };
   const loop = () => {
     const status = jitReactor ? jitReactor.frame() : eng.ex.svm_onramp_frame();
     presentFrame(c, eng.ex.svm_framebuffer_width(), eng.ex.svm_framebuffer_height());
     frames++;
+    if (reactorRun) reactorRun.frames = frames;
     fpsFrames++;
     const now = performance.now();
     if (now - fpsT0 >= 1000) {
@@ -1836,6 +2049,7 @@ async function runReactor(c) {
       status === 5 ? `guest exited after ${frames} frames · ${secs}s`
         : `reactor trapped: status ${status}${trapDetail ? ` (${trapDetail})` : ''}`);
     logTo(c, `reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
+    finalizeReactor({ ended: status === 5 ? 'exit' : 'trap', ok: status === 5, status, trap: trapDetail || undefined });
   };
   reactorRAF = requestAnimationFrame(loop);
 }
@@ -2361,9 +2575,12 @@ function endDebug(c, message) {
 // SVM **text** guests: parse+verify inside the sandbox (`svm_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
+  const mode = c.el.mode.value;
+  // The `jit` powerbox recipe runs the guest on the §22 guest-JIT (host-compiled units in the shared
+  // Domain) — the wasm-JIT tier for SVM-text demos; every other recipe runs on the bytecode engine.
+  const rec = runStart(c, { tier: mode === 'jit' ? 'wasm-JIT' : 'interpreter', mode });
   setState(c, 'running', 'parsing…');
   const src = c.editor.getValue();
-  const mode = c.el.mode.value;
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
@@ -2373,9 +2590,11 @@ async function runText(c) {
   let guest;
   if (srcBytes.length === 0) {
     setState(c, 'error', 'parse error: empty source');
+    runEnd(rec, { ok: false });
     return;
   }
   {
+    const tParse = performance.now();
     const p = eng.ex.svm_alloc(srcBytes.length);
     u8().set(srcBytes, p);
     const ok = eng.ex.svm_parse(p, srcBytes.length);
@@ -2385,11 +2604,15 @@ async function runText(c) {
       const msg = new TextDecoder().decode(out);
       setState(c, 'error', msg);
       c.editor.markError(msg); // pin the offending line in the editor when we can locate it
+      runNote(rec, { parseError: msg });
+      runEnd(rec, { ok: false });
       return;
     }
     guest = out;
+    runStage(rec, 'parse', performance.now() - tParse);
   }
   logTo(c, `parsed: ${srcBytes.length}B text → ${guest.length}B module`);
+  runNote(rec, { srcBytes: srcBytes.length, moduleBytes: guest.length });
 
   aborter = new AbortController();
   c.el.run.disabled = true;
@@ -2405,11 +2628,13 @@ async function runText(c) {
   const t0 = performance.now();
   try {
     const { value, started } = await run(guest, opts);
-    const ms = (performance.now() - t0).toFixed(0);
+    const ms = runStage(rec, `run:${mode === 'jit' ? 'wasm-JIT' : 'interpreter'}`, performance.now() - t0).toFixed(0);
     c.el.result.textContent = `${value}`;
     if (mode === 'io') c.el.stdout.textContent = readParStdout(eng);
     setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
     logTo(c, `run → ${value} across ${started} Workers in ${ms}ms`);
+    runNote(rec, { workers: started });
+    runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
       // Workers were torn down mid-run; shared state (locks, the live-vCPU counter) may be wedged.
@@ -2417,9 +2642,13 @@ async function runText(c) {
       setState(c, 'stopped', 'stopped — reload the page to run again');
       logTo(c, 'stopped by user');
       for (const card of cards) { card.el.run.disabled = true; if (card.el.prove) card.el.prove.disabled = true; }
+      runNote(rec, { stopped: true });
+      runEnd(rec, { ok: false });
     } else {
       setState(c, 'error', `run error: ${e.message}`);
       logTo(c, `run error: ${e.message}`);
+      runNote(rec, { runError: e.message });
+      runEnd(rec, { ok: false });
     }
   } finally {
     aborter = null;

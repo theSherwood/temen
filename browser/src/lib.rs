@@ -3936,6 +3936,16 @@ pub struct JitOnrampRun {
     /// emitted `f0`; `exited` distinguishes "exited with code 0" from "returned 0".
     exit_code: i32,
     exited: bool,
+    /// The value the emitted `f0` returned (the guest's top-level result), reported by the JS driver via
+    /// [`svm_onramp_jit_run_report`]. Meaningful only when the run *returned* (not exited/trapped) — it is
+    /// what [`svm_run_onramp`]'s `value` is on the interpreter, so the two tiers agree on the result.
+    returned_value: i64,
+    /// Set when the emitted `f0` unwound on a **trap** (a wasm `unreachable`, or a cross-tier bounce that
+    /// trapped rather than `exit`ed) instead of returning. The JS driver can't tell an `exit` unwind from
+    /// a trap unwind on its own, so it reports "threw"; combined with `exited` (set Rust-side on a
+    /// cross-tier `Exit`), a throw that did not `exit` is a trap. Keeps the runner from reporting a
+    /// truncated run as `STATUS_OK` (INVARIANT 9: a fast backend never runs wrong — it traps or declines).
+    trapped: bool,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -4172,6 +4182,8 @@ impl JitOnrampRun {
             last_trap: None,
             exit_code: 0,
             exited: false,
+            returned_value: 0,
+            trapped: false,
         })
     }
 
@@ -4232,6 +4244,24 @@ impl JitOnrampRun {
     }
     pub fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+    /// The value the emitted `f0` returned (guest top-level result); meaningful only for a returned run.
+    pub fn returned_value(&self) -> i64 {
+        self.returned_value
+    }
+    /// Whether the emitted `f0` unwound on a trap rather than returning or `exit`ing.
+    pub fn trapped(&self) -> bool {
+        self.trapped
+    }
+    /// Record the JS driver's observation of how the emitted `f0` finished: `value` is its return
+    /// (used only when it returned), and `threw` is whether it unwound. A throw that did not set
+    /// `exited` (a cross-tier `Exit`) is a trap. A cross-tier `Exit` already set `exited`, so `threw`
+    /// there is subsumed by the exit.
+    pub fn record_outcome(&mut self, threw: bool, value: i64) {
+        self.returned_value = value;
+        if threw && !self.exited {
+            self.trapped = true;
+        }
     }
     /// Take the frame the run presented through `display`, if any.
     pub fn take_frame(&self) -> Option<Frame> {
@@ -4311,6 +4341,11 @@ pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
+/// The value the guest's top-level function returned on the most recent run (the `value` in
+/// [`svm_run_onramp`]'s outcome, and the single-shot JIT run's captured `f0` return). Read via
+/// [`svm_run_value`] so both tiers surface the same result for a *returned* run — the parity the
+/// interpreter oracle defines (INVARIANT 9).
+static mut RUN_VALUE: i64 = 0;
 /// Captured data image of the most recent [`svm_pg_snapshot`] (same cdylib-managed lifetime as `OUT`:
 /// a leaked boxed slice, valid until the next snapshot; read via `svm_pg_snapshot_ptr`/`_len`).
 static mut PG_SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
@@ -4886,6 +4921,37 @@ pub extern "C" fn svm_onramp_trap_len() -> usize {
     len
 }
 
+// ---- cross-tier `env.call_interp` slot ABI (shared by the three servicers below) ------------------
+//
+// The emitter (svm-wasm-jit `emit_slot_store` / `emit_slot_load`) packs each cross-tier arg/result
+// into one 8-byte scratch slot; these two helpers are the host end of that single encoding, so all
+// three `*_call_interp` servicers decode/encode identically. `i32` fills the slot (widened); `f32`
+// uses its low 4 bytes; `i64`/`f64` the full slot. `v128` needs two slots and is excluded by
+// `marshallable_sig`, so it never appears in a cross-tier signature.
+
+/// Decode one scratch slot (read as a little-endian `u64`) to a [`Value`] of the callee's param type.
+fn slot_to_value(ty: svm_ir::ValType, raw: u64) -> Value {
+    match ty {
+        svm_ir::ValType::I32 => Value::I32(raw as i32),
+        svm_ir::ValType::I64 => Value::I64(raw as i64),
+        svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
+        svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
+        _ => Value::I64(raw as i64), // v128 never reaches a cross-tier leaf; decode defensively
+    }
+}
+
+/// Encode a cross-tier result [`Value`] into its 8-byte slot bits. `None` for a `v128` result (not
+/// marshallable — the caller fails the cross-tier call closed).
+fn value_to_slot(v: &Value) -> Option<u64> {
+    match v {
+        Value::I32(x) => Some(*x as u32 as u64),
+        Value::I64(x) => Some(*x as u64),
+        Value::F32(x) => Some(x.to_bits() as u64),
+        Value::F64(x) => Some(x.to_bits()),
+        _ => None,
+    }
+}
+
 // ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
 //
 // Unlike the interpreter reactor (`svm_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
@@ -5041,10 +5107,7 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
     let args: Vec<Value> = params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     match reactor.run_cross_tier(func, &args) {
         Ok(vals) => {
@@ -5052,10 +5115,8 @@ pub extern "C" fn svm_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i3
                 if i >= results.len() {
                     break;
                 }
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return STATUS_TRAP,
+                let Some(raw) = value_to_slot(v) else {
+                    return STATUS_TRAP;
                 };
                 let b = raw.to_le_bytes();
                 // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
@@ -5350,10 +5411,7 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
     let args: Vec<Value> = params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     match run.run_cross_tier(func, &args) {
         Ok(vals) => {
@@ -5361,10 +5419,8 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
                 if i >= results.len() {
                     break;
                 }
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return STATUS_TRAP,
+                let Some(raw) = value_to_slot(v) else {
+                    return STATUS_TRAP;
                 };
                 let b = raw.to_le_bytes();
                 // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
@@ -5381,11 +5437,28 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
     }
 }
 
-/// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE` + any presented frame into
-/// the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
-/// [`svm_exit_code`] / `svm_framebuffer_*` accessors — identical to [`svm_run_onramp`]'s contract. Call
-/// once after `f0` returns or unwinds. Returns the status: [`STATUS_EXIT`] if the guest `exit`ed, else
-/// [`STATUS_OK`].
+/// Record how the emitted `f0` finished, from the JS driver's vantage: `value` is `f0`'s return (the
+/// guest's top-level result, meaningful only when it *returned*), and `threw != 0` iff the call unwound.
+/// Call this before [`svm_onramp_jit_run_finish`]. The driver can't tell an `exit` unwind from a trap
+/// unwind, so it reports "threw" and this pairs it with the Rust-side `exited` flag (set on a cross-tier
+/// `Exit`): a throw that did not `exit` is a trap. Optional — a caller that skips it gets the legacy
+/// "returned, value 0" reading (`jit-profile.mjs` doesn't care about the value).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_report(threw: i32, value: i64) {
+    // SAFETY: single-threaded wasm; exclusive access to the run.
+    if let Some(run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() } {
+        run.record_outcome(threw != 0, value);
+    }
+}
+
+/// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE`/`RUN_VALUE` + any presented
+/// frame into the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
+/// [`svm_exit_code`] / [`svm_run_value`] / `svm_framebuffer_*` accessors — identical to
+/// [`svm_run_onramp`]'s contract, so the interpreter and the wasm-JIT agree on result + exit + trap
+/// (INVARIANT 9). Call once after `f0` returns or unwinds (and after [`svm_onramp_jit_run_report`]).
+/// Returns [`STATUS_EXIT`] if the guest `exit`ed, [`STATUS_TRAP`] if the emitted run unwound on a trap
+/// (a wasm `unreachable` / a cross-tier bounce that trapped — never a truncated `STATUS_OK`), else
+/// [`STATUS_OK`] with the returned value in `RUN_VALUE`.
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run.
@@ -5394,10 +5467,16 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     };
     let stdout = run.stdout().to_vec();
     let stderr = run.stderr().to_vec();
-    let (status, code) = if run.exited() {
-        (STATUS_EXIT, run.exit_code())
+    // Exit is checked first (a cross-tier `Exit` sets both `exited` and, via the JS driver, `trapped`);
+    // then a trap; then a clean return carrying the guest's result value. This mirrors `svm_run_onramp`'s
+    // `Exit` / other-`Err` / `Ok(value)` arms exactly, so a program has the same status + value on both
+    // tiers.
+    let (status, code, value) = if run.exited() {
+        (STATUS_EXIT, run.exit_code(), 0)
+    } else if run.trapped() {
+        (STATUS_TRAP, 0, 0)
     } else {
-        (STATUS_OK, 0)
+        (STATUS_OK, 0, run.returned_value())
     };
     let (fb_rgba, fb_w, fb_h) = match run.take_frame() {
         Some(f) => (f.rgba, f.width, f.height),
@@ -5411,6 +5490,7 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
         FB_W = fb_w;
         FB_H = fb_h;
         EXIT_CODE = code;
+        RUN_VALUE = value;
         LAST_STATUS = status;
     }
     status
@@ -5467,6 +5547,15 @@ pub extern "C" fn svm_stderr_len() -> usize {
 #[no_mangle]
 pub extern "C" fn svm_exit_code() -> i32 {
     unsafe { EXIT_CODE }
+}
+
+/// The value the guest's top-level function returned on the most recent single-shot JIT run (valid when
+/// [`svm_status`] / the finish status is [`STATUS_OK`]; `0` after an exit or trap). This is the same
+/// result `svm_run_onramp` returns on the interpreter, so the page shows an identical value on both
+/// tiers for a returned program (INVARIANT 9).
+#[no_mangle]
+pub extern "C" fn svm_run_value() -> i64 {
+    unsafe { RUN_VALUE }
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 (single `i64` `arg`, deny-all
@@ -6017,20 +6106,15 @@ pub extern "C" fn svm_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
         .params
         .iter()
         .enumerate()
-        .map(|(i, t)| match t {
-            svm_ir::ValType::I32 => Value::I32(read_slot(i) as i32),
-            _ => Value::I64(read_slot(i) as i64),
-        })
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
         .collect();
     let _ = nparams;
     let mut fuel = u64::MAX;
     match bytecode::compile_and_run(m, func, &args, &mut fuel) {
         Some(Ok(vals)) if vals.len() == nresults => {
             for (i, v) in vals.iter().enumerate() {
-                let raw = match v {
-                    Value::I32(x) => *x as u32 as u64,
-                    Value::I64(x) => *x as u64,
-                    _ => return 1, // non-integer result: an interp leaf has an integer signature
+                let Some(raw) = value_to_slot(v) else {
+                    return 1; // v128 result: not marshallable through the scratch slot
                 };
                 let b = raw.to_le_bytes();
                 unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };

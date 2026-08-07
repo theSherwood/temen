@@ -47,16 +47,29 @@ async function driveJitRun(ex, memory) {
 
   const env = Number(ex.svm_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
+  // Capture how `f0` finished so the runner reports it with parity to the interpreter: its return value
+  // (the guest's top-level result) when it returns, and whether it *threw*. The cdylib pairs `threw` with
+  // its own `exited` flag (set on a cross-tier `Exit`) — a throw that didn't exit is a trap, so the run
+  // reports STATUS_TRAP instead of a truncated STATUS_OK (INVARIANT 9).
+  let threw = 0;
+  let value = 0n;
   try {
-    // f0(win, env, ...cap-handle slots) — runs `_start` (→ main) to completion on emitted wasm.
-    f0(win, env, ...slots);
+    // f0(win, env, ...cap-handle slots) — runs `_start` (→ main) to completion on emitted wasm. Its
+    // return is the guest's result (an i32/i64, or undefined for a void `_start`); normalize to i64.
+    const r = f0(win, env, ...slots);
+    value = r === undefined || r === null ? 0n : BigInt(r);
   } catch {
-    // A cross-tier `exit`/trap unwound `f0` (expected for a guest that calls exit); the finish status
-    // and `svm_onramp_jit_run_trap_len` distinguish a clean exit from a real trap.
+    // The emitted `f0` unwound — a cross-tier `exit` (expected for a guest that calls exit) or a trap
+    // (a wasm `unreachable` / a cross-tier bounce that trapped). `svm_onramp_jit_run_finish` tells which.
+    threw = 1;
   }
   ex.svm_dealloc(env, envBytes);
-  const status = ex.svm_onramp_jit_run_finish(); // capture stdout/stderr/exit into the shared slots
+  ex.svm_onramp_jit_run_report(threw, value); // record the return value + throw before capturing
+  const status = ex.svm_onramp_jit_run_finish(); // capture stdout/stderr/exit/value into the shared slots
   ex.svm_onramp_jit_run_close();
+  // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
+  // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
+  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted run trapped (declined to the interpreter)');
   return status;
 }
 

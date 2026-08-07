@@ -115,9 +115,13 @@ fn reactor_run(m: &svm_ir::Module, arg: i64) -> i64 {
                         .map(|(i, t)| {
                             let o = args_ptr as usize + i * 8;
                             let raw = u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+                            // Mirrors the browser servicer's `slot_to_value` (the cross-tier ABI).
                             match t {
                                 svm_ir::ValType::I32 => Value::I32(raw as i32),
-                                _ => Value::I64(raw as i64),
+                                svm_ir::ValType::I64 => Value::I64(raw as i64),
+                                svm_ir::ValType::F32 => Value::F32(f32::from_bits(raw as u32)),
+                                svm_ir::ValType::F64 => Value::F64(f64::from_bits(raw)),
+                                _ => panic!("v128 not marshallable cross-tier"),
                             }
                         })
                         .collect()
@@ -141,10 +145,13 @@ fn reactor_run(m: &svm_ir::Module, arg: i64) -> i64 {
                     Some((Ok(vals), _)) => {
                         let data = mem.data_mut(&mut caller);
                         for (i, v) in vals.iter().enumerate() {
+                            // Mirrors the browser servicer's `value_to_slot` (the cross-tier ABI).
                             let raw = match v {
                                 Value::I32(x) => *x as u32 as u64,
                                 Value::I64(x) => *x as u64,
-                                _ => panic!("non-integer cross-tier result"),
+                                Value::F32(x) => x.to_bits() as u64,
+                                Value::F64(x) => x.to_bits(),
+                                _ => panic!("v128 not marshallable cross-tier"),
                             };
                             let o = args_ptr as usize + i * 8;
                             data[o..o + 8].copy_from_slice(&raw.to_le_bytes());
@@ -363,5 +370,77 @@ fn cross_tier_indirect_data_pointer() {
             arg + 7,
             "a call_indirect to a non-RefFunc'd cross-tier target must still route (arg {arg})"
         );
+    }
+}
+
+// **Cross-tier call with a `f64` signature** (Track 1 — the widened `env.call_interp` slot ABI). f0
+// (emitted, `i64`) converts its arg to `f64` and calls the cross-tier `f1: (f64)->(f64)`, which does a
+// scalar `f64.fma` (no core-wasm opcode → out of subset → cross-tier) returning `v0*v0 + v0`; f0 then
+// truncates back to `i64`. So the `f64` arg **and** result must survive the round trip through the
+// 8-byte scratch slot (`f64.store`/`f64.load`), decoded by the harness's `slot_to_value`/`value_to_slot`
+// twins. Small integer args keep every float value exact, so the differential is bit-precise.
+const SRC_F64_LEAF: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = f64.convert_i64_s v0
+  vr = call 1 (vf)
+  vi = i64.trunc_sat_f64_s vr
+  return vi
+  }
+}
+func (f64) -> (f64) {
+block 0 (v0: f64) {
+  vout = f64.fma v0 v0 v0
+  return vout
+  }
+}
+"#;
+
+#[test]
+fn cross_tier_f64_signature() {
+    let m = parse(SRC_F64_LEAF);
+    for &arg in &[0i64, 1, 42, 1000, -5] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "f64-leaf mixed != oracle for arg {arg}"
+        );
+        assert_eq!(got, arg * arg + arg, "fma round-trip (arg {arg})");
+    }
+}
+
+// The same round trip through a **`f32`** cross-tier signature — exercising the *other* slot encoding
+// (`f32.store`/`f32.load`, the value in the slot's low 4 bytes) that `f64` doesn't. f1 is `(f32)->(f32)`.
+const SRC_F32_LEAF: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = f32.convert_i64_s v0
+  vr = call 1 (vf)
+  vi = i64.trunc_sat_f32_s vr
+  return vi
+  }
+}
+func (f32) -> (f32) {
+block 0 (v0: f32) {
+  vout = f32.fma v0 v0 v0
+  return vout
+  }
+}
+"#;
+
+#[test]
+fn cross_tier_f32_signature() {
+    let m = parse(SRC_F32_LEAF);
+    for &arg in &[0i64, 1, 42, 100, -5] {
+        let got = reactor_run(&m, arg);
+        assert_eq!(
+            got,
+            oracle(&m, arg),
+            "f32-leaf mixed != oracle for arg {arg}"
+        );
+        assert_eq!(got, arg * arg + arg, "fma round-trip (arg {arg})");
     }
 }

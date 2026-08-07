@@ -64,7 +64,7 @@ fn auto_discovers_the_hand_built_loop_cells() {
 fn auto_rolled_residual_rolls_and_is_correct() {
     let m = lua_module();
     let r = auto_rolled(&m, SCRIPT);
-    let f = &r.residual.funcs[0];
+    let f = &r.residual.funcs[r.entry as usize];
     let n = r.dyn_cells.len();
     println!(
         "\nAUTO-ROLLED: {} blocks -> {} blocks, {} params (dyn cells), br_table={}",
@@ -85,7 +85,7 @@ fn auto_rolled_residual_rolls_and_is_correct() {
         r.residual_blocks
     );
 
-    let (wm, we) = with_readback(&r.residual, r.acc_addr, n);
+    let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, n);
     svm_verify::verify_module(&wm).expect("wrapped residual verifies");
 
     // Captured seed reproduces the real Lua answer (`for i=1,50 do x=x+3 end` resumed at the body with
@@ -111,4 +111,57 @@ fn auto_rolled_residual_rolls_and_is_correct() {
         "rolled + correct across a trip sweep (counter param index {})",
         r.counter_ix
     );
+}
+
+/// Integer `%` and `//` fold and roll through the zero-config path: `auto_rolled` marks each op's
+/// divisor + result registers dynamic and deopts the divide-by-zero cold arm to the carried baseline,
+/// so the division stays a residual op on the hot path while the dispatch still folds. The divisor is
+/// a *local* (`d`) — a register operand, so the guard is inline in `luaV_execute` (the constant K-form
+/// `i % 2` calls an un-inlined helper and is out of scope). Correctness is checked against real Lua on
+/// all backends, across a trip sweep, for both operators.
+#[test]
+fn auto_rolled_div_and_mod_fold_roll_and_are_correct() {
+    let m = lua_module();
+    // (name, script, closed-form result for trip count n). `d` is a local ⇒ register-operand div/mod.
+    type Closed = fn(i64) -> i64;
+    let cases: [(&str, &str, Closed); 2] = [
+        (
+            "i % d",
+            "local d = 3\nlocal s = 0\nfor i = 1, 50 do s = s + i % d end\nreturn s\n",
+            |n| (1..=n).map(|i| i % 3).sum(),
+        ),
+        (
+            "i // d",
+            "local d = 3\nlocal s = 0\nfor i = 1, 50 do s = s + i // d end\nreturn s\n",
+            |n| (1..=n).map(|i| i / 3).sum(),
+        ),
+    ];
+    for (name, script, want_fn) in cases {
+        let r = auto_rolled(&m, script);
+        let f = &r.residual.funcs[r.entry as usize];
+        assert!(!has_br_table(f), "{name}: the dispatch folds");
+        let n = r.dyn_cells.len();
+        let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, n);
+        svm_verify::verify_module(&wm).expect("wrapped residual verifies");
+
+        // The captured seed reproduces the real Lua answer at the observed trip count, and the loop
+        // rolls: sweeping the counter reproduces the closed form on both backends.
+        let counter0 = r.captured[r.counter_ix];
+        assert_eq!(
+            tw(&wm, we, &r.captured),
+            want_fn(counter0 + 1),
+            "{name}: captured tree-walk"
+        );
+        for c in [0i64, 1, 6, 49, 200] {
+            let mut a = r.captured.clone();
+            a[r.counter_ix] = c;
+            let want = want_fn(c + 1);
+            assert_eq!(tw(&wm, we, &a), want, "{name}: tree-walk c={c}");
+            assert_eq!(jit(&wm, we, &a), want, "{name}: jit c={c}");
+        }
+        println!(
+            "{name}: folds + rolls + correct ({} residual blocks)",
+            f.blocks.len()
+        );
+    }
 }
