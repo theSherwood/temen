@@ -213,12 +213,18 @@ fn translate_object_module(
     ext_types: &[(String, translate::Layout)],
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
+    tls_layout: Option<&std::collections::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
     t.import_funcrefs(ext_funcrefs);
     t.import_proc_frames(ext_frame_procs);
+    // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
+    // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
+    if let Some(layout) = tls_layout {
+        t.import_tls_layout(layout, stem);
+    }
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
     let (text, export_names) = match sel {
@@ -273,6 +279,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        None,
     )?))
 }
 
@@ -288,6 +295,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        None,
     )?))
 }
 
@@ -305,7 +313,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
-    link_selected_with_extra(units, Vec::new())
+    link_selected_with_extra(units, Vec::new(), false)
 }
 
 /// [`link_selected`] with pre-built **runtime** link units appended (e.g. the W3 bottom-edge shim
@@ -315,17 +323,36 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 fn link_selected_with_extra(
     units: &[(&str, &str, Select)],
     extra: Vec<svm_ir::LinkUnit>,
+    tls: bool,
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     let mut pooled_funcrefs = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
+    // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
+    // order, to lay out the one shared per-vCPU block below.
+    let mut pooled_tls: Vec<(String, u64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
         frame_nodes.extend(translate::Translator::proc_frame_nodes(&root, stem)?);
+        if tls {
+            pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
+        }
     }
+    // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
+    // unit is handed this map, so a `tvar` defined in one unit and referenced from another lower to
+    // the same `vcpu.tls.get()+off` — the offset-agreement a cross-module global gets from `data.sym`.
+    let tls_layout: Option<std::collections::HashMap<String, u64>> = tls.then(|| {
+        let mut layout = std::collections::HashMap::new();
+        let mut off = 0u64;
+        for (name, size) in &pooled_tls {
+            layout.insert(name.clone(), off);
+            off += size;
+        }
+        layout
+    });
     // Whole-program frame fixpoint: a proc needs a frame if it does itself, or if it calls one that
     // does — transitively, across module boundaries (`program → seq → alloc → alloc.0.`). Each unit
     // then translates knowing the *final* frame-need of every callee, so a cross-module call to a
@@ -360,6 +387,7 @@ fn link_selected_with_extra(
                 &pooled,
                 &pooled_funcrefs,
                 &pooled_frame_procs,
+                tls_layout.as_ref(),
             )?))
         })
         .collect::<Result<_, LengError>>()?;
@@ -423,7 +451,24 @@ pub fn link_whole_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime)
+    link_selected_with_extra(&sel, runtime, false)
+}
+
+/// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
+/// establishes each thread's TLS base. Like [`link_units`], but `tvar`s lower to per-vCPU TLS-block
+/// accesses over one **shared** block layout (so a thread-var defined in one unit — e.g. the
+/// allocator state in `system` — and referenced from another agree on its offset). `runtime` supplies
+/// the pre-built link units that `vcpu.tls.set` a real block base at thread entry (the analog of the
+/// W3 allocator shim); without such a unit the linked module has no valid TLS base to run against.
+pub fn link_units_tls_with_runtime(
+    units: &[LengModule],
+    runtime: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Names(u.names)))
+        .collect();
+    link_selected_with_extra(&sel, runtime, true)
 }
 
 /// A translated SVM value: its SSA id and type. The unit the expression translator threads.
