@@ -283,7 +283,17 @@ policy applies. If it recurs: audit locks held at `fork_twin`'s fork point on ma
 (pthread_atfork discipline or single-threaded fork window), and consider a per-test timeout so
 a hang fails fast instead of eating the job's 45-minute budget.
 
-### I67 — `svm-llvm` CI job: `apt-get update` dies on unrelated `packages.microsoft.com` 403 before any Rust runs (S4, flaky CI infra) — recorded 2026-08-05 on PR #627
+### I67 — `svm-llvm` CI job: `apt-get update` dies on unrelated `packages.microsoft.com` 403 before any Rust runs (S4, flaky CI infra) — recorded 2026-08-05 on PR #627 — **FIX STAGED 2026-08-07** (`.github/workflows_src/ci.yml`, awaiting owner copy-over)
+
+**Fix staged (2026-08-07, `claude/ci-flakiness-git-hooks-c8xg3t`).** Applied the robust fix below to
+**every** `apt-get update` step, not just `svm-llvm` — the same unused `microsoft*`/`azure*` sources sit
+on every ubuntu runner, so the 403 could fell any of the 10 apt sites (mingw cross lanes, the `clang`
+reference lanes, all `llvm-18` blocks). Each now runs
+`sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*` before `apt-get update`
+(glob + `-f`, so it's a no-op if the files are absent — resilient to the deb822 `azure-cli.sources`
+vs. legacy `.list` naming drift). Staged in `workflows_src` per the CI-editing protocol; the
+`workflows-in-sync` guard stays red until the owner copies it over. Move to Resolved after the copy-over
+lands green.
 
 The Linux-only `svm-llvm` job installs LLVM/clang via apt; on a GitHub runner the
 `apt-get update` step failed with `403 Forbidden` from `packages.microsoft.com`

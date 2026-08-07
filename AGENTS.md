@@ -62,3 +62,5 @@ not from micro-optimizing hot code. Default to:
 
 **Editing CI:** the session token can't push under `.github/workflows/` (needs the `workflow` scope). If you need to change a workflow but can't commit it there, edit the mirror in `.github/workflows_src/` instead and note it in that dir's README — the owner copies it over. See `.github/workflows_src/README.md`.
 
+**Fast local pre-push check (optional):** `git config core.hooksPath .githooks` (or run `scripts/ci/install-git-hooks.sh`) enables a pre-push hook that mirrors CI's `check` job (`build · test · fmt · clippy`), so the common failures surface before a CI round-trip. It's fast feedback, **not** the gate — the CI matrix (cross-OS, miri/asan/tsan/loom, fuzz, differential) still runs on the PR and remains authoritative. Bypass once with `SVM_HOOK_SKIP=1 git push`. See `.githooks/README.md`.
+
