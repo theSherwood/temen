@@ -426,7 +426,19 @@ server serves `fork` + `wait` over one offer; the caller forks, the twin `exit(4
 `wait(3)`s (the deferred path — it waits the instant it forks), reaps `42`, and the run returns it.
 Interp only, like every fork test.
 
-**Remaining for the shell loop:** `exec`/`execve` (the twin replaces its image with a command — image
--replace on the durable-clone capstone), then wiring `fork`/`wait` end-to-end through a compiled-C
-`sh_spawn` (the `c_fork.rs` guest gains the `wait` import), and job-control `waitpid` flags (`WNOHANG`,
-group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking `results` probe.
+**Compiled-C fork → exec → wait, end to end. DONE.**
+`c_fork.rs::a_compiled_c_program_runs_fork_exec_wait_end_to_end` — an ordinary chibicc-compiled C
+program runs the shell's command loop `pid = fork(); if (pid == 0) exec(cmd); else wait(pid);`. The
+manager serves **two** offers (`fork` → func 2 `clone_caller`, `wait` → func 3 `reap`) over two exports
+and re-grants both to the guest as named imports (`__fork`, `__wait`); the guest gained the `__wait`
+import (the "wiring through a compiled-C `sh_spawn`" item). **`exec` is BusyBox-multicall applet
+dispatch** (STAGE1.md — "a shell's `exec` and BusyBox's applet dispatch are the same shape"): the child
+transfers to the selected command entry and *becomes* it, exiting with the command's status; the status
+`42` originates in the exec'd command, flows through the child's exit into `results[twin]`, and is reaped
+by the parent's `wait`. Both `fork` and `wait` retry on the `-EAGAIN` serve/park race (I68 idiom), so the
+demo is stable under load. Interp only, like every fork test.
+
+**Remaining for the shell loop:** true **`execve`** — cross-module image-replace (the twin swaps its
+running module for a *separate* command module, rather than the multicall applet-dispatch above) on the
+durable-clone capstone — and job-control `waitpid` flags (`WNOHANG`, group waits). `reap` today is a
+blocking single-pid `wait`; `WNOHANG` is a non-parking `results` probe.

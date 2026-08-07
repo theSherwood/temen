@@ -175,6 +175,196 @@ block 0 (vx: i64) {
 }
 "#;
 
+/// FORK.md §8.6 — **the shell's command loop in one compiled-C program: `fork()` → `exec` → `wait()`.**
+/// The guest runs the classic `pid = fork(); if (pid == 0) exec(cmd); else wait(pid);`:
+///
+/// - **fork** through `__fork` (the fork offer), retrying on the `-EAGAIN` serve/park race (I68).
+/// - **exec** is **BusyBox-multicall applet dispatch** (STAGE1.md — "a shell's `exec` and BusyBox's
+///   applet dispatch are the same shape"): the child transfers to the selected command entry
+///   (`applet(1)`) and *becomes* it, exiting with the command's status (`42`). This is the achievable
+///   first rung; true cross-module image-replace `execve` is the separate capstone (§8.6 remaining).
+/// - **wait** through `__wait` (the wait offer → `reap`), retrying on `-EAGAIN` too — the parent reaps
+///   the twin and observes the exec'd command's status, which it writes to stdout.
+///
+/// The status `42` **originates in the exec'd command**, flows through the child's exit into the
+/// scheduler's `results[twin]`, and is reaped by the parent's `wait` — the full fork→exec→wait data
+/// path, end to end, in ordinary compiled C. The server serves **two** verbs over two offers: `fork`
+/// (export 0, op → func 2 `clone_caller`) and `wait` (export 1, op → func 3 `reap`). Interp only, like
+/// every fork test.
+const EXEC_GUEST_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+int applet(int which) {
+  if (which == 1) return 42;
+  return 7;
+}
+static long pid;
+static long status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    return applet(1);
+  }
+  while ((status = wait_pid(pid)) < 0);
+  write(1, &status, 8);
+  return status;
+}
+"#;
+
+/// The manager for the fork→exec→wait guest: same shape as `MANAGER`, but the server serves **two**
+/// offers over two exports — `fork` (export 0 → func 2 `clone_caller`) and `wait` (export 1 → func 3
+/// `reap`) — and the 3-entry grant list re-grants `{"stdout" → stream, "__fork" → fork offer, "__wait"
+/// → wait offer}`. One `svc.wait` loop (func 1) serves both, dispatched by `(export, op)`.
+const EXEC_MANAGER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "fork" 1 { op: 2 }
+export 1 interface "wait" 1 { op: 3 }
+data 300 "__fork"
+data 310 "stdout"
+data 320 "__wait"
+func (i32, i32, i64) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64) {
+  vq = i64.const 0
+  ; spawn via record (op 17): entry=1 off=262144 sl=12 quota=0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 262144
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vz0 = i64.const 0
+  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  v1c = i64.const 1
+  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  va0 = i64.const 256
+  vnp0 = i32.const 310
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 300
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  i32.store va4 vsix
+  va5 = i64.const 280
+  i32.store va5 vforkoff
+  va6 = i64.const 288
+  vnp2 = i32.const 320
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  i32.store va7 vsix
+  va8 = i64.const 296
+  i32.store va8 vwaitoff
+  vgp = i64.const 256
+  vgn = i64.const 3
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+"#;
+
+#[test]
+fn a_compiled_c_program_runs_fork_exec_wait_end_to_end() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(EXEC_GUEST_SRC)).expect("parse exec guest");
+    verify_module(&guest).expect("verify exec guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 80_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The parent forked, waited on the twin, and returned the reaped status — the exec'd command's 42.
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the parent's wait(pid) reaped the exec'd applet's exit status (42)"
+    );
+
+    // Exactly ONE write reached stdout: the parent's reaped status. The child took the exec branch
+    // (applet → exit 42) and never wrote — the status flowed command → child-exit → wait → parent.
+    let out = host.stdout_bytes();
+    assert_eq!(
+        out.len(),
+        8,
+        "only the parent wrote — the exec'd child exited"
+    );
+    let status = i64::from_le_bytes(out[..8].try_into().unwrap());
+    assert_eq!(
+        status, 42,
+        "the reaped status is the exec'd command's exit code"
+    );
+}
+
 #[test]
 fn a_compiled_c_program_forks_for_real_and_both_copies_write_through_the_shared_stream() {
     let manager = Arc::new(parse_module_raw(MANAGER).expect("parse manager"));
