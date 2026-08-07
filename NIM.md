@@ -813,11 +813,20 @@ files down the chain. Two existing options, no new host op:
 1. **stdout → stdin piping** — free with `domain_exec`: the driver drains phase N's captured output
    (`read_out`) and seeds it as phase N+1's `stdin` (the `CAT_CONSUMER` pattern, `exec_cap.rs:185`).
    Fits a streaming `hexer | lengc` shape.
-2. **A shared memfs** — the file-based `nifmake` shape. `mem_fs` grants are independent per domain by
-   default (`svm-fs/src/lib.rs:745`), but `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:814`) hands one
-   live `Arc<Mutex<..>>` store to multiple grantees, and a forkable `fs` host_proc re-granted through
-   `regrant_into_child` (`crates/svm-interp/src/lib.rs:18485`) shares the parent's VFS + fd table with
-   a child. So phase N writes `x.nif` and phase N+1 reads it. This is embedder plumbing, not a new op.
+2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
+   This is the faithful hand-off, and it needs a small **additive** piece of shared infrastructure —
+   no new host op, but new API surface, so it is not free the way piping is. Measured, the gap is two
+   parts: (a) `mem_fs` grants are independent per domain (`svm-fs/src/lib.rs:745`), and the one shared
+   primitive, `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:820`), returns a **single** `HostProc` + a
+   host-side `MemFsHandle` — built for host↔handle session persistence (browser-Postgres), *not* a
+   `Fn() -> HostProc` factory grantable to N domains; a grantable-to-N shared factory has to be added;
+   (b) `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout —
+   so children receive **no `fs` at all** today. Wiring the file hand-off therefore means: surface a
+   grantable shared memfs in `svm-fs`, and teach the child-spawn path to grant it (either a
+   `domain_exec` that runs children with `run_with_caps`, or the §14 Instantiator's `regrant_into_child`
+   at `crates/svm-interp/src/lib.rs:18485`). Both are additive, but both touch **shared capability
+   infrastructure** and decide *what filesystem authority a spawned child inherits* — a security-shaped
+   call (INVARIANTS §1/§4), so it is owner-reviewed infra, not a nimony-lane edit.
 
 **v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
 one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
