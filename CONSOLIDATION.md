@@ -258,6 +258,56 @@ retirement is asset-safe — `asset_op_scan` now reports every cap iface per ass
   ordinary `cap.call`), re-run the probe — batching alone will not save the ring, and the
   SQE format, `RingState`, and the async completion path leave then.
 
+  **The parking design (sketched 2026-08-07, owner-endorsed; the plan behind the door).**
+  Long-term the synchronous `cap.call` is the *only* guest-visible host-call shape —
+  latency is the scheduler's problem, never the ABI's (no sync/async function coloring;
+  DESIGN "async-first" delivered as a sync surface). Three layers, no new op, no wire rev:
+
+  1. *Registration declares it* (the §7 `HostProcEntry` pattern — one struct, per-entry
+     powers): an **offloadable** handler variant, `Fn(op, &[i64]) -> Vec<i64> + Send + Sync`
+     — scalars in, scalars out, **no window access**. That signature is the safety
+     property: the pool never touches the window; buffers are read at submit and written
+     at completion on the vCPU thread (exactly the ring's discipline today). Bulk data
+     stays on the §4b region plane.
+  2. *Dispatch gets a third outcome*: `Ok(results) | Err(trap) | Pending(completion_id)`.
+     The handler may decide per call (fast case inline, slow case punts — the io_uring
+     try-nonblocking model), and the dispatch **releases the host lock** before waiting —
+     the fix for the measured `max_active` 1 serialization of the threaded tier.
+  3. *The eval loop maps `Pending` onto existing park machinery* (the `StdinPark` seam, the
+     parked-offer-call delivery path, `wait`/`notify` waking): park the fiber keyed on the
+     completion id, run siblings, deliver result slots on wake. A single-fiber guest
+     degenerates to a plain wait — without the host lock. Nesting is free: a park is a
+     scheduler event, and children already run on the caller's eval loop (§11).
+
+  Pinned constraints (the parts a careless slice could break):
+  - **The fast path is structurally outside the blast radius.** A parkable registration is
+    *never* `fast_cap_resolver`-claimed (the §5a mechanism, already pinned by `jit_diff`'s
+    fallback-seam test); claimed ops keep the exact D45 register-ABI contract. And **sync
+    ops must never pay for parkable ops' existence** — no completion id, no table touch,
+    no lock unless a handler already returned `Pending`. Add the hostcall fast-path number
+    to the bench regression check before the first parking slice lands.
+  - **Determinism**: on the cooperative tier, completions deliver at safepoints in
+    submission order — bit-identical to inline execution, so the §18 oracle survives;
+    genuine reordering exists only on tiers that already accept scheduling nondeterminism.
+  - **Completion sources are pluggable behind the park** (this is why parking, not the
+    ring, is the portable ABI): the offload pool today; host-side io_uring for real
+    file/net caps later; a JS event on the wasm32/browser tier, where blocking a pool
+    thread was never an option.
+  - **Batching belongs to the transport, not the guest**: if the §9 rung-6 brokered tier
+    ever ships, the broker coalesces parked completions across the expensive channel
+    invisibly — the guest ABI stays sync. (The ring's mistake was making the batch format
+    guest-visible, not batching itself.)
+  - **Known loss to sequence around**: ring `submit_async`/`reap` is currently the only way
+    a single-fiber guest overlaps its own compute with host work. Close that with a
+    guest-facing fiber spawn (or the §2 coroutine-as-child pattern), not by keeping a
+    second host-call ABI alive.
+
+  Slice order when picked up: (1) registration + `Pending` + single-fiber wait (no
+  scheduler work; immediately fixes lock-hold-through-sleep), (2) fiber park/wake on the
+  cooperative tier with ordered delivery, (3) threaded-tier wiring, then re-run
+  `io_ring_bench` and let the numbers retire the ring. CALLS-increment-sized, not
+  CALLS-sized.
+
 ## 6. One inert code-handle kind (`Module` + `JitCode`) — deferred, door held open
 
 Both are "code as a capability with no callable ops, named by another capability's verbs."
