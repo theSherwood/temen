@@ -619,8 +619,16 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
         vec![Value::I64(10_105)],
         "durable: the punt completed inside the resume (FIBER_RETURNED, 105) — no ParkedOn state"
     );
-    assert_eq!(comps.minted(), 1, "the punt still minted (degenerate wait, not inline)");
-    assert_eq!(comps.outstanding(), 0, "the completion was consumed by the wait");
+    assert_eq!(
+        comps.minted(),
+        1,
+        "the punt still minted (degenerate wait, not inline)"
+    );
+    assert_eq!(
+        comps.outstanding(),
+        0,
+        "the completion was consumed by the wait"
+    );
 }
 
 #[test]
@@ -662,6 +670,10 @@ fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
         vec![Value::I64(50_111_222)],
         "fiber 2 stayed parked (50/50 polls) while its ready result waited on fiber 1's id"
     );
-    assert_eq!(comps.minted(), 2, "the release is inline; only the punts minted");
+    assert_eq!(
+        comps.minted(),
+        2,
+        "the release is inline; only the punts minted"
+    );
     assert_eq!(comps.outstanding(), 0, "all completions delivered");
 }

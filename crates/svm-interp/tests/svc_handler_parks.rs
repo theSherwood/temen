@@ -352,9 +352,13 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
         }))
     }));
     let comps = host.completions();
-    let t_punt = host.svc_enqueue(0, 0, vec![h as i64]).expect("enqueue punt");
+    let t_punt = host
+        .svc_enqueue(0, 0, vec![h as i64])
+        .expect("enqueue punt");
     let t_probe = host.svc_enqueue(0, 1, vec![0]).expect("enqueue probe");
-    let t_open = host.svc_enqueue(0, 2, vec![h as i64]).expect("enqueue open");
+    let t_open = host
+        .svc_enqueue(0, 2, vec![h as i64])
+        .expect("enqueue open");
     let mut fuel = u64::MAX;
     let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("no trap, no hang");
     assert_eq!(r, vec![Value::I64(3)], "all three dispatches completed");
@@ -370,5 +374,9 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
     );
     assert_eq!(host.svc_result(t_open), Some(0), "the release ran inline");
     assert_eq!(comps.minted(), 1, "only the punt minted");
-    assert_eq!(comps.outstanding(), 0, "the completion was delivered to the handler");
+    assert_eq!(
+        comps.outstanding(),
+        0,
+        "the completion was delivered to the handler"
+    );
 }
