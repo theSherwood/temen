@@ -438,7 +438,30 @@ transfers to the selected command entry and *becomes* it, exiting with the comma
 by the parent's `wait`. Both `fork` and `wait` retry on the `-EAGAIN` serve/park race (I68 idiom), so the
 demo is stable under load. Interp only, like every fork test.
 
-**Remaining for the shell loop:** true **`execve`** — cross-module image-replace (the twin swaps its
-running module for a *separate* command module, rather than the multicall applet-dispatch above) on the
-durable-clone capstone — and job-control `waitpid` flags (`WNOHANG`, group waits). `reap` today is a
-blocking single-pid `wait`; `WNOHANG` is a non-parking `results` probe.
+**True cross-module `execve` (image-replace) — substrate DONE.** `exec_module(module, grants_ptr,
+grants_n, entry, size_log2)` — a self-namespace op (`CAP_SELF_EXEC = 14`) — replaces the **calling
+vCPU's own image** with a granted *separate command module*, in place, keeping the vCPU's `TaskId` +
+fuel. So a parent's `wait(pid)` reaps the *command's* exit, exactly as POSIX `execve` keeps the pid —
+the real image-replace the multicall demo above stood in for. Mechanism: the eval loop does everything
+fallible (resolve the command, regrant the inherited caps named in the grant list into a fresh
+powerbox, bind the command's imports, register its self module) — where a refusal is a clean `-EINVAL`
+that leaves the caller running (POSIX `execve` **returns only on failure**) — then hands `dispatch` an
+`Inner::Exec`/`Step::Exec`. `dispatch` materializes the command's data segments into the caller's window
+and swaps the vCPU to a fresh one (`VCpu::new`) running the command at its entry, then loops back to run
+it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
+`svm-interp/tests/execve.rs`: a guest execs a separate command module that writes `"EXEC"` and exits
+`42`; the guest's post-`exec` `return 99` **never runs** (the image was truly replaced), and a bogus
+command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
+
+*Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command reuses
+the caller's window (its declared memory must equal the carve) and BSS is not zeroed (a well-formed
+command inits its own state from its data segments); non-durable domains only (durable freeze/thaw
+image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
+fibers).
+
+**Remaining for the shell loop:** wire `exec_module` into the compiled-C `fork → execve → wait` loop
+(the `c_fork.rs` guest's child calls `execve` on a *separate* command module instead of the multicall
+`applet()` — increment 2), then the increment-1 simplifications above as they're needed (fresh window +
+BSS zero, durable-domain exec, exec from a nested serve context), and job-control `waitpid` flags
+(`WNOHANG`, group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking
+`results` probe.
