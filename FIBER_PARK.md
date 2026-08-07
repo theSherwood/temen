@@ -84,7 +84,24 @@ carry no fiber kernels).
 
 ## Slices
 
-**F1 — oracle: the fiber park itself (tree-walk M:N scheduler).**
+**F1 — oracle: the fiber park itself (tree-walk M:N scheduler). BUILT 2026-08-07.**
+As designed below, with the as-built notes: the park's register-and-recheck closure files the
+`Waiter::Fiber` under the scheduler lock then calls `completion_drain` itself (the same
+insert-then-drain the vCPU park handler uses — one recheck idiom, and delivery stays ordered
+even on the recheck). The domain key is captured from the dispatching host *before* the lock
+drops, so inside an offer animation it is the provider's id — which is exactly `OfferPark`'s
+`resume_key`, making the CALLS-4b promotion wake work by construction (`OfferPark` resumers
+live in `svc_waiters`; the drain's fiber arm `svc_wake`s that key). Pins landed:
+`fiber_parks.rs` (park/wake contract; **the single-vCPU rendezvous overlap** — the retirement's
+lost capability, restored on the oracle; ordered delivery holding a ready later completion for
+an earlier park; teardown abandoning a cap-parked fiber; the durable degenerate-wait pin) and
+`svc_handler_parks.rs` (a serve-loop handler's punt parks the dispatch, never the domain —
+completion wake re-admits the `svc.wait`-parked loop). Residues, recorded: the **animated-offer
+punt** rides the promotion branch by construction but has no direct pin — `wire_offer_proc`
+seals the provider `Host`, so no public wiring can put an offloadable cap in a provider's world
+yet; pin it when one can. The interim fast-backend divergence is **ISSUES.md I73** (convergence
+= F2+F3). Zero-result punts keep the degenerate wait (the wake pushes exactly one reg —
+invariant 8's single-slot shape, same conjunct as the vCPU park).
 Widen `parkable` (interp lib.rs:10760): a non-root fiber under `SchedRef::Real`,
 non-durable, single-`i64` sig → `fiber_park!` instead of the degenerate `comps.wait(id)`.
 The closure inserts `Waiter::Fiber { reg, slot, svc }` into `completion_waiters[id]`,

@@ -4548,10 +4548,10 @@ impl Scheduler {
                     s.runnable.push_back(v);
                     woke = true;
                 }
-                // No fiber parks on completions yet (slice 2 parks whole vCPUs only — the
-                // FIBER_PARKED unwind would be guest-visible where fast backends block inline,
-                // invariant 9); the arm exists so a future handler-promotion slice inherits the
-                // established wake pair.
+                // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
+                // rides the same ordered drain. The wake pair is the established one: the
+                // result lands on the parked frame, and the domain's `svc.wait` consumers are
+                // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
                 Some(Waiter::Fiber { reg, slot, svc }) => {
                     reg.wake_blocked(slot, Reg::from_i64(r));
                     svc_wake_locked(&mut s, svc);
@@ -10745,18 +10745,55 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             return Err(Trap::CapFault);
                         }
                         let comps = hg.completions();
+                        let svck = hg.domain_id() as usize;
                         drop(hg);
+                        // F1 (FIBER_PARK.md) — a punt inside a FIBER parks the fiber, not the
+                        // vCPU: the §3.6 slice-5a contract (`FIBER_PARKED` unwinds to the
+                        // resumer; the completion wakes the fiber; the next resume delivers the
+                        // scalar). The waiter rides the same `completion_waiters` map as the
+                        // vCPU park, so submission-ordered delivery (§18) is one drain for both.
+                        // Register-then-recheck is the drain itself: a completion that raced the
+                        // park is delivered (in order) by the recheck, never stranded. Durable
+                        // callers keep the degenerate wait below (`freeze_drive` fails closed on
+                        // any unwoken cap park — the FIBER_PARK.md non-goal); the explorer keeps
+                        // whole-vCPU waits (the slice-5a `SchedRef::Real` gate); the single-i64
+                        // gate matches the wake's one pushed reg (invariant 8). An animated
+                        // offer handler that reaches this park rides `fiber_park!`'s CALLS-4b
+                        // promotion branch instead — the dispatch parks, never the domain.
+                        // Until F2/F3, the fast backends still block inline here — the
+                        // enumerated interim divergence (ISSUES.md I73), witnessable only by a
+                        // punt-inside-a-fiber kernel.
+                        if *cur != ROOT_FIBER
+                            && !durable
+                            && matches!(sig.results.as_slice(), [ValType::I64])
+                        {
+                            if let SchedRef::Real(sr) = sched {
+                                let regc = Arc::clone(registry);
+                                fiber_park!(|slot: usize| {
+                                    let mut sg = sr.lock();
+                                    sg.completion_waiters.insert(
+                                        id,
+                                        Waiter::Fiber {
+                                            reg: Arc::clone(&regc),
+                                            slot,
+                                            svc: svck,
+                                        },
+                                    );
+                                    drop(sg);
+                                    sr.completion_drain(&comps);
+                                });
+                            }
+                        }
                         // Slice 2 — park the vCPU instead of blocking its worker thread: the
                         // completion re-queues it via `Pending::CapResult`, so the M:N worker
                         // runs other runnable vCPUs meanwhile. Guest-invisible (a blocking call
                         // just takes time), hence no cross-backend divergence. Conditions: real
                         // scheduler (the explorer keeps whole-vCPU blocking waits), root fiber
-                        // (a `cont` fiber's park would unwind FIBER_PARKED to its resumer —
-                        // guest-visible where fast backends block inline, invariant 9),
-                        // non-durable (the freeze driver has no CapPending arm; a durable
-                        // caller keeps the in-dispatch blocking discipline), and an exactly-i64
-                        // reply (the wake pushes a raw i64 reg — the `Pending::CapResult`
-                        // precedent; `Blocking`/offloadable jobs return one i64 by contract).
+                        // (a fiber's park is the F1 unwind above), non-durable (the freeze
+                        // driver has no CapPending arm; a durable caller keeps the in-dispatch
+                        // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
+                        // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
+                        // jobs return one i64 by contract).
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -10764,8 +10801,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         if parkable {
                             return Ok(Inner::Park(Blocked::CapPending { id }));
                         }
-                        // Degenerate blocking wait (slice 1): single-fiber guests, `cont`
-                        // fibers, durable callers, the deterministic explorer.
+                        // Degenerate blocking wait (slice 1): single-fiber guests, durable
+                        // callers, non-i64 signatures, the deterministic explorer.
                         let r = comps.wait(id);
                         if let Some(ty) = sig.results.first() {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
