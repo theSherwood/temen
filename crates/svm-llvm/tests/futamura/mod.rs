@@ -27,6 +27,8 @@
 //! session; the `CallInfo` stride story is ISSUES I71 facet b). Not automated yet: rolling
 //! safepoint roots (`dynamic_cells`), stitching, multi-value returns, C tail calls.
 
+#![allow(dead_code)] // shared test-support module; each test crate uses a subset
+
 use std::collections::BTreeMap;
 
 use svm_interp::{IrPc, Stop, StopReason, Value};
@@ -145,8 +147,41 @@ pub struct AutoResult {
     pub tail_sites: usize,
 }
 
+/// The build half of the pipeline: the baseline module, the embedded residual module, and stats —
+/// so a caller (e.g. the benchmark) can time the phases and the runs separately.
+pub struct AutoBuild {
+    pub baseline: Module,
+    pub residual: Module,
+    pub residual_blocks: usize,
+    pub br_tables: usize,
+    pub lua_sites: usize,
+    pub c_sites: usize,
+    pub tail_sites: usize,
+    /// Wall time of the profiling run (breakpointed interpreter pass + windows).
+    pub profile_time: std::time::Duration,
+    /// Wall time of `specialize_with_config` alone.
+    pub specialize_time: std::time::Duration,
+}
+
 /// The pipeline: profile `script`, derive the whole `SpecConfig`, specialize, embed, run both.
 pub fn auto(script: &str) -> AutoResult {
+    let b = auto_build(script);
+    let baseline = svm_run::run_powerbox(&b.baseline, script.as_bytes()).expect("baseline run");
+    let residual = svm_run::run_powerbox(&b.residual, script.as_bytes()).expect("residual run");
+    AutoResult {
+        baseline_stdout: baseline.stdout,
+        residual_stdout: residual.stdout,
+        residual_blocks: b.residual_blocks,
+        br_tables: b.br_tables,
+        lua_sites: b.lua_sites,
+        c_sites: b.c_sites,
+        tail_sites: b.tail_sites,
+    }
+}
+
+/// Profile + assemble + specialize + embed (no runs).
+pub fn auto_build(script: &str) -> AutoBuild {
+    let t_profile = std::time::Instant::now();
     let m = lua_module();
     let luav = byname(&m, "luaV_execute").expect("luaV_execute");
     let precall = byname(&m, "luaD_precall").expect("precall");
@@ -343,6 +378,7 @@ pub fn auto(script: &str) -> AutoResult {
             None => {}                    // an in-callee dispatch (its own instructions)
         }
     }
+    let profile_time = t_profile.elapsed();
     let ci_previous_off = ci_previous_off.expect("at least one Lua call");
     // The savedpc field: at a callee's first dispatch it points at that callee's code start.
     let savedpc_off = {
@@ -559,7 +595,9 @@ pub fn auto(script: &str) -> AutoResult {
         SpecArg::ConstI64(l as i64),
         SpecArg::ConstI64(main_ci as i64),
     ];
+    let t_spec = std::time::Instant::now();
     let mut r = specialize_with_config(&m, luav, &args, &cfg).expect("auto projection");
+    let specialize_time = t_spec.elapsed();
     let entry = (r.funcs.len() - 1) as u32;
     let f = &r.funcs[entry as usize];
     let residual_blocks = f.blocks.len();
@@ -583,15 +621,15 @@ pub fn auto(script: &str) -> AutoResult {
         }],
     };
     svm_verify::verify_module(&r).expect("embedded residual verifies");
-    let baseline = svm_run::run_powerbox(&m, script.as_bytes()).expect("baseline run");
-    let residual = svm_run::run_powerbox(&r, script.as_bytes()).expect("residual run");
-    AutoResult {
-        baseline_stdout: baseline.stdout,
-        residual_stdout: residual.stdout,
+    AutoBuild {
+        baseline: m,
+        residual: r,
         residual_blocks,
         br_tables,
         lua_sites: n_lua,
         c_sites: n_c,
         tail_sites: n_tail,
+        profile_time,
+        specialize_time,
     }
 }
