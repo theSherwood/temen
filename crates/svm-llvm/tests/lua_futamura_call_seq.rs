@@ -1,64 +1,52 @@
-//! **A nested Lua call stack — two distinct callees, one calling the other.**
-//!
-//! `lua_futamura_call.rs` projects a *single* Lua callee. This projects a **2-deep call stack**: the
-//! main chunk calls `outer`, which calls `inner` — so at the inner call two Lua frames are live at
-//! once. It checks the soundness question everything else rests on: the `OP_CALL` handler is shared, so
-//! the projection distinguishes call sites **only** by their `ra` ([`svm_peval::LuaSite::ra`]) and each
-//! frame by its own `CallInfo`. (Two *sequential* calls would reuse one cached `CallInfo` — Lua caches
-//! `ci->next` — which one const overlay can't represent; nesting keeps the frames genuinely distinct.)
+//! **I71 facet (c): two sequential, distinct Lua callees share one cached `CallInfo`.**
 //!
 //! ```lua
-//! local function inner(x) return x + 1 end
-//! local function outer(y) return inner(y) * 2 end
-//! print(outer(10))                    -- inner(10)=11, *2 = 22
+//! local function add(a, b) return a + b end
+//! local function mul(a, b) return a * b end
+//! print(add(2, 3) + mul(4, 5))            -- 5 + 20 = 25
 //! ```
 //!
-//! **RESOLVED — I71 facet (b).** Three ingredients, all config (no engine change):
+//! Lua caches the callee frame node: both calls run in `main_ci->next` — the **same** `CallInfo`
+//! address — with its per-callee fields (`func`, `savedpc`) overwritten between the calls. A single
+//! const overlay can only hold one callee's image, which is what kept this facet open.
 //!
-//! 1. Facet (a)'s per-frame `proto->k` overlays + the alloc/GC/string cut-set
-//!    (`lua_futamura_call_arith`).
-//! 2. The **upvalue machinery cut** (`outer` captures `inner` as an upvalue, so `OP_CLOSURE` calls
-//!    `luaF_findupval`, which walks/mutates the open-upvalue list — opaque stateful machinery).
-//! 3. **`CI_SIZE = 64`, the real `CallInfo` stride.** This was the long-hidden root cause: adjacent
-//!    frames' ci nodes sit 64 bytes apart, so the old 104-byte over-slice made `outer`'s ci overlay
-//!    swallow `inner`'s ci header with stale pre-call bytes — `inner.ci->func`/`savedpc` seeded as
-//!    zero, its frame dispatched garbage, and the fold walked into the metamethod/GC cold subtree
-//!    (`Budget`). That masqueraded as an engine-level "callee base is dynamic" blocker; it was an
-//!    overlay collision in the capture config all along (found by `lua_futamura_call_reroot`).
+//! The fix needs **no engine change**: [`svm_peval::LuaSite::pins`] is a generic list of
+//! `(address, value)` cells pinned at the call's cut, and mem cells shadow the overlay seed. So each
+//! call site pins the shared node's *per-callee* fields itself — `ci->func` (this site's `ra`) and
+//! `ci->savedpc` (this callee's code start) — alongside the usual closure-slot pin. The overlay
+//! carries one callee's image for the fields that are the same for both (previous, callstatus, trap);
+//! the pins overwrite the two that differ. Both returns are integer-valued through the one shared
+//! `ci`, so a single [`svm_peval::PoscallModel::selective`] entry covers them.
 //!
-//! With those, the full 2-deep inline projection folds (`br_table == 0`) and the embedded residual
-//! prints `22\n` byte-identically to the interpreter — the `ra` keying routes each site to the right
-//! frame and the nested return chain composes, execution-correct.
+//! The embedded residual prints `25\n` byte-identically to the interpreter — sequential distinct
+//! callees through one shared `CallInfo`, execution-correct. See ISSUES.md I71.
 //!
-//! Run: `cargo test -p svm-llvm --test lua_futamura_call_nested -- --nocapture`
+//! Run: `cargo test -p svm-llvm --test lua_futamura_call_seq -- --nocapture`
 
 use svm_interp::{IrPc, Stop, StopReason, Value};
 use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
 use svm_peval::{specialize_with_config, LuaSite, PoscallModel, PrecallModel, SpecArg, SpecConfig};
 
-const SCRIPT: &str = "local function inner(x) return x + 1 end\n\
-                      local function outer(y) return inner(y) * 2 end\n\
-                      print(outer(10))\n";
+const SCRIPT: &str = "local function add(a, b) return a + b end\n\
+                      local function mul(a, b) return a * b end\n\
+                      print(add(2, 3) + mul(4, 5))\n";
 const CAP: usize = 8 << 20;
 
 const L_CI: u64 = 32;
 const L_STACK_LAST: u64 = 40;
 const L_STACK: u64 = 48;
 const LUA_STATE_SIZE: usize = 200;
-/// One `CallInfo`'s overlay span — the real allocation stride (adjacent ci nodes are 64 apart), NOT a
-/// generous over-slice: a larger span makes one frame's overlay swallow the next frame's header with
-/// stale bytes, which was I71 facet (b)'s root cause. Every field the fold reads (func +0, previous
-/// +16, savedpc, trap, callstatus +62) lies below 64.
+// The real CallInfo allocation stride (adjacent ci nodes are 64 apart). An over-slice makes one
+// frame's ci overlay swallow the next node with stale bytes — the I71(b) root cause.
 const CI_SIZE: usize = 64;
 const CI_FUNC: u64 = 0;
 const LCLOSURE_P: u64 = 24;
+const PROTO_SIZEK: u64 = 20;
 const PROTO_SIZECODE: u64 = 24;
 const PROTO_SIZEP: u64 = 32;
+const PROTO_K: u64 = 56;
 const PROTO_CODE: u64 = 64;
 const PROTO_P: u64 = 72;
-const PROTO_SIZEK: u64 = 20;
-const PROTO_K: u64 = 56;
-const TAG_OFF: u64 = 8;
 const VNUMINT: u8 = 0x03;
 
 fn lua_module() -> Module {
@@ -70,9 +58,6 @@ fn lua_module() -> Module {
 }
 fn byname(m: &Module, n: &str) -> Option<u32> {
     m.exports.iter().find(|e| e.name == n).map(|e| e.func)
-}
-fn luav_execute(m: &Module) -> u32 {
-    byname(m, "luaV_execute").expect("luaV_execute")
 }
 fn rd_u64(w: &[u8], a: u64) -> u64 {
     u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap())
@@ -91,7 +76,6 @@ fn dispatch_block(m: &Module, luav: u32) -> u32 {
     }
     best.0
 }
-/// The precall branch block + the SSA value index of its `ra` (arg 2 of `precall(sp, L, ra, nres)`).
 fn precall_site(m: &Module, luav: u32, precall: u32) -> (u32, u32) {
     for (bi, b) in m.funcs[luav as usize].blocks.iter().enumerate() {
         let ra = b.insts.iter().find_map(|i| match i {
@@ -128,8 +112,7 @@ fn entry_capture(insp: &mut svm_interp::Inspector, luav: u32) -> (i64, u64, u64)
     r
 }
 
-/// One captured Lua callee frame, snapshotted at *its own* first dispatch (so `ci->savedpc` points at
-/// this callee's code start, not a caller's advanced resume pc).
+/// One callee's occupancy of the shared frame node, snapshotted at its own first dispatch.
 struct Callee {
     ci: u64,
     func: u64,
@@ -143,34 +126,31 @@ struct Callee {
 }
 
 #[test]
-fn nested_two_frame_call_stack() {
+fn sequential_distinct_callees_share_one_callinfo() {
     let m = lua_module();
-    let luav = luav_execute(&m);
+    let luav = byname(&m, "luaV_execute").expect("luaV_execute");
     let precall = byname(&m, "luaD_precall").expect("precall");
     let poscall = byname(&m, "luaD_poscall").expect("poscall");
     let dispatch = dispatch_block(&m, luav);
     let (pblock, ra_val) = precall_site(&m, luav, precall);
-    println!(
-        "luav=f{luav} precall=f{precall} poscall=f{poscall} dispatch=b{dispatch} pblock=b{pblock}"
-    );
 
-    // ---- Pass 1: entry + outer frame + the ra of each of the three call sites (add, mul, print). ----
+    // ---- Pass 1: entry state + the ra of each call site (add, mul, print). ----
     let inst = svm_run::instantiate(m.clone()).expect("inst");
     let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    let (sp, l, outer_ci) = entry_capture(&mut insp, luav);
+    let (sp, l, main_ci) = entry_capture(&mut insp, luav);
     let w = insp.read_window(0, CAP).expect("w");
     let stack_lo = rd_u64(&w, l + L_STACK);
     let stack_hi = rd_u64(&w, l + L_STACK_LAST);
     let stack_len = (stack_hi - stack_lo) as usize;
-    let outer_func = rd_u64(&w, outer_ci + CI_FUNC);
-    let outer_cl = rd_u64(&w, outer_func);
-    let outer_proto = rd_u64(&w, outer_cl + LCLOSURE_P);
-    let outer_code = rd_u64(&w, outer_proto + PROTO_CODE);
-    let outer_sizecode = rd_i32(&w, outer_proto + PROTO_SIZECODE) as usize;
-    let outer_pp = rd_u64(&w, outer_proto + PROTO_P);
-    let outer_sizep = rd_i32(&w, outer_proto + PROTO_SIZEP) as usize;
-    let outer_k = rd_u64(&w, outer_proto + PROTO_K);
-    let outer_sizek = rd_i32(&w, outer_proto + PROTO_SIZEK) as usize;
+    let main_func = rd_u64(&w, main_ci + CI_FUNC);
+    let main_cl = rd_u64(&w, main_func);
+    let main_proto = rd_u64(&w, main_cl + LCLOSURE_P);
+    let main_code = rd_u64(&w, main_proto + PROTO_CODE);
+    let main_sizecode = rd_i32(&w, main_proto + PROTO_SIZECODE) as usize;
+    let main_pp = rd_u64(&w, main_proto + PROTO_P);
+    let main_sizep = rd_i32(&w, main_proto + PROTO_SIZEP) as usize;
+    let main_k = rd_u64(&w, main_proto + PROTO_K);
+    let main_sizek = rd_i32(&w, main_proto + PROTO_SIZEK) as usize;
 
     let pbp = IrPc {
         module: 0,
@@ -192,15 +172,12 @@ fn nested_two_frame_call_stack() {
             o => panic!("expected precall break: {o:?}"),
         }
     }
-    // Call order: main→outer (first precall), outer→inner (second), print (third).
-    let (ra_outer, ra_inner, ra_print) = (ras[0], ras[1], ras[2]);
-    println!("ra_outer={ra_outer:#x} ra_inner={ra_inner:#x} ra_print={ra_print:#x}");
-    assert_ne!(
-        ra_outer, ra_inner,
-        "distinct call sites must have distinct ra"
-    );
+    // Sequential call order: add, mul, print.
+    let (ra_add, ra_mul, ra_print) = (ras[0], ras[1], ras[2]);
+    println!("ra_add={ra_add:#x} ra_mul={ra_mul:#x} ra_print={ra_print:#x}");
+    assert_ne!(ra_add, ra_mul, "distinct call sites have distinct ra");
 
-    // ---- Pass 2: capture each callee frame at its OWN first dispatch (distinct non-outer protos). ----
+    // ---- Pass 2: capture each callee's occupancy of the frame node at its own dispatch. ----
     let callees = {
         let inst2 = svm_run::instantiate(m.clone()).expect("inst2");
         let mut in2 = inst2.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
@@ -227,7 +204,7 @@ fn nested_two_frame_call_stack() {
                     let func = rd_u64(&wv, ci + CI_FUNC);
                     let cl = rd_u64(&wv, func);
                     let proto = rd_u64(&wv, cl + LCLOSURE_P);
-                    if proto != outer_proto && !seen.iter().any(|c| c.proto == proto) {
+                    if proto != main_proto && !seen.iter().any(|c| c.proto == proto) {
                         seen.push(Callee {
                             ci,
                             func,
@@ -244,59 +221,67 @@ fn nested_two_frame_call_stack() {
                 o => panic!("callee frames not reached: {o:?}"),
             }
         }
-        assert_eq!(seen.len(), 2, "must capture both callee frames");
+        assert_eq!(seen.len(), 2, "must capture both callee occupancies");
         seen
     };
-    // Route each callee frame to its call site by ci->func == that site's ra.
-    let find = |ra: u64| {
-        callees
-            .iter()
-            .find(|c| c.func == ra)
-            .expect("callee for ra")
-    };
-    let (outer, inner) = (find(ra_outer), find(ra_inner));
+    let find = |ra: u64| callees.iter().find(|c| c.func == ra).expect("callee");
+    let (add, mul) = (find(ra_add), find(ra_mul));
+    // The facet itself: one shared frame node, two occupancies.
+    assert_eq!(
+        add.ci, mul.ci,
+        "sequential callees reuse the SAME cached CallInfo (else this test isn't testing facet c)"
+    );
+    let cci = add.ci;
     println!(
-        "outer: ci={:#x} proto={:#x}   inner: ci={:#x} proto={:#x}",
-        outer.ci, outer.proto, inner.ci, inner.proto
+        "shared ci={cci:#x}   add: proto={:#x} code={:#x}   mul: proto={:#x} code={:#x}",
+        add.proto, add.code, mul.proto, mul.code
     );
-    assert_ne!(
-        outer.ci, inner.ci,
-        "the nested callees must have distinct live CallInfos"
+    // Discover the savedpc offset inside CallInfo: at a callee's first dispatch its savedpc is the
+    // callee's code start. Cross-check on both occupancies.
+    let savedpc_off = (0..CI_SIZE as u64)
+        .step_by(8)
+        .find(|&off| rd_u64(&add.w, cci + off) == add.code)
+        .expect("ci->savedpc");
+    assert_eq!(
+        rd_u64(&mul.w, cci + savedpc_off),
+        mul.code,
+        "savedpc offset consistent across occupancies"
     );
-    // The `previous` offset is structural (same for every CallInfo); the outer frame's `previous` is the
-    // main chunk's ci, so find the offset there, then it resolves inner->outer and outer->main alike.
     let ci_previous_off = (0..CI_SIZE as u64)
         .step_by(8)
-        .find(|&off| rd_u64(&outer.w, outer.ci + off) == outer_ci)
+        .find(|&off| rd_u64(&add.w, cci + off) == main_ci)
         .expect("ci->previous");
 
     let slice = |src: &[u8], a: u64, n: usize| src[a as usize..a as usize + n].to_vec();
+    // ONE overlay for the shared node (add's image). The fields that differ per callee — func and
+    // savedpc — are pinned per call site below; everything the fold reads besides those (previous,
+    // callstatus, trap) is identical across the two occupancies.
     let mut overlays = vec![
         (l, slice(&w, l, LUA_STATE_SIZE)),
         (stack_lo, slice(&w, stack_lo, stack_len)),
-        (outer_ci, slice(&w, outer_ci, CI_SIZE)),
-        (outer_code, slice(&w, outer_code, 4 * outer_sizecode)),
-        (outer_cl, slice(&w, outer_cl, 48)),
-        (outer_proto, slice(&w, outer_proto, 128)),
-        (outer_pp, slice(&w, outer_pp, 8 * outer_sizep)),
+        (main_ci, slice(&w, main_ci, CI_SIZE)),
+        (main_code, slice(&w, main_code, 4 * main_sizecode)),
+        (main_cl, slice(&w, main_cl, 48)),
+        (main_proto, slice(&w, main_proto, 128)),
+        (main_pp, slice(&w, main_pp, 8 * main_sizep)),
+        (cci, slice(&add.w, cci, CI_SIZE)),
     ];
-    // The proto constant pool (`proto->k`) is static program data: an arith-K opcode reads its constant
-    // operand + tag from here (see I71 / `lua_futamura_call_arith`); `outer`'s `inner(y) * 2` needs it.
-    if outer_sizek > 0 {
-        overlays.push((outer_k, slice(&w, outer_k, 16 * outer_sizek)));
+    if main_sizek > 0 {
+        overlays.push((main_k, slice(&w, main_k, 16 * main_sizek)));
     }
-    let mut rename_extra = vec![(stack_lo, stack_hi), (outer_ci, outer_ci + CI_SIZE as u64)];
-    for c in [outer, inner] {
-        // Each frame's overlays come from its own window `c.w` (correct `ci->savedpc` for this callee).
-        overlays.push((c.ci, slice(&c.w, c.ci, CI_SIZE)));
+    for c in [add, mul] {
         overlays.push((c.cl, slice(&c.w, c.cl, 48)));
         overlays.push((c.proto, slice(&c.w, c.proto, 128)));
         overlays.push((c.code, slice(&c.w, c.code, 4 * c.sizecode)));
-        if c.sizek > 0 && c.k != outer_k {
+        if c.sizek > 0 && c.k != main_k {
             overlays.push((c.k, slice(&c.w, c.k, 16 * c.sizek)));
         }
-        rename_extra.push((c.ci, c.ci + CI_SIZE as u64));
     }
+    let rename_extra = vec![
+        (stack_lo, stack_hi),
+        (main_ci, main_ci + CI_SIZE as u64),
+        (cci, cci + CI_SIZE as u64),
+    ];
 
     let read: Vec<u32> = [
         "luaH_get",
@@ -312,8 +297,6 @@ fn nested_two_frame_call_stack() {
         "luaF_newCclosure",
         "luaC_barrier_",
         "luaC_barrierback_",
-        // The allocation / GC / string-interning primitive family — opaque stateful machinery a dynamic
-        // result would otherwise drag the fold through (I71). Same class as the GC barriers above.
         "luaM_realloc_",
         "luaM_saferealloc_",
         "luaM_malloc_",
@@ -321,8 +304,6 @@ fn nested_two_frame_call_stack() {
         "luaS_resize",
         "luaS_newlstr",
         "luaC_fullgc",
-        // Upvalue machinery: `outer` captures `inner` as an upvalue, so `OP_CLOSURE` calls
-        // `luaF_findupval`, which walks/mutates the open-upvalue list and allocates — cut it opaque.
         "luaF_findupval",
         "luaF_closeupval",
         "luaF_close",
@@ -344,6 +325,17 @@ fn nested_two_frame_call_stack() {
     .filter_map(|n| byname(&m, n))
     .collect();
 
+    // Per-site pins carry each callee's occupancy of the shared node: the closure slot, plus the two
+    // ci fields that differ between the calls.
+    let site = |ra: u64, c: &Callee| LuaSite {
+        ra,
+        callee_ci: cci,
+        pins: vec![
+            (c.func, c.cl),
+            (cci + CI_FUNC, ra),
+            (cci + savedpc_off, c.code),
+        ],
+    };
     let cfg = SpecConfig {
         const_overlays: overlays,
         rename: Some((l, l + LUA_STATE_SIZE as u64)),
@@ -359,25 +351,15 @@ fn nested_two_frame_call_stack() {
             precall,
             ra_arg: 2,
             l_ci_addr: l + L_CI,
-            lua_sites: vec![
-                LuaSite {
-                    ra: ra_outer,
-                    callee_ci: outer.ci,
-                    pins: vec![(outer.func, outer.cl)],
-                },
-                LuaSite {
-                    ra: ra_inner,
-                    callee_ci: inner.ci,
-                    pins: vec![(inner.func, inner.cl)],
-                },
-            ],
+            lua_sites: vec![site(ra_add, add), site(ra_mul, mul)],
             c_sites: vec![ra_print],
             poscall: Some(PoscallModel {
                 poscall,
                 ci_previous_off,
                 ci_func_off: CI_FUNC,
-                tag_off: TAG_OFF,
-                selective: vec![(outer.ci, VNUMINT), (inner.ci, VNUMINT)],
+                tag_off: 8,
+                // One shared node, one selective entry — both returns are integers.
+                selective: vec![(cci, VNUMINT)],
             }),
         }),
         ..SpecConfig::default()
@@ -385,27 +367,24 @@ fn nested_two_frame_call_stack() {
     let args = [
         SpecArg::ConstI64(sp),
         SpecArg::ConstI64(l as i64),
-        SpecArg::ConstI64(outer_ci as i64),
+        SpecArg::ConstI64(main_ci as i64),
     ];
-    let mut residual = specialize_with_config(&m, luav, &args, &cfg)
-        .expect("project through the nested Lua calls");
-    let entry = (residual.funcs.len() - 1) as u32;
-    let f = &residual.funcs[entry as usize];
+    let mut r = specialize_with_config(&m, luav, &args, &cfg)
+        .expect("project through two sequential distinct callees sharing one CallInfo");
+    let entry = (r.funcs.len() - 1) as u32;
+    let f = &r.funcs[entry as usize];
     let brt = f
         .blocks
         .iter()
         .filter(|b| matches!(b.term, Terminator::BrTable { .. }))
         .count();
-    println!(
-        "PROJECTED multi-callee: {} blocks, br_table={brt}",
-        f.blocks.len()
-    );
-    assert_eq!(brt, 0, "the dispatch folded through both nested Lua calls");
+    println!("PROJECTED seq: {} blocks, br_table={brt}", f.blocks.len());
+    assert_eq!(brt, 0, "the dispatch folded through both sequential calls");
 
-    // ---- Embed + diff stdout ----
-    residual.imports = m.imports.clone();
-    residual.types = m.types.clone();
-    residual.funcs[luav as usize] = Func {
+    // ---- Embed + diff stdout. ----
+    r.imports = m.imports.clone();
+    r.types = m.types.clone();
+    r.funcs[luav as usize] = Func {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
         blocks: vec![Block {
@@ -417,18 +396,15 @@ fn nested_two_frame_call_stack() {
             term: Terminator::Return(vec![]),
         }],
     };
-    svm_verify::verify_module(&residual).expect("embedded residual verifies");
-    let baseline = svm_run::run_powerbox(&m, SCRIPT.as_bytes()).expect("baseline");
-    let embedded = svm_run::run_powerbox(&residual, SCRIPT.as_bytes()).expect("embedded");
+    svm_verify::verify_module(&r).expect("embedded residual verifies");
+    let base = svm_run::run_powerbox(&m, SCRIPT.as_bytes()).expect("baseline");
+    let emb = svm_run::run_powerbox(&r, SCRIPT.as_bytes()).expect("embedded");
     println!(
         "baseline={:?} embedded={:?}",
-        String::from_utf8_lossy(&baseline.stdout),
-        String::from_utf8_lossy(&embedded.stdout)
+        String::from_utf8_lossy(&base.stdout),
+        String::from_utf8_lossy(&emb.stdout)
     );
-    assert_eq!(baseline.stdout, b"22\n", "baseline prints 22");
-    assert_eq!(
-        embedded.stdout, baseline.stdout,
-        "residual byte-identical to interpreter"
-    );
-    println!("  ✓ nested Lua call stack (outer→inner) projected and correct (22)");
+    assert_eq!(base.stdout, b"25\n", "baseline prints 25");
+    assert_eq!(emb.stdout, base.stdout, "residual byte-identical");
+    println!("  ✓ sequential distinct callees through ONE shared CallInfo, execution-correct (25)");
 }

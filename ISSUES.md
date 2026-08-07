@@ -29,7 +29,7 @@ rerun-once policy applies — a fresh push re-triggers and clears it. No code fi
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 
-### I71 — peval precall/poscall projection: a Lua call whose **result feeds arithmetic in the caller** — **facet (a) FIXED 2026-08-06** (`lua_futamura_call_arith`); nested (b) / sequential-shared-`CallInfo` (c) still open (S3, feature gap in the Futamura call model) — recorded 2026-08-06 (follow-up to PR #637, slices 1–3)
+### I71 — peval precall/poscall call projection gaps — **ALL FACETS FIXED** (S3) — recorded 2026-08-06, closed 2026-08-07: **(a)** result-feeds-arithmetic (`lua_futamura_call_arith`), **(b)** nested 2-frame (`lua_futamura_call_nested` — root cause a `CallInfo` overlay collision, `CI_SIZE` 104 vs the real 64-byte stride, not an engine bug), **(c)** sequential distinct callees sharing one cached `CallInfo` (`lua_futamura_call_seq` — per-site `LuaSite::pins` on the shared node's `func`/`savedpc`); plus the call-bearing loop now **executes** (`lua_futamura_call_loop_exec`). All config/test — zero engine changes.
 
 PR #637 landed projecting *through* a Lua-to-Lua call (`SpecConfig::precall_model` + `PoscallModel`):
 slice 1 (call-in) and slice 2 (return) run end-to-end and diff stdout for `print(add(40,2))`, and
@@ -81,24 +81,48 @@ blocks, no deopt — a call result flowing into `OP_MULK`, the exact shape a rea
 (`x = add(x, k)`). Both ingredients are config the `SpecConfig` API already supports (no engine change):
 the `k`-pool overlay + the alloc/GC/string cut-set.
 
-**Facet (b) — nested 2-frame (`outer(y) = inner(y) * 2`), progressed 2026-08-06, still open**
-(`lua_futamura_call_nested`, `#[ignore]`d). With the `k` overlay + cut-set from (a) **plus** a new
-**upvalue-machinery cut** (`outer` captures `inner`, so `OP_CLOSURE` calls `luaF_findupval`, which
-walks/mutates the open-upvalue list — cut `luaF_findupval`/`luaF_closeupval`/`luaF_close`/
-`luaF_initupvals`), the fold now **descends the full 2-deep stack** (main → `outer` → `inner`, confirmed
-via `startfunc` re-entries) — the earlier attempt couldn't get past the closures. The remaining blocker
-is **engine-level, not config**: a *callee* frame's register base is dynamic in the fold. `inner`'s
-`x + 1` (`OP_ADDI`) falls to `OP_MMBINI` because the operand tag never folds, and `eval_load` shows *no
-constant-base access to either callee's register file*. The base is `ci->func + 1` where `ci` is the
-precall's constant result and `ci->func` seeds from the frame overlay — so it *should* reduce, but 2-deep
-it doesn't, and the fold walks off `inner`'s code into the metamethod/GC cold subtree (`Budget`). (This
-*is* the "dynamic base" shape — a red herring for facet (a), but real here, for a callee frame.) Next:
-instrument the callee `startfunc` base computation to see why `ci->func + 1` doesn't fold, or have the
-precall re-seed the callee's base SSA from the pinned `ci`.
+**Facet (b) — nested 2-frame (`outer(y) = inner(y) * 2`) — FIXED 2026-08-07**
+(`lua_futamura_call_nested`, un-`#[ignore]`d, embeds + stdout-diffs `22`). Three ingredients, all
+config, **no engine change** — and the earlier "engine-level, callee base is dynamic" reading was
+**wrong**:
 
-**Facet (c) — still open:** two **sequential** distinct callees reuse one cached `CallInfo` (`ci->next`),
-which a single const overlay can't represent — per-call-site pinned `ci` fields vs a fixed overlay.
-Repro/harness for (a) and (b) is committed; (c)'s is in the session scratchpad.
+1. Facet (a)'s per-frame `proto->k` overlays + alloc/GC/string cut-set.
+2. The **upvalue-machinery cut** (`luaF_findupval`/`luaF_closeupval`/`luaF_close`/`luaF_initupvals`)
+   — `outer` captures `inner`, so `OP_CLOSURE` walks/mutates the open-upvalue list.
+3. **The real root cause: a `CallInfo` overlay collision.** Adjacent ci nodes sit **64 bytes apart**,
+   but the tests sliced each ci overlay at `CI_SIZE = 104` — so `outer`'s ci overlay (captured at
+   outer's dispatch, *before* inner's ci exists) swallowed `inner`'s ci header with stale zeros.
+   `inner.ci->func`/`savedpc` seeded as `0x0` (caught via `eval_load` seed traces: `ILOAD
+   eff=inner.ci … seed cval=0x0`), inner's frame dispatched garbage, and the fold walked into the
+   metamethod/GC cold subtree (`Budget`) — masquerading as a dynamic-base engine bug. Fix:
+   `CI_SIZE = 64` (the allocation stride; every field the fold reads — func +0, previous +16,
+   savedpc, trap, callstatus +62 — lies below 64) + a non-overlap assert. Harmonized across all
+   call-model tests (`lua_futamura_call{,_arith,_loop,_nested,_reroot}`), all green.
+
+**Shift-the-root (2026-08-07, `lua_futamura_call_reroot`)** — the experiment that exposed the
+collision also validated the **per-function residual architecture**: the same nested program projects
+cleanly when *rooted at `outer`'s frame* (outer's ci as the const entry arg, state overlaid from
+outer's dispatch-moment window). 72 blocks, `br_table = 0`, no metamethod calls — and because Lua's
+inline `RETURN1` fast path folds as const stores, `(10+1)*2` reduces to a **literal `ConstI64(22)`**
+in the residual. So any frame of a call tree can be a projection root handling its own body + one
+call boundary; depth-N inlining is an optimization, not a prerequisite for end-to-end peval.
+
+**Facet (c) — FIXED 2026-08-07** (`lua_futamura_call_seq`, embeds + stdout-diffs `25`). Two
+sequential distinct callees (`add`, `mul`) reuse one cached `CallInfo` (`main_ci->next` — the test
+asserts the shared address). The fix needed **no engine change**: `LuaSite::pins` is already a
+generic `(address, value)` cell list and mem cells shadow the overlay seed, so each call site pins
+the shared node's per-callee fields itself — `ci->func` (that site's `ra`) and `ci->savedpc` (that
+callee's code start, offset discovered per occupancy) — while ONE overlay carries the fields common
+to both occupancies (previous, callstatus, trap). One shared `selective` entry covers both integer
+returns.
+
+**Call-bearing loop, executed (2026-08-07, `lua_futamura_call_loop_exec`)** — closes slice 3's
+"structural-only" caveat from the other side: an **entry-rooted** projection of
+`for i=1,5 do x=add(x,3) end print(x)` unrolls the constant trip count (five bodies through one
+shared `OP_CALL` site/frame node), embeds wholesale, and prints `15` byte-identically. Together with
+`lua_futamura_call_loop` (safepoint-rooted, rolls) the mechanism is shown to both roll *and* run;
+the remaining un-executed artifact is the rolled residual itself, which needs mid-loop entry
+stitching (same follow-up as the reroot residual).
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
