@@ -239,6 +239,25 @@ retirement is asset-safe — `asset_op_scan` now reports every cap iface per ass
   fast-path-sequential vs fiber-overlapped workloads. Deletion only on measured redundancy —
   invariant 1 cuts against deleting on aesthetics too.
 
+  **§5b status (2026-08-07): MEASURED — the ring STAYS.** Probe: `io_ring_bench`
+  (`cargo test -p svm --release --test io_ring_bench -- --ignored --nocapture`), three lanes
+  over the same `Blocking` checksum. The deletion premise fails on its *other* leg:
+  - *Batching (job 1) is measurably negative* — Clock SQEs with the pool out of the picture
+    price the SQE/CQE ABI alone at ~10.0 µs/op vs ~0.75 µs/op direct (13×): the guest-side
+    SQE build + host-side parse + CQE writes swamp the one saved crossing. If batching were
+    the ring's only job, it would leave today.
+  - *Overlap (job 2) is NOT subsumed* — the premise "a blocking host op can simply park the
+    fiber" was never built. At block=2 ms, n=8: ring ~5.4 ms/batch (`max_active` = K=4),
+    sequential ~17.1 ms (`max_active` 1), and the **threaded parallel tier also ~18.4 ms
+    (`max_active` 1)** — a cross-thread `cap.call` holds the one `Mutex<Host>` for the whole
+    dispatch, so blocking ops serialize even across vCPU threads. The ring is today the
+    *only* mechanism that overlaps blocking host ops, so it keeps its keep.
+
+  Consequence recorded for the door §5b holds open: if parking-on-blocking ever lands (a
+  blocking dispatch releasing its vCPU/host lock and completing via the pool behind an
+  ordinary `cap.call`), re-run the probe — batching alone will not save the ring, and the
+  SQE format, `RingState`, and the async completion path leave then.
+
 ## 6. One inert code-handle kind (`Module` + `JitCode`) — deferred, door held open
 
 Both are "code as a capability with no callable ops, named by another capability's verbs."
