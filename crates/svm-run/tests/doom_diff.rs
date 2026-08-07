@@ -96,7 +96,7 @@ fn doom_frame_hashes_match_native() {
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.
     let mut cursors: Vec<u64> = Vec::new();
-    let h = host.grant_host_proc(Box::new(move |op, a, mem| match op {
+    let h = host.grant_host_proc(Box::new(move |op, a, mem, _| match op {
         0 => {
             let name = mem
                 .and_then(|m| m.read_bytes(a[0] as u64, a[1] as u64))

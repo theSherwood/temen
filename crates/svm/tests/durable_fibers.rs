@@ -65,7 +65,7 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
     let sink = Arc::clone(&probes);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, args, _mem| {
+    let hf = host.grant_host_proc(Box::new(move |_op, args, _mem, _| {
         sink.lock().unwrap().push(args[0] as u64);
         Ok(vec![0])
     }));

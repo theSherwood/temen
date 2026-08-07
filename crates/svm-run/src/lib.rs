@@ -4354,7 +4354,7 @@ impl HostCap {
     /// like a plain `host_proc`.
     pub fn host_proc_region(
         op: u32,
-        make: impl Fn() -> svm_interp::HostProcRegion + Send + Sync + 'static,
+        make: impl Fn() -> svm_interp::HostProc + Send + Sync + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
@@ -4889,7 +4889,7 @@ impl Instance {
         // the value the instrumented code must bake in as its `cap.call` handle constant.
         let handle = {
             let mut scratch = Host::new();
-            scratch.grant_host_proc(Box::new(|_, _, _| Ok(vec![])))
+            scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
         };
         let spec = svm_opt::instrument::MemHookSpec {
             type_id: cap_id::HOST_PROC,
@@ -4922,11 +4922,13 @@ impl Instance {
     fn grant_mem_hooks(&self, h: &mut Host) {
         let Some(hooks) = &self.hooks else { return };
         let mut hook = (hooks.make)();
-        let handle = h.grant_host_proc(Box::new(move |op, args, _mem| {
-            let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
-            hook(ev)?;
-            Ok(vec![])
-        }));
+        let handle = h.grant_host_proc(Box::new(
+            move |op, args, _mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+                let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
+                hook(ev)?;
+                Ok(vec![])
+            },
+        ));
         assert_eq!(
             handle, hooks.handle,
             "mem-hook grant must be the first grant on a fresh Host (deterministic handles)"

@@ -1192,8 +1192,11 @@ fn cc1_imports(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> svm_run::Imp
     let fs = HostCap::host_proc(0, move || {
         let (mut inner, _handle) = svm_run::fs::mem_fs_seeded_shared(files.clone(), dirs.clone());
         Box::new(
-            move |_slot_op: u32, args: &[i64], mem: Option<&mut dyn svm_interp::GuestMem>| {
-                inner(args[0] as u32, &args[1..], mem)
+            move |_slot_op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn svm_interp::GuestMem>,
+                  minter: Option<&mut dyn svm_interp::RegionMinter>| {
+                inner(args[0] as u32, &args[1..], mem, minter)
             },
         )
     });

@@ -1775,6 +1775,11 @@ pub enum Inst {
     /// dispatch; a manifest slot could never carry them). A `CallSym` that survives to
     /// verification is an unresolved symbol and is rejected unconditionally — resolve is
     /// source-to-source *before* `verify_module`, so a mis-link fails closed.
+    ///
+    /// CONSOLIDATION §7: the always-present `handle` operand (meaningful only for the
+    /// `Resolved::Cap` outcome; dead weight for `Func`/`Slot`) is the last special case in the
+    /// call encodings — the v7 `ns` field's sibling. It leaves the instruction and the wire at
+    /// the **next wire rev** (whenever one happens for its own reasons); no rev is spent on it.
     CallSym {
         import: u32,
         sig: FuncType,

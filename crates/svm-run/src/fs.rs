@@ -74,7 +74,7 @@
 use crate::HostCap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use svm_interp::{GuestMem, HostProc, HostProcRegion, RegionMinter};
+use svm_interp::{GuestMem, HostProc, RegionMinter};
 
 // The shared fs-cap wire protocol, the in-memory backend, and the shippable data-image format live in
 // the wasm-safe `svm-fs` crate — so the browser cdylib can mount a `mem_fs` without the unix-only JIT
@@ -642,10 +642,10 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
-                  minter: &mut dyn RegionMinter| {
-                Ok(vec![st.handle(op, args, mem, Some(minter))])
+                  minter: Option<&mut dyn RegionMinter>| {
+                Ok(vec![st.handle(op, args, mem, minter)])
             },
-        ) as HostProcRegion
+        ) as HostProc
     })
 }
 
@@ -659,7 +659,10 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
             crash: crashy.then(CrashCtl::default),
         };
         Box::new(
-            move |op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>| {
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem, None)])
             },
         ) as HostProc

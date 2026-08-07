@@ -365,38 +365,40 @@ pub unsafe extern "C" fn svm_imports_provide_host_proc(
     // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
     let cap = HostCap::host_proc(op, move || -> HostProc {
         let ctx = ctx;
-        Box::new(move |op, args, mem| {
-            // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
-            // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
-            let ctx = ctx;
-            let mut buf = [0i64; SVM_MAX_RESULTS];
-            // Wrap the guest window (if any) so the C callback can read/write it bounds-checked, via
-            // `svm_guest_read`/`svm_guest_write`. The shim lives on this stack frame for the call only;
-            // the pointer it hands C is dangling the instant `f` returns (documented contract).
-            let mut shim = mem.map(|m| SvmGuestMem {
-                // SAFETY: erase the borrow's lifetime to carry it through the opaque C handle. The
-                // pointer is dereferenced (by `svm_guest_read`/`write`) only during this in-flight
-                // callback, while `m`'s borrow is live and otherwise untouched — no aliasing.
-                mem: unsafe { std::mem::transmute::<&mut dyn GuestMem, *mut dyn GuestMem>(m) },
-            });
-            let mem_ptr = shim
-                .as_mut()
-                .map_or(ptr::null_mut(), |s| s as *mut SvmGuestMem);
-            let n = f(
-                ctx.0,
-                op,
-                args.as_ptr(),
-                args.len(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                mem_ptr,
-            );
-            if n < 0 {
-                return Err(Trap::CapFault);
-            }
-            let n = (n as usize).min(buf.len());
-            Ok(buf[..n].to_vec())
-        })
+        Box::new(
+            move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+                // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
+                // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
+                let ctx = ctx;
+                let mut buf = [0i64; SVM_MAX_RESULTS];
+                // Wrap the guest window (if any) so the C callback can read/write it bounds-checked, via
+                // `svm_guest_read`/`svm_guest_write`. The shim lives on this stack frame for the call only;
+                // the pointer it hands C is dangling the instant `f` returns (documented contract).
+                let mut shim = mem.map(|m| SvmGuestMem {
+                    // SAFETY: erase the borrow's lifetime to carry it through the opaque C handle. The
+                    // pointer is dereferenced (by `svm_guest_read`/`write`) only during this in-flight
+                    // callback, while `m`'s borrow is live and otherwise untouched — no aliasing.
+                    mem: unsafe { std::mem::transmute::<&mut dyn GuestMem, *mut dyn GuestMem>(m) },
+                });
+                let mem_ptr = shim
+                    .as_mut()
+                    .map_or(ptr::null_mut(), |s| s as *mut SvmGuestMem);
+                let n = f(
+                    ctx.0,
+                    op,
+                    args.as_ptr(),
+                    args.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    mem_ptr,
+                );
+                if n < 0 {
+                    return Err(Trap::CapFault);
+                }
+                let n = (n as usize).min(buf.len());
+                Ok(buf[..n].to_vec())
+            },
+        )
     });
     provide(i, name, cap)
 }

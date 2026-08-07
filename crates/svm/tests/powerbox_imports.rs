@@ -52,11 +52,11 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     let imports = Imports::new()
         .provide(
             "add_seven",
-            HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] + 7]))),
+            HostCap::host_proc(0, || Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 7]))),
         )
         .provide(
             "triple",
-            HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0] * 3]))),
+            HostCap::host_proc(0, || Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 3]))),
         );
 
     // Bound by name; runs interp + JIT under identical capabilities (interp == jit asserted inside).
@@ -103,7 +103,7 @@ fn module_bindings_share_one_instance() {
             "kv",
             HostCap::host_proc(0, || {
                 let mut cell = 0i64;
-                Box::new(move |op, args, _mem| {
+                Box::new(move |op, args, _mem, _| {
                     Ok(vec![match op {
                         0 => {
                             cell = args[0];
@@ -135,7 +135,7 @@ fn unbound_name_fails_closed() {
     // Provide only one of the two imports.
     let imports = Imports::new().provide(
         "add_seven",
-        HostCap::host_proc(0, || Box::new(|_op, args, _mem| Ok(vec![args[0]]))),
+        HostCap::host_proc(0, || Box::new(|_op, args, _mem, _| Ok(vec![args[0]]))),
     );
     let err = match instantiate_with_imports(module, imports) {
         Ok(_) => panic!("instantiation must fail closed when `triple` is unbound"),

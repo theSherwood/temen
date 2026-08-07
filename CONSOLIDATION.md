@@ -267,6 +267,25 @@ door open, nothing more.
   change. Documentation now; any op-space split waits for a wire rev that is happening
   anyway.
 
+  **§7 status (2026-08-06): DONE** (all four, one batch).
+  - *HostProc fold:* one `HostProcEntry { handler, fork, mints }` vec replaced the three
+    parallel tables; `Binding::HostProcRegion` and the `HostProcRegion` closure type are
+    gone (one kind, per-entry powers). The unified `HostProc` signature ends in
+    `Option<&mut dyn RegionMinter>` — `Some` only for an mmap-capable registration, so a
+    plain handler is never silently handed minting authority. `fork_powerbox`'s
+    parallel-table sanity check dissolved (a struct can't desync), and the three public
+    `grant_host_proc*` faces share one registration path.
+  - *`call.sym` handle operand:* recorded on `Inst::CallSym` as leaving at the next wire
+    rev (v10 today; no rev spent on it) — the v7 `ns` policy, verbatim.
+  - *Sink side-channel:* `Binding::Stream` now carries `sink: Option<u32>` into a per-host
+    sink table; `regrant_into_child` grants an entry that *carries* the parent's shared
+    sink instead of mutating `child.out_sink`/`err_sink` — inherited-stdio authority is the
+    table entry ("authority = table entry" restored). The parent-side promotion fields
+    (`shared_stdout`, `stdout_bytes`) are unchanged: they are the *parent's own* read-back
+    state, not a grant.
+  - *`cap.self` families:* named in DESIGN.md's reflection section (reflection vs
+    domain-runtime verbs; op-space split deferred to the anyway-wire-rev).
+
 ## 8. Free downstream payoffs (no work — consequences to notice)
 
 - The `NonDurableKind` refusal list shrinks as bindings merge (§2, §4, §5a, CALLS §7).

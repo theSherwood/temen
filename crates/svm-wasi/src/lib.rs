@@ -83,11 +83,13 @@ pub fn bind(m: &svm_ir::Module, host: &mut Host) -> Option<WasiOut> {
 /// Build the WASI [`HostProc`] handler over `out`. `fd_write` captures into `out`; `proc_exit`
 /// terminates the domain with the given code (a non-error [`Trap::Exit`]).
 pub fn handler(out: WasiOut) -> HostProc {
-    Box::new(move |op, args, mem| match op {
-        OP_FD_WRITE => fd_write(&out, args, mem),
-        OP_PROC_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
-        _ => Err(Trap::CapFault), // unknown WASI op on this handle
-    })
+    Box::new(
+        move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| match op {
+            OP_FD_WRITE => fd_write(&out, args, mem),
+            OP_PROC_EXIT => Err(Trap::Exit(args.first().copied().unwrap_or(0) as i32)),
+            _ => Err(Trap::CapFault), // unknown WASI op on this handle
+        },
+    )
 }
 
 /// `fd_write(fd, iovs, iovs_len, nwritten) -> errno`: walk the iovec array in the guest window,
