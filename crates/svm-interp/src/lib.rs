@@ -4771,7 +4771,13 @@ impl Scheduler {
     ///
     /// `Replied` means the caller's reply is handled here (the dispatch marks the ticket replied);
     /// the other two leave the caller in place for the handler's own errno reply. Real scheduler only.
-    fn reap_parked_caller(&self, callee_id: usize, ticket: u64, pid: TaskId) -> ReapOutcome {
+    fn reap_parked_caller(
+        &self,
+        callee_id: usize,
+        ticket: u64,
+        pid: TaskId,
+        nohang: bool,
+    ) -> ReapOutcome {
         let mut s = self.lock();
         if !s.forked_twins.contains(&pid) {
             return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
@@ -4795,8 +4801,16 @@ impl Scheduler {
             s.runnable.push_back(v);
             self.work.notify_one();
             ReapOutcome::Replied(status)
+        } else if nohang {
+            // `WNOHANG`: the twin has not exited, so `waitpid` returns **0 immediately** (POSIX: no
+            // child changed state) — re-admit the caller now, without parking, leaving the twin
+            // reapable (`forked_twins` untouched) for a later `wait`.
+            v.pending = Some(Pending::CapResult(0));
+            s.runnable.push_back(v);
+            self.work.notify_one();
+            ReapOutcome::Replied(0)
         } else {
-            // Twin still running: park the caller on it; the generic join-wake (a twin finishing)
+            // Blocking `wait`: park the caller on the twin; the generic join-wake (a twin finishing)
             // re-admits it, and `Pending::ReapPid` takes the status on resume.
             v.pending = Some(Pending::ReapPid { pid });
             s.join_waiters.insert(pid, v);
@@ -4833,6 +4847,10 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
 
 /// FORK.md §8.6 — the crash status a trapped twin reaps as (see [`reap_status`]).
 const REAP_CRASH_STATUS: i64 = 128;
+
+/// FORK.md §8.6 — POSIX `WNOHANG`: the `waitpid`/`reap` flag (bit 0) that makes the wait
+/// **non-blocking** — a still-running twin returns `0` at once instead of parking the caller.
+const WNOHANG: i64 = 1;
 
 /// Move any expired `wait` timers' vCPUs back to the run-queue with a timed-out status. (A waiter
 /// already woken by `notify` is simply absent — its stale timer is skipped.)
@@ -10594,11 +10612,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
                 // FORK.md §8.6 — `reap` (self-namespace op 12): serviced here (needs the eval-loop
-                // -local `serve_run`). From within a handler, reap the twin named by the single
-                // `pid` arg on behalf of the parked caller — the servicer side of `wait(pid)`. The
+                // -local `serve_run`). From within a handler, reap the twin named by the `pid` arg on
+                // behalf of the parked caller — the servicer side of `waitpid(pid, flags)`. The
                 // scheduler delivers the twin's exit status as the caller's reply (now, or on
-                // twin-exit); a `pid` that is not a live twin this servicer minted is `-ECHILD`.
-                // `-EINVAL` outside a handler / on a non-`Real` tier (like `clone_caller`).
+                // twin-exit); a `pid` that is not a live twin this servicer minted is `-ECHILD`. The
+                // optional second arg is `flags`: `WNOHANG` (bit 0) makes it **non-blocking** — a
+                // still-running twin replies `0` at once instead of parking. `-EINVAL` outside a
+                // handler / on a non-`Real` tier (like `clone_caller`).
                 Inst::CapCall {
                     type_id: svm_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_REAP,
@@ -10610,6 +10630,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(a) => get(&frames[top].vals, *a)?.i64(),
                         None => -1,
                     };
+                    let nohang = match args.get(1) {
+                        Some(a) => get(&frames[top].vals, *a)?.i64() & WNOHANG != 0,
+                        None => false,
+                    };
                     let r = match serve_run.as_mut() {
                         Some(sr) if *cur != sr.serve_cur => {
                             if let SchedRef::Real(sr_sched) = sched {
@@ -10617,8 +10641,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let callee_id =
                                     host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
                                         as usize;
-                                match sr_sched.reap_parked_caller(callee_id, ticket, pid as TaskId)
-                                {
+                                match sr_sched.reap_parked_caller(
+                                    callee_id,
+                                    ticket,
+                                    pid as TaskId,
+                                    nohang,
+                                ) {
                                     // The scheduler owns the caller's reply now — withhold the
                                     // handler's own, exactly as `clone_caller` does.
                                     ReapOutcome::Replied(status) => {
