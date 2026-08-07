@@ -171,6 +171,48 @@ pub unsafe extern "C" fn cap_thunk(
     n_results: u64,
     trap_out: *mut i64,
 ) {
+    // Sync face (`pending = None`): a single-threaded guest's punts run inline — semantically
+    // identical and cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12).
+    cap_thunk_impl(
+        ctx,
+        mem_base,
+        mem_size,
+        mem_reserved,
+        type_id,
+        op,
+        handle,
+        args,
+        n_args,
+        results,
+        n_results,
+        trap_out,
+        None,
+    );
+}
+
+/// The shared [`cap_thunk`] body. `pending` is the §12 parking out-param: `Some` only from
+/// [`cap_thunk_locked`]'s generic tail, where a punted offloadable dispatch must not run (or
+/// wait) under the domain lock — the caller takes the completion id, releases the lock, and
+/// waits on [`Host::completions`].
+///
+/// # Safety
+/// Same contract as [`cap_thunk`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn cap_thunk_impl(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    mem_reserved: u64,
+    type_id: u32,
+    op: u32,
+    handle: i32,
+    args: *const i64,
+    n_args: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+    pending: Option<&mut Option<u64>>,
+) {
     let host = &mut *(ctx as *mut Host);
     // PROCESS.md S1b/S1c — the **canonical-key futex** region recorder. The JIT futex thunk has no
     // region map, so a §13 `map` must record which absolute pages alias which region bytes into the JIT
@@ -288,7 +330,11 @@ pub unsafe extern "C" fn cap_thunk(
         }
         return;
     }
-    match host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm) {
+    let r = match pending {
+        Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, gm, slot),
+        None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm),
+    };
+    match r {
         Ok(res) => {
             if n_results != 0 {
                 let out = std::slice::from_raw_parts_mut(results, n_results as usize);
@@ -397,7 +443,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         return;
     }
     let host_ptr = &mut *guard as *mut Host as *mut c_void;
-    cap_thunk(
+    let mut pending_id = None;
+    cap_thunk_impl(
         host_ptr,
         mem_base,
         mem_size,
@@ -410,7 +457,26 @@ pub unsafe extern "C" fn cap_thunk_locked(
         results,
         n_results,
         trap_out,
+        Some(&mut pending_id),
     );
+    // §12 parking-on-blocking: a punted offloadable dispatch — release the domain lock **before**
+    // waiting, so sibling vCPU threads' cap.calls proceed while the offload pool does the work
+    // (the §5b serialization fix on the JIT threaded tier). The impl wrote no results on the punt;
+    // the completion's scalar is the call's single result slot (invariant 8 — a wider declared
+    // signature fails closed).
+    if let Some(id) = pending_id {
+        let comps = guard.completions();
+        drop(guard);
+        let r = comps.wait(id);
+        if n_results > 1 {
+            *trap_out = TrapKind::CapFault as i64;
+            return;
+        }
+        if n_results == 1 {
+            *results = r;
+        }
+        *trap_out = 0;
+    }
 }
 
 /// `Jit.invoke` for the [`cap_thunk_locked`] path: resolve the unit **under the lock**, then

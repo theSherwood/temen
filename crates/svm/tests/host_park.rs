@@ -221,23 +221,24 @@ fn sync_ops_never_touch_parking_machinery() {
 
 // ----- shared-host parallel tier: punted blocking ops genuinely overlap -----------------------
 
-/// Main `(i32 blocking) -> (i64)`: spawn 2 workers, join, return the shared accumulator at window
-/// offset 8. Worker: ONE `cap.call 10 0` through the shared `Mutex<Host>`, `atomic.rmw.add` the
-/// result into the cell (the `io_ring_bench` threaded lane, n = 2).
-fn threaded_src() -> String {
-    "memory 16
-func (i32) -> (i64) {
-block 0 (v0: i32) {
+/// Main `(i32 blocking) -> (i64)`: spawn `n` workers, join, return the shared accumulator at
+/// window offset 8. Worker: ONE `cap.call 10 0`, `atomic.rmw.add` the result into the cell (the
+/// `io_ring_bench` threaded lane shape).
+fn threaded_src(n: u64) -> String {
+    format!(
+        "memory 16
+func (i32) -> (i64) {{
+block 0 (v0: i32) {{
   vh = i64.extend_i32_u v0
   vi0 = i64.const 0
   br 1(vi0, vh)
-}
-block 1 (vi: i64, vh1: i64) {
-  vn = i64.const 2
+}}
+block 1 (vi: i64, vh1: i64) {{
+  vn = i64.const {n}
   vlt = i64.lt_u vi vn
   br_if vlt 2(vi, vh1) 3()
-}
-block 2 (vi2: i64, vh2: i64) {
+}}
+block 2 (vi2: i64, vh2: i64) {{
   vt = thread.spawn 1 vi2 vh2
   vm = i64.const 4
   voff = i64.mul vi2 vm
@@ -247,17 +248,17 @@ block 2 (vi2: i64, vh2: i64) {
   vone = i64.const 1
   vnext = i64.add vi2 vone
   br 1(vnext, vh2)
-}
-block 3 () {
+}}
+block 3 () {{
   vj0 = i64.const 0
   br 4(vj0)
-}
-block 4 (vj: i64) {
-  vn2 = i64.const 2
+}}
+block 4 (vj: i64) {{
+  vn2 = i64.const {n}
   vlt2 = i64.lt_u vj vn2
   br_if vlt2 5(vj) 6()
-}
-block 5 (vj2: i64) {
+}}
+block 5 (vj2: i64) {{
   vm2 = i64.const 4
   voff2 = i64.mul vj2 vm2
   vb2 = i64.const 16
@@ -267,25 +268,25 @@ block 5 (vj2: i64) {
   vone2 = i64.const 1
   vnj = i64.add vj2 vone2
   br 4(vnj)
-}
-block 6 () {
+}}
+block 6 () {{
   vz = i64.const 8
   vsum = i64.atomic.load vz
   return vsum
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, vharg: i64) {
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, vharg: i64) {{
   vhandle = i32.wrap_i64 vharg
   vr = cap.call 10 0 (i64) -> (i64) vhandle(vsp)
   vaddr = i64.const 8
   vold = i64.atomic.rmw.add vaddr vr
   vz = i64.const 0
   return vz
-  }
-}
+  }}
+}}
 "
-    .to_string()
+    )
 }
 
 /// The `vcpu_shared_host_miri.rs` driver, duplicated verbatim (test targets cannot share code
@@ -379,7 +380,7 @@ fn drive<'s, 'e>(
 /// plus `max_active == 2` — proves the overlap.
 #[test]
 fn parallel_punted_blocking_ops_overlap_on_the_pool() {
-    let m = parse_module(&threaded_src()).expect("parse threaded");
+    let m = parse_module(&threaded_src(2)).expect("parse threaded");
     let prog = bytecode::VcpuProgram::compile(&m).expect("compile threaded");
 
     let mut host = Host::new();
@@ -417,5 +418,98 @@ fn parallel_punted_blocking_ops_overlap_on_the_pool() {
         "both punted ops co-resided on the pool"
     );
     assert_eq!(comps.minted(), 2, "one completion per punted call");
+    assert_eq!(comps.outstanding(), 0, "all completions delivered");
+}
+
+/// **The JIT threaded tier's version of the same pin**: two OS threads call `cap_thunk_locked`
+/// (the serialized per-domain `Mutex<Host>` thunk) concurrently against a rendezvous-2 `Blocking`
+/// handle. Each dispatch punts, and the thunk releases the domain lock before waiting on the
+/// completion — so both jobs co-reside on the offload pool and meet the barrier. Under the old
+/// delegate-under-guard regime this deadlocks (the first caller sleeps on the barrier holding the
+/// lock), so completion at all — plus `max_active == 2` — proves the release-before-wait.
+#[test]
+fn jit_locked_thunk_releases_lock_before_completion_wait() {
+    let mut host = Host::new();
+    let h = host.grant_blocking(Duration::ZERO, Some(2));
+    let state = host.blocking_state(h).expect("blocking state");
+    let comps = host.completions();
+    let m = Mutex::new(host);
+    let ctx = &m as *const Mutex<Host> as *mut core::ffi::c_void;
+    // SAFETY: `ctx` is a live `*const Mutex<Host>` for the scope; args/results/trap_out are valid
+    // per-thread locals; no window (`mem_base` null) — the `CapThunk` contract.
+    let addr = ctx as usize;
+    let results: Vec<i64> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2i64)
+            .map(|i| {
+                s.spawn(move || {
+                    let arg = [i];
+                    let mut result = 0i64;
+                    let mut trap = 0i64;
+                    unsafe {
+                        svm_run::cap_thunk_locked(
+                            addr as *mut core::ffi::c_void,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            10, // cap_id::BLOCKING
+                            0,
+                            h,
+                            arg.as_ptr(),
+                            1,
+                            &mut result,
+                            1,
+                            &mut trap,
+                        );
+                    }
+                    assert_eq!(trap, 0, "worker {i}: clean dispatch");
+                    result
+                })
+            })
+            .collect();
+        handles.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let sum = results.iter().fold(0i64, |a, b| a.wrapping_add(*b));
+    assert_eq!(sum, mix(0).wrapping_add(mix(1)), "locked-thunk checksum");
+    assert_eq!(state.max_active(), 2, "both punts co-resided on the pool");
+    assert_eq!(comps.minted(), 2, "one completion per punted call");
+    assert_eq!(comps.outstanding(), 0, "all completions delivered");
+}
+
+/// **Slice 2 — parked vCPUs free their workers (the M:N win).** Four tree-walk vCPUs each punt
+/// one call on a rendezvous-4 `Blocking` handle. A punting vCPU dispatches its pool job *before*
+/// parking (`Blocked::CapPending`), so all four jobs reach the pool and meet the width-4 barrier
+/// even when the scheduler has fewer worker threads than vCPUs — under a block-the-worker regime
+/// this hangs whenever workers < 4. Completions re-queue the parked vCPUs in submission order
+/// (`Pending::CapResult`).
+#[test]
+fn oracle_parked_vcpus_free_their_workers() {
+    let m = parse(&threaded_src(4));
+    let mut host = Host::new();
+    let h = host.grant_blocking(Duration::ZERO, Some(4));
+    let state = host.blocking_state(h).expect("blocking state");
+    let comps = host.completions();
+    let mut fuel = 50_000_000u64;
+    let init = vec![0u8; 1 << 16];
+    let (r, _mem) = svm_interp::run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(h)],
+        &mut fuel,
+        &init,
+        0,
+        &mut host,
+    );
+    let got = match r.expect("oracle run ok").pop().expect("one result") {
+        Value::I64(x) => x,
+        o => panic!("unexpected result {o:?}"),
+    };
+    let want = (0..4).fold(0i64, |a, b| a.wrapping_add(mix(b)));
+    assert_eq!(got, want, "oracle parked checksum");
+    assert_eq!(
+        state.max_active(),
+        4,
+        "all four punts co-resided on the pool"
+    );
+    assert_eq!(comps.minted(), 4, "one completion per punted call");
     assert_eq!(comps.outstanding(), 0, "all completions delivered");
 }

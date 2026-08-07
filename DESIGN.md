@@ -1827,14 +1827,19 @@ register-ABI fast path keeps its exact contract), and **sync ops never pay for p
 existence** — no completion id, no table touch unless a handler already returned `Pending`; pin
 the hostcall fast-path number in the bench regression check before the first slice. Determinism:
 cooperative-tier completions deliver at safepoints in submission order (the §18 oracle survives).
-*Slice-1 status (2026-08-07):* **landed** — `Host::grant_host_proc_offloadable` (the registration
-declares blockingness; handler returns `Done` inline or punts an `OffloadWork` job),
+*Status (2026-08-07):* slices 1–3 **landed**. Slice 1 — `Host::grant_host_proc_offloadable` (the
+registration declares blockingness; handler returns `Done` inline or punts an `OffloadWork` job),
 `cap_dispatch_slots_pending` (the parking-aware face; every other call site keeps the sync face and
-runs punts inline — decline-never-diverge), and the single-fiber wait on both interp tiers (the
-eval loop drops the host lock, then `Completions::wait`). The shared-host parallel tier already
-stops serializing (`host_park.rs` pins it by rendezvous, not timing); `fast_cap_resolver` is pinned
-never to claim a parkable iface. Remaining: cooperative-tier fiber park/wake with ordered delivery,
-the JIT locked-thunk wait, then the re-measure.
+runs punts inline — decline-never-diverge), the single-fiber wait on both interp tiers (drop the
+host lock, then `Completions::wait`), and the shared-host parallel tier stops serializing
+(`host_park.rs` pins it by rendezvous, not timing; `fast_cap_resolver` pinned never to claim a
+parkable iface). Slice 2 — the tree-walk scheduler parks the **vCPU** (`Blocked::CapPending`,
+freeing its M:N worker; completions re-queue via `Pending::CapResult`, drained smallest-id-first =
+submission order, the §18 pin), deliberately whole-vCPU: a fiber-level FIBER_PARKED unwind would be
+guest-visible where fast backends block inline (invariant 9), so `cont` fibers, durable callers,
+and the explorer keep the blocking wait. Slice 3 — `cap_thunk_locked` releases the domain lock
+before its completion wait (the JIT threaded tier). Remaining: the re-measure, then the ring's
+retirement (SQE format, `RingState`, the async completion path).
 Completion sources are pluggable behind the park (offload pool now; host io_uring for real
 file/net caps; a JS event on the browser tier). Batching belongs to the *transport* — a future
 §9-rung-6 broker coalesces parked completions invisibly; the guest ABI stays sync. Known loss to

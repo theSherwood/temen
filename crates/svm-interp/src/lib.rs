@@ -2138,6 +2138,17 @@ fn drive_over_cell(
                 sched_for_notify.notify(FutexKey::Anon(key), count);
             }));
     }
+    // §12 slice 2 — the completion-wake hook: a pool worker posting a punted dispatch's result
+    // triggers the scheduler's ordered drain, finishing vCPUs parked in `Blocked::CapPending`.
+    // Cleared at teardown alongside `async_notify` (same Host → Scheduler cycle discipline).
+    {
+        let sched_for_comp = Arc::clone(&sched);
+        let mut hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let comps = hg.completions();
+        hg.set_completion_notify(Arc::new(move || {
+            sched_for_comp.completion_drain(&comps);
+        }));
+    }
     let root_id = {
         let mut s = sched.lock();
         let id = s.next_task;
@@ -2586,6 +2597,7 @@ fn drive_over_cell(
         let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
         h.quiesce_pool();
         h.clear_async_notify();
+        h.clear_completion_notify();
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
@@ -4092,6 +4104,13 @@ enum Blocked {
     /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
     /// what blocking means.
     CapRead { handle: i32 },
+    /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
+    /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
+    /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
+    /// minted monotonically, so this is **submission order** — the §18 ordered-delivery pin) and
+    /// finishes the call via [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
+    /// call just takes time), so a backend that blocks inline instead stays byte-identical.
+    CapPending { id: u64 },
     /// §3.6 slice 3 — parked inside a call to a **live callee** awaiting its reply, keyed by
     /// the dispatch ticket. `callee` is carried for the park-vs-reply race check: the park
     /// handler probes the callee's completion cell under the scheduler lock, so a reply that
@@ -4276,6 +4295,13 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
+    /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
+    /// cell runs at most one sub-run at a time — the `busy` gate). Drained smallest-id-first by
+    /// [`Scheduler::completion_drain`], which stops at the first waiter whose result has not
+    /// arrived — so delivery is in submission order (§18) and a later completion never overtakes
+    /// an earlier parked caller.
+    completion_waiters: BTreeMap<u64, Waiter>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by
     /// `(callee domain id, dispatch ticket)` (exactly one caller per key; woken by
     /// [`Scheduler::cap_reply_or_stash`] with the result). The **callee** must be part of the key:
@@ -4517,6 +4543,50 @@ impl Scheduler {
                     .svc_results
                     .insert(ticket, result);
             }
+        }
+    }
+
+    /// §12 parking-on-blocking (slice 2) — deliver ready punt completions to parked callers **in
+    /// submission order**: drain `completion_waiters` smallest-id-first and stop at the first
+    /// waiter whose result has not arrived, so a later completion never overtakes an earlier
+    /// parked caller (the §18 ordered-delivery pin; latency stays timing-dependent, order does
+    /// not). Called by the run's `completion_notify` hook after each completion posts, and by the
+    /// [`Blocked::CapPending`] park handler right after registering — the register-then-recheck
+    /// TOCTOU close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park
+    /// is delivered here instead of stranding the caller. Unclaimed results simply stay in
+    /// [`Completions::ready`] for their (not-yet-registered or blocking-wait) caller — the stash
+    /// **is** the store, so there is no lost-wakeup window. Lock order sched → completions; the
+    /// completions lock is never held while taking the scheduler's.
+    fn completion_drain(&self, comps: &Completions) {
+        let mut s = self.lock();
+        let mut woke = false;
+        loop {
+            let Some((&id, _)) = s.completion_waiters.first_key_value() else {
+                break;
+            };
+            let Some(r) = comps.try_take(id) else {
+                break;
+            };
+            match s.completion_waiters.remove(&id) {
+                Some(Waiter::VCpu(mut v)) => {
+                    v.pending = Some(Pending::CapResult(r));
+                    s.runnable.push_back(v);
+                    woke = true;
+                }
+                // No fiber parks on completions yet (slice 2 parks whole vCPUs only — the
+                // FIBER_PARKED unwind would be guest-visible where fast backends block inline,
+                // invariant 9); the arm exists so a future handler-promotion slice inherits the
+                // established wake pair.
+                Some(Waiter::Fiber { reg, slot, svc }) => {
+                    reg.wake_blocked(slot, Reg::from_i64(r));
+                    svc_wake_locked(&mut s, svc);
+                    woke = true;
+                }
+                None => unreachable!("first_key_value then remove under one lock"),
+            }
+        }
+        if woke {
+            self.work.notify_all();
         }
     }
 
@@ -4972,6 +5042,23 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
         }
     }
     s.cap_waiters.retain(|_, q| !q.is_empty());
+    // §12 slice 2 — members parked on punt completions die too. The pool job still runs and its
+    // eventual `complete` finds no waiter — the result lands in `Completions::ready`, unclaimed,
+    // and dies with the Host (bounded by punts in flight at death, not call volume).
+    let cw = std::mem::take(&mut s.completion_waiters);
+    for (id, w) in cw {
+        let member = match &w {
+            Waiter::VCpu(v) => domain_key_of(v) == key,
+            Waiter::Fiber { svc, .. } => *svc == key,
+        };
+        if member {
+            if let Waiter::VCpu(v) = w {
+                victims.push(v);
+            }
+        } else {
+            s.completion_waiters.insert(id, w);
+        }
+    }
     // Members parked as *callers* through some other domain die too. The callee's eventual reply
     // will find no waiter here — I40: record the ticket as an orphan so the reply is dropped at its
     // stash site instead of leaking an unclaimable `svc_results` entry on the (surviving) callee.
@@ -5065,6 +5152,11 @@ fn teardown_run(s: &mut Sched) {
         }
     }
     for (_, w) in std::mem::take(&mut s.ticket_waiters) {
+        if let Waiter::VCpu(v) = w {
+            victims.push(v);
+        }
+    }
+    for (_, w) in std::mem::take(&mut s.completion_waiters) {
         if let Waiter::VCpu(v) = w {
             victims.push(v);
         }
@@ -5622,6 +5714,30 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
+            }
+            Step::Park(Blocked::CapPending { id }) => {
+                // §12 slice 2: park inside a punted offloadable dispatch, keyed by completion id.
+                // Register-then-recheck (the `cap_reply_or_stash` TOCTOU close, park side): insert
+                // the waiter under the scheduler lock, then run the ordered drain — a completion
+                // that landed before the insert is delivered right here instead of stranding the
+                // caller. (The host guard below is released before the scheduler lock is taken —
+                // lock order sched → host is never crossed.)
+                let comps = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .completions();
+                {
+                    let mut s = sched.lock();
+                    // §12 domain-lifetime park gate (owner 2026-07-24): never park into a
+                    // torn-down world.
+                    let Some(v) = park_gate(&mut s, v) else {
+                        sched.work.notify_all();
+                        return;
+                    };
+                    s.completion_waiters.insert(id, Waiter::VCpu(v));
+                }
+                sched.completion_drain(&comps);
             }
             Step::Park(Blocked::CapReply { ticket, callee }) => {
                 park_cap_reply(sched, v, ticket, callee);
@@ -6429,6 +6545,7 @@ impl SchedDriver {
                 // other non-resumable drivers). Fail closed rather than wedge.
                 Step::Park(
                     Blocked::CapRead { .. }
+                    | Blocked::CapPending { .. }
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
                     | Blocked::OfferPark { .. }
@@ -10644,19 +10761,37 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     )?;
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
-                    // completion. This slice is the single-fiber degenerate wait (root and
-                    // non-root alike block this vCPU thread; sibling vCPUs now run because the
-                    // lock is free). Fiber-level parking with ordered delivery is the
-                    // cooperative-tier slice. The placeholder `results` is discarded.
+                    // completion. The placeholder `results` is discarded.
                     if let Some(id) = pending_id {
-                        let comps = hg.completions();
-                        drop(hg);
-                        let r = comps.wait(id);
                         if sig.results.len() > 1 {
-                            // Parkable ops carry a single-slot scalar reply (invariant 8) —
-                            // a wider declared signature is a registration bug, fail-closed.
+                            // Parkable ops carry a single-slot scalar reply (invariant 8) — a
+                            // wider declared signature is a registration bug, fail-closed. Checked
+                            // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
                             return Err(Trap::CapFault);
                         }
+                        let comps = hg.completions();
+                        drop(hg);
+                        // Slice 2 — park the vCPU instead of blocking its worker thread: the
+                        // completion re-queues it via `Pending::CapResult`, so the M:N worker
+                        // runs other runnable vCPUs meanwhile. Guest-invisible (a blocking call
+                        // just takes time), hence no cross-backend divergence. Conditions: real
+                        // scheduler (the explorer keeps whole-vCPU blocking waits), root fiber
+                        // (a `cont` fiber's park would unwind FIBER_PARKED to its resumer —
+                        // guest-visible where fast backends block inline, invariant 9),
+                        // non-durable (the freeze driver has no CapPending arm; a durable
+                        // caller keeps the in-dispatch blocking discipline), and an exactly-i64
+                        // reply (the wake pushes a raw i64 reg — the `Pending::CapResult`
+                        // precedent; `Blocking`/offloadable jobs return one i64 by contract).
+                        let parkable = *cur == ROOT_FIBER
+                            && !durable
+                            && matches!(sched, SchedRef::Real(_))
+                            && matches!(sig.results.as_slice(), [ValType::I64]);
+                        if parkable {
+                            return Ok(Inner::Park(Blocked::CapPending { id }));
+                        }
+                        // Degenerate blocking wait (slice 1): single-fiber guests, `cont`
+                        // fibers, durable callers, the deterministic explorer.
+                        let r = comps.wait(id);
                         if let Some(ty) = sig.results.first() {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
                         }
@@ -14397,6 +14532,17 @@ impl Completions {
         }
     }
 
+    /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
+    /// drain's probe and the park path's register-then-recheck. Exactly one taker wins; the
+    /// loser's wake attempt is an idempotent no-op.
+    pub fn try_take(&self, id: u64) -> Option<i64> {
+        self.mx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready
+            .remove(&id)
+    }
+
     /// Ids minted but not yet completed. A test pins the "sync ops never pay" invariant with
     /// [`Completions::minted`]; this is the in-flight drain signal.
     pub fn outstanding(&self) -> usize {
@@ -15113,6 +15259,14 @@ pub struct Host {
     /// without the host lock. Shared out by [`Host::completions`] before the wait. Untouched
     /// (nothing minted) unless an offloadable handler punts on the parking-aware face.
     completions: Arc<Completions>,
+    /// §12 parking-on-blocking (slice 2) — the **completion wake** hook: a pool worker calls this
+    /// after posting a punted job's result, so the run's scheduler can drain
+    /// `completion_waiters` (deliver to parked vCPUs in submission order). Installed per run by
+    /// the executor that owns the wake mechanism (`drive_over_cell` wires it to
+    /// `Scheduler::completion_drain`), cleared at run teardown (it captures the `Arc<Scheduler>`
+    /// — same reference-cycle discipline as `async_notify`); `None` ⇒ parked callers don't exist
+    /// (every waiter is a blocking `Completions::wait`), so no wake is needed.
+    completion_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// §9/§12 async-ring per-handle state, indexed by the id a [`Binding::IoRing`] carries — where a
     /// `submit_async` posts completions for the guest's `reap`.
     rings: Vec<Arc<RingState>>,
@@ -15500,6 +15654,7 @@ impl Host {
             window_minters: Vec::new(),
             pool: None,
             completions: Arc::new(Completions::new()),
+            completion_notify: None,
             rings: Vec::new(),
             async_notify: None,
             cap_pages: None,
@@ -15565,6 +15720,7 @@ impl Host {
             && self.self_instance.is_none()
             && self.pool.is_none()
             && self.async_notify.is_none()
+            && self.completion_notify.is_none()
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
@@ -16226,15 +16382,36 @@ impl Host {
             Some(slot) => {
                 let id = self.completions.mint();
                 let comps = Arc::clone(&self.completions);
+                // The result post happens-before the wake hook, so a drain triggered by the
+                // hook always finds the result it is delivering (no lost wakeup).
+                let hook = self.completion_notify.clone();
                 let pool = self
                     .pool
                     .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-                pool.dispatch(vec![Box::new(move || comps.complete(id, job()))]);
+                pool.dispatch(vec![Box::new(move || {
+                    comps.complete(id, job());
+                    if let Some(h) = &hook {
+                        h();
+                    }
+                })]);
                 *slot = Some(id);
                 Ok(Vec::new())
             }
             None => Ok(vec![job()]),
         }
+    }
+
+    /// §12 slice 2 — install the per-run completion-wake hook (see the `completion_notify`
+    /// field). The executor that owns the wake mechanism wires it to its scheduler's ordered
+    /// drain and clears it at teardown.
+    pub fn set_completion_notify(&mut self, f: Arc<dyn Fn() + Send + Sync>) {
+        self.completion_notify = Some(f);
+    }
+
+    /// §12 slice 2 — drop the completion-wake hook at run teardown (it captures the run's
+    /// `Arc<Scheduler>`; leaving it would cycle Host → Scheduler → Host).
+    pub fn clear_completion_notify(&mut self) {
+        self.completion_notify = None;
     }
 
     /// Install a host binding in a free slot and return the guest handle — a forgeable
