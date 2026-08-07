@@ -889,23 +889,35 @@ persists across calls (write-then-read-back), a non-zero `tvar` initializer seed
 end-to-end: the heap programs of W3/Path A run against the compiled `system` module, whose allocator
 state is thread-vars, and they get the right answer.
 
-**Tier 2 — real per-thread `__thread` over `vcpu.tls` (deferred, spec'd).** The moment a nimony guest
-is genuinely multi-threaded (spawns svm threads *and* relies on per-thread `tvar` state), Tier 1's
-plain global is wrong — all vCPUs would share one copy. The faithful lowering, when it's needed:
-(i) reserve a per-CPU **TLS block** sized to the module's `tvar`s (each `tvar` gets a fixed block
-offset instead of a fixed window offset); (ii) at thread entry, allocate a block (from the same
-Memory-cap heap the allocator already uses) and `vcpu.tls.set` its base — the root vCPU's block set
-up once at `_start`; (iii) lower every `tvar` access to `vcpu.tls.get()` + the tvar's block offset,
-exactly as native code adds to the fs/gs base. svm supplies the base register; the block layout and
-per-thread allocation are the backend's work — no new substrate. This is **deferred on purpose**
-(prime directive: don't build it until a concrete threaded guest demands it), and it is bounded, not
-open: the mechanism above is the whole design, and the single-threaded/multi-threaded switch is local
-to the `tvar` lowering — Tier 1's tests are the differential oracle a Tier 2 implementation must still
-satisfy when run single-threaded.
+**Tier 2 — real per-thread `__thread` over `vcpu.tls` (implemented).** For a genuinely multi-threaded
+guest (spawns svm threads *and* relies on per-thread `tvar` state), Tier 1's plain global is wrong —
+all vCPUs would share one copy. The faithful lowering: (i) each `tvar` gets a fixed offset in a
+per-CPU **TLS block** instead of a window offset; (ii) at thread entry the runtime allocates a block
+and `vcpu.tls.set`s its base (the root vCPU too); (iii) every `tvar` access lowers to
+`vcpu.tls.get()` + the tvar's block offset, exactly as native code adds to the fs/gs base. svm
+supplies the base register; the block layout and per-thread allocation are the backend/runtime's
+work — no new substrate.
 
-**Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved
-for the self-host goal** — nimony's compiler is single-threaded, so Tier 1 is the operative model and
-it is implemented and tested. Tier 2 is the recorded plan for if/when a threaded Nim guest appears.
+svm-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
+(`translate_tls` / `Translator::with_tls`; the `tvar` arm of `collect_globals` assigns block offsets,
+`lvalue_addr` emits `vcpu.tls.get() + off`). Step (ii) is the runtime's job — the `vcpu.tls.set` at
+thread entry, the same division as the C runtime's fs/gs-base setup — so it stays outside the
+translator (a threaded guest's thread-start shim, the analog of Path B's allocator shim). Proven in
+`crates/svm-leng/tests/thread_var.rs`: the lowering routes a `tvar` through `vcpu.tls`, and — the core
+property — the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base B0 and bumps +3, base B1
+and bumps +5, then reads each back as 3 and 5; a shared global would read 8), on both engines. A
+non-zero `tvar` initializer in `tls_mode` is fail-closed (the per-thread block is zeroed; non-zero
+seeding is a bounded follow-up). Two other bounded follow-ups, both additive: cross-module block-offset
+agreement (so a `tvar` defined in `system` and referenced from user code shares one block layout — the
+TLS analog of the `data.sym` global relocation), and wiring the thread-start block-alloc/`vcpu.tls.set`
+shim for a real threaded guest. Tier 1's tests remain the differential oracle Tier 2 must satisfy when
+a `tls_mode` program runs single-threaded with its base set once.
+
+**Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved**.
+Tier 1 (single-threaded `tvar → global`) is the operative model for the self-host goal — nimony's
+compiler is single-threaded — and both tiers are implemented and tested: Tier 1 is the default, Tier 2
+(`tls_mode`) is ready for when a threaded Nim guest appears, needing only the two additive follow-ups
+above.
 
 ## 4. Invariants this must respect
 

@@ -7,10 +7,12 @@
 //! exactly one instance and a plain global *is* that instance. It mirrors the C on-ramp, which strips
 //! `__thread` before clang (`demos/nimony/build_nimony.sh`). These tests pin that model: a `tvar`
 //! must behave as a persistent global — writes survive across calls, non-zero initializers seed it,
-//! and it links across modules the same as a `gvar` — on both engines. (A real multi-threaded
-//! `__thread` lowering over `vcpu.tls` is NIM.md §3d Tier 2, deferred.)
+//! and it links across modules the same as a `gvar` — on both engines. The real multi-threaded
+//! `__thread` lowering over `vcpu.tls` (NIM.md §3d Tier 2) is implemented behind `tls_mode` and
+//! covered by the Tier-2 tests at the bottom of this file.
 
 use svm_interp::Value;
+use svm_ir::LinkUnit;
 use svm_leng::LengModule;
 
 /// Run func `idx` on both engines; assert §9 parity; return the i64 result.
@@ -121,4 +123,120 @@ fn thread_var_links_cross_module_like_a_global() {
         "write then read the external tvar"
     );
     assert_eq!(run(&linked, 0, &[-5]), -5);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2 (NIM.md §3d): the real multi-threaded `__thread` lowering over `vcpu.tls`.
+//
+// In `translate_tls`, a `tvar` no longer collapses to one plain global — it gets an offset in the
+// per-vCPU TLS block, and each access lowers to `vcpu.tls.get() + off` (the fs/gs-base recipe). svm
+// supplies the per-vCPU base register (§12, seeded to the vCPU id, guest-overwritable); the runtime
+// establishes each thread's block base with `vcpu.tls.set` at thread entry. These tests exercise
+// svm-leng's half — the access lowering — with a hand-written driver standing in for that runtime.
+
+/// A tvar module for Tier-2 lowering: `bump(n)` adds to the thread-var `counter`, `get()` reads it.
+/// `bump` is func 0, `get` is func 1.
+const TVAR_ACCESSORS: &str = "\
+(stmts
+ (tvar :counter.0. . (i +64) .)
+ (proc :bump.0. (params (param :n.0 . (i +64))) (void) .
+  (stmts .
+   (asgn counter.0. (add (i +64) counter.0. n.0))))
+ (proc :get.0. . (i +64) . (stmts . (ret counter.0.))))";
+
+#[test]
+fn tls_mode_lowers_a_tvar_through_vcpu_tls() {
+    // Tier 2 reads/writes the tvar via the per-vCPU register; Tier 1 (the default) keeps it a plain
+    // global. The presence/absence of `vcpu.tls` in the emitted text is the switch.
+    let tls = svm_leng::translate_tls_to_text(TVAR_ACCESSORS).unwrap();
+    assert!(
+        tls.contains("vcpu.tls.get"),
+        "TLS mode reaches the tvar through the per-vCPU base:\n{tls}"
+    );
+    let plain = svm_leng::translate_to_text(TVAR_ACCESSORS).unwrap();
+    assert!(
+        !plain.contains("vcpu.tls"),
+        "Tier 1 keeps the tvar a plain global (no vcpu.tls):\n{plain}"
+    );
+}
+
+#[test]
+fn tvar_is_isolated_per_tls_base() {
+    // The core Tier-2 property: the tvar follows `vcpu.tls`, so two different bases are two
+    // independent instances — exactly the per-thread isolation a spawned thread gets when the
+    // runtime hands it its own block. A single vCPU proves the mechanism deterministically by
+    // switching the base (what a real per-thread `vcpu.tls.set` does): set base B0, bump +3; set
+    // base B1, bump +5; read B0 back (3) and B1 back (5) → 3*100 + 5 = 305. If the tvar were a
+    // shared global, both reads would see 8.
+    let user =
+        svm_leng::translate_tls(TVAR_ACCESSORS).unwrap_or_else(|e| panic!("translate_tls: {e}"));
+
+    // The driver stands in for the thread runtime: it owns the `vcpu.tls.set`s and calls the
+    // translated accessors (imported by name, bound to the user unit's exports by the linker).
+    // B0 = 2048, B1 = 4096 — two zeroed 8-byte blocks in the low scratch page.
+    let driver = svm_text::parse_module(
+        "\
+memory 16
+import 0 \"bump\" (i64) -> ()
+import 1 \"get\" () -> (i64)
+func 0 () -> (i64) {
+block 0 () {
+  b0 = i64.const 2048
+  vcpu.tls.set b0
+  three = i64.const 3
+  call.import 0 (three)
+  b1 = i64.const 4096
+  vcpu.tls.set b1
+  five = i64.const 5
+  call.import 0 (five)
+  vcpu.tls.set b0
+  g0 = call.import 1 ()
+  vcpu.tls.set b1
+  g1 = call.import 1 ()
+  hund = i64.const 100
+  m = i64.mul g0 hund
+  r = i64.add m g1
+  return r
+  }
+}
+export 0 func \"_start\" 0
+",
+    )
+    .expect("driver parses");
+
+    let linked = svm_ir::link(&[
+        LinkUnit {
+            module: driver,
+            exports: vec![],
+            ..Default::default()
+        },
+        LinkUnit {
+            module: user,
+            exports: vec![("bump".into(), 0), ("get".into(), 1)],
+            ..Default::default()
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e:?}"));
+    // _start is the driver's func 0 → func 0 of the linked module.
+    assert_eq!(
+        run(&linked, 0, &[]),
+        305,
+        "B0's counter is 3 and B1's is 5 — the tvar is per-tls-base, not shared"
+    );
+}
+
+#[test]
+fn non_zero_tvar_initializer_fails_closed_in_tls_mode() {
+    // Tier 2 zeroes each per-thread block; a non-zero initializer would need per-thread seeding by
+    // the runtime (a bounded follow-up), so it's a clean error rather than a silently-wrong global.
+    let leng = "\
+(stmts
+ (tvar :g.0. . (i +64) 5)
+ (proc :get.0. . (i +64) . (stmts . (ret g.0.))))";
+    let err =
+        svm_leng::translate_tls_to_text(leng).expect_err("non-zero tvar init must fail-closed");
+    assert!(
+        format!("{err:?}").contains("TLS mode"),
+        "clean, specific error: {err:?}"
+    );
 }
