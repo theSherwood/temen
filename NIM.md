@@ -854,6 +854,27 @@ real `nifmake` control flow). This retires the "can the driver shape even run on
 including its failure handling; what's left (above) is compiling the actual phases and — for the
 file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
 
+**Second slice — ✅ a real compiled program as an isolated `exec` child** (step (iii), on a real
+binary). The first slice's phases are hand-written; this runs output from the actual `Leng → SVM-IR`
+backend as a `domain_exec` child. A Leng module with real control flow (a counted `while` loop) is
+lowered by `svm-leng`, **verified**, registered as a phase, and `exec`d by the same nifmake-shaped
+driver; its `main()` returns 55 (sum 1..10), `domain_exec` maps that return to the child's exit code,
+and the driver reads it back via the status op and re-exits with it — so **exit 55 witnesses the whole
+path**: frontend output → verify → isolated child domain → correct compute → status to driver
+(`crates/svm-run/tests/multibinary.rs::driver_runs_a_real_svm_leng_compiled_program_as_an_exec_child`,
+all three engines; svm-leng is a test-only dep of svm-run, no cycle). This proves a *real* compiled
+binary boots and computes correctly as an isolated child — the previously-open half of (iii).
+
+The remaining half of (iii) is **heap/`system`-backed** phases, and it splits cleanly by what the
+child needs at its window edge. A self-contained program (allocator over its own window, the Path-B
+shim) needs only that the shim **self-seed its brk at startup** rather than rely on harness seeding —
+an in-lane change to the shim, no infra. The mmap-backed real `system` additionally needs the
+**bottom-edge host caps granted to the child** (`mmap`/`memcpy`/atomics/`fs`), which `domain_exec` v1
+does not do — it runs each child with only stdin/stdout (`exec.rs:102`). That child-capability grant
+is the same class of owner-reviewed shared-capability infra as the shared-memfs hand-off above (it
+decides what authority a spawned child inherits — INVARIANTS §1/§4), so it is scoped here, not built
+in the nimony lane.
+
 ## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
 
 nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng

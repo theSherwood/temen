@@ -40,6 +40,11 @@ svm-peval.workspace = true
 # The generic IR→IR optimizer (OPT.md): CFG cleanup of the residual before re-verify/encode.
 svm-opt.workspace = true
 
+[dev-dependencies]
+# W4 (NIM.md §3c): run a *real* svm-leng-compiled program as an isolated `domain_exec` child, not a
+# hand-written stand-in phase. Test-only, and svm-leng does not depend on svm-run, so no cycle.
+svm-leng = { path = "../svm-leng" }
+
 [target.'cfg(unix)'.dependencies]
 # Real `map`/`unmap`/`protect` for the Memory capability (§3e): `mprotect` on the JIT window
 # pages, mirrored by a software page-state map (so cap-buffer borrows fail closed rather than
