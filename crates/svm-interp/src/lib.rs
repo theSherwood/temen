@@ -4560,10 +4560,7 @@ impl Scheduler {
     fn completion_drain(&self, comps: &Completions) {
         let mut s = self.lock();
         let mut woke = false;
-        loop {
-            let Some((&id, _)) = s.completion_waiters.first_key_value() else {
-                break;
-            };
+        while let Some((&id, _)) = s.completion_waiters.first_key_value() {
             let Some(r) = comps.try_take(id) else {
                 break;
             };
