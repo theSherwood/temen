@@ -16,6 +16,14 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **I67 apt-source hardening (all `apt-get update` steps)** — every job that runs `apt-get update`
+  (the mingw cross lanes, the `clang` reference lanes, and all `llvm-18` install blocks — 10 sites)
+  now first `sudo rm -f`s the runner's unused `microsoft*`/`azure*` files under
+  `/etc/apt/sources.list.d/`. Those repos are never installed from, but a transient 403/outage from
+  their mirror (ISSUES.md I67) kills `apt-get update` with exit 100 before any Rust runs. Removing
+  the sources makes the update independent of them. No behavior change on a healthy runner. Pure CI
+  infra; no tree code touched.
+
 > **A CI guard now enforces this list.** The `workflows-in-sync` job (`workflows_src == workflows`)
 > reds the run whenever any `.github/workflows_src/*.yml` differs from `.github/workflows/*.yml`, so
 > pending changes can't be silently forgotten — the run stays red until the owner copies them over
