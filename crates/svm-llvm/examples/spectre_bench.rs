@@ -57,7 +57,7 @@ fn main() {
             &mut fuel,
         );
         let (got, _mem) = cm
-            .run(&[sp, SMALL as i64], None, None, None)
+            .run(&[sp, SMALL as i64], None, None)
             .expect("jit runs");
         let got0 = match got {
             svm_jit::JitOutcome::Returned(vals) => vals[0],
@@ -72,7 +72,7 @@ fn main() {
             "MISCOMPILE on {sym}: interp={want0} jit={got0}"
         );
         let ns = per_iter(large, |n| {
-            let r = cm.run(&[sp, n as i64], None, None, None).expect("jit runs");
+            let r = cm.run(&[sp, n as i64], None, None).expect("jit runs");
             black_box(&r);
         });
         println!("{sym},{ns:.4}");

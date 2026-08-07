@@ -41,7 +41,7 @@ fn parse_module(ir: &str) -> Result<svm_ir::Module, svm_text::ParseError> {
 /// `i`'s name maps to `(type_id, op)` via `svm_run::default_cap_resolver` and to the granted
 /// handle by interface — the same mapping `svm_run::Instance::grant_caps` installs. A name outside
 /// the fixed policy leaves its slot unbound (fail-closed CapFault at dispatch).
-fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
+fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 7]) {
     use svm_interp::cap_id;
     if m.imports.is_empty() {
         return;
@@ -65,9 +65,8 @@ fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
                 // grant, sub/region_create → the sized one.
                 (cap_id::ADDRESS_SPACE, 0..=3) => hv(3),
                 (cap_id::ADDRESS_SPACE, _) => hv(4),
-                (cap_id::IO_RING, _) => hv(5),
-                (cap_id::BLOCKING, _) => hv(6),
-                (cap_id::JIT, _) => hv(7),
+                (cap_id::BLOCKING, _) => hv(5),
+                (cap_id::JIT, _) => hv(6),
                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),
             };
             svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -76,17 +75,17 @@ fn bind_imports(h: &mut Host, m: &svm_ir::Module, handles: &[Value; 8]) {
     h.set_import_bindings(bindings);
 }
 
-/// The **8-handle test powerbox** — the product's seven (stdout, stdin, exit, memory, addrspace
-/// (§14), ioring (§9/§12), jit (DESIGN.md §22)) **plus the test-only `Blocking` mock** (§5a: no
-/// product powerbox grants it; this harness does, because the async demos exercise the offload
-/// pool through it) — granted in a fixed order so the handle values are deterministic (and
+/// The **7-handle test powerbox** — the product's six (stdout, stdin, exit, memory, addrspace
+/// (§14), jit (DESIGN.md §22)) **plus the test-only `Blocking` mock** (§5a: no product powerbox
+/// grants it; this harness does, because the blocking tests exercise the offload pool / §12
+/// parking through it) — granted in a fixed order so the handle values are deterministic (and
 /// identical across two hosts), and **registered under their canonical names** (S15 (c2)): the
 /// paramless `_start` resolves each by name (`cap.self.resolve`), so callers run function 0 with
 /// `&[]`, not these as positional args. Every guest gets the same set (one `_start` shape); one that
 /// never touches the ring or the JIT just leaves those handles stashed and unused. `block_for` is the
 /// mock Blocking op's duration — `ZERO` for ordinary programs, non-zero for an async demo that wants
 /// its I/O to actually block. The returned handles are still handy for naming a specific one.
-fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8] {
+fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7] {
     h.set_region_factory(svm_run::new_shared_region);
     h.set_jit_validator(svm_run::jit_blob_validator);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
@@ -96,7 +95,6 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8
         h.grant_exit(),
         h.grant_memory(),
         h.grant_address_space(0, win),
-        h.grant_io_ring(),
         h.grant_blocking(block_for, None),
         h.grant_jit(mem_log2),
     ];
@@ -105,13 +103,12 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 8
     // runtime. The frontend `_start` is paramless — its manifest imports bind to capability slots
     // at instantiation (IMPORTS.md phase 4), and callers run function 0 with `&[]` — but the
     // returned handles are still handy for tests that name a specific one.
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 7] = [
         "stdout",
         "stdin",
         "exit",
         "memory",
         "addrspace",
-        "ioring",
         "blocking",
         "jit",
     ];
@@ -2426,12 +2423,12 @@ fn run_jit_repl_session(
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
 
     let mut host = Host::new();
-    // The fixed 8-handle powerbox a chibicc `_start` imports; the 8th (JIT) grants an invoke-only
+    // The fixed 7-handle powerbox a chibicc `_start` imports; the last (JIT) grants an invoke-only
     // domain (`table_log2 = 0`, no install table), matching the session's `table_reserve_log2` below.
     let args = powerbox(&mut host, win, std::time::Duration::ZERO);
     bind_imports(&mut host, &m, &args);
-    let Value::I32(jit_handle) = args[7] else {
-        panic!("the 8th powerbox handle is the JIT domain");
+    let Value::I32(jit_handle) = args[6] else {
+        panic!("the last powerbox handle is the JIT domain");
     };
     let domain = host.resolve_jit_domain(jit_handle).expect("jit domain");
     // The paramless `_start` resolves the powerbox by name (powerbox() registered the names); the
@@ -2559,114 +2556,6 @@ fn c_guest_thread_safe_malloc() {
         run.stdout, b"0\n",
         "concurrent malloc must hand out disjoint blocks (0 corrupt) on both backends"
     );
-}
-
-/// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`).
-#[cfg(all(unix, target_arch = "x86_64"))]
-fn async_mix(arg: i64) -> i64 {
-    arg.wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)
-}
-
-/// Compile + run an async-ring C demo on **both** backends, returning their captured stdout. The
-/// `Blocking` op blocks ~10 ms so the batch is genuinely in flight when a vCPU parks. The interp drives
-/// the M:N executor (`run_with_host` → `drive` installs the `Scheduler::notify` wake hook); the JIT
-/// uses the async entry + `svm_run::HostAsyncHooks` (its per-run `Domain` futex as the wake hook). Both
-/// must return 0; the caller compares their stdout to the order-invariant expected total.
-#[cfg(all(unix, target_arch = "x86_64"))]
-fn run_async_demo(src: &str) -> (Vec<u8>, Vec<u8>) {
-    use std::time::Duration;
-    let ir = c_to_ir(src);
-    let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
-    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{ir}"));
-    let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-
-    let mut hi = Host::new();
-    let mut hj = Host::new();
-    // Grant + register the powerbox on both hosts (the paramless `_start` resolves it by name); the
-    // entry takes no positional args. Grants are deterministic, so both hosts match.
-    let args = powerbox(&mut hi, win, Duration::from_millis(10));
-    assert_eq!(
-        args,
-        powerbox(&mut hj, win, Duration::from_millis(10)),
-        "grants are deterministic"
-    );
-    bind_imports(&mut hi, &m, &args);
-    bind_imports(&mut hj, &m, &args);
-
-    let mut fuel = 500_000_000u64;
-    let interp = run_with_host(&m, 0, &[], &mut fuel, &mut hi).expect("interp ran ok");
-    assert_eq!(interp, vec![Value::I32(0)], "demo returns 0 (interp)");
-
-    let slots: Vec<i64> = Vec::new();
-    let init = vec![0u8; win as usize];
-    // SAFETY: `hj` is the live cap-ctx Host for this run and outlives it.
-    let hooks = unsafe { svm_run::HostAsyncHooks::new(&mut hj as *mut Host) };
-    // `DEFAULT_RESERVED_LOG2` gives the window its large reserved growth tail (§4) — needed so a guest
-    // `malloc` (e.g. a 256 KiB pthread stack) can grow the heap past the backed prefix via the Memory
-    // cap. (Passing `0` here would leave no tail, so `malloc` returns NULL.)
-    let (jit, _jmem) = svm_jit::compile_and_run_capture_reserved_with_host_async(
-        &m,
-        0,
-        &slots,
-        &init,
-        svm_ir::DEFAULT_RESERVED_LOG2,
-        cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
-        &hooks,
-    )
-    .expect("jit ran");
-    assert!(
-        matches!(jit, JitOutcome::Returned(ref s) if s == &[0]),
-        "jit demo returns 0: {jit:?}"
-    );
-    (hi.stdout, hj.stdout)
-}
-
-/// §9/§12 increment 3c — the async **event-loop runtime** in real C (`demos/async_io`). One vCPU
-/// `submit_async`s a batch of `Blocking` ops onto the host offload pool, then parks on an in-window
-/// completion **counter** (`__vm_wait32`) and reaps completions as the pool delivers them — the
-/// "submit, park, run another, resume on completion" loop, with the parked vCPU woken by a pool
-/// worker's `notify` (an I/O completion is a futex notify, DESIGN §12). The printed total — the sum of
-/// the host's deterministic per-op results — is completion-order-invariant, so the interpreter (its
-/// `Scheduler::notify` wake hook) and the JIT (its per-run `Domain` futex) must agree. Exercises the
-/// new `codegen_ir.c` ring builtins + the 7-handle powerbox end to end.
-#[test]
-#[cfg(all(unix, target_arch = "x86_64"))]
-fn c_guest_async_io_runtime() {
-    let (interp, jit) = run_async_demo(include_str!("../../svm-run/demos/async_io/async_io.c"));
-    // NTASKS = 8 (see the demo).
-    let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
-    let expected = format!("{total}\n").into_bytes();
-    assert_eq!(
-        interp, expected,
-        "interp total must be Σ mix(i) for i in 0..8"
-    );
-    assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..8");
-}
-
-/// §9/§12 increment 3c (capstone) — the async **work-stealing M:N runtime** in real C
-/// (`demos/async_work_stealing`): `NWORKERS` vCPUs cooperatively drain `NTASKS` I/O-bound tasks, each
-/// issuing a blocking op through the ring. A worker never blocks on an I/O — it `submit_async`s a
-/// task's op onto the offload pool and moves on, **parking** on the completion counter only when
-/// nothing is runnable, woken by a pool worker's `notify`. Work-stealing and I/O overlap: N ops in
-/// flight on K pool threads while the vCPUs reap, not block. The total is completion-order- *and*
-/// interleaving-invariant, so the interp (M:N oracle) and JIT (real OS threads) must print the same
-/// regardless of which worker submitted/reaped each task.
-#[test]
-#[cfg(all(unix, target_arch = "x86_64"))]
-fn c_guest_async_work_stealing() {
-    let (interp, jit) = run_async_demo(include_str!(
-        "../../svm-run/demos/async_work_stealing/async_work_stealing.c"
-    ));
-    // NTASKS = 16 (see the demo).
-    let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
-    let expected = format!("{total}\n").into_bytes();
-    assert_eq!(
-        interp, expected,
-        "interp total must be Σ mix(i) for i in 0..16"
-    );
-    assert_eq!(jit, expected, "jit total must be Σ mix(i) for i in 0..16");
 }
 
 /// §7 slice 3b — a brand-new host capability reached as a plain `extern`, no frontend special-case.

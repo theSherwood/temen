@@ -430,7 +430,7 @@ sequence. Plus a C-ABI mirror (`svm_session_*`).
   counterpart to `cap.self.count`/`get`; opcode `0x7E`, full text + binary + verify support). The
   `Host` keeps a `cap_names` directory (name → handle), populated by the powerbox layer at grant time:
   a name-bound guest (`instantiate_with_imports`) resolves its own import names; a fixed §3e powerbox
-  guest resolves the canonical names (`stdout`/`stdin`/`exit`/`memory`/`addrspace`/`ioring`/`blocking`/
+  guest resolves the canonical names (`stdout`/`stdin`/`exit`/`memory`/`addrspace`/
   `jit`). The instruction lowers to op 2 over the reserved `CAP_SELF_TYPE_ID` in the generic
   `cap_dispatch_slots` seam (where `mem` is available to read the name), so **all three backends** get
   it from one implementation. Confers no authority (it only re-finds a handle already granted; an

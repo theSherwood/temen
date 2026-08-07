@@ -281,7 +281,7 @@ fn main() {
 
         // Cranelift JIT (native), compiled once, run per call.
         let mut cm = svm_jit::compile(&m, 0).expect("cranelift compile");
-        let (jitns, jitr) = per_iter_ns(|n| match cm.run(&[n], None, None, None) {
+        let (jitns, jitr) = per_iter_ns(|n| match cm.run(&[n], None, None) {
             Ok((svm_jit::JitOutcome::Returned(r), _)) => r[0],
             _ => -1,
         });

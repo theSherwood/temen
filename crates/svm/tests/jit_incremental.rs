@@ -71,9 +71,7 @@ const ADD: &str =
 fn compile_then_run_twice_matches_interp() {
     let mut cm = compile(ADD);
     for (a, b) in [(2, 40), (-7, 7)] {
-        let (out, _) = cm
-            .run(&[a as i64, b as i64], None, None, None)
-            .expect("run");
+        let (out, _) = cm.run(&[a as i64, b as i64], None, None).expect("run");
         let want = interp(ADD, &[Value::I32(a), Value::I32(b)]);
         assert!(
             matches!(out, JitOutcome::Returned(ref s) if s == &want),
@@ -87,7 +85,7 @@ fn compile_then_run_twice_matches_interp() {
 #[test]
 fn run_rejects_short_args() {
     let mut cm = compile(ADD);
-    assert!(cm.run(&[1], None, None, None).is_err());
+    assert!(cm.run(&[1], None, None).is_err());
 }
 
 /// `define_extra` basics: a pure extra function runs (via its trampoline) and matches the
@@ -146,7 +144,7 @@ fn incremental_finalize_keeps_earlier_code_runnable() {
     let (out, _) = unsafe { cm.run_extra(p2[0].tramp, 1, 1, &[21], None) }.expect("unit2");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[42]));
     // …and the parent entry (finalized before both) still runs.
-    let (out, _) = cm.run(&[40, 2], None, None, None).expect("parent");
+    let (out, _) = cm.run(&[40, 2], None, None).expect("parent");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[42]));
 }
 
@@ -209,7 +207,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     let mut cm = compile(parent_src);
     let sweep = |cm: &mut CompiledModule| -> Vec<JitOutcome> {
         (0..8)
-            .map(|idx| cm.run(&[idx, 100], None, None, None).expect("run").0)
+            .map(|idx| cm.run(&[idx, 100], None, None).expect("run").0)
             .collect()
     };
     let before = sweep(&mut cm);
@@ -399,14 +397,14 @@ fn install_makes_unit_call_indirectable() {
     );
 
     // old→new: parent `call_indirect` of the installed slot reaches the unit.
-    let (out, _) = cm.run(&[slot as i64, 6, 7], None, None, None).expect("run");
+    let (out, _) = cm.run(&[slot as i64, 6, 7], None, None).expect("run");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[142]),
         "{out:?}"
     ); // 6 * 7 + 100
 
     // An un-installed (padding) slot still traps fail-closed.
-    let (out, _) = cm.run(&[2, 6, 7], None, None, None).expect("run");
+    let (out, _) = cm.run(&[2, 6, 7], None, None).expect("run");
     assert!(matches!(
         out,
         JitOutcome::Trapped(TrapKind::IndirectCallType)

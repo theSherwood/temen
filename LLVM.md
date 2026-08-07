@@ -939,7 +939,7 @@ probe covers shrink-discard/grow-zero-fill/read-only-refusal), and feeding the e
 through the on-ramp surfaced two chunked-vector gaps clang's SLP can emit — **`freeze <N x iK>`**
 (now identity-on-parts, like the scalar/i128/mask freeze arms) and **`bitcast <N x iK> → iM`**
 (lane reassembly: mask, shift, OR — the vectorized 4-byte-compare shape). What remains for a
-first-class story: promoting the prototype `IoRing`/`Blocking` route vs the dedicated cap decision
+first-class story: promoting the §12 parking/offloadable route vs the dedicated cap decision
 (this slice used the direct `HostCap` surface). (The SQL-logic-scripts scale follow-up landed —
 slice BK below.)
 
@@ -1784,7 +1784,7 @@ on the JIT powerbox), `vm_fibers_generator`, `vm_atomics_single_threaded` (both 
   relocation** — the one-time fix that forecloses the recurring "new handle collides with heap state"
   bug. All six demos + the malloc/printf paths re-verified byte-identical (the offsets are referenced
   by named constant, so the move is transparent).
-**Slice AD (DONE) — the async-I/O ring (P2; the STW-safe blocking path JACL's GC needs, GC.md §5.2).**
+**Slice AD (DONE; retired 2026-08-07 — the ring and its `__vm_io_*` builtins left with DESIGN §12 parking-on-blocking) — the async-I/O ring (P2; the STW-safe blocking path JACL's GC needs, GC.md §5.2).**
 The §9/§12 submit/complete ring now lowers on the on-ramp, so a guest event-loop / work-stealing
 runtime built on LLVM bitcode drives many concurrent blocking I/Os from one parked vCPU:
 - `__vm_io_submit_async(sq, n, counter)` / `__vm_io_reap(cq, max)` → `CallImport` on the stashed
@@ -2572,8 +2572,8 @@ phases, both worth doing:
     capability yet** — that is the new host-side piece: a positioned-I/O surface (`read_at`/`write_at`/
     `truncate`/`sync`/`size`/advisory-lock) over a host-chosen backing file or block store, granted as
     one more handle in the stash. Two viable shapes: (a) a **dedicated `File`/`Storage` capability**
-    (cleanest semantics), or (b) **ride the existing §9/§12 `IoRing` + `Blocking` path** — a VFS that
-    `submit_async`s `pread`/`pwrite`/`fsync` as blocking ops onto the offload pool (reuses the async
+    (cleanest semantics), or (b) **ride the §12 parking path** — a VFS whose offloadable file ops
+    punts `pread`/`pwrite`/`fsync` as blocking ops onto the offload pool (reuses the parking
     machinery slices AD/async demos already exercise; the parked-vCPU completion model is a natural fit
     for SQLite's synchronous file calls). Recommend prototyping over `IoRing`/`Blocking` first (no new
     capability type), then promoting to a first-class `File` cap if the ergonomics warrant.
@@ -2868,14 +2868,14 @@ Exposing raw Vulkan/Metal/CUDA would blow the TCB open; WebGPU is the *safe wais
 Same thesis as the §22 `Jit` cap (§2a): **verification, not raw access, is the boundary** — and here
 WebGPU does the validation for you (guest-authored WGSL is safe by construction).
 
-**Architecture (mirrors the §9/§12 IoRing pattern).**
+**Architecture (mirrors the §12 parking-on-blocking pattern).**
 - The host holds the real device — via **`wgpu`** (the Rust WebGPU implementation; fits the codebase).
 - The guest is granted a **WebGPU handle** in the powerbox stash (one more `grant_*` on `Host`, slotted
   into `synth_start`'s contiguous prefix exactly like `IoRing`/`Blocking`/`Jit` — likely **no translator
   change**). API calls (create buffer, write, create pipeline, dispatch/submit) cross the boundary as
   **structured, validated commands**; the guest never holds a GPU pointer.
 - Only **data** flows back into the window (a compute buffer's contents, a texture's pixels). Async
-  readback (`mapAsync` / queue completion) maps onto the existing **IoRing/Blocking + M:N executor** —
+  readback (`mapAsync` / queue completion) maps onto the existing **parked completions + M:N executor** —
   GPU work is the same submit/validate/return-data shape as I/O.
 
 **Demos that prove safe access (headless first — the safety story is complete with no display):**

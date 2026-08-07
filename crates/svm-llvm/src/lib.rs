@@ -512,10 +512,6 @@ fn translate_impl(
     // Direct `<svm.h>` Memory-capability builtins (`__vm_map`/`unmap`/`protect`/`page_size`): register
     // their §7 imports and remember the program needs the `Memory` handle granted, even with no `malloc`.
     let uses_vm_memory = register_vm_memory_imports(m, &defined_names, &mut imports, &mut caps);
-    // §9/§12 async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`): register their `IoRing`
-    // imports; `__vm_blocking_handle` only reads the stashed `Blocking` handle (no import). Together
-    // they raise the powerbox arity to grant the `IoRing`/`Blocking` handles.
-    let uses_vm_io = register_vm_io_imports(m, &defined_names, &mut imports, &mut caps);
     // Direct-stream builtins (`__vm_stream_write`/`__vm_stream_read`): register the `write`/`read`
     // `Stream` imports so a guest that defines its own `write`/`read` (an fs-cap syscall shim) can
     // still reach stdout/stdin. Registered unconditionally (the names are reserved, never shadowed).
@@ -598,13 +594,12 @@ fn translate_impl(
     let need_narrow_atomic = uses_narrow_atomic(m);
     // The powerbox is granted a **contiguous prefix** of the `VM_CAP_*` handles (the runner grants by
     // declared arity), sized to the highest capability index the program uses: exit(2) always,
-    // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, ioring(5)
-    // for the async ring, jit(6) for the guest-driven-JIT builtins. (`blocking` left the powerbox
-    // with CONSOLIDATION §5a: `__vm_blocking_handle` resolves the name at runtime, so it needs no
-    // slot — a harness that grants + registers it serves the resolve; anything else fails closed.)
+    // memory(3) for `malloc`/Memory builtins, addrspace(4) for the SharedRegion builtins, jit(5)
+    // for the guest-driven-JIT builtins. (`blocking` left the powerbox with CONSOLIDATION §5a, and
+    // `ioring` with the §12 parking re-measure: `__vm_blocking_handle` resolves the name at
+    // runtime, so it needs no slot — a harness that grants + registers it serves the resolve;
+    // anything else fails closed.)
     let max_cap_index = if uses_vm_jit {
-        6
-    } else if uses_vm_io {
         5
     } else if uses_vm_region {
         4
@@ -3148,10 +3143,6 @@ fn import_sig(import: &str) -> svm_ir::FuncType {
         "vm_unmap" => ft(vec![I64, I64], vec![I64]),
         "vm_protect" => ft(vec![I64, I64, I32], vec![I64]),
         "vm_page_size" => ft(vec![], vec![I64]),
-        // §9/§12 async I/O ring (`IoRing`): submit a batch of deferred ops onto the host offload pool
-        // (op 1) / reap ready completions (op 2). `(sq, n, counter)` / `(cq, max)`, returning a count.
-        "vm_io_submit_async" => ft(vec![I64, I64, I64], vec![I64]),
-        "vm_io_reap" => ft(vec![I64, I64], vec![I64]),
         // §22 guest-driven JIT (`Jit`): submit serialized IR → code handle (op 0) / call a compiled
         // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call_indirect table (op 3)
         // / uninstall a slot (op 4) / compile against a guest symbol table (op 5). All return an `i64`.
@@ -3262,56 +3253,8 @@ fn register_vm_memory_imports(
     used
 }
 
-/// The §7 import a §9/§12 async-ring builtin needs (`__vm_io_submit_async` → `vm_io_submit_async`,
-/// `__vm_io_reap` → `vm_io_reap`), or `None`. Both reach the `IoRing` (slot 5) handle.
-fn vm_io_builtin_import(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "__vm_io_submit_async" => "vm_io_submit_async",
-        "__vm_io_reap" => "vm_io_reap",
-        _ => return None,
-    })
-}
-
-/// Scan for the async-ring builtins (`__vm_io_submit_async`/`__vm_io_reap`), registering each one's
-/// §7 import. Returns whether any were used — the signal that `_start` must be granted up through the
-/// `IoRing` handle. A guest-*defined* function of the same name shadows the builtin.
-fn register_vm_io_imports(
-    m: &LModule,
-    defined: &HashMap<String, u32>,
-    imports: &mut Vec<svm_ir::Import>,
-    caps: &mut HashMap<String, u32>,
-) -> bool {
-    let mut used = false;
-    for f in &m.functions {
-        for bb in &f.basic_blocks {
-            for instr in &bb.instrs {
-                let Instruction::Call(c) = instr else {
-                    continue;
-                };
-                let Some(name) = callee_name(c) else { continue };
-                if defined.contains_key(&name) {
-                    continue;
-                }
-                if let Some(import) = vm_io_builtin_import(&name) {
-                    used = true;
-                    caps.entry(import.to_string()).or_insert_with(|| {
-                        let i = imports.len() as u32;
-                        imports.push(svm_ir::Import {
-                            name: import.to_string(),
-                            shape: svm_ir::ImportShape::Func(u32::MAX),
-                            mode: svm_ir::ImportMode::Required,
-                        });
-                        i
-                    });
-                }
-            }
-        }
-    }
-    used
-}
-
-/// The §7 import the direct-stream builtins need (`__vm_stream_write` → `write`, `__vm_stream_read`
-/// → `read`), or `None`. Both reach the powerbox `Stream` (stdout slot 0 / stdin slot 1). Unlike the
+/// The §7 import a direct-stream builtin needs (`__vm_stream_write` → `write`,
+/// `__vm_stream_read` → `read`), or `None`. Unlike the
 /// libc `write`/`read` recognizers, these are registered *even when the guest defines `write`/`read`
 /// itself* (an fs-cap syscall shim does) — that's the whole point: the shim serves file fds through
 /// its own `write`/`read` and reaches the powerbox streams through these.
@@ -3323,11 +3266,8 @@ fn vm_stream_builtin_import(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Scan for the direct-stream builtins (`__vm_stream_write`/`__vm_stream_read`), registering the
-/// `write`/`read` §7 imports so the `cap_spec` lowering's `import_of` resolves them. Returns whether
-/// any were used (the signal that `_start` must be granted the stdout/stdin handles). These names are
-/// reserved (a guest never defines them), so — unlike the other `register_*` scans — a guest
-/// definition does not shadow them.
+/// Scan for the direct-stream builtins (`__vm_stream_write`/`__vm_stream_read`), registering each
+/// one's §7 import. Registered unconditionally — the names are reserved, never shadowed.
 fn register_vm_stream_imports(
     m: &LModule,
     imports: &mut Vec<svm_ir::Import>,
@@ -11488,28 +11428,8 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // ---- §9/§12 async I/O ring: `cap.call` on the stashed IoRing handle (slot 5) ----
-        "__vm_io_submit_async" | "__vm_io_reap" => {
-            let import = vm_io_builtin_import(name).expect("io builtin");
-            let imp = ctx.import_of(import)?;
-            let mut args = vec![
-                ctx.operand_i64(vm_arg(c, 0)?)?,
-                ctx.operand_i64(vm_arg(c, 1)?)?,
-            ];
-            if name == "__vm_io_submit_async" {
-                args.push(ctx.operand_i64(vm_arg(c, 2)?)?); // the completion counter pointer
-            }
-            let r = ctx.push(Inst::CallImport {
-                import: imp,
-                op: 0,
-                sig: import_sig(import),
-                args,
-            });
-            ctx.bind_dest(&c.dest, r);
-            Ok(true)
-        }
         // `__vm_blocking_handle()` returns the Blocking capability handle — the `i32` a guest
-        // names in an SQE's `handle` field when building a `Blocking.work` request. This is the one
+        // names in a direct `Blocking.work` cap.call (the §12 parking exerciser). This is the one
         // place a *handle value* (not a dispatch) is needed, so resolve it by its canonical name
         // (`cap.self.resolve` — the discovery tier IMPORTS.md deliberately keeps): the name bytes
         // are staged in the low reserved region, which the retired handle stash freed.

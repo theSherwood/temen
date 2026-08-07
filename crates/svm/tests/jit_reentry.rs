@@ -109,7 +109,7 @@ fn mid_run_define_and_invoke_over_live_window() {
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr: *mut CompiledModule = ctx.cm.get();
     let (out, final_mem) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[7, 35], None, None, None) }.expect("run");
+        unsafe { CompiledModule::run_raw(cm_ptr, &[7, 35], None, None) }.expect("run");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[1042]),
         "{out:?}"
@@ -121,7 +121,7 @@ fn mid_run_define_and_invoke_over_live_window() {
 
     // The module survives: run again — the unit is already defined (cached), invoke again.
     let (out, final_mem) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 1], None, None, None) }.expect("re-run");
+        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 1], None, None) }.expect("re-run");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[1002]));
     assert_eq!(final_mem[64], 0xab);
 }
@@ -135,8 +135,7 @@ fn trap_in_invoked_code_kills_the_domain() {
         "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  unreachable\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr = ctx.cm.get();
-    let (out, _) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 2], None, None, None) }.expect("run");
+    let (out, _) = unsafe { CompiledModule::run_raw(cm_ptr, &[1, 2], None, None) }.expect("run");
     assert!(
         matches!(out, JitOutcome::Trapped(TrapKind::Unreachable)),
         "{out:?}"
@@ -151,16 +150,14 @@ fn memory_fault_in_invoked_code_is_caught_and_terminal() {
     let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i64.const 1048584\n  v3 = i32.const 1\n  i32.store8 v2 v3\n  v4 = i32.const 0\n  return v4\n  }\n}\n";
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr = ctx.cm.get();
-    let (out, _) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 2], None, None, None) }.expect("run");
+    let (out, _) = unsafe { CompiledModule::run_raw(cm_ptr, &[1, 2], None, None) }.expect("run");
     assert!(
         matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "{out:?}"
     );
     // Recovery: the same module runs again on a fresh window and dies the same way — the
     // nested guard restored the outer recovery state correctly.
-    let (out, _) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[3, 4], None, None, None) }.expect("re-run");
+    let (out, _) = unsafe { CompiledModule::run_raw(cm_ptr, &[3, 4], None, None) }.expect("re-run");
     assert!(matches!(out, JitOutcome::Trapped(TrapKind::MemoryFault)));
 }
 

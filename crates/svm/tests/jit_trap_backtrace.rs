@@ -90,7 +90,7 @@ debug.loc 1 0 2 0 10 3
 #[test]
 fn trap_backtrace_names_the_faulting_store() {
     let mut cm = compile(STORE_OOB_DBG);
-    let (outcome, _) = cm.run(&[0], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[0], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "the overrunning store must be caught as a MemoryFault, got {outcome:?}"
@@ -109,7 +109,7 @@ fn trap_backtrace_names_the_faulting_store() {
 #[test]
 fn trap_backtrace_walks_the_caller_chain() {
     let mut cm = compile(CALL_THEN_FAULT_DBG);
-    let (outcome, _) = cm.run(&[0], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[0], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::MemoryFault)),
         "the overrunning store in the callee must trap MemoryFault, got {outcome:?}"
@@ -175,7 +175,7 @@ debug.loc 1 0 1 0 30 3
 #[test]
 fn explicit_trap_backtrace_names_the_div() {
     let mut cm = compile(DIV_BY_ZERO_DBG);
-    let (outcome, _) = cm.run(&[7], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[7], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
         "v0/0 must trap DivByZero, got {outcome:?}"
@@ -194,7 +194,7 @@ fn explicit_trap_backtrace_names_the_div() {
 #[test]
 fn explicit_trap_backtrace_walks_the_caller_chain() {
     let mut cm = compile(CALL_THEN_DIV_DBG);
-    let (outcome, _) = cm.run(&[7], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[7], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
         "the callee's div-by-zero must trap DivByZero, got {outcome:?}"
@@ -248,7 +248,7 @@ fn trap_backtrace_attributes_a_spawned_vcpu_trap() {
         return; // no OS-thread vCPU runtime here — thread.spawn is inert, nothing to attribute
     }
     let mut cm = compile(SPAWN_THEN_DIV_DBG);
-    let (outcome, _) = cm.run(&[0], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[0], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
         "the spawned worker's div-by-zero must propagate as DivByZero, got {outcome:?}"
@@ -291,7 +291,7 @@ fn assert_jit_backtrace_matches_interp(src: &str, arg: i32) {
 
     // JIT under test.
     let mut cm = compile(src);
-    cm.run(&[arg as i64], None, None, None).expect("run");
+    cm.run(&[arg as i64], None, None).expect("run");
     let jit: Vec<(u32, String, u32)> = cm
         .last_trap_backtrace()
         .iter()
@@ -327,14 +327,14 @@ block 0 (v0: i32) {
 }
 ",
     );
-    let (out, _) = clean.run(&[7], None, None, None).expect("run");
+    let (out, _) = clean.run(&[7], None, None).expect("run");
     assert_eq!(out, JitOutcome::Returned(vec![7]));
     assert!(
         clean.last_trap_backtrace().is_empty(),
         "a non-trapping run has no trap backtrace"
     );
     // And the trapping module does populate one (sanity vs the empty case above).
-    let _ = cm.run(&[0], None, None, None).expect("run");
+    let _ = cm.run(&[0], None, None).expect("run");
     assert!(
         !cm.last_trap_backtrace().is_empty(),
         "the trapping module has a backtrace"

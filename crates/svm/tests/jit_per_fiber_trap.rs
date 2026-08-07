@@ -56,7 +56,7 @@ fn interp_trap_fiber(src: &str) -> Option<i64> {
 /// returns the agreed-upon attribution so each test can pin the exact handle.
 fn differential_trap_fiber(src: &str) -> Option<i64> {
     let mut cm = compile(src);
-    let _ = cm.run(&[], None, None, None).expect("run");
+    let _ = cm.run(&[], None, None).expect("run");
     let jit = cm.last_trap_fiber();
     let interp = interp_trap_fiber(src);
     assert_eq!(
@@ -93,7 +93,7 @@ const FIBER_DIV0: &str = "func () -> (i32, i64) {\n\
 #[test]
 fn trap_in_a_resumed_fiber_is_attributed_to_that_fiber() {
     let mut cm = compile(FIBER_DIV0);
-    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[], None, None).expect("run");
     assert!(
         matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)),
         "the fiber's div-by-zero must trap DivByZero, got {outcome:?}"
@@ -173,7 +173,7 @@ const ROOT_DIV0: &str = "func () -> (i64) {\n\
 #[test]
 fn trap_in_the_root_is_attributed_to_no_fiber() {
     let mut cm = compile(ROOT_DIV0);
-    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[], None, None).expect("run");
     assert!(matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)));
     assert_eq!(
         cm.last_trap_fiber(),
@@ -195,7 +195,7 @@ const CLEAN: &str = "func () -> (i64) {\n\
 #[test]
 fn a_clean_run_clears_the_trap_fiber() {
     let mut cm = compile(CLEAN);
-    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[], None, None).expect("run");
     assert!(matches!(outcome, JitOutcome::Returned(_)));
     assert_eq!(
         cm.last_trap_fiber(),

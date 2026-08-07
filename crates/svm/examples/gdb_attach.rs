@@ -83,6 +83,6 @@ fn main() {
     }
 
     // Execute the JIT'd function so a source-line breakpoint inside it is actually hit.
-    let (outcome, _mem) = cm.run(&[10], None, None, None).expect("run");
+    let (outcome, _mem) = cm.run(&[10], None, None).expect("run");
     eprintln!("[harness] compute(10) -> {outcome:?}"); // (10+1)*3 - 2 = 31
 }

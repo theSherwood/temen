@@ -161,7 +161,7 @@ fn check_vector(
     // the interpreters, no carve-out.
     let slots: Vec<i64> = vector.iter().copied().map(to_slot).collect();
     let (out, jmem) = cm
-        .run(&slots, Some(init), None, None)
+        .run(&slots, Some(init), None)
         .unwrap_or_else(|e| panic!("{}", ctx("jit", &e)));
     match (&expected, &out) {
         (Ok(Some(e)), JitOutcome::Returned(rs)) if rs.len() == 1 && slot_matches(*e, rs[0]) => {}

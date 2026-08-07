@@ -15,8 +15,8 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use svm_interp::{
-    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, AsyncCounter,
-    CapPageMap, GuestMem, Host, HostProc, RegionBacking, StreamRole, Trap,
+    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
+    GuestMem, Host, HostProc, RegionBacking, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -1264,8 +1264,7 @@ pub fn jit_cap_run(
         }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
         // above); all of the run's vCPU threads serialize their `cap.call`s through `host_mutex`.
-        let r =
-            unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18), None) };
+        let r = unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18)) };
         host_mutex
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1301,7 +1300,7 @@ pub fn jit_cap_run(
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
-    let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18), None) };
+    let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18)) };
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_serve_native_ctx(0);
@@ -1596,7 +1595,7 @@ impl JitSession {
         // through the session's `Mutex<Host>`; `self.cm` is not moved during the call (we hold
         // `&mut self`, and `run_raw` keeps no live reference across the guarded call).
         let r = unsafe {
-            CompiledModule::run_raw(cm_ptr, args, Some(&self.window), Some(SESSION_SNAP), None)
+            CompiledModule::run_raw(cm_ptr, args, Some(&self.window), Some(SESSION_SNAP))
         };
         self.host
             .lock()
@@ -2746,20 +2745,6 @@ impl GuestMem for MprotectWindow {
         self.page as i64
     }
 
-    /// §9/§12 async-ring completion counter. The JIT's `atomic.wait` parks on the confined **physical**
-    /// address `phys = base + (addr & mask)`; an offload worker bumps the counter and `notify`s that
-    /// same `phys`, so the handle keys on it (vs. the interpreter's window-relative offset). `Some` only
-    /// for a 4-byte-aligned, committed, writable in-window address — the same gate as a guest atomic.
-    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
-        let off = counter_addr & (self.reserved - 1); // the §4 mask domain, matching the JIT lowering
-        if !off.is_multiple_of(4) || !self.range_committed(off, 4, true) {
-            return None;
-        }
-        Some(Arc::new(PhysCounter {
-            phys: self.base as u64 + off,
-        }))
-    }
-
     /// §13 op 0 `map`: alias a `SharedRegion` into the window with a **real shared mapping** —
     /// `mmap(MAP_SHARED | MAP_FIXED)` of the region's `os_fd` over `[win_off, win_off+len)`, so two
     /// mappings of the same region (here, or in another window) name the *same* physical pages: true
@@ -2931,66 +2916,6 @@ impl GuestMem for MprotectWindow {
         {
             let _ = (win_off, region_off, len, prot, backing);
             EINVAL
-        }
-    }
-}
-
-/// §9/§12 the JIT's [`AsyncCounter`]: the futex completion counter is a raw window address `phys`, so
-/// an offload worker bumps it with a real atomic — the same `phys` the JIT's `atomic.wait` value-check
-/// reads and the futex `notify` keys on. The run is quiesced before the window is freed
-/// ([`HostAsyncHooks::finish`]), so `phys` is live whenever a worker calls this.
-#[cfg(any(unix, windows))]
-struct PhysCounter {
-    phys: u64,
-}
-// SAFETY: `phys` is a stable, validated, committed window address; it is only ever atomic-accessed,
-// and the offload pool is drained before the window is unmapped (no use-after-free).
-#[cfg(any(unix, windows))]
-unsafe impl Send for PhysCounter {}
-#[cfg(any(unix, windows))]
-unsafe impl Sync for PhysCounter {}
-
-#[cfg(any(unix, windows))]
-impl AsyncCounter for PhysCounter {
-    fn increment(&self, delta: u64) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        // SAFETY: `phys` points at a 4-byte-aligned committed window word (validated in
-        // `async_counter`); the run drains the pool before freeing the window, so it stays live.
-        let a = unsafe { &*(self.phys as *const AtomicU32) };
-        a.fetch_add(delta as u32, Ordering::SeqCst);
-    }
-    fn key(&self) -> u64 {
-        self.phys
-    }
-}
-
-/// §9/§12 the `Host`-backed [`svm_jit::AsyncHostHooks`] for the asynchronous `IoRing.submit_async`:
-/// installs this JIT run's futex `notify` into the `Host` (which owns the offload pool) so a worker can
-/// wake a vCPU parked on a completion counter, and drains the pool at teardown. Construct it over the
-/// **same** `Host` whose pointer is the run's `cap_ctx`, and pass it to
-/// [`svm_jit::compile_and_run_capture_reserved_with_host_async`].
-pub struct HostAsyncHooks {
-    host: *mut Host,
-}
-
-impl HostAsyncHooks {
-    /// # Safety
-    /// `host` must point at the live `Host` used as the run's `cap_ctx`, and outlive the run.
-    pub unsafe fn new(host: *mut Host) -> HostAsyncHooks {
-        HostAsyncHooks { host }
-    }
-}
-
-impl svm_jit::AsyncHostHooks for HostAsyncHooks {
-    fn install_notify(&self, notify: Arc<dyn Fn(u64, u32) + Send + Sync>) {
-        // SAFETY: `host` is the live cap-ctx `Host`; install runs on the run thread before any vCPU.
-        unsafe { (*self.host).set_async_notify(notify) };
-    }
-    fn finish(&self) {
-        // SAFETY: same `Host`; called on the run thread after every vCPU has joined.
-        unsafe {
-            (*self.host).quiesce_pool();
-            (*self.host).clear_async_notify();
         }
     }
 }
@@ -3416,9 +3341,6 @@ pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
         "vm_region_map" => (cap_id::SHARED_REGION, 0),
         "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
         "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // IoRing submit/complete (§9/§12).
-        "vm_io_submit_async" => (cap_id::IO_RING, 1),
-        "vm_io_reap" => (cap_id::IO_RING, 2),
         // Guest-driven JIT (§22).
         "vm_jit_compile" => (cap_id::JIT, 0),
         "vm_jit_compile_linked" => (cap_id::JIT, 5),
@@ -3531,7 +3453,7 @@ unsafe fn powerbox_compile_run(
                 .unwrap_or_else(|e| e.into_inner())
                 .set_epoch_cell(ip as usize);
         }
-        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
+        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap);
         m.lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
@@ -3576,7 +3498,7 @@ unsafe fn powerbox_compile_run(
     // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
     // Single-threaded path only: the locked thunk never serves (see `cap_thunk_locked`).
     host.set_serve_native_ctx(&mut cm as *mut CompiledModule as usize);
-    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap, None);
+    let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap);
     host.set_jit_native_ctx(0);
     host.set_serve_native_ctx(0);
     r.map(|(outcome, snapshot)| JitRun {
@@ -3763,13 +3685,13 @@ fn value_slot(v: Value) -> i64 {
     }
 }
 
-/// Grant the full §3e powerbox — the seven fixed `VM_CAP_*` capabilities in canonical order
-/// (stdout, stdin, exit, memory, addrspace, ioring, jit) — returning the handles in that
+/// Grant the full §3e powerbox — the six fixed `VM_CAP_*` capabilities in canonical order
+/// (stdout, stdin, exit, memory, addrspace, jit) — returning the handles in that
 /// order for the manifest slot binding. Grants are deterministic, so two backends' hosts granted
 /// identically see matching handle values (the differential paths rely on this). (The mock
 /// `Blocking` cap left this set with CONSOLIDATION §5a — test harnesses that exercise the
 /// offload pool grant it themselves and register the `"blocking"` name.)
-fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
+fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 6] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
@@ -3789,7 +3711,6 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
         h.grant_exit(),
         h.grant_memory(),
         h.grant_address_space(0, win),
-        h.grant_io_ring(),
         // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
         // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
         h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
@@ -3806,7 +3727,7 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
 /// powerbox guest resolves against via `cap.self` (F7). A name-bound guest
 /// ([`instantiate_with_imports`]) instead resolves its own import names. One list, shared with the
 /// frontends: re-exported from `svm_ir` so the grant order and the emitters' vocabulary cannot drift.
-const POWERBOX_CAP_NAMES: [&str; 7] = svm_ir::POWERBOX_CAP_NAMES;
+const POWERBOX_CAP_NAMES: [&str; 6] = svm_ir::POWERBOX_CAP_NAMES;
 
 /// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
 /// whose results are `results`: assert the two backends agree (the differential oracle of
@@ -4764,7 +4685,7 @@ fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
         };
         let bindable = matches!(
             cap.type_id,
-            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::IO_RING | cap_id::JIT
+            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::JIT
         );
         if !bindable {
             return Err(format!(
@@ -5332,8 +5253,7 @@ impl Instance {
                 // vestigial handle: the slot binding IS the dispatch. A name outside the fixed
                 // policy leaves its slot unbound (a dispatch through it is a fail-closed
                 // `CapFault`).
-                let [stdout, stdin, exit, memory, addrspace, ioring, jit] =
-                    grant_powerbox_prefix(h, win);
+                let [stdout, stdin, exit, memory, addrspace, jit] = grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
                     use svm_interp::cap_id;
                     let bindings = self
@@ -5354,7 +5274,6 @@ impl Instance {
                                 // (op-keyed, like Stream above).
                                 (cap_id::ADDRESS_SPACE, 0..=3) => memory,
                                 (cap_id::ADDRESS_SPACE, _) => addrspace,
-                                (cap_id::IO_RING, _) => ioring,
                                 (cap_id::JIT, _) => jit,
                                 // e.g. SharedRegion: dynamic-mode only — never a manifest slot.
                                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),

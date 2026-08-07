@@ -39,7 +39,9 @@ never learns about.
   CoW clone is Phase-4, unlanded.
 - **Memory-authority objects exist**: `AddressSpace` (iface 5, attenuable to sub-ranges,
   can mint a child's), `SharedRegion` (§13), demand paging (parent-as-pager).
-- **Async exists**: `IoRing` (iface 9) — batched deferred `cap.call`s with offload.
+- **Async exists**: §12 parking-on-blocking — an offloadable host call punts to the offload
+  pool and parks the caller; completions deliver in submission order. (The `IoRing` prototype
+  was retired by the §12 re-measure, 2026-08-07; iface id 9 stays reserved.)
 - **The capability seam is open by construction** (§7/D46): interfaces are data + host
   code, bound by name at instantiation; `cap.self` reflection is an always-available,
   **runtime-resolved** intrinsic; acquisition is a granted `Resolver`.
@@ -95,7 +97,7 @@ Named gaps (each already a "follow-up" in code comments or docs):
 Two layers above the (unchanged) core VM:
 
 - **Substrate** — OS-neutral primitives: `Domain`, `Endpoint`, window sources, `Budget`,
-  plus the existing `Module`, `SharedRegion`, futex, `IoRing`, durable clone. Exit is
+  plus the existing `Module`, `SharedRegion`, futex, parked completions, durable clone. Exit is
   `(i64, trap kind)`; no channels, no signals, no fds. All of it ordinary §7 capability
   interfaces — **authority-TCB, not escape-TCB** (§2a): a substrate handler bug misuses
   its own authority; it cannot escape.
@@ -117,7 +119,7 @@ second personality never forces a re-layering.
 |---|---|---|
 | memory visible to parent? | **which window source you pass** to `create` | `AddressSpace` sub-range (nested carve — visible superset, §14) vs. platform window minter (detached — opaque) |
 | parent↔child interface | **which verb you drive with** | `call` (sync) / `resume` (coroutine) / `start`+`join` (concurrent) |
-| peer / cousin IPC | same mechanism as everything else | an `Endpoint` (sync `cap.call` or async via `IoRing`) granted to both parties |
+| peer / cousin IPC | same mechanism as everything else | an `Endpoint` (sync `cap.call` or async via parked completions) granted to both parties |
 | who is charged | **which `Budget` you pass** to `create` | budget lineage, not requester identity |
 | who implements my world | invisible to the child | every granted cap is host-, ancestor-, or peer-served — indistinguishable (§14) |
 
@@ -190,8 +192,8 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   §14's "the parent's own handler / pay-for-what-you-virtualize," made a mintable object
   rather than a special case. A personality is now implementable by **any** guest for its
   children — parent-as-POSIX-kernel, parent-as-pager, sibling-as-service.
-- **Async is not a second mechanism**: a client submits the same call through the
-  existing `IoRing`; sync vs async is per-call.
+- **Async is not a second mechanism**: a client makes the same call; a punting
+  (offloadable) dispatch parks the caller — sync vs async is per-call (§12).
 - **v1 scope is deliberately microkernel-lesson-sized**: synchronous rendezvous +
   kill-safe cancellation only. Kill of a parked *client* → the servicer's eventual
   `reply` is inert (generation-checked, like every stale handle). Kill of a *servicer* →
@@ -715,7 +717,7 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 | `getpid`, pid files | personality-local pids; no cross-tree pid meaning |
 | job control (`fg`/`bg`/`kill %1`) | personality bookkeeping over held handles; see the SIGSTOP gap below |
 | `exec` in place | spawn + transfer the pid label + exit — observable only to a peer inspecting window identity |
-| `select`/`poll`/`epoll` | needs one readiness convention across channel caps (futex word / `IoRing` completions) — design work, feasible |
+| `select`/`poll`/`epoll` | needs one readiness convention across channel caps (futex word / parked completions) — design work, feasible |
 
 **Absent (deliberate, or genuinely hard):**
 
@@ -820,7 +822,7 @@ Unchanged in substance from v1, restated against the substrate:
 | S10 | **Interposition gate** (stage 2.5): guest-implemented virtualizing-fs personality runs the BusyBox suite unmodified | S9 | todo |
 | S11 | R8 closure (`call_indirect` durable coverage); `clone` of parked domains (full-copy) + fork endpoint with duplicated reply token | S9, durable | todo |
 | S12 | Bash stage-3; suite subset as CI gate | S8,S11 | todo |
-| S13 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over IoRing; signals L1 (interruptible parks) + L2 (safepoint handlers, rides Phase-4 back-edge polls) + stop/continue (O12); pager-authority generalization incl. self-paging | S11 | parked |
+| S13 | CoW clone; detached-subtree freeze; `ModuleLoader`; async endpoints over parked completions; signals L1 (interruptible parks) + L2 (safepoint handlers, rides Phase-4 back-edge polls) + stop/continue (O12); pager-authority generalization incl. self-paging | S11 | parked |
 | S14 | Second personality (actor-model sketch) — the design-for-two check, build only when wanted | S9,S5 | parked |
 | S15 | **§7 late-binding completion — retire the fixed powerbox.** The fixed 8-slot `_start` / `__vm_cap(slot)` convention is an *implicit positional agreement* (a silent slot numbering duplicated across chibicc's `*_SLOT` defines, `include/svm.h`'s `VM_CAP_*`, and every runner's grant order — nothing checks it; a wrong grant order is a runtime CapFault at best). DESIGN.md §7 [SETTLED] already names the replacement: "late binding is the **general form** of the powerbox — a module declares its capability imports by name and the host resolves each to a registered implementation **+ handle**"; the module's **import section is the manifest** (discoverable, fail-closed, signature-checkable), and `cap.self` reflection audits the held set at runtime. Stages: **(a) done** — `svm_ir::Resolved::CapBound` (name → `(type_id, op)` **+ granted handle**, patched into a `ConstI32` placeholder like `Resolved::Slot`; grant-before-resolve ordering) + the POSIX personality binds handle-free (`svm_posix::resolve_bound`; real-C differential `c_posix.rs` — plain `open(path, flags)` / `getenv(name)` / `malloc(n)` signatures, no slot anywhere); **(b) done** — a guest **definition** of `write`/`read`/`exit` now **shadows** chibicc's Stream/Exit builtin (gate the interception on `!is_definition` — a real function beats a compiler builtin; a bare `extern write` still gets the builtin, so fixed-powerbox programs are unchanged). So the POSIX libc shim uses the *standard* names — `write(fd, buf, n)` reaches the personality with `fd` preserved (the builtin dropped it), forwarding to a placeholder-handle `call.import` bound by (a). Chose the definition-shadow path over re-emitting the builtins as fd-preserving imports: contained to programs that link the personality libc, no default-runner/`c_frontend.rs` migration. Regression tests: `c_defined_write_shadows_the_builtin` / `c_undefined_write_still_hits_the_builtin` (`c_frontend.rs`); `c_write_then_exit_through_the_personality` (`c_posix.rs`). **(c)** `_start` takes no positional handles — stdout/stdin/exit/memory/… migrate to named imports, `__vm_cap`/`VM_CAP_*`/the reserved-region stash retire (`cap.self` remains the reflective enumeration). A staged migration (two frontends + the escape-gated run path + dozens of positional test sites): **(c1) done** — runner-side `svm_run::powerbox_resolver` (name → `(type_id, op)` **+ granted handle**, `CapBound`; `Stream` disambiguated by op; runtime-minted `SharedRegion` handles decline, to compose with a plain-`Cap` resolver), proven against a hand-authored **paramless `_start`** reaching the real `Stream`+`Exit` caps by name on both backends (`powerbox_named.rs`); **(c2) done** — chibicc `emit_start` takes **no params**; its prologue resolves each powerbox cap **by name** (`cap.self.resolve("stdout")`, …) into the reserved stash slot (so the builtins, which still *load* the stash, and `__vm_cap`, which reads it, are **unchanged** — the reserved region is now a private guest cache, not a guest/host slot-index contract). The chosen path is *runtime name resolution*, not load-time `CapBound`: a powerbox cap is used both as a builtin (would-be placeholder) **and** with an explicit handle (`vm_page_size(__vm_cap(3))`), and one name can't be `CapBound` at both sites — cap.self.resolve sidesteps that. `_start` is tagged `export "_start" 0`; the runner's `is_named_powerbox_entry` recognizes it, grants + registers the fixed powerbox by name (F7) and runs func 0 with `&[]`. The **positional path is untouched** (svm-llvm, hand-written IR, `run.rs` still bind 3–8 `i32` params), so the flip is backward-compatible. Migrated the `powerbox()`/`run_c*` harnesses in `c_frontend.rs` (grant+register, run `&[]`) and `c_posix.rs` (personality-only: no powerbox grant; the by-name resolves stash `-errno`, never loaded). Verified: `c_frontend` 90 + `c_posix` 3 + the `svm-run` CLI on a real `.c`. **(c2-followup) done** — a per-program **used-caps scan** (`scan_prog_caps` walks the AST; bit per `VM_CAP_*` index, stdio counted only when unshadowed, `__vm_cap` ⇒ all): `_start` resolves *only* the caps the program reaches, so a **personality-only program resolves none** and depends on no powerbox grant. **(c3)+(c4) done — the by-name unification of the whole embedding API.** The insight: the wasm-style arbitrary-imports entry loads its handle from the *same stash slots* (`i32.load 0/4`) as the fixed powerbox, so **one** paramless `_start` resolving a *name list* serves both — powerbox cap names for the fixed set, the module's own import names for the arbitrary set. Landed: `svm_ir::build_powerbox_start` is now paramless + resolves a name list (`cap.self.resolve`); `synth_powerbox_start` passes `POWERBOX_CAP_NAMES[..n]` (a new `svm-ir` const), `synth_powerbox_start_with_names` / `synth_powerbox_start_for_imports` cover the arbitrary case; `svm-capi` gains `svm_module_synth_powerbox_start_for_imports`; `Instance::grant_caps`'s `Some(binding)` path registers names + runs `&[]` for a paramless entry (positional still supported for a legacy entry). **svm-llvm's own `synth_start`/`synth_start_argv`** now emit the paramless by-name `_start` + `export "_start" 0` too (each name staged in its stash slot — the mapped low region, since svm-llvm's data-SP sits at the window's mapped edge). Verified: the whole in-workspace embedding suite (`powerbox_run`/`imports`/`reactor`/`instantiate`, `abi_tests`) **and** the full off-workspace `svm-llvm` translate suite (313 tests, clang-backed, incl. argv + fs/mmap demos). **c4:** no frontend or synth path emits a positional `_start` any more — the fixed positional powerbox is fully retired; the runner *keeps* positional entry support as a low-level primitive (hand-written IR kernels that take cap handles as args — a valid pattern, `run.rs`), which is *not* dead code, so nothing is removed there. **(d)** resolve-time signature validation (structural compare of the import's declared sig against the registered op's, §7's "type-safety without an IDL") — the last piece | — | **(a)+(b) done** (PR #316), **(c1)+(c2)+(c2-followup)+(c3)+(c4) done** (PR #327/#332); (d) landed as IMPORTS.md phase-1 manifest validation. **Superseded (IMPORTS.md phases 1–4):** executable manifest slots replaced the resolve-time machinery — the S15 (a)/(c1)/(c3) artifacts (`Resolved::CapBound`, `resolve_bound`, `powerbox_resolver`, the `synth_powerbox_start*` family, the stash bootstrap, the runner's positional-entry powerbox) are **deleted** in phase 4; the §2.5 grep-clean gate (`crates/svm/tests/imports_gate.rs`) keeps them gone |
 
@@ -852,7 +854,7 @@ to processes).]** The substrate is four capability-shaped objects — `Domain`
 `Endpoint` (mintable guest-serviceable interfaces — §14's virtualization as mechanism),
 window sources (visibility = provenance: nested `AddressSpace` carve vs. platform-minted
 detached window), and `Budget` (§15's quota as a passable, splittable object) — riding
-existing machinery (`Module`, `SharedRegion`, futex, `IoRing`, D60 durable clone). Every
+existing machinery (`Module`, `SharedRegion`, futex, parked completions, D60 durable clone). Every
 process "dial" is an argument or a verb, never a mode flag; OS semantics (POSIX for
 Bash/BusyBox first; others by design) are guest-library personalities the substrate never
 learns. One deliberate amendment to settled text: `cap.self` gains a read-only,

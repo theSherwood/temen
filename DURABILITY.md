@@ -731,7 +731,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
   (`Host::drain_non_durable` closes the live non-durable handles so a domain that held out-of-line authority
   becomes snapshottable — the actionable form of "freeze refuses unless drained"; §12.5). **Remaining:** the
   rest of the non-STW Phase-4 items — CoW clone, `SharedRegion` consistent-cut (R4), full `Blocking.work`
-  offload cancellation (R2), and in-flight `IoRing`/`Blocking` residue draining (idle handles drain today).
+  offload cancellation (R2), and in-flight `Blocking` residue draining (idle handles drain today).
 
 ---
 
@@ -887,8 +887,7 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`SharedRegion(u32)` (R4), `Module(u32)`, `IoRing(u32)` (drain residue §5),
-`Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitDomain`/`JitCode` handles were here until
+`SharedRegion(u32)` (R4), `Module(u32)`, `Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitDomain`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is
@@ -919,11 +918,11 @@ succeeds, so a subtree that held non-durable authority becomes **snapshottable**
 "freeze refuses unless the non-durable handles are closed/drained first". The freeze is host-driven (STW),
 so the embedder calls this at a freeze safepoint (the STW quiesce + §12.8 4A.7 guarantee no vCPU is
 mid-host-call; async offload residue drains via `quiesce_pool` first). Pinned by
-`svm-interp/tests/handle_durability.rs` (drain makes a clock+io_ring+host_fn domain snapshottable; a
+`svm-interp/tests/handle_durability.rs` (drain makes a clock+blocking+host_fn domain snapshottable; a
 drained handle faults at its use site; an all-durable drain is a no-op) and
 `svm-snapshot/tests/roundtrip.rs::freeze_succeeds_after_draining_a_non_durable_handle` (the freeze
 *refusal* becomes a successful serialize after the drain). *In-flight residue* draining for a busy
-`IoRing`/`Blocking` (vs. an idle handle) rides the §5 run-end pool quiesce / the deferred `Blocking`
+`Blocking` (vs. an idle handle) rides the §5 run-end pool quiesce / the deferred `Blocking`
 cancellation (R2); the guest-facing first-class `cap.self.close` op (vs. this host primitive) is a possible
 ergonomics follow-up.
 
@@ -1283,9 +1282,9 @@ host call"). The cut: once an async freeze has **landed** (the global freeze wor
 vCPU **refuses to enter** a new blocking host call — `cap_dispatch_slots` fails closed with `Trap::ThreadFault`
 (mirroring the `thread.wait` deadlock fail-closed) instead of starting an un-checkpointable offload. So snapshot
 latency excludes *new* host calls once a freeze is requested (narrowing R6); cancelling an *already in-flight*
-call is the full offload-cancellation story, still deferred (R2). Both the **direct** `Blocking.work` cap.call and
-a **batched** `io_ring.submit` that would offload `Blocking` SQEs onto the pool are gated (each parks a vCPU with
-no poll site); an all-inline submit parks nothing and is unaffected. The refusal lives in the **shared** capability
+call is the full offload-cancellation story, still deferred (R2). The **direct** `Blocking.work` cap.call is gated (it parks a vCPU with
+no poll site); the batched `io_ring.submit` variant of this gate left with the ring's §12
+retirement (2026-08-07). The refusal lives in the **shared** capability
 dispatch that *both* backends funnel a `cap.call` through (the JIT via `svm-run`'s `cap_thunk`), so it is
 backend-agnostic. It is gated on `Host::is_durable` (a non-durable guest's byte at window offset 0 is ordinary
 data, not a freeze word): durability is now declared on the *Host* for durable runs on **both** backends — the

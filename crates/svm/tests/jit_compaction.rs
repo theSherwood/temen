@@ -69,7 +69,7 @@ const DISPATCH_PARENT: &str = "func (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32
 /// Dispatch `slot` with `(a, b)` through the parent entry; expect a returned scalar.
 fn dispatch(cm: &mut CompiledModule, slot: u32, a: i32, b: i32) -> i64 {
     let (out, _) = cm
-        .run(&[slot as i64, a as i64, b as i64], None, None, None)
+        .run(&[slot as i64, a as i64, b as i64], None, None)
         .expect("run");
     match out {
         JitOutcome::Returned(s) if s.len() == 1 => s[0],
@@ -186,7 +186,7 @@ fn recompaction_preserves_slots_across_a_gap() {
     assert!(cm.uninstall(slots[1]));
     assert_eq!(dispatch(&mut cm, slots[0], 2, 3), 106); // 2*3 + 100
     assert_eq!(dispatch(&mut cm, slots[2], 2, 3), 306); // 2*3 + 300
-    let (gap, _) = cm.run(&[slots[1] as i64, 2, 3], None, None, None).unwrap();
+    let (gap, _) = cm.run(&[slots[1] as i64, 2, 3], None, None).unwrap();
     assert!(matches!(
         gap,
         JitOutcome::Trapped(TrapKind::IndirectCallType)
@@ -208,9 +208,7 @@ fn recompaction_preserves_slots_across_a_gap() {
     // Exact-slot transparency: 1 and 3 resolve as before, 2 is still a trapping hole.
     assert_eq!(dispatch(&mut fresh, slots[0], 2, 3), 106);
     assert_eq!(dispatch(&mut fresh, slots[2], 2, 3), 306);
-    let (gap, _) = fresh
-        .run(&[slots[1] as i64, 2, 3], None, None, None)
-        .unwrap();
+    let (gap, _) = fresh.run(&[slots[1] as i64, 2, 3], None, None).unwrap();
     assert!(
         matches!(gap, JitOutcome::Trapped(TrapKind::IndirectCallType)),
         "the uninstalled gap must remain a trapping padding slot: {gap:?}"
@@ -337,7 +335,7 @@ fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>
         // Call: dispatch the live slot with x = i + 2; the accumulator lives in window[0].
         let x = (i as i64) + 2;
         let (out, m2) = cm
-            .run(&[slot as i64, x], Some(&mem), Some(1 << 18), None)
+            .run(&[slot as i64, x], Some(&mem), Some(1 << 18))
             .expect("dispatch run");
         mem = m2;
         match out {
@@ -460,7 +458,7 @@ fn recompaction_carries_live_invoke_only_unit() {
 
     // And V is still reachable at its exact slot via call_indirect (5*6 + 99 = 129).
     let (out, _) = cm2
-        .run(&[v_slot as i64, 5, 6], None, Some(1 << 18), None)
+        .run(&[v_slot as i64, 5, 6], None, Some(1 << 18))
         .expect("dispatch V");
     // (slot, x) shell: but V's slot dispatch uses the shell entry (slot, x) -> unit[slot](x,x).
     match out {

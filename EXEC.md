@@ -80,7 +80,7 @@ close(job)                                    -> 0 | -errno
   ambient.
 - **Blocking profile** (same interface, different resource): `host_exec`'s
   `run` blocks a host thread — it is `Blocking`-shaped and offloadable
-  through the existing `IoRing` pool; `domain_exec`'s `run` parks a
+  through the §12 offload pool (a parked completion); `domain_exec`'s `run` parks a
   fiber. Guests see one synchronous op either way.
 - **Determinism**: `scripted_exec` is fully deterministic (the test and
   browser grant); `domain_exec` is deterministic under fuel;

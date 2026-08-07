@@ -2016,7 +2016,7 @@ fn jit_compile(m: &Module) -> CompiledModule {
 }
 
 fn jit_call(cm: &mut CompiledModule, input: i64) -> i64 {
-    match cm.run(&[input], None, None, None) {
+    match cm.run(&[input], None, None) {
         Ok((JitOutcome::Returned(v), _)) => v[0],
         o => panic!("jit outcome {o:?}"),
     }

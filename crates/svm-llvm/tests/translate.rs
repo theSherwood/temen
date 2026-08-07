@@ -224,7 +224,7 @@ fn jit_compile_once_run_many() {
         other => panic!("unexpected outcome {other:?}"),
     };
     for x in [3i64, 10, -4] {
-        let once = val(cm.run(&[sp, x], None, None, None).expect("run").0);
+        let once = val(cm.run(&[sp, x], None, None).expect("run").0);
         let one_shot = val(svm_jit::compile_and_run(&t.module, e, &[sp, x]).expect("one-shot"));
         assert_eq!(once, one_shot, "compile-once vs one-shot at x={x}");
         assert_eq!(once, (x * x + 1) as i32, "result at x={x}");
@@ -7134,10 +7134,10 @@ long twice(long x) { return x + x; }
 // ---- §7 capability reflection: `__vm_cap_count` / `__vm_cap_at` → `cap.self.count` / `.get` -----
 
 /// Capability **reflection**: a domain discovers what its host granted it. Run on the interpreter
-/// under a full 8-handle powerbox host (the grants live in the host-owned table `cap.self.*` reads,
-/// independent of the call's params), so `__vm_cap_count()` returns 8 and `__vm_cap_at(0, &t)` yields
-/// a valid (non-negative) interface type_id. Returns count*10 + (t >= 0) = 81. Interpreter-only (the
-/// JIT bails `Unsupported` on `cap.self`, like fibers).
+/// under a full 7-handle test powerbox host (the grants live in the host-owned table `cap.self.*`
+/// reads, independent of the call's params), so `__vm_cap_count()` returns 7 and `__vm_cap_at(0, &t)`
+/// yields a valid (non-negative) interface type_id. Returns count*10 + (t >= 0) = 71.
+/// Interpreter-only (the JIT bails `Unsupported` on `cap.self`, like fibers).
 #[test]
 #[cfg(unix)]
 fn vm_cap_reflection() {
@@ -7172,7 +7172,6 @@ int f(void) {
         h.grant_exit(),
         h.grant_memory(),
         h.grant_address_space(0, win),
-        h.grant_io_ring(),
         h.grant_blocking(std::time::Duration::ZERO, None),
         h.grant_jit(None),
     ];
@@ -7181,12 +7180,12 @@ int f(void) {
         .expect("interp run");
     assert_eq!(
         r,
-        vec![Value::I32(81)],
-        "cap reflection: 8 caps, type_id >= 0"
+        vec![Value::I32(71)],
+        "cap reflection: 7 caps, type_id >= 0"
     );
 }
 
-// ---- §9/§12 async I/O ring: `__vm_io_submit_async` / `__vm_io_reap` / `__vm_blocking_handle` ------
+// ---- §12 Blocking / test powerbox helpers -------------------------------------------------------
 
 /// Grant a powerbox on an interpreter `Host`, returning the first `n` handles (the prefix `_start`
 /// declares) as call args. Mirrors `svm/tests/c_frontend.rs::powerbox`; `block` is the `Blocking`
@@ -7208,22 +7207,20 @@ fn grant_powerbox(
         h.grant_exit(),
         h.grant_memory(),
         h.grant_address_space(0, win),
-        h.grant_io_ring(),
         h.grant_blocking(block, None),
         h.grant_jit(mem_log2),
     ];
     // Register each granted cap under its canonical name (`cap.self.resolve` — the discovery tier;
     // `__vm_blocking_handle` and `__vm_cap_resolve` use it). The entry runs with `&[]`. This is the
-    // *test* powerbox: the product's seven names (`svm_ir::POWERBOX_CAP_NAMES`) plus the test-only
-    // `Blocking` mock at its historical slot 6 (§5a — the async demos exercise the offload pool
-    // through it, so this harness grants and names it itself).
-    const TEST_NAMES: [&str; 8] = [
+    // *test* powerbox: the product's six names (`svm_ir::POWERBOX_CAP_NAMES`) plus the test-only
+    // `Blocking` mock (§5a — the blocking tests exercise the offload pool / §12 parking through
+    // it, so this harness grants and names it itself).
+    const TEST_NAMES: [&str; 7] = [
         "stdout",
         "stdin",
         "exit",
         "memory",
         "addrspace",
-        "ioring",
         "blocking",
         "jit",
     ];
@@ -7261,9 +7258,8 @@ fn bind_powerbox_imports(h: &mut svm_interp::Host, m: &svm_ir::Module, granted: 
                 // whole-window grant, sub/region_create → the sized one.
                 (cap_id::ADDRESS_SPACE, 0..=3) => hv(3),
                 (cap_id::ADDRESS_SPACE, _) => hv(4),
-                (cap_id::IO_RING, _) => hv(5),
-                (cap_id::BLOCKING, _) => hv(6),
-                (cap_id::JIT, _) => hv(7),
+                (cap_id::BLOCKING, _) => hv(5),
+                (cap_id::JIT, _) => hv(6),
                 _ => return svm_interp::BoundImport::rebindable(0, 0, None),
             };
             svm_interp::BoundImport::required(cap.type_id, cap.op, handle)
@@ -7272,130 +7268,16 @@ fn bind_powerbox_imports(h: &mut svm_interp::Host, m: &svm_ir::Module, granted: 
     h.set_import_bindings(bindings);
 }
 
-/// The host's deterministic `Blocking.work(i)` result (mirrors `svm_interp::AsyncState::mix`, the
-/// value the chibicc async tests check).
-fn async_mix(arg: i64) -> i64 {
-    arg.wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)
-}
-
-/// The async **event-loop runtime** in real C (`demos/async_io`), driven through the LLVM on-ramp:
-/// one vCPU `submit_async`s a batch of `Blocking` ops onto the host offload pool, parks on an in-window
-/// completion counter (`__vm_wait32`), and reaps completions as a pool worker `notify`s it — exercising
-/// `__vm_io_submit_async`/`__vm_io_reap`/`__vm_blocking_handle` and the **7-handle powerbox**
-/// (`synth_start` now grants through `Blocking`) end to end. Interpreter-only (it is the M:N executor
-/// and offload-pool oracle; the JIT async path needs the separate `HostAsyncHooks` harness). The
-/// printed total is completion-order-invariant: Σ mix(i) for i in 0..8.
-#[test]
-#[cfg(unix)]
-fn vm_async_io_runtime() {
-    let src = include_str!("../../svm-run/demos/async_io/async_io.c");
-    let Some(bc) = compile_to_ll("async_io", src) else {
-        return;
-    };
-    let m = svm_llvm::translate_ll_path(&bc)
-        .expect("translate bitcode")
-        .module;
-    // The async-ring imports are registered and the entry grants through Blocking (7 handles).
-    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
-    assert!(
-        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
-        "expected async-ring imports, got {import_names:?}"
-    );
-    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
-    svm_verify::verify_module(&module).expect("verify resolved IR");
-    // Phase 3: `_start` has **no** resolve prologue — the manifest is the declaration and the host
-    // binds slots at instantiation.
-    let ncaps = module.funcs[0].blocks[0]
-        .insts
-        .iter()
-        .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
-        .count();
-    assert_eq!(ncaps, 0, "phase 3: no resolve prologue in _start");
-
-    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let mut h = svm_interp::Host::new();
-    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
-    bind_powerbox_imports(&mut h, &module, &granted);
-    let mut fuel = 500_000_000u64;
-    let out =
-        svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
-    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
-    // NTASKS = 8 (see the demo); the total is Σ of the host's deterministic per-op results.
-    let total: u64 = (0..8).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
-    assert_eq!(
-        h.stdout,
-        format!("{total}\n").into_bytes(),
-        "async total Σ mix(0..8)"
-    );
-}
-
-/// The chibicc `async_work_stealing` demo through the LLVM on-ramp: the async **work-stealing M:N
-/// runtime** (the union of the stackless work-stealing scheduler and the async submit/complete ring).
-/// `NWORKERS` vCPUs cooperatively drain `NTASKS = 16` I/O-bound tasks, each issuing a `Blocking` op
-/// through the ring; a worker **never blocks on an I/O** — it `submit_async`s and moves on, parking on
-/// the completion counter only when nothing is runnable, woken by a pool worker's `notify`. Combines
-/// the guest pthread shim (`thread.spawn` + futex), the async ring (`__vm_io_*` → 7-handle powerbox),
-/// and the offload pool. Interpreter-only (the M:N executor + offload-pool oracle; the JIT async path
-/// needs the separate `HostAsyncHooks` harness), exactly like `vm_async_io_runtime`. The total is
-/// completion-order- *and* interleaving-invariant: Σ mix(i) for i in 0..16. Mirrors
-/// `c_frontend::c_guest_async_work_stealing`.
-#[test]
-#[cfg(all(unix, target_arch = "x86_64"))]
-fn vm_async_work_stealing_runtime() {
-    let Some(bc) = compile_demo_libc_to_ll(
-        "async_work_stealing",
-        "async_work_stealing/async_work_stealing.c",
-    ) else {
-        return;
-    };
-    let m = svm_llvm::translate_ll_path(&bc)
-        .expect("translate bitcode")
-        .module;
-    let import_names: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
-    assert!(
-        import_names.contains(&"vm_io_submit_async") && import_names.contains(&"vm_io_reap"),
-        "expected async-ring imports, got {import_names:?}"
-    );
-    let module = m; // phase 3: the manifest binds at instantiation - no rewrite
-    svm_verify::verify_module(&module).expect("verify resolved IR");
-    // Phase 3: `_start` has **no** resolve prologue — the manifest is the declaration and the host
-    // binds slots at instantiation.
-    let ncaps = module.funcs[0].blocks[0]
-        .insts
-        .iter()
-        .filter(|i| matches!(i, svm_ir::Inst::CapSelfResolve { .. }))
-        .count();
-    assert_eq!(ncaps, 0, "phase 3: no resolve prologue in _start");
-
-    let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let mut h = svm_interp::Host::new();
-    let granted = grant_powerbox(&mut h, win, 7, std::time::Duration::from_millis(10));
-    bind_powerbox_imports(&mut h, &module, &granted);
-    let mut fuel = 1_000_000_000u64;
-    let out =
-        svm_interp::run_with_host(&module, 0, &[], &mut fuel, &mut h).expect("interp async run");
-    assert_eq!(out, vec![Value::I32(0)], "async demo returns 0");
-    // NTASKS = 16 (see the demo); the total is Σ of the host's deterministic per-op results.
-    let total: u64 = (0..16).fold(0u64, |a, i| a.wrapping_add(async_mix(i) as u64));
-    assert_eq!(
-        h.stdout,
-        format!("{total}\n").into_bytes(),
-        "async total Σ mix(0..16)"
-    );
-}
-
-/// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`) now that `synth_start` stashes them:
-/// `__vm_cap(6)` (the Blocking slot) must equal `__vm_blocking_handle()` — both read stash slot 24.
-/// Proves the relocated 8-handle layout is wired through both the generic `__vm_cap` reader and the
-/// named builtin. Run on the interpreter under the 7-handle powerbox.
+/// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`): `__vm_cap(5)` (the test
+/// powerbox's Blocking slot) must equal `__vm_blocking_handle()` — the generic index reader and the
+/// named builtin agree. Run on the interpreter under the 7-handle test powerbox.
 #[test]
 #[cfg(unix)]
 fn vm_cap_index_reaches_tail_handles() {
     let src = r#"
 int __vm_blocking_handle(void);
 int __vm_cap(int i);
-int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
+int main(void) { return (__vm_cap(5) == __vm_blocking_handle()) ? 7 : 0; }
 "#;
     let Some((m, _)) = translate_verified("vm_cap_tail", src) else {
         return;
@@ -7420,14 +7302,14 @@ int main(void) { return (__vm_cap(6) == __vm_blocking_handle()) ? 7 : 0; }
     assert_eq!(
         r,
         vec![Value::I32(7)],
-        "__vm_cap(6) == __vm_blocking_handle()"
+        "__vm_cap(5) == __vm_blocking_handle()"
     );
 }
 
 // ---- §22 guest-driven JIT: `__vm_jit_compile` / `invoke2` / `release` / `install` / `uninstall` ---
 
 /// Structural: every guest-driven-JIT builtin lowers to a `CallImport` on the `Jit` import, and a
-/// program using them is granted the full 8-handle powerbox (the `Jit` handle is the last `VM_CAP_*`
+/// program using them is granted the full test powerbox (the `Jit` handle is the last `VM_CAP_*`
 /// index, so `synth_start` grants the whole prefix). Verifies the import table + entry arity without
 /// the (heavier) end-to-end blob dance below.
 #[test]
@@ -7547,7 +7429,7 @@ long __vm_jit_uninstall(long slot);\n";
 /// serialized SVM IR for a *distinct* unit at runtime and `__vm_jit_compile` it — so several
 /// `Jit.compile`s are in flight at once — then `__vm_jit_invoke2` the freshly-native code and check it
 /// against a C reference on a grid of inputs. Combines the guest pthread shim (`thread.spawn`) with the
-/// `Jit` capability + the **8-handle powerbox**; the host serializes the concurrent compiles through
+/// `Jit` capability + the **7-handle test powerbox**; the host serializes the concurrent compiles through
 /// the per-domain `Mutex<Host>` (engaged automatically for a `thread.spawn`ing guest) while execution
 /// stays parallel. Prints `0` — no worker's concurrently-JITed unit disagreed.
 ///
