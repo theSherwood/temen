@@ -474,6 +474,11 @@ pub struct SpecConfig {
     /// default. The paired return side (`poscall`) is not yet modeled — a callee return still bails via
     /// a [`deopt_edges`](Self::deopt_edges) / [`deopt_targets`](Self::deopt_targets) to the baseline.
     pub precall_model: Option<PrecallModel>,
+    /// **Tail-call post-state model** (see [`PretailcallModel`]) — the `OP_TAILCALL` counterpart of
+    /// [`precall_model`](Self::precall_model): `return f(x)` goes through `luaD_pretailcall`, which
+    /// *reuses* the current frame instead of pushing one. `None` (the default) leaves
+    /// `luaD_pretailcall` to the ordinary cut treatment (unknown result ⇒ both arms explored).
+    pub pretailcall_model: Option<PretailcallModel>,
 }
 
 /// The static description a [`SpecConfig::precall_model`] needs to bind a `luaD_precall` cut's result
@@ -532,6 +537,29 @@ pub struct PoscallModel {
     /// caller cell stays folded. A returning `ci` not listed here gets the plain full reload. Empty by
     /// default (the whole-frame reload of the non-rolling case).
     pub selective: Vec<(u64, u8)>,
+}
+
+/// The static description for a `luaD_pretailcall` cut (`return f(x)` — `OP_TAILCALL`). Unlike
+/// `luaD_precall`, a tail call **reuses the current frame**: the callee closure and its arguments are
+/// moved down to the frame's own `func` slot, `L->ci` is unchanged, and the eventual return pops
+/// straight to the *caller's* caller. Sites are keyed by the (constant) `ra` of the callee's temp
+/// slot, exactly like [`PrecallModel::lua_sites`]. For a matching Lua site the cut's `int` result is
+/// bound **negative** (the "Lua callee, frame moved" arm), `L->ci` is pinned to the site's
+/// `callee_ci` (the *reused* node — normally already there), and the site's pins install the moved
+/// closure and the callee's `savedpc`. A non-matching `ra` falls back to the plain state-touching cut
+/// (unknown result, full reload).
+#[derive(Clone, Debug)]
+pub struct PretailcallModel {
+    /// The cut callee that performs the frame replacement (`luaD_pretailcall`). Must also be in a
+    /// cut set (it is emitted opaquely either way; this model only chooses the abstract post-state).
+    pub pretailcall: u32,
+    /// Which argument of the call is the callee's stack slot `ra` (0-based).
+    pub ra_arg: usize,
+    /// The address of the `L->ci` field (same cell as [`PrecallModel::l_ci_addr`]).
+    pub l_ci_addr: u64,
+    /// Tail-call sites. `callee_ci` is the **reused** frame node; `pins` carry the moved closure slot
+    /// and the per-callee `ci` fields (`savedpc`), exactly like a shared-`CallInfo` sequential site.
+    pub sites: Vec<LuaSite>,
 }
 
 /// One Lua call site for the [`PrecallModel`]. On a `precall` whose `ra` matches, the result (`newci`)
@@ -1448,6 +1476,17 @@ impl Spec<'_> {
                         }
                     }
                 }
+                // Tail-call post-state model (see [`SpecConfig::pretailcall_model`]): like the precall
+                // model, but the frame is REUSED — result bound negative for the Lua arm, no new ci.
+                if let Some(tm) = &self.config.pretailcall_model {
+                    if callee == tm.pretailcall {
+                        let ridx = self.cut[&callee];
+                        let results =
+                            self.emit_pretailcall(ridx, callee, &args_abs, tm, mem, out, rnext)?;
+                        env.extend(results);
+                        continue;
+                    }
+                }
                 // Cut set: a call-out we deliberately keep opaque (see [`SpecConfig::cut_calls`]).
                 // Emit it as a residual `call` to the carried callee and treat its results as
                 // unknowns — never inline or fold through it. Only *explicitly listed* callees are cut;
@@ -1719,6 +1758,66 @@ impl Spec<'_> {
             Ok(r)
         } else {
             // Unrecognized: plain touch-state (unknown result, reload).
+            let r = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
+            self.reload_cells_natural(mem, out, rnext)?;
+            Ok(r)
+        }
+    }
+
+    /// Emit a `luaD_pretailcall` cut with the **tail-call post-state model** ([`PretailcallModel`]).
+    /// The call is emitted opaquely (spill first, like every state-touching cut); the model only
+    /// chooses the abstract post-state:
+    /// - **Lua site** (`ra` in [`PretailcallModel::sites`]): the frame was *reused* — the callee
+    ///   closure and its arguments were moved down onto it. Result 0 binds **negative** so the
+    ///   `n < 0` branch folds to the Lua re-dispatch edge; `L->ci` is pinned to the (unchanged)
+    ///   frame node and the site's pins install the moved closure slot and the callee `savedpc`.
+    /// - **Unrecognized `ra`**: plain touch-state (unknown result, full reload).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_pretailcall(
+        &self,
+        ridx: u32,
+        callee: u32,
+        args_abs: &[Abs],
+        tm: &PretailcallModel,
+        mem: &mut BTreeMap<u64, (u32, Abs)>,
+        out: &mut Vec<Inst>,
+        rnext: &mut u32,
+    ) -> Result<Vec<Abs>, SpecError> {
+        let ra = match args_abs.get(tm.ra_arg) {
+            Some(Abs::Const(k)) => k.as_i64().map(|v| v as u64),
+            _ => None,
+        };
+        let site = ra.and_then(|ra| tm.sites.iter().find(|s| s.ra == ra));
+        // Spill so the opaque cut observes the current state, then emit the call.
+        self.write_back_cells(mem, out, rnext)?;
+        let args: Vec<u32> = args_abs
+            .iter()
+            .map(|&a| materialize(a, out, rnext))
+            .collect();
+        out.push(Inst::Call { func: ridx, args });
+        let nres = self.module.funcs[callee as usize].results.len();
+        if let Some(site) = site {
+            // The reused frame: L->ci unchanged (re-pinned for robustness), moved slots pinned.
+            mem.insert(
+                tm.l_ci_addr,
+                (8, Abs::Const(Known::I64(site.callee_ci as i64))),
+            );
+            for &(addr, val) in &site.pins {
+                mem.insert(addr, (8, Abs::Const(Known::I64(val as i64))));
+            }
+            // A value slot is consumed for every result (result 0's is discarded for the constant)
+            // so `rnext` stays in sync with the residual's value numbering — see `emit_precall`.
+            Ok((0..nres)
+                .map(|k| {
+                    let slot = Abs::Dyn(bump(rnext));
+                    if k == 0 {
+                        Abs::Const(Known::I32(-1))
+                    } else {
+                        slot
+                    }
+                })
+                .collect())
+        } else {
             let r = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
             self.reload_cells_natural(mem, out, rnext)?;
             Ok(r)

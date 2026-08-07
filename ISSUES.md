@@ -149,6 +149,27 @@ per-function-residual execution model working recursively; the remaining step to
 stitch is the guard (closure-identity check with baseline fallback — today the transfer is
 unconditional, valid only because the captured run is deterministic).
 
+**Guarded stitch + float returns + tail calls (2026-08-07)** — three more of the named follow-ups:
+
+- *Guarded stitch* (`lua_futamura_call_stitch_guard`) — the deployable shape, **no engine surface**:
+  the stitch handler is a hand-built `() -> ()` function (what a stitch compiler would emit) that
+  loads the callee closure pointer from the spilled window, compares against the expected constant,
+  and tail-calls the continuation on a match or the **pristine baseline `luaV_execute`** (with
+  materialized `(sp, L, ci)`) on a mismatch. Both paths proven by *poisoning the arm that must not
+  be taken*: match variant (fallback poisoned) and mismatch variant (continuation poisoned, real
+  baseline resumes from the spilled window at the callee frame and completes the program) both print
+  byte-identically.
+- *Float returns* (`lua_futamura_call_float`) — `PoscallModel::selective` generalizes beyond
+  integers: `print(half(5) + 0.25)` with the return tag **discovered at capture** (read from the
+  result slot at print's precall break, `0x13`), float fast-path folds, `2.75` byte-identical.
+- *Tail calls* (`lua_futamura_call_tail`) — `return f(x)` via `luaD_pretailcall`, the frame-REUSE
+  shape, via a new small engine model (`SpecConfig::pretailcall_model` / `PretailcallModel`,
+  mirroring the precall model): at a matching `ra` the cut's int result binds negative (the Lua
+  "frame moved" arm folds), `L->ci` stays on the reused node, and per-occupancy pins install the
+  moved closure slot + callee `savedpc` (the facet-(c) pinning applied to frame reuse — the test
+  asserts both occupancies share the node *and* the `func` slot). `print(outer(10))` where
+  `outer(y) = return inner(y)` → `11` byte-identical.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
