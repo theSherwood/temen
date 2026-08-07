@@ -1345,10 +1345,12 @@ async function runModule(c) {
   let rv = 0, status, tier = 'interpreter', stdout = '';
   if (useJit) {
     try {
-      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit into the
-      // shared slots (read back via the usual accessors, exactly like the interpreter path).
+      // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit/value into the
+      // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
+      // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
+      // result matches on both tiers (a trap throws → we fall back to the interpreter below).
       status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
-      rv = eng.ex.svm_exit_code();
+      rv = Number(eng.ex.svm_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
     } catch (e) {
@@ -1481,14 +1483,23 @@ async function runChibicc(c) {
   runStage(rec, 'encode', performance.now() - tEncode);
   runNote(rec, { moduleBytes: parsed.length });
 
-  // Pass 3 — run the compiled .svmb artifact on the interpreter (the oracle). The wasm-JIT module path
-  // reports a run *status*, not the value `main` returned, so a return-value program (this card's corpus)
-  // can't surface its result on that tier; the interpreter's `svm_run_onramp` return IS that value. The
-  // expensive pass — running the compiler — already rides the wasm-JIT above; the compiled program is
-  // small, so keeping it on the oracle costs little and keeps the shown result correct. (INVARIANT 9.)
+  // Pass 3 — run the compiled .svmb artifact. It rides the wasm-JIT too (not just the compiler): the
+  // runner now reports the guest's returned value (`svm_run_value`, matching the interpreter oracle) and
+  // reports a trap as a trap — so `runJitModule` throws on a trap and we fall back to the interpreter,
+  // which runs it correctly. A clean JIT run is byte-identical to the oracle (INVARIANT 9).
   const tRun = performance.now();
-  const runTierName = 'interpreter';
-  const r = moduleInterp(parsed, null);
+  let r, runTierName = 'interpreter';
+  if (useJit) {
+    try {
+      const status = await runJitModule(eng.ex, eng.memory, parsed, null);
+      r = { rv: Number(eng.ex.svm_run_value()), status, stdout: readModuleStdout() };
+      runTierName = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT run of compiled program declined (${e.message}); running it on the interpreter`);
+      runNote(rec, { runJitDeclined: e.message });
+    }
+  }
+  if (!r) r = moduleInterp(parsed, null);
   const runMs = runStage(rec, `run:${runTierName}`, performance.now() - tRun);
   runNote(rec, { runTier: runTierName, compileMs: +compileMs.toFixed(1), runMs: +runMs.toFixed(1), progStdoutBytes: (r.stdout || '').length });
   c.el.result.textContent = `${r.rv}`;

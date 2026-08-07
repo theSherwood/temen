@@ -3936,6 +3936,16 @@ pub struct JitOnrampRun {
     /// emitted `f0`; `exited` distinguishes "exited with code 0" from "returned 0".
     exit_code: i32,
     exited: bool,
+    /// The value the emitted `f0` returned (the guest's top-level result), reported by the JS driver via
+    /// [`svm_onramp_jit_run_report`]. Meaningful only when the run *returned* (not exited/trapped) — it is
+    /// what [`svm_run_onramp`]'s `value` is on the interpreter, so the two tiers agree on the result.
+    returned_value: i64,
+    /// Set when the emitted `f0` unwound on a **trap** (a wasm `unreachable`, or a cross-tier bounce that
+    /// trapped rather than `exit`ed) instead of returning. The JS driver can't tell an `exit` unwind from
+    /// a trap unwind on its own, so it reports "threw"; combined with `exited` (set Rust-side on a
+    /// cross-tier `Exit`), a throw that did not `exit` is a trap. Keeps the runner from reporting a
+    /// truncated run as `STATUS_OK` (INVARIANT 9: a fast backend never runs wrong — it traps or declines).
+    trapped: bool,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -4172,6 +4182,8 @@ impl JitOnrampRun {
             last_trap: None,
             exit_code: 0,
             exited: false,
+            returned_value: 0,
+            trapped: false,
         })
     }
 
@@ -4232,6 +4244,24 @@ impl JitOnrampRun {
     }
     pub fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+    /// The value the emitted `f0` returned (guest top-level result); meaningful only for a returned run.
+    pub fn returned_value(&self) -> i64 {
+        self.returned_value
+    }
+    /// Whether the emitted `f0` unwound on a trap rather than returning or `exit`ing.
+    pub fn trapped(&self) -> bool {
+        self.trapped
+    }
+    /// Record the JS driver's observation of how the emitted `f0` finished: `value` is its return
+    /// (used only when it returned), and `threw` is whether it unwound. A throw that did not set
+    /// `exited` (a cross-tier `Exit`) is a trap. A cross-tier `Exit` already set `exited`, so `threw`
+    /// there is subsumed by the exit.
+    pub fn record_outcome(&mut self, threw: bool, value: i64) {
+        self.returned_value = value;
+        if threw && !self.exited {
+            self.trapped = true;
+        }
     }
     /// Take the frame the run presented through `display`, if any.
     pub fn take_frame(&self) -> Option<Frame> {
@@ -4311,6 +4341,11 @@ pub fn instantiate_exec(m: &svm_ir::Module) -> (i32, i64) {
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
+/// The value the guest's top-level function returned on the most recent run (the `value` in
+/// [`svm_run_onramp`]'s outcome, and the single-shot JIT run's captured `f0` return). Read via
+/// [`svm_run_value`] so both tiers surface the same result for a *returned* run — the parity the
+/// interpreter oracle defines (INVARIANT 9).
+static mut RUN_VALUE: i64 = 0;
 /// Captured data image of the most recent [`svm_pg_snapshot`] (same cdylib-managed lifetime as `OUT`:
 /// a leaked boxed slice, valid until the next snapshot; read via `svm_pg_snapshot_ptr`/`_len`).
 static mut PG_SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
@@ -5381,11 +5416,28 @@ pub extern "C" fn svm_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -
     }
 }
 
-/// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE` + any presented frame into
-/// the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
-/// [`svm_exit_code`] / `svm_framebuffer_*` accessors — identical to [`svm_run_onramp`]'s contract. Call
-/// once after `f0` returns or unwinds. Returns the status: [`STATUS_EXIT`] if the guest `exit`ed, else
-/// [`STATUS_OK`].
+/// Record how the emitted `f0` finished, from the JS driver's vantage: `value` is `f0`'s return (the
+/// guest's top-level result, meaningful only when it *returned*), and `threw != 0` iff the call unwound.
+/// Call this before [`svm_onramp_jit_run_finish`]. The driver can't tell an `exit` unwind from a trap
+/// unwind, so it reports "threw" and this pairs it with the Rust-side `exited` flag (set on a cross-tier
+/// `Exit`): a throw that did not `exit` is a trap. Optional — a caller that skips it gets the legacy
+/// "returned, value 0" reading (`jit-profile.mjs` doesn't care about the value).
+#[no_mangle]
+pub extern "C" fn svm_onramp_jit_run_report(threw: i32, value: i64) {
+    // SAFETY: single-threaded wasm; exclusive access to the run.
+    if let Some(run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() } {
+        run.record_outcome(threw != 0, value);
+    }
+}
+
+/// Capture the finished run's streams into the shared `OUT`/`ERR`/`EXIT_CODE`/`RUN_VALUE` + any presented
+/// frame into the `svm_framebuffer_*` slots, so the page reads them via the usual [`svm_stdout_ptr`] /
+/// [`svm_exit_code`] / [`svm_run_value`] / `svm_framebuffer_*` accessors — identical to
+/// [`svm_run_onramp`]'s contract, so the interpreter and the wasm-JIT agree on result + exit + trap
+/// (INVARIANT 9). Call once after `f0` returns or unwinds (and after [`svm_onramp_jit_run_report`]).
+/// Returns [`STATUS_EXIT`] if the guest `exit`ed, [`STATUS_TRAP`] if the emitted run unwound on a trap
+/// (a wasm `unreachable` / a cross-tier bounce that trapped — never a truncated `STATUS_OK`), else
+/// [`STATUS_OK`] with the returned value in `RUN_VALUE`.
 #[no_mangle]
 pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run.
@@ -5394,10 +5446,16 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
     };
     let stdout = run.stdout().to_vec();
     let stderr = run.stderr().to_vec();
-    let (status, code) = if run.exited() {
-        (STATUS_EXIT, run.exit_code())
+    // Exit is checked first (a cross-tier `Exit` sets both `exited` and, via the JS driver, `trapped`);
+    // then a trap; then a clean return carrying the guest's result value. This mirrors `svm_run_onramp`'s
+    // `Exit` / other-`Err` / `Ok(value)` arms exactly, so a program has the same status + value on both
+    // tiers.
+    let (status, code, value) = if run.exited() {
+        (STATUS_EXIT, run.exit_code(), 0)
+    } else if run.trapped() {
+        (STATUS_TRAP, 0, 0)
     } else {
-        (STATUS_OK, 0)
+        (STATUS_OK, 0, run.returned_value())
     };
     let (fb_rgba, fb_w, fb_h) = match run.take_frame() {
         Some(f) => (f.rgba, f.width, f.height),
@@ -5411,6 +5469,7 @@ pub extern "C" fn svm_onramp_jit_run_finish() -> i32 {
         FB_W = fb_w;
         FB_H = fb_h;
         EXIT_CODE = code;
+        RUN_VALUE = value;
         LAST_STATUS = status;
     }
     status
@@ -5467,6 +5526,15 @@ pub extern "C" fn svm_stderr_len() -> usize {
 #[no_mangle]
 pub extern "C" fn svm_exit_code() -> i32 {
     unsafe { EXIT_CODE }
+}
+
+/// The value the guest's top-level function returned on the most recent single-shot JIT run (valid when
+/// [`svm_status`] / the finish status is [`STATUS_OK`]; `0` after an exit or trap). This is the same
+/// result `svm_run_onramp` returns on the interpreter, so the page shows an identical value on both
+/// tiers for a returned program (INVARIANT 9).
+#[no_mangle]
+pub extern "C" fn svm_run_value() -> i64 {
+    unsafe { RUN_VALUE }
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 (single `i64` `arg`, deny-all
