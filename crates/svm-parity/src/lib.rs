@@ -124,7 +124,7 @@ const NO_WASM_OP: &str = "no core-wasm opcode (relaxed-SIMD / scalar-fma only)";
 const SERVE: &str =
     "native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle";
 const FORK_GAP: &str =
-    "fork substrate is tree-walk-only today (needs serve_run + the scheduler's fork_twin/reap) — a real gap to close (FORK.md §8.5, ISSUES.md I36)";
+    "native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1)";
 const FUEL_BC: &str = "declines the module (folds to the oracle) rather than adding a native op";
 
 /// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `cap.call`
@@ -168,15 +168,15 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
             leaf,
         ],
 
-        // FORK.md — `clone_caller` (11) / `reap` (12): the fork substrate is eval-loop-only (it needs
-        // `serve_run` and the scheduler's `fork_twin`/`reap_parked_caller`). The fast backends fold
-        // to the oracle today; closing this is the fast-backend fork track (FORK.md §8.5).
-        (t, o) if t == self_ty && matches!(o, capcall::CLONE_CALLER | capcall::REAP) => [
-            F,
-            cell(Status::NotYet, FORK_GAP),
-            cell(Status::NotYet, FORK_GAP),
-            leaf,
-        ],
+        // FORK.md §9 — `clone_caller` (11) / `reap` (12): fork-returns-twice + wait. **Native on the
+        // bytecode engine** (the cooperative serve driver builds the twin over `Mem::fork_private` +
+        // `Host::fork_powerbox` and reaps it; pinned bit-for-bit against the oracle by
+        // `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle`). Still folds on
+        // Cranelift (its serve loop is in svm-run, its twin continuation is a native frame with no
+        // `Clone`) — the next slice (FORK.md §9.1). wasm-JIT leaf-folds like every cap op.
+        (t, o) if t == self_ty && matches!(o, capcall::CLONE_CALLER | capcall::REAP) => {
+            [F, F, cell(Status::NotYet, FORK_GAP), leaf]
+        }
 
         // `fuel.remaining` (13): Cranelift lowers it inline (it owns the fuel cell's address); the
         // bytecode engine declines the module rather than add a native op (folds to the oracle).

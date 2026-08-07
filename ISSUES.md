@@ -69,13 +69,14 @@ rerun-once policy applies — a fresh push re-triggers and clears it. No code fi
 > (domain = actor, svc queue = mailbox, one world = actor state) — but I36 is a promoted work item
 > and I37/I38 need their idioms documented so they're chosen, not stumbled into.
 >
-> **I36 update (2026-08-07):** the fork substrate (`clone_caller`/`reap`) is part of this fold — it
-> runs only on the tree-walk oracle. Two steps landed toward closing it: (a) the parity matrix is now
-> **honest** — the process/serve/fork ops are their own `OPS_PARITY.md` family classified per-backend
-> (fork = 🚧 on bytecode + Cranelift, ⛔ on the wasm-JIT leaf), no longer hidden in the `cap.call`
-> row; (b) the gap is **fail-closed** — `clone_caller`/`reap` register as park seams so any serving
-> module that forks folds to the oracle (was a latent `-EINVAL`-vs-fork divergence). The native
-> fast-backend fork track (bytecode first) is planned in FORK.md §9.
+> **I36 update (2026-08-07):** the fork substrate (`clone_caller`/`reap`) was part of this fold.
+> Progress: (a) the parity matrix is now **honest** — the process/serve/fork ops are their own
+> `OPS_PARITY.md` family classified per-backend, no longer hidden in the `cap.call` row; (b) **native
+> bytecode fork landed** — `clone_caller`/`reap` run on the bytecode cooperative serve driver (twin =
+> the parked caller's `Vm` cloned over `fork_private` + `fork_powerbox`; `reap` via a `BlockedReap`
+> state + `forked_twins`), pinned bit-for-bit against the oracle. The per-backend veto split keeps
+> Cranelift folding fork. So fork is now ✅ on tree-walk + bytecode, 🚧 on Cranelift (the remaining
+> slice), ⛔ on the wasm-JIT leaf. Track + Cranelift plan in FORK.md §9.
 
 ### I71 — peval precall/poscall call projection gaps — **ALL FACETS FIXED** (S3) — recorded 2026-08-06, closed 2026-08-07: **(a)** result-feeds-arithmetic (`lua_futamura_call_arith`), **(b)** nested 2-frame (`lua_futamura_call_nested` — root cause a `CallInfo` overlay collision, `CI_SIZE` 104 vs the real 64-byte stride, not an engine bug), **(c)** sequential distinct callees sharing one cached `CallInfo` (`lua_futamura_call_seq` — per-site `LuaSite::pins` on the shared node's `func`/`savedpc`); plus the call-bearing loop now **executes** (`lua_futamura_call_loop_exec`). All config/test — zero engine changes.
 
