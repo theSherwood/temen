@@ -293,6 +293,17 @@ pub(crate) struct Translator {
     /// `sp + frame_size` (the caller's own frame top) as the leading arg, exactly as a direct call
     /// to a frame-needing proc does. Empty unless the linker pooled sibling units' proc frames.
     ext_frame_procs: std::collections::HashSet<String>,
+    /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
+    /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
+    /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
+    /// `tvar` collapses to a plain global. The per-thread block itself is established by the runtime
+    /// (a `vcpu.tls.set` at thread entry), outside svm-leng, exactly as the C runtime sets fs/gs base.
+    tls_mode: bool,
+    /// Thread-vars → their offset **within the TLS block** (populated only in `tls_mode`).
+    tls_vars: HashMap<String, (u64, TyDesc)>,
+    /// Running size of the TLS block (bytes): the next `tvar`'s offset, and the block size the
+    /// runtime must allocate + zero per thread.
+    tls_block_size: u64,
 }
 
 impl Translator {
@@ -313,7 +324,17 @@ impl Translator {
             imports: RefCell::new(ImportTable::default()),
             ext_funcrefs: HashMap::new(),
             ext_frame_procs: std::collections::HashSet::new(),
+            tls_mode: false,
+            tls_vars: HashMap::new(),
+            tls_block_size: 0,
         }
+    }
+
+    /// Enable **Tier-2 TLS lowering** (NIM.md §3d): `tvar`s go to the per-vCPU TLS block rather than
+    /// collapsing to plain globals. Composes with either the runnable or the link-unit mode.
+    pub fn with_tls(mut self) -> Self {
+        self.tls_mode = true;
+        self
     }
 
     /// A translator that emits a **relocatable link unit** (`.svmo` shape) instead of a directly
@@ -438,13 +459,44 @@ impl Translator {
         let mut off = self.globals_base();
         for item in root.args() {
             match item.tag() {
-                Some("gvar" | "tvar") => {
+                // `gvar` (global) and `tvar` (Leng thread-var, nimony's `__thread`) lower the same:
+                // one plain, zero-initialized global at a fixed window offset. This is the committed
+                // **single-threaded** TLS model (NIM.md §3d) — every guest we target (each nimony
+                // compiler phase; each svm domain) runs single-threaded, so a thread-local has exactly
+                // one instance and a plain global *is* that instance. It mirrors the C on-ramp, which
+                // strips `__thread` before clang (`demos/nimony/build_nimony.sh`). A genuinely
+                // multi-threaded Nim guest instead uses the real per-CPU-block scheme over `vcpu.tls`
+                // (NIM.md §3d Tier 2) — implemented behind `tls_mode` in the branch just below; this
+                // default Tier-1 collapse applies when TLS mode is off, sound only single-threaded.
+                Some(kind @ ("gvar" | "tvar")) => {
                     let a = item.args();
                     if a.len() < 3 {
                         return Err(LengError::Malformed("gvar needs :name pragmas type".into()));
                     }
                     let name = sym_def(&a[0])?;
                     let desc = self.tydesc(&a[2])?;
+                    // Tier 2 (NIM.md §3d): in TLS mode a `tvar` lives in the per-vCPU TLS block, not
+                    // the window — assign it a block offset (accesses lower to `vcpu.tls.get() + off`)
+                    // and reserve no window slot or data segment. Zero-init only: the runtime that
+                    // allocates a per-thread block zeroes it; a non-zero `tvar` initializer would need
+                    // per-thread seeding by that runtime (a bounded follow-up) — fail-closed for now.
+                    if self.tls_mode && kind == "tvar" {
+                        if let Some(init) = a.get(3) {
+                            let nonzero = !init.is_empty_marker()
+                                && init.tag() != Some("nil")
+                                && int_literal(init) != Some(0);
+                            if nonzero {
+                                return Err(LengError::Unsupported(format!(
+                                    "non-zero thread-var initializer for `{name}` in TLS mode \
+                                     (Tier 2 zeroes the per-thread block; non-zero seeding is a follow-up)"
+                                )));
+                            }
+                        }
+                        let sz = self.sizeof(&desc);
+                        self.tls_vars.insert(name, (self.tls_block_size, desc));
+                        self.tls_block_size += sz.max(8);
+                        continue;
+                    }
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
                     // (the window is otherwise zero).
                     if let Some(init) = a.get(3) {
@@ -629,6 +681,8 @@ impl Translator {
                     }
                 }
                 Some("gvar" | "tvar") => {
+                    // `tvar` (thread-var) exports as a plain data symbol, same as `gvar` — the
+                    // single-threaded TLS model (see `collect_globals`).
                     // `(gvar :name pragmas type init)` — pragmas at index 1.
                     if let Some(cname) = exportc_name(item.args().get(1)) {
                         let local = sym_def(&item.args()[0])?;
@@ -2107,6 +2161,13 @@ impl<'a> FuncGen<'a> {
                     let sp = self.cur[0];
                     return Ok((self.add_const_off(sp, off), desc));
                 }
+                // Tier 2 (NIM.md §3d): a thread-var's address is the per-vCPU TLS base plus its block
+                // offset — `vcpu.tls.get() + off`, the fs/gs-base recipe. Only in `tls_mode`; without
+                // it a `tvar` is an ordinary global handled just below.
+                if let Some((off, desc)) = self.t.tls_vars.get(name).cloned() {
+                    let base = self.emit_tls_base();
+                    return Ok((self.add_const_off(base, off), desc));
+                }
                 // A module global's address: a fixed absolute offset in a runnable module, or a
                 // relocatable `data.self <off>` in a link unit (the linker rewrites it on placement).
                 if let Some((off, desc)) = self.t.globals.get(name).cloned() {
@@ -2339,6 +2400,15 @@ impl<'a> FuncGen<'a> {
     }
 
     /// `base + off` (an unchanged base when `off == 0`).
+    /// The per-vCPU TLS block base — `vcpu.tls.get` (§12). Tier-2 `tvar` accesses add their block
+    /// offset to this. The runtime must have `vcpu.tls.set` a real block base before any such access
+    /// (the root vCPU's seed is its id, not a valid address).
+    fn emit_tls_base(&mut self) -> u32 {
+        let id = self.fresh();
+        self.cur_buf.push_str(&format!("  v{id} = vcpu.tls.get\n"));
+        id
+    }
+
     fn add_const_off(&mut self, base: u32, off: u64) -> u32 {
         if off == 0 {
             return base;
@@ -2406,6 +2476,9 @@ impl<'a> FuncGen<'a> {
                     return Some(d.clone());
                 }
                 if let Some((_, d)) = self.t.globals.get(name) {
+                    return Some(d.clone());
+                }
+                if let Some((_, d)) = self.t.tls_vars.get(name) {
                     return Some(d.clone());
                 }
                 if let Some(sig) = self.t.ext_funcrefs.get(name) {
@@ -2480,7 +2553,10 @@ impl<'a> FuncGen<'a> {
         })?;
         // A global is stored through its window address; a cross-module data symbol (link unit,
         // not a local) stores through its `data.sym` address; a local rebinds/stores its slot.
-        if self.t.globals.contains_key(name) || (self.t.link_mode && !self.is_local(name)) {
+        if self.t.globals.contains_key(name)
+            || self.t.tls_vars.contains_key(name)
+            || (self.t.link_mode && !self.is_local(name))
+        {
             return self.store_lvalue(lhs, rhs);
         }
         let v = self.expr(rhs)?;
@@ -3122,8 +3198,8 @@ impl<'a> FuncGen<'a> {
                 if let Some(&c) = self.t.consts.get(a) {
                     return Ok(self.emit_const(ValType::I64, c));
                 }
-                if self.t.globals.contains_key(a) {
-                    return self.load_lvalue(e); // load the scalar global
+                if self.t.globals.contains_key(a) || self.t.tls_vars.contains_key(a) {
+                    return self.load_lvalue(e); // load the scalar global / thread-var
                 }
                 if let Ok(n) = parse_int(a) {
                     return Ok(self.emit_const(ValType::I64, n));

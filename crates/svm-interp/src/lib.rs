@@ -1237,9 +1237,9 @@ impl Inspector {
                     return Stop::Finished(r);
                 }
                 Step::Park(_) | Step::Yield => return Stop::Blocked,
-                // §2.2: pager fault-service needs the real scheduler; under the inspector it is
-                // out of scope (fail closed — the pager transport needs the real scheduler).
-                Step::PageFault(_) => {
+                // §2.2 / §8.6: pager fault-service and `execve` image-replace both need the real
+                // scheduler's `dispatch`; under the inspector they are out of scope (fail closed).
+                Step::PageFault(_) | Step::Exec(_) => {
                     let r = Err(Trap::FiberFault);
                     self.finished = Some(r.clone());
                     return Stop::Finished(r);
@@ -1492,9 +1492,9 @@ impl Inspector {
         }
         match self.v.as_mut().unwrap().run(u64::MAX) {
             Step::Pause(reason, pc) => Stop::Break { reason, pc },
-            // §2.2: pager fault-service needs the real scheduler — fail closed under the
-            // single-vCPU inspector driver (the pager transport needs the real scheduler).
-            Step::PageFault(_) => {
+            // §2.2 / §8.6: pager fault-service and `execve` image-replace both need the real
+            // scheduler's `dispatch` — fail closed under the single-vCPU inspector driver.
+            Step::PageFault(_) | Step::Exec(_) => {
                 let r = Err(Trap::FiberFault);
                 self.finished = Some(r.clone());
                 Stop::Finished(r)
@@ -4164,6 +4164,25 @@ enum Step {
     /// CONSOLIDATION.md §2.2: a demand process child's recoverable fault, serviced by its pager
     /// binding at dispatch level (see [`Inner::PageFault`]).
     PageFault(u64),
+    /// FORK.md §8.6 — **`execve` image-replace** (folded to [`Step::Exec`] by [`VCpu::run`]).
+    Exec(Box<ExecReq>),
+}
+
+/// FORK.md §8.6 — the ready payload of an `exec_module` (`execve`) image-replace. Everything fallible
+/// (module resolve, grant regrant, import bind) is done in the eval loop — where a refusal is a clean
+/// `-EINVAL` that leaves the caller running — so `dispatch`'s rebuild is **infallible**: it only
+/// reloads the command's data into the caller's window and swaps the vCPU to a fresh one running the
+/// command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
+/// regranted by name, its own imports bound, its module registered as the self module).
+struct ExecReq {
+    funcs: Arc<[Func]>,
+    data: Arc<[Data]>,
+    entry: u64,
+    child_size: u64,
+    host: Host,
+    /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
+    /// command's entry takes two params (§14 child-entry ABI).
+    entry_args: Vec<Value>,
 }
 
 /// CONSOLIDATION.md §2.2: a demand process child's pager binding — the provider (parent) host
@@ -4189,6 +4208,9 @@ enum Inner {
     /// A **debug pause** (DEBUGGING.md W2/S4): the per-op hook stopped before the op at this
     /// [`IrPc`]. Folded to [`Step::Pause`] by [`VCpu::run`]; never produced unless `debug` is set.
     Pause(StopReason, IrPc),
+    /// FORK.md §8.6 — **`execve` image-replace**: the guest called `exec_module`. Folded to
+    /// [`Step::Exec`] by [`VCpu::run`]; handled only by `dispatch`.
+    Exec(Box<ExecReq>),
 }
 
 /// The **M:N executor** (§12): a bounded pool of worker OS threads runs many vCPUs (green threads)
@@ -5881,6 +5903,55 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 s.runnable.push_back(v);
                 sched.work.notify_one();
             }
+            // FORK.md §8.6 — `execve` image-replace: swap THIS vCPU to a fresh one running the command,
+            // keeping its `TaskId` + fuel, then loop back to run it (like the page-fault fast lane, no
+            // run-queue round trip). All fallible work was done in the eval loop; this is infallible.
+            Step::Exec(req) => {
+                let ExecReq {
+                    funcs,
+                    data,
+                    entry,
+                    child_size,
+                    host,
+                    entry_args,
+                } = *req;
+                let (fuel, depth, id, sched_ref, quota, dt) = (
+                    v.fuel,
+                    v.depth,
+                    v.id,
+                    v.sched.clone(),
+                    v.quota,
+                    Arc::clone(&v.dt),
+                );
+                // Materialize the command's data segments into the caller's window — the command runs
+                // where the shell did (image-replace). Increment 1 does not zero the rest of the window
+                // (no fresh-BSS): a well-formed command initializes its own state from its segments.
+                let mem = v.mem.take();
+                if let Some(m) = mem.as_ref() {
+                    let base = m.window.base();
+                    for d in data.iter() {
+                        if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                            for (k, &b) in d.bytes.iter().enumerate() {
+                                m.set_byte(base + d.offset + k as u64, b);
+                            }
+                        }
+                    }
+                }
+                *v = VCpu::new(
+                    funcs,
+                    entry as FuncIdx,
+                    &entry_args,
+                    mem,
+                    Arc::new(Mutex::new(host)),
+                    fuel,
+                    depth,
+                    id,
+                    sched_ref,
+                    quota,
+                    dt,
+                );
+                continue;
+            }
             // Only an `Inspector`-driven vCPU pauses, and those are never on the executor (DEBUGGING.md S4).
             Step::Pause(..) => unreachable!("debug pause on a pooled vCPU"),
         }
@@ -6442,15 +6513,17 @@ impl SchedDriver {
                     det.lock().wake_spins(base, width);
                 }
             }
-            // §2.2: pager fault-service runs on the real scheduler only for this slice (the
-            // deterministic explorer has no handoff/park transport for it) — fail closed.
-            let step = if matches!(step, Step::PageFault(_)) {
+            // §2.2 / §8.6: pager fault-service and `execve` image-replace run on the real scheduler
+            // only for this slice (the deterministic explorer has no transport for them) — fail closed.
+            let step = if matches!(step, Step::PageFault(_) | Step::Exec(_)) {
                 Step::Done(Err(Trap::FiberFault))
             } else {
                 step
             };
             match step {
-                Step::PageFault(_) => unreachable!("converted to Done(FiberFault) above"),
+                Step::PageFault(_) | Step::Exec(_) => {
+                    unreachable!("converted to Done(FiberFault) above")
+                }
                 Step::Done(result) => {
                     let id = v.id;
                     // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (trap only).
@@ -8104,6 +8177,7 @@ impl VCpu {
             Ok(Inner::Yield) => Step::Yield,
             Ok(Inner::PageFault(a)) => Step::PageFault(a),
             Ok(Inner::Pause(r, pc)) => Step::Pause(r, pc),
+            Ok(Inner::Exec(req)) => Step::Exec(req),
             Err(t) => Step::Done(Err(t)),
         }
     }
@@ -10583,6 +10657,131 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } => {
                     if !sig.results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(*fuel as i64));
+                    }
+                }
+                // FORK.md §8.6 — `exec_module(module, grants_ptr, grants_n, entry, size_log2)`
+                // (self-namespace op 14): **`execve` image-replace**. Resolve the command module + the
+                // inherited-cap grant list here (we hold the guest's window and host), validate, and
+                // hand `dispatch` an [`Inner::Exec`] to rebuild this vCPU as the command. On success it
+                // never returns; on any refusal it pushes a probeable `-EINVAL` and falls through (the
+                // guest's continuation survives — POSIX `execve` returns only on failure). Increment 1:
+                // reuses the caller's window (command memory must equal it), non-durable domains only,
+                // and only from a clean root computation (no serve handler / active fibers).
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_EXEC,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let argn = |i: usize| -> Result<i64, Trap> {
+                        Ok(get(&frames[top].vals, *args.get(i).ok_or(Trap::Malformed)?)?.i64())
+                    };
+                    let mh = argn(0)? as i32;
+                    let grants_ptr = argn(1)? as u64;
+                    let grants_n = argn(2)? as u64;
+                    let entry = argn(3)? as u64;
+                    let size_log2 = argn(4)?;
+                    // Resolve the command module (forged handle → fail closed) into an owned `ChildMod`.
+                    let cmod = {
+                        let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.resolve_module(mh).ok().map(|g| ChildMod {
+                            funcs: g.funcs.clone(),
+                            memory_log2: g.memory_log2,
+                            data: g.data.clone(),
+                            durable: g.durable,
+                            digest: g.digest,
+                            imports: g.imports.clone(),
+                            types: g.types.clone(),
+                            module: Arc::clone(&g.module),
+                        })
+                    };
+                    // Read + authority-check the inherited-cap grant list (same 16-byte record shape as
+                    // op 13's named grants). Any bad record / non-regrantable handle fails the whole
+                    // exec closed, before we mutate anything.
+                    let grants: Option<Vec<(String, i32)>> = (|| {
+                        let m = mem.as_ref()?;
+                        let mut list = Vec::new();
+                        for i in 0..grants_n {
+                            let rec = m.read_window(grants_ptr + i * 16, 16).ok()?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name_bytes = m.read_window(name_off, name_len).ok()?;
+                            let name = String::from_utf8(name_bytes).ok()?;
+                            host.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .can_regrant(handle)
+                                .then_some(())?;
+                            list.push((name, handle));
+                        }
+                        Some(list)
+                    })();
+                    // Admissibility: a resolvable non-durable command whose declared window equals the
+                    // caller's carve, a real entry, a clean root context (no serve handler / fibers), a
+                    // non-durable domain, and a fully-regrantable grant list. Anything else is a
+                    // probeable `-EINVAL` that leaves the caller running. `want_as` = the §14 child-entry
+                    // takes (Instantiator, AddressSpace) rather than just (Instantiator).
+                    let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
+                    let entry_params = cmod
+                        .as_ref()
+                        .and_then(|cm| cm.funcs.get(entry as usize))
+                        .filter(|f| {
+                            f.results == [ValType::I64]
+                                && f.params.iter().all(|p| *p == ValType::I64)
+                                && (f.params.len() == 1 || f.params.len() == 2)
+                        })
+                        .map(|f| f.params.len());
+                    let admissible = !durable
+                        && clean_root
+                        && grants.is_some()
+                        && (0..64).contains(&size_log2)
+                        && entry_params.is_some()
+                        && cmod
+                            .as_ref()
+                            .is_some_and(|cm| cm.memory_log2 == Some(size_log2 as u8));
+                    // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
+                    // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
+                    // manifest bound, its module registered as the self module. Only then commit to the
+                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly.
+                    let built = if admissible {
+                        let child_size = 1u64 << size_log2;
+                        let cm = cmod.as_ref().expect("admissible");
+                        let grants = grants.as_ref().expect("admissible");
+                        let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                        hg.spawn_named_child(grants, child_size)
+                            .and_then(|(mut ch, ci, ca)| {
+                                ch.self_module = Some(Arc::clone(&cm.module));
+                                ch.bind_child_manifest(&cm.imports, &cm.types)
+                                    .ok()
+                                    .map(|()| (ch, ci, ca, child_size))
+                            })
+                    } else {
+                        None
+                    };
+                    match built {
+                        Some((ch, cinst, cas, child_size)) => {
+                            let cm = cmod.expect("built");
+                            let want_as = entry_params == Some(2);
+                            let mut entry_args = vec![Value::I64(cinst as i64)];
+                            if want_as {
+                                entry_args.push(Value::I64(cas as i64));
+                            }
+                            return Ok(Inner::Exec(Box::new(ExecReq {
+                                funcs: cm.funcs,
+                                data: cm.data,
+                                entry,
+                                child_size,
+                                host: ch,
+                                entry_args,
+                            })));
+                        }
+                        None if !sig.results.is_empty() => {
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
+                        }
+                        None => {}
                     }
                 }
                 Inst::CapCall {
@@ -14774,6 +14973,19 @@ pub const CAP_SELF_CLONE_CALLER: u32 = 11;
 /// host-side or non-serving dispatch answers a probeable `-EINVAL`. Pinned at 12.
 pub const CAP_SELF_REAP: u32 = 12;
 
+/// FORK.md §8.6 — the reserved self-namespace op for `execve` (**true cross-module image-replace**):
+/// `exec_module(module_handle, grants_ptr, grants_n)` replaces the **calling vCPU's own image** with a
+/// granted command `Module`, in place, keeping the vCPU's `TaskId` and fuel — so a parent's `wait(pid)`
+/// reaps the *command's* exit, exactly as POSIX `execve` keeps the pid. The command runs in the caller's
+/// existing window (its declared memory must equal the carve); its data segments are materialized, its
+/// import manifest is bound against a fresh powerbox carrying the inherited caps named in the grant list
+/// (POSIX fd inheritance), and it starts at its entry. On success `exec_module` **never returns** — the
+/// caller's continuation is gone (the whole point of image-replace) — so the eval loop hands the driver a
+/// [`Step::Exec`] that rebuilds the vCPU and re-enters. Refused **probeably** (`-EINVAL`, never a trap)
+/// on a forged module, a non-regrantable grant, a window-size mismatch, or a durable domain (the
+/// freeze/thaw image-swap is the separate capstone). Pinned at 14 (13 is `fuel.remaining`).
+pub const CAP_SELF_EXEC: u32 = 14;
+
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
 /// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
@@ -18749,7 +18961,11 @@ impl Host {
                 // trap — the guest's serve loop can fall back. (The tree-walk eval loop intercepts
                 // these before dispatch; the bytecode engine declines them at compile and falls back
                 // to the tree-walker.)
-                CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT | CAP_SELF_CLONE_CALLER | CAP_SELF_REAP
+                CAP_SELF_SVC_POLL
+                | CAP_SELF_SVC_WAIT
+                | CAP_SELF_CLONE_CALLER
+                | CAP_SELF_REAP
+                | CAP_SELF_EXEC
                     if op >> 8 == 0 =>
                 {
                     Ok(vec![EINVAL])

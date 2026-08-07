@@ -1011,6 +1011,109 @@ fn dap_over_bytecode_multithreaded_breakpoint_per_thread() {
     );
 }
 
+/// The stack frames of DAP thread `tid` at the current stop; empty when the thread has no
+/// resolvable frame.
+fn frames(s: &mut DapServer, seq: i64, tid: i64) -> Vec<Json> {
+    let out = s.handle(&req(
+        seq,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    response(&out)
+        .get("body")
+        .and_then(|b| b.get("stackFrames"))
+        .and_then(|f| f.as_array())
+        .map(|a| a.to_vec())
+        .unwrap_or_default()
+}
+
+#[test]
+fn dap_over_bytecode_threaded_step_keeps_a_resolvable_frame() {
+    // Source-line **stepping** on the multithreaded bytecode engine keeps a resolvable frame — the
+    // c_interpret threading-tier seam. Before the entry-`locate()` fix (commit that closed the
+    // threaded-stepping ask) a fresh scheduled run launched un-positioned, so the first `stepIn` ran
+    // to completion and a following `stackTrace` had no frame ("a bare stackTrace after a threaded
+    // step returns no frames"). This pins the fact the browser threads panel relies on: after each
+    // step the stopped thread resolves a source frame, and a spawned worker resolves its own frame
+    // *while the session is mid-step* (so `select_task` → `stackTrace` lights the panel up during
+    // stepping, not only after a run-to-completion).
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(RACY_COUNTER)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&launch).get("success"),
+        Some(&Json::Bool(true)),
+        "multithreaded launch on the bytecode engine"
+    );
+
+    // The entry itself is a resolvable frame (the single-vCPU engine gets this by construction; the
+    // scheduled one via the entry `locate()`), not an empty backtrace.
+    assert!(
+        !frames(&mut s, 3, 1).is_empty(),
+        "the entry has a resolvable frame"
+    );
+
+    let mut saw_worker_frame = false;
+    for i in 0..24i64 {
+        let out = s.handle(&req(
+            100 + i,
+            "stepIn",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        // The first step must advance one source line, never run the whole program to termination.
+        if event(&out, "terminated").is_some() {
+            assert!(i > 0, "the first step must not run the whole program");
+            break;
+        }
+        // The stopped thread named by the step's `stopped` event resolves a source frame — the
+        // "resolvable frame after a threaded step" the panel reads (regression: an empty backtrace).
+        let tid = event(&out, "stopped")
+            .and_then(|e| e.get("body"))
+            .and_then(|b| b.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .expect("a threaded step reports a stopped thread");
+        let top = frames(&mut s, 200 + i, tid);
+        assert!(
+            !top.is_empty() && top[0].get("line").and_then(|l| l.as_i64()).is_some(),
+            "the stopped thread resolves a source frame after step {i}"
+        );
+
+        // Once a `thread.spawn` has run, the spawned worker (DAP thread id ≥ 2) resolves its own
+        // frame *while stepping* — the fact the threads panel needs mid-run, distinct from the
+        // stopped (root) thread above.
+        let th = s.handle(&req(300 + i, "threads", Json::obj(vec![])));
+        let worker = response(&th)
+            .get("body")
+            .and_then(|b| b.get("threads"))
+            .and_then(|t| t.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("id").and_then(|v| v.as_i64()))
+            .find(|&id| id >= 2);
+        if let Some(w) = worker {
+            let wframes = frames(&mut s, 400 + i, w);
+            assert!(
+                !wframes.is_empty() && wframes[0].get("line").and_then(|l| l.as_i64()).is_some(),
+                "the spawned worker (thread {w}) resolves a source frame while stepping"
+            );
+            saw_worker_frame = true;
+            break;
+        }
+    }
+    assert!(
+        saw_worker_frame,
+        "a spawned worker surfaced a resolvable frame while stepping"
+    );
+}
+
 #[test]
 fn dap_over_bytecode_multithreaded_reverse_continue() {
     // Reverse debugging on the scheduled engine (deterministic replay to a global `turn`): run forward

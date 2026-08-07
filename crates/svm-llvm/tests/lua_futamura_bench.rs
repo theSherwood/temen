@@ -48,10 +48,20 @@
 //!   to just the guest execution. This is the missing piece the numbers above called for: it makes a
 //!   built residual (or the bare interpreter) pay its compile a single time across a batch, turning
 //!   the 11.5× execution win into an end-to-end win instead of one swamped by recompilation.
+//! - **Zero-config end-to-end (`auto_rolled_zero_config_vs_interpreter`): the whole pipeline, no
+//!   hand-config.** `lua_rolled::auto_rolled(m, script)` takes a Lua chunk and returns the rolled
+//!   residual via the shared `peval_capture::discover` — profile + discover + specialize measured as
+//!   one **≈ 0.3 s build** (the cost the compiled-module cache amortizes). The resulting residual runs
+//!   at **≈ 1.5–1.7 ns/iter**, matching the hand-built rolled residual, i.e. **≈ 6–11×** faster than
+//!   the interpreter — the ratio swings only because the interpreter baseline is noisy on shared
+//!   runners (≈ 10–18 ns/iter), while the residual side is stable. Same script-in → speedup-out result
+//!   as the hand-built number, now with **zero hand-configuration**.
 //!
 //! Run: `cargo test -p svm-llvm --release --test lua_futamura_bench -- --ignored --nocapture`
 
 mod futamura;
+mod lua_rolled;
+mod peval_capture;
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -443,5 +453,80 @@ fn powerbox_program_amortizes_compile() {
     println!(
         "compiled-module cache speedup over the batch: {:.1}x",
         per_call.as_secs_f64() / cached.as_secs_f64()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The zero-config end-to-end number: `lua_rolled::auto_rolled` (script in → rolled residual out, no
+// hardcoded offsets, via the shared discovery driver) vs the interpreter on the same loop. Same
+// differential-N methodology as `rolled_residual_vs_interpreter_per_iteration`, but the residual is
+// built by the driver rather than by hand — closing the loop from "a Lua chunk" to "a measured
+// per-iteration speedup", plus the one-time build cost the compiled-module cache amortizes.
+// ---------------------------------------------------------------------------------------------
+
+const AUTO_ROLL_SCRIPT: &str = "local x = 0\nfor i = 1, 50 do x = x + 3 end\nreturn x\n";
+
+#[test]
+#[ignore = "benchmark; run explicitly with --release -- --ignored --nocapture"]
+fn auto_rolled_zero_config_vs_interpreter() {
+    let reps = 3;
+    let m = futamura::lua_module();
+
+    // ---- Interpreter, differential-N (compile cancels): the pure `x = x + 3` loop. ----
+    let (n1, n2) = (1_000_000u64, 21_000_000u64);
+    let mr = &m;
+    let run_base = |n: u64| {
+        let s = pure_loop_script(n);
+        move || svm_run::run_powerbox(mr, s.as_bytes()).expect("run").stdout
+    };
+    let (t1, o1) = best_of(reps, run_base(n1));
+    let (t2, o2) = best_of(reps, run_base(n2));
+    assert_eq!(o1, format!("{}\n", 3 * n1).into_bytes());
+    assert_eq!(o2, format!("{}\n", 3 * n2).into_bytes());
+    let interp_ns = (t2.saturating_sub(t1)).as_nanos() as f64 / (n2 - n1) as f64;
+
+    // ---- Zero-config auto-rolled residual: the whole build (profile + discover + specialize),
+    // timed once. This is the cost the compiled-module cache amortizes across runs. ----
+    let t = Instant::now();
+    let ar = lua_rolled::auto_rolled(&m, AUTO_ROLL_SCRIPT);
+    let build = t.elapsed();
+    let np = ar.dyn_cells.len();
+    let (wm, we) = lua_rolled::with_readback(&ar.residual, ar.entry, ar.acc_addr, np);
+    svm_verify::verify_module(&wm).expect("wrapped residual verifies");
+    println!(
+        "auto_rolled build (profile + discover + specialize): {build:?}; residual {} blocks, {np} dyn params",
+        ar.residual_blocks
+    );
+
+    // The residual is body-entered (in-flight iteration), so counter=c ⇒ x = 3·(c+1); to reproduce a
+    // trip count N (x = 3·N) seed counter = N-1, accumulator = 0. The module is N-independent, so the
+    // differential cancels the residual's own JIT compile just as it cancels the interpreter's.
+    let seed = |nn: u64| {
+        let mut a = vec![0i64; np];
+        a[ar.counter_ix] = nn as i64 - 1;
+        a[ar.acc_ix] = 0;
+        a
+    };
+    assert_eq!(jit_run(&wm, we, &seed(n1)), 3 * n1 as i64, "residual @ n1");
+    assert_eq!(jit_run(&wm, we, &seed(n2)), 3 * n2 as i64, "residual @ n2");
+    let time_at = |nn: u64| {
+        let a = seed(nn);
+        let mut best = Duration::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            black_box(jit_run(&wm, we, &a));
+            best = best.min(t.elapsed());
+        }
+        best
+    };
+    let r1 = time_at(n1);
+    let r2 = time_at(n2);
+    let resid_ns = (r2.saturating_sub(r1)).as_nanos() as f64 / (n2 - n1) as f64;
+
+    println!("interpreter (x = x + 3):        {interp_ns:.1} ns/iter");
+    println!("auto-rolled residual (zero-config): {resid_ns:.2} ns/iter");
+    println!(
+        "zero-config execution speedup (interpreter / residual): {:.1}x",
+        interp_ns / resid_ns
     );
 }

@@ -86,6 +86,25 @@ pub fn translate(src: &str) -> Result<Module, LengError> {
     })
 }
 
+/// Translate a Leng-NIF module to SVM text with **Tier-2 TLS lowering** (NIM.md §3d): a `tvar`
+/// (thread-var) becomes a per-vCPU TLS-block access (`vcpu.tls.get() + off`) instead of a plain
+/// window global. The generated module assumes the runtime has established this thread's TLS base
+/// (`vcpu.tls.set`) before any `tvar` access — the block layout is per-`tvar` offsets from that base.
+pub fn translate_tls_to_text(src: &str) -> Result<String, LengError> {
+    let root = nif::parse(src).map_err(LengError::Parse)?;
+    translate::Translator::new().with_tls().module(&root)
+}
+
+/// [`translate_tls_to_text`] parsed to an SVM-IR [`Module`] (unverified; the caller verifies).
+pub fn translate_tls(src: &str) -> Result<Module, LengError> {
+    let text = translate_tls_to_text(src)?;
+    svm_text::parse_module(&text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })
+}
+
 /// Translate a **single named proc** out of a full Leng module to SVM text — the "go deep" entry
 /// for real nimony output, where the enclosing module still carries constructs the skeleton does
 /// not lower (`gvar`/`type`/`if`/pointers). The named proc becomes func 0; any call it makes to a

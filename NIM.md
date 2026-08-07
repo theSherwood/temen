@@ -7,8 +7,10 @@ compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOS
 libc-as-capabilities (`POSIX.md`), and the frontend trust model (`FRONTEND.md` §1,
 `DESIGN.md` §2a). This doc is the *what/how/when*; it does not restate those.
 
-Fold completed sections into `DESIGN.md` and drop this file once the actionable gaps
-close — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
+This doc stays its own file — it is **not** folded into `DESIGN.md`. `DESIGN.md` describes
+SVM itself; NIM.md describes a *guest* project that runs **on** SVM (nimony, a consumer of the
+substrate). The two never merge: svm's design and the design of something built atop it are
+separate concerns, even where they touch the same seams.
 
 ## 0. TL;DR
 
@@ -743,8 +745,8 @@ already lowers a named import to a host capability (`Cap`) — that's the seam.
 
 Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
 end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
-model onto svm (the on-ramp gap Phase 1 already surfaced), and confirming the ARC destructor
-protocol runs correctly against a real allocator.
+model onto svm (now settled — §3d: single-threaded `tvar → plain global`), and confirming the ARC
+destructor protocol runs correctly against a real allocator.
 
 **✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
 end-to-end on SVM**, both engines, §9 parity. `svm-leng` lowers genuine `hexer` bytes for
@@ -758,6 +760,164 @@ in** via `svm_ir::link`, binding each named import to a shim function. So the wh
 code linked in*, not Rust host capabilities — so it stays inside the pure-IR / both-engines model
 and rides the same verifier. This is the linking mechanism W2 generalizes (many units → one), and
 the shim is the placeholder the real compiled `system` module (Path A) will replace.
+
+## 3c. W4 scope — the multi-binary driver (the unknown is retired: svm already has both seams)
+
+W4 asked (`## 3a` above): nimony is not one binary — `nifmake` spawns `nifler` → `nimony` →
+`hexer` → `lengc` as OS subprocesses, so running the compiler on svm means "either driving those
+phases in-process **or** giving svm a subprocess/exec personality," flagged as "the biggest
+unknown." **Both halves of that dichotomy already exist as landed seams, and neither is new
+substrate** (INVARIANTS §1/§4, §4 below). W4 is no longer an open architecture question; it is a
+build-out on proven mechanism, exactly like W3 turned out to be.
+
+**The two seams, measured:**
+
+- **In-process — `svm_ir::link`** (`crates/svm-ir/src/lib.rs:3762`). Statically links N units into
+  one import-free module: functions concatenated + reindexed, each unit's data placed in a
+  host-page-aligned non-overlapping window region, cross-unit symbols resolved to direct calls.
+  This is the **W2** seam, already proven on real nimony (`link_units`, §3 above). Its shape:
+  **one** module, **one** window/powerbox, **one** flat export namespace (a collision is
+  `LinkError::DuplicateSymbol`, `lib.rs:3835`).
+- **Subprocess/exec personality — the `exec` capability** (`EXEC.md`, `crates/svm-run/src/exec.rs`).
+  A guest imports one interface `"exec"` (resolved by name like `"fs"`); the wirer picks the
+  backend. The load-bearing one is **`domain_exec`** (`exec.rs:61`, BUILT 2026-07-23): each spawn is
+  **a fresh child svm domain — its own window, powerbox, and fuel** — `argv[0]` resolves through a
+  program registry (a miss is `-EPERM`), the full argv rides the §3e args buffer so an ordinary
+  `main(int, char**)` reads it standalone, wire `stdin` seeds the child, both output streams are
+  captured, and the exit code is the child's entry result verbatim. It is **not** new substrate: it
+  is a `HostCap` composed over the §14 Instantiator machinery svm already has (op 13
+  `instantiate_module_named` + `join`), the same mold as `fs`. Proven byte-for-byte on all three
+  engines (`crates/svm-run/tests/exec_cap.rs:141`), incl. stdin flowing into the child
+  (`exec_cap.rs:219`).
+
+**Recommendation: the phase toolchain is `exec`/`domain_exec` (the subprocess route), not `link`.**
+The reason is granularity. nimony's phases are **separate whole programs** — each has its own
+`main`, its own globals, its own heap, and its own copy of the compiled `system` runtime. Collapsing
+the four into one module with `link` would (a) collide immediately on `DuplicateSymbol` (four
+`main`s, four `system` modules) and (b) force all four to share one window / one powerbox / one
+allocator arena — semantically wrong for processes that nimony deliberately isolates. `link` stays
+the right tool at the **other** granularity — merging the modules *within a single program or phase*
+(that *is* W2, and Path A merges the user program with `system` this way). So the two linkers sit at
+two levels: **`link` = within-program (W2); `exec` = across-phases (W4).** They compose — each phase
+is itself a `link`ed module, and the driver `exec`s the phases in sequence.
+
+There is already a **working precedent at exactly W4's shape**: the compiled-C shell drives
+`instantiate_module_named` (op 13) + `join`, resolving `argv[0]` against a name → `Module` registry,
+running an unmodified `main(argc, argv)` child with inherited stdout and seeded argv, and threading
+each command's exit status into `$?` (`crates/svm/tests/c_shell_exec.rs`,
+`crates/svm/tests/stage1_exec_command.rs`). A `nifmake` driver is that shell with a fixed four-command
+script.
+
+**Passing intermediate files between phases.** nimony's phases hand `.p.nif`/`.s.nif`/`.nif`/`.c`
+files down the chain. Two existing options, no new host op:
+1. **stdout → stdin piping** — free with `domain_exec`: the driver drains phase N's captured output
+   (`read_out`) and seeds it as phase N+1's `stdin` (the `CAT_CONSUMER` pattern, `exec_cap.rs:185`).
+   Fits a streaming `hexer | lengc` shape.
+2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
+   This is the faithful hand-off, and it needs a small **additive** piece of shared infrastructure —
+   no new host op, but new API surface, so it is not free the way piping is. Measured, the gap is two
+   parts: (a) `mem_fs` grants are independent per domain (`svm-fs/src/lib.rs:745`), and the one shared
+   primitive, `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:820`), returns a **single** `HostProc` + a
+   host-side `MemFsHandle` — built for host↔handle session persistence (browser-Postgres), *not* a
+   `Fn() -> HostProc` factory grantable to N domains; a grantable-to-N shared factory has to be added;
+   (b) `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout —
+   so children receive **no `fs` at all** today. Wiring the file hand-off therefore means: surface a
+   grantable shared memfs in `svm-fs`, and teach the child-spawn path to grant it (either a
+   `domain_exec` that runs children with `run_with_caps`, or the §14 Instantiator's `regrant_into_child`
+   at `crates/svm-interp/src/lib.rs:18485`). Both are additive, but both touch **shared capability
+   infrastructure** and decide *what filesystem authority a spawned child inherits* — a security-shaped
+   call (INVARIANTS §1/§4), so it is owner-reviewed infra, not a nimony-lane edit.
+
+**v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
+one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
+run strictly in sequence anyway. And the shared-memfs wiring (option 2) is deliberate, not the
+default grant. Remaining real W4 work is therefore **build-out, not invention**: (i) compile each
+phase (`nifler`/`nimony`/`hexer`/`lengc`) to an svm module — Phase 1's C on-ramp already does this
+for one binary, so it is four applications of a proven step; (ii) write the driver module that
+registers them and chains them with a shared memfs; (iii) confirming each phase's allocator/`system`
+runtime boots cleanly as an isolated child. (The **TLS model** that Phase 1's on-ramp surfaced is now
+settled — see §3d: single-threaded `tvar → plain global`, done and tested.)
+
+**First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
+the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
+modules via the `exec` cap in sequence, **passing each phase's output as the next phase's input**,
+and the final result is the composition — the `nifmake` orchestration on svm, decoupled from the real
+toolchain (`crates/svm-run/tests/multibinary.rs`; the driver + stand-in phases are pure SVM modules
+over the `exec` cap, so the proof lives with that seam, not in `svm-leng`). Three cases, all green on
+all three engines: (1) a two-phase hand-off (content-sensitive — `a → aa → aa!` — so it witnesses the
+data flow, not just that two children ran); (2) the **full four-phase depth** (nifler → nimony →
+hexer → lengc), `a → ab → abc → abcd → abcde`; and (3) **run-and-check-exit abort** — the driver reads
+each phase's exit status (`exec` op 3) and `br_if`s to a short-circuit block, so when a phase exits
+non-zero the pipeline stops with that phase's status and the later phases never run (the identical
+driver module, only the phase registry differs — so the abort is the driver reacting to status, the
+real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
+including its failure handling; what's left (above) is compiling the actual phases and — for the
+file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
+
+## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
+
+nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng
+**`tvar`** (thread-var, the sibling of `gvar`). Phase 1's C on-ramp had no `llvm.threadlocal.address`
+lowering, so `demos/nimony/build_nimony.sh` **strips `__thread`** before clang (a `sed` pass with a
+`grep` guard that fails the build if any survives) — valid because the guest is single-threaded. This
+section commits the Phase-2 backend's model. It is a **two-tier** answer, and Tier 1 is done.
+
+**What svm actually offers (measured).** svm has exactly **one** thread-local primitive: a single
+per-vCPU `i64` register, the IR ops `vcpu.tls.get` / `vcpu.tls.set` (§12,
+`crates/svm-ir/src/lib.rs:1935-1959`), seeded to the dense vCPU id (root 0, children distinct;
+`crates/svm-interp/src/lib.rs:7810`) and read *at the execution point* so it tracks the current vCPU
+across fiber migration (D57). It is **not** per-thread global storage — it is one word, meant to hold
+a *thread pointer*. Globals are process-global: a global is just a `Data { offset, readonly, bytes }`
+segment (`crates/svm-ir/src/lib.rs:4338`) in the **one shared window** every thread sees
+(`crates/svm-interp/src/bytecode.rs:8880` — "a thread shares its spawner's window/powerbox"); there
+is **no thread-local storage class** in svm-ir. A real `__thread` is therefore the guest's job:
+allocate a per-CPU block, put its base in `vcpu.tls`, and index thread-locals off it — the native
+fs/gs-base recipe. `DESIGN.md:949` lists `_Thread_local` (with threads) as deferred.
+
+**Tier 1 — `tvar` → plain global (committed, done).** For a single-threaded guest a thread-local has
+exactly one instance, so a plain global *is* that instance. svm-leng lowers `tvar` **identically to
+`gvar`**: one zero-initialized global at a fixed window offset, exported/linked as an ordinary data
+symbol (`translate.rs` `collect_globals`, the `gvar | tvar` arms). This mirrors the on-ramp's
+`__thread`-stripping and needs no new IR. It rests on one **invariant**, stated so it can't rot:
+*every guest we target runs single-threaded* — each nimony compiler phase is a batch process (W4 runs
+them as separate single-threaded domains, §3c), each svm domain is single-threaded, and nimony's own
+concurrency is **CPS/`.passive` → state machines** over a minimal `system.nim` (§1), not OS threads.
+Under that invariant the collapse is exact. Pinned by `crates/svm-leng/tests/thread_var.rs`: a `tvar`
+persists across calls (write-then-read-back), a non-zero `tvar` initializer seeds the window, and a
+`tvar` **links cross-module** like a global (the shape of the real allocator's thread-vars in
+`system`, referenced from user code) — all on both engines. This is also already exercised
+end-to-end: the heap programs of W3/Path A run against the compiled `system` module, whose allocator
+state is thread-vars, and they get the right answer.
+
+**Tier 2 — real per-thread `__thread` over `vcpu.tls` (implemented).** For a genuinely multi-threaded
+guest (spawns svm threads *and* relies on per-thread `tvar` state), Tier 1's plain global is wrong —
+all vCPUs would share one copy. The faithful lowering: (i) each `tvar` gets a fixed offset in a
+per-CPU **TLS block** instead of a window offset; (ii) at thread entry the runtime allocates a block
+and `vcpu.tls.set`s its base (the root vCPU too); (iii) every `tvar` access lowers to
+`vcpu.tls.get()` + the tvar's block offset, exactly as native code adds to the fs/gs base. svm
+supplies the base register; the block layout and per-thread allocation are the backend/runtime's
+work — no new substrate.
+
+svm-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
+(`translate_tls` / `Translator::with_tls`; the `tvar` arm of `collect_globals` assigns block offsets,
+`lvalue_addr` emits `vcpu.tls.get() + off`). Step (ii) is the runtime's job — the `vcpu.tls.set` at
+thread entry, the same division as the C runtime's fs/gs-base setup — so it stays outside the
+translator (a threaded guest's thread-start shim, the analog of Path B's allocator shim). Proven in
+`crates/svm-leng/tests/thread_var.rs`: the lowering routes a `tvar` through `vcpu.tls`, and — the core
+property — the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base B0 and bumps +3, base B1
+and bumps +5, then reads each back as 3 and 5; a shared global would read 8), on both engines. A
+non-zero `tvar` initializer in `tls_mode` is fail-closed (the per-thread block is zeroed; non-zero
+seeding is a bounded follow-up). Two other bounded follow-ups, both additive: cross-module block-offset
+agreement (so a `tvar` defined in `system` and referenced from user code shares one block layout — the
+TLS analog of the `data.sym` global relocation), and wiring the thread-start block-alloc/`vcpu.tls.set`
+shim for a real threaded guest. Tier 1's tests remain the differential oracle Tier 2 must satisfy when
+a `tls_mode` program runs single-threaded with its base set once.
+
+**Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved**.
+Tier 1 (single-threaded `tvar → global`) is the operative model for the self-host goal — nimony's
+compiler is single-threaded — and both tiers are implemented and tested: Tier 1 is the default, Tier 2
+(`tls_mode`) is ready for when a threaded Nim guest appears, needing only the two additive follow-ups
+above.
 
 ## 4. Invariants this must respect
 
