@@ -13,14 +13,20 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I73 — punt-inside-a-fiber: the Cranelift JIT still blocks the vCPU inline where the tree-walk oracle parks the fiber (S3, tracked debt with a convergence plan) — opened 2026-08-07 by FIBER_PARK.md F1; **bytecode half CONVERGED 2026-08-07 (F2)**
+### I73 — punt-inside-a-fiber: the fast backends blocked the vCPU inline where the tree-walk oracle parks the fiber — **CONVERGED 2026-08-07, all three engines** (S3; opened by FIBER_PARK.md F1, closed by F2+F3 on the same arc)
 
-**F2 update.** The bytecode cooperative driver now mirrors the oracle (`FiberState::CapParked` +
-the ordered `drain_cap_parked`; `fiber_punt_diff.rs` pins all four F1 kernels TreeWalk ≡ Bytecode
-bit-exact). Remaining: the **Cranelift JIT** (`cap_thunk`/`cap_thunk_locked` block the OS thread
-on a punt regardless of fiber context) — F3 on the same arc. The bytecode **parallel** and
-browser-`Vcpu` drivers wait inline by design (the I45 posture, not debt), as do the debug drivers
-(sanctioned tiering) and the §22 invoke leaf.
+**F2** converged the bytecode cooperative driver (`FiberState::CapParked` + the ordered
+`drain_cap_parked`; `fiber_punt_diff.rs` pins all four F1 kernels TreeWalk ≡ Bytecode bit-exact).
+**F3** converged the Cranelift JIT: `cap_thunk`/`cap_thunk_locked` route a fiber's punt through
+the pending face and park the FIBER (`fiber_cap_wait` over the `Completions` fiber cells — the
+ordered drain lives inside the store's one lock — plus the `fiber_rt` event-park seam the futex
+thunk already used); `svm/tests/fiber_punt_jit.rs` pins all four kernels across all three
+engines, statuses/values/delivery-order alike. The enumerated **inline-by-design** postures that
+remain are not debt: the bytecode parallel and browser-`Vcpu` drivers (the I45 posture — fiber
+delivery through the real cross-thread futex is its own slice), the debug drivers (sanctioned
+whole-vCPU tiering, invariant 9 observability corollary), the §22 invoke leaves (seam-free
+atomic), confined `instantiate` children on the cooperative driver (their completions live on
+their own host), and durable runs everywhere (`freeze_drive` has no cap-park re-derivation).
 
 **What.** F1 extended the §3.6 slice-5a fiber-park contract to punted host calls: on the
 tree-walk oracle, a `Pending` dispatch inside a fiber now unwinds `FIBER_PARKED (3)` to its

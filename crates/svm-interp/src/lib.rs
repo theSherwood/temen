@@ -14413,6 +14413,26 @@ struct CompletionState {
     /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
     /// tier's ordered-delivery key, §18 determinism).
     next_id: u64,
+    /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
+    /// fiber registers here and its resumer's polls read the cell; the ordered drain moves
+    /// ready results into cells **smallest-id-first, stopping at the first not-yet-arrived**
+    /// (the §18 submission-order pin, JIT form — the tree-walk scheduler's `completion_drain`
+    /// and the bytecode `drain_cap_parked`, cell form). One lock with the store, so
+    /// register-then-recheck is atomic and a completion can never race past a registration.
+    fiber_cells: BTreeMap<u64, Arc<CapFiberCell>>,
+}
+
+/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until the ordered drain claims
+/// the completion; the parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
+pub struct CapFiberCell {
+    result: Mutex<Option<i64>>,
+}
+
+impl CapFiberCell {
+    /// Claim the delivered scalar, if the drain has filled the cell.
+    pub fn take(&self) -> Option<i64> {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 impl Completions {
@@ -14422,8 +14442,43 @@ impl Completions {
                 ready: BTreeMap::new(),
                 in_flight: 0,
                 next_id: 0,
+                fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
+        }
+    }
+
+    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
+    /// the ordered drain under the same lock (register-then-recheck: a completion that raced
+    /// the park is claimed here, in submission order, never stranded).
+    pub fn fiber_register(&self, id: u64) -> Arc<CapFiberCell> {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = Arc::new(CapFiberCell {
+            result: Mutex::new(None),
+        });
+        g.fiber_cells.insert(id, Arc::clone(&cell));
+        Self::fiber_drain_locked(&mut g);
+        cell
+    }
+
+    /// F3 — consume a still-parked cell registration (the trap/teardown exit): the eventual
+    /// result stays unclaimed in `ready` for the teardown sweep, exactly like an abandoned
+    /// vCPU waiter's.
+    pub fn fiber_deregister(&self, id: u64) {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        g.fiber_cells.remove(&id);
+    }
+
+    /// The F3 ordered drain: claim ready results into registered fiber cells smallest-id-first,
+    /// stopping at the first not-yet-arrived id. Runs at registration and at every
+    /// [`complete`](Completions::complete), always under the one state lock.
+    fn fiber_drain_locked(g: &mut CompletionState) {
+        while let Some((&id, _)) = g.fiber_cells.first_key_value() {
+            let Some(r) = g.ready.remove(&id) else {
+                break;
+            };
+            let (_, cell) = g.fiber_cells.pop_first().expect("first_key_value above");
+            *cell.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         }
     }
 
@@ -14436,11 +14491,14 @@ impl Completions {
         id
     }
 
-    /// Post a punted job's scalar result (pool-worker side) and wake waiters.
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters — including the
+    /// F3 fiber cells, via the ordered drain (their resumers observe the wake at the next
+    /// `cont.resume` poll; no separate notify hook is needed on the JIT tier).
     fn complete(&self, id: u64, result: i64) {
         let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
         g.ready.insert(id, result);
         g.in_flight -= 1;
+        Self::fiber_drain_locked(&mut g);
         drop(g);
         self.cv.notify_all();
     }

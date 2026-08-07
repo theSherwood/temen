@@ -151,7 +151,22 @@ already decline to the oracle. Differential: a dedicated punt-in-fiber kernel pi
 TreeWalk == Bytecode bit-exact (the `fiber_timed_wait.rs` `pin_all` pattern — the
 generic harnesses generate no fiber kernels, so the pin is explicit).
 
-**F3 — Cranelift JIT parity.**
+**F3 — Cranelift JIT parity. BUILT 2026-08-07.**
+As designed, with one shape change: the per-fiber completion cells live on **`Completions`
+itself** (`CapFiberCell` + a `fiber_cells` map inside the store's one lock), not on the JIT
+`Domain` — the ordered drain (smallest-outstanding-id-first, stop at the first not-yet-arrived)
+runs at registration and at every pool-side `complete`, so register-then-recheck is atomic and
+no notify hook is needed (resumption is poll-driven; there is no OS sleep on the resumer side).
+`svm-jit` exports the two-function facade (`fiber_active` / `fiber_park_current`) over the
+private `fiber_rt` event-park seam; `svm-run`'s `cap_thunk` routes a fiber's punt through the
+pending face (root keeps the sync face — "sync ops never pay" holds, nothing is touched unless
+a fiber is live) and `cap_thunk_locked` swaps its post-release blocking wait for the fiber
+park-poll under the same gate; both share `fiber_cap_wait` (park before first check = the one
+transient `FIBER_PARKED` on an insta-ready completion; a trap mid-park abandons the wait for
+the teardown sweep). Durable runs keep the blocking wait on every face (the oracle's
+predicate). Pins: `svm/tests/fiber_punt_jit.rs` — all four F1 kernels
+**TreeWalk ≡ Bytecode ≡ Cranelift JIT** (all-integer, so bit-exact), same punt counts,
+platform-gated like `jit_fibers.rs`. This closes **ISSUES.md I73**.
 `cap_thunk`/`cap_thunk_locked` (svm-run lib.rs:333, 446): on `Pending` with a current
 fiber, register a per-fiber completion cell (the `FutexEntry::fibers` /
 `fiber_cell_new` shape from `os_thread_rt.rs`, keyed by completion id) and unwind

@@ -111,6 +111,26 @@ mod os_thread_rt;
 #[cfg(not(loom))]
 pub use os_thread_rt::{region_canon_forget_window, region_canon_record};
 
+/// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
+/// the host thunk's fiber-context probe (the futex thunk's `current_fiber_slot`, public face).
+/// `false` for the root computation, so a root-context punt keeps its inline/blocking wait.
+pub fn fiber_active() -> bool {
+    fiber_rt::current_fiber_slot().is_some()
+}
+
+/// F3 (FIBER_PARK.md) — park the current fiber once: unwinds `FIBER_PARKED` to the resumer
+/// (the suspend the guest didn't write) and returns when a `cont.resume` polls this fiber
+/// again. The host thunk's event-park seam — exactly what the futex thunk's wait loop does
+/// between polls, minus the futex cell.
+///
+/// # Safety
+/// Must be called from a host thunk on a thread currently running a guest fiber
+/// ([`fiber_active`] is `true`) — the same contract as the futex thunk's event park.
+pub unsafe fn fiber_park_current() {
+    let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
+    fiber_rt::fiber_event_park(&slot);
+}
+
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
