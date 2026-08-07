@@ -146,3 +146,220 @@ fn driver_chains_two_phases_passing_output_to_input() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The full nifmake shape: four phases, run-and-check-exit, abort on failure.
+//
+// The two-phase test above proves the data hand-off. A real `nifmake` driver
+// does more than pipe: it runs each phase, **checks its exit status, and stops
+// the pipeline if a phase fails** (a broken `nifler` must not feed garbage to
+// `nimony`). This test proves that control flow at nimony's real phase depth
+// (four: nifler -> nimony -> hexer -> lengc), still entirely within the tested
+// `exec` seam (ops: 0 = run, 1 = read_out, 3 = status) — no new infra.
+//
+// Each phase appends its own letter to its stdin, so the happy path composes
+// `a -> ab -> abc -> abcd -> abcde` and witnesses the 4-deep hand-off. Swapping
+// one phase for a version that exits non-zero makes the driver short-circuit:
+// it emits nothing and exits with the failed phase's code, and the later phases
+// never run. The driver module is identical across both — only the registry
+// differs — so the abort is the driver reacting to status, not a different path.
+
+/// A stand-in phase: echo stdin, then append `letter` (its own 1-byte data). Exit 0.
+fn appender(letter: &str) -> String {
+    format!(
+        "\
+memory 16
+data 0 \"{letter}\"
+import 0 \"read\" (i64, i64) -> (i64)
+import 1 \"write\" (i64, i64) -> (i64)
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 64
+  vc = i64.const 32
+  vn = call.import 0 (vp, vc)
+  vw1 = call.import 1 (vp, vn)
+  vbp = i64.const 0
+  vbl = i64.const 1
+  vw2 = call.import 1 (vbp, vbl)
+  return
+  }}
+}}
+export 0 func \"_start\" 0
+"
+    )
+}
+
+/// A phase that **fails**: its entry returns 7, so the child domain exits 7 (a
+/// clean non-zero exit, not a trap) — the `domain_exec` outcome table maps the
+/// first returned value to the exit code (`exec.rs:106`).
+const P3_FAIL: &str = "\
+memory 16
+func 0 () -> (i64) {
+block 0 () {
+  vcode = i64.const 7
+  return vcode
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// The four-phase driver — the `nifmake` analog with abort-on-failure. Data: `exec`@0; phase names
+/// `p1`@8 `p2`@12 `p3`@16 `p4`@20; seed `a`@24. Per phase: run it, read its output into a fresh
+/// buffer (out1@64, out2@128, out3@192, out4@256), read its status, and `br_if status` to the abort
+/// block (5) or the next phase. Block 4 emits the final output + exit 0; block 5 emits nothing and
+/// exits with the failed phase's status. The `exec` handle is re-resolved per block (idempotent by
+/// name), so only the inter-phase length is threaded.
+const DRIVER4: &str = "\
+memory 16
+data 0 \"exec\"
+data 8 \"p1\"
+data 12 \"p2\"
+data 16 \"p3\"
+data 20 \"p4\"
+data 24 \"a\"
+import 0 \"out\" (i64, i64) -> (i64)
+import 1 \"exit\" (i32) -> ()
+func 0 () -> () {
+block 0 () {
+  vp0 = i64.const 0
+  vl0 = i64.const 4
+  vh0 = cap.self.resolve vp0 vl0
+  va0 = i64.const 8
+  vln0 = i64.const 2
+  vsp0 = i64.const 24
+  vsl0 = i64.const 1
+  vj0 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh0 (va0, vln0, vsp0, vsl0)
+  vb0 = i64.const 64
+  vc0 = i64.const 32
+  vn0 = cap.call 13 1 (i64, i64, i64) -> (i64) vh0 (vj0, vb0, vc0)
+  vs0 = cap.call 13 3 (i64) -> (i64) vh0 (vj0)
+  vs0w = i32.wrap_i64 vs0
+  br_if vs0w 5(vs0) 1(vn0)
+}
+block 1 (q1: i64) {
+  vp1 = i64.const 0
+  vl1 = i64.const 4
+  vh1 = cap.self.resolve vp1 vl1
+  va1 = i64.const 12
+  vln1 = i64.const 2
+  vsp1 = i64.const 64
+  vj1 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh1 (va1, vln1, vsp1, q1)
+  vb1 = i64.const 128
+  vc1 = i64.const 32
+  vn1 = cap.call 13 1 (i64, i64, i64) -> (i64) vh1 (vj1, vb1, vc1)
+  vs1 = cap.call 13 3 (i64) -> (i64) vh1 (vj1)
+  vs1w = i32.wrap_i64 vs1
+  br_if vs1w 5(vs1) 2(vn1)
+}
+block 2 (q2: i64) {
+  vp2 = i64.const 0
+  vl2 = i64.const 4
+  vh2 = cap.self.resolve vp2 vl2
+  va2 = i64.const 16
+  vln2 = i64.const 2
+  vsp2 = i64.const 128
+  vj2 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh2 (va2, vln2, vsp2, q2)
+  vb2 = i64.const 192
+  vc2 = i64.const 32
+  vn2 = cap.call 13 1 (i64, i64, i64) -> (i64) vh2 (vj2, vb2, vc2)
+  vs2 = cap.call 13 3 (i64) -> (i64) vh2 (vj2)
+  vs2w = i32.wrap_i64 vs2
+  br_if vs2w 5(vs2) 3(vn2)
+}
+block 3 (q3: i64) {
+  vp3 = i64.const 0
+  vl3 = i64.const 4
+  vh3 = cap.self.resolve vp3 vl3
+  va3 = i64.const 20
+  vln3 = i64.const 2
+  vsp3 = i64.const 192
+  vj3 = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh3 (va3, vln3, vsp3, q3)
+  vb3 = i64.const 256
+  vc3 = i64.const 32
+  vn3 = cap.call 13 1 (i64, i64, i64) -> (i64) vh3 (vj3, vb3, vc3)
+  vs3 = cap.call 13 3 (i64) -> (i64) vh3 (vj3)
+  vs3w = i32.wrap_i64 vs3
+  br_if vs3w 5(vs3) 4(vn3)
+}
+block 4 (q4: i64) {
+  vb4 = i64.const 256
+  vw4 = call.import 0 (vb4, q4)
+  vz4 = i32.const 0
+  call.import 1 (vz4)
+  unreachable
+}
+block 5 (code: i64) {
+  vcw = i32.wrap_i64 code
+  call.import 1 (vcw)
+  unreachable
+}
+}
+export 0 func \"_start\" 0
+";
+
+/// Registry of four appender phases `p1..p4` (letters b,c,d,e). If `fail_at_p3`, `p3` is swapped for
+/// the failing phase — same names, so the driver is unchanged.
+fn phases4(fail_at_p3: bool) -> Vec<DomainProgram> {
+    let mk = |name: &str, src: String| DomainProgram {
+        name: name.into(),
+        instance: Arc::new(
+            instantiate(parse_module(&src).expect("parse phase")).expect("instantiate phase"),
+        ),
+        limits: Limits::default(),
+    };
+    let p3 = if fail_at_p3 {
+        P3_FAIL.to_string()
+    } else {
+        appender("d")
+    };
+    vec![
+        mk("p1", appender("b")),
+        mk("p2", appender("c")),
+        mk("p3", p3),
+        mk("p4", appender("e")),
+    ]
+}
+
+#[test]
+fn four_phase_pipeline_composes_when_every_phase_succeeds() {
+    let m = parse_module(DRIVER4).expect("parse driver4");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver4");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(phases4(false)))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.stdout, b"abcde",
+            "{backend:?}: 4-deep hand-off a -> ab -> abc -> abcd -> abcde"
+        );
+        assert_eq!(r.outcome, Outcome::Exited(0), "{backend:?}: all phases ok");
+    }
+}
+
+#[test]
+fn pipeline_aborts_with_the_failed_phase_status_and_skips_later_phases() {
+    let m = parse_module(DRIVER4).expect("parse driver4");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver4");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(phases4(true)))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.stdout, b"",
+            "{backend:?}: aborted before the success emit — p4 never ran"
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(7),
+            "{backend:?}: driver exits with the failed phase's status (p3 -> 7)"
+        );
+    }
+}

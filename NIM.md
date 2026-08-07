@@ -839,12 +839,20 @@ are its **TLS model** onto svm (the on-ramp gap Phase 1 already surfaced) and co
 allocator/`system` runtime boots cleanly as an isolated child.
 
 **First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
-the runtime edge before the real `system` module: a driver module runs two stand-in "phase" child
-modules via the `exec` cap in sequence, **passing phase 1's output as phase 2's input**, and the
-final result is the composition — the `nifmake` orchestration on svm, decoupled from the real
+the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
+modules via the `exec` cap in sequence, **passing each phase's output as the next phase's input**,
+and the final result is the composition — the `nifmake` orchestration on svm, decoupled from the real
 toolchain (`crates/svm-run/tests/multibinary.rs`; the driver + stand-in phases are pure SVM modules
-over the `exec` cap, so the proof lives with that seam, not in `svm-leng`). This retires the "can the
-driver shape even run on svm" question; what's left (above) is compiling the actual phases.
+over the `exec` cap, so the proof lives with that seam, not in `svm-leng`). Three cases, all green on
+all three engines: (1) a two-phase hand-off (content-sensitive — `a → aa → aa!` — so it witnesses the
+data flow, not just that two children ran); (2) the **full four-phase depth** (nifler → nimony →
+hexer → lengc), `a → ab → abc → abcd → abcde`; and (3) **run-and-check-exit abort** — the driver reads
+each phase's exit status (`exec` op 3) and `br_if`s to a short-circuit block, so when a phase exits
+non-zero the pipeline stops with that phase's status and the later phases never run (the identical
+driver module, only the phase registry differs — so the abort is the driver reacting to status, the
+real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
+including its failure handling; what's left (above) is compiling the actual phases and — for the
+file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
 
 ## 4. Invariants this must respect
 
