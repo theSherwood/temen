@@ -7,8 +7,10 @@ compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOS
 libc-as-capabilities (`POSIX.md`), and the frontend trust model (`FRONTEND.md` §1,
 `DESIGN.md` §2a). This doc is the *what/how/when*; it does not restate those.
 
-Fold completed sections into `DESIGN.md` and drop this file once the actionable gaps
-close — the repo convention (cf. the former `WASM.md`/`SCHEDULING.md`).
+This doc stays its own file — it is **not** folded into `DESIGN.md`. `DESIGN.md` describes
+SVM itself; NIM.md describes a *guest* project that runs **on** SVM (nimony, a consumer of the
+substrate). The two never merge: svm's design and the design of something built atop it are
+separate concerns, even where they touch the same seams.
 
 ## 0. TL;DR
 
