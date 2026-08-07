@@ -13,24 +13,24 @@
 //! print(outer(10))                    -- inner(10)=11, *2 = 22
 //! ```
 //!
-//! **WIP — `#[ignore]`d — I71 facet (b).** This harness is complete and the config carries every
-//! ingredient facet (a) needed (`lua_futamura_call_arith`): per-frame `proto->k` overlays, the
-//! alloc/GC/string cut-set, and — new here — the **upvalue machinery cut** (`outer` captures `inner` as
-//! an upvalue, so `OP_CLOSURE` calls `luaF_findupval`, which walks/mutates the open-upvalue list). With
-//! that cut the fold **descends the full 2-deep stack** (main → `outer` → `inner`, confirmed via
-//! `startfunc` re-entries), which the earlier attempt could not.
+//! **RESOLVED — I71 facet (b).** Three ingredients, all config (no engine change):
 //!
-//! The remaining blocker is engine-level, not config: **a callee frame's register base is dynamic in
-//! the fold**. `inner`'s `x + 1` (`OP_ADDI`) falls to its `OP_MMBINI` metamethod path because the
-//! operand tag never folds — and `eval_load` instrumentation shows *no constant-base access to either
-//! callee's register file at all*. The base is `ci->func + 1` where `ci` is the precall's constant
-//! result and `ci->func` seeds from the frame overlay, so it *should* reduce to a constant, but 2-deep
-//! it does not — the fold then walks off `inner`'s code into the metamethod/GC cold subtree (`Budget`).
-//! Same class as the once-suspected (and disproven, for facet a) "dynamic base": here it is real for a
-//! *callee* frame. Next: instrument the callee `startfunc` base computation to see why `ci->func + 1`
-//! doesn't fold, or have the precall re-seed the callee's base SSA from the pinned `ci`.
+//! 1. Facet (a)'s per-frame `proto->k` overlays + the alloc/GC/string cut-set
+//!    (`lua_futamura_call_arith`).
+//! 2. The **upvalue machinery cut** (`outer` captures `inner` as an upvalue, so `OP_CLOSURE` calls
+//!    `luaF_findupval`, which walks/mutates the open-upvalue list — opaque stateful machinery).
+//! 3. **`CI_SIZE = 64`, the real `CallInfo` stride.** This was the long-hidden root cause: adjacent
+//!    frames' ci nodes sit 64 bytes apart, so the old 104-byte over-slice made `outer`'s ci overlay
+//!    swallow `inner`'s ci header with stale pre-call bytes — `inner.ci->func`/`savedpc` seeded as
+//!    zero, its frame dispatched garbage, and the fold walked into the metamethod/GC cold subtree
+//!    (`Budget`). That masqueraded as an engine-level "callee base is dynamic" blocker; it was an
+//!    overlay collision in the capture config all along (found by `lua_futamura_call_reroot`).
 //!
-//! Run: `cargo test -p svm-llvm --test lua_futamura_call_nested -- --ignored --nocapture`
+//! With those, the full 2-deep inline projection folds (`br_table == 0`) and the embedded residual
+//! prints `22\n` byte-identically to the interpreter — the `ra` keying routes each site to the right
+//! frame and the nested return chain composes, execution-correct.
+//!
+//! Run: `cargo test -p svm-llvm --test lua_futamura_call_nested -- --nocapture`
 
 use svm_interp::{IrPc, Stop, StopReason, Value};
 use svm_ir::{Block, Func, Inst, Module, Terminator, ValType};
@@ -45,7 +45,11 @@ const L_CI: u64 = 32;
 const L_STACK_LAST: u64 = 40;
 const L_STACK: u64 = 48;
 const LUA_STATE_SIZE: usize = 200;
-const CI_SIZE: usize = 104;
+/// One `CallInfo`'s overlay span — the real allocation stride (adjacent ci nodes are 64 apart), NOT a
+/// generous over-slice: a larger span makes one frame's overlay swallow the next frame's header with
+/// stale bytes, which was I71 facet (b)'s root cause. Every field the fold reads (func +0, previous
+/// +16, savedpc, trap, callstatus +62) lies below 64.
+const CI_SIZE: usize = 64;
 const CI_FUNC: u64 = 0;
 const LCLOSURE_P: u64 = 24;
 const PROTO_SIZECODE: u64 = 24;
@@ -139,8 +143,6 @@ struct Callee {
 }
 
 #[test]
-#[ignore = "WIP — I71 facet (b): 2-deep descent works, but callee frame base stays dynamic so inner's \
-            arith operand doesn't fold and the fold walks off into the metamethod cold subtree (Budget)"]
 fn nested_two_frame_call_stack() {
     let m = lua_module();
     let luav = luav_execute(&m);

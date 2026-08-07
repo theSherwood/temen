@@ -30,7 +30,9 @@ const L_STACK_LAST: u64 = 40;
 const L_STACK: u64 = 48;
 const L_CI: u64 = 32;
 const LUA_STATE_SIZE: usize = 200;
-const CI_SIZE: usize = 104;
+// The real CallInfo allocation stride (adjacent ci nodes are 64 apart). An over-slice makes one
+// frame's ci overlay swallow the next node with stale bytes — the I71(b) root cause.
+const CI_SIZE: usize = 64;
 const CI_FUNC: u64 = 0;
 const LCLOSURE_P: u64 = 24;
 const PROTO_SIZECODE: u64 = 24;
