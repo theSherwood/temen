@@ -69,7 +69,7 @@ jobs:
       # re-run instead of eating the whole job budget (a 29 min apt stall burned one 2026-07-23).
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -287,6 +287,9 @@ jobs:
         # (disassemble it to `.ll` for the reader). Both ship in the base `llvm-18`/`clang-18`
         # packages, as do the `llvm-link-18`/`opt-18` the peval probe uses.
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -327,7 +330,7 @@ jobs:
         # be — the test prefers `clang-18` and falls back to `clang`, so plain `clang` suffices.
         # ISSUES.md I34: bound the fetch so a wedged mirror fails fast into a re-run.
         timeout-minutes: 15
-        run: sudo apt-get update && sudo apt-get install -y clang
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo apt-get update && sudo apt-get install -y clang
       # The heavy self-compile gate is #[ignore]d — too slow (~2 min) for the inner
       # `cargo test --workspace` loop: it `make`s chibicc, compiles ~10 TUs `--emit-object`, links +
       # verifies a ~300-function module, runs it on the tree-walk interpreter AND the JIT, and
@@ -363,7 +366,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: install clang (native reference compiler)
         timeout-minutes: 15
-        run: sudo apt-get update && sudo apt-get install -y clang
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo apt-get update && sudo apt-get install -y clang
       - run: cargo test -p svm --test c_link -j 2 -- --ignored whole_cc1_compiles_giant_tus
 
   full-depth-gates:
@@ -395,6 +398,9 @@ jobs:
         # Same out-of-process build tools as the svm-llvm job (clang-18 + llvm-dis for the on-ramp);
         # make + curl let the Tcl/sqlite capstones fetch and build their sources rather than self-skip.
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18 make curl
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -549,6 +555,9 @@ jobs:
         with: { workspaces: crates/svm-llvm }
       - name: install LLVM/clang 18 (build tools for the svm-llvm test harness)
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -594,6 +603,9 @@ jobs:
       # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
       - name: install LLVM/clang 18 (+ Postgres build deps)
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18 flex bison
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -685,6 +697,9 @@ jobs:
             bench/cross-engine/wasmtime-rs
       - name: install LLVM/clang 18 (clang for the kernels & wasm, llvm-dis for the on-ramp)
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -723,6 +738,9 @@ jobs:
             browser
       - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
         run: |
+          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
+          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
+          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure*
           sudo apt-get update
           sudo apt-get install -y llvm-18 clang-18
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
@@ -770,7 +788,7 @@ jobs:
       # bound it so an apt-mirror wedge fails fast into a re-run.
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo clippy -p svm-jit --features stack-check,arena-stacks --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
   stack-guard-cross-os:
