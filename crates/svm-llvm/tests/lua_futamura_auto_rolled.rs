@@ -13,6 +13,9 @@
 //!
 //! Run: `cargo test -p svm-llvm --test lua_futamura_auto_rolled -- --nocapture`
 
+mod peval_capture;
+
+use peval_capture::{discover, dispatch_block, Located, TargetDesc};
 use svm_interp::{IrPc, Stop, StopReason, Value};
 use svm_ir::{Block, Func, Inst, LoadOp, Module, Terminator, ValType};
 use svm_peval::{specialize_with_config, SpecArg, SpecConfig};
@@ -58,19 +61,6 @@ fn rd_u64(w: &[u8], a: u64) -> u64 {
     u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap())
 }
 
-/// The dispatch block: the function's widest `BrTable` (the ~83-way opcode switch).
-fn dispatch_block(m: &Module, luav: u32) -> u32 {
-    let mut best = (0u32, 0usize);
-    for (bi, b) in m.funcs[luav as usize].blocks.iter().enumerate() {
-        if let Terminator::BrTable { targets, .. } = &b.term {
-            if targets.len() > best.1 {
-                best = (bi as u32, targets.len());
-            }
-        }
-    }
-    best.0
-}
-
 /// Read (sp, L, ci) at `luaV_execute` entry.
 fn read_entry(insp: &mut svm_interp::Inspector, luav: u32) -> (i64, u64, u64) {
     let entry = IrPc {
@@ -111,128 +101,44 @@ struct AutoLoop {
     counter: u64,
 }
 
-/// How many frame registers to scan for loop-carried cells, and how many dispatch hits to observe.
-const SCAN_REGS: u64 = 32;
-const OBSERVE_HITS: usize = 48;
-
-/// Discover the loop safepoint + carried cells with no hardcoded register offsets.
-///
-/// Pass 1 (analysis): step the dispatch block `OBSERVE_HITS` times, recording each hit's `savedpc`
-/// and a slice of the frame registers. The **loop body** is the savedpc value with the longest run of
-/// consecutive hits; its first hit is the safepoint. The **carried cells** are the registers whose
-/// value varies across the observed hits (a VNUMINT that changes = loop state; invariants stay put).
-///
-/// Pass 2 (capture): a fresh run advances to that same safepoint hit and snapshots the full window.
+/// Discover the loop safepoint + carried cells with no hardcoded register offsets, via the shared
+/// interpreter-agnostic [`discover`] driver. The Lua-specific inputs are only the located addresses
+/// (register base `ci->func + 1 TValue`, pc at `ci->savedpc`) and the static `TargetDesc` (16-byte
+/// `TValue` stride, the VNUMINT tag filter) — everything else is the shared driver.
 fn auto_capture_loop(m: &Module, luav: u32) -> AutoLoop {
     let dispatch = dispatch_block(m, luav);
-    let disp_pc = IrPc {
-        module: 0,
-        func: luav,
-        block: dispatch as usize,
-        inst: 0,
-    };
 
-    // ---- Pass 1: observe the dispatch stream. ----
+    // Locate: attach once to read the entry scalars (sp, L, ci) and derive the register base.
     let inst = svm_run::instantiate(m.clone()).expect("instantiate");
-    let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    let (_sp, _l, ci) = read_entry(&mut insp, luav);
-    let w0 = insp.read_window(0, CAPTURE_LEN).expect("window");
-    let func = rd_u64(&w0, ci + CI_FUNC);
-    let base = func + STACKVALUE_SIZE;
+    let mut insp0 = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
+    let (sp, l, ci) = read_entry(&mut insp0, luav);
+    let w0 = insp0.read_window(0, CAPTURE_LEN).expect("window");
+    drop(insp0);
+    let base = rd_u64(&w0, ci + CI_FUNC) + STACKVALUE_SIZE;
 
-    insp.set_breakpoint(disp_pc);
-    let mut savedpcs: Vec<u64> = Vec::new();
-    // reg_series[r] = the sequence of R[r] u64 values across hits.
-    let mut reg_series: Vec<Vec<u64>> = vec![Vec::new(); SCAN_REGS as usize];
-    for _ in 0..OBSERVE_HITS {
-        match insp.run_until_stop() {
-            Stop::Break {
-                reason: StopReason::Breakpoint,
-                ..
-            } => {
-                let w = insp.read_window(0, CAPTURE_LEN).expect("window");
-                savedpcs.push(rd_u64(&w, ci + CI_SAVEDPC));
-                for (r, series) in reg_series.iter_mut().enumerate() {
-                    series.push(rd_u64(&w, base + r as u64 * STACKVALUE_SIZE));
-                }
-            }
-            Stop::Finished { .. } => break,
-            o => panic!("unexpected during observe: {o:?}"),
-        }
-    }
-    insp.clear_breakpoint(disp_pc);
+    let loc = Located {
+        reg_base: base,
+        pc_addr: Some(ci + CI_SAVEDPC),
+    };
+    let desc = TargetDesc {
+        reg_stride: STACKVALUE_SIZE,
+        n_regs: 32,
+        tag: Some((8, VNUMINT_TAG)),
+        capture_len: CAPTURE_LEN,
+        observe_hits: 48,
+    };
+    // A fresh inspector positioned at `luaV_execute`'s entry, ready to run to the dispatch loop.
+    let make_insp = || {
+        let inst = svm_run::instantiate(m.clone()).expect("instantiate");
+        let mut insp = inst.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
+        read_entry(&mut insp, luav);
+        insp
+    };
+    let d = discover(&make_insp, luav, dispatch, &loc, &desc);
+
+    assert!(d.counter != 0, "no strictly-decreasing counter cell found");
     assert!(
-        savedpcs.len() >= 4,
-        "too few dispatch hits to find a loop ({} hits)",
-        savedpcs.len()
-    );
-
-    // Loop body = savedpc value with the longest run of consecutive equal hits; safepoint = its first
-    // hit index.
-    let (mut best_start, mut best_len) = (0usize, 0usize);
-    let (mut run_start, mut run_len) = (0usize, 1usize);
-    for i in 1..savedpcs.len() {
-        if savedpcs[i] == savedpcs[i - 1] {
-            run_len += 1;
-        } else {
-            run_start = i;
-            run_len = 1;
-        }
-        if run_len > best_len {
-            best_len = run_len;
-            best_start = run_start;
-        }
-    }
-    let safepoint_hit = best_start;
-
-    // Carried cells + counter are analysed over the LOOP region only (hits from the safepoint onward)
-    // — the prologue holds pre-FORPREP garbage that would corrupt both the "varies" and the monotone
-    // "counter" checks. Carried cell = a register whose value varies within the loop region; counter =
-    // the varying cell whose loop-region series is (weakly) monotone decreasing and net-decreases.
-    let mut dyn_cells: Vec<u64> = Vec::new();
-    let mut counter = 0u64;
-    for (r, full_series) in reg_series.iter().enumerate() {
-        let series = &full_series[safepoint_hit..];
-        if series.iter().any(|&v| v != series[0]) {
-            let addr = base + r as u64 * STACKVALUE_SIZE;
-            dyn_cells.push(addr);
-            let monotone_down = series.windows(2).all(|w| w[1] <= w[0]);
-            if monotone_down && series.first() > series.last() && counter == 0 {
-                counter = addr;
-            }
-        }
-    }
-
-    // ---- Pass 2: capture the full window at the safepoint hit. ----
-    let inst2 = svm_run::instantiate(m.clone()).expect("instantiate");
-    let mut insp2 = inst2.debug_attach(SCRIPT.as_bytes().to_vec(), u64::MAX);
-    let (sp, l, ci2) = read_entry(&mut insp2, luav);
-    assert_eq!(ci2, ci, "ci differs between passes");
-    insp2.set_breakpoint(disp_pc);
-    let mut window = Vec::new();
-    for hit in 0..=safepoint_hit {
-        match insp2.run_until_stop() {
-            Stop::Break {
-                reason: StopReason::Breakpoint,
-                ..
-            } => {
-                if hit == safepoint_hit {
-                    window = insp2.read_window(0, CAPTURE_LEN).expect("window");
-                }
-            }
-            o => panic!("unexpected during capture: {o:?}"),
-        }
-    }
-    insp2.clear_breakpoint(disp_pc);
-    assert!(!window.is_empty(), "safepoint window not captured");
-
-    // Refine the dynamic-cell filter against the *safepoint* window: keep only VNUMINT cells (drops
-    // any non-integer scratch that happened to vary in pass 1).
-    dyn_cells.retain(|&addr| window.get((addr + 8) as usize).copied() == Some(VNUMINT_TAG));
-
-    assert!(counter != 0, "no strictly-decreasing counter cell found");
-    assert!(
-        dyn_cells.contains(&counter),
+        d.varying.contains(&d.counter),
         "counter must be a dynamic cell"
     );
 
@@ -241,9 +147,9 @@ fn auto_capture_loop(m: &Module, luav: u32) -> AutoLoop {
         l,
         ci,
         base,
-        window,
-        dyn_cells,
-        counter,
+        window: d.window,
+        dyn_cells: d.varying,
+        counter: d.counter,
     }
 }
 

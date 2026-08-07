@@ -299,6 +299,35 @@ entry-roots rather than safepoint-roots — cell discovery transfers, but *rooti
 target-specific. Next: extract the `TargetDesc` abstraction so the Lua and regVM capture paths share
 one parameterized driver, and (harder) a second interpreter that itself needs safepoint rooting.
 
+**De-overfitting: the shared `TargetDesc` driver (2026-08-07, `tests/peval_capture/mod.rs`)** — "same
+technique, parallel code" is now "same code, two interpreters". The near-identical Lua and regVM
+discovery code was extracted into one interpreter-agnostic `discover()`, parameterized by a static
+`TargetDesc` (register stride, count, optional value-tag filter) and a per-run `Located` (register
+base, optional in-memory pc address). One unified predicate reproduces both prior behaviours: a
+carried cell is a register that takes **≥3 distinct values** over the loop region (Lua's "varies in
+the loop region" and the regVM's "distinct ≥ 3 over the whole stream" collapse to this), the safepoint
+is the longest in-memory-pc run when a pc address is given (Lua) or hit 0 otherwise (the regVM's
+register-pc), and the counter is peak-based monotone-decreasing. Both `lua_futamura_auto_rolled`
+(841→53 blocks, rolled + correct) and `peval_second_interp` (R0/R1 discovered, counter=R0) now call
+the shared driver and stay green. The Lua↔regVM difference is now entirely data: two structs, no
+branching in the driver.
+
+**De-overfitting: the SAFEPOINT roll on a second non-Lua interpreter (2026-08-07,
+`peval_struct_interp`)** — the strong generality test. The regVM (`peval_second_interp`) keeps its pc
+in a machine register, so it entry-roots and never exercises the hard Lua machinery. This third
+interpreter does: a C struct-VM `VM { long pc; long r[16]; }` at a fixed address, with `resume(prog)`
+a pure dispatch loop that **resumes from the in-memory `vm.pc`** (like Lua's `ci->savedpc`) and
+`run(prog, n)` setting it up. The **unchanged shared `discover`** finds the loop safepoint via the
+in-memory pc and the carried cells (`r0`/`r1`) in the struct; specializing `resume` rooted at that
+safepoint **rolls** the real dispatch loop (9→24 blocks, br_table folded, 2 dynamic params) and
+matches the interpreter across a trip sweep on tree-walk + JIT. So the full Lua-style safepoint +
+dynamic-cell roll — not just cell discovery — works on a layout that shares nothing with Lua (struct
+fields vs frame `TValue`s vs a bare global array). Two incidental findings: this VM writes `vm.pc`
+every bytecode (no *lazy*-savedpc stickiness like Lua), so the safepoint is a body-entered hit
+(the same "in-flight iteration" the Lua rolled residual has) — which is why correctness is anchored to
+the interpreter itself, not a hand formula; and `resume` had to be `noinline` or `-O2` folds it into
+`run` and the dispatch never appears as its own function.
+
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
 Run 31106929611 (attempt 1): `npm exec playwright install --with-deps chromium` spent the
