@@ -6,7 +6,8 @@ callees. This supersedes the parts of CALLS.md §7 that list "`ProviderState` + 
 `GuestImpl`/`LiveImpl` binding split" as deletions — those are **not** being pursued.
 
 This note records a rejected alternative and the reasoning, so the option isn't silently
-re-litigated. It came out of CALLS.md increment 6 (see §8, 6d.4): 6d.4.1 folded the offer powerbox
+re-litigated. (CALLS.md has since been folded into DESIGN.md §12a per the docs-follow-the-code
+rule; its section numbers below refer to the tracker as it existed, in git history.) It came out of CALLS.md increment 6 (see §8, 6d.4): 6d.4.1 folded the offer powerbox
 onto the granted-child shared-cell shape, and in doing so surfaced that finishing the `ProviderState`
 deletion would require this transport change.
 
