@@ -85,11 +85,12 @@ simple, commit to `main`, fuzz/test/bench early, data-oriented design) is in
 > poll the shared cell, a vCPU parked in a futex `wait`/`join` re-checks it and unwinds too, and a
 > runaway **nested §14 child** polls the parent's cell as well — so the kill reaches every JIT
 > execution context (root, sibling vCPUs, nested children).
-> The **async I/O ring** (§9/§12) has landed: an `IoRing` capability batches deferred `cap.call`s,
-> a bounded host **offload pool** runs blocking ops concurrently, and `submit_async`/`reap` park a
-> vCPU on an in-window futex counter that a pool worker wakes (an I/O completion *is* a futex
-> notify) — driven end-to-end by an **async event-loop runtime in real C**, including an async
-> **work-stealing M:N** scheduler that is *entirely guest code* over the two primitives (D56/D57).
+> **Parking-on-blocking** (§12) has landed (and retired the earlier `IoRing` prototype on the
+> numbers): an *offloadable* host-capability registration punts genuinely-blocking calls onto a
+> bounded host **offload pool**, and the eval loops park the caller — vCPU parked, host lock
+> released, worker thread freed — until the completion re-queues it, delivered in submission
+> order. Sync ops never pay for the machinery, and the M:N schedulers (guest work-stealing over
+> `thread.spawn`/futex, D56/D57) overlap blocking host calls without any second host-call ABI.
 > **Fibers are migratable (D57 complete, DESIGN §23):** `cont.resume` on any vCPU claims a suspended
 > fiber and continues its *native stack* on that OS thread — a loom-verified single-owner protocol
 > arbitrates racing claims, with an empirical net (randomized-migration interp↔JIT differential,

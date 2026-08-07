@@ -382,7 +382,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             Err(JitError::Backend(msg)) if msg.contains("Allocation error") => continue, // transient host OOM (Windows commit limit), not a divergence
             Err(e) => panic!("JIT failed to compile a verified fiber module: {e:?}\n{m:#?}"),
         };
-        let (jit, _) = cm.run(&[4096, 1], None, None, None).expect("jit fiber run");
+        let (jit, _) = cm.run(&[4096, 1], None, None).expect("jit fiber run");
 
         match jit {
             JitOutcome::Returned(slots) => {

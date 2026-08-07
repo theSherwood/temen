@@ -14,7 +14,7 @@ pub mod bytecode;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -832,9 +832,6 @@ impl GuestMem for RecordingMem<'_> {
     }
     fn region_page_size(&self) -> i64 {
         self.inner.region_page_size()
-    }
-    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
-        self.inner.async_counter(counter_addr)
     }
 }
 
@@ -2028,7 +2025,7 @@ fn drive_arc(
 /// the live cell (their mutations land in the instance directly, exactly as an eval-loop
 /// animation's do), so concurrent eval-loop animations keep working while the sub-run is in
 /// flight — where the by-value take would gut the cell under them. The cell persists after the
-/// run (no unwrap-back); the sub-run's transient `async_notify` hook is cleared by the core's
+/// run (no unwrap-back); the sub-run's transient `completion_notify` hook is cleared by the core's
 /// teardown. Durable providers are refused upstream (a durable world can't be sub-run over a
 /// live shared cell — the freeze/thaw seeds assume exclusive ownership), so the thaw seeds are
 /// empty by construction.
@@ -2127,16 +2124,16 @@ fn drive_over_cell(
     };
     // §9/§12 async ring: wire the completion `notify` hook to this run's M:N scheduler, so an offload
     // worker waking a vCPU parked in `wait` is a `Scheduler::notify` on the confined counter key.
+    // §12 — the completion-wake hook: a pool worker posting a punted dispatch's result
+    // triggers the scheduler's ordered drain, finishing vCPUs parked in `Blocked::CapPending`.
+    // Cleared at teardown (it captures the run's scheduler — cycle discipline).
     {
-        let sched_for_notify = Arc::clone(&sched);
-        host_shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_async_notify(Arc::new(move |key, count| {
-                // The async-ring completion counter is always a normal anonymous window page
-                // (`async_counter_impl` rejects backed pages), so its rendezvous key is `Anon` (S1b).
-                sched_for_notify.notify(FutexKey::Anon(key), count);
-            }));
+        let sched_for_comp = Arc::clone(&sched);
+        let mut hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
+        let comps = hg.completions();
+        hg.set_completion_notify(Arc::new(move || {
+            sched_for_comp.completion_drain(&comps);
+        }));
     }
     let root_id = {
         let mut s = sched.lock();
@@ -2585,7 +2582,7 @@ fn drive_over_cell(
     {
         let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
         h.quiesce_pool();
-        h.clear_async_notify();
+        h.clear_completion_notify();
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
@@ -3945,13 +3942,6 @@ const MAX_FIBERS: usize = 1 << 24;
 /// only simultaneous liveness is bounded.
 const MAX_VCPUS: usize = 1 << 16;
 
-/// Hard ceiling on the number of SQEs one async-ring `submit`/`submit_async` (§9/§12) will process in
-/// a single call. The entry count comes straight from a guest register, so an unclamped value would
-/// let a guest drive an unbounded host-side allocation (an uncatchable allocator `abort()`) and loop;
-/// clamping here bounds both. Any real ring batch is far below this — a guest needing more issues
-/// multiple submits. Mirrors the [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb ceilings.
-const MAX_RING_BATCH: u64 = 1 << 16;
-
 // §15 **spawn quota** — the single shared type lives in `svm-ir` (re-exported here and as
 // `svm_jit::Quota`), so a powerbox embedder sets it once and it binds all three backends identically,
 // with no facade conversion (Followup F6). The local `MAX_FIBERS`/`MAX_VCPUS` consts above mirror its
@@ -4092,6 +4082,13 @@ enum Blocked {
     /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
     /// what blocking means.
     CapRead { handle: i32 },
+    /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
+    /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
+    /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
+    /// minted monotonically, so this is **submission order** — the §18 ordered-delivery pin) and
+    /// finishes the call via [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
+    /// call just takes time), so a backend that blocks inline instead stays byte-identical.
+    CapPending { id: u64 },
     /// §3.6 slice 3 — parked inside a call to a **live callee** awaiting its reply, keyed by
     /// the dispatch ticket. `callee` is carried for the park-vs-reply race check: the park
     /// handler probes the callee's completion cell under the scheduler lock, so a reply that
@@ -4276,6 +4273,13 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
+    /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
+    /// cell runs at most one sub-run at a time — the `busy` gate). Drained smallest-id-first by
+    /// [`Scheduler::completion_drain`], which stops at the first waiter whose result has not
+    /// arrived — so delivery is in submission order (§18) and a later completion never overtakes
+    /// an earlier parked caller.
+    completion_waiters: BTreeMap<u64, Waiter>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by
     /// `(callee domain id, dispatch ticket)` (exactly one caller per key; woken by
     /// [`Scheduler::cap_reply_or_stash`] with the result). The **callee** must be part of the key:
@@ -4517,6 +4521,47 @@ impl Scheduler {
                     .svc_results
                     .insert(ticket, result);
             }
+        }
+    }
+
+    /// §12 parking-on-blocking (slice 2) — deliver ready punt completions to parked callers **in
+    /// submission order**: drain `completion_waiters` smallest-id-first and stop at the first
+    /// waiter whose result has not arrived, so a later completion never overtakes an earlier
+    /// parked caller (the §18 ordered-delivery pin; latency stays timing-dependent, order does
+    /// not). Called by the run's `completion_notify` hook after each completion posts, and by the
+    /// [`Blocked::CapPending`] park handler right after registering — the register-then-recheck
+    /// TOCTOU close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park
+    /// is delivered here instead of stranding the caller. Unclaimed results simply stay in
+    /// [`Completions::ready`] for their (not-yet-registered or blocking-wait) caller — the stash
+    /// **is** the store, so there is no lost-wakeup window. Lock order sched → completions; the
+    /// completions lock is never held while taking the scheduler's.
+    fn completion_drain(&self, comps: &Completions) {
+        let mut s = self.lock();
+        let mut woke = false;
+        while let Some((&id, _)) = s.completion_waiters.first_key_value() {
+            let Some(r) = comps.try_take(id) else {
+                break;
+            };
+            match s.completion_waiters.remove(&id) {
+                Some(Waiter::VCpu(mut v)) => {
+                    v.pending = Some(Pending::CapResult(r));
+                    s.runnable.push_back(v);
+                    woke = true;
+                }
+                // No fiber parks on completions yet (slice 2 parks whole vCPUs only — the
+                // FIBER_PARKED unwind would be guest-visible where fast backends block inline,
+                // invariant 9); the arm exists so a future handler-promotion slice inherits the
+                // established wake pair.
+                Some(Waiter::Fiber { reg, slot, svc }) => {
+                    reg.wake_blocked(slot, Reg::from_i64(r));
+                    svc_wake_locked(&mut s, svc);
+                    woke = true;
+                }
+                None => unreachable!("first_key_value then remove under one lock"),
+            }
+        }
+        if woke {
+            self.work.notify_all();
         }
     }
 
@@ -4972,6 +5017,23 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
         }
     }
     s.cap_waiters.retain(|_, q| !q.is_empty());
+    // §12 slice 2 — members parked on punt completions die too. The pool job still runs and its
+    // eventual `complete` finds no waiter — the result lands in `Completions::ready`, unclaimed,
+    // and dies with the Host (bounded by punts in flight at death, not call volume).
+    let cw = std::mem::take(&mut s.completion_waiters);
+    for (id, w) in cw {
+        let member = match &w {
+            Waiter::VCpu(v) => domain_key_of(v) == key,
+            Waiter::Fiber { svc, .. } => *svc == key,
+        };
+        if member {
+            if let Waiter::VCpu(v) = w {
+                victims.push(v);
+            }
+        } else {
+            s.completion_waiters.insert(id, w);
+        }
+    }
     // Members parked as *callers* through some other domain die too. The callee's eventual reply
     // will find no waiter here — I40: record the ticket as an orphan so the reply is dropped at its
     // stash site instead of leaking an unclaimable `svc_results` entry on the (surviving) callee.
@@ -5065,6 +5127,11 @@ fn teardown_run(s: &mut Sched) {
         }
     }
     for (_, w) in std::mem::take(&mut s.ticket_waiters) {
+        if let Waiter::VCpu(v) = w {
+            victims.push(v);
+        }
+    }
+    for (_, w) in std::mem::take(&mut s.completion_waiters) {
         if let Waiter::VCpu(v) = w {
             victims.push(v);
         }
@@ -5622,6 +5689,30 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
+            }
+            Step::Park(Blocked::CapPending { id }) => {
+                // §12 slice 2: park inside a punted offloadable dispatch, keyed by completion id.
+                // Register-then-recheck (the `cap_reply_or_stash` TOCTOU close, park side): insert
+                // the waiter under the scheduler lock, then run the ordered drain — a completion
+                // that landed before the insert is delivered right here instead of stranding the
+                // caller. (The host guard below is released before the scheduler lock is taken —
+                // lock order sched → host is never crossed.)
+                let comps = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .completions();
+                {
+                    let mut s = sched.lock();
+                    // §12 domain-lifetime park gate (owner 2026-07-24): never park into a
+                    // torn-down world.
+                    let Some(v) = park_gate(&mut s, v) else {
+                        sched.work.notify_all();
+                        return;
+                    };
+                    s.completion_waiters.insert(id, Waiter::VCpu(v));
+                }
+                sched.completion_drain(&comps);
             }
             Step::Park(Blocked::CapReply { ticket, callee }) => {
                 park_cap_reply(sched, v, ticket, callee);
@@ -6429,6 +6520,7 @@ impl SchedDriver {
                 // other non-resumable drivers). Fail closed rather than wedge.
                 Step::Park(
                     Blocked::CapRead { .. }
+                    | Blocked::CapPending { .. }
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
                     | Blocked::OfferPark { .. }
@@ -10633,7 +10725,53 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Lock the shared powerbox for the duration of this one cap.call (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
-                    let results = hg.cap_dispatch_slots(*type_id, *op, h, &argv, gm)?;
+                    let mut pending_id = None;
+                    let results = hg.cap_dispatch_slots_pending(
+                        *type_id,
+                        *op,
+                        h,
+                        &argv,
+                        gm,
+                        &mut pending_id,
+                    )?;
+                    // §12 parking-on-blocking: a punted offloadable dispatch — release the host
+                    // lock **before** waiting (the §5b serialization fix), then take the scalar
+                    // completion. The placeholder `results` is discarded.
+                    if let Some(id) = pending_id {
+                        if sig.results.len() > 1 {
+                            // Parkable ops carry a single-slot scalar reply (invariant 8) — a
+                            // wider declared signature is a registration bug, fail-closed. Checked
+                            // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
+                            return Err(Trap::CapFault);
+                        }
+                        let comps = hg.completions();
+                        drop(hg);
+                        // Slice 2 — park the vCPU instead of blocking its worker thread: the
+                        // completion re-queues it via `Pending::CapResult`, so the M:N worker
+                        // runs other runnable vCPUs meanwhile. Guest-invisible (a blocking call
+                        // just takes time), hence no cross-backend divergence. Conditions: real
+                        // scheduler (the explorer keeps whole-vCPU blocking waits), root fiber
+                        // (a `cont` fiber's park would unwind FIBER_PARKED to its resumer —
+                        // guest-visible where fast backends block inline, invariant 9),
+                        // non-durable (the freeze driver has no CapPending arm; a durable
+                        // caller keeps the in-dispatch blocking discipline), and an exactly-i64
+                        // reply (the wake pushes a raw i64 reg — the `Pending::CapResult`
+                        // precedent; `Blocking`/offloadable jobs return one i64 by contract).
+                        let parkable = *cur == ROOT_FIBER
+                            && !durable
+                            && matches!(sched, SchedRef::Real(_))
+                            && matches!(sig.results.as_slice(), [ValType::I64]);
+                        if parkable {
+                            return Ok(Inner::Park(Blocked::CapPending { id }));
+                        }
+                        // Degenerate blocking wait (slice 1): single-fiber guests, `cont`
+                        // fibers, durable callers, the deterministic explorer.
+                        let r = comps.wait(id);
+                        if let Some(ty) = sig.results.first() {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
+                        }
+                        continue;
+                    }
                     // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
                     // (a) a blocking stream read with no data parks THIS fiber, keyed by the
                     //     handle it is parked through (the dispatch's placeholder result is
@@ -13414,19 +13552,17 @@ pub mod cap_id {
     /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
     /// authority). It has no directly callable ops (`cap.call` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
-    /// §9/§12 `IoRing` — the submit/complete ring. `op 0 submit(sq_ptr, n, cq_ptr)` runs `n`
-    /// deferred `cap.call`s (each a 64-byte SQE in the window) and writes their results as 32-byte
-    /// CQEs, amortizing the boundary crossing — and, for *blocking* SQEs, **overlapping** them on a
-    /// bounded host offload pool ([`OFFLOAD_POOL_THREADS`] threads; the §12 increment-2 win).
-    pub const IO_RING: u32 = 9;
+    // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
+    // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
+    // parked blocking dispatches (DESIGN.md §12). The id stays reserved — never reuse it.
     /// §12 `Blocking` — a *mock* synchronous-only / blocking host capability (DNS-/FS-blocking-shaped)
     /// whose op 0 `work(arg) -> mix(arg)` is **window-independent and `&mut Host`-free**, so a
-    /// `submit` batch can hand it to the offload pool instead of the guest's vCPU thread. Op 0 is also
-    /// a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
+    /// punting dispatch hands it to the offload pool instead of the guest's vCPU thread. Op 0 is
+    /// also a perfectly ordinary synchronous `cap.call` (it then blocks the caller — the degenerate path).
     ///
-    /// **Test-only since CONSOLIDATION §5a:** no product powerbox grants it — it is the offload-pool
-    /// *exerciser* (io_ring/async tests and the C async demos), retained until the §5b IoRing
-    /// re-measure decides the ring's fate. A harness that needs it calls [`Host::grant_blocking`]
+    /// **Test-only since CONSOLIDATION §5a:** no product powerbox grants it — it is the
+    /// offload-pool / §12 parking exerciser (an offloadable dispatch that always punts when it
+    /// would genuinely block). A harness that needs it calls [`Host::grant_blocking`]
     /// (and registers the `"blocking"` name if its guest resolves by name).
     pub const BLOCKING: u32 = 10;
     /// `Jit` — the guest-driven JIT capability (DESIGN.md §22): submit serialized IR at runtime to
@@ -13549,28 +13685,6 @@ const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
 const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this servicer minted
 const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
-
-/// A `Trap` → small status code for an `IoRing` CQE, numbered to match the JIT's `TrapKind` codes
-/// (so the whole system speaks one trap-code vocabulary). `0` is reserved for success in the CQE.
-fn trap_status(t: &Trap) -> i64 {
-    match t {
-        Trap::DivByZero => 1,
-        Trap::IntOverflow => 2,
-        Trap::BadConversion => 3,
-        Trap::Unreachable => 4,
-        Trap::IndirectCallType => 5,
-        Trap::CapFault | Trap::Malformed | Trap::Exit(_) => 6, // bad/unsupported async request
-        Trap::MemoryFault => 8,
-        Trap::FiberFault => 9,
-        Trap::ThreadFault => 10,
-        Trap::OutOfFuel => 11,
-        // Matches the JIT's `TrapKind::StackOverflow` (13). The JIT produces it only under the
-        // `stack-check` feature (a fiber's software stack-limit check); the default guard-page path
-        // reports a stack overflow as `MemoryFault` (8) — the hardware can't distinguish it — so the
-        // two configs report the same event under different codes, both a "stack blew up" outcome.
-        Trap::StackOverflow => 13,
-    }
-}
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
@@ -13711,30 +13825,6 @@ pub trait GuestMem {
     fn region_page_size(&self) -> i64 {
         host_region_granularity() as i64
     }
-
-    /// §9/§12 **async ring** support. Return a backend-neutral [`AsyncCounter`] for the 4-byte futex
-    /// **completion counter** at `counter_addr`: an offload-pool worker atomic-increments it (the same
-    /// path the backend's `wait`/`notify` value-check reads) and `notify`s its [`AsyncCounter::key`], so
-    /// a vCPU parked in `wait` on the counter wakes race-free (the compare-under-lock guard). `Some`
-    /// only for a normal in-window, naturally-aligned, writable page. `None` — the default — means the
-    /// backend can't post async completions, so `submit_async` reports `-EINVAL` and the guest falls
-    /// back to the synchronous `submit`. The reference paged [`Mem`] and the JIT's flat window both
-    /// override it (each keyed to its own `wait`/`notify`: a window offset vs. an absolute address).
-    fn async_counter(&self, _counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
-        None
-    }
-}
-
-/// A `Send + Sync` handle an offload-pool worker uses to post an async-ring completion to the futex
-/// **completion counter** (§9/§12). `increment` atomic-adds to the in-window counter through the same
-/// path the backend's atomics take (a [`Region`] on the interpreter, a raw window write on the JIT);
-/// `key` is the parking-lot key to hand the [`Host`]'s wake hook — a window offset on the interpreter
-/// (the `Scheduler` key), an absolute window address on the JIT (the futex key) — each consistent with
-/// that backend's `wait`/`notify`, so the worker's increment targets exactly what the parked vCPU's
-/// value-check reads.
-pub trait AsyncCounter: Send + Sync {
-    fn increment(&self, delta: u64);
-    fn key(&self) -> u64;
 }
 
 /// §4/§7 a JIT cap-path window **page map**: page index → state code (the flat-window backend, e.g.
@@ -13852,11 +13942,6 @@ enum Binding {
     /// authority to instantiate (the Instantiator's module ops, serviced by the eval loop / nesting
     /// runtime); the generic dispatch treats any `cap.call` on it as an inert `CapFault`.
     Module(u32),
-    /// A §9/§12 `IoRing` handle: authority to `submit` a batch of deferred `cap.call`s
-    /// (io_uring-shaped), carrying the index of its [`RingState`] in [`Host::rings`] (the async-path
-    /// completion buffer; the synchronous `submit` doesn't use it). The SQ/CQ ring buffers live in the
-    /// guest window; the ops get their pointers as args.
-    IoRing(u32),
     /// A §12 `Blocking` handle, carrying the index of its [`AsyncState`] in [`Host::blockings`] — a
     /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
     /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
@@ -13953,7 +14038,7 @@ impl Attestation {
 /// into a fresh `Host` reconstructs the exact authority. The `JitDomain`/`JitCode` variants
 /// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
 /// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
-/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`, `IoRing`,
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`,
 /// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
@@ -14068,7 +14153,6 @@ pub struct NonDurableHandle {
 pub enum NonDurableKind {
     SharedRegion,
     Module,
-    IoRing,
     Blocking,
     JitDomain,
     JitCode,
@@ -14256,37 +14340,6 @@ impl OffloadPool {
             g = c.wait(g).unwrap();
         }
     }
-
-    /// Round-robin `jobs` across the workers and **block until all complete**. Each job writes its
-    /// result through its own captured destination, so the caller reads results back by index after
-    /// this returns. This is the synchronous-submit MVP: one boundary crossing, `K`-way overlap,
-    /// then a single reap (fiber-parking / async resume is increment 3).
-    fn run_batch(&self, jobs: Vec<OffloadJob>) {
-        let n = jobs.len();
-        if n == 0 {
-            return;
-        }
-        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
-        for (i, job) in jobs.into_iter().enumerate() {
-            let done = Arc::clone(&done);
-            let wrapped: OffloadJob = Box::new(move || {
-                job();
-                let (m, c) = &*done;
-                *m.lock().unwrap() += 1;
-                c.notify_all();
-            });
-            // `send` only fails if a worker thread is gone — a host bug, not a guest-reachable path,
-            // and the wait below would then hang, so surface it loudly.
-            self.txs[i % self.txs.len()]
-                .send(wrapped)
-                .expect("offload worker vanished");
-        }
-        let (m, c) = &*done;
-        let mut g = m.lock().unwrap();
-        while *g < n {
-            g = c.wait(g).unwrap();
-        }
-    }
 }
 
 impl Drop for OffloadPool {
@@ -14299,30 +14352,97 @@ impl Drop for OffloadPool {
     }
 }
 
-/// §9/§12 async-ring per-handle state: completions posted by offload workers (or by inline ops) during
-/// a `submit_async`, awaiting the guest's `reap` to flush them into the window. `Send + Sync` so a pool
-/// worker pushes from its own thread; the guest reaps on its vCPU thread. The futex completion counter
-/// lives in the *window* (so the guest can `wait` on it); this holds only the CQE payloads.
-#[derive(Default)]
-struct RingState {
-    /// Ready completions `(user_data, result, status)`, FIFO — pushed by workers/inline, popped by reap.
-    completed: Mutex<VecDeque<(i64, i64, i64)>>,
+/// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
+/// offloadable handler punts ([`OffloadOutcome::Offload`]) on the parking-aware dispatch face
+/// ([`Host::cap_dispatch_slots_pending`]), the dispatch mints an id here, hands the job to the
+/// offload pool, and returns `Pending(id)`; the pool worker posts the scalar result via
+/// [`Completions::complete`]. The eval loop then waits **without the host lock**
+/// ([`Completions::wait`] — the single-fiber degenerate path; fiber-level parking is the
+/// cooperative-tier slice). `Send + Sync` (an `Arc` is cloned out of the host before the wait, and
+/// pool workers complete from their own threads).
+///
+/// **Sync ops never pay for this** (the §12 pin): nothing here is touched — no id minted, no map
+/// insert — unless a handler already returned `Offload` on the pending face.
+pub struct Completions {
+    mx: Mutex<CompletionState>,
+    cv: Condvar,
 }
 
-/// The interpreter's [`AsyncCounter`]: the futex completion counter is a normal anonymous window page,
-/// so a worker increments it via the shared [`Region`] (the same real-atomic path cross-vCPU atomics
-/// take) and the parking key is the window-relative offset (the `Scheduler`'s parking-lot key).
-struct RegionCounter {
-    region: Arc<Region>,
-    off: u64,
+struct CompletionState {
+    /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
+    ready: BTreeMap<u64, i64>,
+    /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
+    in_flight: usize,
+    /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
+    /// tier's ordered-delivery key, §18 determinism).
+    next_id: u64,
 }
 
-impl AsyncCounter for RegionCounter {
-    fn increment(&self, delta: u64) {
-        self.region.atomic_rmw(self.off, 4, RmwOp::Add, delta);
+impl Completions {
+    fn new() -> Completions {
+        Completions {
+            mx: Mutex::new(CompletionState {
+                ready: BTreeMap::new(),
+                in_flight: 0,
+                next_id: 0,
+            }),
+            cv: Condvar::new(),
+        }
     }
-    fn key(&self) -> u64 {
-        self.off
+
+    /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
+    fn mint(&self) -> u64 {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.next_id;
+        g.next_id += 1;
+        g.in_flight += 1;
+        id
+    }
+
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters.
+    fn complete(&self, id: u64, result: i64) {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        g.ready.insert(id, result);
+        g.in_flight -= 1;
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
+    /// wait** (§12: "a single-fiber guest degenerates to a plain wait without the lock"). The
+    /// caller must have dropped the host lock; this blocks only the calling vCPU thread while the
+    /// pool does the work.
+    pub fn wait(&self, id: u64) -> i64 {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(r) = g.ready.remove(&id) {
+                return r;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
+    /// drain's probe and the park path's register-then-recheck. Exactly one taker wins; the
+    /// loser's wake attempt is an idempotent no-op.
+    pub fn try_take(&self, id: u64) -> Option<i64> {
+        self.mx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready
+            .remove(&id)
+    }
+
+    /// Ids minted but not yet completed. A test pins the "sync ops never pay" invariant with
+    /// [`Completions::minted`]; this is the in-flight drain signal.
+    pub fn outstanding(&self) -> usize {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner()).in_flight
+    }
+
+    /// Total completion ids ever minted on this host — `0` proves no dispatch ever touched the
+    /// parking machinery (the §12 "sync ops never pay" pin, asserted by tests).
+    pub fn minted(&self) -> u64 {
+        self.mx.lock().unwrap_or_else(|e| e.into_inner()).next_id
     }
 }
 
@@ -14356,6 +14476,43 @@ pub type HostProc = Box<
 /// a forked domain remains forkable (fork-of-fork, nested guests).
 pub type HostProcFork = Arc<dyn Fn() -> HostProc + Send + Sync>;
 
+/// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
+/// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
+/// what it needs at punt time, sees **no window and no `Host`**, and returns exactly one `i64`
+/// (invariant 8's single-slot scalar reply; errors ride negative errnos, never traps — a pool
+/// job has nothing to forge).
+pub type OffloadWork = Box<dyn FnOnce() -> i64 + Send + 'static>;
+
+/// An **offloadable** handler's per-call decision (the io_uring try-nonblocking model): the fast
+/// case completes inline on the vCPU thread ([`OffloadOutcome::Done`] — data already buffered, a
+/// pure compute); the slow case punts its blocking work to the offload pool
+/// ([`OffloadOutcome::Offload`]) and the *dispatch face* decides what that means — a parking-aware
+/// eval loop gets `Pending(id)` and waits without the host lock; every other caller runs the job
+/// inline, byte-identical to a synchronous handler (decline-never-diverge, INVARIANTS.md 9).
+pub enum OffloadOutcome {
+    /// Completed inline — result slots exactly as a plain [`HostProc`] would return them.
+    Done(Result<Vec<i64>, Trap>),
+    /// Would block: run this job off the vCPU thread. The call's declared signature must have at
+    /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
+    Offload(OffloadWork),
+}
+
+/// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
+/// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
+/// guest window, no region minter — because a punted job outlives the dispatch and the pool must
+/// never touch the window (buffers are read at submit and written at completion on the vCPU
+/// thread — the ring's own discipline, kept as the registration contract).
+pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
+
+/// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
+/// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
+/// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
+/// the right to punt to the offload pool.
+enum ProcHandler {
+    Sync(HostProc),
+    Offloadable(OffloadHostProc),
+}
+
 /// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
 /// mint a §13 `SharedRegion` and receive its handle. Deliberately narrow — the handler still cannot
 /// reach the rest of the `Host` (no slot table, no other backings), so the escape hatch widens by
@@ -14372,8 +14529,8 @@ pub trait RegionMinter {
 /// tables can no longer desync because there is only one). Indexed by the id a
 /// [`Binding::HostProc`] carries.
 struct HostProcEntry {
-    /// The handler closure ([`HostProc`]). A dispatch takes it out, runs it, and restores it.
-    handler: HostProc,
+    /// The handler closure ([`ProcHandler`]). A dispatch takes it out, runs it, and restores it.
+    handler: ProcHandler,
     /// FORK.md PR 5 — the provider-supplied fork factory ([`Host::grant_host_proc_forkable`]):
     /// `Some` = [`Host::fork_powerbox`] carries this capability into a twin by minting a fresh
     /// closure; `None` = non-forkable (fail closed).
@@ -14960,15 +15117,19 @@ pub struct Host {
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
     pool: Option<OffloadPool>,
-    /// §9/§12 async-ring per-handle state, indexed by the id a [`Binding::IoRing`] carries — where a
-    /// `submit_async` posts completions for the guest's `reap`.
-    rings: Vec<Arc<RingState>>,
-    /// §9/§12 the **async-completion `notify`** hook: an offload worker calls this (with the confined
-    /// futex counter key) to wake the vCPU parked in `wait` on that key — i.e. an I/O completion *is* a
-    /// futex notify (DESIGN §12). Installed per run by the executor that owns the wake mechanism
-    /// (`drive` wires it to the M:N `Scheduler::notify`); `None` ⇒ no async support, so `submit_async`
-    /// `-EINVAL`s and the guest falls back to the synchronous `submit`.
-    async_notify: Option<Arc<dyn Fn(u64, u32) + Send + Sync>>,
+    /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
+    /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
+    /// without the host lock. Shared out by [`Host::completions`] before the wait. Untouched
+    /// (nothing minted) unless an offloadable handler punts on the parking-aware face.
+    completions: Arc<Completions>,
+    /// §12 parking-on-blocking (slice 2) — the **completion wake** hook: a pool worker calls this
+    /// after posting a punted job's result, so the run's scheduler can drain
+    /// `completion_waiters` (deliver to parked vCPUs in submission order). Installed per run by
+    /// the executor that owns the wake mechanism (`drive_over_cell` wires it to
+    /// `Scheduler::completion_drain`), cleared at run teardown (it captures the `Arc<Scheduler>`
+    /// — same reference-cycle discipline as `async_notify`); `None` ⇒ parked callers don't exist
+    /// (every waiter is a blocking `Completions::wait`), so no wake is needed.
+    completion_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -15346,8 +15507,8 @@ impl Host {
             pending_live_impls: Vec::new(),
             window_minters: Vec::new(),
             pool: None,
-            rings: Vec::new(),
-            async_notify: None,
+            completions: Arc::new(Completions::new()),
+            completion_notify: None,
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),
@@ -15401,7 +15562,6 @@ impl Host {
         let simple = procs_forkable
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
-            && self.rings.is_empty()
             && self.jit_domains.is_empty()
             && self.blockings.is_empty()
             && self.window_minters.is_empty()
@@ -15410,7 +15570,7 @@ impl Host {
             && self.modules.is_empty()
             && self.self_instance.is_none()
             && self.pool.is_none()
-            && self.async_notify.is_none()
+            && self.completion_notify.is_none()
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
@@ -15441,7 +15601,7 @@ impl Host {
             .map(|e| {
                 let factory = e.fork.as_ref().unwrap();
                 HostProcEntry {
-                    handler: factory(),
+                    handler: ProcHandler::Sync(factory()),
                     fork: Some(Arc::clone(factory)),
                     mints: e.mints,
                 }
@@ -15851,7 +16011,6 @@ impl Host {
     fn checkpoint_safe(&self) -> bool {
         self.regions.is_empty()
             && self.blockings.is_empty()
-            && self.rings.is_empty()
             && self.host_procs.is_empty()
             && self.jit_domains.is_empty()
     }
@@ -16033,22 +16192,65 @@ impl Host {
         out
     }
 
-    /// Install the §9/§12 async-completion `notify` hook (the executor that owns the wake mechanism
-    /// wires it at run start; see [`Host::async_notify`]). The interp's `drive` calls this with the M:N
-    /// `Scheduler::notify`; the JIT wires its futex via the same seam (`svm_jit::AsyncHostHooks`).
-    /// Cleared at run end to drop the closure's executor reference.
-    pub fn set_async_notify(&mut self, f: Arc<dyn Fn(u64, u32) + Send + Sync>) {
-        self.async_notify = Some(f);
-    }
-    pub fn clear_async_notify(&mut self) {
-        self.async_notify = None;
-    }
     /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing (or
     /// the JIT's window/`Domain` pointers) when the caller frees them.
     pub fn quiesce_pool(&self) {
         if let Some(p) = &self.pool {
             p.quiesce();
         }
+    }
+
+    /// §12 parking-on-blocking — the completion store ([`Completions`]). An eval loop clones this
+    /// out **before** dropping the host lock, then waits on it for a `Pending` dispatch's result.
+    pub fn completions(&self) -> Arc<Completions> {
+        Arc::clone(&self.completions)
+    }
+
+    /// §12 — dispose of a punted job per the dispatch face: on the parking face, mint a
+    /// completion id, hand the job to the offload pool (worker posts the result via
+    /// [`Completions::complete`]) and return the id through `pending` (result slots are then a
+    /// placeholder the caller discards); on the sync face, run the job inline on this thread —
+    /// byte-identical to a synchronous handler. Nothing here is reachable unless a handler
+    /// already returned [`OffloadOutcome::Offload`] (the "sync ops never pay" pin).
+    fn punt_or_inline(
+        &mut self,
+        job: OffloadWork,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        match pending {
+            Some(slot) => {
+                let id = self.completions.mint();
+                let comps = Arc::clone(&self.completions);
+                // The result post happens-before the wake hook, so a drain triggered by the
+                // hook always finds the result it is delivering (no lost wakeup).
+                let hook = self.completion_notify.clone();
+                let pool = self
+                    .pool
+                    .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
+                pool.dispatch(vec![Box::new(move || {
+                    comps.complete(id, job());
+                    if let Some(h) = &hook {
+                        h();
+                    }
+                })]);
+                *slot = Some(id);
+                Ok(Vec::new())
+            }
+            None => Ok(vec![job()]),
+        }
+    }
+
+    /// §12 slice 2 — install the per-run completion-wake hook (see the `completion_notify`
+    /// field). The executor that owns the wake mechanism wires it to its scheduler's ordered
+    /// drain and clears it at teardown.
+    pub fn set_completion_notify(&mut self, f: Arc<dyn Fn() + Send + Sync>) {
+        self.completion_notify = Some(f);
+    }
+
+    /// §12 slice 2 — drop the completion-wake hook at run teardown (it captures the run's
+    /// `Arc<Scheduler>`; leaving it would cycle Host → Scheduler → Host).
+    pub fn clear_completion_notify(&mut self) {
+        self.completion_notify = None;
     }
 
     /// Install a host binding in a free slot and return the guest handle — a forgeable
@@ -16157,7 +16359,6 @@ impl Host {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
                 Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
-                Binding::IoRing(_) => return Err(self.non_durable(slot, NonDurableKind::IoRing)),
                 Binding::Blocking(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::Blocking))
                 }
@@ -16205,7 +16406,7 @@ impl Host {
     /// **Drain the live non-durable handles** so the domain becomes snapshottable (DURABILITY.md §12.5
     /// "drainable non-durable bindings" / Phase-4 handle hardening). Closes every live slot holding a
     /// binding [`Self::capture_durable_handles`] would refuse on — the ones carrying out-of-line host
-    /// state or native pointers (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`JitDomain`/`JitCode`/
+    /// state or native pointers (`SharedRegion`/`Module`/`Blocking`/`JitDomain`/`JitCode`/
     /// `HostProc`) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
     /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
     /// `cap.call` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
@@ -16239,7 +16440,6 @@ impl Host {
                 | Binding::JitCode { .. } => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
-                Binding::IoRing(_) => NonDurableKind::IoRing,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
@@ -16526,13 +16726,6 @@ impl Host {
             },
         )
     }
-    /// Grant a §9/§12 `IoRing` capability — authority to `submit` batched/deferred `cap.call`s
-    /// (synchronously via op 0, or asynchronously via op 1 `submit_async` + op 2 `reap`).
-    pub fn grant_io_ring(&mut self) -> i32 {
-        let idx = self.rings.len() as u32;
-        self.rings.push(Arc::new(RingState::default()));
-        self.grant(cap_id::IO_RING, Binding::IoRing(idx))
-    }
     /// Grant a §12 `Blocking` capability — a mock synchronous/blocking host op the offload pool can
     /// overlap. `block_for` is how long each op blocks (`Duration::ZERO` for a pure compute);
     /// `rendezvous` (test-only) installs a width-`w` [`Barrier`] so a batch of exactly `w` ops on a
@@ -16564,7 +16757,24 @@ impl Host {
     /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
     pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
+            fork: None,
+            mints: false,
+        })
+    }
+
+    /// §12 parking-on-blocking — register an **offloadable** host-capability handler (also iface
+    /// [`cap_id::HOST_PROC`]): the registration declares blockingness. The handler decides per call
+    /// (the io_uring try-nonblocking model): [`OffloadOutcome::Done`] completes inline;
+    /// [`OffloadOutcome::Offload`] punts a self-contained scalar job to the offload pool. On a
+    /// parking-aware eval loop the punting call returns `Pending` and the caller waits **without
+    /// the host lock**; everywhere else the job runs inline, byte-identical to a synchronous
+    /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
+    /// minter, no fork factory — the pool must never touch the window (the ring's discipline,
+    /// kept), and a punted call's declared signature carries at most one result (invariant 8).
+    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: ProcHandler::Offloadable(f),
             fork: None,
             mints: false,
         })
@@ -16585,7 +16795,7 @@ impl Host {
     /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
     pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
             fork: Some(fork),
             mints: false,
         })
@@ -16599,7 +16809,7 @@ impl Host {
     /// is exactly region-minting (nothing else of the `Host` is reachable).
     pub fn grant_host_proc_region(&mut self, f: HostProc) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
-            handler: f,
+            handler: ProcHandler::Sync(f),
             fork: None,
             mints: true,
         })
@@ -18094,7 +18304,7 @@ impl Host {
     /// (`Instantiator.instantiate_granted`), so a §14 child is not born destitute. Only a
     /// **coordinate-free, self-contained** capability qualifies — one a fresh child `Host` can hold
     /// as-is: `Stream` (stdio), `Exit`, `Clock`. Refused (`CapFault`), deliberately:
-    /// - **index-carrying** caps (`SharedRegion`/`Module`/`IoRing`/`Blocking`/`HostProc*`) whose index
+    /// - **index-carrying** caps (`SharedRegion`/`Module`/`Blocking`/`HostProc*`) whose index
     ///   names a slot in *this* Host's side tables — a child needs those installed by their own
     ///   deep-copy path (e.g. the SharedRegion grant), not a raw binding copy; and
     /// - **window-coordinate** caps (`AddressSpace`/`Instantiator`, `Memory`) whose `{base,size}` are
@@ -18339,6 +18549,47 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, None)
+    }
+
+    /// §12 parking-on-blocking — the **parking-aware dispatch face**: identical to
+    /// [`Host::cap_dispatch_slots`] except an offloadable handler's punt returns immediately with
+    /// `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
+    /// running the job inline. The result slots are then a placeholder the caller must discard —
+    /// on `Some`, drop the host lock, then [`Completions::wait`] (via [`Host::completions`]) for
+    /// the scalar result and deliver it as the call's single result slot. Only eval loops that
+    /// implement that discipline may use this face; everything else stays on the sync face and
+    /// gets byte-identical inline semantics (decline-never-diverge, INVARIANTS.md 9). Under a W1
+    /// tape the punt is forced inline so the recorded crossing carries the real result.
+    pub fn cap_dispatch_slots_pending(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: &mut Option<u64>,
+    ) -> Result<Vec<i64>, Trap> {
+        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, Some(pending))
+    }
+
+    fn cap_dispatch_slots_impl(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
+        // placeholder on the tape would replay as a phantom result; the inline run records the
+        // real one (the same reasoning as the parked-stdin tape suppression below).
+        let pending = if self.cap_record.is_some() || self.cap_replay.is_some() {
+            None
+        } else {
+            pending
+        };
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -18456,11 +18707,12 @@ impl Host {
                         handle,
                         args,
                         Some(&mut rec_mem),
+                        pending,
                     );
                     (r, rec_mem.writes)
                 }
                 None => (
-                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None),
+                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None, pending),
                     Vec::new(),
                 ),
             };
@@ -18481,11 +18733,13 @@ impl Host {
             }
             return result;
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending)
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
     /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
+    /// `pending` is the §12 parking out-param ([`Host::cap_dispatch_slots_pending`]); `None` = the
+    /// sync face, where an offloadable punt runs inline.
     fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
@@ -18493,6 +18747,7 @@ impl Host {
         handle: i32,
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
+        pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -18689,7 +18944,7 @@ impl Host {
                         // them. `busy` serves here as a **host-side-only gate**: one sub-run per
                         // instance at a time (a second host-side caller answers `-EAGAIN`,
                         // probeable) because the sub-run wires transient run hooks
-                        // (`async_notify`) onto the cell that two concurrent sub-runs would
+                        // (`completion_notify`) onto the cell that two concurrent sub-runs would
                         // clobber. The eval-loop threaded arm ignores `busy` entirely, so
                         // eval-loop admission stays unbounded alongside one host-side sub-run —
                         // exactly the tier split §10.1 orders (gate = the provider's declaration,
@@ -18757,9 +19012,9 @@ impl Host {
                                 let mut result_slots: Vec<i64> =
                                     res?.iter().map(|v| val_to_slot(*v)).collect();
                                 // Edge 2 — results provider→caller. Blocking is sound here: no
-                                // path holds a provider cell while entering this arm (IoRing is
-                                // not regrantable into a powerbox, and durable sub-runs are
-                                // refused), so the only contention is brief edge scopes.
+                                // path holds a provider cell while entering this arm (durable
+                                // sub-runs are refused), so the only contention is brief edge
+                                // scopes.
                                 let mut ph = cell.lock().unwrap_or_else(|e| e.into_inner());
                                 translate_cap_slots(
                                     &mut ph,
@@ -18897,15 +19152,32 @@ impl Host {
                     Some(e) => (
                         std::mem::replace(
                             &mut e.handler,
-                            Box::new(|_, _, _, _| Err(Trap::CapFault)),
+                            ProcHandler::Sync(Box::new(|_, _, _, _| Err(Trap::CapFault))),
                         ),
                         e.mints,
                     ),
                     None => return Err(Trap::CapFault),
                 };
-                let r = f(op, args, mem, if mints { Some(self) } else { None });
+                // §12 offloadable: the handler decides per call — `Done` completed inline (the
+                // fast case pays nothing beyond this match); `Offload` punts the self-contained
+                // job (pool + `Pending` on the parking face, inline on the sync face). The
+                // window/minter are deliberately out of reach of an offloadable handler.
+                let mut punted: Option<OffloadWork> = None;
+                let r = match &mut f {
+                    ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
+                    ProcHandler::Offloadable(f) => match f(op, args) {
+                        OffloadOutcome::Done(r) => r,
+                        OffloadOutcome::Offload(job) => {
+                            punted = Some(job);
+                            Ok(Vec::new()) // replaced below
+                        }
+                    },
+                };
                 self.host_procs[idx as usize].handler = f;
-                r
+                match punted {
+                    Some(job) => self.punt_or_inline(job, pending),
+                    None => r,
+                }
             }
             Binding::Exit => {
                 // op 0: exit(code: i32) — noreturn. Propagate as a (non-error) trap.
@@ -19239,17 +19511,6 @@ impl Host {
             // A `CompiledCode` handle has no directly callable ops (like `Module`): it is only
             // *named* in `Jit.invoke`/`release`.
             Binding::JitCode { .. } => Err(Trap::CapFault),
-            // §9/§12 IoRing. op 0 `submit(sq_ptr, n, cq_ptr)` — synchronous batch (increment 1/2). op 1
-            // `submit_async(sq_ptr, n, counter_addr)` — kick the batch onto the pool and return; each
-            // completion posts to the ring's [`RingState`] + bumps the in-window futex counter + wakes
-            // a parked vCPU (increment 3). op 2 `reap(cq_ptr, max)` — flush ready completions to the
-            // window on the vCPU thread.
-            Binding::IoRing(idx) => match op {
-                0 => self.io_ring_submit(args, mem),
-                1 => self.io_ring_submit_async(idx, args, mem),
-                2 => self.io_ring_reap(idx, args, mem),
-                _ => Ok(vec![EINVAL]),
-            },
             // §12 Blocking: `op 0 work(arg) -> mix(arg)`. As a *direct* cap.call it runs inline and
             // blocks the caller (the degenerate single path); a batched `submit` instead overlaps it
             // on the offload pool. Either way the result is the same deterministic transform.
@@ -19268,349 +19529,21 @@ impl Host {
                         return Err(Trap::ThreadFault);
                     }
                     let arg = *args.first().unwrap_or(&0);
-                    Ok(vec![self.blockings[idx as usize].run(arg)])
+                    // §12 parking: `Blocking` is the offloadable-registration exerciser — the
+                    // per-call decision inlined. Fast case (nothing to block on) completes on the
+                    // vCPU thread before any `Arc` clone, so the block=0 bench regime pays only
+                    // these two loads; the genuinely-blocking case punts (Pending on the parking
+                    // face, inline on the sync face — today's semantics, byte-identical).
+                    let st = &self.blockings[idx as usize];
+                    if st.block_for.is_zero() && st.rendezvous.is_none() {
+                        return Ok(vec![st.run(arg)]);
+                    }
+                    let st = Arc::clone(st);
+                    self.punt_or_inline(Box::new(move || st.run(arg)), pending)
                 }
                 _ => Ok(vec![EINVAL]),
             },
         }
-    }
-
-    /// §9/§12 the **submit/complete ring** (io_uring-shaped). `submit(sq_ptr, n, cq_ptr)` reads `n`
-    /// 64-byte SQEs from `[sq_ptr, …)` (each a *deferred `cap.call`*) and writes a 32-byte CQE to
-    /// `[cq_ptr, …)` per entry; returns the count completed. One boundary crossing for `n` ops (the
-    /// §1a interface-amortization win).
-    ///
-    /// **Two execution classes (increment 2 — the bounded offload pool):**
-    /// - **Inline** — ops that touch the window or `&mut Host` (Clock, Memory, Stream, …) run on the
-    ///   submitting thread through the normal dispatch, in SQE order, exactly as increment 1.
-    /// - **Offloaded** — `Blocking` ops (window-independent, `&mut Host`-free) are handed to the
-    ///   bounded [`OffloadPool`] and run **concurrently** on `K` threads (waves of `K`), so the
-    ///   guest's vCPU thread isn't multiplied by the blocking count (§12 "0 blocked vCPU threads").
-    ///
-    /// Window reads (SQE parse) and writes (CQE) stay on the submit thread; only the offloaded *op
-    /// bodies* overlap, and each `Blocking` result is a deterministic pure transform — so the final
-    /// window is **identical to running every op inline in order**, and both backends still agree (the
-    /// §18 oracle). The submit blocks until the whole batch completes (fiber-parking is increment 3).
-    ///
-    /// SQE (64 B, little-endian): `u32 type_id | u32 op | i32 handle | u32 n_args | i64 args[4] |
-    /// i64 user_data | i64 pad`. CQE (32 B): `i64 user_data | i64 result | i64 status (0=ok, else a
-    /// TrapKind code) | i64 pad`. A nested `IoRing` op, or an op the dispatch can't service
-    /// (Instantiator/Module → `CapFault`), simply lands as a CQE with a non-zero `status` —
-    /// never a host panic and never unbounded recursion.
-    fn io_ring_submit(
-        &mut self,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
-        const SQE: u64 = 64;
-        const CQE: u64 = 32;
-        const MAX_SQ_ARGS: usize = 4;
-        // A ring with no window is inert (`-EFAULT`); otherwise borrow the window once and reborrow it
-        // (`&mut *m`) for each SQE's read, inline dispatch, and CQE write.
-        let m = match mem {
-            Some(m) => m,
-            None => return Ok(vec![EFAULT]),
-        };
-        let sq_ptr = *args.first().unwrap_or(&0) as u64;
-        // Clamp the guest-supplied entry count to a bounded batch ceiling. Without this a forged `n`
-        // (e.g. `i64::MAX`) would both `with_capacity`-allocate ~`n * size_of::<Pending>()` bytes (an
-        // uncatchable allocator `abort()` — a host crash from a guest, defeating §5) and spin the
-        // submit loop `n` times. Any real ring batch fits well under this; a guest needing more issues
-        // multiple submits. The clamped value is what we report submitted.
-        let n = ((*args.get(1).unwrap_or(&0)).max(0) as u64).min(MAX_RING_BATCH);
-        let cq_ptr = *args.get(2).unwrap_or(&0) as u64;
-
-        // One pending completion per SQE we managed to read; filled inline now, or by the pool below.
-        // (An unreadable SQE writes its `-EFAULT` CQE immediately and is not tracked here.)
-        struct Pending {
-            at: u64,
-            user_data: i64,
-            result: i64,
-            status: i64,
-        }
-        let mut pending: Vec<Pending> = Vec::with_capacity(n as usize);
-        // Offloadable `Blocking` SQEs: `(index into `pending`, its state, its argument)`.
-        let mut offload: Vec<(usize, Arc<AsyncState>, i64)> = Vec::new();
-
-        for i in 0..n {
-            let at = cq_ptr + i * CQE;
-            // Read SQE i (a borrow-checked window read; out-of-window ⇒ -EFAULT completion).
-            let raw = match m.read_bytes(sq_ptr + i * SQE, SQE) {
-                Some(r) => r,
-                None => {
-                    Self::write_cqe(&mut *m, at, 0, 0, -EFAULT);
-                    continue;
-                }
-            };
-            let type_id = u32::from_le_bytes(raw[0..4].try_into().unwrap());
-            let op = u32::from_le_bytes(raw[4..8].try_into().unwrap());
-            let handle = i32::from_le_bytes(raw[8..12].try_into().unwrap());
-            let n_args =
-                (u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize).min(MAX_SQ_ARGS);
-            let mut opargs = [0i64; MAX_SQ_ARGS];
-            for (a, slot) in opargs.iter_mut().enumerate().take(n_args) {
-                *slot = i64::from_le_bytes(raw[16 + a * 8..24 + a * 8].try_into().unwrap());
-            }
-            let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
-
-            if type_id == cap_id::IO_RING {
-                // A ring submitting to a ring would recurse without bound — inert CapFault.
-                pending.push(Pending {
-                    at,
-                    user_data,
-                    result: 0,
-                    status: trap_status(&Trap::CapFault),
-                });
-            } else if type_id == cap_id::BLOCKING && op == 0 {
-                // Offloadable iff the handle actually resolves to a `Blocking` binding; a forged /
-                // wrong-type handle is an inert CapFault (the I2 check), never queued.
-                match self.resolve(handle, cap_id::BLOCKING) {
-                    Ok(Binding::Blocking(idx)) => {
-                        let slot = pending.len();
-                        pending.push(Pending {
-                            at,
-                            user_data,
-                            result: 0, // filled from the pool below
-                            status: 0,
-                        });
-                        offload.push((slot, Arc::clone(&self.blockings[idx as usize]), opargs[0]));
-                    }
-                    _ => pending.push(Pending {
-                        at,
-                        user_data,
-                        result: 0,
-                        status: trap_status(&Trap::CapFault),
-                    }),
-                }
-            } else {
-                // Inline: window-/host-touching ops run on the submit thread, in order.
-                let (result, status) = match self.cap_dispatch_slots(
-                    type_id,
-                    op,
-                    handle,
-                    &opargs[..n_args],
-                    Some(&mut *m),
-                ) {
-                    Ok(res) => (res.first().copied().unwrap_or(0), 0),
-                    Err(t) => (0, trap_status(&t)),
-                };
-                pending.push(Pending {
-                    at,
-                    user_data,
-                    result,
-                    status,
-                });
-            }
-        }
-
-        // Run the offloadable blocking ops concurrently on the bounded pool (created lazily so a Host
-        // that never offloads spawns no threads). Each job writes its result by index; the submit
-        // thread parks until the whole batch posts completion, then we copy results back in order.
-        if !offload.is_empty() {
-            // §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). A batched submit *parks* the vCPU
-            // thread on the pool until the whole offload completes — no poll site. If an async STW
-            // freeze has already landed, fail **closed** rather than start the batch (the same
-            // fail-closed as a direct `Blocking.work` cap.call); the submit thread would otherwise
-            // stall the freeze for the whole batch (R6). Cancelling in-flight pool work is deferred
-            // (R2). Only the *offloadable* (blocking) batch is gated — an all-inline submit already
-            // ran above and parks nothing.
-            if self.is_durable() && freeze_has_landed(Some(&*m)) {
-                return Err(Trap::ThreadFault);
-            }
-            let results: Arc<Vec<AtomicI64>> =
-                Arc::new(offload.iter().map(|_| AtomicI64::new(0)).collect());
-            let mut jobs: Vec<OffloadJob> = Vec::with_capacity(offload.len());
-            for (k, (_slot, state, arg)) in offload.iter().enumerate() {
-                let state = Arc::clone(state);
-                let arg = *arg;
-                let results = Arc::clone(&results);
-                jobs.push(Box::new(move || {
-                    results[k].store(state.run(arg), Ordering::SeqCst);
-                }));
-            }
-            let pool = self
-                .pool
-                .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-            pool.run_batch(jobs);
-            for (k, (slot, _, _)) in offload.iter().enumerate() {
-                pending[*slot].result = results[k].load(Ordering::SeqCst);
-            }
-        }
-
-        for p in &pending {
-            Self::write_cqe(&mut *m, p.at, p.user_data, p.result, p.status);
-        }
-        Ok(vec![n as i64])
-    }
-
-    /// §9/§12 **async submit** (op 1, increment 3). `submit_async(sq_ptr, n, counter_addr)` reads `n`
-    /// SQEs, kicks the **offloadable** (`Blocking`) ones onto the bounded pool, runs the inline ones
-    /// immediately, and returns the count submitted **without waiting**. Each completion posts its CQE
-    /// to the ring's host-side [`RingState`] and atomic-increments the 4-byte futex **completion
-    /// counter** at `counter_addr`; an offloaded completion additionally `notify`s the counter key to
-    /// wake a vCPU parked in `wait` on it — an I/O completion *is* a futex notify (DESIGN §12). The
-    /// guest then parks on the counter, runs other fibers, and `reap`s once it advances.
-    ///
-    /// Requires the backend to expose the futex counter (`async_counter`) **and** the wake hook
-    /// (`async_notify`); without them — the JIT pre-§3b, or the deterministic explorer — it returns
-    /// `-EINVAL`, and the guest is expected to fall back to the synchronous `submit`. CQEs are written
-    /// only by `reap` on the vCPU thread, so the single counter atomic is the *only* cross-thread
-    /// window write an async ring performs.
-    fn io_ring_submit_async(
-        &mut self,
-        ring_idx: u32,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
-        const SQE: u64 = 64;
-        const MAX_SQ_ARGS: usize = 4;
-        let m = match mem {
-            Some(m) => m,
-            None => return Ok(vec![EFAULT]),
-        };
-        let sq_ptr = *args.first().unwrap_or(&0) as u64;
-        // Bounded batch ceiling, as in `io_ring_submit` — a forged `n` must not drive an unbounded
-        // allocation or loop on the host.
-        let n = ((*args.get(1).unwrap_or(&0)).max(0) as u64).min(MAX_RING_BATCH);
-        let counter_addr = *args.get(2).unwrap_or(&0) as u64;
-
-        // The backend must expose the futex counter handle + the wake hook, else there is no async
-        // path here (the guest falls back to the synchronous `submit`).
-        let counter = match m.async_counter(counter_addr) {
-            Some(c) => c,
-            None => return Ok(vec![EINVAL]),
-        };
-        let notify = match &self.async_notify {
-            Some(f) => Arc::clone(f),
-            None => return Ok(vec![EINVAL]),
-        };
-        let ring = Arc::clone(&self.rings[ring_idx as usize]);
-
-        let mut jobs: Vec<OffloadJob> = Vec::new();
-        let mut inline_done: u32 = 0; // completions ready before we return (counter bumped once below)
-        for i in 0..n {
-            let raw = match m.read_bytes(sq_ptr + i * SQE, SQE) {
-                Some(r) => r,
-                None => {
-                    ring.completed.lock().unwrap().push_back((0, 0, -EFAULT));
-                    inline_done += 1;
-                    continue;
-                }
-            };
-            let type_id = u32::from_le_bytes(raw[0..4].try_into().unwrap());
-            let op = u32::from_le_bytes(raw[4..8].try_into().unwrap());
-            let handle = i32::from_le_bytes(raw[8..12].try_into().unwrap());
-            let n_args =
-                (u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize).min(MAX_SQ_ARGS);
-            let mut opargs = [0i64; MAX_SQ_ARGS];
-            for (a, slot) in opargs.iter_mut().enumerate().take(n_args) {
-                *slot = i64::from_le_bytes(raw[16 + a * 8..24 + a * 8].try_into().unwrap());
-            }
-            let user_data = i64::from_le_bytes(raw[48..56].try_into().unwrap());
-
-            if type_id == cap_id::BLOCKING && op == 0 {
-                if let Ok(Binding::Blocking(bidx)) = self.resolve(handle, cap_id::BLOCKING) {
-                    // Offload: compute on a pool thread, post the completion, then bump+notify so a
-                    // parked vCPU wakes (the counter write happens-before the notify, so the futex
-                    // compare-under-lock can't lose the wakeup).
-                    let state = Arc::clone(&self.blockings[bidx as usize]);
-                    let arg = opargs[0];
-                    let ring = Arc::clone(&ring);
-                    let counter = Arc::clone(&counter);
-                    let notify = Arc::clone(&notify);
-                    jobs.push(Box::new(move || {
-                        let r = state.run(arg);
-                        ring.completed.lock().unwrap().push_back((user_data, r, 0));
-                        counter.increment(1);
-                        notify(counter.key(), u32::MAX);
-                    }));
-                    continue;
-                }
-                // forged / wrong-type Blocking handle → inert CapFault completion (the I2 check).
-                ring.completed.lock().unwrap().push_back((
-                    user_data,
-                    0,
-                    trap_status(&Trap::CapFault),
-                ));
-                inline_done += 1;
-            } else if type_id == cap_id::IO_RING {
-                // A ring submitting to a ring would recurse without bound — inert CapFault.
-                ring.completed.lock().unwrap().push_back((
-                    user_data,
-                    0,
-                    trap_status(&Trap::CapFault),
-                ));
-                inline_done += 1;
-            } else {
-                // Inline: window-/host-touching ops run now on the submit thread.
-                let (result, status) = match self.cap_dispatch_slots(
-                    type_id,
-                    op,
-                    handle,
-                    &opargs[..n_args],
-                    Some(&mut *m),
-                ) {
-                    Ok(res) => (res.first().copied().unwrap_or(0), 0),
-                    Err(t) => (0, trap_status(&t)),
-                };
-                ring.completed
-                    .lock()
-                    .unwrap()
-                    .push_back((user_data, result, status));
-                inline_done += 1;
-            }
-        }
-
-        // Account the inline completions on the counter once (no wake — the guest can't be parked
-        // during its own submit). Offloaded ones bump the counter as they finish.
-        if inline_done > 0 {
-            counter.increment(inline_done as u64);
-        }
-        if !jobs.is_empty() {
-            let pool = self
-                .pool
-                .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-            pool.dispatch(jobs);
-        }
-        Ok(vec![n as i64])
-    }
-
-    /// §9/§12 **reap** (op 2). `reap(cq_ptr, max) -> n_reaped` pops up to `max` ready completions from
-    /// the ring's [`RingState`] and writes them as 32-byte CQEs to `[cq_ptr, …)`, on the vCPU thread.
-    fn io_ring_reap(
-        &mut self,
-        ring_idx: u32,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-    ) -> Result<Vec<i64>, Trap> {
-        const CQE: u64 = 32;
-        let m = match mem {
-            Some(m) => m,
-            None => return Ok(vec![EFAULT]),
-        };
-        let cq_ptr = *args.first().unwrap_or(&0) as u64;
-        let max = (*args.get(1).unwrap_or(&0)).max(0) as u64;
-        let ring = Arc::clone(&self.rings[ring_idx as usize]);
-        let mut q = ring.completed.lock().unwrap();
-        let mut i = 0u64;
-        while i < max {
-            let Some((ud, result, status)) = q.pop_front() else {
-                break;
-            };
-            Self::write_cqe(&mut *m, cq_ptr + i * CQE, ud, result, status);
-            i += 1;
-        }
-        Ok(vec![i as i64])
-    }
-
-    /// Write one 32-byte CQE (little-endian) at `at`. A bad address is dropped (the guest's bug; the
-    /// `completed` count still reflects the SQEs the host ran).
-    fn write_cqe(m: &mut dyn GuestMem, at: u64, user_data: i64, result: i64, status: i64) {
-        let mut b = [0u8; 32];
-        b[0..8].copy_from_slice(&user_data.to_le_bytes());
-        b[8..16].copy_from_slice(&result.to_le_bytes());
-        b[16..24].copy_from_slice(&status.to_le_bytes());
-        let _ = m.write_bytes(at, &b);
     }
 
     /// `Stream` ops (§3e D43): 0 `read`, 1 `write`, 2 `close`. Buffers are `(ptr,len)`,
@@ -20443,23 +20376,6 @@ impl Mem {
                     .get(&(base.wrapping_sub(self.window.base()) / self.page)),
                 Some(PageProt::Backed { .. })
             )
-    }
-
-    /// §9/§12 async-ring completion counter: confine + validate a 4-byte futex counter address (same
-    /// gate as an `i32` atomic), require a normal anonymous page (a §13 alias's atomics route through
-    /// `read_le`, not `back`, so an offload worker couldn't reach it consistently), and hand back the
-    /// `Arc<Region>` + confined key for a worker to atomic-increment (matching `atomic_value`'s
-    /// non-backed path) before it `notify`s.
-    fn async_counter_impl(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
-        let base = self.confine_checked(counter_addr, 0, 4).ok()?;
-        if !base.is_multiple_of(4) || self.is_backed(base) {
-            return None;
-        }
-        self.check_prot(base, 4, true).ok()?;
-        Some(Arc::new(RegionCounter {
-            region: Arc::clone(&self.back),
-            off: base,
-        }))
     }
 
     /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
@@ -21307,9 +21223,6 @@ impl GuestMem for Mem {
     /// so the two backends agree.
     fn page_size(&self) -> i64 {
         self.page as i64
-    }
-    fn async_counter(&self, counter_addr: u64) -> Option<Arc<dyn AsyncCounter>> {
-        self.async_counter_impl(counter_addr)
     }
 }
 

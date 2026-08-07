@@ -10907,7 +10907,30 @@ impl Vm {
                         continue;
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let res = host.with(|p| p.cap_dispatch_slots(*type_id, *op, h, &argv, gm))?;
+                    let mut pending_id = None;
+                    let res = host.with(|p| {
+                        p.cap_dispatch_slots_pending(*type_id, *op, h, &argv, gm, &mut pending_id)
+                    })?;
+                    // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
+                    // above already released the shared-host lock, so the wait below blocks only
+                    // this vCPU thread while the offload pool does the work — on the parallel
+                    // tier sibling vCPUs' cap.calls proceed (the §5b `max_active = 1`
+                    // serialization fix). This slice is the single-fiber degenerate wait; the
+                    // placeholder `res` is discarded.
+                    if let Some(id) = pending_id {
+                        let comps = host.with(|p| p.completions());
+                        let r = comps.wait(id);
+                        if results.len() > 1 {
+                            // Parkable ops carry a single-slot scalar reply (invariant 8) —
+                            // a wider declared signature is a registration bug, fail-closed.
+                            return Err(Trap::CapFault);
+                        }
+                        if let Some(ty) = results.first() {
+                            self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
+                        }
+                        pc += 1;
+                        continue;
+                    }
                     // Blocking-stdin park: a `Stream{In}` `read` (type 0, op 0) whose buffer was empty
                     // under `Host::set_stdin_blocking` yields here instead of completing. Do NOT write
                     // results or advance `pc`: persist state at *this* instruction so the driver, after

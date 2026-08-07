@@ -204,7 +204,7 @@ fn check_one(
         Shape::Operands => vector.iter().copied().map(to_slot).collect(),
         Shape::Immediate => Vec::new(),
     };
-    if let Ok((out, _)) = cm.run(&slots, None, None, None) {
+    if let Ok((out, _)) = cm.run(&slots, None, None) {
         let ok = match (&expected, &out) {
             (Ok(e), JitOutcome::Returned(rs)) => rs.len() == 1 && slot_matches(*e, rs[0]),
             (Err(t), JitOutcome::Trapped(k)) => *k == jit_trap(*t),

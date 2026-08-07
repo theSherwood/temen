@@ -142,7 +142,7 @@ fn check_batch(row: &SimdRow, batch: &[Vec<SpecVal>]) {
         }
         Err(e) => panic!("simd batch for {} fails JIT compile: {e:?}", row.id),
     };
-    let (out, _mem) = cm.run(&[], None, None, None).unwrap();
+    let (out, _mem) = cm.run(&[], None, None).unwrap();
     match out {
         JitOutcome::Returned(slots) => check_slots("jit", &slots),
         other => panic!(
@@ -373,7 +373,7 @@ fn run_all_mem(
     }
 
     let mut cm = compile(m, 0).unwrap();
-    let (out, jmem) = cm.run(&[], Some(init), None, None).unwrap();
+    let (out, jmem) = cm.run(&[], Some(init), None).unwrap();
     match out {
         JitOutcome::Returned(slots) => check(Ok(&slots), &jmem[..init.len().min(jmem.len())]),
         JitOutcome::Trapped(TrapKind::MemoryFault) => check(Err(()), init), // window unchecked on JIT trap

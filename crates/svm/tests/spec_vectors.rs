@@ -130,7 +130,7 @@ fn check_vector(row: &OpRow, m: &svm_ir::Module, cm: &mut CompiledModule, vector
         Shape::Immediate => Vec::new(),
     };
     let (out, _mem) = cm
-        .run(&slots, None, None, None)
+        .run(&slots, None, None)
         .unwrap_or_else(|e| panic!("{}", ctx("jit", &e)));
     let ok = match (&expected, &out) {
         (Ok(e), JitOutcome::Returned(rs)) => rs.len() == 1 && slot_matches(*e, rs[0]),

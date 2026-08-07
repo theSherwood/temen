@@ -91,3 +91,26 @@ fn clock_fast_path_faults_on_forged_handle() {
         "forged clock handle must not return cleanly: {r:?}"
     );
 }
+
+#[test]
+fn resolver_never_claims_parkable_ifaces() {
+    // DESIGN.md §12 parking pin: a parkable registration is never fast-path-claimed. The D45
+    // resolver bakes a register-ABI address at compile time; a handler that can answer `Pending`
+    // needs the generic thunk (completion mint + park), so `HOST_PROC` and the test-only
+    // `BLOCKING` iface must resolve to null for every plausible arity.
+    use svm_interp::cap_id;
+    for iface in [cap_id::HOST_PROC, cap_id::BLOCKING] {
+        for op in 0..4u32 {
+            for n_args in 0..5u32 {
+                for n_res in 0..2u32 {
+                    let p = unsafe { fast_cap_resolver(iface, op, n_args, n_res) };
+                    assert!(
+                        p.is_null(),
+                        "fast_cap_resolver claimed parkable iface {iface} op {op} \
+                         ({n_args} args, {n_res} res)"
+                    );
+                }
+            }
+        }
+    }
+}

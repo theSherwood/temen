@@ -251,7 +251,7 @@ fn freeze_refuses_a_non_durable_handle() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    host.grant_io_ring(); // non-durable (carries out-of-line ring state)
+    host.grant_blocking(std::time::Duration::ZERO, None); // non-durable (out-of-line state)
     let win = init_durable_window(WINDOW);
     match freeze(&inst, &win, &host) {
         Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
@@ -260,25 +260,25 @@ fn freeze_refuses_a_non_durable_handle() {
 }
 
 /// §12.5 handle hardening: draining the non-durable handle turns the refusal above into a successful
-/// serialize. `Host::drain_non_durable` closes the out-of-line `IoRing` (the guest relinquishes that
-/// authority), leaving only the re-grantable `Clock`, so the domain becomes snapshottable.
+/// serialize. `Host::drain_non_durable` closes the out-of-line `Blocking` (the guest relinquishes
+/// that authority), leaving only the re-grantable `Clock`, so the domain becomes snapshottable.
 #[test]
 fn freeze_succeeds_after_draining_a_non_durable_handle() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    host.grant_io_ring(); // non-durable — blocks the freeze until drained
+    host.grant_blocking(std::time::Duration::ZERO, None); // non-durable — blocks the freeze until drained
     let win = init_durable_window(WINDOW);
     assert!(
         matches!(
             freeze(&inst, &win, &host),
             Err(FreezeError::NonDurableHandle(_))
         ),
-        "the live io_ring refuses the freeze"
+        "the live blocking handle refuses the freeze"
     );
 
     let drained = host.drain_non_durable();
-    assert_eq!(drained.len(), 1, "the io_ring was drained");
+    assert_eq!(drained.len(), 1, "the blocking handle was drained");
     freeze(&inst, &win, &host).expect("a drained domain serializes");
 }
 

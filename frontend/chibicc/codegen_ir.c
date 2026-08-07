@@ -1093,41 +1093,8 @@ static int gen_builtin_fs(Node *node) {
   return r; // i64 result (fd / bytes / 0 / negative errno)
 }
 
-// §9/§12 async I/O ring builtins (iface 9). `__vm_io_submit_async(sq, n, counter)` lowers to
-// `cap.call 9 1`: kick `n` deferred ops (64-byte SQEs at `sq`, each a `Blocking.work`) onto the host
-// offload pool and **return immediately** with the count submitted. `__vm_io_reap(cq, max)` lowers to
-// `cap.call 9 2`: pop up to `max` ready completions into 32-byte CQEs at `cq`. The guest parks on the
-// in-window completion `counter` (an `i32`) between rounds via `__vm_wait32` — an I/O completion is a
-// futex notify (§12): a pool worker bumps the counter and wakes the parked vCPU. Both are on the
-// stashed IoRing handle.
-static int gen_builtin_io_submit_async(Node *node) {
-  Node *a = node->args;
-  if (!a || !a->next || !a->next->next || a->next->next->next)
-    error_tok(node->tok, "codegen_ir: __vm_io_submit_async(sq, n, counter) expects 3 arguments");
-  int sq = widen_i64(gen_expr(a), a->ty);
-  int n = widen_i64(gen_expr(a->next), a->next->ty);
-  int ctr = widen_i64(gen_expr(a->next->next), a->next->next->ty);
-  int h = dummy_handle();
-  int r = nv++;
-  cg("  v%d = call.sym \"vm_io_submit_async\" (i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d)\n",
-          r, h, sq, n, ctr);
-  return r;
-}
-
-static int gen_builtin_io_reap(Node *node) {
-  Node *a = node->args;
-  if (!a || !a->next || a->next->next)
-    error_tok(node->tok, "codegen_ir: __vm_io_reap(cq, max) expects 2 arguments");
-  int cq = widen_i64(gen_expr(a), a->ty);
-  int mx = widen_i64(gen_expr(a->next), a->next->ty);
-  int h = dummy_handle();
-  int r = nv++;
-  cg("  v%d = call.sym \"vm_io_reap\" (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, cq, mx);
-  return r;
-}
-
 // `__vm_blocking_handle()` returns the Blocking capability handle (an `i32`) so the guest can
-// name it in an SQE's `handle` field when building a `Blocking.work` request. This is a real
+// name it in a direct `Blocking.work` cap.call (the §12 parking exerciser). This is a real
 // *handle value* (not a dispatch), so resolve it by its canonical name (`cap.self.resolve` — the
 // discovery tier IMPORTS.md keeps); the name bytes are staged in the low reserved region that the
 // retired handle stash freed.
@@ -1783,10 +1750,6 @@ static int gen_expr(Node *node) {
           return gen_builtin_wait32(node);
         if (!strcmp(fname, "__vm_notify"))
           return gen_builtin_notify(node);
-        if (!strcmp(fname, "__vm_io_submit_async"))
-          return gen_builtin_io_submit_async(node);
-        if (!strcmp(fname, "__vm_io_reap"))
-          return gen_builtin_io_reap(node);
         if (!strcmp(fname, "__vm_blocking_handle"))
           return gen_builtin_blocking_handle(node);
         if (!strcmp(fname, "__vm_cap"))
@@ -2803,8 +2766,6 @@ static void scan_caps(Node *n, unsigned *mask) {
       *mask |= 1u << 3; // memory
     else if (!strcmp(nm, "__vm_region_create"))
       *mask |= 1u << 4; // addrspace
-    else if (!strcmp(nm, "__vm_io_submit_async") || !strcmp(nm, "__vm_io_reap"))
-      *mask |= 1u << 5; // ioring
     else if (!strcmp(nm, "__vm_blocking_handle"))
       *mask |= 1u << 6; // blocking
     else if (!strncmp(nm, "__vm_jit_", 9))

@@ -144,7 +144,7 @@ fn main() {
             // the `vadd` 128-bit-SIMD number, not compile noise.
             let mut cm = svm_jit::compile(&t.module, e).expect("jit compiles");
             per_iter(|n| {
-                let r = cm.run(&[sp, n as i64], None, None, None).expect("jit runs");
+                let r = cm.run(&[sp, n as i64], None, None).expect("jit runs");
                 black_box(&r);
             })
         };

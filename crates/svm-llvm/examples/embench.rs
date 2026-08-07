@@ -448,7 +448,7 @@ fn main() {
         let jit_ns = {
             let mut cm = svm_jit::compile(&t.module, e).expect("jit compiles");
             per_iter(large, |n| {
-                black_box(cm.run(&[sp, n], None, None, None).unwrap());
+                black_box(cm.run(&[sp, n], None, None).unwrap());
             })
         };
         jit_ratios.push((name, jit_ns / nat_ns));

@@ -1801,40 +1801,49 @@ JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regressio
   the vCPU); both-as-peers ABI (doubles surface/TCB; async-first's penalty on the
   pure-sync case is negligible).
 
-**As-measured status + the parking plan (CONSOLIDATION §5b, measured 2026-08-07, owner-endorsed;
-probe: `svm/tests/io_ring_bench.rs`, run with `--ignored --nocapture`).** The submit/complete
-*surface* shipped as the `IoRing` capability; the park-the-fiber half was never wired to plain
-`cap.call`s. The re-measure found: batching is measurably negative in-process (Clock SQEs price
-the SQE/CQE ABI alone at ~10.0 µs/op vs ~0.75 µs/op direct — the saved crossing is swamped by SQE
-build/parse); and overlap is **not** subsumed — a blocking dispatch holds the one `Mutex<Host>`,
-so even the threaded parallel tier serializes (`max_active` 1). The ring therefore **stays** as
-the only overlap mechanism until parking lands. The plan that retires it:
+**Parking-on-blocking (landed 2026-08-07; the arc that retired the `IoRing`).** The submit/complete
+ring shipped first as the `IoRing` capability; the §5b re-measure (CONSOLIDATION, owner-endorsed)
+found batching measurably **negative** in-process (Clock SQEs priced the SQE/CQE ABI alone at
+~10 µs/op vs ~0.8 µs/op direct — the saved crossing swamped by SQE build/parse) and overlap not yet
+subsumed (a blocking dispatch held the one `Mutex<Host>`, serializing even the threaded tier at
+`max_active` 1). The parking plan then landed in three slices and the ring was retired on the
+numbers:
 
-1. *Registration declares blockingness* (the `HostProcEntry` per-entry-powers pattern): an
-   **offloadable** handler variant, `Fn(op, &[i64]) -> Vec<i64> + Send + Sync` — scalars only,
-   **no window access** (the pool never touches the window; buffers are read at submit and
-   written at completion on the vCPU thread — the ring's own discipline).
-2. *Dispatch gains a third outcome*: `Ok | Err | Pending(completion_id)`; the handler may decide
-   per call (fast case inline, slow case punts — the io_uring try-nonblocking model); the
-   dispatch releases the host lock before waiting.
-3. *The eval loop maps `Pending` onto existing park machinery* (the `StdinPark` seam, parked
-   offer-call delivery, `wait`/`notify` waking); a single-fiber guest degenerates to a plain
-   wait without the lock; nesting is free (a park is a scheduler event; children run on the
-   caller's eval loop).
+1. *Registration declares blockingness* (`Host::grant_host_proc_offloadable`, the `HostProcEntry`
+   per-entry-powers pattern): the handler decides per call — `Done` inline (the fast case pays
+   nothing) or `Offload` a self-contained scalar job (the io_uring try-nonblocking model). Scalars
+   only, **no window access** (the pool never touches the window), single-`i64` replies
+   (invariant 8). The test-only `Blocking` cap is the exerciser.
+2. *Dispatch gains a third outcome* behind an out-param face (`cap_dispatch_slots_pending` →
+   `Pending(completion_id)`, job handed to the offload pool, result posted to `Completions`);
+   every other call site keeps the sync face and runs punts inline — decline-never-diverge
+   (invariant 9). Under a W1 tape punts are forced inline so the tape records real results.
+3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
+   `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
+   (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
+   drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
+   (the JIT threaded tier) releases the domain lock before its completion wait. Deliberately
+   whole-vCPU and guest-invisible — a fiber-level FIBER_PARKED unwind would be guest-visible where
+   fast backends block inline — so `cont` fibers, durable callers, and the explorer keep the
+   blocking wait (fiber-park promotion is a recorded follow-on, not a semantic hole).
 
-Pinned constraints: a parkable registration is **never** `fast_cap_resolver`-claimed (the D45
-register-ABI fast path keeps its exact contract), and **sync ops never pay for parkable ops'
-existence** — no completion id, no table touch unless a handler already returned `Pending`; pin
-the hostcall fast-path number in the bench regression check before the first slice. Determinism:
-cooperative-tier completions deliver at safepoints in submission order (the §18 oracle survives).
-Completion sources are pluggable behind the park (offload pool now; host io_uring for real
-file/net caps; a JS event on the browser tier). Batching belongs to the *transport* — a future
-§9-rung-6 broker coalesces parked completions invisibly; the guest ABI stays sync. Known loss to
-sequence around: ring `submit_async`/`reap` is today's only single-fiber compute/host overlap —
-close it with a guest-facing fiber spawn, not a second host-call ABI. Slice order: registration +
-`Pending` + single-fiber wait; cooperative-tier park/wake with ordered delivery; threaded-tier
-wiring; then re-run `io_ring_bench` and let the numbers retire the ring (SQE format, `RingState`,
-the async completion path).
+Pinned constraints (tests in `svm/tests/host_park.rs`, `svm-run/tests/fast_cap.rs`): a parkable
+registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
+existence** — no completion id, no table touch unless a handler already returned `Offload`
+(`Completions::minted() == 0` pins); overlap pinned by rendezvous, never timing.
+
+*The retirement measurement (interp tier, pool K=4):* with parking landed, the threaded lane
+matched/beat the ring's own overlap (~5.1–5.5 ms/batch vs ring ~5.2–5.8 ms at n=8, block=2 ms,
+both `max_active` 4, vs 18.5 ms serialized before) while batching stayed 13–14× negative — both
+of the ring's jobs subsumed or disproven, so the `IoRing` was deleted (SQE/CQE format,
+`RingState`, `submit`/`submit_async`/`reap`, the `async_notify`/`AsyncCounter`/`AsyncHostHooks`
+seams, the `__vm_io_*` builtins; iface id 9 stays reserved; `ioring` left the powerbox — six caps
+now). Known, accepted loss: `submit_async`/`reap` was the only *single-vCPU* compute/host overlap
+— its replacement is guest-facing concurrency (`thread.spawn` today; fiber-park promotion later),
+never a second host-call ABI. Completion sources stay pluggable behind the park (offload pool
+now; host io_uring for real file/net caps; a JS event on the browser tier). Batching belongs to
+the *transport* — a future §9-rung-6 broker coalesces parked completions invisibly; the guest ABI
+stays sync.
 
 ### Unified event-parking
 - All blocking = **park a fiber until an event**. Events: `notify` (futex), I/O

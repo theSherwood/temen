@@ -56,9 +56,7 @@ fn main() {
             &[svm_interp::Value::I64(sp), svm_interp::Value::I32(SMALL)],
             &mut fuel,
         );
-        let (got, _mem) = cm
-            .run(&[sp, SMALL as i64], None, None, None)
-            .expect("jit runs");
+        let (got, _mem) = cm.run(&[sp, SMALL as i64], None, None).expect("jit runs");
         let got0 = match got {
             svm_jit::JitOutcome::Returned(vals) => vals[0],
             other => panic!("JIT did not return on {sym}: {other:?}"),
@@ -72,7 +70,7 @@ fn main() {
             "MISCOMPILE on {sym}: interp={want0} jit={got0}"
         );
         let ns = per_iter(large, |n| {
-            let r = cm.run(&[sp, n as i64], None, None, None).expect("jit runs");
+            let r = cm.run(&[sp, n as i64], None, None).expect("jit runs");
             black_box(&r);
         });
         println!("{sym},{ns:.4}");

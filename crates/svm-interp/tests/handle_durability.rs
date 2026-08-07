@@ -81,31 +81,31 @@ fn restore_pins_generation_not_destination_default() {
     );
 }
 
-/// A live non-durable handle (here an `IoRing`, which carries out-of-line host state) makes
+/// A live non-durable handle (here a `Blocking`, which carries out-of-line host state) makes
 /// the table non-snapshottable: capture refuses, naming the offending slot, rather than
 /// dropping the authority.
 #[test]
 fn capture_refuses_a_non_durable_handle() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0, durable
-    a.grant_io_ring(); // slot 1, NOT durable (Binding::IoRing carries a ring index)
+    a.grant_blocking(std::time::Duration::ZERO, None); // slot 1, NOT durable (out-of-line index)
 
     let err = a
         .capture_durable_handles()
-        .expect_err("an io_ring handle blocks the snapshot");
+        .expect_err("a blocking handle blocks the snapshot");
     assert_eq!(err.slot, 1);
-    assert_eq!(err.kind, NonDurableKind::IoRing);
+    assert_eq!(err.kind, NonDurableKind::Blocking);
 }
 
 /// Draining the non-durable handles turns a capture refusal into a successful one: the out-of-line
-/// bindings (an `IoRing` and a `HostProc`) are closed, the durable `Clock` is kept, and
+/// bindings (a `Blocking` and a `HostProc`) are closed, the durable `Clock` is kept, and
 /// `capture_durable_handles` then succeeds. The drained set comes back in ascending slot order so the
 /// embedder can audit the relinquished authority (DURABILITY.md §12.5 handle hardening).
 #[test]
 fn drain_non_durable_makes_a_domain_snapshottable() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0 — durable
-    a.grant_io_ring(); // slot 1 — non-durable
+    a.grant_blocking(std::time::Duration::ZERO, None); // slot 1 — non-durable
     a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // slot 2 — non-durable
 
     assert!(
@@ -117,11 +117,11 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     assert_eq!(
         drained.len(),
         2,
-        "the io_ring and the host_proc were drained"
+        "the blocking handle and the host_proc were drained"
     );
     assert_eq!(
         (drained[0].slot, drained[0].kind),
-        (1, NonDurableKind::IoRing)
+        (1, NonDurableKind::Blocking)
     );
     assert_eq!(
         (drained[1].slot, drained[1].kind),
@@ -147,14 +147,14 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
 fn drain_non_durable_kills_stale_handle_values() {
     let mut a = Host::new();
     a.grant_clock(); // durable — kept
-    let ring = a.grant_io_ring(); // non-durable — drained
+    let ring = a.grant_blocking(std::time::Duration::ZERO, None); // non-durable — drained
 
     let drained = a.drain_non_durable();
-    assert_eq!(drained.len(), 1, "only the io_ring drained");
+    assert_eq!(drained.len(), 1, "only the blocking handle drained");
 
     // The drained handle completes with `-EBADF` at the use site (freed slot ⇒ resolve fails
     // before the op runs; the once-issued generation makes it the revocation errno, not a trap).
-    let r = a.cap_dispatch_slots(cap_id::IO_RING, 0, ring, &[], None);
+    let r = a.cap_dispatch_slots(cap_id::BLOCKING, 0, ring, &[], None);
     assert!(
         matches!(&r, Ok(v) if v.as_slice() == [-9]),
         "a drained handle is a revoked-once-valid generation, got {r:?}"

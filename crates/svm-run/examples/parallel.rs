@@ -81,7 +81,7 @@ fn worker(engine: Engine, m: &Module, n: i32, barrier: &Barrier) {
         Engine::Jit => {
             let mut cm = jit_compile(m); // compile excluded from the timed window
             barrier.wait();
-            let r = cm.run(&[n as i64], None, None, None).expect("jit run");
+            let r = cm.run(&[n as i64], None, None).expect("jit run");
             std::hint::black_box(&r);
         }
         Engine::Bytecode => {

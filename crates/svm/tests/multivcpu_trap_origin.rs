@@ -105,7 +105,7 @@ fn interp_and_jit_agree_on_the_worker_trap_origin() {
 
     // JIT.
     let mut cm = compile(WORKER_DIV0);
-    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[], None, None).expect("run");
     assert!(matches!(outcome, JitOutcome::Trapped(TrapKind::DivByZero)));
     let jit = cm.last_trap_backtrace().first().map(|f| {
         (

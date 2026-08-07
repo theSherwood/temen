@@ -203,7 +203,7 @@ fn jit_compile(m: &Module, entry: u32) -> CompiledModule {
 
 /// Run an already-compiled module over a fresh guest window (state resets each call).
 fn jit_call(cm: &mut CompiledModule, args: &[i64]) -> i64 {
-    match cm.run(args, None, None, None) {
+    match cm.run(args, None, None) {
         Ok((JitOutcome::Returned(v), _mem)) => v[0],
         o => panic!("unexpected jit outcome {o:?}"),
     }

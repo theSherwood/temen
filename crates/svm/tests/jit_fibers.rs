@@ -349,7 +349,7 @@ debug.loc 2 0 0 0 9 3
     );
 
     // The root resumes the fiber (it suspends) and returns its yielded value, leaving fiber 0 parked.
-    let (outcome, _) = cm.run(&[], None, None, None).expect("run");
+    let (outcome, _) = cm.run(&[], None, None).expect("run");
     let JitOutcome::Returned(ref v) = outcome else {
         panic!("expected the root to return, got {outcome:?}");
     };
