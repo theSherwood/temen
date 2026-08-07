@@ -136,8 +136,18 @@ convention) resumes purely from the written-back window, runs `add`, main's post
 entry replaces it after both passes, valid because both carries are identity-indexed). One capture
 subtlety: the caller residual still needs the **callee proto overlaid** — main's `OP_CLOSURE` reads
 `proto->p[bx]->sizeupvalues` to bound the upvalue-init loop, even though the fold never enters the
-callee's body. This is the per-function-residual execution model in miniature; next steps are a
-guarded (closure-identity-checked) stitch and chaining more than two residuals.
+callee's body.
+
+**Stitching slice 2 (2026-08-07, `lua_futamura_call_stitch_chain`)** — the composition **chains**: a
+continuation residual is itself an ordinary projection that stitches onward at *its* next call
+boundary. Three residuals, two stitches, one program (`print(add(2,3) * mul(4,5))` → `100`,
+byte-identical): entry-rooted B → add-rooted A1 (runs add, main's middle, stitches at mul's
+`startfunc`) → mul-rooted A2 (runs mul, the register-register `OP_MUL`, `print`, exit). The two
+sequential callees share one cached `CallInfo`, so this composes with the facet-(c) per-site pins;
+the module is padded with two placeholders and every pass carries identity indices. This is the
+per-function-residual execution model working recursively; the remaining step to a *deployable*
+stitch is the guard (closure-identity check with baseline fallback — today the transfer is
+unconditional, valid only because the captured run is deterministic).
 
 ### I70 — `real-browser` CI job: the `Install Playwright + Chromium` step times out at 10 min because the Azure apt mirror serves `--with-deps` font packages at ~35 KB/s (S4, flaky CI infra) — recorded 2026-08-06 on PR #639
 
