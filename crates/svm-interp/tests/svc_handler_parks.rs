@@ -264,3 +264,119 @@ fn a_handler_that_suspends_faults_the_domain() {
     let r = run_with_host(&m, 0, &[], &mut fuel, &mut host);
     assert!(r.is_err(), "a suspend with no resumer is a fiber fault");
 }
+
+// ----- F1 (FIBER_PARK.md) — a handler whose PUNT parks the dispatch, never the domain --------
+
+/// Three dispatches: `a_punt` (op 0) makes a blocking host call that punts to the offload pool —
+/// its handler fiber parks on the completion (the F1 `CapPending` fiber park) and the serve loop
+/// moves on; `b_probe` (op 1), served *while `a_punt`'s handler is parked*, returns 7; `c_open`
+/// (op 2) releases the host-side latch `a_punt`'s pool job waits on. The job then completes and
+/// the completion wake (`wake_blocked` + `svc_wake`) re-admits the `svc.wait`-parked serve loop,
+/// which re-claims the woken handler to completion. Under the pre-F1 degenerate wait the punt
+/// blocks the serving vCPU inside `a_punt`'s dispatch and `c_open` never serves — deadlock — so
+/// completing at all proves the dispatch parked, not the domain. Main loops `svc.wait` until
+/// all three dispatches have settled (the punt settles only on its async completion wake).
+const PUNT_PARKS_THE_DISPATCH: &str = r#"
+memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { a_punt: 0, b_probe: 0, c_open: 0 }
+export 0 interface "svc" 1 { a_punt: 1, b_probe: 2, c_open: 3 }
+
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vtot: i64) {
+  vp = i32.const 0
+  vn = svc.wait vp
+  vt2 = i64.add vtot vn
+  vthree = i64.const 3
+  vlt = i64.lt_s vt2 vthree
+  br_if vlt 1(vt2) 2(vt2)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (varg: i64) {
+  vh = i32.wrap_i64 varg
+  vz = i64.const 0
+  vr = cap.call 13 0 (i64) -> (i64) vh (vz)
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (varg: i64) {
+  vr = i64.const 7
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (varg: i64) {
+  vh = i32.wrap_i64 varg
+  vz = i64.const 0
+  vr = cap.call 13 1 (i64) -> (i64) vh (vz)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
+    let m = module(PUNT_PARKS_THE_DISPATCH);
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let gate_job = Arc::clone(&gate);
+    let gate_rel = Arc::clone(&gate);
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let h = host.grant_host_proc_offloadable(Box::new(move |op, _args| {
+        if op == 1 {
+            let (mx, cv) = &*gate_rel;
+            *mx.lock().unwrap() = true;
+            cv.notify_all();
+            return svm_interp::OffloadOutcome::Done(Ok(vec![0]));
+        }
+        let g = Arc::clone(&gate_job);
+        svm_interp::OffloadOutcome::Offload(Box::new(move || {
+            let (mx, cv) = &*g;
+            let mut open = mx.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            111
+        }))
+    }));
+    let comps = host.completions();
+    let t_punt = host
+        .svc_enqueue(0, 0, vec![h as i64])
+        .expect("enqueue punt");
+    let t_probe = host.svc_enqueue(0, 1, vec![0]).expect("enqueue probe");
+    let t_open = host
+        .svc_enqueue(0, 2, vec![h as i64])
+        .expect("enqueue open");
+    let mut fuel = u64::MAX;
+    let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("no trap, no hang");
+    assert_eq!(r, vec![Value::I64(3)], "all three dispatches completed");
+    assert_eq!(
+        host.svc_result(t_punt),
+        Some(111),
+        "the parked handler resumed with its pool job's result"
+    );
+    assert_eq!(
+        host.svc_result(t_probe),
+        Some(7),
+        "served while the punting handler was parked"
+    );
+    assert_eq!(host.svc_result(t_open), Some(0), "the release ran inline");
+    assert_eq!(comps.minted(), 1, "only the punt minted");
+    assert_eq!(
+        comps.outstanding(),
+        0,
+        "the completion was delivered to the handler"
+    );
+}

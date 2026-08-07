@@ -4548,10 +4548,10 @@ impl Scheduler {
                     s.runnable.push_back(v);
                     woke = true;
                 }
-                // No fiber parks on completions yet (slice 2 parks whole vCPUs only — the
-                // FIBER_PARKED unwind would be guest-visible where fast backends block inline,
-                // invariant 9); the arm exists so a future handler-promotion slice inherits the
-                // established wake pair.
+                // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
+                // rides the same ordered drain. The wake pair is the established one: the
+                // result lands on the parked frame, and the domain's `svc.wait` consumers are
+                // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
                 Some(Waiter::Fiber { reg, slot, svc }) => {
                     reg.wake_blocked(slot, Reg::from_i64(r));
                     svc_wake_locked(&mut s, svc);
@@ -10745,18 +10745,55 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             return Err(Trap::CapFault);
                         }
                         let comps = hg.completions();
+                        let svck = hg.domain_id() as usize;
                         drop(hg);
+                        // F1 (FIBER_PARK.md) — a punt inside a FIBER parks the fiber, not the
+                        // vCPU: the §3.6 slice-5a contract (`FIBER_PARKED` unwinds to the
+                        // resumer; the completion wakes the fiber; the next resume delivers the
+                        // scalar). The waiter rides the same `completion_waiters` map as the
+                        // vCPU park, so submission-ordered delivery (§18) is one drain for both.
+                        // Register-then-recheck is the drain itself: a completion that raced the
+                        // park is delivered (in order) by the recheck, never stranded. Durable
+                        // callers keep the degenerate wait below (`freeze_drive` fails closed on
+                        // any unwoken cap park — the FIBER_PARK.md non-goal); the explorer keeps
+                        // whole-vCPU waits (the slice-5a `SchedRef::Real` gate); the single-i64
+                        // gate matches the wake's one pushed reg (invariant 8). An animated
+                        // offer handler that reaches this park rides `fiber_park!`'s CALLS-4b
+                        // promotion branch instead — the dispatch parks, never the domain.
+                        // Until F2/F3, the fast backends still block inline here — the
+                        // enumerated interim divergence (ISSUES.md I73), witnessable only by a
+                        // punt-inside-a-fiber kernel.
+                        if *cur != ROOT_FIBER
+                            && !durable
+                            && matches!(sig.results.as_slice(), [ValType::I64])
+                        {
+                            if let SchedRef::Real(sr) = sched {
+                                let regc = Arc::clone(registry);
+                                fiber_park!(|slot: usize| {
+                                    let mut sg = sr.lock();
+                                    sg.completion_waiters.insert(
+                                        id,
+                                        Waiter::Fiber {
+                                            reg: Arc::clone(&regc),
+                                            slot,
+                                            svc: svck,
+                                        },
+                                    );
+                                    drop(sg);
+                                    sr.completion_drain(&comps);
+                                });
+                            }
+                        }
                         // Slice 2 — park the vCPU instead of blocking its worker thread: the
                         // completion re-queues it via `Pending::CapResult`, so the M:N worker
                         // runs other runnable vCPUs meanwhile. Guest-invisible (a blocking call
                         // just takes time), hence no cross-backend divergence. Conditions: real
                         // scheduler (the explorer keeps whole-vCPU blocking waits), root fiber
-                        // (a `cont` fiber's park would unwind FIBER_PARKED to its resumer —
-                        // guest-visible where fast backends block inline, invariant 9),
-                        // non-durable (the freeze driver has no CapPending arm; a durable
-                        // caller keeps the in-dispatch blocking discipline), and an exactly-i64
-                        // reply (the wake pushes a raw i64 reg — the `Pending::CapResult`
-                        // precedent; `Blocking`/offloadable jobs return one i64 by contract).
+                        // (a fiber's park is the F1 unwind above), non-durable (the freeze
+                        // driver has no CapPending arm; a durable caller keeps the in-dispatch
+                        // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
+                        // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
+                        // jobs return one i64 by contract).
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -10764,8 +10801,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         if parkable {
                             return Ok(Inner::Park(Blocked::CapPending { id }));
                         }
-                        // Degenerate blocking wait (slice 1): single-fiber guests, `cont`
-                        // fibers, durable callers, the deterministic explorer.
+                        // Degenerate blocking wait (slice 1): single-fiber guests, durable
+                        // callers, non-i64 signatures, the deterministic explorer.
                         let r = comps.wait(id);
                         if let Some(ty) = sig.results.first() {
                             frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
@@ -14376,6 +14413,26 @@ struct CompletionState {
     /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
     /// tier's ordered-delivery key, §18 determinism).
     next_id: u64,
+    /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
+    /// fiber registers here and its resumer's polls read the cell; the ordered drain moves
+    /// ready results into cells **smallest-id-first, stopping at the first not-yet-arrived**
+    /// (the §18 submission-order pin, JIT form — the tree-walk scheduler's `completion_drain`
+    /// and the bytecode `drain_cap_parked`, cell form). One lock with the store, so
+    /// register-then-recheck is atomic and a completion can never race past a registration.
+    fiber_cells: BTreeMap<u64, Arc<CapFiberCell>>,
+}
+
+/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until the ordered drain claims
+/// the completion; the parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
+pub struct CapFiberCell {
+    result: Mutex<Option<i64>>,
+}
+
+impl CapFiberCell {
+    /// Claim the delivered scalar, if the drain has filled the cell.
+    pub fn take(&self) -> Option<i64> {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
 }
 
 impl Completions {
@@ -14385,8 +14442,43 @@ impl Completions {
                 ready: BTreeMap::new(),
                 in_flight: 0,
                 next_id: 0,
+                fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
+        }
+    }
+
+    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
+    /// the ordered drain under the same lock (register-then-recheck: a completion that raced
+    /// the park is claimed here, in submission order, never stranded).
+    pub fn fiber_register(&self, id: u64) -> Arc<CapFiberCell> {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        let cell = Arc::new(CapFiberCell {
+            result: Mutex::new(None),
+        });
+        g.fiber_cells.insert(id, Arc::clone(&cell));
+        Self::fiber_drain_locked(&mut g);
+        cell
+    }
+
+    /// F3 — consume a still-parked cell registration (the trap/teardown exit): the eventual
+    /// result stays unclaimed in `ready` for the teardown sweep, exactly like an abandoned
+    /// vCPU waiter's.
+    pub fn fiber_deregister(&self, id: u64) {
+        let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
+        g.fiber_cells.remove(&id);
+    }
+
+    /// The F3 ordered drain: claim ready results into registered fiber cells smallest-id-first,
+    /// stopping at the first not-yet-arrived id. Runs at registration and at every
+    /// [`complete`](Completions::complete), always under the one state lock.
+    fn fiber_drain_locked(g: &mut CompletionState) {
+        while let Some((&id, _)) = g.fiber_cells.first_key_value() {
+            let Some(r) = g.ready.remove(&id) else {
+                break;
+            };
+            let (_, cell) = g.fiber_cells.pop_first().expect("first_key_value above");
+            *cell.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         }
     }
 
@@ -14399,11 +14491,14 @@ impl Completions {
         id
     }
 
-    /// Post a punted job's scalar result (pool-worker side) and wake waiters.
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters — including the
+    /// F3 fiber cells, via the ordered drain (their resumers observe the wake at the next
+    /// `cont.resume` poll; no separate notify hook is needed on the JIT tier).
     fn complete(&self, id: u64, result: i64) {
         let mut g = self.mx.lock().unwrap_or_else(|e| e.into_inner());
         g.ready.insert(id, result);
         g.in_flight -= 1;
+        Self::fiber_drain_locked(&mut g);
         drop(g);
         self.cv.notify_all();
     }

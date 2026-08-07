@@ -13,6 +13,46 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I73 — punt-inside-a-fiber: the fast backends blocked the vCPU inline where the tree-walk oracle parks the fiber — **CONVERGED 2026-08-07, all three engines** (S3; opened by FIBER_PARK.md F1, closed by F2+F3 on the same arc)
+
+**F2** converged the bytecode cooperative driver (`FiberState::CapParked` + the ordered
+`drain_cap_parked`; `fiber_punt_diff.rs` pins all four F1 kernels TreeWalk ≡ Bytecode bit-exact).
+**F3** converged the Cranelift JIT: `cap_thunk`/`cap_thunk_locked` route a fiber's punt through
+the pending face and park the FIBER (`fiber_cap_wait` over the `Completions` fiber cells — the
+ordered drain lives inside the store's one lock — plus the `fiber_rt` event-park seam the futex
+thunk already used); `svm/tests/fiber_punt_jit.rs` pins all four kernels across all three
+engines, statuses/values/delivery-order alike. The enumerated **inline-by-design** postures that
+remain are not debt: the bytecode parallel and browser-`Vcpu` drivers (the I45 posture — fiber
+delivery through the real cross-thread futex is its own slice), the debug drivers (sanctioned
+whole-vCPU tiering, invariant 9 observability corollary), the §22 invoke leaves (seam-free
+atomic), confined `instantiate` children on the cooperative driver (their completions live on
+their own host), and durable runs everywhere (`freeze_drive` has no cap-park re-derivation).
+
+**What.** F1 extended the §3.6 slice-5a fiber-park contract to punted host calls: on the
+tree-walk oracle, a `Pending` dispatch inside a fiber now unwinds `FIBER_PARKED (3)` to its
+resumer and the pool completion wakes the fiber (`completion_waiters` × `Waiter::Fiber`, the
+ordered drain). The bytecode cooperative driver and the Cranelift JIT still run the pre-F1
+semantics — the punt blocks the vCPU inline (bytecode: `comps.wait(id)` at its punt site; JIT:
+`cap_thunk`/`cap_thunk_locked` wait on the thunk). A resumer polling a fiber that punts sees
+`FIBER_PARKED` on the oracle but `FIBER_RETURNED`-with-result on the fast backends.
+
+**Why tracked, not fixed here.** A punt is a per-call runtime decision (`OffloadOutcome`), so a
+compile veto cannot see it — decline is unavailable and parity is the only convergence
+(invariant 9). Each fast backend mirrors its existing slice-5a futex fiber-park shape keyed by
+completion id: **F2** (bytecode `FiberState` arm + `drive` idle wake on completions) and **F3**
+(Cranelift JIT per-fiber completion cell + the `fiber_rt` event-park seam) are the plan, on the
+same PR arc. Until then the divergence is witnessable only by a punt-inside-a-fiber kernel: the
+generic differentials generate no fiber kernels (verified — `bytecode_diff`/`jit_diff` carry
+none), and the I45 rule extends — any harness pointed at the fast backends must avoid
+punt-inside-fiber kernels until F3 closes this. Cross-engine pins land with F2/F3
+(`fiber_timed_wait.rs` `pin_all` pattern).
+
+**Scope notes (the deliberate non-divergences).** Root-context punts are unchanged everywhere
+(vCPU park, guest-invisible). Durable callers never fiber-park on punts (the predicate's
+`!durable` — `freeze_drive` fails closed on unwoken cap parks, pinned in `fiber_parks.rs`).
+The explorer has no powerbox, so no punt can occur there (the `SchedRef::Real` gate is
+structural). The I45 secondary drivers gain the same row by reference.
+
 ### I72 — `fiber-scaling features (macos-latest)` failed at *action download* with `Service Unavailable` (S4, GitHub Actions infra flake) — recorded 2026-08-06 on PR #642
 
 Run 31119236467: the job died in **Prepare all required actions** — `Failed to resolve action

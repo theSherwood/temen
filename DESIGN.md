@@ -1822,10 +1822,9 @@ numbers:
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
    (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
    drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
-   (the JIT threaded tier) releases the domain lock before its completion wait. Deliberately
-   whole-vCPU and guest-invisible — a fiber-level FIBER_PARKED unwind would be guest-visible where
-   fast backends block inline — so `cont` fibers, durable callers, and the explorer keep the
-   blocking wait (fiber-park promotion is a recorded follow-on, not a semantic hole).
+   (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
+   parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
+   fiber-park promotion below.
 
 Pinned constraints (tests in `svm/tests/host_park.rs`, `svm-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -1838,12 +1837,53 @@ both `max_active` 4, vs 18.5 ms serialized before) while batching stayed 13–14
 of the ring's jobs subsumed or disproven, so the `IoRing` was deleted (SQE/CQE format,
 `RingState`, `submit`/`submit_async`/`reap`, the `async_notify`/`AsyncCounter`/`AsyncHostHooks`
 seams, the `__vm_io_*` builtins; iface id 9 stays reserved; `ioring` left the powerbox — six caps
-now). Known, accepted loss: `submit_async`/`reap` was the only *single-vCPU* compute/host overlap
-— its replacement is guest-facing concurrency (`thread.spawn` today; fiber-park promotion later),
-never a second host-call ABI. Completion sources stay pluggable behind the park (offload pool
-now; host io_uring for real file/net caps; a JS event on the browser tier). Batching belongs to
-the *transport* — a future §9-rung-6 broker coalesces parked completions invisibly; the guest ABI
+now). The retirement's recorded loss — `submit_async`/`reap` was the only *single-vCPU*
+compute/host overlap — was closed by **fiber-park promotion** (below), never by a second
+host-call ABI. Completion sources stay pluggable behind the park (offload pool now; host
+io_uring for real file/net caps; a JS event on the browser tier). Batching belongs to the
+*transport* — a future §9-rung-6 broker coalesces parked completions invisibly; the guest ABI
 stays sync.
+
+**Fiber-park promotion (landed 2026-08-07; the FIBER_PARK arc — slices F1–F4 in git history).**
+A punted host call **inside a fiber** parks the FIBER, not the vCPU: the `cap.call` unwinds
+`FIBER_PARKED (3)` to its resumer — the §3.6 slice-5a contract `memory.atomic.wait` already
+follows, extended to `Pending` — the pool completion wakes the fiber, and the next resume
+delivers the scalar. One vCPU, two fibers: submit, park, run the other, resume on completion —
+the async-first paragraph above, delivered. Identical on all three engines (invariant 9;
+`fiber_punt_diff.rs` TreeWalk ≡ Bytecode bit-exact, `fiber_punt_jit.rs` adds the Cranelift JIT
+— ISSUES.md I73, opened and closed on the arc):
+
+- *Oracle (F1):* the park predicate's fiber arm rides `fiber_park!` filing a `Waiter::Fiber` in
+  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so
+  delivery stays submission-ordered even on the register race, and an animated offer handler's
+  punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
+  resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
+  non-durable, `SchedRef::Real`.
+- *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
+  each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
+  ONE ordered drain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the first
+  not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on the
+  store** (pending pool work is never a deadlock and never jumps the logical clock). GC root
+  scans cover cap-parked frames.
+- *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
+  the store, drain at registration + every pool-side `complete` — no notify hook; resumption is
+  poll-driven), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
+  the pending face and park via the `fiber_rt` event-park seam the futex thunk already used.
+  Root context keeps the sync/blocking faces — "sync ops never pay" holds.
+
+*Measured (F4, `fiber_overlap_bench.rs`, n=8 × block=2 ms, K=4):* fiber lane ~4.8–5.3 ms/batch
+on all three engines (JIT net of its per-run compile floor) vs ~19 ms serialized root — the
+ring's own overlap range, restored on one vCPU. **Inline-by-design postures (enumerated, not
+debt):** the bytecode parallel + browser-`Vcpu` drivers (I45 — fiber delivery through the real
+cross-thread futex is its own slice), the debug drivers (sanctioned whole-vCPU tiering;
+checkpointing excludes cap-parked fibers like futex-parked ones), the §22 invoke leaves
+(seam-free atomic), confined `instantiate` children on the cooperative driver (their
+completions live on their own host), durable runs everywhere (`freeze_drive` fails closed on
+any unwoken cap park — pinned), and zero/multi-result punts (the degenerate wait). Residue: the
+animated-offer punt is exercised only by construction (`wire_offer_proc` seals the provider
+`Host`; pin it when a public wiring can grant a provider an offloadable cap). I48 (a blocking
+`cont.resume`) stays deferred — this arc built the wake machinery it would idle on, the
+primitive still wants a second consumer.
 
 ### Unified event-parking
 - All blocking = **park a fiber until an event**. Events: `notify` (futex), I/O

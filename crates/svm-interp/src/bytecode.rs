@@ -2950,6 +2950,16 @@ impl<'p> Vcpu<'p> {
                     self.pending = Some(dst);
                     return VcpuEvent::Join { handle };
                 }
+                Ok(VcpuStop::CapPending { id, dst }) => {
+                    // F2: the session driver keeps the inline completion wait — identical to
+                    // the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
+                    let comps = match self.shared_host {
+                        Some(m) => m.lock().unwrap_or_else(|e| e.into_inner()).completions(),
+                        None => self.host.completions(),
+                    };
+                    let r = comps.wait(id);
+                    self.vt.active.set(dst, Reg::from_i64(r));
+                }
                 Ok(VcpuStop::Wait {
                     base,
                     expected,
@@ -4165,6 +4175,15 @@ fn debug_advance_fiber(
                 Err(t) => FiberStep::Trapped(t),
             }
         }
+        // F2 — a punted host call in a debug advance keeps the pre-F2 inline wait (the debug
+        // drivers' whole-vCPU-park shape is sanctioned tiering, invariant 9 observability
+        // corollary; checkpointing across one is already excluded by `checkpoint_safe`'s
+        // replay-substate rules — the wait happens inside the advance, leaving no parked state).
+        Ok(Outcome::CapPending { id, dst }) => {
+            let r = host.completions().wait(id);
+            vt.active.set(dst, Reg::from_i64(r));
+            FiberStep::Stepped
+        }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
         // dispatches its subset).
@@ -4670,10 +4689,12 @@ impl DebugRun {
             // captured here, so a checkpoint mid-invoke can't be restored. A reverse-seek near an invoke
             // replays from an earlier checkpoint, which re-enters the invoke deterministically.
             && self.vt.active_invoke.is_none()
-            && !self
-                .fibers
-                .iter()
-                .any(|f| matches!(f, FiberState::WaitParked { .. }))
+            && !self.fibers.iter().any(|f| {
+                matches!(
+                    f,
+                    FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+                )
+            })
     }
 
     /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
@@ -6111,8 +6132,15 @@ fn step_active_invoke(
         {
             Ok(Outcome::Suspended) => InvStep::Ran, // budget boundary — one op done, keep stepping
             Ok(Outcome::Done(vals)) => InvStep::Done(vals),
+            // F2 — a punted host call inside an invoked unit keeps the pre-F2 inline wait
+            // (`run_invoke`'s arm; the unit is a seam-free atomic leaf, DESIGN §22).
+            Ok(Outcome::CapPending { id, dst }) => {
+                let r = host.completions().wait(id);
+                iv.vm.set(dst, Reg::from_i64(r));
+                InvStep::Ran
+            }
             // A seam op (spawn/park/yield/cont.*/re-invoke) inside an invoked unit is an inert CapFault,
-            // matching run_invoke's `_ => CapFault`. Host cap.calls complete inline (never surface here).
+            // matching run_invoke's `_ => CapFault`.
             Ok(_) => InvStep::Trap(Trap::CapFault),
             Err(t) => InvStep::Trap(t),
         }
@@ -6925,10 +6953,12 @@ impl ScheduledDebugRun {
     fn checkpointable(&self) -> bool {
         self.host.checkpoint_safe()
             && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
-            && !self
-                .fibers
-                .iter()
-                .any(|f| matches!(f, FiberState::WaitParked { .. }))
+            && !self.fibers.iter().any(|f| {
+                matches!(
+                    f,
+                    FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+                )
+            })
             && self.extra_envs.iter().all(|e| {
                 e.host.checkpoint_safe() && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
             })
@@ -7229,6 +7259,15 @@ enum Outcome {
         dst: usize,
         results: Box<[ValType]>,
     },
+    /// F2 (FIBER_PARK.md) — a punted offloadable dispatch (`Pending(completion_id)`) with an
+    /// exactly-`i64` reply, surfaced so the DRIVER decides the wait shape: the cooperative
+    /// `drive` parks a punting FIBER (`FiberState::CapParked` — the slice-5a contract) and
+    /// blocks inline at root; every other driver keeps the slice-1 inline wait (the I45
+    /// posture). The op already advanced `pc`; delivery writes the scalar to `dst`.
+    CapPending {
+        id: u64,
+        dst: u32,
+    },
     /// `cont.new`: register a fiber for `(funcref, sp)`, write its handle to `dst`, continue.
     ContNew {
         funcref: i32,
@@ -7457,10 +7496,60 @@ enum FiberState {
         /// delivers the status; `None` while still blocked.
         woken: Option<i32>,
     },
+    /// F2 (FIBER_PARK.md) — **event-parked on a punt completion**: the fiber's blocking host
+    /// call punted to the offload pool (`Pending(completion_id)`) and parked the FIBER, not its
+    /// vCPU (the oracle's `CapPending` fiber park, `fiber_parks.rs`). Not resumable until the
+    /// completion is claimed into `woken`; a `cont.resume` meanwhile reports `FIBER_PARKED`
+    /// without switching (the cooperative poll). Claims happen ONLY through the ordered drain
+    /// (`drain_cap_parked` — smallest outstanding id first, stop at the first not-yet-arrived),
+    /// so a later completion never overtakes an earlier parked fiber: bit-exact with the
+    /// oracle's `completion_drain` (the §18 pin). The drain runs at each `cont.resume` poll of
+    /// a cap-parked fiber and at driver idle (which blocks on the completion store when only
+    /// cap parks remain — a pool completion is pending work, never a deadlock).
+    CapParked {
+        vm: Vm,
+        /// The `cap.call`'s result register in `vm`; the waking resume writes the scalar here.
+        dst: u32,
+        /// The completion id this fiber waits on (ids are minted monotonically — submission
+        /// order — so "smallest outstanding" is the delivery order).
+        id: u64,
+        /// `Some(result)` once the drain claimed the completion; `None` while still in flight.
+        woken: Option<i64>,
+    },
     /// Currently on the resume chain (active or an ancestor) — not independently resumable.
     Running,
     /// Returned; resuming again is a `FiberFault`.
     Done,
+}
+
+/// F2 (FIBER_PARK.md) — the ordered completion drain over the fiber registry: claim ready punt
+/// completions for [`FiberState::CapParked`] fibers **smallest-id-first, stopping at the first
+/// not-yet-arrived** — the bytecode mirror of the oracle scheduler's `completion_drain`
+/// (submission-ordered delivery, the §18 pin). Returns whether anything was claimed.
+fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> bool {
+    let mut claimed = false;
+    loop {
+        let Some((fi, id)) = fibers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| match f {
+                FiberState::CapParked {
+                    id, woken: None, ..
+                } => Some((i, *id)),
+                _ => None,
+            })
+            .min_by_key(|&(_, id)| id)
+        else {
+            return claimed;
+        };
+        let Some(r) = comps.try_take(id) else {
+            return claimed;
+        };
+        if let FiberState::CapParked { woken, .. } = &mut fibers[fi] {
+            *woken = Some(r);
+        }
+        claimed = true;
+    }
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -7738,6 +7827,13 @@ fn run_invoke(
         match vm.resume(source, table, fuel, mem, host, u64::MAX)? {
             Outcome::Done(vals) => return Ok(vals),
             Outcome::Suspended => {}
+            // F2 — a punted host call inside an invoked unit keeps the pre-F2 inline wait
+            // (the unit is a seam-free atomic leaf, DESIGN §22: no park surface exists here,
+            // so blocking in place is the contract, not a divergence).
+            Outcome::CapPending { id, dst } => {
+                let r = host.with(|p| p.completions()).wait(id);
+                vm.set(dst, Reg::from_i64(r));
+            }
             _ => return Err(Trap::CapFault),
         }
     }
@@ -7752,6 +7848,13 @@ enum VcpuStop {
     LiveCall {
         ticket: u64,
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
+        dst: u32,
+    },
+    /// F2 (FIBER_PARK.md): a punted offloadable dispatch with an exactly-`i64` reply
+    /// ([`Outcome::CapPending`]) — the cooperative driver fiber-parks a punting fiber; every
+    /// other driver waits inline on the completion (the I45 posture).
+    CapPending {
+        id: u64,
         dst: u32,
     },
     /// §3.6 (I36 slice 2): park this task in `svc.wait` on its own domain ([`Outcome::SvcWait`]).
@@ -7962,6 +8065,18 @@ fn step_vcpu(
             }
             Outcome::ContResume { kh, arg, dst } => {
                 let k = kh as usize;
+                // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain
+                // first (so a busy resume-poll loop observes its completion without waiting
+                // for driver idle — the WaitParked `real_deadline` shape, completion form).
+                // The drain, not a direct `try_take`, so a poll of a LATER id never lets its
+                // ready result overtake an earlier outstanding park (the §18 pin).
+                if matches!(
+                    fibers.get(k),
+                    Some(FiberState::CapParked { woken: None, .. })
+                ) {
+                    let comps = ctx.host.with(|p| p.completions());
+                    drain_cap_parked(fibers, &comps);
+                }
                 // Claim fiber `k` from the **run-shared** registry: a pending fiber starts (call
                 // `funcref(sp, arg)`), a parked one continues (the new `arg` becomes its `suspend`'s
                 // result) — possibly one suspended on *another* vCPU (D57 migration). Anything else
@@ -8034,6 +8149,32 @@ fn step_vcpu(
                                 mut vm, wait_dst, ..
                             } => {
                                 vm.set(wait_dst, Reg::from_i32(st));
+                                vm
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    // F2 — a cap-parked fiber (blocked on its punt completion). Claimed by
+                    // the drain above (`woken`), the resume delivers the scalar into the
+                    // `cap.call`'s result register and continues it (the resume `arg` is
+                    // deliberately NOT delivered — the oracle's `LiveWoken`); still in
+                    // flight, the resumer gets `(FIBER_PARKED, 0)` without a switch.
+                    Some(slot @ FiberState::CapParked { .. }) => {
+                        let FiberState::CapParked { woken, .. } = slot else {
+                            unreachable!()
+                        };
+                        let Some(r) = woken.take() else {
+                            vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                            vt.active.set(dst + 1, Reg::from_i64(0));
+                            continue;
+                        };
+                        match std::mem::replace(slot, FiberState::Running) {
+                            FiberState::CapParked {
+                                mut vm,
+                                dst: cap_dst,
+                                ..
+                            } => {
+                                vm.set(cap_dst, Reg::from_i64(r));
                                 vm
                             }
                             _ => unreachable!(),
@@ -8170,6 +8311,7 @@ fn step_vcpu(
                     budget,
                 })
             }
+            Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
             Outcome::MemoryWait {
                 base,
                 expected,
@@ -8238,11 +8380,13 @@ fn step_vcpu(
                         scan_vm_roots(vm, &dom.source, &mut consider);
                     }
                     for fib in fibers.iter() {
-                        // §3.6 slice 5a: an event-parked (`WaitParked`) fiber holds live frames
-                        // exactly like a suspended one — scan both, or a root held across a
-                        // fiber's `memory.wait` would be missed (unsound for GC.md §3.2).
-                        if let FiberState::Parked { vm, .. } | FiberState::WaitParked { vm, .. } =
-                            fib
+                        // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex,
+                        // `CapParked` punt completion) holds live frames exactly like a
+                        // suspended one — scan all three, or a root held across a fiber's
+                        // blocking point would be missed (unsound for GC.md §3.2).
+                        if let FiberState::Parked { vm, .. }
+                        | FiberState::WaitParked { vm, .. }
+                        | FiberState::CapParked { vm, .. } = fib
                         {
                             scan_vm_roots(vm, &dom.source, &mut consider);
                         }
@@ -8461,6 +8605,39 @@ fn drive(
             .iter()
             .position(|t| matches!(t.state, TaskState::Runnable))
         else {
+            // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
+            // pending work on the offload pool, never a deadlock and never a reason to jump the
+            // logical clock. Block on the store for the smallest outstanding id (submission
+            // order), deliver through the ordered drain, and loop — the woken fibers'
+            // resumers observe the wake at their next poll (or their own timers fire below on
+            // a later pass).
+            let min_cap = fibers
+                .iter()
+                .filter_map(|f| match f {
+                    FiberState::CapParked {
+                        id, woken: None, ..
+                    } => Some(*id),
+                    _ => None,
+                })
+                .min();
+            if let Some(id) = min_cap {
+                let comps = host.completions();
+                let r = comps.wait(id);
+                for f in fibers.iter_mut() {
+                    if let FiberState::CapParked {
+                        id: fid,
+                        woken: w @ None,
+                        ..
+                    } = f
+                    {
+                        if *fid == id {
+                            *w = Some(r);
+                        }
+                    }
+                }
+                drain_cap_parked(&mut fibers, &comps);
+                continue;
+            }
             // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
             // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
             let next = tasks
@@ -8594,6 +8771,49 @@ fn drive(
                     callee,
                     dst,
                 };
+            }
+            Ok(VcpuStop::CapPending { id, dst }) => {
+                // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
+                // (`CapParked` — the slice-5a contract; the ordered drain right after the
+                // park is the register-then-recheck closing the completion-raced-the-park
+                // window). The root keeps the inline wait (guest-invisible — the oracle
+                // parks the vCPU here instead; the cooperative driver has nothing else to
+                // run on this task anyway). Two more inline cases, both mirroring the
+                // oracle's predicate: a durable run (`freeze_drive` has no cap-park
+                // re-derivation — the freeze must never meet one) and a confined
+                // `instantiate` child (its completions live on ITS host; keeping the child
+                // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
+                let durable = host.is_durable();
+                if tasks[ti].vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
+                    let comps = host.completions();
+                    let vt = &mut tasks[ti].vt;
+                    let (rid, resumer, rdst) =
+                        vt.chain.pop().expect("a running fiber has a resumer");
+                    let k = vt.active_id;
+                    shadow_switch(mem, &mut fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
+                    let fvm = std::mem::replace(&mut vt.active, resumer);
+                    fibers[k] = FiberState::CapParked {
+                        vm: fvm,
+                        dst,
+                        id,
+                        woken: None,
+                    };
+                    drain_cap_parked(&mut fibers, &comps);
+                    vt.active_id = rid;
+                    vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
+                    vt.active.set(rdst + 1, Reg::from_i64(0));
+                } else {
+                    let comps = match tasks[ti].env {
+                        None => host.completions(),
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .completions(),
+                    };
+                    let r = comps.wait(id);
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                }
             }
             Ok(VcpuStop::ChildOffer { child, export, dst }) => {
                 // Mint a live-callee offer over a running child's export: shape from the
@@ -9619,6 +9839,15 @@ fn run_vcpu_parallel<'scope, 'env>(
                     // A child trap propagates: the joiner completes with the same trap.
                     Err(t) => return (Err(t), mem),
                 }
+            }
+            Ok(VcpuStop::CapPending { id, dst }) => {
+                // F2: the parallel driver keeps the inline completion wait — it blocks only
+                // this OS thread while the pool works (the §5b overlap across sibling vCPUs
+                // is the lock-release, already landed); fiber-waiter delivery through the
+                // real cross-thread futex is the I45/I73 residue, its own slice.
+                let comps = host.lock().unwrap_or_else(|e| e.into_inner()).completions();
+                let r = comps.wait(id);
+                vt.active.set(dst, Reg::from_i64(r));
             }
             Ok(VcpuStop::Wait {
                 base,
@@ -10912,19 +11141,27 @@ impl Vm {
                         p.cap_dispatch_slots_pending(*type_id, *op, h, &argv, gm, &mut pending_id)
                     })?;
                     // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
-                    // above already released the shared-host lock, so the wait below blocks only
-                    // this vCPU thread while the offload pool does the work — on the parallel
-                    // tier sibling vCPUs' cap.calls proceed (the §5b `max_active = 1`
-                    // serialization fix). This slice is the single-fiber degenerate wait; the
-                    // placeholder `res` is discarded.
+                    // above already released the shared-host lock. The exactly-`i64` case is
+                    // surfaced as [`Outcome::CapPending`] so the DRIVER chooses the wait shape
+                    // (F2: the cooperative `drive` fiber-parks a punting fiber; every other
+                    // driver waits inline — the I45 posture). Other reply shapes keep the
+                    // slice-1 inline wait right here; the placeholder `res` is discarded.
                     if let Some(id) = pending_id {
-                        let comps = host.with(|p| p.completions());
-                        let r = comps.wait(id);
                         if results.len() > 1 {
                             // Parkable ops carry a single-slot scalar reply (invariant 8) —
-                            // a wider declared signature is a registration bug, fail-closed.
+                            // a wider declared signature is a registration bug, fail-closed
+                            // BEFORE any park or wait.
                             return Err(Trap::CapFault);
                         }
+                        if let [ValType::I64] = &results[..] {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc + 1;
+                            return Ok(Outcome::CapPending { id, dst: *dst });
+                        }
+                        let comps = host.with(|p| p.completions());
+                        let r = comps.wait(id);
                         if let Some(ty) = results.first() {
                             self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
                         }

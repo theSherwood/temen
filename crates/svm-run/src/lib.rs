@@ -171,6 +171,41 @@ pub unsafe extern "C" fn cap_thunk(
     n_results: u64,
     trap_out: *mut i64,
 ) {
+    // F3 (FIBER_PARK.md) — a punt INSIDE A FIBER parks the fiber, not this OS thread: route
+    // through the pending face so the dispatch can punt to the pool, then park-poll on the
+    // completion cell (`fiber_cap_wait`) — the §3.6 slice-5a contract, completion form, the
+    // futex thunk's exact shape. Gated on the oracle's predicate: a live fiber, exactly one
+    // result slot (the wake delivers one scalar — invariant 8), and a non-durable run (the
+    // freeze driver has no cap-park re-derivation). Root context keeps the sync face below:
+    // a single-threaded guest's punts run inline — semantically identical and cheaper than a
+    // pool round-trip nobody could overlap with (DESIGN.md §12), and the "sync ops never pay"
+    // pin stays intact (nothing here is touched unless a fiber is live).
+    if n_results == 1 && svm_jit::fiber_active() && !(*(ctx as *mut Host)).is_durable() {
+        let mut pending_id = None;
+        cap_thunk_impl(
+            ctx,
+            mem_base,
+            mem_size,
+            mem_reserved,
+            type_id,
+            op,
+            handle,
+            args,
+            n_args,
+            results,
+            n_results,
+            trap_out,
+            Some(&mut pending_id),
+        );
+        if let Some(id) = pending_id {
+            let comps = (*(ctx as *mut Host)).completions();
+            let r = fiber_cap_wait(&comps, id, trap_out);
+            if *trap_out == 0 {
+                *results = r;
+            }
+        }
+        return;
+    }
     // Sync face (`pending = None`): a single-threaded guest's punts run inline — semantically
     // identical and cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12).
     cap_thunk_impl(
@@ -188,6 +223,37 @@ pub unsafe extern "C" fn cap_thunk(
         trap_out,
         None,
     );
+}
+
+/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
+/// drain claims a completion that raced the park, in submission order — a ready LATER id is
+/// held behind an earlier outstanding park, the §18 pin), then park-poll: each `cont.resume`
+/// of this fiber re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the
+/// resumer) until the drain has delivered. Parking before the first check gives the one
+/// transient `FIBER_PARKED` even on an insta-ready completion, matching the oracle's
+/// register-then-recheck. A trap raised meanwhile (teardown) abandons the wait — the result
+/// stays unclaimed for the sweep and the caller's trailing guards unwind before the guest
+/// could observe the placeholder scalar.
+///
+/// # Safety
+/// Same fiber-context contract as [`svm_jit::fiber_park_current`]; `trap_out` is the live trap
+/// cell.
+unsafe fn fiber_cap_wait(
+    comps: &std::sync::Arc<svm_interp::Completions>,
+    id: u64,
+    trap_out: *mut i64,
+) -> i64 {
+    let cell = comps.fiber_register(id);
+    loop {
+        svm_jit::fiber_park_current();
+        if let Some(r) = cell.take() {
+            return r;
+        }
+        if *trap_out != 0 {
+            comps.fiber_deregister(id);
+            return 0;
+        }
+    }
 }
 
 /// The shared [`cap_thunk`] body. `pending` is the §12 parking out-param: `Some` only from
@@ -466,10 +532,22 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // signature fails closed).
     if let Some(id) = pending_id {
         let comps = guard.completions();
+        let durable = guard.is_durable();
         drop(guard);
-        let r = comps.wait(id);
         if n_results > 1 {
             *trap_out = TrapKind::CapFault as i64;
+            return;
+        }
+        // F3 (FIBER_PARK.md) — a punt inside a FIBER on the threaded tier parks the fiber
+        // (lock already released above), so the spawned vCPU keeps polling its other fibers;
+        // the root keeps the blocking wait (a JIT vCPU is a real thread — blocking it at root
+        // is the landed P3 contract).
+        let r = if n_results == 1 && svm_jit::fiber_active() && !durable {
+            fiber_cap_wait(&comps, id, trap_out)
+        } else {
+            comps.wait(id)
+        };
+        if *trap_out != 0 {
             return;
         }
         if n_results == 1 {
