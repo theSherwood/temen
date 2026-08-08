@@ -1853,9 +1853,22 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // re-poll. `ParkGuard` counts this vCPU blocked for the deadlock detector; the bounded wait
         // re-checks a kill / timeout / freeze / teardown within `KILL_RECHECK`. The lock is dropped
         // (with the returned guard) before the next re-resume — the fiber may take it.
-        let g = lock(&dom.futex);
-        let _pg = ParkGuard::new(&dom.parked);
-        let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+        //
+        // `KILL_RECHECK` / `wait_timeout` are the real-build cadence (both absent under loom, which
+        // has no wall clock). loom does not model fibers, so this thunk is never exercised there;
+        // the `#[cfg(loom)]` arm takes the advisory `FIBER_PARKED` downgrade purely so the crate
+        // still compiles under `--cfg loom`.
+        #[cfg(not(loom))]
+        {
+            let g = lock(&dom.futex);
+            let _pg = ParkGuard::new(&dom.parked);
+            let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+        }
+        #[cfg(loom)]
+        {
+            let _ = &dom.futex; // touch the field so it isn't flagged unused under loom
+            return value;
+        }
     }
 }
 
