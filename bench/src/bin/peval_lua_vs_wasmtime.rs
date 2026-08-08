@@ -1,29 +1,27 @@
 //! **Real Lua: interpreter vs partial-evaluation residual vs native wasm (Wasmtime).**
 //!
 //! The Futamura arc (`crates/svm-llvm/tests/lua_futamura_*.rs`) measures the peval *residual* of the
-//! real `luaV_execute` against the interpreter and reports an ~11.5× per-iteration win — but only
+//! real `luaV_execute` against the interpreter and reports an ~11–19× per-iteration win — but only
 //! *within our own engine*. This bench adds the missing anchor: an **independent native baseline**,
-//! the same per-iteration kernel compiled Rust → wasm32 → Wasmtime (Cranelift). Three lanes, one
-//! kernel, all timed the same way, so the question the whole arc points at gets a number:
+//! the same per-iteration kernel compiled Rust → wasm → Wasmtime (Cranelift). Three lanes, a gallery
+//! of kernels, all timed the same way, so the question the whole arc points at gets a number:
 //!
 //!   **how much of the interpreted-Lua → native gap does specializing the interpreter actually close?**
 //!
-//! Kernel: `for i = 1, n do x = x + 3 end` — a deliberately trivial loop body. A trivial body is the
-//! *right* microbenchmark here: it maximizes the share of time spent in interpreter decode+dispatch,
-//! which is exactly what the residual removes and what native never pays. The native lane adds 3 per
-//! iteration behind a `black_box` so the optimizer can't close-form the loop to `3*n`.
-//!
-//!   - **interpreter**: real `luaV_execute` run through svm-jit on the Lua chunk (whole program,
-//!     differential-N over the trip count cancels compile+parse).
-//!   - **residual**: the dispatch-folded, loop-rolled specialization of `luaV_execute` for this chunk
-//!     (the arc's payoff), run through svm-jit; the module is N-independent so the same differential
-//!     cancels its compile exactly.
-//!   - **native (wasm32/Wasmtime)**: `run(n){ x=0; for i<n { x += black_box(3) } }` in Rust, built to
-//!     wasm32 and run on the same Wasmtime this crate already links.
+//! Kernels are real numeric loops whose body uses the loop variable and does genuine arithmetic
+//! (`s+i`, `s+i*i`, a fibonacci recurrence, `i%d` / `i//d` — the divisor a local, so a register
+//! operand). Each lane:
+//!   - **interpreter**: real `luaV_execute` through svm-jit on the Lua chunk (whole program).
+//!   - **residual**: the dispatch-folded, loop-rolled specialization built by the shared
+//!     `futamura::auto_rolled` driver (the arc's payoff), through svm-jit.
+//!   - **native**: the same per-iteration kernel in Rust, built to wasm32 and run on the same Wasmtime
+//!     this crate already links. All kernels live in one wasm module (built once) and the body reads
+//!     its inputs through `black_box`, so the optimizer can't close-form the loop.
 //!
 //! All three: min-over-reps + large/small-N differential (`(t(N₂)−t(N₁))/(N₂−N₁)`), the repo-standard
-//! per-iteration methodology (rustbench.rs, embench_one.rs). The native lane skips gracefully if
-//! `rustc`/the wasm32 target is unavailable (like rustbench), so the interpreter-vs-residual half
+//! per-iteration methodology (rustbench.rs, embench_one.rs). Correctness (residual == interpreter ==
+//! native at a small sample trip count) is asserted before any timing is trusted. The native lane
+//! skips gracefully if `rustc`/the wasm32 target is unavailable, so the interpreter-vs-residual half
 //! always runs.
 //!
 //! Run: `cargo run --release --manifest-path bench/Cargo.toml --bin peval_lua_vs_wasmtime`
@@ -34,189 +32,100 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use svm_interp::{IrPc, Stop, StopReason, Value, WatchKind};
-use svm_ir::{Block, Func, Inst, LoadOp, Module, Terminator, ValType};
-use svm_peval::{specialize_with_config, SpecArg, SpecConfig};
+use svm_bench_vs_wasmtime::futamura::{auto_rolled, has_br_table, lua_module, with_readback};
+use svm_ir::Module;
 use wasmtime::{Config, Engine, Instance, Module as WtModule, Store, Val};
 
-// ---- Lua 5.4.7 layout offsets (identical to lua_futamura_bench.rs — the proven capture). ----
-const CAPTURE_LEN: usize = 8 << 20;
-const L_STACK_LAST: u64 = 40;
-const L_STACK: u64 = 48;
-const LUA_STATE_SIZE: usize = 200;
-const CI_SIZE: usize = 104;
-const CI_FUNC: u64 = 0;
-const LCLOSURE_P: u64 = 24;
-const PROTO_SIZECODE: u64 = 24;
-const PROTO_CODE: u64 = 64;
-const SV: u64 = 16;
-
-const ROLL_SCRIPT: &str = "local x = 0\nfor i = 1, 50 do x = x + 3 end\nreturn x\n";
-
-// The differential trip counts (a 20M-iteration delta keeps the per-iteration number stable against
-// shared-runner noise; the interpreter side especially).
+// Differential trip counts (a 20M-iteration delta keeps the per-iteration number stable against
+// shared-runner noise), a small sample count for the correctness cross-check, and the rep count.
 const N1: u64 = 1_000_000;
 const N2: u64 = 21_000_000;
+const SAMPLE: u64 = 50;
 const REPS: usize = 5;
 
-fn rd_u64(w: &[u8], a: u64) -> u64 {
-    u64::from_le_bytes(w[a as usize..a as usize + 8].try_into().unwrap())
-}
-fn rd_i32(w: &[u8], a: u64) -> i32 {
-    i32::from_le_bytes(w[a as usize..a as usize + 4].try_into().unwrap())
-}
-
-fn lua_module() -> Module {
-    let p = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../crates/svm-llvm/tests/fixtures/lua/lua_eval.ll"
-    );
-    svm_llvm::translate_ll_path(p)
-        .expect("translate lua_eval.ll")
-        .module
+/// A gallery kernel: the Lua chunk parts (`decls`, `body`, `ret`) and the matching native Rust — the
+/// per-iteration statement(s), the accumulator init, and the returned expression. The native loop is
+/// `for i in 1..=n`, mirroring Lua's `for i = 1, n`.
+struct Kernel {
+    name: &'static str,
+    decls: &'static str,
+    body: &'static str,
+    ret: &'static str,
+    native_init: &'static str,
+    native_body: &'static str,
+    native_ret: &'static str,
 }
 
-fn luav_execute(m: &Module) -> u32 {
-    m.exports
-        .iter()
-        .find(|e| e.name == "luaV_execute")
-        .expect("luaV_execute export")
-        .func
+fn kernels() -> Vec<Kernel> {
+    vec![
+        Kernel {
+            name: "add const (x+3)",
+            decls: "local x = 0",
+            body: "x = x + 3",
+            ret: "x",
+            native_init: "let mut x: i64 = 0;",
+            native_body: "x = x.wrapping_add(bb(3));",
+            native_ret: "x",
+        },
+        Kernel {
+            name: "sum (s+i)",
+            decls: "local s = 0",
+            body: "s = s + i",
+            ret: "s",
+            native_init: "let mut s: i64 = 0;",
+            native_body: "s = s.wrapping_add(bb(i));",
+            native_ret: "s",
+        },
+        Kernel {
+            name: "sum squares (s+i*i)",
+            decls: "local s = 0",
+            body: "s = s + i * i",
+            ret: "s",
+            native_init: "let mut s: i64 = 0;",
+            native_body: "s = s.wrapping_add(bb(i).wrapping_mul(i));",
+            native_ret: "s",
+        },
+        Kernel {
+            name: "fibonacci (a,b=b,a+b)",
+            decls: "local a = 0\nlocal b = 1",
+            body: "local t = a + b a = b b = t",
+            ret: "b",
+            native_init: "let mut a: i64 = 0; let mut b: i64 = 1;",
+            native_body: "let t = a.wrapping_add(bb(b)); a = b; b = t;",
+            native_ret: "b",
+        },
+        Kernel {
+            name: "modulo (s + i%d)",
+            decls: "local d = 2\nlocal s = 0",
+            body: "s = s + i % d",
+            ret: "s",
+            native_init: "let mut s: i64 = 0; let d: i64 = bb(2);",
+            native_body: "s = s.wrapping_add(i % d);",
+            native_ret: "s",
+        },
+        Kernel {
+            name: "floordiv (s + i//d)",
+            decls: "local d = 3\nlocal s = 0",
+            body: "s = s + i // d",
+            ret: "s",
+            native_init: "let mut s: i64 = 0; let d: i64 = bb(3);",
+            native_body: "s = s.wrapping_add(i / d);", // i,d>0 ⇒ Rust trunc-div == Lua floor-div
+            native_ret: "s",
+        },
+    ]
 }
 
-/// The loop-body safepoint capture: (sp, L, ci, base, counter, window). Watch the FORLOOP counter cell
-/// and stop once it holds a small positive VNUMINT while the accumulator is still 0 — a clean mid-loop
-/// resume image. (Ported verbatim from `lua_futamura_bench.rs`.)
-struct LoopEntry {
-    sp: i64,
-    l: u64,
-    ci: u64,
-    base: u64,
-    counter: u64,
-    window: Vec<u8>,
+fn return_script(k: &Kernel, n: u64) -> String {
+    format!(
+        "{}\nfor i = 1, {n} do {} end\nreturn {}\n",
+        k.decls, k.body, k.ret
+    )
 }
-
-fn capture_loop_entry(m: &Module, luav: u32) -> LoopEntry {
-    let inst = svm_run::instantiate(m.clone()).expect("instantiate");
-    let mut insp = inst.debug_attach(ROLL_SCRIPT.as_bytes().to_vec(), u64::MAX);
-    let entry_pc = IrPc {
-        module: 0,
-        func: luav,
-        block: 0,
-        inst: 0,
-    };
-    insp.set_breakpoint(entry_pc);
-    let (sp, l, ci) = match insp.run_until_stop() {
-        Stop::Break {
-            reason: StopReason::Breakpoint,
-            ..
-        } => {
-            let g = |i| match insp.read_ir_value(0, i) {
-                Some(Value::I64(v)) => v,
-                o => panic!("{o:?}"),
-            };
-            (g(0), g(1) as u64, g(2) as u64)
-        }
-        o => panic!("no entry break: {o:?}"),
-    };
-    insp.clear_breakpoint(entry_pc);
-    let w0 = insp.read_window(0, CAPTURE_LEN).expect("window");
-    let func = rd_u64(&w0, ci + CI_FUNC);
-    let base = func + SV;
-    let counter = base + 3 * SV;
-    let acc = base + SV;
-    insp.set_watchpoint(counter, 8, WatchKind::Write);
-    let window = loop {
-        match insp.run_until_stop() {
-            Stop::Break {
-                reason: StopReason::Watchpoint { write: true, .. },
-                ..
-            } => {
-                insp.step();
-                let w = insp.read_window(0, CAPTURE_LEN).expect("window");
-                let ctag = w[(counter + 8) as usize];
-                let atag = w[(acc + 8) as usize];
-                if ctag == 0x03 && atag == 0x03 && rd_u64(&w, acc) == 0 && rd_u64(&w, counter) > 0 {
-                    break w;
-                }
-            }
-            o => panic!("did not reach loop body: {o:?}"),
-        }
-    };
-    LoopEntry {
-        sp,
-        l,
-        ci,
-        base,
-        counter,
-        window,
-    }
-}
-
-/// Build the rolled residual for the captured `x = x + 3` loop: dispatch folds, the loop rolls over a
-/// dynamic trip counter. (The SpecConfig recipe from `lua_futamura_bench.rs`.)
-fn build_residual(m: &Module, luav: u32, cap: &LoopEntry) -> Module {
-    let (l, ci, w) = (cap.l, cap.ci, &cap.window);
-    let stack_lo = rd_u64(w, l + L_STACK);
-    let stack_hi = rd_u64(w, l + L_STACK_LAST);
-    let func = rd_u64(w, ci + CI_FUNC);
-    let closure = rd_u64(w, func);
-    let proto = rd_u64(w, closure + LCLOSURE_P);
-    let code = rd_u64(w, proto + PROTO_CODE);
-    let sizecode = rd_i32(w, proto + PROTO_SIZECODE) as usize;
-    let slice = |a: u64, n: usize| w[a as usize..a as usize + n].to_vec();
-    let cfg = SpecConfig {
-        const_overlays: vec![
-            (l, slice(l, LUA_STATE_SIZE)),
-            (stack_lo, slice(stack_lo, (stack_hi - stack_lo) as usize)),
-            (ci, slice(ci, CI_SIZE)),
-            (code, slice(code, 4 * sizecode)),
-            (closure, slice(closure, 48)),
-            (proto, slice(proto, 128)),
-        ],
-        rename: Some((l, l + LUA_STATE_SIZE as u64)),
-        rename_extra: vec![(stack_lo, stack_hi), (ci, ci + CI_SIZE as u64)],
-        rename_is_private: true,
-        rename_seed_from_image: true,
-        dynamic_cells: vec![(cap.base + SV, 8), (cap.base + 2 * SV, 8), (cap.counter, 8)],
-        indirect_targets_cap: Some(16),
-        ..SpecConfig::default()
-    };
-    let args = [
-        SpecArg::ConstI64(cap.sp),
-        SpecArg::ConstI64(l as i64),
-        SpecArg::ConstI64(ci as i64),
-    ];
-    specialize_with_config(m, luav, &args, &cfg).expect("residual rolls")
-}
-
-/// Append a `(x0, i0, counter) -> i64` wrapper that calls the rolled residual then loads the
-/// accumulator cell it wrote back.
-fn with_readback(residual: &Module, read_addr: u64) -> (Module, u32) {
-    let mut m = residual.clone();
-    let wrapper = m.funcs.len() as u32;
-    m.funcs.push(Func {
-        params: vec![ValType::I64, ValType::I64, ValType::I64],
-        results: vec![ValType::I64],
-        blocks: vec![Block {
-            params: vec![ValType::I64, ValType::I64, ValType::I64],
-            insts: vec![
-                Inst::ConstI64(read_addr as i64),
-                Inst::Call {
-                    func: 0,
-                    args: vec![0, 1, 2],
-                },
-                Inst::Load {
-                    op: LoadOp::I64,
-                    addr: 3,
-                    offset: 0,
-                    align: 8,
-                },
-            ],
-            term: Terminator::Return(vec![4]),
-        }],
-    });
-    (m, wrapper)
+fn print_script(k: &Kernel, n: u64) -> String {
+    format!(
+        "{}\nfor i = 1, {n} do {} end\nprint({})\n",
+        k.decls, k.body, k.ret
+    )
 }
 
 fn jit_run(m: &Module, e: u32, a: &[i64]) -> i64 {
@@ -226,37 +135,46 @@ fn jit_run(m: &Module, e: u32, a: &[i64]) -> i64 {
     }
 }
 
-fn pure_loop_script(n: u64) -> String {
-    format!("local x = 0\nfor i = 1, {n} do x = x + 3 end\nprint(x)\n")
+fn interp_out(m: &Module, k: &Kernel, n: u64) -> i64 {
+    let out = svm_run::run_powerbox(m, print_script(k, n).as_bytes())
+        .expect("interp")
+        .stdout;
+    String::from_utf8_lossy(&out)
+        .trim()
+        .parse()
+        .expect("int out")
 }
 
-// ---- The native lane: the same per-iteration kernel, Rust → wasm32 → Wasmtime. ----
+// ---- The native lane: all kernels in one wasm module, built once, run on Wasmtime. ----
 
-/// A bare `no_std` cdylib exporting `run(n) -> i64` that adds 3 per iteration behind a `black_box`
-/// (so the optimizer can't close-form the loop to `3*n`). Matches the Lua `x = x + 3` body exactly.
-const NATIVE_SRC: &str = r#"#![no_std]
-#[panic_handler]
-fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
-#[no_mangle]
-pub extern "C" fn run(n: i64) -> i64 {
-    let mut x: i64 = 0;
-    let mut i: i64 = 0;
-    while i < n {
-        x = x.wrapping_add(core::hint::black_box(3));
-        i += 1;
+/// One `no_std` wasm module exporting `run_0 … run_{K-1}`, each `run_k(n) = for i in 1..=n { body }`.
+/// The body reads its inputs through `bb` (`core::hint::black_box`) so the optimizer can't close-form
+/// the loop to a formula.
+fn native_source(ks: &[Kernel]) -> String {
+    let mut s = String::from(
+        "#![no_std]\nuse core::hint::black_box as bb;\n\
+         #[panic_handler]\nfn ph(_: &core::panic::PanicInfo) -> ! { loop {} }\n",
+    );
+    for (i, k) in ks.iter().enumerate() {
+        s.push_str(&format!(
+            "#[no_mangle]\npub extern \"C\" fn run_{i}(n: i64) -> i64 {{\n    \
+             {}\n    let mut i: i64 = 1;\n    while i <= n {{\n        {}\n        i += 1;\n    }}\n    \
+             {}\n}}\n",
+            k.native_init, k.native_body, k.native_ret
+        ));
     }
-    x
+    s
 }
-"#;
 
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("peval_lua_vs_wt_{name}"))
 }
 
-/// `rustc -O --target wasm32-unknown-unknown` → module path; `None` if the toolchain/target is absent.
-fn build_wasm32() -> Option<PathBuf> {
+/// `rustc -O --target wasm32-unknown-unknown` on the combined source → module path; `None` if the
+/// toolchain/target is absent. wasm32 (ILP32) is the fast default that needs no nightly.
+fn build_wasm32(src_text: &str) -> Option<PathBuf> {
     let src = tmp("native.rs");
-    std::fs::write(&src, NATIVE_SRC).ok()?;
+    std::fs::write(&src, src_text).ok()?;
     let wasm = tmp("native.wasm");
     let rustc = std::env::var("SVM_RUSTBENCH_RUSTC").unwrap_or_else(|_| "rustc".into());
     let ok = Command::new(rustc)
@@ -277,23 +195,64 @@ fn build_wasm32() -> Option<PathBuf> {
     (ok && wasm.exists()).then_some(wasm)
 }
 
-/// Instantiate the prebuilt wasm on Wasmtime and return a `run(n)` closure. (rustbench's `wt_runner`.)
-fn wt_runner(wasm: &Path) -> Option<impl FnMut(i64) -> i64> {
-    let engine = Engine::new(&Config::new()).ok()?;
-    let module = WtModule::from_file(&engine, wasm).ok()?;
-    let mut store = Store::new(&engine, ());
-    let inst = Instance::new(&mut store, &module, &[]).ok()?;
-    let f = inst.get_func(&mut store, "run")?;
-    let mut out = [Val::I64(0)];
-    Some(move |n: i64| -> i64 {
-        f.call(&mut store, &[Val::I64(n)], &mut out)
+/// `cargo +nightly build -Z build-std=core --target wasm64-unknown-unknown` in a throwaway project
+/// (wasm64 is tier-3, so it needs build-std). The LP64-matched native baseline DESIGN.md §1a cares
+/// about; opt in with `SVM_BENCH_W64=1`. `None` if nightly / rust-src / the target is absent.
+fn build_wasm64(src_text: &str) -> Option<PathBuf> {
+    let dir = tmp("w64proj");
+    std::fs::create_dir_all(dir.join("src")).ok()?;
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"peval_lua_w64\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+         [lib]\ncrate-type = [\"cdylib\"]\n[profile.release]\npanic = \"abort\"\n",
+    )
+    .ok()?;
+    std::fs::write(dir.join("src/lib.rs"), src_text).ok()?;
+    let ok = Command::new("cargo")
+        .args([
+            "+nightly",
+            "build",
+            "-Zbuild-std=core",
+            "--target=wasm64-unknown-unknown",
+            "--release",
+        ])
+        .current_dir(&dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let wasm = dir.join("target/wasm64-unknown-unknown/release/peval_lua_w64.wasm");
+    (ok && wasm.exists()).then_some(wasm)
+}
+
+/// A reusable Wasmtime instance over the prebuilt module; `run(k, n)` calls `run_k(n)`.
+struct Native {
+    store: Store<()>,
+    inst: Instance,
+}
+impl Native {
+    fn load(wasm: &Path, w64: bool) -> Option<Native> {
+        let mut cfg = Config::new();
+        cfg.wasm_memory64(w64);
+        let engine = Engine::new(&cfg).ok()?;
+        let module = WtModule::from_file(&engine, wasm).ok()?;
+        let mut store = Store::new(&engine, ());
+        let inst = Instance::new(&mut store, &module, &[]).ok()?;
+        Some(Native { store, inst })
+    }
+    fn run(&mut self, k: usize, n: i64) -> i64 {
+        let f = self
+            .inst
+            .get_func(&mut self.store, &format!("run_{k}"))
+            .expect("export run_k");
+        let mut out = [Val::I64(0)];
+        f.call(&mut self.store, &[Val::I64(n)], &mut out)
             .expect("wt run");
         match out[0] {
             Val::I64(x) => x,
             Val::I32(x) => x as i64,
             _ => panic!("unexpected wt return"),
         }
-    })
+    }
 }
 
 fn best(mut f: impl FnMut()) -> Duration {
@@ -314,108 +273,150 @@ fn per_iter(t1: Duration, t2: Duration) -> f64 {
 
 fn main() {
     let csv = std::env::var("SVM_BENCH_CSV").is_ok();
+    let w64 = std::env::var("SVM_BENCH_W64").is_ok();
     let m = lua_module();
-    let luav = luav_execute(&m);
+    let ks = kernels();
 
-    // ---- Residual: build once (N-independent). ----
-    let cap = capture_loop_entry(&m, luav);
-    let (wm, we) = with_readback(&build_residual(&m, luav, &cap), cap.base + SV);
-    svm_verify::verify_module(&wm).expect("residual verifies");
-    // Body-entered: counter = c ⇒ x = 3·(c+1). Seed counter = n-1 to reproduce n loop iterations.
-    let resid_at = |n: u64| jit_run(&wm, we, &[0, 1, n as i64 - 1]);
-
-    // ---- Correctness: all three lanes must agree on 3·n before we trust any timing. ----
-    let want = 3 * N1 as i64;
-    assert_eq!(resid_at(N1), want, "residual == 3·n");
-    let interp_out = |n: u64| -> i64 {
-        let out = svm_run::run_powerbox(&m, pure_loop_script(n).as_bytes())
-            .expect("interp")
-            .stdout;
-        String::from_utf8_lossy(&out)
-            .trim()
-            .parse()
-            .expect("int out")
-    };
-    assert_eq!(interp_out(N1), want, "interpreter == 3·n");
-
-    // ---- Interpreter per-iteration (whole-program differential-N). ----
-    let interp_ns = {
-        let (s1, s2) = (pure_loop_script(N1), pure_loop_script(N2));
-        let t1 = best(|| {
-            black_box(
-                svm_run::run_powerbox(&m, s1.as_bytes())
-                    .expect("run")
-                    .stdout,
-            );
-        });
-        let t2 = best(|| {
-            black_box(
-                svm_run::run_powerbox(&m, s2.as_bytes())
-                    .expect("run")
-                    .stdout,
-            );
-        });
-        per_iter(t1, t2)
-    };
-
-    // ---- Residual per-iteration (same module, only the counter arg changes). ----
-    let resid_ns = {
-        let (a1, a2) = ([0i64, 1, N1 as i64 - 1], [0i64, 1, N2 as i64 - 1]);
-        let t1 = best(|| {
-            black_box(jit_run(&wm, we, &a1));
-        });
-        let t2 = best(|| {
-            black_box(jit_run(&wm, we, &a2));
-        });
-        per_iter(t1, t2)
-    };
-
-    // ---- Native per-iteration (Rust → wasm32 → Wasmtime), or a skip note. ----
-    let native_ns = build_wasm32().and_then(|w| wt_runner(&w)).map(|mut run| {
-        assert_eq!(run(N1 as i64), want, "native == 3·n");
-        let t1 = best(|| {
-            black_box(run(N1 as i64));
-        });
-        let t2 = best(|| {
-            black_box(run(N2 as i64));
-        });
-        per_iter(t1, t2)
-    });
-
-    // ---- Report. ----
-    if csv {
-        println!("lane,ns_per_iter");
-        println!("interpreter,{interp_ns:.4}");
-        println!("residual,{resid_ns:.4}");
-        match native_ns {
-            Some(n) => println!("native_wasm32,{n:.4}"),
-            None => println!("native_wasm32,NA"),
-        }
-        return;
+    // Native module: build all kernels once (or note the skip). wasm32 by default; wasm64 (the
+    // LP64-matched §1a baseline, needs nightly + build-std) when SVM_BENCH_W64=1.
+    let src = native_source(&ks);
+    let native_kind = if w64 { "wasm64" } else { "wasm32" };
+    let mut native = if w64 {
+        build_wasm64(&src)
+    } else {
+        build_wasm32(&src)
     }
+    .and_then(|w| Native::load(&w, w64));
 
-    println!("\nReal Lua `x = x + 3` per iteration — interpreter vs peval residual vs native wasm");
-    println!("(differential-N: N₁={N1}, N₂={N2}, min of {REPS} reps)\n");
-    println!("{:<24} {:>14}", "lane", "ns/iter");
-    println!("{}", "-".repeat(40));
-    println!("{:<24} {:>11.2} ns", "Lua interpreter", interp_ns);
-    println!("{:<24} {:>11.2} ns", "Lua peval residual", resid_ns);
-    match native_ns {
-        Some(n) => println!("{:<24} {:>11.2} ns", "native wasm (Wasmtime)", n),
-        None => println!(
-            "{:<24} {:>14}",
-            "native wasm (Wasmtime)", "skipped (no rustc/wasm32)"
-        ),
-    }
-    println!("\nspeedups:");
-    println!("  residual vs interpreter: {:>6.1}x", interp_ns / resid_ns);
-    if let Some(n) = native_ns {
-        println!("  interpreter vs native:   {:>6.1}x", interp_ns / n);
-        println!("  residual  vs native:     {:>6.2}x", resid_ns / n);
-        let closed = (interp_ns - resid_ns) / (interp_ns - n) * 100.0;
+    if !csv {
         println!(
-            "\nthe residual closes {closed:.0}% of the interpreted→native gap \
-             (interp {interp_ns:.1} → residual {resid_ns:.2} → native {n:.2} ns/iter)"
+            "\nReal Lua per iteration — interpreter vs peval residual vs native wasm (Wasmtime)"
         );
+        println!("(differential-N: N₁={N1}, N₂={N2}, min of {REPS} reps)\n");
+        println!(
+            "{:<22} {:>13} {:>13} {:>13} {:>9}",
+            "kernel", "interp ns", "residual ns", "native ns", "resid/nat"
+        );
+        println!("{}", "-".repeat(76));
+    } else {
+        println!("kernel,interp_ns,residual_ns,native_ns");
+    }
+
+    for (ki, k) in ks.iter().enumerate() {
+        // ---- Residual: build once (N-independent), verify, correctness-check at SAMPLE. ----
+        let ar = auto_rolled(&m, &return_script(k, SAMPLE));
+        assert!(
+            !has_br_table(&ar.residual.funcs[ar.entry as usize]),
+            "{}: dispatch folds",
+            k.name
+        );
+        let np = ar.dyn_cells.len();
+        let (wm, we) = with_readback(&ar.residual, ar.entry, ar.acc_addr, np);
+        svm_verify::verify_module(&wm).expect("residual verifies");
+
+        let want = interp_out(&m, k, SAMPLE);
+        assert_eq!(
+            jit_run(&wm, we, &ar.captured),
+            want,
+            "{}: residual == interp",
+            k.name
+        );
+        if let Some(nat) = native.as_mut() {
+            assert_eq!(
+                nat.run(ki, SAMPLE as i64),
+                want,
+                "{}: native == interp",
+                k.name
+            );
+        }
+
+        // ---- Interpreter per-iteration (whole-program differential-N). ----
+        let (s1, s2) = (print_script(k, N1), print_script(k, N2));
+        let interp_ns = {
+            let t1 = best(|| {
+                black_box(
+                    svm_run::run_powerbox(&m, s1.as_bytes())
+                        .expect("run")
+                        .stdout,
+                );
+            });
+            let t2 = best(|| {
+                black_box(
+                    svm_run::run_powerbox(&m, s2.as_bytes())
+                        .expect("run")
+                        .stdout,
+                );
+            });
+            per_iter(t1, t2)
+        };
+
+        // ---- Residual per-iteration (same module, only the counter arg changes). ----
+        let seed_at = |c: u64| {
+            let mut a = ar.captured.clone();
+            a[ar.counter_ix] = c as i64;
+            a
+        };
+        let resid_ns = {
+            let (a1, a2) = (seed_at(N1), seed_at(N2));
+            let t1 = best(|| {
+                black_box(jit_run(&wm, we, &a1));
+            });
+            let t2 = best(|| {
+                black_box(jit_run(&wm, we, &a2));
+            });
+            per_iter(t1, t2)
+        };
+
+        // ---- Native per-iteration (wasm32/Wasmtime), if available. ----
+        let native_ns = native.as_mut().map(|nat| {
+            let t1 = best(|| {
+                black_box(nat.run(ki, N1 as i64));
+            });
+            let t2 = best(|| {
+                black_box(nat.run(ki, N2 as i64));
+            });
+            per_iter(t1, t2)
+        });
+
+        if csv {
+            match native_ns {
+                Some(n) => println!("{},{interp_ns:.4},{resid_ns:.4},{n:.4}", k.name),
+                None => println!("{},{interp_ns:.4},{resid_ns:.4},NA", k.name),
+            }
+            continue;
+        }
+        match native_ns {
+            Some(n) => println!(
+                "{:<22} {:>10.1} ns {:>10.2} ns {:>10.2} ns {:>8.2}x",
+                k.name,
+                interp_ns,
+                resid_ns,
+                n,
+                resid_ns / n
+            ),
+            None => println!(
+                "{:<22} {:>10.1} ns {:>10.2} ns {:>13} {:>9}",
+                k.name, interp_ns, resid_ns, "skipped", "-"
+            ),
+        }
+    }
+
+    if !csv {
+        if native.is_some() {
+            println!(
+                "\n(interp = luaV_execute via svm-jit; residual = folded auto_rolled via svm-jit; \
+                 native = Rust→{native_kind}→Wasmtime.\n resid/nat = the residual's remaining gap to \
+                 native — the Lua-ness that survives dispatch folding.{})",
+                if w64 {
+                    ""
+                } else {
+                    " Set SVM_BENCH_W64=1 for the LP64-matched wasm64 baseline."
+                }
+            );
+        } else {
+            println!(
+                "\n(native {native_kind} skipped: no rustc / {native_kind}-unknown-unknown target.)"
+            );
+        }
     }
 }
