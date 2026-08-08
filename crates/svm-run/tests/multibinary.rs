@@ -363,3 +363,95 @@ fn pipeline_aborts_with_the_failed_phase_status_and_skips_later_phases() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// W4 step (iii): a *real* compiled program as an isolated exec child.
+//
+// The phases above are hand-written stand-ins — they prove the driver's control flow (hand-off,
+// status, abort), but not that a program produced by the actual `Leng → SVM-IR` backend boots and
+// runs correctly as a `domain_exec` child. This closes that gap on a real compiled binary: a Leng
+// module with real control flow (a counted `while` loop over scalar locals) is lowered by
+// `svm-leng`, verified, registered as a phase, and `exec`d by the same nifmake-shaped driver. Its
+// `main()` returns 55 (the sum 1..10), and `domain_exec` maps that return to the child's exit code,
+// which the driver reads via the status op (13/3) and re-exits with — so exit 55 witnesses the whole
+// path: frontend output → verify → isolated child domain → correct compute → status back to driver.
+//
+// Scope: this is a **self-contained compute** program (no heap, no host imports beyond the child's
+// default stdin/stdout). A phase that uses the real allocator/`system` runtime additionally needs
+// either a self-seeding in-window allocator (the Path-B shim, made startup-seeding) or — for the
+// mmap-backed `system` — the bottom-edge host caps granted to the child, which `domain_exec` does
+// not do today (it runs children with only stdin/stdout). That child-capability grant is the same
+// owner-reviewed infra as the shared-memfs hand-off (NIM.md §3c), so it is scoped there, not here.
+
+/// A real Leng compute program: `main()` sums 1..10 with a `while` loop and returns 55. Its sole
+/// proc becomes func 0 — the entry `domain_exec` runs — and it takes no params and imports nothing,
+/// so it runs standalone in a fresh child window. (Same shape svm-leng's own `whole_module` tests
+/// compile and run; here it runs *as an exec child*.)
+const SUM_1_TO_10_LENG: &str = "\
+(stmts
+ (proc :main.0. . (i +64) .
+  (stmts .
+   (var :s.0 . (i +64) 0)
+   (var :i.0 . (i +64) 1)
+   (while (lt i.0 11)
+    (stmts .
+     (asgn s.0 (add (i +64) s.0 i.0))
+     (asgn i.0 (add (i +64) i.0 1))))
+   (ret s.0))))";
+
+/// The nifmake-shaped driver for one real phase: resolve `exec`, run `compute` with no stdin, read
+/// its exit status (op 13/3), and re-exit with it.
+const DRIVER_REAL: &str = "\
+memory 16
+data 0 \"exec\"
+data 8 \"compute\"
+import 0 \"exit\" (i32) -> ()
+func 0 () -> () {
+block 0 () {
+  vep = i64.const 0
+  vel = i64.const 4
+  vh = cap.self.resolve vep vel
+  vname = i64.const 8
+  vnamelen = i64.const 7
+  vzero = i64.const 0
+  vjob = cap.call 13 0 (i64, i64, i64, i64) -> (i64) vh (vname, vnamelen, vzero, vzero)
+  vstatus = cap.call 13 3 (i64) -> (i64) vh (vjob)
+  vcode = i32.wrap_i64 vstatus
+  call.import 0 (vcode)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// Build the `compute` phase by compiling `SUM_1_TO_10_LENG` through the real svm-leng backend and
+/// verifying it (the frontend is untrusted; the verifier re-checks — DESIGN.md §2a).
+fn compiled_compute_phase() -> DomainProgram {
+    let module = svm_leng::translate(SUM_1_TO_10_LENG).expect("svm-leng compiles the program");
+    svm_verify::verify_module(&module).expect("the compiled program verifies");
+    DomainProgram {
+        name: "compute".into(),
+        instance: Arc::new(instantiate(module).expect("instantiate compute")),
+        limits: Limits::default(),
+    }
+}
+
+#[test]
+fn driver_runs_a_real_svm_leng_compiled_program_as_an_exec_child() {
+    let m = parse_module(DRIVER_REAL).expect("parse real driver");
+    let inst = instantiate_with_imports(m, registry()).expect("instantiate driver");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(
+                backend,
+                &RunConfig::default(),
+                &[("exec", domain_exec(vec![compiled_compute_phase()]))],
+            )
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(55),
+            "{backend:?}: real compiled main() summed 1..10 in an isolated child; status reached the driver"
+        );
+    }
+}
