@@ -1747,6 +1747,23 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **Blocking fiber resume (`cont.resume.block`, I48, landed 2026-08-07).** A fiber
+  park (§3.6 slice-5a) unwinds `FIBER_PARKED (3)` to the resumer, which polls; a
+  guest whose *only* pending work is one parked fiber would busy-spin that poll.
+  `cont.resume.block` is `cont.resume` with one **advisory** difference: on a still-
+  parked fiber the runtime *may* idle the resuming vCPU on the fiber's own already-
+  registered waiter (futex/timer/completion/revoke — every fiber-wake `svc_wake`s the
+  domain, so the idle resumer re-admits for free) instead of returning `FIBER_PARKED`.
+  Advisory means returning `FIBER_PARKED` stays conforming, so the guest still loops
+  and the op costs nothing in surface: only the tree-walk M:N oracle idles; the
+  bytecode/Cranelift backends and the deterministic explorer alias it to `cont.resume`
+  (no idle core, no compile veto, no divergence — invariant 9), and durable runs take
+  the same downgrade (freeze-on-quiesce untouched). It never "blocks the domain"
+  (§12 below) — the guest issues it only when it has nothing else to run (mechanism,
+  not policy), and other vCPUs keep running; teardown/exit/trap free an idle resumer
+  through the `svc_waiters` sweep. *The one guest-facing blocking primitive on the
+  scheduler park/idle core — kept advisory precisely to stay off the §18 determinism
+  surface.*
 - **Per-vCPU TLS register (`vcpu.tls.get`/`vcpu.tls.set`).** One ambient i64 of
   per-vCPU state, **read at the execution point** — so a fiber that migrated to
   another vCPU reads the *current* vCPU's word, the value only the runtime knows

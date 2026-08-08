@@ -749,6 +749,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::CapSelfCovers { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
+        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }

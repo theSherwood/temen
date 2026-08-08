@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**463 ops.** Across the two JIT columns: 862 ✅ Full · 52 ⛔ Declines · 2 🚧 Not-yet · 10 🔶 Conditional.
+**464 ops.** Across the two JIT columns: 862 ✅ Full · 53 ⛔ Declines · 2 🚧 Not-yet · 11 🔶 Conditional.
 
 ## scalar integer
 
@@ -512,6 +512,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 |----|:----:|:----:|:----:|:----:|-------|
 | `cont.new` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `cont.resume` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `cont.resume.block` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |

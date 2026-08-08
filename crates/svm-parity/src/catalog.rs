@@ -1225,6 +1225,9 @@ fn fibers_threads(ops: &mut Vec<Op>) {
     for (name, inst) in [
         ("cont.new", Inst::ContNew { func: 0, sp: 1 }),
         ("cont.resume", Inst::ContResume { k: 0, arg: 1 }),
+        // I48 advisory blocking resume: same parity as `cont.resume` (bytecode/Cranelift alias
+        // it; only the tree-walk oracle idles — DESIGN §12).
+        ("cont.resume.block", Inst::ContResumeBlock { k: 0, arg: 1 }),
         ("suspend", Inst::Suspend { value: 0 }),
         (
             "thread.spawn",

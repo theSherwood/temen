@@ -4126,6 +4126,14 @@ enum Blocked {
     /// *start* one. A self-re-entrant call (the instance on the caller's own `offer_anim` stack) is
     /// **not** filed here — it has no distinct holder to wait for (4c.2 handles it inline).
     OfferAdmit { key: usize },
+    /// I48 — a `cont.resume.block` whose target fiber is still event-parked: idle this vCPU as
+    /// the fiber's resumer, keyed on the fiber's **domain** (`key`, == the resumer's own domain).
+    /// Filed into `svc_waiters` exactly like [`Blocked::OfferPark`]; the fiber's own block-wake
+    /// (`wake_blocked` + `svc_wake`) re-admits it, and the rewound `cont.resume.block` re-executes
+    /// on resume — re-claiming the now-woken fiber and switching in. `slot` is the fiber's registry
+    /// slot, for the lost-wakeup recheck (`slot_woken`) under the scheduler lock: a wake that fired
+    /// in the determine→park window is observed there and re-admits instead of stranding.
+    ContResumeBlock { key: usize, slot: usize },
 }
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
@@ -5872,6 +5880,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.svc_waiters.entry(key).or_default().push(v);
                 }
             }
+            Step::Park(Blocked::ContResumeBlock { key, slot }) => {
+                // I48 — idle a `cont.resume.block` resumer on its target fiber, keyed on the
+                // fiber's domain (reusing `svc_waiters` + its wake, the `OfferPark` shape). The
+                // fiber's block-wake (`wake_blocked` + `svc_wake`) re-admits it; the rewound op
+                // re-executes on resume. Lost-wakeup guard, the `SvcWait`/`OfferPark` shape: a
+                // block-event may have fired in the determine→park window (its `svc_wake` ran
+                // before this vCPU registered, so the wake was dropped) — observe the woken fiber
+                // slot under the scheduler lock and re-admit instead of parking.
+                let mut s = sched.lock();
+                // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                if v.registry.slot_woken(slot) {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.svc_waiters.entry(key).or_default().push(v);
+                }
+            }
             Step::Park(Blocked::OfferAdmit { key }) => {
                 // CALLS.md 4c.1 — park the caller of a busy `single` instance as an admission-waiter
                 // (keyed by the `ProviderState` pointer). Lost-wakeup guard, the `SvcWait` shape: the
@@ -6597,7 +6626,11 @@ impl SchedDriver {
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
                     | Blocked::OfferPark { .. }
-                    | Blocked::OfferAdmit { .. },
+                    | Blocked::OfferAdmit { .. }
+                    // I48: the explorer takes the advisory downgrade at the resume site (the
+                    // blocking idle is gated on `SchedRef::Real`), so `cont.resume.block` there
+                    // returns FIBER_PARKED and never produces this park — the arm is defensive.
+                    | Blocked::ContResumeBlock { .. },
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -8628,6 +8661,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut cur_funcs: Arc<[Func]> =
         resolve_module(&funcs, units, invoked, dt, cur_module).ok_or(Trap::Malformed)?;
 
+    // I48 — fiber slots whose current resume used `cont.resume.block`, so a park inside them
+    // idles the vCPU (via `fiber_park!`) instead of unwinding `FIBER_PARKED` to the resumer.
+    // Keyed by the resumed fiber's slot; set/cleared at each `cont.resume(.block)` before the
+    // switch-in, read at the fiber's park. A `run_inner`-local suffices: case-1 (switch-in →
+    // park) is one invocation, and a spurious wake re-executes the op — re-marking in a fresh
+    // set before the claim. Stale marks are harmless (keyed by the *resumed* fiber, never a
+    // resumer's own slot). Tiny (fiber nesting is shallow), so a `Vec` used as a set is fine.
+    let mut cont_block: Vec<usize> = Vec::new();
+
     // Drive the running fiber's top frame. A `call` pushes a new top and restarts here; a
     // `return` pops and appends results to the caller (which resumes past the call); a tail
     // call replaces the top in place (O(1) frames). `cont.resume`/`suspend` switch which
@@ -9230,6 +9272,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     *parked_frames -= frames.len();
                     let rtop = frames.len() - 1;
+                    // I48 — if the fiber that just parked was resumed via `cont.resume.block`,
+                    // **idle the vCPU** on the fiber's own waiter instead of unwinding
+                    // FIBER_PARKED to the resumer. Rewind the resumer's `cont.resume.block` so
+                    // the wake re-executes it (re-claims the now-woken fiber and switches in);
+                    // park keyed on the fiber's domain (== the resumer's), the `OfferPark` shape.
+                    // Gated on the real M:N scheduler and a non-durable run (the explorer and
+                    // durable freeze take the advisory FIBER_PARKED downgrade below — the guest
+                    // loops). `slot: leaving` is the parked fiber, for the lost-wakeup recheck.
+                    if cont_block.contains(&leaving) && !durable {
+                        if let SchedRef::Real(_) = sched {
+                            let key = host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .domain_id() as usize;
+                            frames[rtop].inst -= 1; // rewind: the wake re-executes the resume
+                            return Ok(Inner::Park(Blocked::ContResumeBlock {
+                                key,
+                                slot: leaving,
+                            }));
+                        }
+                    }
                     frames[rtop].vals.push(Reg::from_i32(FIBER_PARKED));
                     frames[rtop].vals.push(Reg::from_i64(0));
                     continue 'frames;
@@ -11559,7 +11622,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // and a loser faults (D57) — and switch into it, delivering `arg`. The two results
                 // `(status, value)` are appended to *this* frame later, when `k` suspends or
                 // returns control here (see `Suspend` and `Return`).
-                Inst::ContResume { k, arg } => {
+                Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } => {
+                    // I48 — the **blocking** variant (`cont.resume.block`) idles this vCPU on the
+                    // resumed fiber's own registered waiter instead of returning the FIBER_PARKED
+                    // poll status (see the `StillParked` arm). Advisory: every other path is
+                    // byte-identical to `cont.resume`, so the flag only matters when the target is
+                    // still parked.
+                    let blocking = matches!(inst, Inst::ContResumeBlock { .. });
                     // Fuel unification: resuming a fiber is a control transfer that per-op fuel used to
                     // meter (every op the fiber ran decremented the counter). Under safepoint metering
                     // it must charge here too — one fuel per `cont.resume` op, exactly as the bytecode
@@ -11590,6 +11659,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         c => (target, c),
                     };
+                    // I48 — record this resume's blockingness on the resumed fiber's slot so a
+                    // park inside it (`fiber_park!`) idles the vCPU rather than unwinding
+                    // FIBER_PARKED. Set for the blocking variant, cleared for the plain one (a
+                    // slot reused for a fresh fiber must not inherit a stale mark).
+                    if blocking {
+                        if !cont_block.contains(&target) {
+                            cont_block.push(target);
+                        }
+                    } else {
+                        cont_block.retain(|&s| s != target);
+                    }
                     let new_frames = match claimed {
                         Claimed::Start { func: funcref, sp } => {
                             // A forged / wrong-type fiber funcref is a **fiber** fault, not a
@@ -11635,6 +11715,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // §3.6 slice 5a: still blocked — the cooperative poll. Report
                         // `(FIBER_PARKED, 0)` to the resumer without switching.
                         Claimed::StillParked => {
+                            // I48 blocking variant: on the REAL M:N scheduler and a non-durable
+                            // run, idle this vCPU on the fiber's own registered waiter instead of
+                            // returning FIBER_PARKED. Rewind the op so the wake re-executes it —
+                            // re-claiming the now-woken fiber and switching in (the `svc.wait`
+                            // rewind shape). Park keyed on this fiber's domain (== the resumer's
+                            // own domain): every fiber-wake `svc_wake`s that key, so the resumer
+                            // is re-admitted for free, teardown sweeps `svc_waiters` by identity,
+                            // and the idle deadline already includes the fiber's own timer. A
+                            // durable run or the deterministic explorer takes the advisory
+                            // downgrade below (return FIBER_PARKED) — a conforming result the
+                            // guest's loop absorbs, so freeze-on-quiesce and the §18 explorer need
+                            // no new machinery (ISSUES.md I48).
+                            if blocking && !durable {
+                                if let SchedRef::Real(_) = sched {
+                                    let key =
+                                        host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
+                                            as usize;
+                                    frames[top].inst -= 1; // rewind: the wake re-executes this op
+                                    return Ok(Inner::Park(Blocked::ContResumeBlock {
+                                        key,
+                                        slot: target,
+                                    }));
+                                }
+                            }
                             frames[top].vals.push(Reg::from_i32(FIBER_PARKED));
                             frames[top].vals.push(Reg::from_i64(0));
                             continue;
@@ -12837,6 +12941,7 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         | Inst::CapCall { .. }
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
+        | Inst::ContResumeBlock { .. }
         | Inst::Suspend { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }

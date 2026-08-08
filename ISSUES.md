@@ -2361,29 +2361,44 @@ round-trips now agree; existing `debug_info_round_trips_through_binary` /
 `no_debug_info_is_back_compatible` unit tests still pass, and the exact crash input was verified to
 normalize and round-trip through both the binary and text paths.
 
-### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25 by the jacl fiber-timed-wait follow-up
+### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25; **BUILT 2026-08-07** as `cont.resume.block` (DESIGN.md §12)
 
 **What.** After the §3.6 slice-5a fiber-park contract (svm PR #442), a `memory.wait` inside a
 fiber parks the *fiber* and the resumer polls it with `cont.resume`, seeing `FIBER_PARKED (3)`
-until the event fires. A guest runtime with a runnable sibling just resumes it and comes back;
-but a guest whose **only** pending work is one parked fiber has nothing to do between polls, so
-it busy-spins `cont.resume` (jacl's shape) or approximates an idle by waiting on an unrelated
-cell. There is no primitive to say "idle this vCPU until the parked fiber is due or woken."
+until the event fires. A guest whose **only** pending work is one parked fiber had nothing to do
+between polls, so it busy-spun `cont.resume` (jacl's shape). No primitive said "idle this vCPU
+until the parked fiber is due or woken."
 
-**Why tracked, not built.** One named consumer (jacl) with a working — if spinny — workaround, and
-a blocking-resume primitive lands squarely on the scheduler's park/idle core (the most sensitive
-concurrency surface). INVARIANTS #1 (no machinery without a demonstrated need) says wait for a
-second consumer or a measured cost before adding surface; the poll contract is correct and
-complete as-is, this is only efficiency. jacl itself framed the ask as "only when a second
-consumer demonstrates genuine need."
+**Invariant-1 renegotiation (owner, 2026-08-07).** This was deferred on INVARIANTS #1 ("no
+machinery without a demonstrated need — wait for a second consumer or a measured cost"). The
+owner explicitly requested the primitive be built, which *is* the demonstrated need the invariant
+gates on; invariant 1 is satisfied, not weakened (no standing rule changed). Recorded here dated,
+per the INVARIANTS.md preamble.
 
-**Shape if/when built.** A `cont.resume`-family variant (or a flag) that, on `FIBER_PARKED`, idles
-the vCPU on the same deadline/wake machinery the fiber's `Waiter::Fiber` / `FiberWaitCell` already
-registers — waking on the futex notify or the timeout instead of returning `FIBER_PARKED` to the
-guest. Must stay backend-uniform (tree-walk oracle first, §18) and preserve the #440 teardown
-exits (a blocking resume must still unblock on exit/trap/freeze), and must not reintroduce a
-"blocks the domain" path (DESIGN.md §12: blocks the fiber, never the domain) — the vCPU idles only
-when nothing else in the domain is runnable.
+**BUILT — `cont.resume.block`, an advisory op (DESIGN.md §12).** A new opcode (`0xBF`) that is
+**identical to `cont.resume`** — same `(status, value)` result, same 0/1 statuses — except the
+runtime **may idle the resuming vCPU** on the resumed fiber's own registered waiter instead of
+returning the `FIBER_PARKED (3)` poll status. Advisory is the whole trick: returning
+`FIBER_PARKED` is a *conforming* implementation, so a guest still loops for completion exactly as
+with `cont.resume`, and the design's hard problems dissolve —
+- only the **tree-walk M:N oracle** idles (park into `svc_waiters` keyed on the fiber's domain,
+  the `Blocked::OfferPark` shape — woken for free by the `svc_wake_locked` every fiber-wake
+  already calls; swept by teardown; the idle deadline already includes the fiber's timer). The
+  interception is at both `fiber_park!` (switch-in → fiber parks → idle) and the `cont.resume`
+  `StillParked` re-poll, keyed by a `run_inner`-local marker on the resumed fiber slot;
+- the **bytecode** and **Cranelift JIT** backends and the **deterministic explorer** alias it to
+  `cont.resume` (return `FIBER_PARKED`) — no idle core needed, **no compile veto, nothing
+  de-JITed**, invariant 9 holds by definition;
+- **freeze / durability**: gated on `!durable`, so a durable run takes the `FIBER_PARKED`
+  downgrade (guest loops) and freeze-on-quiesce is untouched (the F1 precedent);
+- **teardown (#440)**: the idle resumer parks through `park_gate` into `svc_waiters`, swept by
+  `teardown_domain`/`teardown_run` on exit/trap/freeze exactly like `OfferPark`.
+
+Pins: `svm-interp/tests/blocking_resume.rs` (oracle idle-on-timer with a **fuel** proof it does
+not spin, cross-vCPU notify wake, sibling-trap frees a blocked resumer);
+`svm/tests/fiber_blocking_resume.rs` (advisory conformance — the looping form agrees
+TreeWalk ≡ Bytecode ≡ Cranelift JIT, the oracle via idle, the others via spin). jacl swaps one
+opcode in its existing poll loop and gets idle-on-oracle with no regression anywhere.
 
 ---
 

@@ -1982,6 +1982,21 @@ pub enum Inst {
         k: ValIdx,
         arg: ValIdx,
     },
+    /// §12 fiber resume, **blocking** variant (`cont.resume.block`, ISSUES.md I48). Identical to
+    /// [`Inst::ContResume`] — same `(status: i32, value: i64)` result, same 0/1 statuses — except
+    /// the runtime **may idle the resuming vCPU** on the resumed fiber's own registered waiter
+    /// (futex notify / timeout / completion / revoke) instead of returning the runtime-only
+    /// `FIBER_PARKED (3)` poll status. This is an **advisory scheduling hint**, not a new
+    /// semantics: returning `FIBER_PARKED` is always a conforming implementation, so a guest must
+    /// still loop for completion exactly as with `cont.resume`; the guest issues this form only
+    /// when it has *nothing else to run* (DESIGN.md §12 — mechanism, not policy) to avoid
+    /// busy-polling a lone parked fiber. Because a `FIBER_PARKED` return conforms, the fast
+    /// backends and the deterministic explorer alias it to `cont.resume` (no idle core needed, no
+    /// compile veto, no divergence — invariant 9); only the tree-walk M:N scheduler idles.
+    ContResumeBlock {
+        k: ValIdx,
+        arg: ValIdx,
+    },
     /// §12 fiber suspend (`suspend`): from within a running fiber, suspend back to the
     /// resumer delivering `value` (`i64`); evaluates to the `i64` `arg` of the next resume.
     /// Suspending when no fiber is running (the root computation) **traps**. Like
@@ -2507,7 +2522,9 @@ impl Inst {
 
             // ---- Fibers, threads, and non-local control transfer. ----
             Inst::ContNew { .. } => fx(false, false, false, true), // allocates a fiber; runs nothing yet
-            Inst::ContResume { .. } | Inst::Suspend { .. } => fx(true, true, true, true), // stack switch → clobber
+            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } | Inst::Suspend { .. } => {
+                fx(true, true, true, true) // stack switch → clobber
+            }
             Inst::SetJmp { .. } => fx(true, false, true, true), // writes an opaque token into the guest jmp_buf
             Inst::LongJmp { .. } => fx(true, true, false, true), // reads the jmp_buf; noreturn unwind
             Inst::ThreadSpawn { .. } => fx(false, true, true, true), // shares memory with the new vCPU
@@ -2553,8 +2570,8 @@ impl Inst {
             | Inst::V128Store { .. } => 0,
             // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
-            // `cont.resume` is the one multi-result non-call op: `(status, value)`.
-            Inst::ContResume { .. } => 2,
+            // `cont.resume` (and its blocking variant) are the multi-result non-call ops: `(status, value)`.
+            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => 2,
             // `cap.self.get` appends `(handle, type_id)`; `cap.self.count`/`resolve`/`label` append
             // one `i32`.
             Inst::CapSelfGet { .. } => 2,
@@ -2656,6 +2673,7 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
+                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
@@ -2677,7 +2695,10 @@ impl Func {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::ContNew { .. } | Inst::ContResume { .. } | Inst::Suspend { .. }
+                    Inst::ContNew { .. }
+                        | Inst::ContResume { .. }
+                        | Inst::ContResumeBlock { .. }
+                        | Inst::Suspend { .. }
                 )
             })
         })
@@ -2709,6 +2730,7 @@ impl Func {
                     i,
                     Inst::ContNew { .. }
                         | Inst::ContResume { .. }
+                        | Inst::ContResumeBlock { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadSpawn { .. }
                         | Inst::ThreadJoin { .. }
