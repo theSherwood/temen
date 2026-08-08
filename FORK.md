@@ -486,10 +486,19 @@ Three enablers made it work, each a small correctness fix in its own right:
 `__vm_exec_module` is also proven in isolation from fork by
 `a_nested_compiled_c_guest_execs_a_separate_command` (a nested op-13 guest execs a command, no fork/wait).
 
-**Remaining for the shell loop:** the increment-1 simplifications as they're needed (fresh window + BSS
-zero, durable-domain exec, exec from a nested serve context), and job-control `waitpid` flags
-(`WNOHANG`, group waits). `reap` today is a blocking single-pid `wait`; `WNOHANG` is a non-parking
-`results` probe.
+**`waitpid(pid, WNOHANG)` — the non-blocking poll. DONE.** `reap` now takes an optional second
+`flags` arg; `WNOHANG` (bit 0) makes a still-running twin reply **`0` at once** — POSIX's "no child
+changed state" — instead of parking (`reap_parked_caller`'s `nohang` branch re-admits the caller
+immediately and leaves the twin reapable). The already-finished and unknown-pid / serve-race paths are
+unchanged (status / `-ECHILD` / `-EAGAIN`). Proven by
+`clone_caller.rs::waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking`: the twin
+**parks forever** (`atomic.wait`, timeout `-1`) so a blocking `wait` *would* hang — `WNOHANG`
+deterministically returns `0`. Stable 0/40 under stress.
+
+**Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
+BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control — `wait`
+for **any** child (`waitpid(-1, …)`) and process groups (which need per-parent child tracking, not just
+the single-pid `forked_twins` reap), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 
