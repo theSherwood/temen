@@ -814,19 +814,27 @@ files down the chain. Two existing options, no new host op:
    (`read_out`) and seeds it as phase N+1's `stdin` (the `CAT_CONSUMER` pattern, `exec_cap.rs:185`).
    Fits a streaming `hexer | lengc` shape.
 2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
-   This is the faithful hand-off, and it needs a small **additive** piece of shared infrastructure —
-   no new host op, but new API surface, so it is not free the way piping is. Measured, the gap is two
-   parts: (a) `mem_fs` grants are independent per domain (`svm-fs/src/lib.rs:745`), and the one shared
-   primitive, `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:820`), returns a **single** `HostProc` + a
-   host-side `MemFsHandle` — built for host↔handle session persistence (browser-Postgres), *not* a
-   `Fn() -> HostProc` factory grantable to N domains; a grantable-to-N shared factory has to be added;
-   (b) `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout —
-   so children receive **no `fs` at all** today. Wiring the file hand-off therefore means: surface a
-   grantable shared memfs in `svm-fs`, and teach the child-spawn path to grant it (either a
-   `domain_exec` that runs children with `run_with_caps`, or the §14 Instantiator's `regrant_into_child`
-   at `crates/svm-interp/src/lib.rs:18485`). Both are additive, but both touch **shared capability
-   infrastructure** and decide *what filesystem authority a spawned child inherits* — a security-shaped
-   call (INVARIANTS §1/§4), so it is owner-reviewed infra, not a nimony-lane edit.
+   This is the faithful hand-off. It has **two** parts, and they sit on opposite sides of the
+   security boundary — worth stating precisely, because the memfs machinery mostly already exists:
+   - (a) **A store shared across domains** — the *data* layer. `mem_fs_seeded_handler` re-seeds a
+     *fresh* store per grant (isolated filesystems), and `mem_fs_seeded_shared` shares one store but
+     only host↔handle (its `MemFsHandle` is host-side, built for browser-Postgres session snapshots;
+     it's used single-guest in `crates/svm/tests/c_link.rs` to seed the cc1 memfs). Neither shares a
+     store **guest↔guest**. That piece is now built and tested: **`mem_fs_shared_factory`**
+     (`svm-fs/src/lib.rs`) mints N `HostProc`s over one `Arc<Mutex<MemFsState>>`, so a file one domain
+     writes another reads — proven at the op level by `two_grants_from_the_factory_share_one_store`
+     (phase A writes `x`, a separate grant reads it back). It's an ordinary additive `svm-fs` helper:
+     it changes no existing grant and hands the *caller* the choice to share, so it is **not** on the
+     security boundary. (`mem_fs_seeded_shared` now delegates to it — one grant from the factory.)
+   - (b) **Granting that store to a spawned child** — the *authority* layer, and the real gate.
+     `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout — so
+     children receive **no `fs` at all** today. Wiring the hand-off means teaching the child-spawn path
+     to grant the shared memfs (a `domain_exec` that runs children with `run_with_caps`, or the §14
+     Instantiator's `regrant_into_child` at `crates/svm-interp/src/lib.rs:18485`). This decides *what
+     filesystem authority a spawned child inherits* — a security-shaped call (INVARIANTS §1/§4), so
+     **this** part is owner-reviewed infra, not a nimony-lane edit. It is the same gate as granting the
+     real `system`'s bottom-edge caps to a child (§3c second slice) — one child-capability-inheritance
+     decision covers both.
 
 **v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
 one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases

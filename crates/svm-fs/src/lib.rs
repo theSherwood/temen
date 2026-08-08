@@ -821,6 +821,23 @@ pub fn mem_fs_seeded_shared(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
 ) -> (HostProc, MemFsHandle) {
+    let (factory, handle) = mem_fs_shared_factory(files, dirs);
+    (factory(), handle)
+}
+
+/// Like [`mem_fs_seeded_shared`] but returns a **reusable factory** granting the *same* live store to
+/// every domain it's called for, instead of a single `HostProc`. This is the **cross-domain shared
+/// memfs**: unlike [`mem_fs_seeded_handler`] (a factory that re-seeds a *fresh* store per grant, so
+/// two domains get isolated filesystems), every `HostProc` this yields closes over one shared
+/// `Arc<Mutex<MemFsState>>`, so a file one domain writes another domain reads — the file hand-off a
+/// multi-phase pipeline needs (NIM.md §3c, W4: phase N writes `x.nif`, phase N+1 reads it). The
+/// returned [`MemFsHandle`] observes the same store (snapshot/seed it host-side). Granting this to a
+/// spawned *child* (vs. a top-level domain) is a separate, security-shaped decision — what fs
+/// authority a child inherits — and lives in the spawn path, not here.
+pub fn mem_fs_shared_factory(
+    files: Vec<(String, Vec<u8>)>,
+    dirs: Vec<String>,
+) -> (impl Fn() -> HostProc + Send + Sync + 'static, MemFsHandle) {
     let mut st = MemFsState::default();
     for (p, data) in &files {
         st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
@@ -830,18 +847,21 @@ pub fn mem_fs_seeded_shared(
     }
     let shared = Arc::new(Mutex::new(st));
     let handle = MemFsHandle(shared.clone());
-    let hostfn: HostProc = Box::new(
-        move |op: u32,
-              args: &[i64],
-              mem: Option<&mut dyn GuestMem>,
-              _minter: Option<&mut dyn svm_interp::RegionMinter>| {
-            Ok(vec![shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle(op, args, mem)])
-        },
-    );
-    (hostfn, handle)
+    let factory = move || {
+        let shared = shared.clone();
+        Box::new(
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+                Ok(vec![shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle(op, args, mem)])
+            },
+        ) as HostProc
+    };
+    (factory, handle)
 }
 
 /// A filesystem seed: `(files as (relative-path, bytes), directory relative-paths)`. The material both
@@ -1009,5 +1029,47 @@ mod tests {
 
         // Snapshotting an unchanged store is byte-identical (deterministic, sorted output).
         assert_eq!(handle.image(), handle.image());
+    }
+
+    /// The cross-domain file hand-off (NIM.md §3c, W4): two **independent** grants from one
+    /// `mem_fs_shared_factory` — as two pipeline phases would each receive — see each other's writes.
+    /// Phase A creates and writes "x"; phase B, a separate `HostProc`, opens and reads it back. Had
+    /// the grants owned isolated stores (the `mem_fs_seeded_handler` behavior), B's read-only open
+    /// would miss and this would fail — so the read-back witnesses one shared store across the two.
+    #[test]
+    fn two_grants_from_the_factory_share_one_store() {
+        let (factory, _handle) = mem_fs_shared_factory(vec![], vec![]);
+        let mut phase_a: HostProc = factory();
+        let mut phase_b: HostProc = factory();
+        let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
+            fs(op, args, Some(mem), None).expect("host fn")[0]
+        };
+
+        // Phase A: create "x" (O_CREATE|O_WRITE) and write "hi".
+        let mut mem_a = VecMem(vec![0u8; 32]);
+        mem_a.0[..1].copy_from_slice(b"x");
+        mem_a.0[16..18].copy_from_slice(b"hi");
+        let fda = call(
+            &mut phase_a,
+            FS_OPEN,
+            &[0, 1, O_CREATE | O_WRITE],
+            &mut mem_a,
+        );
+        assert!(fda >= 3, "phase A open: fd = {fda}");
+        assert_eq!(call(&mut phase_a, FS_WRITE, &[fda, 16, 2], &mut mem_a), 2);
+        assert_eq!(call(&mut phase_a, FS_CLOSE, &[fda], &mut mem_a), 0);
+
+        // Phase B (a separate grant): open "x" **read-only** (O_READ, no O_CREATE) and read it back.
+        let mut mem_b = VecMem(vec![0u8; 32]);
+        mem_b.0[..1].copy_from_slice(b"x");
+        let fdb = call(&mut phase_b, FS_OPEN, &[0, 1, O_READ], &mut mem_b);
+        assert!(fdb >= 3, "phase B open of A's file: fd = {fdb}");
+        let n = call(&mut phase_b, FS_READ, &[fdb, 16, 8], &mut mem_b);
+        assert_eq!(n, 2, "phase B read the 2 bytes A wrote");
+        assert_eq!(
+            &mem_b.0[16..18],
+            b"hi",
+            "phase B sees phase A's write across the domain boundary"
+        );
     }
 }
