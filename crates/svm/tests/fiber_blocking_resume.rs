@@ -119,3 +119,52 @@ block 0 (vsp: i64, varg: i64) {
 fn blocking_resume_of_a_non_parking_fiber_is_plain_resume() {
     pin_all(BLOCK_NO_PARK, 107);
 }
+
+/// I48 parity — a **single** `cont.resume.block` with **no guest loop** of a fiber that does a
+/// 10 ms timed `atomic.wait`. On a backend that genuinely idles, this returns the fiber's real
+/// completion `WAIT_TIMED_OUT(2)*100 + 0 = 102`; a backend that merely aliased the op to
+/// `cont.resume` (spins) would return the transient `FIBER_PARKED(3)*100 = 300` — the guest has no
+/// loop to absorb it. So `== 102` on a no-loop kernel is a direct behavioral proof the vCPU idled
+/// and re-resumed, not spun. Pinned on the tree-walk oracle and the **bytecode** engine (which
+/// also backs the wasm-jit's `InterpDriven` fold); the Cranelift JIT still takes the advisory
+/// downgrade (its OS-thread idle is the follow-up slice), so it is excluded here.
+const BLOCK_NO_LOOP_TIMED: &str = r#"
+memory 16
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  vz = i64.const 0
+  vs, vv = cont.resume.block v2 vz
+  vk = i64.const 100
+  vse = i64.extend_i32_s vs
+  va = i64.mul vse vk
+  vr = i64.add va vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const 10000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+
+#[test]
+fn no_loop_blocking_resume_idles_on_tree_walk_and_bytecode() {
+    // WAIT_TIMED_OUT(2)*100 + 0 — reached only by actually idling until the timer, then resuming.
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        assert_eq!(
+            run_on(BLOCK_NO_LOOP_TIMED, backend),
+            102,
+            "{backend:?}: a no-loop cont.resume.block must idle-and-complete, not spin to 300"
+        );
+    }
+}
