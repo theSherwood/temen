@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**463 ops.** Across the two JIT columns: 862 ✅ Full · 52 ⛔ Declines · 2 🚧 Not-yet · 10 🔶 Conditional.
+**464 ops.** Across the two JIT columns: 862 ✅ Full · 53 ⛔ Declines · 3 🚧 Not-yet · 10 🔶 Conditional.
 
 ## scalar integer
 
@@ -505,6 +505,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `fuel.remaining` | ✅ | 🚧 | ✅ | ⛔ | declines the module (folds to the oracle) rather than adding a native op; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `exec_module` | ✅ | 🚧 | 🚧 | ⛔ | eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## fibers, threads & non-local control
 
