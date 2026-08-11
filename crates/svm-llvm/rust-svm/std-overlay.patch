@@ -154,3 +154,17 @@
      _ => {
          mod unsupported;
          pub use unsupported::*;
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -44,7 +44,11 @@
+     target_os = "vexos" => {
+         mod vexos;
+         use vexos as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
