@@ -3404,9 +3404,11 @@ pub fn is_named_powerbox_entry(module: &Module) -> bool {
 pub fn default_cap_resolver(name: &str) -> Option<svm_ir::ResolvedCap> {
     use svm_interp::cap_id;
     let (type_id, op): (u32, u32) = match name {
-        // Stream — the *handle* (stdout/stdin) selects the endpoint, not the name.
+        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint. `write` and `stderr` are
+        // both write (op 1); the manifest binding uses the name to pick stdout vs the stderr handle.
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
+        "stderr" => (cap_id::STREAM, 1),
         // Exit (noreturn).
         "exit" => (cap_id::EXIT, 0),
         // Memory management (§3e/§4).
@@ -4074,7 +4076,7 @@ fn value_slot(v: Value) -> i64 {
 /// identically see matching handle values (the differential paths rely on this). (The mock
 /// `Blocking` cap left this set with CONSOLIDATION §5a — test harnesses that exercise the
 /// offload pool grant it themselves and register the `"blocking"` name.)
-fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 6] {
+fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
     h.set_region_factory(new_shared_region);
@@ -4097,6 +4099,9 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 6] {
         // Reserve the `call_indirect` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
         // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
         h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
+        // stderr — a second write-only `Stream` (`StreamRole::Err` → `host.stderr`), appended last so
+        // the earlier handle indices are unchanged. Reached by the `"stderr"` manifest import.
+        h.grant_stream(StreamRole::Err),
     ];
     // §7 register the granted set under canonical names (F7) so a powerbox guest can also
     // `cap.self`-resolve its capabilities by name, not only through its manifest slots.
@@ -4110,7 +4115,7 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 6] {
 /// powerbox guest resolves against via `cap.self` (F7). A name-bound guest
 /// ([`instantiate_with_imports`]) instead resolves its own import names. One list, shared with the
 /// frontends: re-exported from `svm_ir` so the grant order and the emitters' vocabulary cannot drift.
-const POWERBOX_CAP_NAMES: [&str; 6] = svm_ir::POWERBOX_CAP_NAMES;
+const POWERBOX_CAP_NAMES: [&str; 7] = svm_ir::POWERBOX_CAP_NAMES;
 
 /// Reconcile the interpreter's `Result<Vec<Value>, Trap>` with the JIT's [`JitOutcome`] for an entry
 /// whose results are `results`: assert the two backends agree (the differential oracle of
@@ -5636,7 +5641,8 @@ impl Instance {
                 // vestigial handle: the slot binding IS the dispatch. A name outside the fixed
                 // policy leaves its slot unbound (a dispatch through it is a fail-closed
                 // `CapFault`).
-                let [stdout, stdin, exit, memory, addrspace, jit] = grant_powerbox_prefix(h, win);
+                let [stdout, stdin, exit, memory, addrspace, jit, stderr] =
+                    grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
                     use svm_interp::cap_id;
                     let bindings = self
@@ -5648,6 +5654,15 @@ impl Instance {
                                 // Unknown name: declared but unbound — fail-closed at dispatch.
                                 return svm_interp::BoundImport::rebindable(0, 0, None);
                             };
+                            // `write` and `stderr` are both `Stream` write (op 1); the name breaks the
+                            // tie (stdout vs the appended stderr handle) since op alone can't.
+                            if im.name == "stderr" {
+                                return svm_interp::BoundImport::required(
+                                    cap.type_id,
+                                    cap.op,
+                                    stderr,
+                                );
+                            }
                             let handle = match (cap.type_id, cap.op) {
                                 (cap_id::STREAM, 1) => stdout, // write
                                 (cap_id::STREAM, _) => stdin,  // read

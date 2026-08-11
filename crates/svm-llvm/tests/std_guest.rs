@@ -174,6 +174,50 @@ fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     native_oracle_args(name, src, &[])
 }
 
+/// Run `src` on the powerbox → `(stdout, stderr, exit)` — the stderr-separating variant.
+fn svm_run_std_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let run = svm_run::run_powerbox(&t.module, b"").expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((run.stdout, run.stderr, exit))
+}
+
+/// Native oracle returning stdout and stderr **separately**.
+fn native_oracle_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)> {
+    let host_src = src.replace("#![feature(restricted_std)]\n", "");
+    let dir = std::env::temp_dir().join(format!("svm_std_natst_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let rs = dir.join("main.rs");
+    let bin = dir.join("oracle");
+    std::fs::write(&rs, host_src).ok()?;
+    let built = Command::new("rustc")
+        .args(["--edition", "2021", "-O"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .ok()?
+        .success();
+    if !built {
+        return None;
+    }
+    let out = Command::new(&bin).output().ok()?;
+    Some((
+        out.stdout,
+        out.stderr,
+        out.status.code().unwrap_or(-1) as u8,
+    ))
+}
+
 /// S1b — a real `std` binary (`lang_start` + heap `Vec` + iterator fold) returning a **computed exit
 /// code** through `Termination` runs on svm byte-identical to the native-equivalent oracle. This is
 /// pure compute (no I/O), so it passes even with only the `unsupported` PAL for stdio.
@@ -245,6 +289,45 @@ fn std_stdout_and_exit_match_native() {
         svm_exit, native_exit,
         "std `process::exit` code matches native"
     );
+}
+
+/// S1e — distinct `stderr`: the svm PAL's `Stderr` routes to the powerbox stderr `Stream` (the
+/// `__vm_write_stderr` builtin → the appended `"stderr"` handle), so interleaved `println!`/
+/// `eprintln!` land in **separate** streams, each matching native.
+#[test]
+fn std_stderr_is_distinct_from_stdout() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest stderr (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   println!(\"out line 1\");\n\
+         \x20   eprintln!(\"err line 1\");\n\
+         \x20   println!(\"out line 2\");\n\
+         \x20   eprintln!(\"err line 2\");\n\
+         }\n";
+
+    let Some((svm_out, svm_err, _)) = svm_run_std_streams("svm_std_stderr", src) else {
+        eprintln!("note: skipping std_guest stderr (build-std produced no .ll)");
+        return;
+    };
+    // The svm side is fully determined: stdout has only the `println!` lines, stderr only `eprintln!`.
+    assert_eq!(
+        String::from_utf8_lossy(&svm_out),
+        "out line 1\nout line 2\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&svm_err),
+        "err line 1\nerr line 2\n"
+    );
+
+    // Cross-check both streams against a real native run.
+    if let Some((n_out, n_err, _)) = native_oracle_streams("svm_std_stderr", src) {
+        assert_eq!(svm_out, n_out, "svm stdout matches native stdout");
+        assert_eq!(svm_err, n_err, "svm stderr matches native stderr");
+    }
 }
 
 /// S1d — `std::env::args`: the svm PAL's `init` captures the powerbox-threaded `argv`, and the svm
