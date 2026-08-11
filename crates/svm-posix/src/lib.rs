@@ -126,6 +126,20 @@ pub const OP_SIGCHECK: u32 = 32;
 /// realtime (nanos since the Unix epoch). An embedder/test can pin the value with [`Posix::set_clock`]
 /// for determinism (the differential harness wants a reproducible clock).
 pub const OP_CLOCK: u32 = 33;
+/// `getenv_r(name, nlen, buf, cap) -> nbytes | -1` — a **buffer-writing** `getenv` for callers that
+/// own the destination (Rust's `std::env::var` copies into an `OsString`), unlike op 11 which
+/// materializes a stable `char*` in the personality arena. Returns the value's byte length (writing it
+/// into `[buf, cap)` when it fits — the two-call size-then-fetch shape of `getcwd`/`readdir`), or `-1`
+/// if unset. Because it writes into guest-owned memory it needs **no arena**, so it never contends
+/// with the guest's own heap — the reason the svm `std` PAL uses it.
+pub const OP_GETENV_R: u32 = 34;
+/// `unsetenv(name, nlen) -> 0` — remove an environment variable (`std::env::remove_var`). Absent name
+/// is a success no-op; a non-UTF-8 name is `-EINVAL`.
+pub const OP_UNSETENV: u32 = 35;
+/// `environ(index, buf, cap) -> len | -1` — enumerate the environment for `std::env::vars`. Writes the
+/// `index`-th `KEY=VALUE` (keys **sorted**, so the order is deterministic) into `[buf, cap)` and
+/// returns its byte length (size-then-fetch like `getenv_r`); `-1` once `index` is past the last var.
+pub const OP_ENVIRON: u32 = 36;
 
 /// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
 const SIG_DFL: i64 = 0;
@@ -518,6 +532,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "chdir" => OP_CHDIR,
         "getenv" => OP_GETENV,
         "setenv" => OP_SETENV,
+        "getenv_r" => OP_GETENV_R,
+        "unsetenv" => OP_UNSETENV,
+        "environ" => OP_ENVIRON,
         "clock_gettime" | "clock" => OP_CLOCK,
         "stat" | "lstat" => OP_STAT,
         "opendir" => OP_OPENDIR,
@@ -713,6 +730,9 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_CHDIR => st.chdir(args, mem),
                 OP_GETENV => st.getenv(args, mem),
                 OP_SETENV => st.setenv(args, mem),
+                OP_GETENV_R => st.getenv_r(args, mem),
+                OP_UNSETENV => st.unsetenv(args, mem),
+                OP_ENVIRON => st.environ(args, mem),
                 OP_CLOCK => Ok(vec![st.clock(args)]),
                 _ => Err(Trap::CapFault),
             }
@@ -1541,7 +1561,9 @@ impl Inner {
         let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let vptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
         let vlen = (*args.get(3).ok_or(Trap::Malformed)?).max(0) as u64;
-        let overwrite = *args.get(4).ok_or(Trap::Malformed)?;
+        // The 5-arg C ABI passes `overwrite` explicitly; a 4-arg `__vm_host_call` (the svm `std` PAL's
+        // `set_var`, which always overwrites) omits it, so default to overwrite when absent.
+        let overwrite = *args.get(4).unwrap_or(&1);
         let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
         let vb = mem.read_bytes(vptr, vlen).ok_or(Trap::Malformed)?;
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
@@ -1553,6 +1575,67 @@ impl Inner {
         self.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
         self.env.insert(name, value);
         Ok(vec![0])
+    }
+
+    /// `getenv_r(name, nlen, buf, cap) -> nbytes | -1`: the value's byte length, written into
+    /// `[buf, cap)` when it fits (no NUL — the caller owns the copy); `-1` if unset. A `cap` too small
+    /// (or `buf == 0`) still returns the length, so the caller can size a buffer and retry — no arena,
+    /// so it never contends with the guest's own heap. A non-UTF-8 name reads as unset.
+    fn getenv_r(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let buf = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        let cap = (*args.get(3).ok_or(Trap::Malformed)?).max(0) as u64;
+        let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
+        let Ok(name) = String::from_utf8(nb) else {
+            return Ok(vec![-1]);
+        };
+        let Some(value) = self.env.get(&name) else {
+            return Ok(vec![-1]); // unset
+        };
+        let vb = value.as_bytes();
+        if buf != 0 && (vb.len() as u64) <= cap {
+            mem.write_bytes(buf, vb).ok_or(Trap::Malformed)?;
+        }
+        Ok(vec![vb.len() as i64])
+    }
+
+    /// `unsetenv(name, nlen) -> 0 | -EINVAL`: remove a variable (absent = success no-op).
+    fn unsetenv(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let nptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let nb = mem.read_bytes(nptr, nlen).ok_or(Trap::Malformed)?;
+        let Ok(name) = String::from_utf8(nb) else {
+            return Ok(vec![EINVAL]);
+        };
+        self.env_ptrs.remove(&name);
+        self.env.remove(&name);
+        Ok(vec![0])
+    }
+
+    /// `environ(index, buf, cap) -> len | -1`: the `index`-th `KEY=VALUE` (keys **sorted** for a
+    /// deterministic order), written into `[buf, cap)` when it fits (size-then-fetch like `getenv_r`);
+    /// `-1` once `index` is past the last variable.
+    fn environ(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let index = *args.first().ok_or(Trap::Malformed)?;
+        let buf = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let cap = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
+        if index < 0 {
+            return Ok(vec![-1]);
+        }
+        let mut keys: Vec<&String> = self.env.keys().collect();
+        keys.sort();
+        let Some(key) = keys.get(index as usize) else {
+            return Ok(vec![-1]); // past the end
+        };
+        let entry = format!("{key}={}", self.env[*key]).into_bytes();
+        if buf != 0 && (entry.len() as u64) <= cap {
+            mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
+        }
+        Ok(vec![entry.len() as i64])
     }
 
     /// `clock(clock_id) -> nanos`: `clock_id == 1` → monotonic (nanos since this personality started),

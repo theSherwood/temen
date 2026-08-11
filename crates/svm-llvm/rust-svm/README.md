@@ -19,6 +19,7 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | `svm-pal.rs` | The svm PAL proper (copied to `sys/pal/svm.rs`). Mirrors the `unsupported` PAL, but its `init` captures the powerbox-threaded `argv` (so `std::env::args` works), and it hosts the `host` bridge — `__vm_cap_resolve("posix")` + per-op `__vm_host_call` wrappers — that the richer surface (`time`, later `fs`/`env`) reaches the host through. |
 | `svm-args-imp.rs` | The args module (copied to `sys/args/svm.rs`). Stores `(argc, argv)` at init and walks them as C strings on demand — the "stored at startup" half of the unix strategy, no `os::unix` dependency. |
 | `svm-time-imp.rs` | The time module (copied to `sys/time/svm.rs`). `Instant`/`SystemTime::now()` call the PAL `host` bridge's `clock` op (svm-posix `OP_CLOCK`) — monotonic for `Instant`, realtime for `SystemTime`. Needs a granted `posix` cap (`run_with_caps`); without one the clock reads zero. |
+| `svm-env-imp.rs` | The env module (copied to `sys/env/svm.rs`). `getenv`/`setenv`/`unsetenv`/`vars` reach the posix env map via the `host` bridge's **buffer-writing** ops (`OP_GETENV_R`/`OP_SETENV`/`OP_UNSETENV`/`OP_ENVIRON`) — copies into guest memory, no personality arena. (`std::env::var`/`vars` await on-ramp fix #755.) |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -68,8 +69,9 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   parse fine). Everything else — malloc-synth, the `Memory` grant, `lang_start` —
   worked as-is off the bin's `main`.
 - **Working today:** stdout (`println!`), `stderr` (`eprintln!`), `process::exit`,
-  `env::args`, **`std::time`** (`Instant`/`SystemTime`, via a granted posix cap),
-  heap/`Vec`, collections, `fmt`, iterators.
+  `env::args`, **`std::time`** (`Instant`/`SystemTime`), **`std::env`**
+  (`var_os`/`set_var`/`remove_var`/`vars`, via a granted posix cap), heap/`Vec`,
+  collections, `fmt`, iterators. (`std::env::var`/`vars` await on-ramp fix #755.)
 - **The two paths:** the powerbox stream/exit handles carry stdio/exit/args (no
   extra grant); the **posix-cap path** (`run_with_caps` + a `posix` cap, reached
   via the PAL `host` bridge's `__vm_host_call`) carries `time` now and `fs`/`env`

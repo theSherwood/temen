@@ -65,4 +65,31 @@ pub(crate) mod host {
     pub(crate) fn clock(clock_id: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 33, clock_id, 0, 0, 0) }
     }
+
+    /// `getenv_r(name, nlen, buf, cap) -> nbytes | -1` (svm-posix `OP_GETENV_R` = 34). Writes the
+    /// value into `[buf, cap)` when it fits; the length is returned either way (size-then-fetch).
+    #[inline(always)]
+    pub(crate) fn getenv_r(name: *const u8, nlen: i64, buf: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 34, name as i64, nlen, buf as i64, cap) }
+    }
+
+    /// `setenv(name, nlen, val, vlen) -> 0 | -errno` (svm-posix `OP_SETENV` = 12; the 4-arg form
+    /// always overwrites).
+    #[inline(always)]
+    pub(crate) fn setenv(name: *const u8, nlen: i64, val: *const u8, vlen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 12, name as i64, nlen, val as i64, vlen) }
+    }
+
+    /// `unsetenv(name, nlen) -> 0 | -errno` (svm-posix `OP_UNSETENV` = 35).
+    #[inline(always)]
+    pub(crate) fn unsetenv(name: *const u8, nlen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 35, name as i64, nlen, 0, 0) }
+    }
+
+    /// `environ(index, buf, cap) -> len | -1` (svm-posix `OP_ENVIRON` = 36). Writes the `index`-th
+    /// `KEY=VALUE` into `[buf, cap)` when it fits; the length is returned either way.
+    #[inline(always)]
+    pub(crate) fn environ(index: i64, buf: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 36, index, buf as i64, cap, 0) }
+    }
 }

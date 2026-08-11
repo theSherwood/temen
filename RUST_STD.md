@@ -6,14 +6,16 @@ The analog of `NIM.md` for this workstream; fold completed sections into `DESIGN
 and drop this file once the actionable gaps close (the repo convention, cf. the former
 `WASM.md`).
 
-> Status: **`std` I/O + args + stderr + time work on svm (S0 + S1a–e + S2-time done, 2026-08-11).**
+> Status: **`std` I/O + args + stderr + time + env work on svm (S0 + S1a–e + S2 time/env, 2026-08-11).**
 > A `std` binary built for `x86_64-unknown-svm` via `-Zbuild-std` (`crates/svm-llvm/rust-svm/`) runs
 > on the powerbox: **`println!`, `eprintln!` (distinct stderr), `process::exit`, `std::env::args`**
-> are byte-identical to native, and **`std::time` (`Instant`/`SystemTime`)** reads a granted posix
-> clock (`crates/svm-llvm/tests/std_guest.rs`, five gated tests). S2 established the **posix-cap run
-> path** — `run_with_caps` + a `posix` cap, reached via the PAL's `__vm_cap_resolve("posix")` +
-> `__vm_host_call` bridge — the scalable seam the many-op `fs`/`env` surface needs (a new svm-posix
-> `OP_CLOCK` was its first op). Next: `fs` + `env::var`/`set_var` on that path. Route decision §1/§4.
+> are byte-identical to native; **`std::time`** reads a granted posix clock; and **`std::env`
+> (`var_os`/`set_var`/`remove_var`/`vars`)** reaches the posix env map
+> (`crates/svm-llvm/tests/std_guest.rs`, six gated tests). S2 established the **posix-cap run path** —
+> `run_with_caps` + a `posix` cap, reached via the PAL's `__vm_cap_resolve("posix")` +
+> `__vm_host_call` bridge — the scalable seam `fs` needs (new svm-posix ops `OP_CLOCK` /
+> `OP_GETENV_R` / `OP_UNSETENV` / `OP_ENVIRON`). **`std::env::var`/`vars` are gated on an unrelated
+> on-ramp φ bug (#755).** Next: `fs`. Route decision §1/§4.
 
 Section numbers like "§7" refer to `DESIGN.md` unless prefixed with a file; "D54" etc. are its
 Decision Log; "I55" is `ISSUES.md`.
@@ -178,7 +180,7 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 | **S1d** | ✅ **args DONE.** A minimal svm PAL (`sys/pal/svm.rs`, mirroring `unsupported`) whose `init` calls `sys::args::init`, + an svm `args` module (`sys/args/svm.rs`) storing `(argc,argv)` at init and walking it on demand. `std::env::args` matches native (`tests/std_guest.rs::std_env_args_match_native`). No on-ramp change — the powerbox already threads argv into `main(argc,argv)`. | powerbox argv (present) | `env::args` byte-identical to native. |
 | **S1e** | ✅ **DONE.** Distinct `stderr`: appended a 7th powerbox `Stream` (`StreamRole::Err` → `host.stderr`) as `POWERBOX_CAP_NAMES[6] = "stderr"` (svm_ir), granted + name-bound in svm-run (the manifest binds the `"stderr"` import to the stderr handle — `write`/`stderr` are both op 1, so the *name* breaks the tie), and a `__vm_write_stderr` builtin in the on-ramp that the svm PAL's `Stderr` calls. `eprintln!` now lands in `Run.stderr`, byte-identical to native (`tests/std_guest.rs::std_stderr_is_distinct_from_stdout`; 326 translate tests still green). Same `Stream` kind as stdout → no new confinement surface (INVARIANTS §2). | svm_ir + svm-run grant + on-ramp builtin | `println!`/`eprintln!` separate, each matching native. |
 | **S2 (time)** | ✅ **DONE.** `std::time` on the **posix-cap path**: the PAL `host` bridge resolves `__vm_cap_resolve("posix")` and calls `__vm_host_call(posix, OP_CLOCK, clock_id)` (new svm-posix op 33; monotonic/realtime; `Posix::set_clock` pins it for deterministic tests). `sys/time/svm.rs` implements `Instant`/`SystemTime::now()`. Run via `run_with_caps` + a `posix` cap. Established the scalable posix seam (fs needs it) with the cleanest first op — a **scalar** (no window pointer → none of getenv's arena/heap-coexistence problem). `op` is a compile-time constant at the call site (§9 requirement, first exercised, holds). Test: `std_time_reads_the_posix_clock`. | new svm-posix `OP_CLOCK` | `Instant`/`SystemTime` read a seeded clock deterministically. |
-| **S2 (env)** | *pending.* `env::var` (getenv, op 11 — clean 2-arg) + `set_var` (op 12 setenv, defaulting `overwrite`→1 for the 4-arg `__vm_host_call`, §6). Wrinkles found: getenv **materializes the value in the posix arena** inside the guest window, which must not collide with the program's synth-malloc heap (untested coexistence — the reason time went first); and `vars()` has no posix enumerate op. | ops 11/12 (present) + arena-coexistence check | `env::var`/`set_var` round-trip vs native; `vars()` deferred. |
+| **S2 (env)** | ✅ **ops DONE (var_os/set_var/remove_var/vars work).** The arena-coexistence worry is *solved*, not deferred: Rust's `getenv` returns an owned `OsString`, so it needs no stable `char*` — new **buffer-writing** ops `OP_GETENV_R` (34) and `OP_ENVIRON` (36, sorted for determinism) copy into guest-owned memory, using **no posix arena** (no heap contention). Plus `OP_UNSETENV` (35) and a `setenv` `overwrite`→1 default for the 4-arg `__vm_host_call` (§6). `sys/env/svm.rs` implements getenv/setenv/unsetenv/`env()`. Test: `std_env_var_os_round_trips`. **`var`/`vars` blocked only by on-ramp φ bug #755** (the `OsString`→`String` path pulls in `core::str::lossy::Debug::fmt`) — an on-ramp gap, not an env one; the ops are complete and light up when #755 lands. | new svm-posix env ops | `var_os`/`set_var`/`remove_var` round-trip; `var`/`vars` gated on #755. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |
 | **S5** | *(deferred, separate designs)* threads/sync/TLS; unwinding; net; `Command` | new ops + EH substrate | Each gets its own slice plan when a consumer names it. |
