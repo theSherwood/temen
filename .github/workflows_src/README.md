@@ -16,6 +16,14 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
+  test block (right after the already-copied `node browser-jit-cache-test.mjs`):
+  `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
+  slice-0 JACL residual): an SVM-text compute guest run with tier-up on must equal the all-interpreter
+  value and tier-up must fire (no assets — parses in-page via `svm_parse`). Reuses the threads module
+  the job already builds — no new toolchain. Verified locally in Chromium. (The sibling
+  `browser-jit-cache-test.mjs` line was already copied over in commit `90c3b6d`.)
+
 - **Doc-only CI skip (`ci.yml` `on:` triggers).** Added `paths-ignore: ["**.md"]` to both the
   `push: [main]` and `pull_request` triggers so a changeset that touches **only** Markdown skips the
   whole CI matrix (it's slow, and prose edits don't affect build/test/fuzz). `paths-ignore` skips a run

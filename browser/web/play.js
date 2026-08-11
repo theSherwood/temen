@@ -1349,7 +1349,9 @@ async function runModule(c) {
       // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
       // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
       // result matches on both tiers (a trap throws → we fall back to the interpreter below).
-      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
+      // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
+      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
       rv = Number(eng.ex.svm_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
@@ -1428,7 +1430,9 @@ async function runChibicc(c) {
   if (useJit) {
     try {
       // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      // chibicc's emitted `_start` is source-independent (the C source is fed via memfs, not baked
+      // into the code), so cache it under a stable key — every compile reuses the compiled Module.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn, 'chibicc-compiler');
       compileTier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
@@ -1558,7 +1562,7 @@ async function runSelfhost(c) {
   let cstatus, tier = 'interpreter';
   if (useJit) {
     try {
-      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn, 'chibicc-selfhost');
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);
@@ -2622,18 +2626,26 @@ async function runText(c) {
     jit: mode === 'jit',
     inst: mode === 'inst',
     io: mode === 'io',
+    // Slice 2 (WASM_AOT.md): the compute-only recipe defaults to the wasm-JIT tier-up path — the
+    // interpreter drives, hot in-subset functions run on emitted wasm over the same live window
+    // (fail-closed per-function; validated interp≡tier-up in `browser-tierup-mainline-test.mjs`). The
+    // §22-`jit`/§14-`inst` recipes have their own JIT; `io` stays on the interpreter for now.
+    tierup: mode === 'plain',
     winSize: winSizeOf(src),
     signal: aborter.signal,
   };
   const t0 = performance.now();
   try {
-    const { value, started } = await run(guest, opts);
-    const ms = runStage(rec, `run:${mode === 'jit' ? 'wasm-JIT' : 'interpreter'}`, performance.now() - t0).toFixed(0);
+    const { value, started, tierups } = await run(guest, opts);
+    const tiered = opts.tierup && tierups > 0;
+    const label = tiered ? 'interpreter+wasm-JIT' : mode === 'jit' ? 'wasm-JIT' : 'interpreter';
+    const ms = runStage(rec, `run:${label}`, performance.now() - t0).toFixed(0);
     c.el.result.textContent = `${value}`;
     if (mode === 'io') c.el.stdout.textContent = readParStdout(eng);
-    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
-    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms`);
-    runNote(rec, { workers: started });
+    const tierNote = tiered ? ` · ${tierups} region${tierups === 1 ? '' : 's'} on emitted wasm` : '';
+    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms${tierNote}`);
+    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms${tierNote}`);
+    runNote(rec, { workers: started, tierups });
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
