@@ -796,6 +796,9 @@ struct RecordingMem<'a> {
 }
 
 impl GuestMem for RecordingMem<'_> {
+    fn window_size(&self) -> u64 {
+        self.inner.window_size()
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.inner.read_bytes(ptr, len)
     }
@@ -7951,7 +7954,12 @@ fn fiber_sig() -> FuncType {
 /// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
 /// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
 fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
-    if threads.is_empty() {
+    // #773 defense-in-depth: a join handle is a small non-negative slot; a **negative** value is never
+    // one — it is a forged handle or (the real footgun) a failed-spawn errno the guest forwarded to
+    // `join`/`poll`/`detach` without checking. Reject it (invariant 5: a trap for forgery) rather than
+    // let the `& mask` fold it onto a live slot (e.g. a background server), which would wedge the join
+    // on a child that never exits. `threads.is_empty()` alone missed this.
+    if handle < 0 || threads.is_empty() {
         return Err(Trap::ThreadFault);
     }
     let mask = threads.len().next_power_of_two() - 1;
@@ -10105,17 +10113,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19). A
-                            // separate-module child's carve must **equal its declared memory** (§14
-                            // transparency: the plugin runs exactly as it would standalone — same
-                            // window size, same wrap behaviour; a module with no memory can't nest).
+                            // separate-module child's carve must be **at least its declared memory**
+                            // (FORK.md §8.6 / #773: a larger window is a safe superset — confinement,
+                            // invariant 2, still masks every access to the actual carve; the only
+                            // relaxation vs. an exact-equal carve is that an *out-of-declared-window*
+                            // access — a guest bug — wraps at the carve, not at the declared size. This
+                            // lets a shell spawn a small program into a generous window so its own
+                            // `exec` of a larger command has room. A module with no memory can't nest).
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
                                 0
                             };
-                            let mod_ok = child_mod
-                                .as_ref()
-                                .is_none_or(|cm| cm.memory_log2 == Some(size_log2 as u8));
+                            let mod_ok = child_mod.as_ref().is_none_or(|cm| {
+                                cm.memory_log2.is_some_and(|ml| ml <= size_log2 as u8)
+                            });
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -11256,12 +11268,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         Some(list)
                     })();
-                    // Admissibility: a resolvable non-durable command whose declared window equals the
-                    // caller's carve, a real entry, a clean root context (no serve handler / fibers), a
-                    // non-durable domain, and a fully-regrantable grant list. Anything else is a
-                    // probeable `-EINVAL` that leaves the caller running. `want_as` = the §14 child-entry
-                    // takes (Instantiator, AddressSpace) rather than just (Instantiator).
+                    // Admissibility: a resolvable non-durable command whose declared window **fits the
+                    // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
+                    // window in place, so the command runs there iff its declared memory ≤ that window —
+                    // a larger window is a safe superset, still masked to the actual size by invariant 2).
+                    // The guest-passed `size_log2` is now advisory: the real bound is the caller's own
+                    // window (`mem.window_size()`), so a shell whose window is bigger than the shim's
+                    // hardcoded hint can exec a command that declares more memory than that hint. A real
+                    // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
+                    // fully-regrantable grant list are also required. Anything else is a probeable
+                    // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
+                    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
+                    // (Instantiator).
                     let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
+                    let win_bytes = mem.as_ref().map(|m| m.window_size()).unwrap_or(0);
+                    let win_log2 = win_bytes
+                        .is_power_of_two()
+                        .then(|| win_bytes.trailing_zeros() as u8);
                     let entry_params = cmod
                         .as_ref()
                         .and_then(|cm| cm.funcs.get(entry as usize))
@@ -11276,15 +11299,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && grants.is_some()
                         && (0..64).contains(&size_log2)
                         && entry_params.is_some()
-                        && cmod
-                            .as_ref()
-                            .is_some_and(|cm| cm.memory_log2 == Some(size_log2 as u8));
+                        && win_log2.is_some_and(|wl| {
+                            cmod.as_ref()
+                                .is_some_and(|cm| cm.memory_log2.is_some_and(|ml| ml <= wl))
+                        });
                     // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
                     // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
                     // manifest bound, its module registered as the self module. Only then commit to the
-                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly.
+                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly. The command's
+                    // window (its Instantiator/AddressSpace authority + the data-materialization bound) is
+                    // the **caller's** window, not the guest's `size_log2` hint — it runs where the shell did.
                     let built = if admissible {
-                        let child_size = 1u64 << size_log2;
+                        let child_size = 1u64 << win_log2.expect("admissible");
                         let cm = cmod.as_ref().expect("admissible");
                         let grants = grants.as_ref().expect("admissible");
                         let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -14700,6 +14726,14 @@ pub trait GuestMem {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>>;
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
 
+    /// The logical window size in bytes — `[0, window_size)` is this domain's confinement bound
+    /// (invariant 2). FORK.md §8.6 / #773: `exec_module` reuses the caller's window, so it admits a
+    /// command whose declared memory **fits** this size (a larger window is a safe superset). The
+    /// default `0` means "unknown / no window" — a domain that can't host an exec.
+    fn window_size(&self) -> u64 {
+        0
+    }
+
     /// `Memory` capability ops (§3e): (re)commit / decommit / re-protect window pages. `offset`
     /// is page-aligned and `[offset, offset+len)` window-relative; `prot` is `READ|WRITE`. Each
     /// returns `0` or a negative errno (`-EINVAL`). The default is a success no-op — overridden
@@ -14772,6 +14806,9 @@ impl<'a> WindowMem<'a> {
 }
 
 impl GuestMem for WindowMem<'_> {
+    fn window_size(&self) -> u64 {
+        self.size
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         let end = ptr.checked_add(len)?;
         if end > self.size {
@@ -22367,6 +22404,9 @@ impl Mem {
 }
 
 impl GuestMem for Mem {
+    fn window_size(&self) -> u64 {
+        self.window.size()
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.read_bytes_impl(ptr, len)
     }

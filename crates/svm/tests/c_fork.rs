@@ -1674,6 +1674,95 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     );
 }
 
+/// #773 (FORK.md §8.6) — **a forked child execs a command with a large static/BSS buffer.** A command
+/// that declares more memory than the default 128 KiB window (its window directive is `memory 18`, 256
+/// KiB, because of the 60 KB array) used to be un-`exec`able: the fork/exec surface required the child's
+/// declared window to **equal** the caller's carve, but the shell shim hardcodes the exec's window hint
+/// (17), so the command was rejected — and a manager that then joined the failed spawn wedged. The fix
+/// admits a command whose declared memory **fits** the inherited window (a larger window is a safe
+/// superset, still masked to its actual size by invariant 2). This shell is spawned into a 256 KiB
+/// window (the manager passes carve size 18 at a 256 KiB-aligned offset), so its forked child inherits
+/// the room to exec the 256 KiB command. The command touches the *far end* of its 60 KB buffer (proving
+/// the big window is genuinely mapped and usable) and writes a byte from it; the shell reaps its exit.
+const BIGEXEC_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char big[60000];
+int main(int argc, char **argv) {
+  big[59999] = 'Z';           /* touch the far end of the 60 KB BSS (only reachable in the big window) */
+  write(1, &big[59999], 1);   /* prove the large window is mapped + usable */
+  return 0;
+}
+"#;
+
+const BIGEXEC_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("one", a_one, shell_out, 0); return 127; }
+  return wait_pid(p);         /* the large command's exit status (0) */
+}
+"#;
+
+#[test]
+fn a_shell_execs_a_command_with_a_large_bss_buffer() {
+    // Spawn the shell into a 256 KiB window (carve size 18 at a 256 KiB-aligned offset) instead of the
+    // default 128 KiB (size 17 at 128 KiB) — a `MICROSHELL_MANAGER` with the two carve constants bumped.
+    // The small shell (`memory 17`) into a size-18 carve exercises op-13's window-≥-declared admission;
+    // the forked child's exec of the `memory 18` command exercises op-14's.
+    let bigwin = MICROSHELL_MANAGER
+        .replace("voffg = i64.const 131072", "voffg = i64.const 262144")
+        .replace("vsl = i64.const 17", "vsl = i64.const 18");
+    let manager = Arc::new(parse_module_raw(&bigwin).expect("parse bigwin manager"));
+    verify_module(&manager).expect("verify bigwin manager");
+    let shell_src = format!("{FORK_SHIM}\n{BIGEXEC_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse bigexec shell");
+    verify_module(&guest).expect("verify bigexec shell");
+    let cmd = parse_module_raw(&c_to_ir(BIGEXEC_CMD_SRC)).expect("parse bigexec command");
+    verify_module(&cmd).expect("verify bigexec command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&cmd); // "one"
+    let mod2 = host.grant_module(&cmd); // "two" (unused)
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The command ran to completion in the big inherited window and the shell reaped its exit (0) —
+    // no wedge, no exec refusal.
+    assert_eq!(
+        r,
+        vec![Value::I64(0)],
+        "the shell reaped the large-BSS command's exit status (0)"
+    );
+    // It genuinely used the far end of its 60 KB buffer and wrote from it.
+    assert_eq!(
+        host.stdout_bytes(),
+        b"Z",
+        "the exec'd command touched its 60 KB buffer (only reachable in the enlarged window) and wrote from it"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.
