@@ -23,21 +23,26 @@ if (!existsSync(modPath)) {
 }
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-// Plain build owns its own linear memory (no shared `env.memory` import); pass none.
-const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
+// The real-browser CI job builds the THREADS module (imports its linear memory as a shared memory, like
+// web/par.js / pg_snapshot_test.mjs); a plain build owns its own and ignores the import. Pass one
+// unconditionally so both work, and read through whichever memory the instance actually uses
+// (`ex.memory` for the plain build's own export; the imported `memory` for the threads build).
+const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
+const membuf = () => (ex.memory ?? memory).buffer;
 const is64 = ex.svm_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 
 // Alloc `bytes.length` in linear memory and copy in; re-fetch the view (alloc may grow/detach memory).
 const put = (bytes) => {
   const p = ex.svm_alloc(N(bytes.length));
-  new Uint8Array(ex.memory.buffer).set(bytes, Number(p));
+  new Uint8Array(membuf()).set(bytes, Number(p));
   return { p, len: N(bytes.length), free: () => ex.svm_dealloc(p, N(bytes.length)) };
 };
 const readStdout = () => {
   const p = Number(ex.svm_stdout_ptr());
   const l = Number(ex.svm_stdout_len());
-  return p && l ? Buffer.from(new Uint8Array(ex.memory.buffer, p, l)).toString() : '';
+  return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : '';
 };
 const fail = (m) => {
   console.error(`FAIL: ${m}`);
