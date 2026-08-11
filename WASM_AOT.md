@@ -136,27 +136,28 @@ over `encode_module`, the same identity the durable module-grant registry alread
   reuse-without-recompile, content-not-object keying, `run_powerbox` parity across inputs, no
   state-leak across reuses, distinct-module isolation, and that a refused (concurrent) module is not
   cached and does not poison the cache.
-- **Browser — NEXT (two steps, low-risk first).** The playground's dominant pattern is re-Running
-  the same module (edit stdin, re-Run Lua/SQLite/chibicc). Today every Run re-emits (cdylib) and
-  re-compiles (`WebAssembly.compile`, `wasmjit-module.js:32`) with no cross-Run reuse.
-  - **Step 1 (JS-only, no TCB/concurrency change):** a JS `Map` from the module's content digest →
-    the compiled `WebAssembly.Module`, consulted in `driveJitRun` (`wasmjit-module.js`) before
-    `WebAssembly.compile`. Key on the *source/module* the Run was launched with (the same bytes
-    `moduleCache` already holds by URL, or the editor text for editable cards) — not the emitted
-    bytes, so the lookup precedes emit. This skips V8 compile (and, if we also memoize the emitted
-    bytes, the cdylib emit) on a re-Run. It touches no `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN`
-    state, so it can't introduce a cross-Worker race — the reason to do it first.
-  - **Step 2 (cdylib, only if step 1's emit cost still shows):** replace the per-Run `PAR_RUN_GEN`
-    emit-dedup key with the content digest (`svm_encode::digest256` over the decoded module — the
-    *same* key `svm_run::CompiledCache` uses), so the cdylib itself skips re-emit across Runs, not
-    just across Workers within a Run. Higher-risk (it edits the I22 shared-stash lifetime), so gated
-    on a measured need.
-  - **Validation:** not locally runnable here (no wasm toolchain in this environment). Rides CI's
-    `browser-real` Chromium differential suite for correctness (a stale-cache bug shows as a
-    render/output divergence there), plus a first-vs-second-Run timing assertion added to the
-    playground recorder / a `node` bench (`bench_jit.mjs`-style) for the win itself.
-- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser) second Run of
-  a light script ≥ interpreter-only time — kills the "net slower under JIT" footgun.
+- **Browser — LANDED (step 1, JS-only).** `wasmjit-module.js`'s `driveJitRun` now consults a
+  cross-Run `Map` (`jitModuleCache`) keyed by a caller-supplied **stable module identity** before
+  `WebAssembly.compile`: on a hit the compiled `WebAssembly.Module` is reused verbatim, skipping V8
+  codegen; a miss compiles and caches. `play.js` passes the module's content-addressed URL for on-ramp
+  cards and stable keys for the chibicc compiler/self-host paths (`ex.url` / `'chibicc-compiler'` /
+  `'chibicc-selfhost'`). **Code only** — a fresh instance/window/env cell is built per Run, so no guest
+  state crosses Runs; the cache is bounded (16 entries, LRU-ish) and opt-in (no key ⇒ no caching, so
+  the dynamic in-browser-compiled-C path and the parity prover are unaffected). It touches no
+  `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN` state — no cross-Worker race surface.
+  - **Measured in Chromium** (`browser-jit-cache-test.mjs`): re-Running the same module produces
+    byte-identical stdout every Run and compiles exactly once (`{compiles:1, hits:2}`). Warm re-Runs:
+    **hello_c 33 ms → 4 ms** (now *beats* the interpreter's ~8 ms — the "light script slower under
+    JIT" footgun is fixed), **qjs_repl ~4.4 s → ~2.5 s (~1.8×)** — the reused Module keeps V8's
+    tiered-up code warm across Runs, saving far more than the ~30–50 ms `WebAssembly.compile` alone.
+- **Browser — step 2 (deferred, gated on need).** Have the cdylib itself skip *re-emit* across Runs
+  (replace the per-Run `PAR_RUN_GEN` emit-dedup key with the `svm_encode::digest256` content key —
+  the same one `svm_run::CompiledCache` uses). Higher-risk (it edits the I22 shared-stash lifetime).
+  Step 1's warm numbers already clear the footgun gate, so this waits for a measured re-emit cost that
+  step 1 doesn't cover.
+- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser, met) second
+  Run of a light script (hello_c 4 ms) now beats interpreter-only (~8 ms) — footgun closed, pinned by
+  `browser-jit-cache-test.mjs`.
 
 ### Slice 2 — default the JIT tier on where eligible (after slice 0)
 

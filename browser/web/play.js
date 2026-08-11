@@ -1349,7 +1349,9 @@ async function runModule(c) {
       // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
       // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
       // result matches on both tiers (a trap throws → we fall back to the interpreter below).
-      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
+      // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
+      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
       rv = Number(eng.ex.svm_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
@@ -1428,7 +1430,9 @@ async function runChibicc(c) {
   if (useJit) {
     try {
       // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      // chibicc's emitted `_start` is source-independent (the C source is fed via memfs, not baked
+      // into the code), so cache it under a stable key — every compile reuses the compiled Module.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn, 'chibicc-compiler');
       compileTier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
@@ -1558,7 +1562,7 @@ async function runSelfhost(c) {
   let cstatus, tier = 'interpreter';
   if (useJit) {
     try {
-      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn, 'chibicc-selfhost');
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);

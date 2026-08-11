@@ -674,6 +674,10 @@ jobs:
           # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
           # Reuses the threads module built above + the committed `.svmb` assets — no extra toolchain.
           node browser-jit-reactor-test.mjs
+          # slice-1 cross-Run compiled-Module cache (WASM_AOT.md): re-Running the same module with a
+          # stable key must produce byte-identical stdout every Run and compile exactly once. Uses the
+          # committed hello_c/qjs_repl assets; skips cleanly if absent.
+          node browser-jit-cache-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
