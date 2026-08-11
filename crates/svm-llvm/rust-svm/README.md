@@ -15,7 +15,9 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | `x86_64-unknown-svm.json` | The custom target spec. `os=svm`, `panic=abort`, `singlethread=true` (single-threaded but keeps 64-bit atomics), static reloc, no PIE. |
 | `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the right leaf-module impls: the minimal (no-OS, single-thread) ones for `sys/{alloc,thread_local,random,io/error}` (as `vexos`/`zkvm` do), the new svm `stdio` module, and the powerbox `exit` in `sys/exit.rs`. 26 added lines across 6 files. |
 | `svm-alloc-imp.rs` | The allocator `imp` (copied to `sys/alloc/svm.rs`). Forwards `alloc`/`dealloc`/`realloc` to the C `malloc` family, which the on-ramp synthesizes as an in-window guest bump allocator (LLVM.md slice S). |
-| `svm-stdio-imp.rs` | The stdio PAL (copied to `sys/stdio/svm.rs`). `Stdin`/`Stdout`/`Stderr` reach the host through `extern "C" write`/`read`, which the on-ramp's "Lane C" binds to the powerbox `Stream` handles (POSIX.md ops 0/1). So `println!` writes real bytes. |
+| `svm-stdio-imp.rs` | The stdio PAL (copied to `sys/stdio/svm.rs`). `Stdin`/`Stdout` reach the host through `extern "C" write`/`read` (on-ramp "Lane C" → powerbox stdout/stdin, POSIX.md 0/1); `Stderr` calls `__vm_write_stderr` → the distinct powerbox stderr `Stream`. So `println!` and `eprintln!` write real bytes on separate streams. |
+| `svm-pal.rs` | The svm PAL proper (copied to `sys/pal/svm.rs`). Mirrors the `unsupported` PAL, but its `init` captures the powerbox-threaded `argv` (calls `sys::args::init`) so `std::env::args` works. |
+| `svm-args-imp.rs` | The args module (copied to `sys/args/svm.rs`). Stores `(argc, argv)` at init and walks them as C strings on demand — the "stored at startup" half of the unix strategy, no `os::unix` dependency. |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -64,12 +66,11 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   (`ll/parse.rs`); the earlier "packed-struct globals" suspicion was wrong (those
   parse fine). Everything else — malloc-synth, the `Memory` grant, `lang_start` —
   worked as-is off the bin's `main`.
-- **Working today:** stdout (`println!`), `process::exit`, heap/`Vec`,
-  collections, `fmt`, iterators.
-- **Not yet (uses the `unsupported` PAL):** `env::args` (needs a PAL `init`
-  hook to capture argv), `stderr` as a distinct stream (currently merges into
-  stdout — the on-ramp drops the `fd`), `File`/`fs`, `env`, `time`. Tracked in
-  RUST_STD.md (S1d/S2+).
+- **Working today:** stdout (`println!`), **`stderr` (`eprintln!`, a distinct
+  stream)**, `process::exit`, `env::args`, heap/`Vec`, collections, `fmt`,
+  iterators.
+- **Not yet:** `File`/`fs`, `env`, `time` (S2+, over `__vm_host_call`+posix).
+  Tracked in RUST_STD.md.
 
 ## Reproducibility note
 

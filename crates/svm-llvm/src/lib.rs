@@ -3111,6 +3111,14 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
             sig: ft(vec![I64, I64], vec![I64]),
             drop_args: 0,
         },
+        // `long __vm_write_stderr(long buf, long len)` — the powerbox stderr stream, a *second*
+        // write-only `Stream` distinct from stdout (the `"stderr"` manifest import → the appended
+        // stderr handle). The svm `std` PAL routes `Stderr` here so `eprintln!` captures separately.
+        "__vm_write_stderr" => CapSpec {
+            name: "stderr",
+            sig: ft(vec![I64, I64], vec![I64]),
+            drop_args: 0,
+        },
         _ => return None,
     })
 }
@@ -3262,6 +3270,7 @@ fn vm_stream_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_stream_write" => "write",
         "__vm_stream_read" => "read",
+        "__vm_write_stderr" => "stderr",
         _ => return None,
     })
 }

@@ -2810,12 +2810,22 @@ pub const POWERBOX_ARGS_END: u64 = 16384;
 /// The canonical **names** of the fixed §3e powerbox capabilities, in `VM_CAP_*` / grant order (the
 /// same order/names `svm_run` grants + registers). A powerbox guest's manifest imports resolve
 /// against this vocabulary (and `cap.self.resolve` re-finds them by name); `[..n]` is the prefix a
-/// program granted `n` capabilities uses. (`"blocking"` left this vocabulary with CONSOLIDATION §5a
+/// program granted `n` capabilities uses. (`"stderr"` is appended last — a second write-only
+/// `Stream`, distinct from `"stdout"` so `eprintln!`/fd 2 capture separately; grant order keeps the
+/// earlier indices stable.) (`"blocking"` left this vocabulary with CONSOLIDATION §5a
 /// — the mock `Blocking` cap is test-only wiring now; a test harness that grants it registers the
 /// name itself, and an unregistered resolve fails closed. `"ioring"` left with the §12
 /// parking-on-blocking re-measure, 2026-08-07 — blocking host calls park instead; the retired
 /// ring's iface id 9 stays reserved.)
-pub const POWERBOX_CAP_NAMES: [&str; 6] = ["stdout", "stdin", "exit", "memory", "addrspace", "jit"];
+pub const POWERBOX_CAP_NAMES: [&str; 7] = [
+    "stdout",
+    "stdin",
+    "exit",
+    "memory",
+    "addrspace",
+    "jit",
+    "stderr",
+];
 /// The guest heap's bump-pointer word (`i64`) at window offset 32 (page 0 is reserved scratch).
 /// Seeded by a frontend's `_start` (to the window's mapped boundary) when the program allocates.
 pub const POWERBOX_HEAP_BRK: u64 = 32;
