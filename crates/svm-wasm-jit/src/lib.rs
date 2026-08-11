@@ -111,7 +111,9 @@ pub enum FuelMode {
     None,
 }
 
-/// The wasm global index of the fuel counter in [`FuelMode::Global`] (the only declared global).
+/// The wasm global index of the fuel counter in [`FuelMode::Global`] — global 0, emitted first so the
+/// `mapped` global (below) follows it. (`FuelMode::Memory`/`None` declare no fuel global, so `mapped`
+/// takes index 0 there — see [`mapped_global_idx`].)
 const FUEL_GLOBAL_IDX: u32 = 0;
 /// The fuel global's instantiation-time default — the standard per-region budget every host seed
 /// site writes (`1 << 61`). Because the global self-initializes to this, an emitted module runs
@@ -120,6 +122,18 @@ const FUEL_GLOBAL_IDX: u32 = 0;
 /// export to a smaller value before the call. This keeps fuel-in-global a drop-in for the shipped
 /// linear-memory-cell seeding: the old `env`-cell write becomes a no-op, the budget is unchanged.
 const FUEL_DEFAULT: i64 = 1 << 61;
+
+/// The wasm global index of the **live window `mapped` size** (#717 / issue: wasm-JIT confines against
+/// the compile-time `mapped`). The emitted bounds check (`emit_confine`/`emit_span_check`) reads this
+/// global via `global.get` instead of a baked `1 << size_log2`, so an access into memory the guest grew
+/// at runtime via `vm_map` no longer spuriously faults on the JIT where the interpreter admits it. The
+/// global self-initializes to the emit-time `1 << size_log2`, so a host that never grows the window sees
+/// behavior **identical** to the old constant; a growing host writes the live size through the exported
+/// `"mapped"` global (kept in sync by the `vm_map` cross-tier handler). It sits *after* the fuel global
+/// when one is present, so its index is `1` under [`FuelMode::Global`] and `0` otherwise.
+fn mapped_global_idx(fuel_mode: FuelMode) -> u32 {
+    (fuel_mode == FuelMode::Global) as u32
+}
 
 // ---- wasm binary encoding primitives -------------------------------------------------------------
 
@@ -2395,23 +2409,39 @@ fn emit_module(
         section(&mut out, 4, &sec);
     }
 
-    if fuel_mode == FuelMode::Global {
-        // Global section (6): one mutable `i64` fuel counter, self-initialized to the standard
-        // per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
-        // or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check` — a
-        // register-allocatable counter that no guest memory store can alias.
+    {
+        // Global section (6): the emitted module's mutable `i64` globals, in index order.
+        //  * global 0 (`FuelMode::Global` only) — the fuel counter, self-initialized to the standard
+        //    per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
+        //    or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check`.
+        //  * global `mapped_global_idx(fuel_mode)` — the live window `mapped` size (#717), self-
+        //    initialized to the emit-time `1 << size_log2`. A host that never grows behaves exactly as
+        //    the old baked constant; a `vm_map`-growing host writes the live size via the `"mapped"`
+        //    export, and `emit_confine`/`emit_span_check` read it live. Register-allocatable; no guest
+        //    store can alias it.
         let mut sec = Vec::new();
-        uleb(&mut sec, 1); // one global
+        let has_fuel_global = fuel_mode == FuelMode::Global;
+        uleb(&mut sec, 1 + has_fuel_global as u64);
+        if has_fuel_global {
+            sec.push(0x7e); // i64
+            sec.push(0x01); // mutable
+            sec.push(OP_I64_CONST);
+            sleb64(&mut sec, FUEL_DEFAULT);
+            sec.push(OP_END);
+        }
+        // The `mapped` global: default = the emit-time window size (`1 << size_log2`).
         sec.push(0x7e); // i64
         sec.push(0x01); // mutable
         sec.push(OP_I64_CONST);
-        sleb64(&mut sec, FUEL_DEFAULT);
+        sleb64(&mut sec, mapped as i64);
         sec.push(OP_END);
         section(&mut out, 6, &sec);
     }
 
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
-    let n_exports = emitted.len() as u64 + (fuel_mode == FuelMode::Global) as u64;
+                              // One `f{i}` per emitted function, the `"mapped"` global (always — #717 host sync), and the
+                              // `"fuel"` global when one is declared (`FuelMode::Global`).
+    let n_exports = emitted.len() as u64 + 1 + (fuel_mode == FuelMode::Global) as u64;
     uleb(&mut sec, n_exports);
     for &fi in emitted {
         let name = format!("f{fi}");
@@ -2426,6 +2456,14 @@ fn emit_module(
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x03); // global export kind
         uleb(&mut sec, FUEL_GLOBAL_IDX as u64);
+    }
+    {
+        // The live-`mapped` global (#717): exported so a `vm_map`-growing host can write the live size.
+        let name = "mapped";
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x03); // global export kind
+        uleb(&mut sec, mapped_global_idx(fuel_mode) as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -2607,6 +2645,10 @@ struct FnCtx {
     depth: u32,
     /// Where the per-dispatch fuel debit reads/writes its counter.
     fuel_mode: FuelMode,
+    /// Wasm global index of the live-`mapped` window size (#717). `emit_confine`/`emit_span_check`
+    /// read it via `global.get` instead of a baked `1 << size_log2`, so a `vm_map`-grown window no
+    /// longer spuriously faults a legitimate access on the JIT. See [`mapped_global_idx`].
+    mapped_global_idx: u32,
 }
 
 impl FnCtx {
@@ -2729,6 +2771,7 @@ fn emit_func(
         atomic_addr_l,
         depth: 0,
         fuel_mode,
+        mapped_global_idx: mapped_global_idx(fuel_mode),
     };
 
     let mut code = Vec::new();
@@ -2895,10 +2938,9 @@ fn emit_confine(
     addr_local: u32,
     offset: u64,
     width: u64,
-    mapped: u64,
     elide: bool,
 ) {
-    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, mapped, false, elide)
+    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, false, elide)
 }
 
 /// Like [`emit_confine`] but, when `align`, also traps `MemoryFault` on a **misaligned** effective
@@ -2913,15 +2955,16 @@ fn emit_confine(
 /// would raise — a trap-parity divergence the interpreter differential catches — never a
 /// confinement escape. (The native JIT, which also drops the clamp on proof, is the escape-critical
 /// consumer of the same predicate; here we keep the clamp, a strictly safer subset.) The alignment
-/// trap is **independent of bounds** and is emitted whenever `align`, elided or not.
-#[allow(clippy::too_many_arguments)]
+/// trap is **independent of bounds** and is emitted whenever `align`, elided or not. The elision proof
+/// uses the emit-time `mapped` (`elide_access`), a *lower* bound on the live [`mapped_global_idx`] size
+/// the trap branch actually reads (#717) — the window only grows, so a proven-bounded access stays
+/// bounded.
 fn emit_confine_maybe_aligned(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
     addr_local: u32,
     offset: u64,
     width: u64,
-    mapped: u64,
     align: bool,
     elide: bool,
 ) {
@@ -2933,9 +2976,16 @@ fn emit_confine_maybe_aligned(
     code.push(OP_LOCAL_TEE);
     uleb(code, cx.ea_l as u64);
     if !elide {
+        // eff > live_mapped - width ?  — #717: the bound is the **live** window size, read from the
+        // `mapped` global (default = the emit-time `1 << size_log2`) rather than a baked constant, so
+        // an access into a `vm_map`-grown region no longer faults on the JIT where the interpreter
+        // admits it. `i64.sub` wraps exactly like the old `mapped.wrapping_sub(width)` constant did.
+        code.push(0x23); // global.get
+        uleb(code, cx.mapped_global_idx as u64);
         code.push(OP_I64_CONST);
-        sleb64(code, mapped.wrapping_sub(width) as i64);
-        code.push(0x56); // i64.gt_u: eff > mapped - width ?
+        sleb64(code, width as i64);
+        code.push(0x7d); // i64.sub → live_mapped - width
+        code.push(0x56); // i64.gt_u: eff > live_mapped - width ?
         code.push(OP_IF);
         code.push(BLOCKTYPE_VOID);
         cx.depth += 1;
@@ -2990,28 +3040,24 @@ fn emit_bulk_guard_open(cx: &mut FnCtx, code: &mut Vec<u8>, len_local: u32) {
 
 /// **Whole-span confinement** for a bulk op (`memory.copy`/`memory.fill`) — the `len`-is-a-value
 /// analogue of [`emit_confine`], and the security hinge for D62 bulk memory. Traps `MemoryFault` unless
-/// the span `[base, base+len)` lies within `[0, mapped)` — matching the interpreter's `confine_span` +
-/// `check_prot_span` net behaviour over a fresh window (a span above `mapped` is uncommitted → faults),
-/// and keeping every accessed byte inside the physical window (never the adjacent linear memory). The
-/// check is **overflow-safe**: `base > mapped` then `len > mapped - base` (the second computed only
-/// once `base <= mapped`, so `mapped - base` can't underflow and `base + len` can't overflow).
+/// the span `[base, base+len)` lies within `[0, live_mapped)` — matching the interpreter's
+/// `confine_span`/`check_prot_span` net behaviour (a span above the live `mapped` is uncommitted →
+/// faults), and keeping every accessed byte inside the physical window (never the adjacent linear
+/// memory). The bound is the **live** window size read from the [`mapped_global_idx`] global (#717),
+/// not a baked constant, so a `vm_map`-grown span no longer faults where the interpreter admits it. The
+/// check is **overflow-safe**: `base > live_mapped`, then (only once `base <= live_mapped`)
+/// `len > live_mapped - base`, so `live_mapped - base` can't underflow and `base + len` can't overflow.
 ///
 /// Called **inside an `if len != 0` guard** (see the lowering in `emit_block_body`), so `len >= 1`
-/// here and a passed check guarantees `base < mapped` — which makes [`emit_win_addr`]'s mask a no-op.
+/// here and a passed check guarantees `base < live_mapped` — making [`emit_win_addr`]'s mask a no-op.
 /// Emits nothing to the operand stack; call [`emit_win_addr`] afterwards for each span's confined
 /// address.
-fn emit_span_check(
-    cx: &mut FnCtx,
-    code: &mut Vec<u8>,
-    base_local: u32,
-    len_local: u32,
-    mapped: u64,
-) {
-    // trap if base > mapped
+fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_local: u32) {
+    // trap if base > live_mapped  (#717: live window size from the `mapped` global, not a constant)
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, mapped as i64);
+    code.push(0x23); // global.get
+    uleb(code, cx.mapped_global_idx as u64);
     code.push(0x56); // i64.gt_u
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
@@ -3019,15 +3065,15 @@ fn emit_span_check(
     emit_trap(code, TRAP_MEMORY_FAULT);
     code.push(OP_END);
     cx.depth -= 1;
-    // trap if len > mapped - base
+    // trap if len > live_mapped - base
     code.push(OP_LOCAL_GET);
     uleb(code, len_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, mapped as i64);
+    code.push(0x23); // global.get
+    uleb(code, cx.mapped_global_idx as u64);
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
-    code.push(0x7d); // i64.sub → mapped - base (base <= mapped here)
-    code.push(0x56); // i64.gt_u: len > mapped - base
+    code.push(0x7d); // i64.sub → live_mapped - base (base <= live_mapped here)
+    code.push(0x56); // i64.gt_u: len > live_mapped - base
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
@@ -3193,7 +3239,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
@@ -3213,7 +3258,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 get(code, cx, *value);
@@ -3233,7 +3277,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
@@ -3254,7 +3297,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
@@ -3277,7 +3319,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
@@ -3319,7 +3360,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
                 );
@@ -3360,7 +3400,7 @@ fn emit_block_body(
                 let dl = cx.local_of[k][*dst as usize];
                 let ll = cx.local_of[k][*len as usize];
                 emit_bulk_guard_open(cx, code, ll);
-                emit_span_check(cx, code, dl, ll, mapped);
+                emit_span_check(cx, code, dl, ll);
                 emit_win_addr(code, dl); // dest addr (i32)
                 get(code, cx, *val); // fill byte (already i32)
                 get(code, cx, *len);
@@ -3376,8 +3416,8 @@ fn emit_block_body(
                 let sl = cx.local_of[k][*src as usize];
                 let ll = cx.local_of[k][*len as usize];
                 emit_bulk_guard_open(cx, code, ll);
-                emit_span_check(cx, code, dl, ll, mapped);
-                emit_span_check(cx, code, sl, ll, mapped);
+                emit_span_check(cx, code, dl, ll);
+                emit_span_check(cx, code, sl, ll);
                 emit_win_addr(code, dl); // dest addr (i32)
                 emit_win_addr(code, sl); // src addr (i32)
                 get(code, cx, *len);
@@ -3648,7 +3688,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     16,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, 16, mapped),
                 );
                 emit_simd(code, 0); // v128.load
@@ -3667,7 +3706,6 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     16,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, 16, mapped),
                 );
                 get(code, cx, *value);
