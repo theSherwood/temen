@@ -99,8 +99,8 @@ What lives where, so nothing is double-maintained:
   issues (live items) and otherwise left to git history. Do not recreate it; file
   an issue instead. Old `ISSUES.md I##` references in code comments are frozen
   provenance — resolve them via `git log`.
-- **`TODO.md`** — the legacy index of deferred work; the board supersedes it for
-  indexing open work. Migrate a row to an issue when it goes active.
+- **`TODO.md`** — **retired.** Its live rows were migrated to issues; parked /
+  reserved / future rows remain in git history. The board is the index of open work.
 
 ## Closing
 
