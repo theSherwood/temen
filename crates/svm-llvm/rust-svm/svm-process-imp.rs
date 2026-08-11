@@ -139,36 +139,18 @@ impl Command {
             return Err(unsupported_err());
         }
 
-        // Resolve the stdout disposition and, if it redirects fd 1, bracket the spawn so the parent's
-        // fd 1 is restored afterwards. `captured` is the read end handed back for `output` to drain.
-        let stdout_cfg = self.stdout.as_ref().unwrap_or(&default);
-        let mut captured: Option<Pipe> = None;
-        let mut saved_fd1: Option<i32> = None;
-        let mut discard: Option<Pipe> = None;
-        match stdout_cfg {
-            Stdio::MakePipe => {
-                let (read_end, write_end) = pipe::pipe()?;
-                saved_fd1 = redirect_fd1(write_end.fd());
-                captured = Some(read_end);
-                // `write_end` drops here; `dup2` gave fd 1 its own reference to the shared FIFO.
+        // Bracket the spawn with the stdout (fd 1) and stderr (fd 2) redirects the dispositions ask for,
+        // restoring both afterwards so a capture never leaks to the parent's own fd 1 / fd 2. Each
+        // `Stream` carries its captured read end (`MakePipe`), the saved fd to restore, and a discard
+        // read end (`Null`). If the stderr setup fails, the stdout redirect is unwound before bailing.
+        let out_stream = setup_stream(self.stdout.as_ref().unwrap_or(&default), 1)?;
+        let err_stream = match setup_stream(self.stderr.as_ref().unwrap_or(&default), 2) {
+            Ok(s) => s,
+            Err(e) => {
+                out_stream.restore();
+                return Err(e);
             }
-            Stdio::Null => {
-                let (read_end, write_end) = pipe::pipe()?;
-                saved_fd1 = redirect_fd1(write_end.fd());
-                discard = Some(read_end); // drained-then-dropped below: the child's output is discarded
-            }
-            Stdio::Fd(p) => {
-                saved_fd1 = redirect_fd1(p.fd());
-            }
-            Stdio::InheritFile(_) => {
-                return Err(io::const_error!(
-                    io::ErrorKind::Unsupported,
-                    "file-backed child stdio is not supported on svm"
-                ));
-            }
-            // Inherit / ParentStdout / ParentStderr: the child writes to the parent's fd 1.
-            Stdio::Inherit | Stdio::ParentStdout | Stdio::ParentStderr => {}
-        }
+        };
 
         // argv: the args as a NUL-separated blob (`argv[0]` is the program, set by `Command::new`).
         let mut argv: Vec<u8> = Vec::new();
@@ -181,41 +163,111 @@ impl Command {
         let name = self.program.as_encoded_bytes();
         let pid = host::spawn(name.as_ptr(), name.len() as i64, argv.as_ptr(), argv.len() as i64);
 
-        // Restore the parent's fd 1 before returning, whatever happened.
-        if let Some(s) = saved_fd1 {
-            host::dup2(s as i64, 1);
-            let _ = host::close(s as i64);
-        }
-        // For `Null`, drop the discarded output so the FIFO/read-end fd is released.
-        drop(discard);
+        // Restore the parent's fd 1 / fd 2 before returning, whatever happened.
+        let captured_out = out_stream.captured;
+        let captured_err = err_stream.captured;
+        out_stream.saved.restore_to(1);
+        err_stream.saved.restore_to(2);
 
         if pid < 0 {
             return Err(err(pid));
         }
-        let pipes = StdioPipes { stdin: None, stdout: captured, stderr: None };
+        let pipes = StdioPipes { stdin: None, stdout: captured_out, stderr: captured_err };
         Ok((Process { pid: pid as i32, status: None }, pipes))
     }
 }
 
-/// Save the parent's fd 1 (via `dup`) and point fd 1 at `fd`, returning the saved fd to restore later
-/// (`None` if the save failed — then fd 1 is not restored, which is acceptable for a discard sink).
-fn redirect_fd1(fd: i32) -> Option<i32> {
-    let saved = host::dup(1);
-    host::dup2(fd as i64, 1);
+/// The redirect state for one child stream (fd 1 or fd 2): the captured read end handed back for
+/// `output` to drain (`MakePipe`), the saved original fd to restore, and a discard read end (`Null`,
+/// dropped after the spawn so its FIFO is released).
+struct Stream {
+    captured: Option<Pipe>,
+    saved: Saved,
+    _discard: Option<Pipe>,
+}
+
+impl Stream {
+    /// Restore this stream's redirected fd immediately (error-unwind path, before the spawn).
+    fn restore(self) {
+        // The target fd is encoded in `saved`; restore it and drop the pipes.
+        self.saved.restore();
+    }
+}
+
+/// A saved fd (from `dup`) plus the target it shadows, so it can be restored exactly once.
+struct Saved {
+    fd: Option<i32>,
+    target: i64,
+}
+
+impl Saved {
+    fn restore(self) {
+        self.restore_to(self.target);
+    }
+    fn restore_to(&self, target: i64) {
+        if let Some(s) = self.fd {
+            host::dup2(s as i64, target);
+            let _ = host::close(s as i64);
+        }
+    }
+}
+
+/// Set up the redirect for one child stream (`target_fd` = 1 for stdout, 2 for stderr) per `cfg`. For
+/// `MakePipe`/`Null` a fresh pipe's write end is `dup2`'d onto `target_fd` (its read end kept as the
+/// capture, or dropped for `Null`); `Fd` redirects to an existing pipe; `InheritFile` is unsupported;
+/// the inherit/parent variants leave the fd alone (the child writes to the parent's stream).
+fn setup_stream(cfg: &Stdio, target_fd: i64) -> io::Result<Stream> {
+    let saved = |fd| Saved { fd, target: target_fd };
+    match cfg {
+        Stdio::MakePipe => {
+            let (read_end, write_end) = pipe::pipe()?;
+            let s = redirect_fd(target_fd, write_end.fd());
+            Ok(Stream { captured: Some(read_end), saved: saved(s), _discard: None })
+        }
+        Stdio::Null => {
+            let (read_end, write_end) = pipe::pipe()?;
+            let s = redirect_fd(target_fd, write_end.fd());
+            Ok(Stream { captured: None, saved: saved(s), _discard: Some(read_end) })
+        }
+        Stdio::Fd(p) => {
+            let s = redirect_fd(target_fd, p.fd());
+            Ok(Stream { captured: None, saved: saved(s), _discard: None })
+        }
+        Stdio::InheritFile(_) => Err(io::const_error!(
+            io::ErrorKind::Unsupported,
+            "file-backed child stdio is not supported on svm"
+        )),
+        // Inherit / ParentStdout / ParentStderr: leave the fd; the child writes to the parent's stream.
+        Stdio::Inherit | Stdio::ParentStdout | Stdio::ParentStderr => {
+            Ok(Stream { captured: None, saved: saved(None), _discard: None })
+        }
+    }
+}
+
+/// Save `target` (via `dup`) and point it at `source`, returning the saved fd (`None` if the save
+/// failed — then `target` is not restored, acceptable for a discard sink).
+fn redirect_fd(target: i64, source: i32) -> Option<i32> {
+    let saved = host::dup(target);
+    host::dup2(source as i64, target);
     (saved >= 0).then_some(saved as i32)
 }
 
-/// `Command::output`: capture stdout (stderr is not separately captured by the host spawn model, so it
-/// comes back empty). Mirrors the generic `output` in `sys::process` but for the synchronous spawn.
+/// `Command::output`: capture both the child's stdout and stderr (the host spawn now routes stderr to
+/// fd 2, which our `MakePipe` redirect turns into a capturable pipe). Mirrors the generic `output` in
+/// `sys::process` but for the synchronous spawn.
 pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
     drop(pipes.stdin.take());
     let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     if let Some(out) = pipes.stdout.take() {
         out.read_to_end(&mut stdout)?;
     }
+    if let Some(err) = pipes.stderr.take() {
+        err.read_to_end(&mut stderr)?;
+    }
     let status = process.wait()?;
-    Ok((status, stdout, Vec::new()))
+    Ok((status, stdout, stderr))
 }
 
 impl From<ChildPipe> for Stdio {

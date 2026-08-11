@@ -22,7 +22,7 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | `svm-env-imp.rs` | The env module (copied to `sys/env/svm.rs`). `getenv`/`setenv`/`unsetenv`/`vars` reach the posix env map via the `host` bridge's **buffer-writing** ops (`OP_GETENV_R`/`OP_SETENV`/`OP_UNSETENV`/`OP_ENVIRON`) — copies into guest memory, no personality arena. |
 | `svm-fs-imp.rs` | The fs module (copied to `sys/fs/svm.rs`). `File` (open/read/write/seek/`try_clone`), `metadata`/`read_dir`/`remove_file`/`exists`, and the directory ops `create_dir`/`create_dir_all`/`rename`/`remove_dir` reach the personality's in-memory filesystem via the `host` bridge's file ops (`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_LSEEK`/`OP_CLOSE`/`OP_UNLINK`/`OP_STAT`/`OP_OPENDIR`/`OP_READDIR`/`OP_CLOSEDIR`/`OP_MKDIR`/`OP_RENAME`/`OP_RMDIR`/`OP_DUP`). The memfs has no symlinks or mutable perms, so `lstat==stat`, perms are always-writable, and `symlink`/hard-link/perms/times/`canonicalize` stay `Unsupported`. Needs a granted `posix` cap. |
 | `svm-pipe-imp.rs` | The anonymous-pipe module (copied to `sys/pipe/svm.rs`). `sys::pipe::Pipe` is a pair of fds over one in-personality byte FIFO (`OP_PIPE`), read/written through `OP_READ`/`OP_WRITE` and closed on drop — the plumbing `std::process` captures child stdout through. |
-| `svm-process-imp.rs` | The process module (copied to `sys/process/svm.rs`). `std::process::Command` over the personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`): a spawn runs the named command to completion synchronously, `output` captures stdout via an `OP_PIPE`+`OP_DUP2` fd-1 redirect (saved/restored around the spawn), and `wait`/`status` reap the exit code. The command is resolved by the embedder's spawn delegate (`Posix::set_spawn`); without one, spawning is `Unsupported`. Synchronous model ⇒ no live child to stream stdin into (stdin is whatever fd 0 holds) and stderr isn't separately captured. |
+| `svm-process-imp.rs` | The process module (copied to `sys/process/svm.rs`). `std::process::Command` over the personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`): a spawn runs the named command to completion synchronously, `output` captures **stdout and stderr** via `OP_PIPE`+`OP_DUP2` fd-1 / fd-2 redirects (saved/restored around the spawn), and `wait`/`status` reap the exit code. The command is resolved by the embedder's spawn delegate (`Posix::set_spawn` → `SpawnResult { stdout, stderr, status }`); without one, spawning is `Unsupported`. Synchronous model ⇒ no live child to stream stdin into (stdin is whatever fd 0 holds). |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -90,9 +90,10 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   ops `OP_MKDIR`/`OP_RENAME`/`OP_RMDIR` + `OP_DUP`). Tracked in RUST_STD.md.
 - **process caveats:** spawn is **fork-free and synchronous** (the child runs to
   completion inside `spawn`), so there is no live child to stream stdin into
-  (`StdioPipes` yields no writable stdin), stderr isn't separately captured
-  (`output().stderr` is empty), and `Command::spawn` returns an already-exited
-  child. `fork`/`exec`-in-place stay parked. Tracked in RUST_STD.md.
+  (`StdioPipes` yields no writable stdin — a piped-stdin write after `spawn` can't
+  reach an already-exited child; the child's stdin is whatever fd 0 holds at spawn),
+  and `Command::spawn` returns an already-exited child. `output()` **does** capture
+  both stdout and stderr. `fork`/`exec`-in-place stay parked. Tracked in RUST_STD.md.
 
 ## Reproducibility note
 

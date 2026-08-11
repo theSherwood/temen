@@ -574,18 +574,31 @@ fn std_process_round_trips() {
          \x20   println!(\"false_code={:?}\", st.code());\n\
          \x20   let mut child = Command::new(\"true\").stdout(Stdio::null()).spawn().expect(\"spawn\");\n\
          \x20   println!(\"true_ok={}\", child.wait().expect(\"wait\").success());\n\
+         \x20   let noisy = Command::new(\"noisy\").output().expect(\"output\");\n\
+         \x20   println!(\"noisy_out={:?}\", String::from_utf8_lossy(&noisy.stdout).trim_end());\n\
+         \x20   println!(\"noisy_err={:?}\", String::from_utf8_lossy(&noisy.stderr).trim_end());\n\
          \x20   println!(\"pid={}\", std::process::id());\n\
          }\n";
 
     let Some((stdout, _)) = svm_run_std_posix("svm_std_process", src, |p| {
         p.set_spawn(|name: &str, argv: &[String], _stdin: &[u8]| {
-            let (stdout, status) = match name {
-                "echo" => (format!("{}\n", argv[1..].join(" ")).into_bytes(), 0),
-                "true" => (Vec::new(), 0),
-                "false" => (Vec::new(), 1),
-                _ => (Vec::new(), 127),
+            let (stdout, stderr, status) = match name {
+                "echo" => (
+                    format!("{}\n", argv[1..].join(" ")).into_bytes(),
+                    Vec::new(),
+                    0,
+                ),
+                "true" => (Vec::new(), Vec::new(), 0),
+                "false" => (Vec::new(), Vec::new(), 1),
+                // Emits on *both* streams, so `output()` capturing stderr separately is exercised.
+                "noisy" => (b"on stdout\n".to_vec(), b"on stderr\n".to_vec(), 0),
+                _ => (Vec::new(), Vec::new(), 127),
             };
-            svm_posix::SpawnResult { stdout, status }
+            svm_posix::SpawnResult {
+                stdout,
+                stderr,
+                status,
+            }
         })
     }) else {
         eprintln!("note: skipping std_guest process (build-std produced no .ll)");
@@ -597,8 +610,10 @@ fn std_process_round_trips() {
          echo_stdout=\"hello world\"\n\
          false_code=Some(1)\n\
          true_ok=true\n\
+         noisy_out=\"on stdout\"\n\
+         noisy_err=\"on stderr\"\n\
          pid=1\n",
-        "Command output/status/spawn+wait round-trip through the posix cap's fork-free spawn"
+        "Command output (stdout+stderr)/status/spawn+wait round-trip through the fork-free spawn"
     );
 }
 
