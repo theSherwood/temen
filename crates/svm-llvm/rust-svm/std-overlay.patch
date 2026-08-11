@@ -1,0 +1,59 @@
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -113,6 +113,10 @@
+         mod zkvm;
+         use zkvm as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+ }
+ 
+ pub use imp::{alloc, dealloc, realloc};
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -30,6 +30,7 @@
+         target_os = "zkvm",
+         target_os = "trusty",
+         target_os = "vexos",
++        target_os = "svm",
+     ) => {
+         mod no_threads;
+         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
+@@ -101,6 +102,7 @@
+             target_os = "zkvm",
+             target_os = "trusty",
+             target_os = "vexos",
++            target_os = "svm",
+         ) => {
+             pub(crate) fn enable() {
+                 // FIXME: Right now there is no concept of "thread exit" on
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -107,6 +107,7 @@
+         target_os = "xous",
+         target_os = "vexos",
+         target_os = "l4re",
++        target_os = "svm",
+     ) => {
+         // FIXME: finally remove std support for wasm32-unknown-unknown
+         // FIXME: add random data generation to xous
+@@ -124,6 +125,7 @@
+     target_os = "xous",
+     target_os = "vexos",
+     target_os = "l4re",
++    target_os = "svm",
+ )))]
+ pub fn hashmap_random_keys() -> (u64, u64) {
+     let mut buf = [0; 16];
+--- a/library/std/src/sys/io/error/mod.rs
++++ b/library/std/src/sys/io/error/mod.rs
+@@ -33,6 +33,7 @@
+     }
+     any(
+         target_os = "vexos",
++        target_os = "svm",
+         target_family = "wasm",
+         target_os = "zkvm",
+         target_os = "trusty",

@@ -6,10 +6,12 @@ The analog of `NIM.md` for this workstream; fold completed sections into `DESIGN
 and drop this file once the actionable gaps close (the repo convention, cf. the former
 `WASM.md`).
 
-> Status: **scoping complete, no slices started.** `core`+`alloc` Rust is done and
-> byte-identical to native (`LLVM.md` slices AH–AM); full `std` has never run
-> (`NIM.md` §3e names the blockers). Route decision recorded below (§1, §4). First
-> implementation slice is S0+S1 (§8).
+> Status: **S0 landed — `std` builds for `os=svm`; first on-ramp gap located.**
+> `core`+`alloc` Rust was already byte-identical to native (`LLVM.md` slices AH–AM);
+> as of 2026-08-11 real `std` **compiles** for a custom `x86_64-unknown-svm` target
+> (`crates/svm-llvm/rust-svm/`, §8 S0). The LTO'd std IR's undefined externals are
+> 100% within the on-ramp's already-supported set; the first gap is the textual `.ll`
+> **parser** on std's global-initializer shapes (§9). Route decision in §1/§4.
 
 Section numbers like "§7" refer to `DESIGN.md` unless prefixed with a file; "D54" etc. are its
 Decision Log; "I55" is `ISSUES.md`.
@@ -90,16 +92,18 @@ State the ops need — fd table, memfs, cwd, env map, argv — already lives hos
 
 ## 4. Alternatives considered — final review (recorded so we don't re-litigate)
 
-- **A. Custom `std::sys` platform ("PAL") for an svm target — CHOSEN.** A target JSON
-  (`x86_64-unknown-svm.json`-shaped, `panic-strategy: "abort"`) + `-Zbuild-std` + a small
-  platform module patched into the toolchain's `rust-src`. The in-tree precedent is exactly
-  this shape: a PAL is a contained directory (`library/std/src/sys/`), and the `wasi`/`sgx`
-  PALs show the pattern of re-exporting the `unsupported` PAL for everything not implemented,
-  overriding only `stdio`/`fs`/`env`/`args`/`time`/`alloc`. The PAL talks `__vm_host_call`
-  directly (§3), so struct layouts are **ours** (no reconciliation): `stat` is svm-posix's
+- **A. Custom `std::sys` platform ("PAL") for an svm target — CHOSEN, S0 done.** A target JSON
+  (`x86_64-unknown-svm.json`, `panic-strategy: "abort"`, `singlethread: true`) + `-Zbuild-std` +
+  a small overlay patched into the toolchain's `rust-src`. **S0 built `std` this way**
+  (`crates/svm-llvm/rust-svm/`): the PAL (`sys/pal/`) already has a clean `_ => unsupported`
+  fallback, so the overlay is just **five one-line `cfg_select!` arm additions** routing
+  `target_os="svm"` to the minimal no-OS/single-thread leaf-module impls (the same ones
+  `vexos`/`zkvm` use, in `sys/{alloc,thread_local,random,io/error}`) plus one ~85-line
+  allocator `imp` forwarding to the C `malloc` family. The PAL talks `__vm_host_call` directly
+  (§3), so struct layouts are **ours** (no reconciliation): `stat` is svm-posix's
   `{st_mode, st_size}`, timestamps are whatever the Clock op returns. Cost: a rust-src overlay
-  patch to rebase when the pinned nightly moves — contained, mechanical, and entirely in
-  guest/untrusted code.
+  patch to rebase when the pinned nightly moves — contained (13 added lines), mechanical, and
+  entirely in guest/untrusted code.
 - **B. Reuse `std::sys::unix` via a Linux-claiming triple + a guest `svm-libc` shim —
   REJECTED.** No std fork, but the price is the libc-crate ABI: ~50–80 symbols including
   `pthread_mutex_*`/`pthread_key_*` TLS, `sigaction`, `mmap`, glibc struct layouts to
@@ -114,10 +118,15 @@ State the ops need — fd table, memfs, cwd, env map, argv — already lives hos
   Note the wasm on-ramp remains the stated Path-W end-goal for *self-hosting* (`NIM.md` §3e
   slice 5) — that workstream is unaffected; it targets `wasm32-unknown-unknown` (no WASI)
   precisely because `svm-wasi` stays thin.
-- **D. `restricted_std` (custom target, unpatched std) — S0 ONLY.** `-Zbuild-std` against an
-  unknown target compiles `std` with the `unsupported` PAL: programs link and run but every
-  platform call errors. Useless as a destination, **perfect as the S0 smoke test** that the
-  target JSON + build-std + translate + link lane works before the PAL exists.
+- **D. `restricted_std` (custom target, *unpatched* std) — FOUND INSUFFICIENT.** The original
+  plan was to use `restricted_std` as a no-PAL S0 smoke test. **S0 disproved this for a novel
+  OS:** modern std's leaf modules (`sys/{alloc,thread_local,random,io/error}`) enumerate
+  `target_os` with **no catch-all**, so an unknown `os=svm` fails to *build* with missing-symbol
+  errors — even though the PAL itself falls back to `unsupported`. The minimum buildable overlay
+  is therefore the five `svm` leaf-arms + one alloc `imp` (Alternative A, now done). This is why
+  S0 and S1 partly merge: "std that builds but errors at runtime" is not free for a new OS. The
+  overlay still uses the `unsupported` PAL for I/O, so S0's std *runs* only pure compute; real
+  stdio/fs/args wait for the S1 PAL.
 - **E. No-`std`-at-all forever (status quo) — REJECTED** by the premise: `no_std + alloc`
   blocks every crate that touches `std::io`/`fs`/`time` even incidentally, which is most of
   crates.io — the breadth D54 exists to buy.
@@ -127,7 +136,7 @@ State the ops need — fd table, memfs, cwd, env map, argv — already lives hos
 | Pin | Value | Why |
 |---|---|---|
 | Panic strategy | `panic=abort` (target JSON + `-Zbuild-std=std,panic_abort`) | Sidesteps unwinding entirely; EH (`invoke`/`landingpad`) is planned substrate, not built (`LLVM.md` §"setjmp/longjmp + C++ EH"). Panic *messages* still format and print via the PAL's stderr before the abort → trap. |
-| Threading | **Single-threaded v1.** `thread::spawn` → unsupported `io::Error`; `Mutex`/`RwLock`/`Once` single-thread trivial; TLS via plain statics (`has-thread-local` off, PAL key-based TLS over a static table) | The one big deferrable. svm has a threading model (`THREADS.md`) but wiring std's thread/futex/TLS backend is its own project (S5). |
+| Threading | **Single-threaded v1** via `singlethread: true` in the target JSON (the `zkvm` posture: single-thread, atomics still available). Selects std's `no_threads` sync (`Mutex` = `Cell`) and static TLS automatically. `thread::spawn` → unsupported `io::Error` | The one big deferrable. svm has a threading model (`THREADS.md`) but wiring std's thread/futex/TLS backend is its own project (S5). **S0 note:** `singlethread` is load-bearing — without it std sees `target_has_threads` and `compile_error!`s the `no_threads` impls. |
 | Errno | In-band negative returns → `io::Error`; no errno TLS | INVARIANTS §5; §3 above. |
 | Allocator | PAL `sys::alloc` → `extern "C" malloc/free` → synthesized guest bump allocator | Zero host crossings; already built (slice S). |
 | `stat`/time layouts | svm-posix's, verbatim (`{st_mode, st_size}`; Clock op's epoch/units) | The PAL is the only consumer — no reconciliation layer. |
@@ -160,8 +169,8 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 
 | # | Slice | Needs | Proves / test |
 |---|---|---|---|
-| **S0** | Target JSON + pinned nightly + `-Zbuild-std` (restricted-std, no PAL); `fn main(){}` → `.ll` → translate → verify → run on both backends | toolchain script; asset-lane CI check (guest builds live outside the per-PR gate — I55, the `chibicc.svmb` template) | The build lane exists. Also answers the §9 `llvm.trap`/defined-panic-symbol risks on a real `std` module. |
-| **S1** | Minimal PAL: `stdio` (posix ops 0/1), `exit` (4), `args` (17/18), `alloc` (extern malloc); `println!` + `process::exit` + `env::args` | S0 | **First `std` hello-world byte-identical to native rustc** — the `check_powerbox_vs_native` analog, in `crates/svm-llvm/tests/` beside `w5_rust_guest.rs`. |
+| **S0** | ✅ **DONE (2026-08-11).** Target JSON + nightly `-Zbuild-std` + the minimal svm overlay (`crates/svm-llvm/rust-svm/`); `std` compiles for `os=svm`, and a fat-LTO'd pure-compute crate emits one self-contained `.ll` whose undefined externals are all on-ramp-supported. | overlay (5 leaf-arms + alloc `imp`); asset-lane CI check still TODO (I55) | The build lane exists; the route is validated. **Surfaced the first S1 gap** (parser, §9) rather than the anticipated `llvm.trap` one (that intrinsic is already handled). |
+| **S1** | (a) **On-ramp parser: accept std's global-initializer forms** — packed structs `<{ [24 x i8], ptr, … }>` with embedded byte arrays + pointer relocations, `!guid` on globals (§9). (b) Minimal PAL: `stdio` (posix 0/1), `exit` (4), `args` (17/18); `println!`+`process::exit`+`env::args` over `__vm_host_call`. | S0; posix `write`/`exit`/`argv` (present) | Real std IR *translates+runs*; then **first `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog, beside `w5_rust_guest.rs`. |
 | **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |
@@ -172,26 +181,34 @@ crate *without* the `no_std + alloc` rework `NIM.md` §3e slice 2 currently assu
 fixed-seed hasher lands here as the PAL default instead of a per-crate patch. Re-scope that
 slice when S4 lands.
 
-## 9. Risks / things S0 must answer
+## 9. Risks — S0 results and what's now live for S1
 
-- **`op` constant-folding.** If rustc outlines a shared host-call helper, `op` reaches the
-  call site as a runtime value → clean `Unsupported`. Mitigation pinned in §3 (per-op
-  `#[inline(always)]` wrappers); S0/S1 asserts it holds at `-O2` **and** `-O0`.
-- **Defined panic machinery.** With build-std, `core::panicking::*` are guest-defined, so the
-  slice-AI external-recognizer no longer fires; the panic path *executes* (format → PAL
-  stderr → `panic_abort` → `llvm.trap`/`unreachable`). S0 verifies the translator handles
-  the terminal intrinsic; if not, that's a one-case lowering (→ `Trap`), not a design change.
-- **`lang_start` surface.** `std::rt` init (argc/argv plumb-through, `sys::init`,
-  stack-guard setup, `sigaltstack` on unix — ours is a no-op) compiles as ordinary guest
-  code; S1's hello-world is the existence proof. Unknowns land as `unsupported`-PAL errors,
-  which fail loud, not wrong (INVARIANTS §9's decline-never-diverge, applied to a runtime).
-- **std-internal `thread_local!`** (stdout buffering, panic counters) must work
-  single-threaded — the static-table key TLS in §5 covers it; S1 exercises it via `println!`
-  (stdout's `RefCell` buffer is TLS-backed).
-- **Nightly rebase cost.** The PAL overlay must re-apply when the pin moves. Keep the patch
-  minimal (re-export `unsupported`, override six modules); the S0 CI lane catches drift.
-- **CI drift (I55).** The guest-std build lives outside the workspace; without an asset-lane
-  check it rots silently — S0 lands the lane check *with* the first artifact, not after.
+- **First real gap — the textual `.ll` parser (S1, confirmed by S0).** Real std IR uses
+  global-initializer forms the on-ramp reader rejects: **packed structs** `<{ [24 x i8], ptr,
+  ptr, ptr }>` with **embedded byte arrays** and **pointer relocations** (`ptr @sym`,
+  `inttoptr (i64 N to ptr)`), and `!guid !N` metadata attached to globals. Translation fails
+  in the parser (`expected \`%dest =\`, found LBracket`) before any lowering runs. This is
+  parser-completeness for constant forms — bounded, mechanical, *not* an architecture problem —
+  and is S1's first task. (The no_std corpus never emitted these packed vtable/panic-location
+  constants, so it wasn't hit before.)
+- **`llvm.trap`/panic machinery — NOT a risk (S0 cleared it).** The LTO'd std module's only
+  undefined externals are `malloc`/`free`/`realloc` (synth, slice S) and intrinsics the on-ramp
+  already handles: `llvm.trap`, `memcpy`, `sadd.with.overflow.i64`, `umax`/`umin.i64`,
+  `vector.reduce.add.*`, `lifetime`/`assume`/`noalias.scope.decl` (dropped). No new intrinsic
+  lowering is needed for the pure-compute path.
+- **`op` constant-folding (still to verify in S1).** If rustc outlines a shared host-call
+  helper, `op` reaches the call site as a runtime value → clean `Unsupported`. Mitigation
+  pinned in §3 (per-op `#[inline(always)]` wrappers); S1 asserts it holds at `-O2` **and**
+  `-O0`. (Not yet exercised — S0's program does no host calls.)
+- **`lang_start` surface (S1).** `std::rt` init compiles as ordinary guest code; S1's
+  hello-world is the existence proof. Unknowns land as `unsupported`-PAL errors, which fail
+  loud, not wrong (INVARIANTS §9's decline-never-diverge, applied to a runtime).
+- **Nightly rebase cost — measured small.** The overlay is **13 added lines across 4 files +
+  one `imp`**, sitting next to the long-lived `vexos`/`zkvm` arms; `apply-overlay.sh` is
+  idempotent and dry-run-verified. The CI asset-lane check catches drift.
+- **CI drift (I55) — still open.** The guest-std build lives outside the workspace; without an
+  asset-lane check it rots silently. The lane check is the remaining S0 loose end — land it
+  with S1's first translating artifact.
 
 ## 10. Invariants respected
 
