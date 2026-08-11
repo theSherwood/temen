@@ -160,4 +160,44 @@ pub(crate) mod host {
     pub(crate) fn closedir(dir: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 16, dir, 0, 0, 0) }
     }
+
+    // ---- pipes + spawn/wait (svm-posix `OP_PIPE`/`OP_DUP2`/`OP_SPAWN`/… — the `std::process` surface) --
+
+    /// `pipe(fds_ptr) -> 0 | -errno` (svm-posix `OP_PIPE` = 23). Writes `[read_fd, write_fd]` (two
+    /// little-endian `i32`s) at `fds_ptr`; the two ends share one in-personality FIFO (non-blocking).
+    #[inline(always)]
+    pub(crate) fn pipe(fds_ptr: *mut u8) -> i64 {
+        unsafe { __vm_host_call(posix(), 23, fds_ptr as i64, 0, 0, 0) }
+    }
+
+    /// `dup2(oldfd, newfd) -> newfd | -errno` (svm-posix `OP_DUP2` = 24). Re-points `newfd` at `oldfd`'s
+    /// object, closing whatever `newfd` referred to — the redirect primitive (`dup2(pipe_w, 1)`).
+    #[inline(always)]
+    pub(crate) fn dup2(oldfd: i64, newfd: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 24, oldfd, newfd, 0, 0) }
+    }
+
+    /// `dup(oldfd) -> fd | -errno` (svm-posix `OP_DUP` = 25). Clones `oldfd` onto the lowest free fd —
+    /// used to save fd 1 across a spawn's stdout redirect.
+    #[inline(always)]
+    pub(crate) fn dup(oldfd: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 25, oldfd, 0, 0, 0) }
+    }
+
+    /// `spawn(name, name_len, argv, argv_len) -> pid | -errno` (svm-posix `OP_SPAWN` = 27). Runs a
+    /// command to completion (fork-free, sequential) via the embedder's spawn delegate; the child
+    /// inherits fd 0 (stdin) and routes its stdout to the caller's current fd 1. `argv` is a
+    /// NUL-separated blob (`argv[0]` = program name; empty ⇒ `[name]`). `-ENOSYS` if no delegate.
+    #[inline(always)]
+    pub(crate) fn spawn(name: *const u8, name_len: i64, argv: *const u8, argv_len: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 27, name as i64, name_len, argv as i64, argv_len) }
+    }
+
+    /// `waitpid(pid, status_ptr, options) -> pid | -errno` (svm-posix `OP_WAITPID` = 28). Reaps `pid`
+    /// (or any child when `pid == -1`), writing the wait-encoded status (`WEXITSTATUS` in bits 8–15) as
+    /// an `i32` to `status_ptr` when non-null. A spawned child has already run, so this never blocks.
+    #[inline(always)]
+    pub(crate) fn waitpid(pid: i64, status_ptr: *mut u8, options: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 28, pid, status_ptr as i64, options, 0) }
+    }
 }
