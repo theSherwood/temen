@@ -691,6 +691,11 @@ jobs:
           # stable key must produce byte-identical stdout every Run and compile exactly once. Uses the
           # committed hello_c/qjs_repl assets; skips cleanly if absent.
           node browser-jit-cache-test.mjs
+          # warm-runtime snapshot (WASM_AOT.md follow-on): svm_warm_open runs the QuickJS `warmup` once,
+          # svm_warm_eval restores the post-init image and runs `eval_run` — which must match the cold
+          # `_start` path byte-for-byte while skipping the runtime rebuild. Uses the committed
+          # qjs_snapshot.svmb; skips cleanly if absent.
+          node warm-snapshot-test.mjs
           # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
           # SVM-text compute guest whose root loops calling a window-round-tripping leaf must return the
           # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
