@@ -571,13 +571,21 @@ fork twin seeds `{argc, packed argv}` before `execve` and the command reads `arg
 (`execve_delivers_argv_to_the_command`). Nothing in the core loop broke — fork, resolve-by-name, argv
 marshalling, image-replace, and repeated fork→exec→wait all compose.
 
+**env delivery through `execve`. DONE.** The gap the microshell surfaced. A `main(argc, argv, envp)`
+entry (3 params) now makes chibicc's `_start` also parse the `envc` env strings — which follow the argv
+strings in the §3e args buffer — into an `envp[]` pointer array placed right after `argv[]`, passed as
+`main`'s third argument (`codegen_ir.c`: `needs_envp` + the env loop, blocks 6–10 of the arg-parsing
+`_start`). A 2-param `main(argc, argv)` is byte-identical to before (the env path is behind
+`needs_envp`). No interpreter change: `execve` already preserves the caller's args window, so a fork
+twin seeds `{argc, envc, packed argv+env}` and the exec'd command reads `envp`. Proven by
+`c_fork.rs::execve_delivers_the_environment_to_the_command` (a forked child seeds `env={"V=7"}`, the
+command returns `envp[0][2]='7'`=55). A libc `getenv` walking `envp`/`environ` is the guest-side
+follow-up (a shim, not a substrate concern).
+
 **What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
-- **env delivery.** `envc` is hardcoded 0 everywhere, and chibicc's `_start` parses `argc`/argv but
-  never the env strings — no `environ`, no `envp` to `main`. A command cannot read an exported var.
-  *The next concrete slice.*
-- **argv-seeding ergonomics.** A shell hand-writes the `{argc, envc}`+packed-strings buffer at offset
-  128; there is no `execvp(argv[])` helper. Doable in ~10 lines of C (the microshell does), but a real
-  libc wants the wrapper.
+- **argv/env-seeding ergonomics.** A shell hand-writes the `{argc, envc}`+packed-strings buffer at offset
+  128; there is no `execvp(argv[], envp[])` helper. Doable in ~10 lines of C (the microshell does), but
+  a real libc wants the wrapper (and a `getenv` walking the delivered `envp`).
 - **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
   `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
 - **pipes / redirection between forked children** (`cmd1 | cmd2`, `cmd > file`) — the Power-2/`Endpoint`

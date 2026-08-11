@@ -1012,6 +1012,95 @@ fn a_microshell_dispatches_two_named_commands_through_fork_exec_wait() {
     );
 }
 
+/// FORK.md §8.6 — **`execve` delivers the environment.** The gap the microshell surfaced: `envc` was
+/// always 0 and chibicc's `_start` never parsed the env portion of the args buffer, so a command could
+/// not read an exported variable. Now a `main(argc, argv, envp)` entry (3 params) makes `_start` also
+/// parse the `envc` env strings — which follow the argv strings in the §3e buffer — into an `envp[]`
+/// pointer array, passed as `main`'s third argument. Here a forked child seeds `argc=1, envc=1` with
+/// `argv={"c"}` and `env={"V=7"}`, then `execve`s a command that returns `envp[0][2]` (`'7'` = 55) —
+/// proving the env vector reaches the exec'd image, indexed through the pointer array.
+const EXECVE_ENV_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static long pid, status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;
+    hdr[0] = 1;                 /* argc = 1 */
+    hdr[1] = 1;                 /* envc = 1 */
+    char *s = (char *)136;
+    s[0] = 'c'; s[1] = 0;                        /* argv[0] = "c" */
+    s[2] = 'V'; s[3] = '='; s[4] = '7'; s[5] = 0; /* env[0]  = "V=7" */
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The command: a 3-arg `main` that returns the third byte of its first env string — `'7'` (55) for
+/// `env[0] = "V=7"`, if the environment was delivered through `execve`.
+const EXECVE_ENV_CMD_SRC: &str = r#"
+int main(int argc, char **argv, char **envp) {
+  return envp[0][2];
+}
+"#;
+
+#[test]
+fn execve_delivers_the_environment_to_the_command() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let guest = parse_module_raw(&c_to_ir(EXECVE_ENV_GUEST_SRC)).expect("parse env guest");
+    verify_module(&guest).expect("verify env guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_ENV_CMD_SRC)).expect("parse env command");
+    verify_module(&cmd).expect("verify env command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(55)],
+        "the exec'd command read envp[0][2] = '7' (55) — the environment was delivered through execve"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.

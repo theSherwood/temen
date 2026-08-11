@@ -307,6 +307,11 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 // globals shift past it. Computed once in `codegen_ir` before `layout_globals`.
 static bool needs_argv;
 
+// True when `main` also takes `envp` (>= 3 params: `main(argc, argv, envp)`), so `_start` additionally
+// parses the env portion of the §3e args buffer into an `envp[]` array and passes it as main's 3rd
+// argument. Implies `needs_argv`. Computed alongside it in `codegen_ir`.
+static bool needs_envp;
+
 // Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
 // The low RESERVED_BYTES are the runtime-reserved region holding the powerbox capability handles
@@ -2977,10 +2982,12 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v%d = i64.const 0\n", vi0);
     cg("  br 1(v%d, v%d, v%d)\n", vac, vi0, vp0);
     cg("  }\n");
-    // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish.
+    // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish. On finish, `p`
+    // points just past the last argv string's NUL — i.e. the first env string — so thread it to
+    // block 5 when `main` also takes `envp` (the env parse starts there).
     cg("block 1 (v0: i64, v1: i64, v2: i64) {\n");
     cg("  v3 = i64.lt_u v1 v0\n");
-    cg("  br_if v3 2(v0, v1, v2) 5(v0)\n");
+    cg("  br_if v3 2(v0, v1, v2) 5(v0%s)\n", needs_envp ? ", v2" : "");
     cg("  }\n");
     // body: argv[i] = p, then scan p to the byte past its NUL.
     cg("block 2 (v0: i64, v1: i64, v2: i64) {\n");
@@ -3005,40 +3012,114 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v4 = i64.add v1 v3\n");
     cg("  br 1(v0, v4, v2)\n");
     cg("  }\n");
-    // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
-    cg("block 5 (v0: i64) {\n");
-    emit_data_base_at(1); // v1 = argv[] base (data-stack base)
-    cg("  v2 = i64.const 8\n");
-    cg("  v3 = i64.mul v0 v2\n");
-    cg("  v4 = i64.add v1 v3\n");
-    cg("  v5 = i64.const 0\n");
-    cg("  i64.store v4 v5\n");
-    cg("  v6 = i64.const 1\n");
-    cg("  v7 = i64.add v0 v6\n");
-    cg("  v8 = i64.mul v7 v2\n");
-    cg("  v9 = i64.add v1 v8\n");
-    // `main_sp` = the byte past `argv[]`, rounded up to the 16-byte frame alignment (`data_end` is
-    // already 16-aligned; this only clears the `(argc+1)*8` array). It must sit **just above** the
-    // array — enough that `main`'s upward-growing frame never overwrites `argv[]` — but no higher:
-    // rounding up to a full page (the old `POWERBOX_ARGS_END`) needlessly pushed the frame onto the
-    // next 16 KiB boundary, which collided with a window offset a program mapped a SharedRegion at
-    // (ISSUES.md I35 — a `--child-entry` runner maps rings at a fixed high offset and assumes the
-    // frame stays below it). 16-byte alignment is all the ABI needs (every frame offset is aligned
-    // within the frame; only the base must be 16-aligned).
-    cg("  v10 = i64.const 15\n");
-    cg("  v11 = i64.add v9 v10\n");
-    cg("  v12 = i64.const -16\n");
-    cg("  v13 = i64.and v11 v12\n");
-    cg("  v14 = i32.wrap_i64 v0\n");
+    // done: argv[argc] = NULL, main_sp = align16(argv_base + (argc+1)*8), call main.
+    // `main_sp` sits **just above** the array (16-byte aligned) — enough that `main`'s upward-growing
+    // frame never overwrites `argv[]`/`envp[]`, but no higher (rounding to a full page collided with a
+    // ring-mapping offset, ISSUES.md I35). 16-byte alignment is all the ABI needs.
+    if (!needs_envp) {
+      cg("block 5 (v0: i64) {\n");
+      emit_data_base_at(1); // v1 = argv[] base (data-stack base)
+      cg("  v2 = i64.const 8\n");
+      cg("  v3 = i64.mul v0 v2\n");
+      cg("  v4 = i64.add v1 v3\n");
+      cg("  v5 = i64.const 0\n");
+      cg("  i64.store v4 v5\n"); // argv[argc] = NULL
+      cg("  v6 = i64.const 1\n");
+      cg("  v7 = i64.add v0 v6\n");
+      cg("  v8 = i64.mul v7 v2\n");
+      cg("  v9 = i64.add v1 v8\n");
+      cg("  v10 = i64.const 15\n");
+      cg("  v11 = i64.add v9 v10\n");
+      cg("  v12 = i64.const -16\n");
+      cg("  v13 = i64.and v11 v12\n"); // main_sp
+      cg("  v14 = i32.wrap_i64 v0\n"); // argc (i32)
+      if (is_void) {
+        // A child entry returns an i64 status even for a void main (0); a powerbox entry returns ().
+        cg("  call %d (v13, v14, v1)\n", mi);
+        cg(opt_child_entry ? "  v15 = i64.const 0\n  return v15\n" : "  return\n");
+      } else if (opt_child_entry) {
+        cg("  v15 = call %d (v13, v14, v1)\n", mi);
+        cg("  v16 = i64.extend_i32_u v15\n  return v16\n"); // widen main's int to the i64 status
+      } else {
+        cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
+      }
+      cg("  }\n");
+      cg("}\n\n");
+      return;
+    }
+    // `main(argc, argv, envp)`: after the argv terminator, parse the `envc` env strings (they follow
+    // the argv strings in the §3e buffer, starting at `p` threaded from block 1) into an `envp[]`
+    // pointer array placed **right after** `argv[]` (base `EB = argv_base + (argc+1)*8`), then call
+    // `main(main_sp, argc, argv, envp)`. The env loop (blocks 6–9) mirrors the argv loop.
+    cg("block 5 (v0: i64, v1: i64) {\n"); // (argc, envstart)
+    emit_data_base_at(2);                 // v2 = argv[] base (AB)
+    cg("  v3 = i64.const 8\n");
+    cg("  v4 = i64.mul v0 v3\n");
+    cg("  v5 = i64.add v2 v4\n");
+    cg("  v6 = i64.const 0\n");
+    cg("  i64.store v5 v6\n"); // argv[argc] = NULL
+    cg("  v7 = i64.const %d\n", POWERBOX_ARGS_BASE + 4);
+    cg("  v8 = i32.load v7\n"); // envc (u32)
+    cg("  v9 = i64.extend_i32_u v8\n");
+    cg("  v10 = i64.const 1\n");
+    cg("  v11 = i64.add v0 v10\n");
+    cg("  v12 = i64.mul v11 v3\n");
+    cg("  v13 = i64.add v2 v12\n"); // EB = AB + (argc+1)*8
+    cg("  v14 = i64.const 0\n");    // j = 0
+    cg("  br 6(v0, v13, v9, v14, v1)\n");
+    cg("  }\n");
+    // env loop_head(argc, EB, envc, j, p): while j <u envc, write envp[j] and scan; else finish.
+    cg("block 6 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.lt_u v3 v2\n");
+    cg("  br_if v5 7(v0, v1, v2, v3, v4) 10(v0, v1, v2)\n");
+    cg("  }\n");
+    // body: envp[j] = p, then scan p to the byte past its NUL.
+    cg("block 7 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.const 8\n");
+    cg("  v6 = i64.mul v3 v5\n");
+    cg("  v7 = i64.add v1 v6\n");
+    cg("  i64.store v7 v4\n"); // envp[j] = p
+    cg("  br 8(v0, v1, v2, v3, v4, v4)\n");
+    cg("  }\n");
+    // scan(argc, EB, envc, j, p, q): advance q past the NUL, then step j and loop.
+    cg("block 8 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64) {\n");
+    cg("  v6 = i32.load8_u v5\n");
+    cg("  v7 = i64.const 1\n");
+    cg("  v8 = i64.add v5 v7\n");
+    cg("  v9 = i32.eqz v6\n");
+    cg("  br_if v9 9(v0, v1, v2, v3, v8) 8(v0, v1, v2, v3, v4, v8)\n");
+    cg("  }\n");
+    // next: j++ and loop (p = the byte past this env string's NUL).
+    cg("block 9 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.const 1\n");
+    cg("  v6 = i64.add v3 v5\n");
+    cg("  br 6(v0, v1, v2, v6, v4)\n");
+    cg("  }\n");
+    // env done(argc, EB, envc): envp[envc] = NULL, main_sp = align16(EB + (envc+1)*8), call main.
+    cg("block 10 (v0: i64, v1: i64, v2: i64) {\n");
+    cg("  v3 = i64.const 8\n");
+    cg("  v4 = i64.mul v2 v3\n");
+    cg("  v5 = i64.add v1 v4\n");
+    cg("  v6 = i64.const 0\n");
+    cg("  i64.store v5 v6\n"); // envp[envc] = NULL
+    cg("  v7 = i64.const 1\n");
+    cg("  v8 = i64.add v2 v7\n");
+    cg("  v9 = i64.mul v8 v3\n");
+    cg("  v10 = i64.add v1 v9\n");
+    cg("  v11 = i64.const 15\n");
+    cg("  v12 = i64.add v10 v11\n");
+    cg("  v13 = i64.const -16\n");
+    cg("  v14 = i64.and v12 v13\n"); // main_sp
+    emit_data_base_at(15);          // v15 = argv[] base (AB)
+    cg("  v16 = i32.wrap_i64 v0\n"); // argc (i32)
     if (is_void) {
-      // A child entry returns an i64 status even for a void main (0); a powerbox entry returns ().
-      cg("  call %d (v13, v14, v1)\n", mi);
-      cg(opt_child_entry ? "  v15 = i64.const 0\n  return v15\n" : "  return\n");
+      cg("  call %d (v14, v16, v15, v1)\n", mi);
+      cg(opt_child_entry ? "  v17 = i64.const 0\n  return v17\n" : "  return\n");
     } else if (opt_child_entry) {
-      cg("  v15 = call %d (v13, v14, v1)\n", mi);
-      cg("  v16 = i64.extend_i32_u v15\n  return v16\n"); // widen main's int to the i64 status
+      cg("  v17 = call %d (v14, v16, v15, v1)\n", mi);
+      cg("  v18 = i64.extend_i32_u v17\n  return v18\n");
     } else {
-      cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
+      cg("  v17 = call %d (v14, v16, v15, v1)\n  return v17\n", mi);
     }
     cg("  }\n");
     cg("}\n\n");
@@ -3347,6 +3428,8 @@ void codegen_ir(Obj *prog, FILE *out) {
   // globals shift past it. Must be known before `layout_globals`. (`guest_params` drops a hidden sret
   // pointer; `main` never returns an aggregate, so it's just the C params.)
   needs_argv = has_main && guest_params(funcs[0]) && guest_params(funcs[0])->next;
+  // `main(argc, argv, envp)` (>= 3 params) also parses the env strings into an `envp[]` array.
+  needs_envp = needs_argv && guest_params(funcs[0])->next->next;
 
   // `_start` stashes the capability handles in the window, so a module with an entry
   // always needs one.
