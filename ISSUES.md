@@ -2447,6 +2447,33 @@ unit tests in `svm-jit/tests/bulk_mem.rs`. Pinned by
 generated modules and fails the instant a `MemCopy` is reintroduced; the crash seed is also added to
 `DIFF_REGRESSIONS`.
 
+### I76 — optimizer miscompile: dead-function elimination renumbered functions under a live `ref.func`, changing the funcref's **observable** i32 value (S2, wrong result — nightly fuzz red) — **FIX LANDED 2026-08-11** (`claude/nightly-ci-failures-x6oj7x`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (opt_sccp)` failed 2026-08-09 (input `[0xfc]`, still
+deterministically reproducible): `optimize_module changed observable behavior — orig: Ok([F32(1.0),
+I32(2)]), opt: Ok([F32(1.0), I32(1)])`. The entry function returns `ref.func 2` as its `i32` result;
+after optimization the same run returns `1`.
+
+**Root cause.** `dead_func_elim` (`svm-opt/src/interproc.rs`) drops unreachable functions and
+**renumbers** the survivors densely, rewriting every static funcidx — including `ref.func` operands —
+through the old→new map. Its soundness argument assumed a funcref only ever matters as a
+`call_indirect` **dispatch** target (which rides the same map, so dispatch stays correct), and it
+bailed to the identity only when the module contained a live indirect dispatch
+(`has_indirect_funcref_dispatch`). But a `ref.func` result **is the function index as a plain
+observable `i32`** — a program can return/store/compare it. Here `func 1` was dead, so `func 2` (kept
+alive by the entry's `ref.func`) renumbered to `1`, the `ref.func 2` operand was rewritten to
+`ref.func 1`, and the *returned integer* silently changed `2 → 1`. With no `call_indirect` anywhere,
+the dispatch-only guard never tripped.
+
+**Fix.** Bail `dead_func_elim` to the identity whenever the module contains any live `ref.func`
+(`has_ref_func`), matching the pass's existing conservative "renumbering is unsafe → identity" posture.
+A *dead* `ref.func` is cleared by the per-function DCE before DFE runs in the fixpoint, so devirt →
+inline → DFE collapses still fire (existing `devirtualizes_constant_funcref_then_inlines_and_dfes`
+passes); only a genuinely-live, observable funcref now pins the function table. Pinned by
+`keeps_functions_when_a_ref_func_value_is_observable` (`svm-opt/tests/interproc.rs`), which returns a
+`ref.func` value past a dead function and asserts `optimize_module` preserves the observed integer;
+verified failing before the fix, and a 3000-seed `optimize_module` differential sweep is clean.
+
 ### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25; **BUILT 2026-08-07** as `cont.resume.block` (DESIGN.md §12)
 
 **What.** After the §3.6 slice-5a fiber-park contract (svm PR #442), a `memory.wait` inside a

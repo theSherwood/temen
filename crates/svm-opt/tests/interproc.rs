@@ -262,6 +262,57 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
     }
 }
 
+#[test]
+fn keeps_functions_when_a_ref_func_value_is_observable() {
+    // Regression (nightly `opt_sccp`, input `[0xfc]`): a `ref.func` result **is the function index as
+    // an observable i32**, not only a `call_indirect` dispatch target. Here the entry returns
+    // `ref.func 2` directly, and func 1 is dead. DFE used to drop func 1 and renumber func 2 → 1,
+    // rewriting the `ref.func` operand to keep *dispatch* correct — but that silently changed the
+    // returned integer from 2 to 1, an observable-behavior break. With no `call_indirect` in the
+    // module the old dispatch-only guard did not trip; DFE must bail on the live `ref.func` too.
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![Inst::RefFunc { func: 2 }], // v1 = funcref(2), returned as a plain i32
+            term: Terminator::Return(vec![1]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![
+            entry,          // 0 — returns the funcref value 2
+            add_const(999), // 1 — DEAD (never referenced), yet dropping it would renumber func 2
+            add_const(1),   // 2 — kept alive by the ref.func, its index is what the entry returns
+        ],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+
+    // The entry observably returns the funcref integer 2.
+    assert_eq!(run(&m, 0, &[Value::I32(0)]), Ok(vec![Value::I32(2)]));
+
+    // DFE must be a no-op: renumbering would corrupt the returned funcref value.
+    let opt = dead_func_elim(&m);
+    assert_eq!(
+        opt.funcs.len(),
+        3,
+        "DFE must not renumber while a ref.func value is live (its i32 is observable)"
+    );
+
+    // End to end: the full optimizer preserves the observed funcref integer (2, not 1).
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    for a in [0i32, 7, -3] {
+        assert_eq!(
+            run(&m, 0, &[Value::I32(a)]),
+            run(&opt, 0, &[Value::I32(a)]),
+            "optimize_module changed the observable funcref value at a={a}"
+        );
+        assert_eq!(run(&opt, 0, &[Value::I32(a)]), Ok(vec![Value::I32(2)]));
+    }
+}
+
 /// `helper(a, b) = a*3 + b*5 + 7`, a single-block leaf.
 fn affine_helper() -> Func {
     Func {
