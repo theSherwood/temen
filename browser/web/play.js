@@ -1115,18 +1115,26 @@ SELECT n, a AS fib FROM fib;
   },
   'JavaScript (QuickJS — write & run JS)': {
     kind: 'module',
-    jit: true, // _start is wasm-JIT-emittable (atomics + cap.self.resolve outlining + pooled locals);
-    // ~6× over the interpreter, byte-identical (browser-jit-module-test). See LLVM.md "Active target — QuickJS".
+    warm: true, // WASM_AOT.md warm-runtime snapshot: init the QuickJS runtime once, then restore that
+    // warm image and eval-only per Run — the "trivial program takes >1s" fixed init is paid once, so
+    // later Runs are ~milliseconds. Fresh-per-Run isolation is enforced in the engine (svm_warm_eval
+    // restores the same post-warmup image each Run). Default path for this card.
+    jit: true, // _start is also wasm-JIT-emittable (atomics + cap.self.resolve outlining + pooled locals),
+    // byte-identical (browser-jit-module-test); tick "wasm-JIT" to run the cold engine on emitted wasm.
+    // See LLVM.md "Active target — QuickJS" and WASM_AOT.md.
     editable: true,
     lang: 'js',
-    url: './assets/qjs_repl.svmb',
+    url: './assets/qjs_snapshot.svmb',
     mode: 'io',
     desc: 'Bellard\'s unmodified QuickJS 2024-01-13 — a full JavaScript engine (NaN-boxing, a bytecode ' +
       'VM with computed-goto dispatch, BigInt, regex, Unicode) compiled through the LLVM on-ramp. Edit ' +
       'the JS on the left and click Run: it evaluates in a fresh runtime (each Run starts clean), and ' +
       'prints anything you print()/console.log() plus the value of the last expression. Real QuickJS, ' +
-      'running client-side in the sandbox — no ambient authority. Toggle "wasm-JIT" to run the whole ' +
-      'engine on emitted wasm (~6× faster); "Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
+      'running client-side in the sandbox — no ambient authority. By default it uses a warm-runtime ' +
+      'snapshot: the first Run initializes the QuickJS runtime (~once), and every Run after restores ' +
+      'that warm image and evaluates only your code — so a trivial program runs in milliseconds instead ' +
+      'of rebuilding the whole engine each time. Tick "wasm-JIT" to run the cold engine (_start) on ' +
+      'emitted wasm; "Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
     src: `// Write JavaScript here, then click Run. Each Run is a fresh QuickJS runtime.
 function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 console.log("fib(0..10):", Array.from({length: 11}, (_, i) => fib(i)).join(" "));
@@ -1402,6 +1410,47 @@ function moduleInterp(bytes, stdinBytes) {
   return { rv, status, stdout };
 }
 
+// ---- warm-runtime snapshot (WASM_AOT.md): init once, restore-per-Run for a two-phase on-ramp guest ----
+// The engine holds ONE warm session (a Rust static: svm_warm_open/eval/close). `warmSessionUrl` tracks
+// which module it's warmed for; a new svm_warm_open replaces any prior session, so we (re)open lazily
+// only when the module URL changes. Fresh-per-Run isolation is enforced in the engine (each eval restores
+// the same post-`warmup` image), so a `var` in one Run can't leak into the next — the card's
+// "each Run starts clean" promise holds.
+let warmSessionUrl = null;
+
+// Ensure the warm session is open for `url`'s module `bytes` (runs the guest's `warmup` once and
+// snapshots the post-init image). Returns true on success; false if the module isn't a warm-snapshot
+// driver (no `warmup`/`eval_run` exports) or open traps — the caller then falls back to the cold path.
+function ensureWarmSession(bytes, url) {
+  if (warmSessionUrl === url) return true;
+  const p = eng.ex.svm_alloc(bytes.length);
+  new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const live = Number(eng.ex.svm_warm_open(p, bytes.length));
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (live < 0 || eng.ex.svm_status() !== 0) {
+    warmSessionUrl = null;
+    return false;
+  }
+  warmSessionUrl = url;
+  return true;
+}
+
+// Evaluate the user's source over the warm session — restore the snapshot + eval only, no runtime
+// rebuild. Returns { rv, status, stdout }. Assumes ensureWarmSession succeeded for this module.
+function warmEval(stdinBytes) {
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = eng.ex.svm_alloc(stdinLen);
+    new Uint8Array(eng.memory.buffer).set(stdinBytes, stdinP);
+  }
+  const rv = Number(eng.ex.svm_warm_eval(stdinP, stdinLen));
+  const status = eng.ex.svm_status();
+  const stdout = readModuleStdout();
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  return { rv, status, stdout };
+}
+
 // Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `svm_run_shell` parses: a u32 entry
 // count, then per entry u32 name-length + UTF-8 name + u32 module-length + module bytes (all
 // little-endian). The `__stage` ring runner and every external command (`primes`, …) travel in one
@@ -1565,6 +1614,21 @@ async function runModule(c) {
       logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
       runNote(rec, { jitFallbackReason: e.message });
       status = undefined;
+    }
+  }
+  if (status === undefined && ex.warm) {
+    // Warm-runtime snapshot (the default for the QuickJS card): open the session once (the first Run
+    // pays the ~one-time runtime init), then every Run restores the warm image and evaluates only.
+    const needOpen = warmSessionUrl !== ex.url;
+    if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
+    if (ensureWarmSession(bytes, ex.url)) {
+      const r = warmEval(stdinBytes);
+      rv = r.rv; status = r.status; stdout = r.stdout;
+      tier = 'warm-snapshot';
+    } else {
+      logTo(c, 'warm-snapshot unavailable for this module; falling back to the interpreter');
+      const r = moduleInterp(bytes, stdinBytes);
+      rv = r.rv; status = r.status; stdout = r.stdout;
     }
   }
   if (status === undefined) {
@@ -3109,7 +3173,9 @@ function buildCard(name, ex) {
       : 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
     jit = el('input');
     jit.type = 'checkbox';
-    jit.checked = true;
+    // A warm-snapshot card (QuickJS) defaults to the warm path (checkbox off); ticking it opts into the
+    // cold wasm-JIT tier. Every other jit card defaults to the JIT tier on.
+    jit.checked = !ex.warm;
     l.append(jit, ' wasm-JIT');
     controls.appendChild(l);
     // "Prove it": run the guest on both tiers and assert the result is byte-identical.
