@@ -619,7 +619,25 @@ follow-up (a shim, not a substrate concern).
     `wait`, `close` the write end, fork consumer — the buffered bytes drain, then EOF.
   - Interp-only (the park lives in the eval loop; the JIT/bytecode tiers don't block a pipe read, so a
     differential guest must `close` the write end before an empty read — see `pipe.rs`).
-    `SIGPIPE`/backpressure (the FIFO is unbounded) remains a follow-up.
+  - **~~SIGPIPE + backpressure~~. DONE — the write side made symmetric to the read side.** The FIFO is
+    now a **bounded buffer** (`PIPE_CAP` = 64 KiB, Linux's default) with two write-side contracts:
+    - **SIGPIPE (`-EPIPE`).** A **read**-end refcount (the third `Arc` in `PipeBacking`) mirrors the
+      writer refcount, bumped/dropped at every read-end lifecycle point (mint / re-grant into a child /
+      fork-copy / explicit `close` / exec / teardown). A `write` to a pipe whose read count is `0`
+      returns `-EPIPE` — the SIGPIPE-ignored contract: a producer whose consumer has quit fails its next
+      write instead of piling into a FIFO nobody drains.
+    - **Backpressure (blocking write).** A `write` that would overflow `PIPE_CAP` **parks** the writer
+      (`Blocked::PipeWrite`, keyed by pipe id) — the exact write-side twin of the read park: a `read` that
+      drains a full pipe (room opened) or the last read end closing (→ `-EPIPE`) wakes it; the woken write
+      is rewound and re-executes. A partially-full pipe short-returns (the freed room), so a well-behaved
+      writer loops. This closes the "the FIFO is unbounded" hole: a runaway producer (`yes | head`) is
+      bounded to one 64 KiB buffer, not host RAM.
+
+      Proven by `c_fork.rs`: `a_producer_gets_epipe_when_its_consumer_exits` (the `yes | head` story — the
+      producer blocks as the pipe fills, resumes as the consumer drains, and gets `-EPIPE` = returns 88
+      the moment the consumer's read end closes, rather than spinning to its safety cap) and
+      `a_full_pipe_write_is_bounded_to_the_capacity` (a 100 000-byte write short-returns exactly 65 536 —
+      the FIFO never grows past the bound). Interp-only, same reason as the read park.
 - **~~file redirection~~ (`cmd > file`). DONE — as a pump over the pipe + fs substrate, no new mechanism.**
   The shell wires the command's stdout to a pipe **write** end (`exec_io(cmd, argv, fds[1], 0)`), drops its
   own copies of both ends (so `cmd` is the sole writer), then — instead of forking a second stage — *is*
