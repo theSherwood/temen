@@ -396,6 +396,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     OTHER    = 1 << 16,
     SIGNED   = 1 << 17,
     UNSIGNED = 1 << 18,
+    M128     = 1 << 19,
   };
 
   Type *ty = ty_int;
@@ -499,6 +500,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       counter += FLOAT;
     else if (equal(tok, "double"))
       counter += DOUBLE;
+    else if (equal(tok, "__m128"))
+      counter += M128;
     else if (equal(tok, "signed"))
       counter |= SIGNED;
     else if (equal(tok, "unsigned"))
@@ -563,6 +566,9 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       break;
     case LONG + DOUBLE:
       ty = ty_ldouble;
+      break;
+    case M128:
+      ty = ty_v128;
       break;
     default:
       error_tok(tok, "invalid type");
@@ -1537,7 +1543,7 @@ static bool is_typename(Token *tok) {
       "typedef", "enum", "static", "extern", "_Alignas", "signed", "unsigned",
       "const", "volatile", "auto", "register", "restrict", "__restrict",
       "__restrict__", "_Noreturn", "float", "double", "typeof", "inline",
-      "_Thread_local", "__thread", "_Atomic",
+      "_Thread_local", "__thread", "_Atomic", "__m128",
     };
 
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)

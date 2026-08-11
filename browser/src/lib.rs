@@ -3071,6 +3071,10 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/math.h",
             include_str!("../playground-include/math.h"),
         ),
+        (
+            "include/xmmintrin.h",
+            include_str!("../playground-include/xmmintrin.h"),
+        ),
         // The §12 threading layer (INTERACTIVE_EMBEDDING.md slice 9): pthreads + POSIX semaphores
         // over the VM's futex/atomics builtins. Seeded from the *frontend's* bundled copies —
         // one source of truth, since the guest chibicc lowers the same `__vm_*` builtins the

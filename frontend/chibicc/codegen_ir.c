@@ -460,6 +460,8 @@ static char *irty(Type *ty) {
   case TY_DOUBLE:
   case TY_LDOUBLE: // long double = f64 (no 80-bit; pinned, §3d)
     return "f64";
+  case TY_V128: // __m128 — the 16-byte SIMD vector
+    return "v128";
   default:
     error_tok(ty->name, "codegen_ir: unsupported type");
   }
@@ -604,6 +606,9 @@ static int gen_load(Type *ty, int addr) {
   case TY_LDOUBLE:
     cg("  v%d = f64.load v%d\n", r, addr);
     break;
+  case TY_V128:
+    cg("  v%d = v128.load v%d\n", r, addr);
+    break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported load type");
   }
@@ -643,6 +648,9 @@ static void gen_store(Type *ty, int addr, int val) {
   case TY_DOUBLE:
   case TY_LDOUBLE:
     cg("  f64.store v%d v%d\n", addr, val);
+    break;
+  case TY_V128:
+    cg("  v128.store v%d v%d\n", addr, val);
     break;
   default:
     error_tok(ty->name, "codegen_ir: unsupported store type");
@@ -1626,6 +1634,88 @@ static int gen_builtin_notify(Node *node) {
   return r; // number woken
 }
 
+// ---- SSE (xmmintrin.h): packed single-precision float (f32x4) intrinsics --------------------
+// `__m128` is our `v128` value type. These lower the fixed set of `_ps` intrinsics the teaching
+// curriculum uses to the existing `f32x4`/`v128` IR ops — no new ops, and the value flows through
+// ordinary `__m128` locals (window slots, `v128.load`/`store`). Args are `__m128` (a `v128` SSA
+// value), `float*` (an i64 address), or `float` scalars, per each intrinsic's prototype.
+
+// `_mm_{add,sub,mul}_ps(__m128, __m128)` and the pseudo-min/max `_mm_{min,max}_ps` (whose
+// operand-order/NaN behavior is exactly SSE `minps`/`maxps` → `f32x4.pmin`/`pmax`).
+static int gen_builtin_mm_binop(Node *node, const char *op) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: _mm_*_ps binary intrinsic expects 2 __m128 arguments");
+  int va = gen_expr(a);
+  int vb = gen_expr(a->next);
+  int r = nv++;
+  cg("  v%d = f32x4.%s v%d v%d\n", r, op, va, vb);
+  return r;
+}
+
+// `_mm_set1_ps(float x)` → broadcast `x` to all four lanes.
+static int gen_builtin_mm_set1_ps(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: _mm_set1_ps expects 1 float argument");
+  int s = gen_expr(node->args); // f32
+  int r = nv++;
+  cg("  v%d = f32x4.splat v%d\n", r, s);
+  return r;
+}
+
+// `_mm_setzero_ps()` → the all-zero vector.
+static int gen_builtin_mm_setzero_ps(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: _mm_setzero_ps takes no arguments");
+  int r = nv++;
+  cg("  v%d = v128.const 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", r);
+  return r;
+}
+
+// `_mm_set_ps(e3, e2, e1, e0)` → e0 in the low lane … e3 in the high lane (Intel order).
+static int gen_builtin_mm_set_ps(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || !a->next->next->next ||
+      a->next->next->next->next)
+    error_tok(node->tok, "codegen_ir: _mm_set_ps expects 4 float arguments");
+  int e3 = gen_expr(a);
+  int e2 = gen_expr(a->next);
+  int e1 = gen_expr(a->next->next);
+  int e0 = gen_expr(a->next->next->next);
+  int v = nv++;
+  cg("  v%d = f32x4.splat v%d\n", v, e0); // lanes 0..3 = e0
+  int v1 = nv++;
+  cg("  v%d = f32x4.replace_lane 1 v%d v%d\n", v1, v, e1);
+  int v2 = nv++;
+  cg("  v%d = f32x4.replace_lane 2 v%d v%d\n", v2, v1, e2);
+  int v3 = nv++;
+  cg("  v%d = f32x4.replace_lane 3 v%d v%d\n", v3, v2, e3);
+  return v3;
+}
+
+// `_mm_load_ps` / `_mm_loadu_ps(const float *p)` → load 16 bytes. Our confined `v128.load` is
+// alignment-agnostic (the address is masked regardless), so both aligned and unaligned lower the
+// same way — the aligned form is just a promise the guest makes, not something we must enforce.
+static int gen_builtin_mm_load_ps(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: _mm_load_ps expects 1 pointer argument");
+  int p = widen_i64(gen_expr(node->args), node->args->ty);
+  int r = nv++;
+  cg("  v%d = v128.load v%d\n", r, p);
+  return r;
+}
+
+// `_mm_store_ps` / `_mm_storeu_ps(float *p, __m128 v)` → store 16 bytes (void).
+static int gen_builtin_mm_store_ps(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: _mm_store_ps expects (float*, __m128)");
+  int p = widen_i64(gen_expr(a), a->ty);
+  int v = gen_expr(a->next);
+  cg("  v128.store v%d v%d\n", p, v);
+  return 0; // void
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
   case ND_NUM: {
@@ -1820,6 +1910,27 @@ static int gen_expr(Node *node) {
           return gen_builtin_jit_install(node);
         if (!strcmp(fname, "__vm_jit_uninstall"))
           return gen_builtin_jit_uninstall(node);
+        // SSE `_ps` intrinsics (xmmintrin.h) — reserved names, lowered to f32x4/v128 ops.
+        if (!strcmp(fname, "_mm_add_ps"))
+          return gen_builtin_mm_binop(node, "add");
+        if (!strcmp(fname, "_mm_sub_ps"))
+          return gen_builtin_mm_binop(node, "sub");
+        if (!strcmp(fname, "_mm_mul_ps"))
+          return gen_builtin_mm_binop(node, "mul");
+        if (!strcmp(fname, "_mm_min_ps"))
+          return gen_builtin_mm_binop(node, "pmin");
+        if (!strcmp(fname, "_mm_max_ps"))
+          return gen_builtin_mm_binop(node, "pmax");
+        if (!strcmp(fname, "_mm_set1_ps"))
+          return gen_builtin_mm_set1_ps(node);
+        if (!strcmp(fname, "_mm_setzero_ps"))
+          return gen_builtin_mm_setzero_ps(node);
+        if (!strcmp(fname, "_mm_set_ps"))
+          return gen_builtin_mm_set_ps(node);
+        if (!strcmp(fname, "_mm_load_ps") || !strcmp(fname, "_mm_loadu_ps"))
+          return gen_builtin_mm_load_ps(node);
+        if (!strcmp(fname, "_mm_store_ps") || !strcmp(fname, "_mm_storeu_ps"))
+          return gen_builtin_mm_store_ps(node);
         // §7 generic capability import: any *other* direct call to an undefined extern (no body,
         // not a recognized builtin above) is a named host capability — lower it to `call.import`
         // with arg0 as the handle. The host resolves the name at load (fail-closed if unknown), so
@@ -3074,6 +3185,7 @@ static const char *dbg_typename(Type *ty) {
   case TY_FLOAT:   return "float";
   case TY_DOUBLE:  return "double";
   case TY_LDOUBLE: return "long double";
+  case TY_V128:    return "__m128";
   case TY_ENUM:    return "enum";
   case TY_PTR:     return format("%s *", dbg_typename(ty->base));
   case TY_ARRAY:   return format("%s[%d]", dbg_typename(ty->base), ty->array_len);
@@ -3134,8 +3246,10 @@ static int intern_type(Type *ty) {
       return i;
   // Scalars: also dedup structurally — chibicc copies base `Type` structs freely (each `int`
   // decl can be a distinct pointer), so identity alone would bloat the table with clones.
+  // __m128 is emitted as an *array* (below), not a base type, so exclude it here too.
   bool is_base = ty->kind != TY_PTR && ty->kind != TY_ARRAY && ty->kind != TY_STRUCT &&
-                 ty->kind != TY_UNION && ty->kind != TY_FUNC && ty->kind != TY_VLA;
+                 ty->kind != TY_UNION && ty->kind != TY_FUNC && ty->kind != TY_VLA &&
+                 ty->kind != TY_V128;
   if (is_base) {
     int enc = base_enc(ty);
     for (int i = 0; i < n_dbg_types; i++)
@@ -3157,6 +3271,15 @@ static int intern_type(Type *ty) {
     dbg_types[id].kind = DT_ARRAY;
     dbg_types[id].count = ty->base->size ? ty->size / ty->base->size : 0;
     dbg_types[id].child = intern_type(ty->base);
+    break;
+  case TY_V128:
+    // Present __m128 as four `float` lanes (the layout of an f32x4): the 16 bytes in the window
+    // slot are exactly four little-endian f32s, lane 0 in the low bytes. Emitting it as an array
+    // lets the debugger expand it into per-lane values with no v128-specific consumer code — how
+    // real toolchains render __m128. The render name stays "__m128" (dbg_typename).
+    dbg_types[id].kind = DT_ARRAY;
+    dbg_types[id].count = 4;
+    dbg_types[id].child = intern_type(ty_float);
     break;
   case TY_STRUCT:
   case TY_UNION:
