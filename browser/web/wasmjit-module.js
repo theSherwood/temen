@@ -137,6 +137,78 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   return driveJitRun(ex, memory, cacheKey);
 }
 
+// Run the warm session's `eval_run` on the **warm+JIT** tier (WASM_AOT.md warm+JIT). The warm snapshot
+// (`svm_warm_open`) has already paid the QuickJS runtime init once; this evaluates the user's code on
+// emitted wasm over the restored warm image, so a compute-heavy program runs the eval near-native while
+// init stays paid-once. The engine emits `eval_run` on the first Run and caches it (a warm+JIT Run never
+// re-pays the cdylib emit); the compiled `WebAssembly.Module` is cached across Runs too (keyed by
+// `cacheKey`). Differs from `driveJitRun` only in the accessors it drives and in passing the entry `sp`
+// as the emitted `f0`'s third argument (an i64 slot ⇒ a BigInt). Assumes `svm_warm_open` already
+// succeeded for this module. Returns the run status (0 = returned, 5 = exited); throws if `eval_run`
+// isn't wasm-drivable or the run traps (the caller falls back to the interpreter warm path).
+export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  // Emit `eval_run` (idempotent — cached in the warm session after the first Run).
+  if (ex.svm_warm_jit_open(shared) !== 0) {
+    throw new Error(`warm-JIT open failed: status ${ex.svm_status()} (2 = eval_run not emittable)`);
+  }
+  // Per-Run: restore the warm image + reset the run's powerbox, feeding the editor text as stdin.
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = Number(ex.svm_alloc(stdinLen));
+    u8().set(stdinBytes, stdinP);
+  }
+  const prepared = ex.svm_warm_jit_prepare(stdinP, stdinLen);
+  if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
+  if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.svm_status()}`);
+
+  const wptr = Number(ex.svm_warm_jit_wasm_ptr());
+  const wlen = ex.svm_warm_jit_wasm_len();
+  const emitted = u8().slice(wptr, wptr + wlen);
+  const win = Number(ex.svm_warm_jit_win_ptr());
+  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as f0's i64 slot
+  const envBytes = ex.svm_onramp_jit_run_env_bytes();
+
+  let module = cacheGet(cacheKey);
+  if (module === undefined) {
+    module = await WebAssembly.compile(emitted);
+    cachePut(cacheKey, module);
+    jitCacheStats.compiles++;
+  } else {
+    jitCacheStats.hits++;
+  }
+  const instance = await WebAssembly.instantiate(module, {
+    env: {
+      memory,
+      trap: () => {},
+      call_interp: (func, argsPtr) => {
+        if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+      },
+    },
+  });
+  const f0 = instance.exports.f0;
+  if (typeof f0 !== 'function') throw new Error('emitted warm module has no f0 export');
+
+  const env = Number(ex.svm_alloc(envBytes));
+  new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
+  let threw = 0;
+  let value = 0n;
+  try {
+    // f0(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return is
+    // the guest's top-level result (an i32/i64); normalize to i64.
+    const r = f0(win, env, sp);
+    value = r === undefined || r === null ? 0n : BigInt(r);
+  } catch {
+    threw = 1;
+  }
+  ex.svm_dealloc(env, envBytes);
+  ex.svm_warm_jit_report(threw, value);
+  const status = ex.svm_warm_jit_finish();
+  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted warm run trapped (declined to the interpreter)');
+  return status;
+}
+
 // Run the **chibicc compiler** on the wasm-JIT: feed it the user's C `srcBytes` (seeded at `/in.c`) plus
 // the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
 // argv (`svm_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver
