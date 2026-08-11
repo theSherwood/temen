@@ -1843,6 +1843,28 @@ pub fn compile_module_tierup_caps(
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
+    // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
+    // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
+    // (`NESTED_JIT.md`; see [`module_uses_page_ops`]). `compile_jit`/`compile_nested` gate this before
+    // reaching here, but this is a **public entry** a host can call directly (the JACL browser tier-up
+    // spike did — `jacl_impl/docs/SVM_BROWSER_TIERUP_FINDINGS.md`, where an emitted leaf over a
+    // page-managed window trapped `MemoryFault` mid-body). Self-protect: emit nothing, exactly like
+    // `compile_interp_only`, so the gate holds regardless of caller.
+    if module_uses_page_ops(m) {
+        let wasm_of = vec![None; n];
+        let leaf = vec![false; n];
+        let wasm = emit_module(
+            m,
+            shared_memory,
+            &[],
+            &wasm_of,
+            &leaf,
+            None,
+            nested_caps,
+            FuelMode::Global,
+        )?;
+        return Ok((wasm, vec![false; n]));
+    }
     let atomics_ok = module_atomics_ok(m);
     let in_subset: Vec<bool> = m
         .funcs

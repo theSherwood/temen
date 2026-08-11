@@ -76,27 +76,50 @@ before any `env.call_interp`. Their ranked hypotheses — all consistent with ou
    past it faults legitimate accesses.
 3. **Subset-classification hole** (least likely — the trap preceded any cross-tier call).
 
-Until this is fixed, "default the JIT on" (slice 2) would ship a path a real consumer has already
-shown to fault. So the bug comes first.
+This came first: "default the JIT on" (slice 2) would otherwise ship a path a real consumer has
+already shown to fault. Slice 0 is now diagnosed and the confirmed defect is fixed (below).
 
 ## 5. Slices
 
 Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
 
-### Slice 0 — mainline tier-up over a live window (bug fix; unblocks slice 2)
+### Slice 0 — mainline tier-up over a live window (DIAGNOSED; gate fix landed)
 
-- **Repro:** a minimal `InterpDriven` guest that (a) has a data segment and (b) is forced through
-  per-function `TierUp` from *mainline* code (not `thread.spawn`), driven through the
-  `svm_par_run` loop in the browser test harness. Per the JACL doc, if it faults the problem is
-  "mainline TierUp over a live window", independent of guest size.
-- **Diagnose:** instrument `env.trap` (test-only) to log trap code + `eff`/`mapped`/`win`; diff the
-  window setup between `svm_run_onramp` and the `svm_par_run`/`PAR_TIERUP` lane (data
-  materialization, provenance of `win` and `size_log2`).
-- **Fix direction:** per the JACL doc's option (a)/(b) — either make mainline tier-up run emitted
-  code over the interpreter's *current* live window as a first-class contract, or enforce (and
-  assert at the seam) that the par lane materializes data and shares the exact window. Whichever it
-  is, the contract gets stated in `svm-wasm-jit`'s module docs and pinned by the repro test.
-- **Gate:** repro test red→green; existing tier-up/threads differentials stay green.
+**Diagnosis (empirical, native).** A new native harness (`svm-wasm-jit/tests/tierup_live_window.rs`)
+drives the real loop — `bytecode::VcpuReactor` opens over a caller-owned window, runs `_start`
+(materializing `m.data`), and tiers up a mainline `Call` onto emitted wasm mirrored over that live
+window. It is the native twin of the browser `svm_par_run`/`PAR_TIERUP` lane, which had **no native
+coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation over a hand-seeded window).
+
+Against the JACL doc's ranked hypotheses:
+- **Hypothesis 1 (data/window-materialization) — ruled out for the native path.** With a
+  window sized to `1 << size_log2` and data materialized by the interpreter, mainline tier-up over
+  the live window (incl. a data-segment read and a write-then-read round-trip) matches the
+  interpreter oracle exactly. The interpreter's `init_data` + the shared `win` base already satisfy
+  the contract; the harness pins it.
+- **Hypothesis 2/3 (baked `size_log2` vs a page-managed window) — confirmed as a real defect.**
+  `compile_module_tierup` (a **public** entry) did **not** apply the `module_uses_page_ops` gate that
+  `compile_jit`/`compile_nested` apply (NESTED_JIT Track 3). So a guest that manages its own pages —
+  which grows/remaps its window at runtime, exactly the JACL compiler's heap shape — got hot leaves
+  emitted with a `mapped = 1 << size_log2` baked at emit time; an emitted mask-only access then
+  ignores the live page state (a grown/remapped region), diverging from the interpreter → the
+  `MemoryFault → unreachable` mid-body, before any `env.call_interp`, that the spike saw. The JACL
+  spike called `compile_module_tierup` directly, bypassing `compile_jit`'s gate.
+
+**Fix (landed).** `compile_module_tierup_caps` now self-applies the page-op gate: a page-op module
+emits nothing (all-`false` bitmap, valid imports-only wasm), identical to `compile_interp_only` and
+to `compile_jit(Threaded)`. The gate now holds regardless of which public entry a host calls.
+Pinned by `tierup_page_op_module_emits_nothing` (red→green: was `[false, true]`, now `[false,
+false]`), a control that still emits without the page op, and a cross-entry agreement test.
+
+**Scope honesty.** This closes the confirmed native-reproducible defect. One JACL hypothesis-1
+residue can only be checked with the browser Worker harness (node + the wasm cdylib), out of reach
+here: whether the `svm_par_run`/`PAR_TIERUP` lane's `win`/`size_log2` provenance matches
+`svm_run_onramp` for a guest that *grows* its window mid-run. The native evidence says the shared-
+`win` contract is sound when sizes match; the remaining risk is purely the grow/remap case, which
+the landed gate now routes to the interpreter anyway (a page-managing guest emits nothing). If a
+future consumer needs a *page-managing* guest accelerated, that is the gated-(b)-with-elision
+escalation NESTED_JIT Track 3 documents — not in scope here.
 
 ### Slice 1 — compiled-output cache (the biggest playground feel-fix)
 
