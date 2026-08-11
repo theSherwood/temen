@@ -64,6 +64,18 @@ fn has_indirect_funcref_dispatch(m: &Module) -> bool {
     })
 }
 
+/// Whether the module materializes any funcref via `ref.func`. Its result is the function index as an
+/// observable `i32`, so renumbering functions would change that value wherever it flows to data (a
+/// return, a store, a comparison) rather than an immediately-consumed dispatch. [`dead_func_elim`]
+/// bails to the identity when one is present — see the call site.
+fn has_ref_func(m: &Module) -> bool {
+    m.funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::RefFunc { .. }))
+}
+
 /// Rewrite every static function index in `f` through the old→new map (the exact set
 /// [`referenced_funcs`] reads).
 fn remap_func_indices(f: &mut Func, map: &[u32]) {
@@ -103,6 +115,16 @@ pub fn dead_func_elim(m: &Module) -> Module {
     // Unsound to remove/renumber functions while any indirect funcref dispatch is live (see
     // [`has_indirect_funcref_dispatch`]) — bail to the identity until devirtualization removes it.
     if has_indirect_funcref_dispatch(m) {
+        return m.clone();
+    }
+    // Also unsound while any `ref.func` is live: its result **is the function index as a plain i32**
+    // (the identity table), so a program can return/store/compare that integer — its value is
+    // directly observable, not only a `call_indirect` dispatch target. Renumbering rewrites the
+    // `ref.func` operand to preserve *dispatch*, but that silently changes the observed integer
+    // (nightly `opt_sccp`, input `[0xfc]`: `ref.func 2` returned as the entry's i32 result folded to
+    // `ref.func 1` after func 1 was dropped, so the result went `2 → 1`). A dead `ref.func` is cleared
+    // by the per-function DCE before this pass runs in the fixpoint, so this only pins live ones.
+    if has_ref_func(m) {
         return m.clone();
     }
 
