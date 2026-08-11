@@ -186,6 +186,7 @@ fn print_debug_info(s: &mut String, m: &Module) {
         && di.types.is_empty()
         && di.vars.is_empty()
         && di.blobs.is_empty()
+        && di.func_names.is_empty()
     {
         return;
     }
@@ -3688,6 +3689,30 @@ debug.loc 0 0 0 0 7 5
             parse_module(&print_module(&m)).unwrap(),
             m,
             "print → re-parse is identity"
+        );
+    }
+
+    #[test]
+    fn debug_info_with_only_func_names_survives_text_round_trip() {
+        // Regression (nightly `roundtrip` fuzz, input `[83,86,77,0,10,0,…,1,42,0]`): a module whose
+        // `debug_info` carries *only* a `func_names` entry (every other table empty) must still print
+        // its debug section, so `parse ∘ print = id`. The printer's emptiness guard used to check the
+        // other five `DebugInfo` fields but not `func_names`, so it emitted nothing and the round-trip
+        // collapsed `Some(DebugInfo { func_names: [..] })` to `None` — the I47 class, one field over.
+        let m = Module {
+            debug_info: Some(DebugInfo {
+                func_names: vec![FuncName {
+                    func: 42,
+                    name: String::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "a func_names-only debug section must round-trip through text"
         );
     }
 }

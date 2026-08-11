@@ -607,27 +607,32 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
             // bounds-checked access exercising `svm-mask`'s wider width under the oracle.
             25 => gen_simd(bb, has_mem),
             26 if has_mem => {
-                // Bulk memory (`memcpy`/`memmove`/`memset`, D62): the whole span `[ptr, ptr+len)` is
-                // confined as a unit, then copied/filled. `dst`/`src` are arbitrary pool values (mostly
+                // Bulk memory (`memmove`/`memset`, D62): the whole span `[ptr, ptr+len)` is confined
+                // as a unit, then copied/filled. `dst`/`src` are arbitrary pool values (mostly
                 // out-of-window ⇒ both backends trap-agree, same masking lowering as `Store`); `len` is
                 // a small synthesized constant so an in-window span is a cheap bounded copy, never a
                 // multi-GB one. `val` (the `memset` byte) is an i32.
+                //
+                // We deliberately synthesize only the overlap-safe `MemMove`, never `MemCopy`. Both
+                // carry the same whole-span confinement lowering (they differ only in the final
+                // libcall), but `MemCopy` has the C `memcpy` contract — the source and destination
+                // spans must not overlap, exactly as `llvm.memcpy` (its only frontend source) requires.
+                // With `dst`/`src` drawn from arbitrary runtime pool values we cannot prove them
+                // disjoint, so a `MemCopy` here can name overlapping in-window spans: the interpreter
+                // oracle is overlap-safe (memmove semantics) while the JIT lowers to a raw `memcpy`
+                // libcall, so the two backends legitimately diverge (UB on the JIT side — ASan reports
+                // `memcpy-param-overlap`). That is an out-of-contract program, not a miscompile, so the
+                // differential generator must not emit it. `MemCopy`'s non-overlapping lowering is
+                // instead covered by the fixed-address differential unit tests in `svm-jit/tests/bulk_mem.rs`.
                 let dst = bb.want(ValType::I64);
                 let n = bb.g.below(1024) as i64;
                 let len = bb.push(Inst::ConstI64(n), ValType::I64);
-                match bb.g.below(3) {
-                    0 => {
-                        let src = bb.want(ValType::I64);
-                        bb.push0(Inst::MemCopy { dst, src, len });
-                    }
-                    1 => {
-                        let src = bb.want(ValType::I64);
-                        bb.push0(Inst::MemMove { dst, src, len });
-                    }
-                    _ => {
-                        let val = bb.want(ValType::I32);
-                        bb.push0(Inst::MemFill { dst, val, len });
-                    }
+                if bb.g.below(2) == 0 {
+                    let src = bb.want(ValType::I64);
+                    bb.push0(Inst::MemMove { dst, src, len });
+                } else {
+                    let val = bb.want(ValType::I32);
+                    bb.push0(Inst::MemFill { dst, val, len });
                 }
             }
             _ => continue, // a mem/call kind that isn't available here — re-roll
