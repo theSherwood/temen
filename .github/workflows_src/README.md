@@ -16,6 +16,15 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`warm-snapshot-test.mjs` in the `browser-real` job** — one line added to the Chromium test block
+  (right after `node browser-jit-cache-test.mjs`): `node warm-snapshot-test.mjs`. Validates the
+  WASM_AOT.md warm-runtime snapshot: `svm_warm_open` runs the QuickJS `warmup` export once, then
+  `svm_warm_eval` restores the post-init image and runs `eval_run`, which must match the cold `_start`
+  path (`svm_run_onramp`) byte-for-byte while skipping the runtime rebuild. Uses the committed
+  `web/assets/qjs_snapshot.svmb`; skips cleanly if absent. Reuses the wasm the job already builds — no
+  new toolchain. Verified locally in Node/V8. (Until copied over, the `workflows-in-sync` guard stays
+  red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
   test block (right after the already-copied `node browser-jit-cache-test.mjs`):
   `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the

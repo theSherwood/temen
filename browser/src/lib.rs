@@ -4694,6 +4694,249 @@ pub extern "C" fn svm_run_onramp(
     out.value
 }
 
+// ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
+//
+// WASM_AOT.md § "warm-runtime snapshot". A language on-ramp (QuickJS…) rebuilds its whole runtime on
+// every Run; for a trivial program that fixed init dominates the wall clock. This session runs the
+// guest's `warmup` export **once** (init runtime+context into statics), snapshots the post-init guest
+// image, then restores that image before each `eval_run` — so every Run evaluates the user's code over
+// a warm runtime it did not have to rebuild. Fresh-per-Run isolation holds: each Run restores the SAME
+// program-independent image into the window (no guest state crosses Runs). The native prototype is
+// `crates/svm-llvm/examples/qjs_snapshot.rs`; this is its browser twin, a stateful session like
+// `PgSession`. Requires a two-phase driver module exporting `warmup` + `eval_run` (both `(i64 sp)`).
+//
+// Memory model (the wrinkle the native prototype de-risked): the on-ramp heap grows **above** the
+// declared window (`heap_base = 1 << declared_log2`), and that `vm_map` growth's mapped-width state
+// lives in the `Mem`, not the window bytes — so we run under a **larger mapped window**
+// (`WARM_MAPPED_LOG2`) that keeps the whole heap inside the mapped region, making the guest image a
+// contiguous byte range we snapshot/restore by plain copy.
+
+/// The mapped-window log2 the warm session runs the guest under, overriding the module's declared size
+/// so the on-ramp heap stays inside the mapped region (see the memory-model note above). 2^26 = 64 MiB:
+/// a few MiB of globals/stack + generous heap headroom for QuickJS. Matches the native prototype.
+const WARM_MAPPED_LOG2: u8 = 26;
+
+/// A live warm-runtime snapshot session over an owned window: the compiled program, the warm image, and
+/// the window it restores into. Single-threaded wasm ⇒ held in a plain static ([`WARM_SESSION`]).
+struct WarmSession {
+    prog: bytecode::SharedProgram,
+    /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
+    /// deterministic powerbox handles match the snapshot's window-relative state.
+    module: svm_ir::Module,
+    /// Mapped window size, `1 << WARM_MAPPED_LOG2` (also the owned backing size).
+    win: u64,
+    /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
+    entry_sp: u64,
+    eval_fn: svm_ir::FuncIdx,
+    /// The owned window backing (kept alive for the session; `back` aliases it).
+    win_ptr: *mut u8,
+    win_layout: Layout,
+    back: std::sync::Arc<svm_interp::Region>,
+    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
+    image: Vec<u8>,
+    /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
+    /// `[image.len(), dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    dirty_end: usize,
+}
+
+/// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`svm_warm_open`].
+static mut WARM_SESSION: Option<WarmSession> = None;
+
+/// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`) from a window image.
+fn warm_read_brk(win: &[u8]) -> usize {
+    let o = svm_ir::POWERBOX_HEAP_BRK as usize;
+    i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
+}
+
+/// Open a warm session over the two-phase driver module at `[mod_ptr, mod_len)`: run `warmup` once and
+/// keep its post-init guest image for [`svm_warm_eval`]. Returns the live-image byte length on success
+/// (≥ 0), or `-1` with [`svm_status`] set (`UNSUPPORTED` if the module isn't a warm-snapshot driver —
+/// no `warmup`/`eval_run` exports, or its declared window ≥ the mapped window; `TRAP` if `warmup`
+/// traps). Closes any prior session first. Drive with [`svm_warm_eval`], end with [`svm_warm_close`].
+#[no_mangle]
+pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    svm_warm_close();
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let mut m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -1;
+        }
+    };
+    let Some(mc) = m.memory else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let declared_log2 = mc.size_log2;
+    // Need headroom above the declared window for the heap; the mapped window must exceed it.
+    if declared_log2 >= WARM_MAPPED_LOG2 {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    }
+    let heap_base = 1u64 << declared_log2;
+    let (Some(warmup_fn), Some(eval_fn)) =
+        (m.resolve_export("warmup"), m.resolve_export("eval_run"))
+    else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    // Compute the entry sp from the declared (data-segment) layout, then enlarge the mapped window.
+    let entry_sp = svm_ir::powerbox_entry_sp(&m);
+    m.memory = Some(svm_ir::Memory {
+        size_log2: WARM_MAPPED_LOG2,
+    });
+    let win = 1u64 << WARM_MAPPED_LOG2;
+    let Some(prog) = bytecode::SharedProgram::compile(&m) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    // SAFETY: non-zero 8-aligned size; the buffer is this session's window, freed in `svm_warm_close`.
+    let win_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if win_ptr.is_null() {
+        set(STATUS_TRAP);
+        return -1;
+    }
+    // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
+    // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
+    unsafe {
+        let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);
+        let hb = (heap_base as i64).to_le_bytes();
+        let (b, t) = (
+            svm_ir::POWERBOX_HEAP_BRK as usize,
+            svm_ir::POWERBOX_HEAP_TOP as usize,
+        );
+        w[b..b + 8].copy_from_slice(&hb);
+        w[t..t + 8].copy_from_slice(&hb);
+    }
+    // SAFETY: `[win_ptr, win)` is this session's exclusive window; the engine takes the `Arc<Region>`.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win) });
+    let mut host = Host::new();
+    let _ = grant_onramp_caps(&mut host, &m, None);
+    let mut fuel = u64::MAX;
+    let ran = prog.run_over(
+        warmup_fn,
+        &[Value::I64(entry_sp as i64)],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        true, // seed the module's data segments once, here
+    );
+    if !matches!(ran, Ok(_) | Err(Trap::Exit(_))) {
+        drop(back);
+        // SAFETY: no alias remains (back dropped, run returned); free the window.
+        unsafe { std::alloc::dealloc(win_ptr, layout) };
+        set(STATUS_TRAP);
+        return -1;
+    }
+    // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left.
+    // SAFETY: `win_ptr` owns `win` bytes; read the post-warmup image, no run in flight.
+    let (image, live) = unsafe {
+        let w = core::slice::from_raw_parts(win_ptr, win as usize);
+        let live = warm_read_brk(w).min(win as usize);
+        (w[..live].to_vec(), live)
+    };
+    // SAFETY: single-threaded wasm; the session is read back only via the warm exports.
+    unsafe {
+        *core::ptr::addr_of_mut!(WARM_SESSION) = Some(WarmSession {
+            prog,
+            module: m,
+            win,
+            entry_sp,
+            eval_fn,
+            win_ptr,
+            win_layout: layout,
+            back,
+            image,
+            dirty_end: live,
+        });
+    }
+    set(STATUS_OK);
+    live as i64
+}
+
+/// Evaluate `[stdin_ptr, stdin_len)` (the user's source) over the warm session: restore the snapshot
+/// into the window, run `eval_run`, and stage its stdout/stderr/exit into the shared capture slots
+/// (read via `svm_stdout_ptr`/`_len`, `svm_stderr_ptr`/`_len`, `svm_exit_code`; status via
+/// [`svm_status`]). Returns the guest's `i64` result, or `-1` with `UNSUPPORTED` if no session is open.
+#[no_mangle]
+pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `svm_alloc`ation it filled.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
+    // byte-identical warm state (fresh-per-Run isolation).
+    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
+    unsafe {
+        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        w[..s.image.len()].copy_from_slice(&s.image);
+        w[s.image.len()..s.dirty_end].fill(0);
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    let _ = grant_onramp_caps(&mut host, &s.module, None);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match s.prog.run_over(
+        s.eval_fn,
+        &[Value::I64(s.entry_sp as i64)],
+        &mut fuel,
+        s.back.clone(),
+        &mut host,
+        false, // window already carries the warm image — do not re-seed
+    ) {
+        Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
+        Err(_) => (STATUS_TRAP, 0, 0),
+        Ok(vals) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_OK, 0, 0),
+        },
+    };
+    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied.
+    // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
+    unsafe {
+        let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
+        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize));
+    }
+    set(status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        EXIT_CODE = exit_code;
+    }
+    value
+}
+
+/// Tear down the warm session (free its window), if any. Idempotent; the next [`svm_warm_open`] starts
+/// a fresh one.
+#[no_mangle]
+pub extern "C" fn svm_warm_close() {
+    // SAFETY: single-threaded wasm; take the session and free its owned window.
+    unsafe {
+        if let Some(s) = (*core::ptr::addr_of_mut!(WARM_SESSION)).take() {
+            let (win_ptr, layout) = (s.win_ptr, s.win_layout);
+            drop(s); // drops `back` (the last Region alias) and the rest before we free the buffer
+            std::alloc::dealloc(win_ptr, layout);
+        }
+    }
+}
+
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **POSIX personality** (see
 /// [`onramp_posix_exec`]) — the entry the real `svm-posix` shell runs through in the playground. Same
 /// capture/accessor contract as [`svm_run_onramp`]: seed stdin from `[stdin_ptr, stdin_len)`, read the
