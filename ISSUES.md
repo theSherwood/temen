@@ -1545,6 +1545,15 @@ pinning the runner); every other job on the commit was green and the change was 
 or pre-provision the apt font deps** (or split `--with-deps` off the timed step) so a slow distro
 mirror can't eat the budget. Cleared by a re-run.
 
+**Recurred 2026-08-11 (run 31500730518, PR #698):** exactly the original shape — the
+`fiber-scaling (stack-check + arena-stacks)` job's mingw install step tripped its **15-min cap**
+mid-download from a crawling Azure mirror (`gcc-mingw-w64-x86-64-posix` alone took ~5 min;
+`gcc-mingw-w64-x86-64-win32` was still fetching at the cap). The job's own tests had already passed
+(`12 passed; 0 failed`); the PR was a fuzz-harness/test-only change with no fiber or cross-compile
+surface. The 15-min `timeout-minutes` did its job (failed fast vs. the ~29-min stall in the original
+report). Cleared by a re-run. Still-open residual unchanged: **cache the mingw toolchain** so the
+per-PR gate stops depending on a healthy distro mirror.
+
 ### I30 — Rare Linux-CI linker crash: `rust-lld` dies with SIGBUS while linking `svm-jit` test binaries (S4) — seen on the `build · test · fmt · clippy` job (2026-07-18)
 
 **Where:** the gating `build · test · fmt · clippy` job (ubuntu-latest), during `cargo test --workspace`'s
