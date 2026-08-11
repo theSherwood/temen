@@ -526,14 +526,78 @@ the any-child queue only when unclaimed, so the two waits compose. Empty `forked
 `-EAGAIN` when there is nothing to wait for). The teardown sweeps drain `reap_any_waiters` alongside
 `join_waiters`. Proven in `c_fork.rs`: `a_compiled_c_program_reaps_two_children_with_waitpid_minus_one`
 (fork two children exiting 3/4, reap both with `wait(-1)`, sum = 7 regardless of order — stable 40/40
-under stress) and `waitpid_minus_one_with_no_children_is_echild`. Still coarse in one way — with no
-per-parent child table, `wait(-1)` reaps any twin in the global `forked_twins`, so a multi-parent
-topology could cross-reap; that (and process groups) is the tracking follow-up below.
+under stress) and `waitpid_minus_one_with_no_children_is_echild`.
 
-**Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control —
-per-parent child tracking (so `waitpid(-1)` and process groups are scoped to a parent's own children,
-not the global `forked_twins` set), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
+**Per-parent child scoping — `wait` reaps only a domain's own children. DONE.** `forked_twins` is now a
+map `twin → parent domain` (`domain_key_of` the forking caller, recorded in `fork_parked_caller`)
+rather than a bare set. Every reap path is scoped: `reap_parked_caller` (`wait(pid)`) refuses a twin
+whose recorded parent is not the calling domain (`-ECHILD`, not a foreign reap); `reap_any_parked_caller`
+(`wait(-1)`) ranges only over twins of the calling parent, and `-ECHILD`s when that parent owns none
+even though other parents' twins exist; and `wake_reap_any` wakes only a parked `wait(-1)` caller whose
+domain is the finishing twin's parent. So the shared fork/wait offer no longer lets one shell reap
+another's child. The peek-then-claim ordering keeps the serve/park race retryable (`-EAGAIN`) while
+making cross-parent reaps deterministic `-ECHILD`. Proven by
+`c_fork.rs::wait_only_reaps_a_domains_own_children`: a guest forks a child; the **child**'s `wait(-1)`
+gets `-ECHILD` (the global twin set is non-empty — it holds the child itself under the *parent's* key —
+so without scoping this would deadlock), and the parent reaps only its own child. Stable 40/40 under
+stress.
+
+**Process groups — `setpgid` + `waitpid(-pgid)`. DONE.** Job control's grouping primitive, built on
+the per-parent table. Each twin's [`Twin`] record now also carries a `pgid` (POSIX process group),
+defaulting to the twin's own id at fork — every child starts its own group leader. `setpgid(pid, pgid)`
+is a **direct self-op** (op 15) the *parent* drives — the caller *is* the parent, so its own
+`domain_id` scopes the change with no serve round-trip (unlike `reap`, which needs the servicer to
+reach the parked caller); it retargets a child's `pgid` (`pgid == 0` → the child's own id), confined to
+real children of the caller (`-ESRCH` otherwise). `reap` grew a group form: `reap_any_parked_caller`
+became `reap_group_parked_caller(…, target: Option<TaskId>)` — `None` for `wait(-1)` (any child),
+`Some(pgid)` for `waitpid(-pgid)` (any child in that group) — and the parked-waiter queue carries the
+target so a finishing child wakes only a waiter of its parent whose group it matches. The `waitpid` pid
+selector now decodes POSIX fully enough for a shell: `-1` any child, `< -1` the group `|pid|`, `> 0` a
+named twin. Exposed to compiled C as `__vm_setpgid(pid, pgid)` (chibicc builtin → op 15) alongside the
+existing `__fork`/`__wait`. Proven in `c_fork.rs`: `setpgid_groups_children_and_waitpid_reaps_the_group`
+(fork A/B, `setpgid` B into A's group, `wait(-a_pid)` reaps both → 30; a failed move would sum 0) and
+`waitpid_by_group_does_not_reap_other_groups` (the dual — `wait(-a_pid)` reaps only A, then `-ECHILD`,
+while B waits in its own group). Both stable 30/30 under stress.
+
+**Shell viability — a real command-dispatch loop runs on the surface.** With the process model in
+place we pointed a shell at it (a compiled-C **microshell**, not the Instantiator-spawn Stage-0 shell):
+a reusable `run(name, arg)` that **forks**, has the child marshal an `argv` from runtime strings into
+the §3e args buffer, **resolves the command module by name** (dynamic dispatch — the shell's PATH is
+the name→module grant map), **`execve`s** it, and the parent **`waitpid`s** the status; `main` runs two
+*different* named commands in sequence and sums their exits. It runs end to end
+(`c_fork.rs::a_microshell_dispatches_two_named_commands_through_fork_exec_wait` → 107). The pivotal
+enabler is that **`execve` delivers argv**: the image-replace preserves the caller's args window, so a
+fork twin seeds `{argc, packed argv}` before `execve` and the command reads `argv[1]`
+(`execve_delivers_argv_to_the_command`). Nothing in the core loop broke — fork, resolve-by-name, argv
+marshalling, image-replace, and repeated fork→exec→wait all compose.
+
+**env delivery through `execve`. DONE.** The gap the microshell surfaced. A `main(argc, argv, envp)`
+entry (3 params) now makes chibicc's `_start` also parse the `envc` env strings — which follow the argv
+strings in the §3e args buffer — into an `envp[]` pointer array placed right after `argv[]`, passed as
+`main`'s third argument (`codegen_ir.c`: `needs_envp` + the env loop, blocks 6–10 of the arg-parsing
+`_start`). A 2-param `main(argc, argv)` is byte-identical to before (the env path is behind
+`needs_envp`). No interpreter change: `execve` already preserves the caller's args window, so a fork
+twin seeds `{argc, envc, packed argv+env}` and the exec'd command reads `envp`. Proven by
+`c_fork.rs::execve_delivers_the_environment_to_the_command` (a forked child seeds `env={"V=7"}`, the
+command returns `envp[0][2]='7'`=55). A libc `getenv` walking `envp`/`environ` is the guest-side
+follow-up (a shim, not a substrate concern).
+
+**What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
+- **argv/env-seeding ergonomics.** A shell hand-writes the `{argc, envc}`+packed-strings buffer at offset
+  128; there is no `execvp(argv[], envp[])` helper. Doable in ~10 lines of C (the microshell does), but
+  a real libc wants the wrapper (and a `getenv` walking the delivered `envp`).
+- **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
+  `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
+- **pipes / redirection between forked children** (`cmd1 | cmd2`, `cmd > file`) — the Power-2/`Endpoint`
+  or personality-`pipe`/`dup2` work, untouched by the fork surface.
+- **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
+- **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
+  only (no bytecode/JIT/wasm) — the §9 backend-parity track.
+
+**Remaining lower-level items:** the increment-1 exec simplifications as they're needed (fresh window +
+BSS zero, durable-domain exec, exec from a nested serve context), and `WUNTRACED`/`WCONTINUED` once
+stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a
+microshell running on them, the core process-model surface a shell drives is complete.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 
