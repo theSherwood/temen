@@ -72,6 +72,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fork_diff"
+path = "fuzz_targets/fork_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "onramp_diff"
 path = "fuzz_targets/onramp_diff.rs"
 test = false

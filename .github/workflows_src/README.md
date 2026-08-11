@@ -53,6 +53,15 @@ identical until the next agent edit.
   the sources makes the update independent of them. No behavior change on a healthy runner. Pure CI
   infra; no tree code touched.
 
+- **`fork_diff` fuzz target added to the `fuzz` matrix (`ci.yml`)** — one new entry in the nightly
+  `cargo-fuzz (all targets)` matrix (no new job): `fork_diff` differentials native **bytecode fork**
+  (`clone_caller`/`reap` on the cooperative `drive`) against the tree-walk oracle over fuzz-chosen
+  reply/status values, hardening the single hand-written `SRC_TWIN` pin. The target
+  (`fuzz/fuzz_targets/fork_diff.rs` + its `[[bin]]` in `fuzz/Cargo.toml`) and a stable seed-sweep
+  counterpart (`crates/svm/tests/fork_fuzz.rs`, gated on every run) are ordinary tree code and land
+  with this PR; only the matrix line needs the copy-over. The `workflows-in-sync` guard reds CI until
+  it is applied.
+
 > **A CI guard now enforces this list.** The `workflows-in-sync` job (`workflows_src == workflows`)
 > reds the run whenever any `.github/workflows_src/*.yml` differs from `.github/workflows/*.yml`, so
 > pending changes can't be silently forgotten — the run stays red until the owner copies them over
