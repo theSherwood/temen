@@ -1101,10 +1101,26 @@ So the surface a guest build must satisfy is tiny.
    requires it. Everything — integer code, `String`/`Vec`/`HashMap`, the allocator, and now the float
    formatter — translates and runs.
 
-   Remaining W5 surface is packaging, not viability: the fuller `svm-leng.svmb` asset over a real hexer
-   Leng file (the `chibicc_selfhost_asset` analog) and the browser card.
-3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
-   self-hosting payoff, no browser.
+   **The `svm-leng.svmb` self-host asset is now ✅ baked (2026-08-11) — the `chibicc_selfhost_asset`
+   analog.** `crates/svm-run/demos/leng_selfhost/` mirrors the chibicc/Postgres asset lane for the Rust
+   translator: a `leng_guest` powerbox program (reads a Leng-NIF module from stdin, `translate_to_text`,
+   writes SVM text to stdout — raw `read`/`write` + a bump allocator so the only externs are
+   `read`/`write`/`bcmp`), a `build_leng_svmb.sh` pipeline (`-Z build-std` → `llvm-link-18` →
+   `opt-18` → `svm-llvm-translate --binary` → `prep_svmb`, with a stub audit), a `corpus/` of **verbatim
+   `hexer c` output** (Nim's `system/stringimpl` with ARC, control flow, gotos), and the committed
+   **`svm-leng.svmb`** (282 funcs, ~796 KB, decode/verify/bytecode-compile clean). The gate
+   `crates/svm-run/tests/leng_selfhost_asset.rs` runs the committed asset **in-sandbox over each real
+   hexer file** and asserts the emitted SVM text is byte-identical to native `svm_leng::translate_to_text`
+   — a code-coupled gate needing no build toolchain (the oracle is the in-tree crate), so an
+   IR/ABI/encoder or `svm-leng` change that drifts the asset fails the PR (regenerate + commit, per the
+   demo `README.md`). This *is* the loop headless: real hexer Leng → real `svm-leng` running on svm →
+   verified SVM-IR, byte-exact.
+
+   Remaining W5 surface is packaging, not viability: the browser card.
+3. **The loop, headless — ✅ demonstrated (2026-08-11).** real hexer Leng → `svm-leng`-on-svm →
+   verified SVM-IR, byte-exact (the `leng_selfhost` asset lane above). The self-hosting payoff, no
+   browser. (Chaining W4's nimony-on-svm to feed the Leng end-to-end in one process is the remaining
+   integration step.)
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
    playground over an in-window memfs.
 5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
