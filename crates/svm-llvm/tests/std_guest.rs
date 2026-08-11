@@ -106,8 +106,8 @@ fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Translate + verify + run `src` on the powerbox **with a granted `posix` cap** (`run_with_caps`),
-/// letting `seed` stage the personality (env, a pinned clock, …) → `(stdout, exit)`. This is the
-/// richer-`std::sys` path (`time` here, `fs`/`env` later) that reaches the host via `__vm_host_call`.
+/// letting `seed` stage the personality (env, a pinned clock, a seeded memfs, …) → `(stdout, exit)`.
+/// This is the richer-`std::sys` path (`time`/`env`/`fs`) that reaches the host via `__vm_host_call`.
 fn svm_run_std_posix(
     name: &str,
     src: &str,
@@ -462,9 +462,9 @@ fn std_time_reads_the_posix_clock() {
 /// `OP_SETENV` / `OP_UNSETENV`, so no personality arena contends with the guest heap). A program
 /// reads a seeded var, sets one, and removes one — fully deterministic output.
 ///
-/// Note: `std::env::var` / `vars` (the `OsString`→`String` paths) additionally pull in
-/// `core::str::lossy::Debug::fmt`, whose irreducible CFG the on-ramp's SSA→block-args pass can't yet
-/// translate — an orthogonal on-ramp gap (tracked), not an env issue; the ops here are complete.
+/// (`std::env::var` / `vars` — the `OsString`→`String` paths through `core::str::lossy::Debug::fmt` —
+/// now translate too, once the on-ramp's entry-block slot-numbering fix for named params landed; see
+/// `std_fs_round_trips` and the `ll/parse.rs` fix in this change.)
 #[test]
 fn std_env_var_os_round_trips() {
     if lane_ready().is_none() {
@@ -493,5 +493,60 @@ fn std_env_var_os_round_trips() {
         String::from_utf8_lossy(&stdout),
         "SEEDED=from_host\nMADE=here\nafter_remove_present=false\n",
         "env var_os/set_var/remove_var round-trip through the posix cap"
+    );
+}
+
+/// S2 (fs) — `std::fs` via the posix-cap path: the svm `fs` module reaches the personality's in-memory
+/// filesystem through the PAL `host` bridge's file ops (`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_LSEEK`/
+/// `OP_CLOSE`/`OP_UNLINK`/`OP_STAT`/`OP_OPENDIR`/`OP_READDIR`/`OP_CLOSEDIR`). One program exercises the
+/// whole surface: `File::create`+`write_all`, `read_to_string`, `metadata`, `Seek`+`read`, `read_dir`,
+/// an `ErrorKind::NotFound` on a missing path, and `remove_file`+`exists` — fully deterministic output.
+/// The memfs is seeded with one extra file so `read_dir` returns a stable, sorted two-entry listing.
+#[test]
+fn std_fs_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest fs (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::fs;\n\
+         use std::io::{Read, Seek, SeekFrom, Write};\n\
+         fn main() {\n\
+         \x20   let mut f = fs::File::create(\"/data/hello.txt\").expect(\"create\");\n\
+         \x20   f.write_all(b\"hello svm fs\").expect(\"write\");\n\
+         \x20   drop(f);\n\
+         \x20   println!(\"read_to_string={:?}\", fs::read_to_string(\"/data/hello.txt\").expect(\"read\"));\n\
+         \x20   let md = fs::metadata(\"/data/hello.txt\").expect(\"metadata\");\n\
+         \x20   println!(\"is_file={} len={}\", md.is_file(), md.len());\n\
+         \x20   let mut g = fs::File::open(\"/data/hello.txt\").expect(\"open\");\n\
+         \x20   g.seek(SeekFrom::Start(6)).expect(\"seek\");\n\
+         \x20   let mut s = String::new();\n\
+         \x20   g.read_to_string(&mut s).expect(\"read\");\n\
+         \x20   println!(\"after_seek={s:?}\");\n\
+         \x20   let mut names: Vec<String> = fs::read_dir(\"/data\").expect(\"read_dir\")\n\
+         \x20       .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();\n\
+         \x20   names.sort();\n\
+         \x20   println!(\"read_dir={names:?}\");\n\
+         \x20   println!(\"missing_kind={:?}\", fs::metadata(\"/data/nope\").unwrap_err().kind());\n\
+         \x20   fs::remove_file(\"/data/hello.txt\").expect(\"remove\");\n\
+         \x20   println!(\"exists_after_remove={}\", fs::exists(\"/data/hello.txt\").unwrap());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_fs", src, |p| {
+        p.write_file("/data/seed.txt", b"seed")
+    }) else {
+        eprintln!("note: skipping std_guest fs (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "read_to_string=\"hello svm fs\"\n\
+         is_file=true len=12\n\
+         after_seek=\"svm fs\"\n\
+         read_dir=[\"hello.txt\", \"seed.txt\"]\n\
+         missing_kind=NotFound\n\
+         exists_after_remove=false\n",
+        "fs File/metadata/seek/read_dir/remove round-trip through the posix cap"
     );
 }

@@ -92,4 +92,72 @@ pub(crate) mod host {
     pub(crate) fn environ(index: i64, buf: *mut u8, cap: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 36, index, buf as i64, cap, 0) }
     }
+
+    // ---- filesystem (svm-posix `OP_OPEN`/`OP_READ`/… — the `std::fs` surface) -------------------
+    // Each op's literal code is inlined at the `__vm_host_call` site (the on-ramp requires the `op`
+    // argument to be a compile-time constant).
+
+    /// `open(path, plen, flags) -> fd | -errno` (svm-posix `OP_OPEN` = 5).
+    #[inline(always)]
+    pub(crate) fn open(path: *const u8, plen: i64, flags: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 5, path as i64, plen, flags, 0) }
+    }
+
+    /// `close(fd) -> 0 | -errno` (svm-posix `OP_CLOSE` = 6).
+    #[inline(always)]
+    pub(crate) fn close(fd: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 6, fd, 0, 0, 0) }
+    }
+
+    /// `lseek(fd, offset, whence) -> new_offset | -errno` (svm-posix `OP_LSEEK` = 7).
+    #[inline(always)]
+    pub(crate) fn lseek(fd: i64, offset: i64, whence: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 7, fd, offset, whence, 0) }
+    }
+
+    /// `unlink(path, plen) -> 0 | -errno` (svm-posix `OP_UNLINK` = 8).
+    #[inline(always)]
+    pub(crate) fn unlink(path: *const u8, plen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 8, path as i64, plen, 0, 0) }
+    }
+
+    /// `read(fd, buf, len) -> n | -errno` (svm-posix `OP_READ` = 1). Distinct from the stdio PAL's
+    /// `extern "C" read` (the powerbox stdin stream) — this drives a `posix`-personality file fd.
+    #[inline(always)]
+    pub(crate) fn read_fd(fd: i64, buf: *mut u8, len: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 1, fd, buf as i64, len, 0) }
+    }
+
+    /// `write(fd, buf, len) -> n | -errno` (svm-posix `OP_WRITE` = 0). The file-fd counterpart of the
+    /// stdio PAL's powerbox `write`.
+    #[inline(always)]
+    pub(crate) fn write_fd(fd: i64, buf: *const u8, len: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 0, fd, buf as i64, len, 0) }
+    }
+
+    /// `stat(path, plen, statbuf) -> 0 | -errno` (svm-posix `OP_STAT` = 13). Fills the caller's
+    /// `{ i64 st_mode; i64 st_size; }` (16 bytes).
+    #[inline(always)]
+    pub(crate) fn stat(path: *const u8, plen: i64, statbuf: *mut u8) -> i64 {
+        unsafe { __vm_host_call(posix(), 13, path as i64, plen, statbuf as i64, 0) }
+    }
+
+    /// `opendir(path, plen) -> dir | -errno` (svm-posix `OP_OPENDIR` = 14).
+    #[inline(always)]
+    pub(crate) fn opendir(path: *const u8, plen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 14, path as i64, plen, 0, 0) }
+    }
+
+    /// `readdir(dir, name_buf, cap) -> namelen | 0 | -errno` (svm-posix `OP_READDIR` = 15). Writes the
+    /// next entry's NUL-terminated name; `0` is end-of-stream, `-ERANGE` means `cap` was too small.
+    #[inline(always)]
+    pub(crate) fn readdir(dir: i64, name_buf: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 15, dir, name_buf as i64, cap, 0) }
+    }
+
+    /// `closedir(dir) -> 0 | -errno` (svm-posix `OP_CLOSEDIR` = 16).
+    #[inline(always)]
+    pub(crate) fn closedir(dir: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 16, dir, 0, 0, 0) }
+    }
 }
