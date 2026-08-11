@@ -1254,8 +1254,9 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The granted unit's per-function tier-up eligibility (`compile_jit` / `Shape::Threaded`): `f{i}` is emitted
-/// + safe to call. A confined child whose entry is eligible runs on wasm; else it interprets.
+/// The granted unit's per-function eligibility ([`svm_wasm_jit::compile_nested`]'s `emitted` bitmap):
+/// `f{i}` is emitted + safe to call directly. A confined child whose entry is eligible runs on wasm;
+/// else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 
 /// Enable §14 real codegen for the run: emit the granted unit ([`ParInstCfg::module`]) to wasm and
@@ -1279,30 +1280,24 @@ pub extern "C" fn svm_par_enable_inst_codegen() -> i32 {
         let Some(m) = &cfg.module else {
             return 0;
         };
-        // §14 VM-in-VM first: the nested emit (`compile_module_nested`) subsumes the plain one — pure
-        // functions emit identically, and a cap-using entry (`cap.call 6 0/1` instantiate/join) *also*
-        // emits, its spawn/join bounced to the Worker via the `env.instantiate`/`env.join` imports
-        // (worker.js services them through the same confined-child completion-slot protocol the
-        // interpreter path uses; providing the extra imports is harmless for a 2-import module).
-        // ADDRESS_SPACE wrappers are NOT outlined here: the browser's `call_interp` callback carries
-        // no powerbox yet, so a `sub`/`page_size`-using entry fails `compile_module_nested` closed and
-        // falls through to the tier-up shape (interpreter entry).
-        if let Ok((wasm, eligible)) = svm_wasm_jit::compile_module_nested_with_eligibility(m, true)
-        {
-            // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
-            unsafe {
-                stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
-                *core::ptr::addr_of_mut!(INST_ELIGIBLE) = Some(eligible);
-            }
-            return 1;
-        }
-        // Fallback: a §14 instantiator child runs interpreter-driven on its own Worker (the `Threaded`
-        // shape), tiering up its in-subset functions.
+        // §14 VM-in-VM codegen via the library's single nested front door ([`compile_nested`]): it
+        // picks the drive mode from the IR and always yields a runnable artifact. A cap-using entry
+        // (`cap.call 6 0/1` instantiate/join, or a `thread.spawn`) emits, its bounce arriving at the
+        // Worker via the `env.instantiate`/`env.join`/`env.thread_*` imports (serviced through the same
+        // confined-child completion-slot protocol as the interpreter path); a fiber-bearing unit falls
+        // to an interpreter-driven tier-up. Either way `emitted[i]` is the sound "safe to call `f{i}`
+        // directly" signal the Worker gates on (`svm_par_inst_eligible`): a fiber reachable from the
+        // entry drops it from `emitted` (the tier-up fixpoint), and a `thread.spawn`ed fiber runs in its
+        // own spawned interpreter vCPU — never across the emitted frame. The Worker offers the whole
+        // nested import set unconditionally, so the uniform layout `compile_nested` emits just works.
+        // ADDRESS_SPACE wrappers are NOT outlined here (the browser's `call_interp` carries no powerbox
+        // yet), so a `sub`/`page_size` entry stays interpreter-driven; a `map`/`unmap`/`protect` unit
+        // emits nothing and interprets wholly (mask-only confinement can't honor page state).
         let Ok(svm_wasm_jit::Artifact {
             wasm,
             emitted: eligible,
             ..
-        }) = svm_wasm_jit::compile_jit(m, svm_wasm_jit::Shape::Threaded, true)
+        }) = svm_wasm_jit::compile_nested(m, true)
         else {
             return 0;
         };
