@@ -4010,7 +4010,15 @@ impl<'a> FuncGen<'a> {
         let mut argvals = vec![dest_addr];
         let mut argtys = vec![ValType::I64]; // the sret pointer
         for arg in args {
-            if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            // Aggregate args pass by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)`
+            // literal, e.g. a `string` argument) is constructed into a temp, an aggregate **lvalue**
+            // (a var) rides its own address. Scalars go by value. This mirrors [`call_import`] (the
+            // non-sret twin); without the rvalue case an aggregate-literal arg to an aggregate-returning
+            // cross-module call (`s = f(a, "lit")`) fell through to `expr` and failed closed (#760).
+            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+                argvals.push(addr);
+                argtys.push(ValType::I64);
+            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
                 let (addr, _) = self.lvalue_addr(arg)?;
                 argvals.push(addr);
                 argtys.push(ValType::I64);

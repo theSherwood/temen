@@ -261,6 +261,45 @@ fn nested_cross_module_types_resolve() {
     );
 }
 
+#[test]
+fn cross_module_sret_call_with_oconstr_arg() {
+    // Regression (#760): an aggregate **rvalue** — an `(oconstr …)` literal — passed to a
+    // cross-module **aggregate-returning** call. `caller` does `r = id((oconstr Pair 5 7))`; because
+    // `r` is an aggregate, the call flows through the sret-import path (`call_import_sret`), whose
+    // argument is the oconstr. That path handled aggregate *lvalues* (a var, by address) but not
+    // aggregate *rvalues* — the oconstr fell through to `expr` and failed closed ("expression
+    // `oconstr`"). It now constructs the literal into a temp and passes it by address, like every
+    // other aggregate arg (matching the non-sret `call_import`). This was the dominant gap when
+    // sweeping real nimony output — a `string` literal argument to a returning call (`concat`, `&`,
+    // `$`, `write`) hits it on nearly every program.
+    let mod_p = "\
+(stmts
+ (type :Pair.0. . (object . (fld :x.0 . (i +64)) (fld :y.0 . (i +64))))
+ (proc :id.0. (params (param :p.0 . Pair.0.)) Pair.0. .
+  (stmts . (ret p.0))))";
+    let mod_u = "\
+(stmts
+ (proc :caller.0. (params) (i +64) .
+  (stmts .
+   (var :r.0 . Pair.0.modp (call id.0.modp (oconstr Pair.0.modp (kv x.0 5) (kv y.0 7))))
+   (ret (add (i +64) (dot r.0 x.0 0) (dot r.0 y.0 0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["caller.0."],
+        },
+        LengModule {
+            stem: "modp",
+            src: mod_p,
+            names: &["id.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // caller() = id((5,7)).x + .y = 12, on both engines (`run` asserts §9 parity).
+    assert_eq!(run(&linked, 0, &[4096]), 12, "id((5,7)).x + .y");
+}
+
 /// Real nimony `greet(): string = "hello"` — the SSO literal — linked against a stand-in system
 /// unit carrying the real `string` def under the real system stem. `string.0.sysvq0asl` resolves
 /// from the *linked unit's* type def: no hand-supplied prelude (contrast `strings.rs`, which feeds
