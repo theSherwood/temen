@@ -1044,12 +1044,22 @@ So the surface a guest build must satisfy is tiny.
   per-PR gate doesn't build (I55, `ISSUES.md`). A W5 asset needs an asset-lane check like `chibicc.svmb`'s.
 
 **Slices (each a checkpoint, smallest first):**
-1. **First light (Path L).** Compile one pure `svm-leng` path — e.g. `translate` on a trivial one-proc
-   module — through `rustc --emit=llvm-ir` → `svm-llvm` → svm, output matching native `svm-leng`.
-   Retires "a Rust `svm-leng` fragment runs on svm."
+1. **First light (Path L) — ✅ DONE.** A `no_std + alloc` Rust program doing **`svm-leng`-shaped work**
+   (emit IR-ish text, then re-parse and fold it — `String`/`Vec` building, byte scanning, integer
+   format/parse) compiled `rustc --emit=llvm-ir` → `svm-llvm` and run **as a guest on svm**, matching a
+   native oracle across 10 inputs (incl. edge cases), interp == JIT == native
+   (`crates/svm-llvm/tests/w5_rust_guest.rs`). This retires "purpose-built Rust in the self-host lane
+   runs correctly on svm" and exercises the exact `alloc`/string surface the real translator needs. (It
+   builds on the already-proven Rust→svm on-ramp — `rustbench`, the `peval` fixtures run real
+   multi-crate Rust on svm — so the pipeline itself is mature; this pins the *leng surface* on it.)
 2. **Whole `translate`, byte-identical.** The full translator as one svm-ir module (an `svm-leng.svmb`
    asset), run on svm over a real hexer Leng file, byte-for-byte vs native `svm-leng` — the §18
-   differential, the `chibicc_selfhost_asset` analog.
+   differential, the `chibicc_selfhost_asset` analog. **Discovered prerequisite (from slice 1):** the
+   on-ramp/fixture model synthesizes `malloc`/`free` and cannot satisfy `std`'s `getrandom`/syscalls,
+   so real `svm-leng` (a `std` crate — `HashMap`'s `RandomState`) must first go **`no_std + alloc` with
+   a fixed-seed hasher and a supplied allocator**. Its deps (`svm-ir`/`svm-text`/`svm-encode`) are pure
+   and take the same posture; the browser cdylib already builds them for wasm, so this is a bounded,
+   mechanical port — but it is the real content of slice 2, not a footnote.
 3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
    self-hosting payoff, no browser.
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
