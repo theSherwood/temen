@@ -96,6 +96,28 @@ try {
     console.log('  SKIP: editable-module stdin (lua_eval.svmb not built — run build-onramp-assets.mjs)');
   }
 
+  // The svm-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
+  // running it pipes that to the committed `svm-leng.svmb` (always present) on stdin — the translator
+  // emits SVM IR text on stdout and exits 0. The IR carries `func`/`block` (svm-text), proving the real
+  // leng→SVM-IR translator ran client-side over genuine nimony output.
+  const lengCard = 'svm-leng: translate real nimony Leng → SVM IR (self-host)';
+  const lengSrc = await page.evaluate((sel) => {
+    const cm = document.querySelector(`${sel} .CodeMirror`)?.CodeMirror;
+    return (cm?.getValue() || '');
+  }, card(lengCard));
+  lengSrc.includes('stmts') && lengSrc.includes('wasMoved')
+    ? ok('svm-leng card → editor holds the real hexer Leng')
+    : fail(`svm-leng editor: ${lengSrc.slice(0, 80)}`);
+  await runCard(page, lengCard, 30_000);
+  const leng = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(lengCard));
+  leng.state === 'done' && leng.result === '0' && leng.stdout.includes('func') && leng.stdout.includes('block')
+    ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser')
+    : fail(`svm-leng run: state=${leng.state} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
+
   // The C-compiler card mounted a C-mode editor.
   const cc = await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`)?.CodeMirror?.getOption('mode'),
     card('C compiler (chibicc → SVM — compile & run)'));

@@ -1116,13 +1116,21 @@ So the surface a guest build must satisfy is tiny.
    demo `README.md`). This *is* the loop headless: real hexer Leng → real `svm-leng` running on svm →
    verified SVM-IR, byte-exact.
 
-   Remaining W5 surface is packaging, not viability: the browser card.
+   And it now runs **client-side in the browser** too (item 4 below).
 3. **The loop, headless — ✅ demonstrated (2026-08-11).** real hexer Leng → `svm-leng`-on-svm →
    verified SVM-IR, byte-exact (the `leng_selfhost` asset lane above). The self-hosting payoff, no
    browser. (Chaining W4's nimony-on-svm to feed the Leng end-to-end in one process is the remaining
    integration step.)
-4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
-   playground over an in-window memfs.
+4. **The browser card — ✅ shipped (2026-08-11).** The Rust/leng analog of the chibicc self-host card:
+   a playground card (`browser/web/play.js`, `kind: 'module'`) whose editor holds a **real hexer Leng
+   file** (Nim `system/stringimpl` — ARC, `=wasMoved`) and whose Run pipes it to the committed
+   `svm-leng.svmb` (copied into `browser/web/assets/`) on stdin via `svm_run_onramp` — the fixed §3e
+   powerbox on the wasm engine. The translator emits **SVM IR text on stdout**, shown in the pane; the
+   run is ~200 ms and the emitted IR is byte-identical to native (`svm-leng.svmb` is the same asset the
+   `leng_selfhost_asset.rs` gate pins). Verified end-to-end in a real Chromium by
+   `browser/browser-play-editor-test.mjs`; the asset-reference PR gate (`check-play-assets.mjs`) sees it
+   committed. No server, no memfs image needed (stdin/stdout suffice — simpler than chibicc's header
+   closure): the real Rust translator, running on the SVM, in your browser.
 5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
    `svm_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
 

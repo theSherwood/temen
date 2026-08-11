@@ -829,6 +829,212 @@ int main(void) {
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
+  'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
+    kind: 'module',
+    jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms
+    editable: true,
+    lang: 'svm',
+    url: './assets/svm-leng.svmb',
+    mode: 'io',
+    desc: "The **leng self-host capstone** (NIM.md §3e): svm-leng — the Leng→SVM-IR translator, itself compiled to a verified SVM module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `svm-leng.svmb` on stdin, the translator parses the NIF and emits **SVM IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running svm-leng natively** (gated in CI by `leng_selfhost_asset.rs`). Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the SVM.",
+    src: `(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LongString.0.))))
+ (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc@,1g,nimony/lib/std/system/stringimpl.nim :=wasMoved.2.@5
+  (params@H
+   (param@1 :s.40 .
+    (ptr@3 string.0.@4))).
+  (pragmas@X
+   (exportc "nimStrWasMoved")
+   (inline 0 0)
+   (smry~X
+    (param 0 0 reads writes)))
+  (stmts@2,1
+   (asgn@8
+    (dot~7
+     (deref~1 s.40)bytes.0 0)
+    (conv@2
+     (u@B,c,nimony/lib/std/system/basic_types.nim 64)0))))
+ (proc@,1j,nimony/lib/std/system/stringimpl.nim :=destroy.2.@5
+  (params@G
+   (param@1 :s.41 . string.0.@3)).
+  (pragmas@S
+   (exportc "nimStrDestroy")
+   (inline 0 150)
+   (smry~S writeGlobal readGlobal callsUnknown
+    (param 0 0 reads writes escapes)))
+  (stmts@2,1
+   (if
+    (elif@3
+     (eq@9
+      (conv~9,~13
+       (i@U,E,nimony/lib/std/system/defaults.nim 64)
+       (deref@1
+        (cast
+         (ptr@5
+          (u@4 8))
+         (addr@K
+          (dot@1 s.41~G,13 bytes.0 0)))))
+      (suf@1,~1Y 255 "i64"))
+     (stmts~1,1
+      (var@3 :\`x.223 .
+       (bool@J,A,nimony/lib/std/system/arcops.nim)
+       (call arcDec.0.
+        (addr@D
+         (dot
+          (deref
+           (dot~5 s.41~1 more.0 0))rc.0 0))))
+      (if
+       (elif@3 \`x.223
+        (stmts~1,1
+         (call dealloc.1.
+          (conv@9
+           (ptr@J,2f,nimony/lib/std/system/memory.nim
+            (void))
+           (dot s.41~1 more.0 0)))))))))))
+ (proc@,1o,nimony/lib/std/system/stringimpl.nim :=copy.2.@5
+  (params@D
+   (param@1 :dest.11 .
+    (ptr@6 string.0.@4))
+   (param@J :src.6 . string.0.@5)).
+  (pragmas@j
+   (exportc "nimStrCopy")
+   (smry~j writeGlobal readGlobal callsUnknown
+    (param 0 0 reads writes escapes)
+    (param 1 1 reads escapes)))
+  (stmts@2,1
+   (var@4 :ssrc.0 .
+    (i@7,~1B 64)
+    (conv~1,~18
+     (i@U,E,nimony/lib/std/system/defaults.nim 64)
+     (deref@1
+      (cast
+       (ptr@5
+        (u@4 8))
+       (addr@K
+        (dot@1 src.6~8,18 bytes.0 0))))))
+   (if@,1
+    (elif@3
+     (le@5 ssrc.0~5
+      (suf@a,~1b 14 "i64"))
+     (stmts~1,2
+      (var@4 :sdest.0 .
+       (i@5,~1E 64)
+       (conv~3,~1B
+        (i@U,E,nimony/lib/std/system/defaults.nim 64)
+        (deref@1
+         (cast
+          (ptr@5
+           (u@4 8))
+          (addr@K
+           (dot@1
+            (deref~5,1B dest.11)bytes.0 0))))))
+      (if@,1
+       (elif@3
+        (eq@6 sdest.0~6
+         (suf@2,~1h 255 "i64"))
+        (stmts~1,1
+         (var@3 :\`x.224 .
+          (bool@J,A,nimony/lib/std/system/arcops.nim)
+          (call arcDec.0.
+           (addr@G
+            (dot
+             (deref
+              (dot~5
+               (deref~4 dest.11)more.0 0))rc.0 0))))
+         (if
+          (elif@3 \`x.224
+           (stmts~1,1
+            (call dealloc.1.
+             (conv@C
+              (ptr@J,2f,nimony/lib/std/system/memory.nim
+               (void))
+              (dot
+               (deref~4 dest.11)more.0 0)))))))))
+      (call@,4 copyMem.0.
+       (conv@D
+        (ptr@P,O,nimony/lib/std/system/memory.nim
+         (void))
+        (addr
+         (dot@4
+          (deref~4 dest.11)bytes.0 0)))
+       (conv@U
+        (ptr@P,O,nimony/lib/std/system/memory.nim
+         (void))
+        (addr
+         (dot@3 src.6~3 bytes.0 0)))
+       (sizeof@l string.0.@1))))
+    (else
+     (stmts
+      (stmts
+       (stmts
+        (stmts@2,9
+         (if
+          (elif@3
+           (eq@B
+            (addr~7
+             (deref@1 dest.11))
+            (addr@7 src.6@1))
+           (stmts@P
+            (ret .))))
+         (var@4,1 :sdest.1 .
+          (i@5,~1M 64)
+          (conv~3,~1J
+           (i@U,E,nimony/lib/std/system/defaults.nim 64)
+           (deref@1
+            (cast
+             (ptr@5
+              (u@4 8))
+             (addr@K
+              (dot@1
+               (deref~5,1J dest.11)bytes.0 0))))))
+         (if@,2
+          (elif@3
+           (eq@6 sdest.1~6
+            (suf@2,~1p 255 "i64"))
+           (stmts~1,1
+            (var@3 :\`x.225 .
+             (bool@J,A,nimony/lib/std/system/arcops.nim)
+             (call arcDec.0.
+              (addr@G
+               (dot
+                (deref
+                 (dot~5
+                  (deref~4 dest.11)more.0 0))rc.0 0))))
+            (if
+             (elif@3 \`x.225
+              (stmts~1,1
+               (call dealloc.1.
+                (conv@C
+                 (ptr@J,2f,nimony/lib/std/system/memory.nim
+                  (void))
+                 (dot
+                  (deref~4 dest.11)more.0 0)))))))))
+         (if@,5
+          (elif@3
+           (eq@5 ssrc.0~5
+            (suf@3,~1s 255 "i64"))
+           (stmts~1,1
+            (call arcInc.0.
+             (addr@F
+              (dot
+               (deref
+                (dot~5 src.6~3 more.0 0))rc.0 0))))))
+         (call@,7 copyMem.0.
+          (conv@D
+           (ptr@P,O,nimony/lib/std/system/memory.nim
+            (void))
+           (addr
+            (dot@4
+             (deref~4 dest.11)bytes.0 0)))
+          (conv@U
+           (ptr@P,O,nimony/lib/std/system/memory.nim
+            (void))
+           (addr
+            (dot@3 src.6~3 bytes.0 0)))
+          (sizeof@l string.0.@1)))))))))))
+`,
+  },
   'Shell (svm-posix — write & run a script)': {
     kind: 'shell',
     jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
