@@ -68,6 +68,14 @@ static inline int pipe(int *fds) { return __vm_pipe(fds); }
 long __vm_close(int handle);
 static inline int close(int fd) { return __vm_close(fd); }
 
+/* read_fd/write_fd(fd, buf, len): read/write a *specific* Stream/pipe-end handle (the plain `read`/
+ * `write` builtins always hit the ambient stdin/stdout). A shell uses these to pump a pipe fd it holds
+ * — e.g. draining a stage's output into a redirect file. Byte count / -errno; read_fd 0 = EOF. */
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+static inline long read_fd(int fd, void *buf, long len) { return __vm_read(fd, buf, len); }
+static inline long write_fd(int fd, void *buf, long len) { return __vm_write(fd, buf, len); }
+
 struct __grant { int name_off; int name_len; int handle; int pad; };
 static char __so_name[] = "stdout";
 static char __si_name[] = "stdin";
