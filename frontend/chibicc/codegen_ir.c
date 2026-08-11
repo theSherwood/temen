@@ -3246,8 +3246,10 @@ static int intern_type(Type *ty) {
       return i;
   // Scalars: also dedup structurally — chibicc copies base `Type` structs freely (each `int`
   // decl can be a distinct pointer), so identity alone would bloat the table with clones.
+  // __m128 is emitted as an *array* (below), not a base type, so exclude it here too.
   bool is_base = ty->kind != TY_PTR && ty->kind != TY_ARRAY && ty->kind != TY_STRUCT &&
-                 ty->kind != TY_UNION && ty->kind != TY_FUNC && ty->kind != TY_VLA;
+                 ty->kind != TY_UNION && ty->kind != TY_FUNC && ty->kind != TY_VLA &&
+                 ty->kind != TY_V128;
   if (is_base) {
     int enc = base_enc(ty);
     for (int i = 0; i < n_dbg_types; i++)
@@ -3269,6 +3271,15 @@ static int intern_type(Type *ty) {
     dbg_types[id].kind = DT_ARRAY;
     dbg_types[id].count = ty->base->size ? ty->size / ty->base->size : 0;
     dbg_types[id].child = intern_type(ty->base);
+    break;
+  case TY_V128:
+    // Present __m128 as four `float` lanes (the layout of an f32x4): the 16 bytes in the window
+    // slot are exactly four little-endian f32s, lane 0 in the low bytes. Emitting it as an array
+    // lets the debugger expand it into per-lane values with no v128-specific consumer code — how
+    // real toolchains render __m128. The render name stays "__m128" (dbg_typename).
+    dbg_types[id].kind = DT_ARRAY;
+    dbg_types[id].count = 4;
+    dbg_types[id].child = intern_type(ty_float);
     break;
   case TY_STRUCT:
   case TY_UNION:
