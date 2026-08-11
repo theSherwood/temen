@@ -699,6 +699,319 @@ fn waitpid_by_group_does_not_reap_other_groups() {
     );
 }
 
+/// FORK.md §8.6 — **`execve` delivers argv to the command.** A shell running `echo hello` must hand
+/// the command its argument vector. The §3e powerbox args buffer lives at
+/// `[POWERBOX_ARGS_BASE=128, POWERBOX_ARGS_END=16384)` as `{argc:u32, envc:u32}` + packed
+/// NUL-terminated strings, and a `--child-entry` `main(argc, argv)` `_start` parses it. `execve`
+/// replaces the image in the caller's *own* window in place, and a `main(argc,argv)` command's globals
+/// start at `POWERBOX_ARGS_END`, so a forked child seeds the buffer *before* `execve` and the new image
+/// reads it. Proven end to end: the child seeds `argv = {"cmd", "42"}` then `execve`s a command that
+/// returns `argv[1][0]` (`'4'` = 52) — pointer-array delivery, not a flat read (the image-replace
+/// preserves the args window; the command's data lands above it). This is the primitive the microshell
+/// below builds on; env (`envc > 0`) is not yet parsed by the `_start` (the next frontier).
+const EXECVE_ARGV_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static long pid, status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;      /* POWERBOX_ARGS_BASE */
+    hdr[0] = 2;                 /* argc */
+    hdr[1] = 0;                 /* envc */
+    char *s = (char *)136;      /* packed strings: base + 8 */
+    s[0] = 'c'; s[1] = 'm'; s[2] = 'd'; s[3] = 0;
+    s[4] = '4'; s[5] = '2'; s[6] = 0;
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The command: return the first byte of `argv[1]` — `'4'` (52) if argv was delivered.
+const EXECVE_ARGV_CMD_SRC: &str = r#"
+int main(int argc, char **argv) {
+  return argv[1][0];
+}
+"#;
+
+#[test]
+fn execve_delivers_argv_to_the_command() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let guest = parse_module_raw(&c_to_ir(EXECVE_ARGV_GUEST_SRC)).expect("parse argv guest");
+    verify_module(&guest).expect("verify argv guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_ARGV_CMD_SRC)).expect("parse argv command");
+    verify_module(&cmd).expect("verify argv command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(52)],
+        "the exec'd command read argv[1][0] = '4' (52) — argv was delivered through execve"
+    );
+}
+
+/// MICROSHELL (pointing a real shell at the fork/exec/wait surface) — a shell's whole command loop in
+/// ordinary compiled C: a reusable `run(name, arg)` that **forks**, has the child build an `argv` from
+/// runtime strings, **resolves the command module by name** (dynamic dispatch — the shell's PATH is the
+/// name→module grant map), **execve**s it, and the parent **waitpid**s for the status. `main` runs two
+/// *different* named commands in sequence and sums their statuses. This is the real shape — not a single
+/// hardcoded exec — exercising dynamic command lookup, runtime argv marshalling from inside a fork
+/// twin's own window, and repeated fork→exec→wait, all end to end.
+const MICROSHELL_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static long slen(const char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
+static long run(const char *name, const char *arg) {
+  long pid, st, i, k;
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;
+    hdr[0] = 2; hdr[1] = 0;                 /* argc = 2, envc = 0 */
+    char *s = (char *)136;
+    i = 0;
+    for (k = 0; name[k]; k = k + 1) { s[i] = name[k]; i = i + 1; } s[i] = 0; i = i + 1;
+    for (k = 0; arg[k]; k = k + 1) { s[i] = arg[k]; i = i + 1; } s[i] = 0;
+    long cmd = __vm_resolve(name, slen(name));
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((st = wait_pid(pid)) < 0);
+  return st;
+}
+static char n_one[] = "one";
+static char n_two[] = "two";
+static char a_five[] = "5";
+int main(int argc, char **argv) {
+  long r1 = run(n_one, a_five);   /* command "one": returns argv[1][0] = '5' = 53 */
+  long r2 = run(n_two, a_five);   /* command "two": returns argv[1][0] + 1 = 54 */
+  return r1 + r2;                 /* 53 + 54 = 107 */
+}
+"#;
+
+/// The two commands the microshell dispatches — each reads its `argv[1]` (proving per-command argv
+/// delivery) and returns a distinct function of it, so the summed status pins that *both* ran with the
+/// right arguments through *different* name lookups.
+const MICROSHELL_CMD_ONE_SRC: &str = r#"
+int main(int argc, char **argv) { return argv[1][0]; }
+"#;
+const MICROSHELL_CMD_TWO_SRC: &str = r#"
+int main(int argc, char **argv) { return argv[1][0] + 1; }
+"#;
+
+/// The manager: spawns the fork/wait server, then the microshell guest via op 13 with a 5-entry grant
+/// list `{stdout, __fork, __wait, "one"→mod1, "two"→mod2}` (the two commands are the shell's PATH), and
+/// joins. `main(inst, stream, guestmod, mod1, mod2)`.
+const MICROSHELL_MANAGER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "fork" 1 { op: 2 }
+export 1 interface "wait" 1 { op: 3 }
+data 400 "__fork"
+data 410 "stdout"
+data 420 "__wait"
+data 430 "one"
+data 440 "two"
+func (i32, i32, i64, i64, i64) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
+  vq = i64.const 0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 262144
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vz0 = i64.const 0
+  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  v1c = i64.const 1
+  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vmod1_32 = i32.wrap_i64 vmod1
+  vmod2_32 = i32.wrap_i64 vmod2
+  va0 = i64.const 256
+  vnp0 = i32.const 410
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 400
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  i32.store va4 vsix
+  va5 = i64.const 280
+  i32.store va5 vforkoff
+  va6 = i64.const 288
+  vnp2 = i32.const 420
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  i32.store va7 vsix
+  va8 = i64.const 296
+  i32.store va8 vwaitoff
+  va9 = i64.const 304
+  vnp3 = i32.const 430
+  i32.store va9 vnp3
+  va10 = i64.const 308
+  vthree = i32.const 3
+  i32.store va10 vthree
+  va11 = i64.const 312
+  i32.store va11 vmod1_32
+  va12 = i64.const 320
+  vnp4 = i32.const 440
+  i32.store va12 vnp4
+  va13 = i64.const 324
+  i32.store va13 vthree
+  va14 = i64.const 328
+  i32.store va14 vmod2_32
+  vgp = i64.const 256
+  vgn = i64.const 5
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+"#;
+
+#[test]
+fn a_microshell_dispatches_two_named_commands_through_fork_exec_wait() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let guest = parse_module_raw(&c_to_ir(MICROSHELL_GUEST_SRC)).expect("parse microshell guest");
+    verify_module(&guest).expect("verify microshell guest");
+    let one = parse_module_raw(&c_to_ir(MICROSHELL_CMD_ONE_SRC)).expect("parse cmd one");
+    verify_module(&one).expect("verify cmd one");
+    let two = parse_module_raw(&c_to_ir(MICROSHELL_CMD_TWO_SRC)).expect("parse cmd two");
+    verify_module(&two).expect("verify cmd two");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&one);
+    let mod2 = host.grant_module(&two);
+
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // Both commands ran through the shell's fork→resolve-by-name→execve→wait loop with their own argv:
+    // "one" returned '5' (53), "two" returned '6' (54); the shell summed them → 107.
+    assert_eq!(
+        r,
+        vec![Value::I64(107)],
+        "the microshell dispatched two named commands via fork/exec/wait (53 + 54 = 107)"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.

@@ -559,10 +559,37 @@ existing `__fork`/`__wait`. Proven in `c_fork.rs`: `setpgid_groups_children_and_
 `waitpid_by_group_does_not_reap_other_groups` (the dual — `wait(-a_pid)` reaps only A, then `-ECHILD`,
 while B waits in its own group). Both stable 30/30 under stress.
 
-**Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
+**Shell viability — a real command-dispatch loop runs on the surface.** With the process model in
+place we pointed a shell at it (a compiled-C **microshell**, not the Instantiator-spawn Stage-0 shell):
+a reusable `run(name, arg)` that **forks**, has the child marshal an `argv` from runtime strings into
+the §3e args buffer, **resolves the command module by name** (dynamic dispatch — the shell's PATH is
+the name→module grant map), **`execve`s** it, and the parent **`waitpid`s** the status; `main` runs two
+*different* named commands in sequence and sums their exits. It runs end to end
+(`c_fork.rs::a_microshell_dispatches_two_named_commands_through_fork_exec_wait` → 107). The pivotal
+enabler is that **`execve` delivers argv**: the image-replace preserves the caller's args window, so a
+fork twin seeds `{argc, packed argv}` before `execve` and the command reads `argv[1]`
+(`execve_delivers_argv_to_the_command`). Nothing in the core loop broke — fork, resolve-by-name, argv
+marshalling, image-replace, and repeated fork→exec→wait all compose.
+
+**What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
+- **env delivery.** `envc` is hardcoded 0 everywhere, and chibicc's `_start` parses `argc`/argv but
+  never the env strings — no `environ`, no `envp` to `main`. A command cannot read an exported var.
+  *The next concrete slice.*
+- **argv-seeding ergonomics.** A shell hand-writes the `{argc, envc}`+packed-strings buffer at offset
+  128; there is no `execvp(argv[])` helper. Doable in ~10 lines of C (the microshell does), but a real
+  libc wants the wrapper.
+- **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
+  `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
+- **pipes / redirection between forked children** (`cmd1 | cmd2`, `cmd > file`) — the Power-2/`Endpoint`
+  or personality-`pipe`/`dup2` work, untouched by the fork surface.
+- **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
+- **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
+  only (no bytecode/JIT/wasm) — the §9 backend-parity track.
+
+**Remaining lower-level items:** the increment-1 exec simplifications as they're needed (fresh window +
 BSS zero, durable-domain exec, exec from a nested serve context), and `WUNTRACED`/`WCONTINUED` once
-stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place, the
-core process-model surface a shell drives is complete.
+stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a
+microshell running on them, the core process-model surface a shell drives is complete.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 
