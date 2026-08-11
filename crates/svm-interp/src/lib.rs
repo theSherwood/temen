@@ -4295,6 +4295,15 @@ struct Sched {
     /// forever). Confinement is capability-shaped: only a domain holding the fork/wait offer can
     /// drive `reap` at all, and even then only over a real twin.
     forked_twins: BTreeSet<TaskId>,
+    /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` (`waitpid(-1)`: reap **any**
+    /// child). Unlike `join_waiters` these are not keyed by a specific twin — any [`forked_twins`]
+    /// member finishing wakes one, FIFO. A twin finishing prefers a `join_waiters` waiter (a
+    /// specific `wait(pid)`) first; only an unclaimed twin falls through to this queue. Confinement
+    /// is the same as `reap`: a `wait(-1)` only ever fires over a twin in `forked_twins`, so it
+    /// cannot reap a foreign task — it can, in a multi-parent topology, reap another servicer's
+    /// twin (there is no per-parent child table yet — the same coarseness `reap` already has;
+    /// per-parent tracking is the process-group follow-up).
+    reap_any_waiters: VecDeque<Box<VCpu>>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
@@ -4825,6 +4834,56 @@ impl Scheduler {
             ReapOutcome::Replied(0)
         }
     }
+
+    /// FORK.md §8.6 — the servicer side of `wait(-1)` / `waitpid(-1)`: reap **any** child, not a
+    /// named one. Mirrors [`Self::reap_parked_caller`] but ranges over the whole `forked_twins` set:
+    ///   * no twins at all → [`ReapOutcome::NoChild`] (`-ECHILD`).
+    ///   * the caller has not parked yet (serve/park race) → [`ReapOutcome::Retry`] (`-EAGAIN`).
+    ///   * **some** twin has already finished → reap it now, reply its status.
+    ///   * `nohang` and none finished → reply `0` at once (POSIX: nothing changed state).
+    ///   * otherwise park the caller in `reap_any_waiters`; the next twin to finish wakes it (via
+    ///     [`Pending::ReapPid`], the same resume path a named `wait` uses).
+    fn reap_any_parked_caller(&self, callee_id: usize, ticket: u64, nohang: bool) -> ReapOutcome {
+        let mut s = self.lock();
+        if s.forked_twins.is_empty() {
+            return ReapOutcome::NoChild; // no children of any pid — a genuine -ECHILD.
+        }
+        let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
+            Some(Waiter::VCpu(v)) => v,
+            Some(other) => {
+                s.ticket_waiters.insert((callee_id, ticket), other);
+                return ReapOutcome::Retry;
+            }
+            None => return ReapOutcome::Retry,
+        };
+        // Any already-finished twin? (Deterministic: smallest id first — `forked_twins` is ordered.)
+        let finished = s
+            .forked_twins
+            .iter()
+            .copied()
+            .find(|t| s.results.contains_key(t));
+        if let Some(pid) = finished {
+            s.forked_twins.remove(&pid);
+            let status = match s.results.remove(&pid) {
+                Some(out) => reap_status(&out.result),
+                None => 0,
+            };
+            v.pending = Some(Pending::CapResult(status));
+            s.runnable.push_back(v);
+            self.work.notify_one();
+            ReapOutcome::Replied(status)
+        } else if nohang {
+            v.pending = Some(Pending::CapResult(0));
+            s.runnable.push_back(v);
+            self.work.notify_one();
+            ReapOutcome::Replied(0)
+        } else {
+            // Park for *any* child: the next `forked_twins` member to finish re-admits us with
+            // `Pending::ReapPid` (set at wake, in the completion path), reusing the named-wait resume.
+            s.reap_any_waiters.push_back(v);
+            ReapOutcome::Replied(0)
+        }
+    }
 }
 
 /// FORK.md §8.6 — the three ways a servicer-side `reap` (`wait(pid)`) resolves. See
@@ -4850,6 +4909,25 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
             _ => 0,
         },
         Err(_) => REAP_CRASH_STATUS,
+    }
+}
+
+/// FORK.md §8.6 — a `forked_twins` member `id` just finished and no named `wait(pid)` claimed it:
+/// if a `wait(-1)` caller is parked in `reap_any_waiters`, wake one (FIFO) to reap this twin via
+/// [`Pending::ReapPid`]. Returns whether a waiter was woken. The twin is left in `forked_twins` /
+/// `results` — the woken caller's `reap_twin` retires it, exactly as a named `wait` does. Called at
+/// each completion site *before* the outcome lands in `results` (the woken caller only runs after
+/// the lock releases, by which point the result is present — the same ordering the named path uses).
+fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
+    if !s.forked_twins.contains(&id) {
+        return false;
+    }
+    if let Some(mut parent) = s.reap_any_waiters.pop_front() {
+        parent.pending = Some(Pending::ReapPid { pid: id });
+        s.runnable.push_back(parent);
+        true
+    } else {
+        false
     }
 }
 
@@ -4967,6 +5045,8 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     drop(v);
     if let Some(parent) = s.join_waiters.remove(&id) {
         s.runnable.push_back(parent);
+    } else {
+        wake_reap_any(s, id); // a `wait(-1)` caller reaps this twin if no named waiter claimed it
     }
     s.results.insert(id, outcome);
     s.live -= 1;
@@ -5029,6 +5109,15 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             victims.push(v);
         } else {
             s.join_waiters.insert(k, v);
+        }
+    }
+    // Parked `wait(-1)` callers of the dying domain are reaped; others stay parked (FIFO order).
+    let raw = std::mem::take(&mut s.reap_any_waiters);
+    for v in raw {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.reap_any_waiters.push_back(v);
         }
     }
     for q in s.wait_waiters.values_mut() {
@@ -5160,6 +5249,7 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
+    victims.extend(std::mem::take(&mut s.reap_any_waiters)); // parked `wait(-1)` callers
     for (_, q) in std::mem::take(&mut s.wait_waiters) {
         for (_, w) in q {
             if let Waiter::VCpu(v) = w {
@@ -5638,6 +5728,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let died: Option<Trap> = outcome.result.as_ref().err().cloned();
                 if let Some(parent) = s.join_waiters.remove(&id) {
                     s.runnable.push_back(parent);
+                    sched.work.notify_one();
+                } else if wake_reap_any(&mut s, id) {
+                    // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
                     sched.work.notify_one();
                 }
                 s.results.insert(id, outcome);
@@ -10704,12 +10797,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let callee_id =
                                     host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
                                         as usize;
-                                match sr_sched.reap_parked_caller(
-                                    callee_id,
-                                    ticket,
-                                    pid as TaskId,
-                                    nohang,
-                                ) {
+                                // `pid == -1` is POSIX `waitpid(-1)` — reap **any** child; any other
+                                // value names a specific twin (`pid > 0`; a bogus/unsupported pid,
+                                // incl. process-group forms `pid < -1` / `0`, casts to no live twin →
+                                // `-ECHILD`, the untracked-group follow-up).
+                                let outcome = if pid == -1 {
+                                    sr_sched.reap_any_parked_caller(callee_id, ticket, nohang)
+                                } else {
+                                    sr_sched.reap_parked_caller(
+                                        callee_id,
+                                        ticket,
+                                        pid as TaskId,
+                                        nohang,
+                                    )
+                                };
+                                match outcome {
                                     // The scheduler owns the caller's reply now — withhold the
                                     // handler's own, exactly as `clone_caller` does.
                                     ReapOutcome::Replied(status) => {

@@ -516,10 +516,24 @@ in `c_fork.rs`:
   The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
   into a child, so the memfs store is shared across the fork.
 
+**`waitpid(-1)` — reap *any* child. DONE.** The servicer-side `reap` now special-cases `pid == -1`
+(`reap_any_parked_caller`): instead of a named twin it ranges over the whole `forked_twins` set —
+reaping any already-finished twin at once, else parking the caller in a new FIFO `reap_any_waiters`
+queue that the **next** twin to finish wakes (via `Pending::ReapPid`, the same resume the named wait
+uses). A finishing twin prefers a named `wait(pid)` waiter first (`join_waiters`), falling through to
+the any-child queue only when unclaimed, so the two waits compose. Empty `forked_twins` → `-ECHILD`
+*before* claiming the caller, so a shell's wait loop terminates deterministically (no serve-race
+`-EAGAIN` when there is nothing to wait for). The teardown sweeps drain `reap_any_waiters` alongside
+`join_waiters`. Proven in `c_fork.rs`: `a_compiled_c_program_reaps_two_children_with_waitpid_minus_one`
+(fork two children exiting 3/4, reap both with `wait(-1)`, sum = 7 regardless of order — stable 40/40
+under stress) and `waitpid_minus_one_with_no_children_is_echild`. Still coarse in one way — with no
+per-parent child table, `wait(-1)` reaps any twin in the global `forked_twins`, so a multi-parent
+topology could cross-reap; that (and process groups) is the tracking follow-up below.
+
 **Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control — `wait`
-for **any** child (`waitpid(-1, …)`) and process groups (which need per-parent child tracking, not just
-the single-pid `forked_twins` reap), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
+BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control —
+per-parent child tracking (so `waitpid(-1)` and process groups are scoped to a parent's own children,
+not the global `forked_twins` set), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 

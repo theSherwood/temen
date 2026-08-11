@@ -365,6 +365,136 @@ fn a_compiled_c_program_runs_fork_exec_wait_end_to_end() {
     );
 }
 
+/// FORK.md §8.6 — **`waitpid(-1)`: reap *any* child.** The shell's `wait`-for-any-child loop, in
+/// compiled C. The guest forks **twice** (two children exiting `3` and `4`), then reaps both with
+/// `wait(-1)` — passing `pid == -1` so the servicer reaps whichever twin finishes next, not a named
+/// one — accumulating their statuses. `3 + 4 = 7` proves both children were reaped through the
+/// any-child path regardless of completion order. Reuses `EXEC_MANAGER` (grants `{stdout, __fork,
+/// __wait}`); `__wait(0, -1)` lowers to the wait offer with `pid = -1`, which the `reap` self-op
+/// routes to `reap_any_parked_caller`. The `s < 0` retry absorbs the `-EAGAIN` serve/park race.
+const WAITANY_GUEST_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_any(void) { return __wait(0, -1); }
+static long pid1, pid2, s, total, n;
+int main(int argc, char **argv) {
+  while ((pid1 = fork()) < 0);
+  if (pid1 == 0) return 3;
+  while ((pid2 = fork()) < 0);
+  if (pid2 == 0) return 4;
+  total = 0;
+  n = 0;
+  while (n < 2) {
+    s = wait_any();
+    if (s < 0) continue;
+    total = total + s;
+    n = n + 1;
+  }
+  write(1, &total, 8);
+  return total;
+}
+"#;
+
+#[test]
+fn a_compiled_c_program_reaps_two_children_with_waitpid_minus_one() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(WAITANY_GUEST_SRC)).expect("parse wait-any guest");
+    verify_module(&guest).expect("verify wait-any guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // Both children (exit 3 and 4) were reaped via wait(-1); the parent summed their statuses.
+    assert_eq!(
+        r,
+        vec![Value::I64(7)],
+        "the parent reaped both children through wait(-1): 3 + 4 = 7"
+    );
+    // Exactly one write — the parent's summed total. Neither child wrote (both returned before write).
+    let out = host.stdout_bytes();
+    assert_eq!(out.len(), 8, "only the parent wrote its summed total");
+    let total = i64::from_le_bytes(out[..8].try_into().unwrap());
+    assert_eq!(total, 7, "3 + 4, both reaped via the any-child wait");
+}
+
+/// FORK.md §8.6 — `waitpid(-1)` with **no children** is `-ECHILD`, not a hang. A shell's wait loop
+/// must terminate when every child has been reaped; the any-child reap fails closed on an empty
+/// `forked_twins` set *before* claiming the caller, so this is deterministic even under the serve
+/// race (there is no twin to wait for). The guest never forks — its single `wait(-1)` sees `-10`
+/// (`ECHILD`) and branches on it (returning `55`, so the check survives `int main`'s truncation of
+/// a negative `long`).
+const WAITANY_NOCHILD_GUEST_SRC: &str = r#"
+long __wait(int h, long pid);
+long wait_any(void) { return __wait(0, -1); }
+static long s;
+int main(int argc, char **argv) {
+  s = wait_any();
+  if (s == -10) return 55;
+  return 66;
+}
+"#;
+
+#[test]
+fn waitpid_minus_one_with_no_children_is_echild() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest =
+        parse_module_raw(&c_to_ir(WAITANY_NOCHILD_GUEST_SRC)).expect("parse no-child guest");
+    verify_module(&guest).expect("verify no-child guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 80_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // wait(-1) with no children returned -ECHILD at once (the guest saw it and took the `55` branch)
+    // — the shell's wait loop terminates rather than hanging.
+    assert_eq!(
+        r,
+        vec![Value::I64(55)],
+        "wait(-1) with no children is -ECHILD, so the guest took the `s == -10` branch"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.
@@ -597,7 +727,9 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
         let factory = factory.clone();
         std::sync::Arc::new(move || -> svm_interp::HostProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
         })
     };
     let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
@@ -1028,7 +1160,9 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
         let factory = factory.clone();
         std::sync::Arc::new(move || -> svm_interp::HostProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
         })
     };
     let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
