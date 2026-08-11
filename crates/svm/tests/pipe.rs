@@ -85,12 +85,15 @@ block 0 (vw: i32, vr: i32) {\n\
   }\n\
 }\n";
 
-/// func 0 `(write_end, read_end)`: read from the pipe **before** anything is written (non-blocking →
-/// `0`), then try to **write to the read end** (wrong direction → `-EINVAL` = `-22`). Encode
-/// `empty_read * 1000 + (0 - bad_write)` = `0*1000 + 22` = `22`.
+/// func 0 `(write_end, read_end)`: **close the write end** (op 2 → writer count 0, so the pipe is at
+/// EOF), read from the now-writerless pipe (empty ⇒ `0`), then try to **write to the read end** (wrong
+/// direction → `-EINVAL` = `-22`). Encode `empty_read * 1000 + (0 - bad_write)` = `0*1000 + 22` = `22`.
+/// (FORK.md §8.6: a pipe read blocks while a writer is open; closing the sole write end first makes the
+/// empty read a clean EOF on both backends — a single-vCPU program can't park on a live writer.)
 const EMPTY_AND_WRONG_DIRECTION: &str = "memory 17\n\
 func (i32, i32) -> (i64) {\n\
 block 0 (vw: i32, vr: i32) {\n\
+  vcl = cap.call 0 2 () -> (i64) vw ()\n\
   a0 = i64.const 0\n\
   vlen = i64.const 4\n\
   vempty = cap.call 0 0 (i64, i64) -> (i64) vr (a0, vlen)\n\

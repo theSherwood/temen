@@ -1478,6 +1478,20 @@ static int gen_builtin_pipe(Node *node) {
   return r; // i64 result (0 / -errno); the C `long __vm_pipe` return narrows at the use site
 }
 
+// FORK.md §8.6 — `__vm_close(int handle)`: close a `Stream`/pipe-end handle. Lowers to `cap.call 0 2`
+// (iface `STREAM` = 0, op 2 = close) on the runtime handle. Revokes the handle; closing a pipe **write**
+// end also drops the pipe's writer count (→ EOF for its reader once all writers close). A shell closes
+// its own copies of a pipe's ends after forking the stages, so the producer becomes the last writer.
+static int gen_builtin_close(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_close(handle) expects 1 argument");
+  int h = gen_expr(a); // i32 capability handle
+  int r = nv++;
+  cg("  v%d = cap.call 0 2 () -> (i64) v%d ()\n", r, h);
+  return r; // i64 result (0); the C `int __vm_close` return narrows at the use site
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1904,6 +1918,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_setpgid(node);
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
+        if (!strcmp(fname, "__vm_close"))
+          return gen_builtin_close(node);
         if (!strcmp(fname, "__vm_fs"))
           return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))

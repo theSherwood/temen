@@ -1188,8 +1188,9 @@ fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
 /// shell's own `stdout` as its output. The two commands use plain `write(1)` / `read(0)` — they never
 /// know a pipe is there; the shim's `exec_io` re-grants the pipe ends by name, and the FIFO backing
 /// aliases across each `execve`, so the producer's bytes reach the consumer transparently. Sequential
-/// (fill-then-drain) for this slice: the producer completes before the consumer runs, and the
-/// non-blocking FIFO yields EOF when empty. `one` writes `"hi\n"`; `two` uppercases stdin to stdout →
+/// (fill-then-drain): the producer completes before the consumer runs. After reaping it the shell
+/// **closes its own write end** (`close(fds[1])`) so the pipe has no writers left — the blocking read
+/// then EOFs once the buffered bytes drain. `one` writes `"hi\n"`; `two` uppercases stdin to stdout →
 /// the sink holds `"HI\n"` and `two` returns the 3 bytes it moved.
 const PIPE_SHELL_SRC: &str = r#"
 static char *a_one[] = { "one", 0 };
@@ -1202,6 +1203,7 @@ int main(int argc, char **argv) {
   while (p1 < 0) p1 = fork();
   if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
   wait_pid(p1);                    /* producer fills the pipe, then exits */
+  close(fds[1]);                   /* no writers left → the consumer's read EOFs after draining */
   long p2 = fork();
   while (p2 < 0) p2 = fork();
   if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
@@ -1289,6 +1291,104 @@ fn a_shell_pipes_the_output_of_one_forked_command_into_another() {
     assert_eq!(
         &out, b"HI\n",
         "one | two: the producer's output flowed through the pipe and the consumer uppercased it"
+    );
+}
+
+/// FORK.md §8.6 — **concurrent pipe: `one | two` with both stages live at once.** Unlike the sequential
+/// test above (fork producer, *wait*, fork consumer), the shell forks **both** stages, closes its own
+/// copies of the pipe ends, and only then waits — so the consumer starts reading before the producer
+/// has written. This exercises the **blocking read**: the producer `one` first burns a long compute
+/// loop, so the consumer `two` reaches its `read(0)` on an empty FIFO and **parks** (writers still open)
+/// rather than seeing a false EOF; when `one` finally writes and exits (the last write end closing), the
+/// parked read wakes — draining the bytes, then EOF. Were the read non-blocking (the pre-slice
+/// behavior) the consumer would EOF immediately and emit nothing. The producer's write end reaches it
+/// through fork+exec; the shell's `close(fds…)` leaves `one` the sole writer so EOF arrives on its exit.
+/// `one` writes `"go\n"`; `two` uppercases → the sink holds `"GO\n"` and `two` returns 3.
+const CONCURRENT_PIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  /* Both stages are live; the shell drops its own ends so `one` is the sole writer (EOF on its exit). */
+  close(fds[0]);
+  close(fds[1]);
+  wait_pid(p1);
+  return wait_pid(p2);   /* the consumer's byte count */
+}
+"#;
+
+/// The concurrent producer `one`: burn a compute loop *first* (so the consumer parks on an empty read),
+/// then write `"go\n"`. The `volatile` accumulator keeps the loop from folding away.
+const CONCURRENT_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "go\n";
+int main(int argc, char **argv) {
+  volatile long acc = 0;
+  long i;
+  for (i = 0; i < 3000000; i = i + 1) acc = acc + i;
+  write(1, msg, 3);
+  return 0;
+}
+"#;
+
+#[test]
+fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{CONCURRENT_PIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse concurrent pipe shell");
+    verify_module(&guest).expect("verify concurrent pipe shell");
+    let producer = parse_module_raw(&c_to_ir(CONCURRENT_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    // Reuse the uppercasing consumer from the sequential test.
+    let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // "one"
+    let mod2 = host.grant_module(&consumer); // "two"
+
+    let mut fuel = 400_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The consumer blocked on the empty pipe, was woken by the producer's write, drained all 3 bytes
+    // (returned 3), and — after the producer exited (EOF) — uppercased "go\n" to "GO\n" on the sink.
+    assert_eq!(
+        r,
+        vec![Value::I64(3)],
+        "the concurrent consumer blocked, woke on the write, and drained 3 bytes"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"GO\n",
+        "concurrent one | two: the blocking read delivered the producer's output in full"
     );
 }
 
