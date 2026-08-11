@@ -9,8 +9,10 @@
 //! Scope: a single top-level numeric-`for` accumulator chunk (`local acc = …; for i = a,b do acc = … end`).
 //! The result cell is identified generically by decoding the chunk's `RETURN`/`RETURN1` bytecode (its
 //! `A` operand is the returned register), so multi-accumulator chunks like fibonacci work too. Integer
-//! `%` / `//` are in scope: their divide-by-zero cold arm deopts to the carried baseline (the divisor
-//! must be a register operand — a local, not a bare constant literal; see `auto_rolled`).
+//! `%` / `//` are in scope in both forms: a **register** divisor (`local d`) deopts its divide-by-zero
+//! cold arm to the carried baseline, and a **constant** divisor (`i % 2`, an `OP_MODK`/`OP_IDIVK`) folds
+//! outright — freezing the proto's constants pool proves the divisor non-zero, so the error arm is dead
+//! (see `auto_rolled`).
 
 #![allow(dead_code)]
 
@@ -30,6 +32,8 @@ const CI_SAVEDPC: u64 = 32;
 const LCLOSURE_P: u64 = 24;
 const PROTO_SIZECODE: u64 = 24;
 const PROTO_CODE: u64 = 64;
+const PROTO_SIZEK: u64 = 20;
+const PROTO_K: u64 = 56;
 const STACKVALUE_SIZE: u64 = 16;
 const VNUMINT_TAG: u8 = 0x03;
 
@@ -155,6 +159,21 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
     let code = rd_u64(w, proto + PROTO_CODE);
     let sizecode = rd_i32(w, proto + PROTO_SIZECODE) as usize;
     let slice = |a: u64, n: usize| w[a as usize..a as usize + n].to_vec();
+
+    // **Freeze the constants pool.** A constant-operand op like `i % 2` compiles to `OP_MODK`, whose
+    // divisor is `K[C]` — a load from the proto's constants array (`Proto.k`), a separate heap allocation
+    // the `proto` overlay doesn't cover. Un-frozen, the divisor stays `Dyn`, so the specializer can't
+    // prove it non-zero and must project the divide-by-zero / metamethod machinery (which reaches the GC
+    // and the allocator) — `Unsupported`. Freezing the (read-only) `K` array folds `K[C]` to the literal,
+    // so `i % 2` folds with the error arm dead — no divisor cell, no deopt. `Proto.k` @+56, `sizek` @+20;
+    // each constant is one 16-byte `TValue`.
+    let kptr = rd_u64(w, proto + PROTO_K);
+    let sizek = rd_i32(w, proto + PROTO_SIZEK) as usize;
+    let k_overlay: Vec<(u64, Vec<u8>)> = if kptr != 0 && sizek > 0 {
+        vec![(kptr, slice(kptr, sizek * STACKVALUE_SIZE as usize))]
+    } else {
+        Vec::new()
+    };
 
     // Integer `//` (OP_IDIV) and `%` (OP_MOD) are the only arithmetic ops that *raise* on a bad
     // operand — a zero divisor, or `INT_MIN // -1` overflow — and the register-register forms inline
@@ -300,14 +319,18 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
         SpecArg::ConstI64(ci as i64),
     ];
     let base_cfg = || SpecConfig {
-        const_overlays: vec![
-            (l, slice(l, LUA_STATE_SIZE)),
-            (stack_lo, slice(stack_lo, stack_len)),
-            (ci, ci_image.clone()),
-            (code, slice(code, 4 * sizecode)),
-            (closure, slice(closure, 48)),
-            (proto, slice(proto, 128)),
-        ],
+        const_overlays: [
+            vec![
+                (l, slice(l, LUA_STATE_SIZE)),
+                (stack_lo, slice(stack_lo, stack_len)),
+                (ci, ci_image.clone()),
+                (code, slice(code, 4 * sizecode)),
+                (closure, slice(closure, 48)),
+                (proto, slice(proto, 128)),
+            ],
+            k_overlay.clone(),
+        ]
+        .concat(),
         rename: Some((l, l + LUA_STATE_SIZE as u64)),
         rename_extra: vec![(stack_lo, stack_hi), (ci, ci + CI_SIZE as u64)],
         rename_is_private: true,
