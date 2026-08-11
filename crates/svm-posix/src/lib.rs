@@ -23,7 +23,7 @@
 //! is **guest code**, not a cap — it needs no authority (POSIX.md §1).
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use svm_interp::{cap_id, GuestMem, Host, HostProc, Trap};
@@ -140,6 +140,19 @@ pub const OP_UNSETENV: u32 = 35;
 /// `index`-th `KEY=VALUE` (keys **sorted**, so the order is deterministic) into `[buf, cap)` and
 /// returns its byte length (size-then-fetch like `getenv_r`); `-1` once `index` is past the last var.
 pub const OP_ENVIRON: u32 = 36;
+/// `mkdir(path, plen, mode) -> 0 | -errno` — create an explicit **empty** directory (`std::fs::create_dir`).
+/// The memfs otherwise infers dirs from file prefixes, so an empty dir needs recording. `mode` is
+/// ignored (no perm model). `-EEXIST` if the path already exists (file or dir), `-ENOENT` if the parent
+/// isn't a directory, `-EINVAL` for a non-UTF-8 path.
+pub const OP_MKDIR: u32 = 37;
+/// `rename(old, olen, new, nlen) -> 0 | -errno` — rename a file or directory (`std::fs::rename`). A file
+/// key moves (overwriting any existing target file); a directory re-keys every file/subdir under it.
+/// `-ENOENT` if `old` doesn't exist, `-EINVAL` for a non-UTF-8 path.
+pub const OP_RENAME: u32 = 38;
+/// `rmdir(path, plen) -> 0 | -errno` — remove an **empty** directory (`std::fs::remove_dir`). `-ENOTDIR`
+/// if the path is a file, `-ENOENT` if it isn't a directory, `-ENOTEMPTY` if it still has children,
+/// `-EINVAL` for the root or a non-UTF-8 path.
+pub const OP_RMDIR: u32 = 39;
 
 /// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
 const SIG_DFL: i64 = 0;
@@ -154,6 +167,8 @@ const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a dir
 const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
 const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
+const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
+const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
 
 /// `fcntl` commands this personality serves (Linux `<fcntl.h>` values). `F_DUPFD`/`F_DUPFD_CLOEXEC`
 /// duplicate to the lowest free fd `>= arg`; `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are accepted no-ops
@@ -297,6 +312,10 @@ struct Inner {
     /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
     /// follow-up. Shared file bytes; per-fd offsets live in [`Inner::fds`].
     files: HashMap<String, Vec<u8>>,
+    /// Explicitly-created **empty** directories (`mkdir`). The memfs otherwise infers directories as
+    /// prefixes of file keys, which can't represent a dir with no files under it; this set carries those.
+    /// A path is a directory if it is the root, appears here, or is a proper prefix of some file key.
+    explicit_dirs: HashSet<String>,
     /// The host-side fd table (indexed by fd). Seeded with the three stdio sentinels at `0`/`1`/`2`
     /// (`FdEntry::Stdin`/`Stdout`/`Stderr`), so `dup2`/`dup`/`close`/`fcntl` treat every fd uniformly.
     /// `open`/`pipe`/`dup` allocate the lowest free slot; a closed fd (including a closed stdio fd) is
@@ -528,6 +547,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "close" => OP_CLOSE,
         "lseek" => OP_LSEEK,
         "unlink" | "remove" => OP_UNLINK,
+        "mkdir" => OP_MKDIR,
+        "rename" => OP_RENAME,
+        "rmdir" => OP_RMDIR,
         "getcwd" => OP_GETCWD,
         "chdir" => OP_CHDIR,
         "getenv" => OP_GETENV,
@@ -663,6 +685,7 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         allocated: HashMap::new(),
         free_list: Vec::new(),
         files: HashMap::new(),
+        explicit_dirs: HashSet::new(),
         fds: vec![
             Some(FdEntry::Stdin),
             Some(FdEntry::Stdout),
@@ -706,6 +729,9 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_CLOSE => Ok(vec![st.close(args)]),
                 OP_LSEEK => Ok(vec![st.lseek(args)]),
                 OP_UNLINK => st.unlink(args, mem),
+                OP_MKDIR => st.mkdir(args, mem),
+                OP_RENAME => st.rename(args, mem),
+                OP_RMDIR => st.rmdir(args, mem),
                 OP_STAT => st.stat(args, mem),
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
@@ -1176,6 +1202,121 @@ impl Inner {
         }])
     }
 
+    /// `mkdir(path, plen, mode) -> 0 | -errno`: record an explicit empty directory. `mode` is ignored.
+    /// `-EEXIST` if the path is already a file or directory; `-ENOENT` if the parent isn't a directory
+    /// (`create_dir`, not `create_dir_all` — the std layer creates parents itself); `-EINVAL` for a
+    /// non-UTF-8 path.
+    fn mkdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let norm = path.trim_end_matches('/').to_string();
+        if norm.is_empty() {
+            return Ok(vec![EEXIST]); // the root always exists
+        }
+        if self.files.contains_key(&norm) || self.is_dir(&norm) {
+            return Ok(vec![EEXIST]);
+        }
+        let parent = match norm.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => &norm[..i],
+        };
+        if !self.is_dir(parent) {
+            return Ok(vec![ENOENT]);
+        }
+        self.explicit_dirs.insert(norm);
+        Ok(vec![0])
+    }
+
+    /// `rmdir(path, plen) -> 0 | -errno`: remove an empty directory. `-ENOTDIR` if it's a file, `-ENOENT`
+    /// if it isn't a directory, `-ENOTEMPTY` if it still has children (an implicit dir always does),
+    /// `-EINVAL` for the root or a non-UTF-8 path.
+    fn rmdir(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let norm = path.trim_end_matches('/').to_string();
+        if norm.is_empty() {
+            return Ok(vec![EINVAL]); // cannot remove the root
+        }
+        if self.files.contains_key(&norm) {
+            return Ok(vec![ENOTDIR]);
+        }
+        if !self.is_dir(&norm) {
+            return Ok(vec![ENOENT]);
+        }
+        if !self.dir_children(&norm).is_empty() {
+            return Ok(vec![ENOTEMPTY]);
+        }
+        self.explicit_dirs.remove(&norm);
+        Ok(vec![0])
+    }
+
+    /// `rename(old, olen, new, nlen) -> 0 | -errno`: move a file key (overwriting any existing target
+    /// file) or a directory (re-keying every file and explicit subdir under it). `-ENOENT` if `old`
+    /// doesn't exist; `-EINVAL` for a non-UTF-8 path.
+    fn rename(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let old_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let old_len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let new_ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        let new_len = (*args.get(3).ok_or(Trap::Malformed)?).max(0) as u64;
+        let old_bytes = mem.read_bytes(old_ptr, old_len).ok_or(Trap::Malformed)?;
+        let new_bytes = mem.read_bytes(new_ptr, new_len).ok_or(Trap::Malformed)?;
+        let (Ok(old), Ok(new)) = (String::from_utf8(old_bytes), String::from_utf8(new_bytes))
+        else {
+            return Ok(vec![EINVAL]);
+        };
+        let old_n = old.trim_end_matches('/').to_string();
+        let new_n = new.trim_end_matches('/').to_string();
+        // File fast path: move the bytes, shadowing any explicit dir marker at the destination.
+        if let Some(v) = self.files.remove(&old_n) {
+            self.files.insert(new_n.clone(), v);
+            self.explicit_dirs.remove(&new_n);
+            return Ok(vec![0]);
+        }
+        // Directory: re-key every file and explicit subdir under `old_n`, plus the marker itself.
+        if self.is_dir(&old_n) {
+            let op = format!("{old_n}/");
+            let np = format!("{new_n}/");
+            let moved: Vec<String> = self
+                .files
+                .keys()
+                .filter(|k| k.starts_with(&op))
+                .cloned()
+                .collect();
+            for k in moved {
+                let v = self.files.remove(&k).unwrap();
+                self.files.insert(format!("{np}{}", &k[op.len()..]), v);
+            }
+            let dirs: Vec<String> = self
+                .explicit_dirs
+                .iter()
+                .filter(|d| d.as_str() == old_n || d.starts_with(&op))
+                .cloned()
+                .collect();
+            for d in dirs {
+                self.explicit_dirs.remove(&d);
+                let nd = if d == old_n {
+                    new_n.clone()
+                } else {
+                    format!("{np}{}", &d[op.len()..])
+                };
+                self.explicit_dirs.insert(nd);
+            }
+            return Ok(vec![0]);
+        }
+        Ok(vec![ENOENT])
+    }
+
     /// The immediate child **names** of directory `path` in the flat memfs — the distinct first
     /// component of every file key under `path` (deduped, sorted for determinism). A file key exactly
     /// one level below yields its basename; a key deeper below yields the intervening subdir name
@@ -1187,9 +1328,13 @@ impl Inner {
         } else {
             format!("{}/", path.trim_end_matches('/'))
         };
+        // Immediate child names come from two sources: file keys under `prefix`, and explicitly-created
+        // empty directories under `prefix` (`mkdir`). Both contribute the first path component after
+        // `prefix`.
         let mut names: Vec<String> = self
             .files
             .keys()
+            .chain(self.explicit_dirs.iter())
             .filter_map(|k| k.strip_prefix(&prefix))
             .filter(|rest| !rest.is_empty())
             .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
@@ -1199,10 +1344,12 @@ impl Inner {
         names
     }
 
-    /// True if `path` names a directory in the flat memfs: the root `"/"`, or any path that is a
-    /// proper prefix of some file key (i.e. has at least one child). Not a file key itself.
+    /// True if `path` names a directory in the flat memfs: the root `"/"`, an explicitly-created empty
+    /// directory, or any path that is a proper prefix of some file key (i.e. has at least one child).
+    /// Not a file key itself.
     fn is_dir(&self, path: &str) -> bool {
-        path == "/" || !self.dir_children(path).is_empty()
+        let norm = path.trim_end_matches('/');
+        norm.is_empty() || self.explicit_dirs.contains(norm) || !self.dir_children(path).is_empty()
     }
 
     /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
@@ -2795,6 +2942,99 @@ block 0 (vph: i32) {\n\
 
         // opendir of a regular file → -ENOTDIR.
         assert_eq!(st.opendir(&[0, 6], Some(&mut mem)).unwrap()[0], ENOTDIR);
+    }
+
+    #[test]
+    fn mkdir_rename_rmdir_over_the_memfs() {
+        // The directory-mutation surface: `mkdir` records an explicit empty dir (visible to stat and
+        // readdir), `rename` moves a file or a whole subtree, `rmdir` removes only an empty dir — each
+        // with the POSIX errnos `std::fs` maps to `ErrorKind`s.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/data/seed", b"x");
+        posix.write_file("/data/d/inner", b"yy");
+
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        win_write(&mut mem, 0, b"/data/sub");
+        win_write(&mut mem, 16, b"/data/seed");
+        win_write(&mut mem, 32, b"/gone/x");
+        win_write(&mut mem, 48, b"/data");
+        win_write(&mut mem, 64, b"/data/renamed");
+        win_write(&mut mem, 80, b"/data/d");
+        win_write(&mut mem, 96, b"/data/e");
+        win_write(&mut mem, 112, b"/data/e/inner");
+        win_write(&mut mem, 128, b"/data/d/inner");
+        let mut st = posix.inner.lock().unwrap();
+        let rd = |mem: &svm_interp::WindowMem, off: u64| {
+            i64::from_le_bytes(mem.read_bytes(off, 8).unwrap().try_into().unwrap())
+        };
+
+        // mkdir("/data/sub") → 0; again → -EEXIST; over a file → -EEXIST; missing parent → -ENOENT.
+        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.mkdir(&[0, 9, 0o777], Some(&mut mem)).unwrap()[0], EEXIST);
+        assert_eq!(
+            st.mkdir(&[16, 10, 0o777], Some(&mut mem)).unwrap()[0],
+            EEXIST
+        );
+        assert_eq!(
+            st.mkdir(&[32, 7, 0o777], Some(&mut mem)).unwrap()[0],
+            ENOENT
+        );
+
+        // The new empty dir stats as a directory and joins its parent's listing.
+        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(
+            rd(&mem, 512),
+            S_IFDIR | 0o755,
+            "mkdir'd path stats as a directory"
+        );
+        let dir = st.opendir(&[48, 5], Some(&mut mem)).unwrap()[0];
+        let mut got = Vec::new();
+        loop {
+            let n = st.readdir(&[dir, 600, 64], Some(&mut mem)).unwrap()[0];
+            if n == 0 {
+                break;
+            }
+            got.push(String::from_utf8(mem.read_bytes(600, n as u64).unwrap()).unwrap());
+        }
+        st.closedir(&[dir]);
+        assert_eq!(
+            got,
+            vec!["d", "seed", "sub"],
+            "explicit dir joins file-derived children"
+        );
+
+        // rmdir: -ENOTEMPTY on a populated dir, -ENOTDIR on a file, success on the empty explicit dir.
+        assert_eq!(st.rmdir(&[48, 5], Some(&mut mem)).unwrap()[0], ENOTEMPTY);
+        assert_eq!(st.rmdir(&[16, 10], Some(&mut mem)).unwrap()[0], ENOTDIR);
+        assert_eq!(st.rmdir(&[0, 9], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[0, 9, 512], Some(&mut mem)).unwrap()[0], ENOENT);
+
+        // rename a file: /data/seed → /data/renamed (contents follow, old name gone).
+        assert_eq!(st.rename(&[16, 10, 64, 13], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.stat(&[16, 10, 512], Some(&mut mem)).unwrap()[0], ENOENT);
+        assert_eq!(st.stat(&[64, 13, 512], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(rd(&mem, 520), 1, "renamed file keeps its 1-byte contents");
+
+        // rename a directory subtree: /data/d → /data/e (its file moves with it).
+        assert_eq!(st.rename(&[80, 7, 96, 7], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(
+            st.stat(&[112, 13, 512], Some(&mut mem)).unwrap()[0],
+            0,
+            "/data/e/inner exists"
+        );
+        assert_eq!(
+            st.stat(&[128, 13, 512], Some(&mut mem)).unwrap()[0],
+            ENOENT,
+            "old subtree gone"
+        );
+
+        // rename of a missing source → -ENOENT.
+        assert_eq!(
+            st.rename(&[32, 7, 96, 7], Some(&mut mem)).unwrap()[0],
+            ENOENT
+        );
     }
 
     /// Write `bytes` into `mem` at `off` (test helper — `WindowMem` has no direct slice setter).

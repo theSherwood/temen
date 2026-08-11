@@ -17,15 +17,16 @@ use crate::sys::time::SystemTime;
 use crate::sys::{unsupported, unsupported_err};
 
 // The metadata-only / directory-mutation surface has no host op on the memfs backend; borrow the flat
-// `Unsupported` implementations (and the shared `Dir`/`DirBuilder`/`FileTimes` types) from the
-// `unsupported` PAL, exactly as `vexos` does.
+// `Unsupported` implementations (and the shared `Dir`/`FileTimes` types) from the `unsupported` PAL,
+// exactly as `vexos` does. `mkdir` (via our own `DirBuilder`), `rename`, and `rmdir` are implemented
+// below over the memfs directory ops; the rest (symlinks, hard links, times, canonicalize) have no
+// memfs backing and stay `Unsupported`.
 #[expect(dead_code)]
 #[path = "unsupported.rs"]
 mod unsupported_fs;
 pub use crate::sys::fs::common::{copy, exists, remove_dir_all};
 pub use unsupported_fs::{
-    Dir, DirBuilder, FileTimes, canonicalize, link, readlink, rename, rmdir, set_times,
-    set_times_nofollow, symlink,
+    Dir, FileTimes, canonicalize, link, readlink, set_times, set_times_nofollow, symlink,
 };
 
 // `set_perm`/`set_perm_nofollow` take *this* backend's `FilePermissions`, so they can't be borrowed
@@ -54,14 +55,21 @@ const SEEK_CUR: i64 = 1;
 const SEEK_END: i64 = 2;
 // The errno values (`-code`) the memfs ops return, mapped to the `ErrorKind`s programs actually match.
 const ENOENT: i64 = -2;
+const EEXIST: i64 = -17;
+const ENOTDIR: i64 = -20;
 const EINVAL: i64 = -22;
 const ERANGE: i64 = -34;
+const ENOTEMPTY: i64 = -39;
 
 /// Turn a negative errno returned by a host op into an `io::Error`, giving the common cases a precise
-/// `ErrorKind` (the svm `io/error` leaf otherwise decodes everything to `Uncategorized`).
+/// `ErrorKind` (the svm `io/error` leaf otherwise decodes everything to `Uncategorized`). `EEXIST`
+/// maps to `AlreadyExists` so `create_dir_all` correctly treats an existing directory as success.
 fn err(code: i64) -> io::Error {
     match code {
         ENOENT => io::ErrorKind::NotFound.into(),
+        EEXIST => io::ErrorKind::AlreadyExists.into(),
+        ENOTDIR => io::ErrorKind::NotADirectory.into(),
+        ENOTEMPTY => io::ErrorKind::DirectoryNotEmpty.into(),
         EINVAL => io::ErrorKind::InvalidInput.into(),
         _ => io::Error::from_raw_os_error((-code) as i32),
     }
@@ -409,7 +417,9 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        unsupported()
+        // `try_clone`: a second fd onto the same open file, via the personality's `dup`.
+        let fd = host::dup(self.fd as i64);
+        if fd < 0 { Err(err(fd)) } else { Ok(File { fd: fd as i32 }) }
     }
 
     pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
@@ -477,4 +487,43 @@ pub fn stat(path: &Path) -> io::Result<FileAttr> {
 pub fn lstat(path: &Path) -> io::Result<FileAttr> {
     // No symlinks on the memfs, so `lstat` and `stat` coincide.
     stat(path)
+}
+
+pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
+    if !host::have_posix() {
+        return Err(unsupported_err());
+    }
+    let ob = path_bytes(old);
+    let nb = path_bytes(new);
+    let r = host::rename(ob.as_ptr(), ob.len() as i64, nb.as_ptr(), nb.len() as i64);
+    if r < 0 { Err(err(r)) } else { Ok(()) }
+}
+
+pub fn rmdir(path: &Path) -> io::Result<()> {
+    if !host::have_posix() {
+        return Err(unsupported_err());
+    }
+    let b = path_bytes(path);
+    let r = host::rmdir(b.as_ptr(), b.len() as i64);
+    if r < 0 { Err(err(r)) } else { Ok(()) }
+}
+
+/// The `std::fs::DirBuilder` PAL: a single `mkdir` over the memfs directory op. `create_dir_all` is
+/// driven by the std layer (it calls `mkdir` per component and tolerates `AlreadyExists`).
+#[derive(Debug)]
+pub struct DirBuilder;
+
+impl DirBuilder {
+    pub fn new() -> DirBuilder {
+        DirBuilder
+    }
+
+    pub fn mkdir(&self, p: &Path) -> io::Result<()> {
+        if !host::have_posix() {
+            return Err(unsupported_err());
+        }
+        let b = path_bytes(p);
+        let r = host::mkdir(b.as_ptr(), b.len() as i64, 0o777);
+        if r < 0 { Err(err(r)) } else { Ok(()) }
+    }
 }

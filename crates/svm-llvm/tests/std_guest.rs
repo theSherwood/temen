@@ -601,3 +601,56 @@ fn std_process_round_trips() {
         "Command output/status/spawn+wait round-trip through the posix cap's fork-free spawn"
     );
 }
+
+/// S2 (fs — directory mutation) — the `std::fs` dir ops the memfs now backs: `create_dir` /
+/// `create_dir_all` (explicit-dir op `OP_MKDIR`, with `AlreadyExists` on a repeat), `rename` (file
+/// move), `remove_dir` (`OP_RMDIR`, `DirectoryNotEmpty` on a populated dir), and `File::try_clone`
+/// (a second fd via `OP_DUP`). Seeded with one file so `/data` exists as a parent directory.
+#[test]
+fn std_fs_dir_ops() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest fs-dir (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::fs;\n\
+         use std::io::Read;\n\
+         fn main() {\n\
+         \x20   fs::create_dir(\"/data/new\").expect(\"create_dir\");\n\
+         \x20   println!(\"is_dir={}\", fs::metadata(\"/data/new\").unwrap().is_dir());\n\
+         \x20   println!(\"exists_err={:?}\", fs::create_dir(\"/data/new\").unwrap_err().kind());\n\
+         \x20   fs::create_dir_all(\"/data/a/b/c\").expect(\"create_dir_all\");\n\
+         \x20   println!(\"deep_is_dir={}\", fs::metadata(\"/data/a/b/c\").unwrap().is_dir());\n\
+         \x20   fs::write(\"/data/f.txt\", b\"hi there\").expect(\"write\");\n\
+         \x20   fs::rename(\"/data/f.txt\", \"/data/g.txt\").expect(\"rename\");\n\
+         \x20   println!(\"renamed={:?}\", fs::read_to_string(\"/data/g.txt\").unwrap());\n\
+         \x20   println!(\"old_gone={}\", !fs::exists(\"/data/f.txt\").unwrap());\n\
+         \x20   fs::remove_dir(\"/data/new\").expect(\"remove_dir\");\n\
+         \x20   println!(\"removed_gone={}\", !fs::exists(\"/data/new\").unwrap());\n\
+         \x20   println!(\"rmdir_nonempty_err={:?}\", fs::remove_dir(\"/data/a\").unwrap_err().kind());\n\
+         \x20   let mut clone = fs::File::open(\"/data/g.txt\").expect(\"open\").try_clone().expect(\"clone\");\n\
+         \x20   let mut s = String::new();\n\
+         \x20   clone.read_to_string(&mut s).expect(\"read clone\");\n\
+         \x20   println!(\"clone_read={s:?}\");\n\
+         }\n";
+
+    let Some((stdout, _)) =
+        svm_run_std_posix("svm_std_fs_dir", src, |p| p.write_file("/data/seed", b"x"))
+    else {
+        eprintln!("note: skipping std_guest fs-dir (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "is_dir=true\n\
+         exists_err=AlreadyExists\n\
+         deep_is_dir=true\n\
+         renamed=\"hi there\"\n\
+         old_gone=true\n\
+         removed_gone=true\n\
+         rmdir_nonempty_err=DirectoryNotEmpty\n\
+         clone_read=\"hi there\"\n",
+        "create_dir/create_dir_all/rename/remove_dir/try_clone over the memfs dir ops"
+    );
+}
