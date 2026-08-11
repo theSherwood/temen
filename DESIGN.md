@@ -2228,7 +2228,13 @@ access would sail through a page the interpreter (which enforces `Mem`'s page-pr
 oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is module-wide (the hazard is
 every *other* emitted access, not the op's own function) and covers only the state-mutating ops:
 `page_size`/`sub`/`len` are pure queries, and `grow` only commits within the fixed reservation the mask
-already permits, so neither is gated. The rejected alternative — a per-access **software page-check** in
+already permits, so neither is gated. (The **grow** case does still need the bound to track the live
+size: emitted accesses confine against the live `mapped` read from the module's exported `mapped`
+global — self-initialized to the emit-time `1 << size_log2`, and raised by a `vm_map`-growing host —
+rather than a baked constant, so an access into a grown region no longer spuriously faults on the wasm
+tier where the interpreter admits it. This is the **size/grow** axis, #717; the **page-state** axis
+below stays fail-closed. The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a
+trap-parity divergence, never an escape.) The rejected alternative — a per-access **software page-check** in
 emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit
 only page-managing guests see, and even gated + loop-invariant-elided it stays ~1.5–3×+ on the
 random-access tail; a gated, elided page-check is the escalation *iff* a hot page-managing guest ever
