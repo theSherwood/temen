@@ -13204,24 +13204,81 @@ fn lower_int_intrinsic(
             if shape.is_float() {
                 return unsup("vector funnel shift on a float shape");
             }
-            if args[0] != args[1] {
-                return unsup(format!("general vector funnel shift `{name}` (non-rotate)"));
-            }
             let lane_ty = int_ty(shape.lane_val())?;
-            let data = vec_explode(ctx, args[0], types, false)?;
-            let amts = vec_explode(ctx, args[2], types, false)?;
-            let op = if base == "llvm.fshl" {
-                BinOp::Rotl
-            } else {
-                BinOp::Rotr
+            let is_fshl = base == "llvm.fshl";
+            // The **rotate idiom** (`a == b`): svm-ir's lane `Rotl`/`Rotr` masks the count mod width
+            // and accepts a runtime amount, so scalarize to one rotate per lane (the auto-vectorizer
+            // emits per-lane-varying constant amounts, e.g. xxHash's `<1,7,12,18>`).
+            if args[0] == args[1] {
+                let data = vec_explode(ctx, args[0], types, false)?;
+                let amts = vec_explode(ctx, args[2], types, false)?;
+                let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
+                let mut out = Vec::with_capacity(data.len());
+                for (&d, &s) in data.iter().zip(amts.iter()) {
+                    out.push(ctx.push(Inst::IntBin {
+                        ty: lane_ty,
+                        op,
+                        a: d,
+                        b: s,
+                    }));
+                }
+                return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+            }
+            // A **general (non-rotate)** vector funnel shift (distinct value operands): scalarize to a
+            // per-lane `(a << s) | (b >>u (w - s))` (`fshr` mirrors), with a `select` on `s == 0` for
+            // the width-edge case (`w - s == w` would shift by the full width). Only full-width lanes
+            // (`i32x4`/`i64x2`), where the lane container width **is** the shift width `w`, so the
+            // runtime amount is edge-safe with no narrow-container masking. `<4 x i32>` in this form is
+            // what dragon4's u128 bignum (svm-leng's float formatter) emits — W5 §3e path (a).
+            let w = shape.lane_bytes() * 8;
+            if w != 32 && w != 64 {
+                return unsup(format!(
+                    "general vector funnel shift `{name}` (narrow lane i{w})"
+                ));
+            }
+            let a_lanes = vec_explode(ctx, args[0], types, false)?;
+            let b_lanes = vec_explode(ctx, args[1], types, false)?;
+            let s_lanes = vec_explode(ctx, args[2], types, false)?;
+            let kc = |ctx: &mut BlockCtx, n: i64| {
+                if lane_ty == IntTy::I64 {
+                    ctx.push(Inst::ConstI64(n))
+                } else {
+                    ctx.push(Inst::ConstI32(n as i32))
+                }
             };
-            let mut out = Vec::with_capacity(data.len());
-            for (&d, &s) in data.iter().zip(amts.iter()) {
-                out.push(ctx.push(Inst::IntBin {
+            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                ctx.push(Inst::IntBin {
                     ty: lane_ty,
                     op,
-                    a: d,
-                    b: s,
+                    a,
+                    b,
+                })
+            };
+            let mut out = Vec::with_capacity(a_lanes.len());
+            for i in 0..a_lanes.len() {
+                let (a, b, s_raw) = (a_lanes[i], b_lanes[i], s_lanes[i]);
+                // `s = amt mod w` (w is a power of two: mask with `w - 1`).
+                let wmask = kc(ctx, (w - 1) as i64);
+                let s = bin(ctx, BinOp::And, s_raw, wmask);
+                let wc = kc(ctx, w as i64);
+                let comp = bin(ctx, BinOp::Sub, wc, s); // `w - s`
+                let (lsh, rsh) = if is_fshl { (s, comp) } else { (comp, s) };
+                let hi = bin(ctx, BinOp::Shl, a, lsh);
+                let lo = bin(ctx, BinOp::ShrU, b, rsh);
+                let comb = bin(ctx, BinOp::Or, hi, lo);
+                // `s == 0` ⇒ the concatenation is unshifted: `fshl` yields `a`, `fshr` yields `b`.
+                let zero = kc(ctx, 0);
+                let is_zero = ctx.push(Inst::IntCmp {
+                    ty: lane_ty,
+                    op: CmpOp::Eq,
+                    a: s,
+                    b: zero,
+                });
+                let edge = if is_fshl { a } else { b };
+                out.push(ctx.push(Inst::Select {
+                    cond: is_zero,
+                    a: edge,
+                    b: comb,
                 }));
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
