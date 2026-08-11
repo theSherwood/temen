@@ -583,9 +583,18 @@ command returns `envp[0][2]='7'`=55). A libc `getenv` walking `envp`/`environ` i
 follow-up (a shim, not a substrate concern).
 
 **What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
-- **argv/env-seeding ergonomics.** A shell hand-writes the `{argc, envc}`+packed-strings buffer at offset
-  128; there is no `execvp(argv[], envp[])` helper. Doable in ~10 lines of C (the microshell does), but
-  a real libc wants the wrapper (and a `getenv` walking the delivered `envp`).
+- **~~argv/env-seeding ergonomics~~ — a process libc shim. DONE.** `crates/svm/tests/fork_shim.c` is the
+  guest-side layer a shell links so it writes the idiomatic loop —
+  `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` — over a NUL-terminated `argv[]`,
+  instead of hand-marshalling the buffer: `fork`/`wait_pid`(`pid`/`-1`/`-pgid`)/`setpgid`/`execvp`
+  (packs argv **and** `environ` into the §3e buffer, resolves the module by name, inherits `stdout`,
+  image-replaces) + `getenv`/`strlen`. Every entry point is **`static inline`**, so chibicc's dead-code
+  pass drops the ones a program doesn't call — a command that only reads its env pulls in `getenv`, not
+  `fork`/`execvp` and their `__fork`/`__wait` offer imports (which it was never granted; a plain
+  `static` non-inline function is a liveness *root*, so `inline` is load-bearing here). Proven by
+  `c_fork.rs::a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env` (a shim shell `execvp`s a
+  command with argv + env; the command reads both via `argv` and `getenv` → 107). A `$PATH`-dir scan
+  (below) and `pipe`/`dup2` are the remaining libc gaps.
 - **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
   `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
 - **pipes / redirection between forked children** (`cmd1 | cmd2`, `cmd > file`) — the Power-2/`Endpoint`

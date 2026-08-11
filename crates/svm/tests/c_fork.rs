@@ -77,6 +77,12 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// The reusable guest-side process libc (`fork`/`wait_pid`/`setpgid`/`execvp`/`getenv`) over the
+/// fork/exec/wait surface — the layer a shell links so it writes the idiomatic fork/exec/wait loop
+/// instead of hand-marshalling the args buffer. `#[allow(dead_code)]`-style: all entry points are
+/// `static`, so chibicc drops the ones a given program doesn't call. Prepended to a guest's C source.
+const FORK_SHIM: &str = include_str!("fork_shim.c");
+
 /// The guest: `fork()` (through the `__fork` import → the fork offer), retrying while it returns `< 0`
 /// (the `-EAGAIN` serve/park race — the `while ((pid = fork()) < 0)` shell idiom, ISSUES.md I68), then
 /// write the 8-byte fork return to fd 1 (the granted stdout stream) — in BOTH the original and the twin.
@@ -1098,6 +1104,81 @@ fn execve_delivers_the_environment_to_the_command() {
         r,
         vec![Value::I64(55)],
         "the exec'd command read envp[0][2] = '7' (55) — the environment was delivered through execve"
+    );
+}
+
+/// FORK.md §8.6 — **the process libc shim in action.** The microshell above hand-marshalled the args
+/// buffer and drove the raw self-ops; a real shell links `fork_shim.c` and writes the idiomatic loop:
+/// `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` with a NUL-terminated `argv[]`.
+/// The shell points `environ` at its own env, `execvp` marshals both argv and env into the §3e buffer,
+/// and the command — also linking the shim — sets `environ = envp` and reads a var back with `getenv`.
+/// The shim's `static` entry points mean the command drags in only `getenv`/`strlen`, **not**
+/// `fork`/`execvp` and their `__fork`/`__wait` offer imports (which it was never granted). The command
+/// returns `argv[1][0] + getenv("V")[0]` = `'4'`(52) + `'7'`(55) = 107.
+const SHIM_SHELL_SRC: &str = r#"
+static char *sh_env[] = { "V=7", 0 };
+static char *cmd_argv[] = { "cmd", "42", 0 };
+int main(int argc, char **argv) {
+  environ = sh_env;
+  long pid = fork();
+  while (pid < 0) pid = fork();
+  if (pid == 0) { execvp("cmd", cmd_argv); return 127; }
+  return wait_pid(pid);
+}
+"#;
+
+/// The command, also over the shim: wire `environ` from `envp`, then return a function of both its
+/// argument (`argv[1]`) and its environment (`getenv("V")`) — so a correct result proves *both* the
+/// argv and the env crossed `execvp`, and that `getenv` reads the delivered env.
+const SHIM_CMD_SRC: &str = r#"
+int main(int argc, char **argv, char **envp) {
+  environ = envp;
+  char *v = getenv("V");
+  return argv[1][0] + (v ? v[0] : 0);
+}
+"#;
+
+#[test]
+fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let shell_src = format!("{FORK_SHIM}\n{SHIM_SHELL_SRC}");
+    let cmd_src = format!("{FORK_SHIM}\n{SHIM_CMD_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse shim shell");
+    verify_module(&guest).expect("verify shim shell");
+    let cmd = parse_module_raw(&c_to_ir(&cmd_src)).expect("parse shim command");
+    verify_module(&cmd).expect("verify shim command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell forked, execvp'd "cmd" with argv={"cmd","42"} and env={"V=7"}, and waited: the command
+    // read argv[1][0]='4' (52) + getenv("V")[0]='7' (55) = 107 through the libc shim.
+    assert_eq!(
+        r,
+        vec![Value::I64(107)],
+        "the shim shell ran execvp with argv + env; the command read both (52 + 55 = 107)"
     );
 }
 
