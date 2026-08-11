@@ -6,12 +6,14 @@ The analog of `NIM.md` for this workstream; fold completed sections into `DESIGN
 and drop this file once the actionable gaps close (the repo convention, cf. the former
 `WASM.md`).
 
-> Status: **S0 landed — `std` builds for `os=svm`; first on-ramp gap located.**
-> `core`+`alloc` Rust was already byte-identical to native (`LLVM.md` slices AH–AM);
-> as of 2026-08-11 real `std` **compiles** for a custom `x86_64-unknown-svm` target
-> (`crates/svm-llvm/rust-svm/`, §8 S0). The LTO'd std IR's undefined externals are
-> 100% within the on-ramp's already-supported set; the first gap is the textual `.ll`
-> **parser** on std's global-initializer shapes (§9). Route decision in §1/§4.
+> Status: **real `std` runs on svm (S0 + S1a + S1b core done, 2026-08-11).** A `std`
+> binary — `lang_start` + heap `Vec` + iterators — built for `x86_64-unknown-svm` via
+> `-Zbuild-std` (`crates/svm-llvm/rust-svm/`), translated through the on-ramp, runs on the
+> powerbox to the correct computed exit code, byte-identical to native
+> (`crates/svm-llvm/tests/std_guest.rs`). Getting there took **one on-ramp change** — parsing
+> call operand bundles (§9, S1a) — plus the build lane; malloc-synth + `lang_start` worked as-is
+> off the bin's `main`. **Remaining for S1: the PAL** so actual I/O (`println!`, args) works
+> over `__vm_host_call`; pure-compute `std` is already live. Route decision in §1/§4.
 
 Section numbers like "§7" refer to `DESIGN.md` unless prefixed with a file; "D54" etc. are its
 Decision Log; "I55" is `ISSUES.md`.
@@ -171,7 +173,8 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 |---|---|---|---|
 | **S0** | ✅ **DONE (2026-08-11).** Target JSON + nightly `-Zbuild-std` + the minimal svm overlay (`crates/svm-llvm/rust-svm/`); `std` compiles for `os=svm`, and a fat-LTO'd pure-compute crate emits one self-contained `.ll` whose undefined externals are all on-ramp-supported. | overlay (5 leaf-arms + alloc `imp`); asset-lane CI check still TODO (I55) | The build lane exists; the route is validated. **Surfaced the first S1 gap** (parser, §9) rather than the anticipated `llvm.trap` one (that intrinsic is already handled). |
 | **S1a** | ✅ **DONE.** On-ramp parser accepts call **operand bundles** (`[ "nonnull"(…) ]` on `llvm.assume`) — `skip_call_trailing` in `ll/parse.rs`, the real first gap (§9). | — | Std IR parses past the panic/assume machinery; unit-tested, no regression. |
-| **S1b** | **Entry/powerbox for std**: get malloc-synth + the `Memory` grant for a std entry (build as a bin with a powerbox `main`, or grant `Memory` for the std `lang_start` shape). Then minimal PAL: `stdio` (posix 0/1), `exit` (4), `args` (17/18); `println!`+`process::exit`+`env::args` over `__vm_host_call`. | S1a; posix `write`/`exit`/`argv` (present) | Real std IR *translates+runs*; then **first `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog, beside `w5_rust_guest.rs`. |
+| **S1b** | ✅ **core DONE.** Entry/powerbox for std works **as-is** off a bin's C `main` — no on-ramp change needed: malloc-synth + `Memory` grant + `lang_start` all fire. A pure-compute `std` bin (`Vec` + iterators, computed `ExitCode`) runs on the powerbox byte-identical to native (`tests/std_guest.rs`, gated on the build-std lane). | S1a | Real `std` (lang_start + heap) runs on svm. |
+| **S1c** | **The PAL for real I/O**: a small `std::sys::svm` (replacing `unsupported`) whose `stdio`/`args`/`exit` call svm-posix ops (0/1, 17/18, 4) via `__vm_host_call`; then `println!`+`process::exit`+`env::args`. | S1b; posix `write`/`exit`/`argv` (present) | **First `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog. Also the first exercise of the §9 `op`-constant-folding assumption. |
 | **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |
@@ -192,15 +195,13 @@ slice when S4 lands.
   `skip_operand_bundle` in `ll/parse.rs` (bundles are optimization/annotation hints the on-ramp
   doesn't lower → parse-and-drop; unit test `call_operand_bundles_are_dropped`, 326 translate
   tests still green). Benefits every LLVM frontend, not just std.
-- **Next gap — the entry/powerbox story (S1b).** After the parser fix, translation reaches a
-  *lowering* stop: `call to external/undefined function \`malloc\``. Malloc synthesis is gated
-  `need_malloc = needs_malloc && has_main` (`lib.rs:528`) — it rides the powerbox `_start`
-  (which grants the `Memory` cap the bump allocator grows into, slice S). The S0 probe was a
-  `#![no_main]` lib exporting a bare `compute`, so no `main` → no powerbox → no malloc. A real
-  std program presents a `main` (the bin entry `lang_start` wraps), so the path is: **build the
-  probe as a bin with a powerbox-compatible `main`**, or teach the on-ramp to grant `Memory`
-  for a std entry. This is the concrete S1b task — the "lang_start surface" risk below, now
-  located precisely.
+- **Entry/powerbox — RESOLVED, no on-ramp change (S1b).** The `malloc` undefined-call stop
+  seen on the S0 *lib* probe (`need_malloc = needs_malloc && has_main`, `lib.rs:528`) was purely
+  an artifact of building `#![no_main]`. A real std **bin** emits the C `main` the powerbox
+  recognizes (arity 3 = `main(argc, argv)`), so `_start` synthesis, the `Memory` grant, and
+  malloc-synth all fire, and `lang_start` runs on top. A pure-compute std bin now runs to the
+  right exit code on the powerbox (`tests/std_guest.rs`). No `lang_start`-specific work was
+  needed — the earlier "lang_start surface" risk is retired for the compute path.
 - **`llvm.trap`/panic machinery — NOT a risk (S0 cleared it).** The LTO'd std module's only
   undefined externals are `malloc`/`free`/`realloc` (synth, slice S) and intrinsics the on-ramp
   already handles: `llvm.trap`, `memcpy`, `sadd.with.overflow.i64`, `umax`/`umin.i64`,
