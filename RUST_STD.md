@@ -170,7 +170,8 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 | # | Slice | Needs | Proves / test |
 |---|---|---|---|
 | **S0** | ✅ **DONE (2026-08-11).** Target JSON + nightly `-Zbuild-std` + the minimal svm overlay (`crates/svm-llvm/rust-svm/`); `std` compiles for `os=svm`, and a fat-LTO'd pure-compute crate emits one self-contained `.ll` whose undefined externals are all on-ramp-supported. | overlay (5 leaf-arms + alloc `imp`); asset-lane CI check still TODO (I55) | The build lane exists; the route is validated. **Surfaced the first S1 gap** (parser, §9) rather than the anticipated `llvm.trap` one (that intrinsic is already handled). |
-| **S1** | (a) **On-ramp parser: accept std's global-initializer forms** — packed structs `<{ [24 x i8], ptr, … }>` with embedded byte arrays + pointer relocations, `!guid` on globals (§9). (b) Minimal PAL: `stdio` (posix 0/1), `exit` (4), `args` (17/18); `println!`+`process::exit`+`env::args` over `__vm_host_call`. | S0; posix `write`/`exit`/`argv` (present) | Real std IR *translates+runs*; then **first `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog, beside `w5_rust_guest.rs`. |
+| **S1a** | ✅ **DONE.** On-ramp parser accepts call **operand bundles** (`[ "nonnull"(…) ]` on `llvm.assume`) — `skip_call_trailing` in `ll/parse.rs`, the real first gap (§9). | — | Std IR parses past the panic/assume machinery; unit-tested, no regression. |
+| **S1b** | **Entry/powerbox for std**: get malloc-synth + the `Memory` grant for a std entry (build as a bin with a powerbox `main`, or grant `Memory` for the std `lang_start` shape). Then minimal PAL: `stdio` (posix 0/1), `exit` (4), `args` (17/18); `println!`+`process::exit`+`env::args` over `__vm_host_call`. | S1a; posix `write`/`exit`/`argv` (present) | Real std IR *translates+runs*; then **first `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog, beside `w5_rust_guest.rs`. |
 | **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |
@@ -183,14 +184,23 @@ slice when S4 lands.
 
 ## 9. Risks — S0 results and what's now live for S1
 
-- **First real gap — the textual `.ll` parser (S1, confirmed by S0).** Real std IR uses
-  global-initializer forms the on-ramp reader rejects: **packed structs** `<{ [24 x i8], ptr,
-  ptr, ptr }>` with **embedded byte arrays** and **pointer relocations** (`ptr @sym`,
-  `inttoptr (i64 N to ptr)`), and `!guid !N` metadata attached to globals. Translation fails
-  in the parser (`expected \`%dest =\`, found LBracket`) before any lowering runs. This is
-  parser-completeness for constant forms — bounded, mechanical, *not* an architecture problem —
-  and is S1's first task. (The no_std corpus never emitted these packed vtable/panic-location
-  constants, so it wasn't hit before.)
+- **First real gap — call operand bundles — FIXED (S1a, 2026-08-11).** The `expected
+  \`%dest =\`, found LBracket` failure was *not* the packed-struct globals (those parse fine);
+  it was **operand bundles** on `llvm.assume`: `rustc` emits `call void @llvm.assume(i1 true) [
+  "nonnull"(ptr %p) ]`, and the parser didn't consume the `[ … ]` after a call's arg list, so
+  the leading `[` desynced it into the next instruction. Fixed by `skip_call_trailing` /
+  `skip_operand_bundle` in `ll/parse.rs` (bundles are optimization/annotation hints the on-ramp
+  doesn't lower → parse-and-drop; unit test `call_operand_bundles_are_dropped`, 326 translate
+  tests still green). Benefits every LLVM frontend, not just std.
+- **Next gap — the entry/powerbox story (S1b).** After the parser fix, translation reaches a
+  *lowering* stop: `call to external/undefined function \`malloc\``. Malloc synthesis is gated
+  `need_malloc = needs_malloc && has_main` (`lib.rs:528`) — it rides the powerbox `_start`
+  (which grants the `Memory` cap the bump allocator grows into, slice S). The S0 probe was a
+  `#![no_main]` lib exporting a bare `compute`, so no `main` → no powerbox → no malloc. A real
+  std program presents a `main` (the bin entry `lang_start` wraps), so the path is: **build the
+  probe as a bin with a powerbox-compatible `main`**, or teach the on-ramp to grant `Memory`
+  for a std entry. This is the concrete S1b task — the "lang_start surface" risk below, now
+  located precisely.
 - **`llvm.trap`/panic machinery — NOT a risk (S0 cleared it).** The LTO'd std module's only
   undefined externals are `malloc`/`free`/`realloc` (synth, slice S) and intrinsics the on-ramp
   already handles: `llvm.trap`, `memcpy`, `sadd.with.overflow.i64`, `umax`/`umin.i64`,
