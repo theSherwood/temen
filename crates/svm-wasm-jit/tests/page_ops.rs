@@ -1,4 +1,4 @@
-//! **Track 3 (c)+(a): page-op gating** (`NESTED_JIT.md`). The wasm-JIT tier confines memory by
+//! **Window-remapping gating** (DESIGN.md §14 "wasm-JIT tier coverage"). The wasm-JIT tier confines memory by
 //! masking to `[0, size)` — it cannot honor per-page state (`map`/`unmap`/`protect`, ADDRESS_SPACE
 //! iface 5 ops 0/1/2), so an emitted access would sail through a page the interpreter (the oracle,
 //! which enforces `Mem`'s page-protection map) would trap on. A module that reaches a page op is
