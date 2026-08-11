@@ -22,8 +22,8 @@
 //! passed by address; aggregate `var`s are frame-resident. Whole-aggregate copy/constructors and
 //! C-ABI field offsets remain later refinements.
 
+use crate::dethash::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use svm_ir::ValType;
 
@@ -238,7 +238,7 @@ pub(crate) struct Translator {
     /// Names of locally-declared `object`/`array` aggregate types. A bare-symbol type is treated as
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
     /// type (`enum`, `distinct` int, `proctype`, opaque/external) is an integer scalar.
-    agg_names: std::collections::HashSet<String>,
+    agg_names: HashSet<String>,
     /// Named-type **pointer aliases** — a `(type :RootRef … (ptr T))` declares `RootRef` as an alias
     /// for a typed pointer. Without this, a bare-symbol type not in `agg_names` falls back to a plain
     /// `i64` scalar, so a param typed `RootRef` wouldn't `deref`. Records the resolved `TyDesc::Ptr`
@@ -292,7 +292,7 @@ pub(crate) struct Translator {
     /// blind to the callee's hidden `$sp`. With the callee named here, `call_import` prepends
     /// `sp + frame_size` (the caller's own frame top) as the leading arg, exactly as a direct call
     /// to a frame-needing proc does. Empty unless the linker pooled sibling units' proc frames.
-    ext_frame_procs: std::collections::HashSet<String>,
+    ext_frame_procs: HashSet<String>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
     /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
@@ -319,25 +319,25 @@ pub(crate) struct Translator {
 impl Translator {
     pub fn new() -> Self {
         Translator {
-            procs: HashMap::new(),
-            types: HashMap::new(),
-            agg_names: std::collections::HashSet::new(),
-            ty_aliases: HashMap::new(),
-            proctypes: HashMap::new(),
+            procs: HashMap::default(),
+            types: HashMap::default(),
+            agg_names: HashSet::default(),
+            ty_aliases: HashMap::default(),
+            proctypes: HashMap::default(),
             data_inits: Vec::new(),
             data_ptrs: Vec::new(),
             funcref_inits: Vec::new(),
             globals_top: 16,
             link_mode: false,
-            globals: HashMap::new(),
-            consts: HashMap::new(),
+            globals: HashMap::default(),
+            consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
-            ext_funcrefs: HashMap::new(),
-            ext_frame_procs: std::collections::HashSet::new(),
+            ext_funcrefs: HashMap::default(),
+            ext_frame_procs: HashSet::default(),
             tls_mode: false,
-            tls_vars: HashMap::new(),
+            tls_vars: HashMap::default(),
             tls_block_size: 0,
-            ext_tls_layout: HashMap::new(),
+            ext_tls_layout: HashMap::default(),
             own_stem: String::new(),
         }
     }
@@ -1005,7 +1005,7 @@ impl Translator {
     /// Collect all `(type :Name … Body)` top-level declarations into the layout registry, resolving
     /// forward references (nimony emits array types *after* their use).
     fn collect_types(&mut self, root: &Node) -> Result<(), LengError> {
-        let mut raw: HashMap<String, &Node> = HashMap::new();
+        let mut raw: HashMap<String, &Node> = HashMap::default();
         for item in root.args() {
             if item.tag() == Some("type") {
                 let a = item.args();
@@ -1302,7 +1302,7 @@ impl Translator {
             if item.tag() == Some("proc") && !is_importc_proc(item) {
                 let name = sym_def(&item.args()[0])?;
                 let base = t.proc_needs_frame(item);
-                let mut callees = std::collections::HashSet::new();
+                let mut callees = HashSet::default();
                 if let Some(body) = item.args().get(4) {
                     collect_calls(body, &mut callees);
                 }
@@ -1323,7 +1323,7 @@ impl Translator {
     pub fn export_types(root: &Node, stem: &str) -> Result<Vec<(String, Layout)>, LengError> {
         let mut t = Translator::new();
         t.collect_types(root)?;
-        let local: std::collections::HashSet<&String> = t.types.keys().collect();
+        let local: HashSet<&String> = t.types.keys().collect();
         let suffix = |n: &String| {
             if local.contains(n) {
                 format!("{n}{stem}")
@@ -1441,7 +1441,12 @@ impl Translator {
             let mut to_frame = Vec::new();
             for node in nodes {
                 let name = sym_def(&node.args()[0])?;
-                if self.procs.get(&name).is_none_or(|s| s.needs_frame) {
+                // `map_or(true, …)` not `is_none_or` — svm-leng must compile under the W5 guest
+                // toolchain (rustc 1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools, §3e),
+                // which predates `Option::is_none_or` (1.82). clippy (on modern rustc) suggests
+                // `is_none_or`; keep `map_or` for the toolchain floor.
+                #[allow(clippy::unnecessary_map_or)]
+                if self.procs.get(&name).map_or(true, |s| s.needs_frame) {
                     continue;
                 }
                 if let Some(b) = node.args().get(4) {
@@ -1471,11 +1476,11 @@ impl Translator {
             Some(b) => b,
             None => return false,
         };
-        let mut addr = std::collections::HashSet::new();
+        let mut addr = HashSet::default();
         collect_addr_taken(body, &mut addr);
         let mut var_descs = Vec::new();
-        let mut pointee = HashMap::new();
-        let mut unsigned = std::collections::HashSet::new();
+        let mut pointee = HashMap::default();
+        let mut unsigned = HashSet::default();
         if self
             .collect_var_descs(body, &mut var_descs, &mut pointee, &mut unsigned)
             .is_err()
@@ -1668,7 +1673,7 @@ impl Translator {
         node: &Node,
         out: &mut Vec<(String, TyDesc)>,
         pointee: &mut HashMap<String, TyDesc>,
-        unsigned: &mut std::collections::HashSet<String>,
+        unsigned: &mut HashSet<String>,
     ) -> Result<(), LengError> {
         if let Node::List(_) = node {
             if node.tag() == Some("var") {
@@ -1733,10 +1738,10 @@ impl Translator {
 
         // Type descriptor of every local (aggregate params are by-address), and the pointee of every
         // pointer local — for `lvalue_addr` / `deref`.
-        let mut local_desc: HashMap<String, TyDesc> = HashMap::new();
-        let mut pointee: HashMap<String, TyDesc> = HashMap::new();
+        let mut local_desc: HashMap<String, TyDesc> = HashMap::default();
+        let mut pointee: HashMap<String, TyDesc> = HashMap::default();
         // Unsigned-typed scalar slots (params + vars): comparisons on these lower to `lt_u`/`le_u`.
-        let mut unsigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unsigned: HashSet<String> = HashSet::default();
         for (name, tnode) in self.param_types(&a[1])? {
             local_desc.insert(name.clone(), self.tydesc(tnode)?);
             if ty_is_unsigned(tnode) {
@@ -1753,7 +1758,7 @@ impl Translator {
         }
 
         // Which locals are address-taken (`(addr x)`).
-        let mut addr_taken = std::collections::HashSet::new();
+        let mut addr_taken = HashSet::default();
         if let Some(b) = body {
             collect_addr_taken(b, &mut addr_taken);
         }
@@ -1771,7 +1776,7 @@ impl Translator {
 
         // A var is frame-resident if it is an aggregate (indexed by `at`/`dot`) or address-taken;
         // the rest are SSA slots. Frame locals get natural-size byte offsets.
-        let mut mem: HashMap<String, (u64, TyDesc)> = HashMap::new();
+        let mut mem: HashMap<String, (u64, TyDesc)> = HashMap::default();
         let mut frame_size = 0u64;
         let mut ssa_vars: Vec<(String, ValType)> = Vec::new();
         for (vn, desc) in &var_descs {
@@ -1932,7 +1937,7 @@ struct FuncGen<'a> {
     /// Slot names (params + vars) whose nimony type is **unsigned** (`(u N)`) — a comparison with an
     /// operand in this set lowers to the unsigned SVM op (`lt_u`/`le_u`) so a high-bit-set value
     /// orders correctly (the TLSF allocator's `uint32` bitmaps depend on this).
-    unsigned: std::collections::HashSet<String>,
+    unsigned: HashSet<String>,
     /// Set once the function emits a load/store (so the module declares a window).
     used_memory: bool,
     /// Rendered blocks (header + body + terminator), indexed by block id.
@@ -1961,7 +1966,7 @@ impl<'a> FuncGen<'a> {
         temp_base: u64,
         spill_params: Vec<(String, ValType)>,
         sret: Option<(usize, TyDesc)>,
-        unsigned: std::collections::HashSet<String>,
+        unsigned: HashSet<String>,
     ) -> Self {
         let slot_of = slots
             .iter()
@@ -1983,9 +1988,9 @@ impl<'a> FuncGen<'a> {
             frame_size,
             sret,
             unsigned,
-            label_block: HashMap::new(),
+            label_block: HashMap::default(),
             loop_stack: Vec::new(),
-            local_consts: HashMap::new(),
+            local_consts: HashMap::default(),
             used_memory: false,
             blocks: Vec::new(),
             next_block: 0,
@@ -4134,11 +4139,7 @@ fn is_float(t: ValType) -> bool {
 
 /// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
 /// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
-fn body_calls_framed(
-    node: &Node,
-    procs: &HashMap<String, Sig>,
-    ext: &std::collections::HashSet<String>,
-) -> bool {
+fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>, ext: &HashSet<String>) -> bool {
     if node.tag() == Some("call") {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             // A **local** frame-needing callee (bare `foo.0.`) or a **cross-module** one (`foo.0.<stem>`
@@ -4153,7 +4154,7 @@ fn body_calls_framed(
 
 /// Collect every direct **call callee** name in a proc body (bare `foo.0.` for a local proc,
 /// `foo.0.<stem>` for a cross-module one). Feeds the linker's whole-program frame fixpoint.
-fn collect_calls(node: &Node, out: &mut std::collections::HashSet<String>) {
+fn collect_calls(node: &Node, out: &mut HashSet<String>) {
     if node.tag() == Some("call") {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             out.insert(callee.to_string());
@@ -4182,7 +4183,7 @@ fn collect_labels(node: &Node, out: &mut Vec<String>) {
 }
 
 /// Collect the names of locals whose address is taken (`(addr name)`).
-fn collect_addr_taken(node: &Node, out: &mut std::collections::HashSet<String>) {
+fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
     if let Node::List(_) = node {
         if node.tag() == Some("addr") {
             if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
