@@ -13484,8 +13484,114 @@ fn lower_int_intrinsic(
         // native widths (i32/i64) — a narrow saturating width would need width-specific clamp bounds.
         "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
             let bits = src_bits(args[0], types)?;
+            // Narrow widths (i8/i16) saturate to their **own** bounds, not i32's. A narrow value sits
+            // in an i32 container with unspecified high bits (§3b), so canonicalize first — mask
+            // (unsigned) or sign-extend (signed) — then compute at i32 and clamp to the width's bounds.
+            // Rust's `dec2flt` (float parsing, reached by svm-leng) emits `usub.sat.i8`, W5 §3e.
+            if bits == 8 || bits == 16 {
+                let ty = IntTy::I32;
+                let a0 = ctx.operand(args[0])?;
+                let b0 = ctx.operand(args[1])?;
+                let ci = |ctx: &mut BlockCtx, v: i64| ctx.push(Inst::ConstI32(v as i32));
+                let binop = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                    ctx.push(Inst::IntBin { ty, op, a, b })
+                };
+                let signed = base == "llvm.sadd.sat" || base == "llvm.ssub.sat";
+                let (a, b) = if signed {
+                    // sign-extend from `bits`: (x << (32-bits)) >>s (32-bits).
+                    let sh = ci(ctx, (32 - bits) as i64);
+                    let sx = |ctx: &mut BlockCtx, x: ValIdx| {
+                        let l = ctx.push(Inst::IntBin {
+                            ty,
+                            op: BinOp::Shl,
+                            a: x,
+                            b: sh,
+                        });
+                        ctx.push(Inst::IntBin {
+                            ty,
+                            op: BinOp::ShrS,
+                            a: l,
+                            b: sh,
+                        })
+                    };
+                    (sx(ctx, a0), sx(ctx, b0))
+                } else {
+                    let m = ci(ctx, (1i64 << bits) - 1);
+                    (binop(ctx, BinOp::And, a0, m), binop(ctx, BinOp::And, b0, m))
+                };
+                let idx = match base {
+                    // unsigned sub: borrow (a <u b) ⇒ 0. (Lower bound is width-independent.)
+                    "llvm.usub.sat" => {
+                        let under = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::LtU,
+                            a,
+                            b,
+                        });
+                        let diff = binop(ctx, BinOp::Sub, a, b);
+                        let zero = ci(ctx, 0);
+                        ctx.push(Inst::Select {
+                            cond: under,
+                            a: zero,
+                            b: diff,
+                        })
+                    }
+                    // unsigned add: sum > UMAX_w ⇒ UMAX_w.
+                    "llvm.uadd.sat" => {
+                        let s = binop(ctx, BinOp::Add, a, b);
+                        let umax = ci(ctx, (1i64 << bits) - 1);
+                        let over = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::GtU,
+                            a: s,
+                            b: umax,
+                        });
+                        ctx.push(Inst::Select {
+                            cond: over,
+                            a: umax,
+                            b: s,
+                        })
+                    }
+                    // signed add/sub: the i32 result of sign-extended narrow operands can't overflow
+                    // i32 (|operands| ≤ 2^15), so a plain clamp to [SMIN_w, SMAX_w] is exact.
+                    "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                        let op = if base == "llvm.sadd.sat" {
+                            BinOp::Add
+                        } else {
+                            BinOp::Sub
+                        };
+                        let r = binop(ctx, op, a, b);
+                        let smax = ci(ctx, (1i64 << (bits - 1)) - 1);
+                        let smin = ci(ctx, -(1i64 << (bits - 1)));
+                        let hi = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::GtS,
+                            a: r,
+                            b: smax,
+                        });
+                        let c1 = ctx.push(Inst::Select {
+                            cond: hi,
+                            a: smax,
+                            b: r,
+                        });
+                        let lo = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::LtS,
+                            a: c1,
+                            b: smin,
+                        });
+                        ctx.push(Inst::Select {
+                            cond: lo,
+                            a: smin,
+                            b: c1,
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(Some(idx));
+            }
             if bits != 32 && bits != 64 {
-                return unsup(format!("`{name}` (only i32/i64 saturating)"));
+                return unsup(format!("`{name}` (only i8/i16/i32/i64 saturating)"));
             }
             let a = ctx.operand(args[0])?;
             let b = ctx.operand(args[1])?;

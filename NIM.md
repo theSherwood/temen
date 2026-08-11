@@ -1062,13 +1062,26 @@ So the surface a guest build must satisfy is tiny.
    FNV hasher** for svm-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
    and makes output deterministic), and `map_or` for `is_none_or` (the guest toolchain floors at rustc
    1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools). No `no_std`, no four-crate port.
-   What's *left* to a **correct run** (and the byte-identical §18 differential — the `svm-leng.svmb`
-   asset over a real hexer Leng file, the `chibicc_selfhost_asset` analog) is one **toolchain** step,
-   not code: `translate_to_text` reaches `core::fmt::Display`/`FromStr` (it formats and parses numbers),
-   which stay external libcore/liballoc symbols — stubbed to traps today (so a run would trap), and
-   made *real* by `-Z build-std`. That needs a nightly whose LLVM matches the link/opt tools; this env
-   has only LLVM-18 tools against an LLVM-23 nightly, so build-std is blocked *here* — a toolchain
-   alignment task (a matching nightly, or LLVM-23 `llvm-link`/`opt`), the sole remaining gate.
+   **Toolchain now aligned (2026-08-11).** The correct run needs the external libcore/liballoc symbols
+   (`fmt`/`FromStr`) made *real* via `-Z build-std`. The blocker was LLVM version skew — but
+   `RUSTC_BOOTSTRAP=1` unlocks `-Z build-std` on **stable 1.81 (LLVM 18)**, which matches the existing
+   `llvm-*-18` tools; with `rust-src` added, `build-std=std,panic_abort` +
+   `build-std-features=panic_immediate_abort` compiles std from source and the whole thing links to a
+   module whose **only externals are `malloc`/`free`/`calloc`/`bcmp`** — all four **synthesized** by
+   the on-ramp (`svm_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
+   real, and the run clears them.
+   **The genuinely-remaining blocker is narrower than "toolchain," and it's in the on-ramp: `svm_llvm`
+   doesn't yet cover every intrinsic Rust's *float* code emits.** Translating the build-std module
+   surfaced two, both in std's float path (reached because svm-leng parses/formats float literals):
+   `llvm.usub.sat.i8` in `dec2flt` — **now fixed** (the on-ramp gained i8/i16
+   `{u,s}{add,sub}.sat`, `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
+   vector funnel shift) in `flt2dec`/dragon4, the u128-bignum formatter, which is **not** yet supported.
+   So the correct run + byte-identical §18 differential (the `svm-leng.svmb` asset over a real hexer
+   Leng file, the `chibicc_selfhost_asset` analog) needs one of: **(a)** hardening `svm_llvm` for the
+   u128/vector ops Rust's float algorithms use (the clean path, a bounded on-ramp pass), or **(b)**
+   a `guest` build of svm-leng that fail-closes on float literals (integer-only self-host first — the
+   float paths are the only ones that reach dragon4/dec2flt). Everything else — integer code, `String`/
+   `Vec`/`HashMap`, the allocator — already translates and runs.
 3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
    self-hosting payoff, no browser.
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
