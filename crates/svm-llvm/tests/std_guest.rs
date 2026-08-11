@@ -105,74 +105,121 @@ fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Run a translated powerbox module and return its exit code as a `u8`.
-fn powerbox_exit(module: &svm_ir::Module) -> u8 {
-    let run = svm_run::run_powerbox(module, b"").expect("powerbox run");
-    match run.outcome {
-        svm_run::Outcome::Exited(c) => c as u8,
-        svm_run::Outcome::Returned(ref v) => match v.first() {
-            Some(svm_interp::Value::I32(x)) => *x as u8,
-            Some(svm_interp::Value::I64(x)) => *x as u8,
-            _ => 0,
-        },
-    }
-}
-
-/// A real `std` binary — `lang_start` + heap `Vec` + iterator fold — returning a **computed exit
-/// code** through `Termination` (no I/O, so the `unsupported` PAL's stdio/exit are never reached),
-/// runs on svm byte-identical to the native-equivalent oracle.
-#[test]
-fn std_bin_runs_on_svm_via_powerbox() {
-    let Some(_std_src) = lane_ready() else {
-        eprintln!(
-            "note: skipping std_guest (need nightly + rust-src + the svm std overlay applied — \
-             run crates/svm-llvm/rust-svm/apply-overlay.sh)"
-        );
-        return;
-    };
-
-    // Σ i² for i in 0..N, taken mod 256 — the same shape the on-ramp exercises for `no_std`, now
-    // through the full `std` runtime and a heap `Vec`.
-    const N: i32 = 8;
-    let src = format!(
-        "#![feature(restricted_std)]\n\
-         use std::process::ExitCode;\n\
-         fn main() -> ExitCode {{\n\
-         \x20   let n = {N}i32;\n\
-         \x20   let mut v: Vec<i32> = Vec::new();\n\
-         \x20   let mut i = 0;\n\
-         \x20   while i < n {{ v.push(i.wrapping_mul(i)); i += 1; }}\n\
-         \x20   let sum: i32 = v.iter().copied().fold(0, |a, b| a.wrapping_add(b));\n\
-         \x20   ExitCode::from((sum & 0xff) as u8)\n\
-         }}\n"
-    );
-
-    let Some(ll) = build_std_bin_ll("svm_std_probe", &src) else {
-        eprintln!("note: skipping std_guest (build-std produced no .ll)");
-        return;
-    };
-
+/// Translate + verify + run `src` as a std guest on the powerbox → `(stdout, exit code)`.
+fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
     let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
     svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "a std binary produces a powerbox entry (its C `main` rides the powerbox `_start`)"
     );
-
-    // The native-equivalent oracle (pure compute — deterministic, no platform surface).
-    let oracle: u8 = {
-        let mut acc = 0i32;
-        let mut i = 0;
-        while i < N {
-            acc = acc.wrapping_add(i.wrapping_mul(i));
-            i += 1;
-        }
-        (acc & 0xff) as u8
+    let run = svm_run::run_powerbox(&t.module, b"").expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
     };
+    Some((run.stdout, exit))
+}
 
-    let got = powerbox_exit(&t.module);
+/// Build + run the **native-equivalent oracle**: the same program with the svm-only feature gate
+/// stripped, compiled by the default host `rustc`. Returns `(stdout, exit code)`, or `None` if the
+/// host `rustc` is absent.
+fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    let host_src = src.replace("#![feature(restricted_std)]\n", "");
+    let dir = std::env::temp_dir().join(format!("svm_std_native_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let rs = dir.join("main.rs");
+    let bin = dir.join("oracle");
+    std::fs::write(&rs, host_src).ok()?;
+    let built = Command::new("rustc")
+        .args(["--edition", "2021", "-O"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .ok()?
+        .success();
+    if !built {
+        return None;
+    }
+    let out = Command::new(&bin).output().ok()?;
+    Some((out.stdout, out.status.code().unwrap_or(-1) as u8))
+}
+
+/// S1b — a real `std` binary (`lang_start` + heap `Vec` + iterator fold) returning a **computed exit
+/// code** through `Termination` runs on svm byte-identical to the native-equivalent oracle. This is
+/// pure compute (no I/O), so it passes even with only the `unsupported` PAL for stdio.
+#[test]
+fn std_bin_runs_on_svm_via_powerbox() {
+    if lane_ready().is_none() {
+        eprintln!(
+            "note: skipping std_guest (need nightly + rust-src + the svm std overlay applied — \
+             run crates/svm-llvm/rust-svm/apply-overlay.sh)"
+        );
+        return;
+    }
+
+    // Σ i² for i in 0..8, mod 256 — the on-ramp's `no_std` shape, now through the full `std` runtime.
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let mut v: Vec<i32> = Vec::new();\n\
+         \x20   let mut i = 0i32;\n\
+         \x20   while i < 8 { v.push(i.wrapping_mul(i)); i += 1; }\n\
+         \x20   let sum: i32 = v.iter().copied().fold(0, |a, b| a.wrapping_add(b));\n\
+         \x20   ExitCode::from((sum & 0xff) as u8)\n\
+         }\n";
+
+    let Some((stdout, exit)) = svm_run_std("svm_std_compute", src) else {
+        eprintln!("note: skipping std_guest (build-std produced no .ll)");
+        return;
+    };
+    assert!(stdout.is_empty(), "pure-compute program writes nothing");
     assert_eq!(
-        got, oracle,
-        "real std ran on svm to the computed exit code (§18 native equivalence)"
+        exit, 140,
+        "Σ i² for i<8 = 140; ran on svm to the computed exit code"
+    );
+}
+
+/// S1c — the svm `std::sys::svm` PAL: real `println!` reaches the host through the powerbox `write`
+/// binding, and `std::process::exit` through the `Exit` binding. A `std` program's **stdout and exit
+/// code** match a real native run byte-for-byte (the `powerbox_diff` analog, one language up).
+#[test]
+fn std_stdout_and_exit_match_native() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest stdout (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   println!(\"hello from std on svm\");\n\
+         \x20   let v: Vec<u32> = (1..=5).collect();\n\
+         \x20   println!(\"sum(1..=5) = {}\", v.iter().sum::<u32>());\n\
+         \x20   std::process::exit(7);\n\
+         }\n";
+
+    let Some((svm_stdout, svm_exit)) = svm_run_std("svm_std_hello", src) else {
+        eprintln!("note: skipping std_guest stdout (build-std produced no .ll)");
+        return;
+    };
+    let Some((native_stdout, native_exit)) = native_oracle("svm_std_hello", src) else {
+        // No host rustc — still assert the svm side against the known-good bytes.
+        assert_eq!(svm_stdout, b"hello from std on svm\nsum(1..=5) = 15\n");
+        assert_eq!(svm_exit, 7);
+        return;
+    };
+    assert_eq!(
+        svm_stdout, native_stdout,
+        "real std `println!` on svm matches native stdout byte-for-byte"
+    );
+    assert_eq!(
+        svm_exit, native_exit,
+        "std `process::exit` code matches native"
     );
 }

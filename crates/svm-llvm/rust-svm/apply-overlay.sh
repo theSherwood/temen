@@ -25,8 +25,9 @@ if [[ ! -d "${STD}" ]]; then
   exit 1
 fi
 
-# 1) The allocator imp (new file — copy is idempotent).
+# 1) The new PAL module files (copies are idempotent).
 cp "${HERE}/svm-alloc-imp.rs" "${STD}/sys/alloc/svm.rs"
+cp "${HERE}/svm-stdio-imp.rs" "${STD}/sys/stdio/svm.rs"
 
 # 2) The cfg-arm additions. Skip if already applied (patch is not idempotent on its own).
 if grep -q 'target_os = "svm"' "${STD}/sys/alloc/mod.rs"; then

@@ -57,3 +57,32 @@
          target_family = "wasm",
          target_os = "zkvm",
          target_os = "trusty",
+--- a/library/std/src/sys/stdio/mod.rs
++++ b/library/std/src/sys/stdio/mod.rs
+@@ -41,6 +41,10 @@
+         mod xous;
+         pub use xous::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     target_os = "zkvm" => {
+         mod zkvm;
+         pub use zkvm::*;
+--- a/library/std/src/sys/exit.rs
++++ b/library/std/src/sys/exit.rs
+@@ -154,6 +154,13 @@
+         target_os = "xous" => {
+             crate::os::xous::ffi::exit(code as u32)
+         }
++        target_os = "svm" => {
++            // The powerbox `Exit` capability (svm-llvm Lane C binds `exit`; POSIX.md op 4).
++            unsafe extern "C" {
++                fn exit(code: i32) -> !;
++            }
++            unsafe { exit(code) }
++        }
+         _ => {
+             let _ = code;
+             crate::intrinsics::abort()

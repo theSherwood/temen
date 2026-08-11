@@ -6,14 +6,14 @@ The analog of `NIM.md` for this workstream; fold completed sections into `DESIGN
 and drop this file once the actionable gaps close (the repo convention, cf. the former
 `WASM.md`).
 
-> Status: **real `std` runs on svm (S0 + S1a + S1b core done, 2026-08-11).** A `std`
-> binary — `lang_start` + heap `Vec` + iterators — built for `x86_64-unknown-svm` via
-> `-Zbuild-std` (`crates/svm-llvm/rust-svm/`), translated through the on-ramp, runs on the
-> powerbox to the correct computed exit code, byte-identical to native
-> (`crates/svm-llvm/tests/std_guest.rs`). Getting there took **one on-ramp change** — parsing
-> call operand bundles (§9, S1a) — plus the build lane; malloc-synth + `lang_start` worked as-is
-> off the bin's `main`. **Remaining for S1: the PAL** so actual I/O (`println!`, args) works
-> over `__vm_host_call`; pure-compute `std` is already live. Route decision in §1/§4.
+> Status: **real `std` prints on svm (S0 + S1a/b/c done, 2026-08-11).** A `std` binary built for
+> `x86_64-unknown-svm` via `-Zbuild-std` (`crates/svm-llvm/rust-svm/`), translated through the
+> on-ramp, runs on the powerbox: pure compute returns the right exit code, and **`println!` +
+> `process::exit` are byte-identical to a real native run** (`crates/svm-llvm/tests/std_guest.rs`,
+> two gated tests). Cost: **one on-ramp change** (parsing call operand bundles, §9/S1a) + the build
+> lane + a ~90-line svm PAL (alloc/stdio) and 26 overlay lines. Remaining: `env::args` (a PAL
+> `init` hook), distinct `stderr`, and `fs`/`env`/`time` over `__vm_host_call` (S1d/S2+). Route
+> decision in §1/§4.
 
 Section numbers like "§7" refer to `DESIGN.md` unless prefixed with a file; "D54" etc. are its
 Decision Log; "I55" is `ISSUES.md`.
@@ -174,8 +174,9 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 | **S0** | ✅ **DONE (2026-08-11).** Target JSON + nightly `-Zbuild-std` + the minimal svm overlay (`crates/svm-llvm/rust-svm/`); `std` compiles for `os=svm`, and a fat-LTO'd pure-compute crate emits one self-contained `.ll` whose undefined externals are all on-ramp-supported. | overlay (5 leaf-arms + alloc `imp`); asset-lane CI check still TODO (I55) | The build lane exists; the route is validated. **Surfaced the first S1 gap** (parser, §9) rather than the anticipated `llvm.trap` one (that intrinsic is already handled). |
 | **S1a** | ✅ **DONE.** On-ramp parser accepts call **operand bundles** (`[ "nonnull"(…) ]` on `llvm.assume`) — `skip_call_trailing` in `ll/parse.rs`, the real first gap (§9). | — | Std IR parses past the panic/assume machinery; unit-tested, no regression. |
 | **S1b** | ✅ **core DONE.** Entry/powerbox for std works **as-is** off a bin's C `main` — no on-ramp change needed: malloc-synth + `Memory` grant + `lang_start` all fire. A pure-compute `std` bin (`Vec` + iterators, computed `ExitCode`) runs on the powerbox byte-identical to native (`tests/std_guest.rs`, gated on the build-std lane). | S1a | Real `std` (lang_start + heap) runs on svm. |
-| **S1c** | **The PAL for real I/O**: a small `std::sys::svm` (replacing `unsupported`) whose `stdio`/`args`/`exit` call svm-posix ops (0/1, 17/18, 4) via `__vm_host_call`; then `println!`+`process::exit`+`env::args`. | S1b; posix `write`/`exit`/`argv` (present) | **First `std` hello-world byte-identical to native** — the `check_powerbox_vs_native` analog. Also the first exercise of the §9 `op`-constant-folding assumption. |
-| **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
+| **S1c** | ✅ **stdout + exit DONE.** The svm PAL's `sys/stdio/svm.rs` reaches the host via `extern "C" write`/`read` (on-ramp Lane C → powerbox `Stream`, POSIX.md 0/1), and `sys/exit.rs`'s svm arm via `extern "C" exit` (Lane C → `Exit`, op 4). `println!` + `process::exit` are **byte-identical to a real native run** (`tests/std_guest.rs::std_stdout_and_exit_match_native`). Note: chose the powerbox Lane C bindings over `__vm_host_call`+posix-cap for stdio/exit — same host caps, far less wiring, no cap grant under `run_powerbox` (§3-revisited). | S1b; powerbox `write`/`exit` (present) | **First `std` `println!` byte-identical to native** — the `powerbox_diff` analog, one language up. |
+| **S1d** | `env::args`: a PAL `init(argc, argv)` hook capturing the powerbox-threaded argv into a static (the unix pattern; the `unsupported` PAL no-ops `init`). `stderr` as a distinct stream once the powerbox grows a stderr handle or the on-ramp keeps `write`'s `fd`. | powerbox argv (present, `main(argc,argv)`) | `env::args` matches native; `eprintln!` separable from stdout. |
+| **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) — here the richer surface moves to `__vm_host_call`+a granted posix cap (run via `run_with_caps`, not bare `run_powerbox`). | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |
 | **S5** | *(deferred, separate designs)* threads/sync/TLS; unwinding; net; `Command` | new ops + EH substrate | Each gets its own slice plan when a consumer names it. |
@@ -207,7 +208,10 @@ slice when S4 lands.
   already handles: `llvm.trap`, `memcpy`, `sadd.with.overflow.i64`, `umax`/`umin.i64`,
   `vector.reduce.add.*`, `lifetime`/`assume`/`noalias.scope.decl` (dropped). No new intrinsic
   lowering is needed for the pure-compute path.
-- **`op` constant-folding (still to verify in S1).** If rustc outlines a shared host-call
+- **`op` constant-folding (deferred to S2, not yet exercised).** S1c reached stdio/exit through
+  the powerbox Lane C named imports (`write`/`exit`), *not* `__vm_host_call`, so the constant-`op`
+  requirement doesn't bite yet — it first applies when the richer surface (fs/env/time) uses
+  `__vm_host_call(posix, OP, …)` in S2. If rustc outlines a shared host-call
   helper, `op` reaches the call site as a runtime value → clean `Unsupported`. Mitigation
   pinned in §3 (per-op `#[inline(always)]` wrappers); S1 asserts it holds at `-O2` **and**
   `-O0`. (Not yet exercised — S0's program does no host calls.)

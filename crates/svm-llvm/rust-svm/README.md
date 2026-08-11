@@ -13,8 +13,9 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | File | What it is |
 |---|---|
 | `x86_64-unknown-svm.json` | The custom target spec. `os=svm`, `panic=abort`, `singlethread=true` (single-threaded but keeps 64-bit atomics), static reloc, no PIE. |
-| `std-overlay.patch` | Five one-line `cfg_select!` arm additions routing `target_os="svm"` to the minimal (no-OS, single-thread) leaf-module impls already used by `vexos`/`zkvm` — in `sys/{alloc,thread_local,random,io/error}`. |
+| `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the right leaf-module impls: the minimal (no-OS, single-thread) ones for `sys/{alloc,thread_local,random,io/error}` (as `vexos`/`zkvm` do), the new svm `stdio` module, and the powerbox `exit` in `sys/exit.rs`. 26 added lines across 6 files. |
 | `svm-alloc-imp.rs` | The allocator `imp` (copied to `sys/alloc/svm.rs`). Forwards `alloc`/`dealloc`/`realloc` to the C `malloc` family, which the on-ramp synthesizes as an in-window guest bump allocator (LLVM.md slice S). |
+| `svm-stdio-imp.rs` | The stdio PAL (copied to `sys/stdio/svm.rs`). `Stdin`/`Stdout`/`Stderr` reach the host through `extern "C" write`/`read`, which the on-ramp's "Lane C" binds to the powerbox `Stream` handles (POSIX.md ops 0/1). So `println!` writes real bytes. |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -55,17 +56,20 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
 
 ## Status (2026-08-11)
 
-- **`std` builds for `os=svm`** ✅ — target JSON + this overlay, via `-Zbuild-std`
-  on nightly (validated: `core`+`alloc`+`std`+`panic_abort` compile).
-- **The LTO'd std IR's undefined externals are 100% already-supported** ✅ —
-  `malloc`/`free`/`realloc` (synth), `llvm.trap` (panic path), `memcpy` (synth),
-  `sadd.with.overflow`/`umax`/`umin` (checked arith + minmax), `vector.reduce.*`
-  (SIMD), `lifetime`/`assume`/`noalias.scope` (dropped).
-- **First on-ramp gap: the textual `.ll` parser** ❌ — it rejects the
-  global-initializer shapes real std emits (packed structs `<{ [24 x i8], ptr,
-  … }>` with embedded byte arrays and pointer relocations, `!guid` metadata on
-  globals). This is the concrete first S1 task: parser completeness for these
-  constant forms, *not* an architecture problem. Tracked in RUST_STD.md §9.
+- **`std` builds and runs for `os=svm`** ✅ — target JSON + this overlay, via
+  `-Zbuild-std` on nightly. A `std` binary translated through the on-ramp runs on
+  the powerbox: pure compute returns the right exit code, and **`println!` writes
+  real bytes byte-identical to native** (`crates/svm-llvm/tests/std_guest.rs`).
+- **One on-ramp change was needed** — parsing call operand bundles
+  (`ll/parse.rs`); the earlier "packed-struct globals" suspicion was wrong (those
+  parse fine). Everything else — malloc-synth, the `Memory` grant, `lang_start` —
+  worked as-is off the bin's `main`.
+- **Working today:** stdout (`println!`), `process::exit`, heap/`Vec`,
+  collections, `fmt`, iterators.
+- **Not yet (uses the `unsupported` PAL):** `env::args` (needs a PAL `init`
+  hook to capture argv), `stderr` as a distinct stream (currently merges into
+  stdout — the on-ramp drops the `fd`), `File`/`fs`, `env`, `time`. Tracked in
+  RUST_STD.md (S1d/S2+).
 
 ## Reproducibility note
 
