@@ -597,17 +597,29 @@ follow-up (a shim, not a substrate concern).
   (below) and `pipe`/`dup2` are the remaining libc gaps.
 - **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
   `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
-- **~~pipes between forked children~~ (`cmd1 | cmd2`). DONE (sequential).** A guest-reachable `pipe()`
-  self-op (op 16) mints a host-served FIFO into the shell's own powerbox and hands back the two
-  `Stream`-typed ends (`fds[0]` read / `fds[1]` write, POSIX order); the shim's `exec_io(file, argv,
-  out, in)` re-grants a pipe end to a stage's `stdout`/`stdin` by name. Because a `PipeEnd`'s FIFO
-  backing aliases across `execve` (and across fork), two commands' **plain `write(1)`/`read(0)`**
-  connect transparently — neither knows a pipe is there. Proven by
-  `c_fork.rs::a_shell_pipes_the_output_of_one_forked_command_into_another` (`one` writes `"hi\n"` → the
-  pipe → `two` uppercases to the shell's stdout → `"HI\n"`). **Sequential** for this slice: the shell
-  fills the pipe (fork producer, `wait`) then drains it (fork consumer) — correct for finite output on
-  the non-blocking FIFO (empty read = EOF). *Concurrent* stages (both live, with backpressure/blocking
-  reads and `SIGPIPE`) and `cmd > file` redirection are the follow-ups.
+- **~~pipes between forked children~~ (`cmd1 | cmd2`). DONE — sequential *and* concurrent.** A
+  guest-reachable `pipe()` self-op (op 16) mints a host-served FIFO into the shell's own powerbox and
+  hands back the two `Stream`-typed ends (`fds[0]` read / `fds[1]` write, POSIX order); the shim's
+  `exec_io(file, argv, out, in)` re-grants a pipe end to a stage's `stdout`/`stdin` by name. Because a
+  `PipeEnd`'s FIFO backing aliases across `execve` (and across fork), two commands' **plain
+  `write(1)`/`read(0)`** connect transparently — neither knows a pipe is there.
+  - **Concurrent (both stages live) — the read *blocks*.** A `read` of an empty FIFO parks the reader
+    (`Blocked::PipeRead`, keyed by pipe id) while any write end is open, and a producer's `write` — or
+    the **last write end closing** — wakes it; the woken read is rewound, so it re-executes and drains
+    the new bytes or EOFs. EOF is a POSIX **writer refcount** on the shared backing: bumped when a write
+    end is minted / re-granted into a child / fork-copied, dropped on explicit `close(fd)` and when a
+    domain execs or exits — so a fork-inherited write end holds the pipe open across the fork→exec gap,
+    race-free against the shell closing its own ends. The shim gained `close(fd)` (`__vm_close` → op 2);
+    a shell closes its copies of the ends after forking the stages, leaving the producer the last
+    writer. Proven by `c_fork.rs::a_shell_runs_a_concurrent_pipe_with_a_blocking_read`: the shell forks
+    both stages and only then waits; the producer *burns a compute loop first*, so the consumer parks on
+    the empty pipe and is woken by the write (a non-blocking read would have EOF'd to empty output).
+    Stable 20/20 under stress.
+  - **Sequential** (`a_shell_pipes_the_output_of_one_forked_command_into_another`): fork producer,
+    `wait`, `close` the write end, fork consumer — the buffered bytes drain, then EOF.
+  - Interp-only (the park lives in the eval loop; the JIT/bytecode tiers don't block a pipe read, so a
+    differential guest must `close` the write end before an empty read — see `pipe.rs`). `cmd > file`
+    redirection and `SIGPIPE`/backpressure (the FIFO is unbounded) remain follow-ups.
 - **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
 - **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
   only (no bytecode/JIT/wasm) — the §9 backend-parity track.

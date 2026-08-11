@@ -4082,6 +4082,11 @@ enum Blocked {
     /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
     /// what blocking means.
     CapRead { handle: i32 },
+    /// FORK.md §8.6 — a **blocking pipe read** parked on an empty FIFO whose writer count is still
+    /// `> 0`. Keyed by pipe id in `pipe_waiters`; woken by another domain's `write` to the pipe or by
+    /// the last write end closing (writer count → 0, which re-issues the read to EOF). On wake the read
+    /// re-executes from the top (no partial state), like [`Blocked::CapRead`] / the stdin park.
+    PipeRead { pipe: u32 },
     /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
     /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
     /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
@@ -4281,6 +4286,24 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
     }
 }
 
+/// FORK.md §8.6 — wake every reader parked on `pipe` under an **already-held** scheduler lock (the
+/// domain-exit hook holds it). Re-admits each waiting vCPU with no pending value — its rewound read
+/// re-executes. The `Scheduler::wake_pipe_readers` method wraps this with the lock + a `notify_all`.
+fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
+    let woken = s.pipe_waiters.remove(&pipe).unwrap_or_default();
+    let n = woken.len() as u32;
+    for w in woken {
+        match w {
+            Waiter::VCpu(v) => s.runnable.push_back(v),
+            Waiter::Fiber { reg, slot, svc } => {
+                reg.wake_blocked(slot, Reg::from_i64(0));
+                svc_wake_locked(s, svc);
+            }
+        }
+    }
+    n
+}
+
 /// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
 /// scoping — only the parent may reap it) and its POSIX **process group** (`pgid`, for
 /// `waitpid(-pgid)` / `setpgid`). `pgid` defaults to the twin's own id at fork (each child starts as
@@ -4324,6 +4347,11 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
+    /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
+    /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
+    /// as `cap_waiters`, a different key (a shared pipe, not a single domain's handle).
+    pipe_waiters: BTreeMap<u32, Vec<Waiter>>,
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
     /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
     /// cell runs at most one sub-run at a time — the `busy` gate). Drained smallest-id-first by
@@ -4530,6 +4558,19 @@ impl Scheduler {
                 }
             }
         }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// FORK.md §8.6 — wake every reader parked in a blocking pipe read on `pipe` ([`Blocked::PipeRead`]).
+    /// Called after a `write` to the pipe (data available) or when its last write end closes (writer
+    /// count → 0, EOF). The woken vCPU carries **no pending value**: its read op was rewound before
+    /// parking, so it re-executes and either drains the new bytes or returns EOF.
+    fn wake_pipe_readers(&self, pipe: u32) -> u32 {
+        let mut s = self.lock();
+        let n = wake_pipe_readers_locked(&mut s, pipe);
         if n > 0 {
             self.work.notify_all();
         }
@@ -5777,6 +5818,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     .map(|&(_, t)| t)
                     .chain(v.serve_run.as_ref().map(|r| r.ticket))
                     .collect();
+                // FORK.md §8.6 — a domain finishing (cleanly or trapping) releases its pipe write ends,
+                // so a producer that exits lets its consumer see EOF. Collect the pipes that thereby
+                // hit 0 writers; wake their parked readers once the scheduler lock is held below.
+                let pipe_eofs = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .drop_all_pipe_writers();
                 let mut outcome = Outcome {
                     result,
                     mem: v.mem.take(),
@@ -5786,6 +5835,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 drop(v);
                 let mut s = sched.lock();
+                for pipe in &pipe_eofs {
+                    wake_pipe_readers_locked(&mut s, *pipe);
+                }
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
                 // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
                 // true origin. A clean finish leaves it untouched.
@@ -5907,6 +5959,37 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     v.pending = Some(Pending::CapResult(CAP_REVOKED));
                     s.runnable.push_back(v);
                     sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::PipeRead { pipe }) => {
+                // FORK.md §8.6 — park a blocking pipe read, keyed by pipe id. The read op was rewound,
+                // so a re-admit just re-executes it. Park-vs-wake race (mirrors `CapRead`): a `write` /
+                // last-writer-close that ran between the empty-read decision and this insert found no
+                // waiter — so re-check under the lock. If the FIFO now has bytes or every writer closed,
+                // re-admit (the read re-runs and completes / EOFs) rather than park forever.
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let ready = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    match hg.pipes.get(pipe as usize) {
+                        Some((fifo, writers)) => {
+                            !fifo.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
+                        }
+                        None => true, // vanished — re-run to fail closed
+                    }
+                };
+                if ready {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.pipe_waiters
+                        .entry(pipe)
+                        .or_default()
+                        .push(Waiter::VCpu(v));
                 }
             }
             Step::Park(Blocked::CapPending { id }) => {
@@ -6215,6 +6298,14 @@ impl SchedRef {
     fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
         match self {
             SchedRef::Real(s) => s.cap_revoke(handle, status),
+            SchedRef::Det(_) => 0,
+        }
+    }
+    /// FORK.md §8.6 — wake readers parked on a pipe (real scheduler only; the explorer never parks a
+    /// blocking pipe read — its read arm fails closed, so there is nothing to wake).
+    fn wake_pipe_readers(&self, pipe: u32) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.wake_pipe_readers(pipe),
             SchedRef::Det(_) => 0,
         }
     }
@@ -6811,6 +6902,7 @@ impl SchedDriver {
                 // other non-resumable drivers). Fail closed rather than wedge.
                 Step::Park(
                     Blocked::CapRead { .. }
+                    | Blocked::PipeRead { .. }
                     | Blocked::CapPending { .. }
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
@@ -11126,6 +11218,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if want_as {
                                 entry_args.push(Value::I64(cas as i64));
                             }
+                            // FORK.md §8.6 — the old powerbox is about to be dropped by the image
+                            // -replace: release its pipe write ends (the fork-inherited ones this exec
+                            // did not carry into the new image) and wake any pipe that thereby reached
+                            // 0 writers. The new image's grants already bumped their own ends
+                            // (`install_pipe_end`), so the shared count never dips through this.
+                            let zeroed = host
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .drop_all_pipe_writers();
+                            for pipe in zeroed {
+                                sched.wake_pipe_readers(pipe);
+                            }
                             return Ok(Inner::Exec(Box::new(ExecReq {
                                 funcs: cm.funcs,
                                 data: cm.data,
@@ -11401,9 +11505,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (b) a `Stream.close` that just revoked `h` wakes every sibling fiber
                     //     parked in a call through it, each completing with a probeable errno.
                     let closed = *type_id == cap_id::STREAM && *op == 2;
+                    // FORK.md §8.6 — closing a pipe write end that dropped the writer count to 0 flags
+                    // its readers to wake (they re-read → EOF). This is the shell's `close(fd)` path.
+                    let pipe_wake = hg.take_pipe_wake();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
+                    }
+                    if let Some(pipe) = pipe_wake {
+                        sched.wake_pipe_readers(pipe);
                     }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -11705,7 +11815,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read` are
+                    // `call.sym` imports bound to pipe ends). A `read` that found an empty FIFO with
+                    // writers open flagged `pipe_read_parked`: rewind the op so it re-executes (re-drains)
+                    // on wake and park on the pipe. A `write` (or a writer-to-zero close) flagged
+                    // `pipe_wake`: wake that pipe's parked readers. Root-fiber readers only (a forked
+                    // command's `main`); a thread reading a pipe takes the placeholder (a follow-up).
+                    let pipe_park = hg.take_pipe_read_parked();
+                    let pipe_wake = hg.take_pipe_wake();
                     let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
+                    drop(hg);
+                    if let Some(pipe) = pipe_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the read re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    if let Some(pipe) = pipe_wake {
+                        sched.wake_pipe_readers(pipe);
+                    }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -14373,7 +14502,21 @@ pub type RegionBacking = Arc<dyn SharedBacking>;
 /// **re-granted into a §14 child** (the child's `Host` clones the `Arc`, aliasing the same queue) and
 /// so concurrent parent/child access — the interpreter runs children on its M:N executor — is
 /// serialized. The `write` end appends, the `read` end drains.
-type PipeBacking = Arc<Mutex<VecDeque<u8>>>;
+///
+/// FORK.md §8.6 — the second `Arc` is the count of **open write-end handles** across every domain,
+/// which drives the concurrent-pipe EOF contract: a `read` of an empty FIFO **parks** while the count
+/// is `> 0` (a producer may still write) and returns `0` (EOF) only once it hits `0` (every write end
+/// closed / its holder exited). It is a *separate* shared `Arc` (not a field inside the queue) so
+/// [`Host::grant_input_pipe`]'s public `Arc<Mutex<VecDeque<u8>>>` return — the FIFO the POSIX
+/// personality feeds — is untouched. Refcounted at every write-end lifecycle point: minted
+/// (`grant_pipe`/`try_grant_pipe`), re-granted into a child (`install_pipe_end`), fork-copied (a
+/// post-fork table scan), explicitly closed, or dropped when a domain execs/tears down — so a forked
+/// child's inherited write end keeps the pipe open across the fork→exec gap (the POSIX refcount,
+/// race-free against the shell closing its own ends).
+type PipeBacking = (
+    Arc<Mutex<VecDeque<u8>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 
 /// The reference [`SharedBacking`]: a plain in-process buffer behind a `Mutex` (so it is `Send +
 /// Sync` and safe to alias across vCPU threads). The interpreter models aliasing by reading/writing
@@ -15654,6 +15797,14 @@ pub struct Host {
     /// Transient: the last `Stream{In}` `read` parked (buffer empty under [`Self::stdin_block`]). The
     /// bytecode `CapCall` arm takes this to yield [`Outcome::StdinPark`] instead of completing the read.
     stdin_parked: bool,
+    /// FORK.md §8.6 — transient: the last pipe `read` found an empty FIFO with writers still open, so
+    /// the reader must **park** on this pipe id (the eval loop turns it into a `Blocked::PipeRead` and
+    /// re-issues the read on wake). Distinct from `stdin_parked`: a pipe reader is woken by another
+    /// domain's `write`/close, not the embedder pushing input. Taken by [`Self::take_pipe_read_parked`].
+    pipe_read_parked: Option<u32>,
+    /// FORK.md §8.6 — transient: the last pipe `write` (or a writer-count-to-zero close) landed on this
+    /// pipe id, so the eval loop should wake any reader parked on it. Taken by [`Self::take_pipe_wake`].
+    pipe_wake: Option<u32>,
     /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
     /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
     /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
@@ -16195,6 +16346,8 @@ impl Host {
             stdin_pos: 0,
             stdin_block: false,
             stdin_parked: false,
+            pipe_read_parked: None,
+            pipe_wake: None,
             mem_map_limit: None,
             mem_mapped_bytes: 0,
             stdout: Vec::new(),
@@ -16315,6 +16468,18 @@ impl Host {
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
         twin.regions = self.regions.clone();
         twin.pipes = self.pipes.clone();
+        // FORK.md §8.6 — the twin's copied table carries copies of every pipe **write** end (POSIX
+        // fork inherits fds): each is a new open write end, so bump the shared writer count. This keeps
+        // a pipe open across the fork→exec gap — the inherited end holds it until the twin execs (its
+        // old powerbox is dropped, decrementing) or closes it — so the reader never sees a false EOF
+        // in the window between the shell forking a producer and that producer installing its own end.
+        for s in &twin.table {
+            if let Some(Binding::PipeEnd { pipe, write: true }) = s.entry {
+                if let Some((_, writers)) = twin.pipes.get(pipe as usize) {
+                    writers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
         twin.region_hook = self.region_hook.clone();
         twin.region_factory = self.region_factory;
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
@@ -16641,6 +16806,46 @@ impl Host {
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
     pub(crate) fn take_stdin_parked(&mut self) -> bool {
         core::mem::take(&mut self.stdin_parked)
+    }
+
+    /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
+    /// eval loop can register a `Blocked::PipeRead` and re-issue the read on wake.
+    fn take_pipe_read_parked(&mut self) -> Option<u32> {
+        self.pipe_read_parked.take()
+    }
+
+    /// FORK.md §8.6 — take the transient "wake readers of this pipe" flag (`Some(pipe)`) a `write` (or a
+    /// writer-to-zero close) set, so the eval loop can drain that pipe's parked readers.
+    fn take_pipe_wake(&mut self) -> Option<u32> {
+        self.pipe_wake.take()
+    }
+
+    /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
+    /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
+    /// parked readers (they re-issue their read, see writers == 0, and get EOF).
+    fn drop_pipe_writer(&self, pipe: u32) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.pipes.get(pipe as usize) {
+            // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
+            Some((_, writers)) if writers.load(SeqCst) > 0 => writers.fetch_sub(1, SeqCst) == 1,
+            _ => false,
+        }
+    }
+
+    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
+    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
+    /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
+    /// by crashing — releases its write ends and never wedges a downstream consumer.
+    fn drop_all_pipe_writers(&self) -> Vec<u32> {
+        let mut zeroed = Vec::new();
+        for s in &self.table {
+            if let Some(Binding::PipeEnd { pipe, write: true }) = s.entry {
+                if self.drop_pipe_writer(pipe) {
+                    zeroed.push(pipe);
+                }
+            }
+        }
+        zeroed
     }
 
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
@@ -17379,7 +17584,11 @@ impl Host {
     /// own fibers.)
     pub fn grant_pipe(&mut self) -> (i32, i32) {
         let pipe = self.pipes.len() as u32;
-        self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
+        // One write end is minted here, so the shared writer count starts at 1 (§8.6 EOF contract).
+        self.pipes.push((
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (w, r)
@@ -17395,7 +17604,11 @@ impl Host {
             return None;
         }
         let pipe = self.pipes.len() as u32;
-        self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
+        // One write end minted → writer count starts at 1 (§8.6 EOF contract).
+        self.pipes.push((
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
         Some((w, r))
@@ -17410,7 +17623,12 @@ impl Host {
     pub fn grant_input_pipe(&mut self) -> (i32, Arc<Mutex<std::collections::VecDeque<u8>>>) {
         let pipe = self.pipes.len() as u32;
         let backing = Arc::new(Mutex::new(VecDeque::new()));
-        self.pipes.push(Arc::clone(&backing));
+        // No write end is exposed — the source is the embedder's buffer — so the writer count is 0,
+        // preserving the non-blocking "empty ⇒ EOF" contract (a filter reading it terminates cleanly).
+        self.pipes.push((
+            Arc::clone(&backing),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
     }
@@ -17422,7 +17640,7 @@ impl Host {
     fn resolve_pipe_end(&self, handle: i32) -> Option<(bool, PipeBacking)> {
         match self.resolve(handle, cap_id::STREAM) {
             Ok(Binding::PipeEnd { pipe, write }) => {
-                Some((write, Arc::clone(self.pipes.get(pipe as usize)?)))
+                Some((write, self.pipes.get(pipe as usize)?.clone()))
             }
             _ => None,
         }
@@ -17430,8 +17648,12 @@ impl Host {
 
     /// Install a re-granted pipe end (its shared `backing` aliased from the granting domain) into this
     /// `Host` and return its handle. The child sees the **same** FIFO as the parent's other end — how a
-    /// pipe crosses a §14 domain boundary.
+    /// pipe crosses a §14 domain boundary. A **write** end re-granted here bumps the shared writer
+    /// count (§8.6): the child is a new writer, so the pipe stays open until it too closes/exits.
     fn install_pipe_end(&mut self, write: bool, backing: PipeBacking) -> i32 {
+        if write {
+            backing.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let pipe = self.pipes.len() as u32;
         self.pipes.push(backing);
         self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write })
@@ -19679,6 +19901,16 @@ impl Host {
                 Ok(vec![0])
             }
             Binding::Stream { role, sink } => self.stream_op(role, sink, op, args, mem),
+            // FORK.md §8.6 — closing a pipe **write** end decrements the shared writer count; when it
+            // reaches 0 (every write end gone) the pipe is at EOF, so flag its readers to wake (they
+            // re-read → EOF). The handle is revoked either way. A read-end close is just the revoke.
+            Binding::PipeEnd { pipe, write } if op == 2 => {
+                if write && self.drop_pipe_writer(pipe) {
+                    self.pipe_wake = Some(pipe);
+                }
+                self.close(handle);
+                Ok(vec![0])
+            }
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
             // dispatch**. The op executes as a fresh reference run over the offer's own function
@@ -20418,10 +20650,12 @@ impl Host {
     }
 
     /// §4 / S4 host-served **pipe** end, dispatched under iface `STREAM` (a pipe end *is* a stream).
-    /// Non-blocking: the `read` half drains bytes the `write` half has queued (op 0), a `read` of an
-    /// empty pipe returns `0`; the `write` half appends (op 1). Wrong-direction ops are `-EINVAL`. Same
-    /// `(buf, len) -> n | -errno` shapes as `stream_op`, so a personality's fd layer treats a pipe end
-    /// and a stdio stream identically.
+    /// FORK.md §8.6 — **blocking** read: the `read` half drains bytes the `write` half queued (op 0); an
+    /// empty FIFO **parks** the reader (sets [`Self::pipe_read_parked`], which the eval loop turns into a
+    /// `Blocked::PipeRead` park) while the shared writer count is `> 0`, and returns `0` (EOF) only once
+    /// it hits `0`. The `write` half appends (op 1) and flags [`Self::pipe_wake`] so the eval loop wakes
+    /// any parked reader. Wrong-direction ops are `-EINVAL`. Same `(buf, len) -> n | -errno` shapes as
+    /// `stream_op`, so a personality's fd layer treats a pipe end and a stdio stream identically.
     fn pipe_op(
         &mut self,
         pipe: u32,
@@ -20430,11 +20664,13 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(vec![v]);
-        let Some(backing) = self.pipes.get(pipe as usize) else {
+        // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
+        let Some((fifo_arc, writers_arc)) = self.pipes.get(pipe as usize).cloned() else {
             return ret(EINVAL);
         };
-        let mut fifo = backing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fifo = fifo_arc.lock().unwrap_or_else(|e| e.into_inner());
         match op {
             0 => {
                 // read(buf, len) -> n; only the read end is readable.
@@ -20443,8 +20679,19 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                if fifo.is_empty() {
+                    // Empty FIFO: block while a producer may still write (writers > 0), else EOF.
+                    // A zero-length read never blocks — the guest asked for nothing.
+                    if len > 0 && writers_arc.load(SeqCst) > 0 {
+                        drop(fifo);
+                        self.pipe_read_parked = Some(pipe);
+                        return ret(0); // placeholder; the eval loop parks and re-issues on wake
+                    }
+                    return ret(0); // EOF (all writers closed) or a zero-length read
+                }
                 let n = (len as usize).min(fifo.len());
                 let chunk: Vec<u8> = fifo.drain(..n).collect();
+                drop(fifo);
                 let Some(m) = mem else {
                     return ret(EFAULT);
                 };
@@ -20469,9 +20716,11 @@ impl Host {
                     return ret(EFAULT);
                 };
                 fifo.extend(bytes);
+                drop(fifo);
+                self.pipe_wake = Some(pipe); // eval loop wakes readers parked on this pipe
                 ret(len as i64)
             }
-            2 => ret(0), // close: no-op in the MVP (exit reclaims all)
+            2 => ret(0), // close: writer-decrement is handled in the dispatch arm (it sees the handle)
             _ => ret(EINVAL),
         }
     }

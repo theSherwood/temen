@@ -62,6 +62,12 @@ static inline int setpgid(long pid, long pgid) { return (int)__vm_setpgid(pid, p
 long __vm_pipe(int *fds);
 static inline int pipe(int *fds) { return __vm_pipe(fds); }
 
+/* close(fd): close a Stream/pipe-end handle. Closing a pipe **write** end drops its writer count, so a
+ * shell must close its own copies of a pipe's ends after forking the stages (leaving the producer the
+ * last writer) for the consumer to see EOF. 0 / -errno. */
+long __vm_close(int handle);
+static inline int close(int fd) { return __vm_close(fd); }
+
 struct __grant { int name_off; int name_len; int handle; int pad; };
 static char __so_name[] = "stdout";
 static char __si_name[] = "stdin";
