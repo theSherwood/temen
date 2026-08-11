@@ -136,14 +136,25 @@ over `encode_module`, the same identity the durable module-grant registry alread
   reuse-without-recompile, content-not-object keying, `run_powerbox` parity across inputs, no
   state-leak across reuses, distinct-module isolation, and that a refused (concurrent) module is not
   cached and does not poison the cache.
-- **Browser — NEXT.** Cache emitted wasm bytes → the compiled `WebAssembly.Module` across Runs,
-  keyed by the *same* content digest (compute it in the cdylib over the decoded module, replacing the
-  per-Run `PAR_RUN_GEN` generation counter — which today re-emits the same module on the next Run —
-  as the emit-dedup key; the per-code `jitInstCache` per Worker is the pattern to extend to the
-  top-level module). First Run pays emit+compile once; every later Run of the same module (edit
-  stdin, re-Run Lua/SQLite/chibicc) skips both. Not locally testable here (no wasm toolchain); it
-  rides CI's `browser-real` differential suite for correctness, plus a first-vs-second-Run timing
-  assertion in the playground recorder for the win itself.
+- **Browser — NEXT (two steps, low-risk first).** The playground's dominant pattern is re-Running
+  the same module (edit stdin, re-Run Lua/SQLite/chibicc). Today every Run re-emits (cdylib) and
+  re-compiles (`WebAssembly.compile`, `wasmjit-module.js:32`) with no cross-Run reuse.
+  - **Step 1 (JS-only, no TCB/concurrency change):** a JS `Map` from the module's content digest →
+    the compiled `WebAssembly.Module`, consulted in `driveJitRun` (`wasmjit-module.js`) before
+    `WebAssembly.compile`. Key on the *source/module* the Run was launched with (the same bytes
+    `moduleCache` already holds by URL, or the editor text for editable cards) — not the emitted
+    bytes, so the lookup precedes emit. This skips V8 compile (and, if we also memoize the emitted
+    bytes, the cdylib emit) on a re-Run. It touches no `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN`
+    state, so it can't introduce a cross-Worker race — the reason to do it first.
+  - **Step 2 (cdylib, only if step 1's emit cost still shows):** replace the per-Run `PAR_RUN_GEN`
+    emit-dedup key with the content digest (`svm_encode::digest256` over the decoded module — the
+    *same* key `svm_run::CompiledCache` uses), so the cdylib itself skips re-emit across Runs, not
+    just across Workers within a Run. Higher-risk (it edits the I22 shared-stash lifetime), so gated
+    on a measured need.
+  - **Validation:** not locally runnable here (no wasm toolchain in this environment). Rides CI's
+    `browser-real` Chromium differential suite for correctness (a stale-cache bug shows as a
+    render/output divergence there), plus a first-vs-second-Run timing assertion added to the
+    playground recorder / a `node` bench (`bench_jit.mjs`-style) for the win itself.
 - **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser) second Run of
   a light script ≥ interpreter-only time — kills the "net slower under JIT" footgun.
 
