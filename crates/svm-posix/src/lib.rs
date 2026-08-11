@@ -121,6 +121,11 @@ pub const OP_WAIT: u32 = 29;
 pub const OP_SIGNAL: u32 = 30;
 pub const OP_KILL: u32 = 31;
 pub const OP_SIGCHECK: u32 = 32;
+/// `clock(clock_id) -> nanos` (POSIX.md — the `Clock` surface; `std::time` reaches it via the svm
+/// `std` PAL). `clock_id == 1` is monotonic (nanos since this personality started), anything else is
+/// realtime (nanos since the Unix epoch). An embedder/test can pin the value with [`Posix::set_clock`]
+/// for determinism (the differential harness wants a reproducible clock).
+pub const OP_CLOCK: u32 = 33;
 
 /// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
 const SIG_DFL: i64 = 0;
@@ -299,6 +304,11 @@ struct Inner {
     /// The environment: `name → value`. `getenv`/`setenv` read and update it; host-side, out of the
     /// guest's reach, like the rest of the bookkeeping (POSIX.md §3).
     env: HashMap<String, String>,
+    /// The monotonic-clock base — `clock(1)` reports nanos elapsed since this. Captured at creation.
+    clock_base: std::time::Instant,
+    /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
+    /// so a differential run is reproducible. `None` reads the real host clock.
+    clock_fixed: Option<i64>,
     /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
     /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
     /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
@@ -388,6 +398,15 @@ impl Posix {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         st.env_ptrs.remove(name);
         st.env.insert(name.to_string(), value.to_string());
+    }
+
+    /// Pin the clock to a fixed `nanos` value (all `clock(_)` calls return it) — how a test makes
+    /// `std::time` deterministic. Passing a value makes a differential run reproducible.
+    pub fn set_clock(&self, nanos: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clock_fixed = Some(nanos);
     }
 
     /// The current working directory — how an embedder/test observes a guest `chdir`.
@@ -499,6 +518,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "chdir" => OP_CHDIR,
         "getenv" => OP_GETENV,
         "setenv" => OP_SETENV,
+        "clock_gettime" | "clock" => OP_CLOCK,
         "stat" | "lstat" => OP_STAT,
         "opendir" => OP_OPENDIR,
         "readdir" => OP_READDIR,
@@ -635,6 +655,8 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         args: Vec::new(),
         cwd: "/".to_string(),
         env: HashMap::new(),
+        clock_base: std::time::Instant::now(),
+        clock_fixed: None,
         env_ptrs: HashMap::new(),
         commands: Vec::new(),
         exec_stdout_handle: 0,
@@ -691,6 +713,7 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_CHDIR => st.chdir(args, mem),
                 OP_GETENV => st.getenv(args, mem),
                 OP_SETENV => st.setenv(args, mem),
+                OP_CLOCK => Ok(vec![st.clock(args)]),
                 _ => Err(Trap::CapFault),
             }
         },
@@ -1530,6 +1553,23 @@ impl Inner {
         self.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
         self.env.insert(name, value);
         Ok(vec![0])
+    }
+
+    /// `clock(clock_id) -> nanos`: `clock_id == 1` → monotonic (nanos since this personality started),
+    /// else realtime (nanos since the Unix epoch). Returns a pinned value when [`Posix::set_clock`] set
+    /// one, so a differential run is reproducible; otherwise reads the real host clock.
+    fn clock(&self, args: &[i64]) -> i64 {
+        if let Some(fixed) = self.clock_fixed {
+            return fixed;
+        }
+        if *args.first().unwrap_or(&0) == 1 {
+            self.clock_base.elapsed().as_nanos() as i64
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0)
+        }
     }
 
     /// `free(ptr)`: return `ptr`'s block to the free list for reuse. `free(NULL)` and a double / bogus
