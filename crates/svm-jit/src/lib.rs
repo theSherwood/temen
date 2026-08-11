@@ -76,6 +76,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use std::sync::Arc;
+use svm_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
@@ -8816,58 +8817,9 @@ fn confine_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) 
     b.ins().iadd(base, shifted)
 }
 
-/// Unknown upper bound — the value may be anything (so its accesses must be masked).
-const UB_TOP: u64 = u64::MAX;
-
-/// The recorded upper bound of IR value `i` (unknown if out of range — defensive).
-fn ub_at(ubs: &[u64], i: u32) -> u64 {
-    ubs.get(i as usize).copied().unwrap_or(UB_TOP)
-}
-
-/// A **sound, conservative upper bound** on an SSA value's unsigned (`u64`) magnitude, used
-/// only to decide mask elision. Every rule must never under-estimate the real maximum;
-/// anything not modelled returns [`UB_TOP`]. Lower bounds are irrelevant (a `u64` is `≥ 0`),
-/// so only the upper bound is tracked. Indexed like the value map (block params = `UB_TOP`).
-fn ub_of(inst: &Inst, ubs: &[u64]) -> u64 {
-    let ub = |i: u32| ubs.get(i as usize).copied().unwrap_or(UB_TOP);
-    match inst {
-        Inst::ConstI64(c) => *c as u64,
-        Inst::ConstI32(c) => *c as u32 as u64,
-        Inst::IntBin { op, a, b, .. } => {
-            let (x, y) = (ub(*a), ub(*b));
-            match op {
-                // a & b ≤ min(a, b); a|b, a^b, a+b ≤ a + b; a*b ≤ a * b (wrap ⇒ Top).
-                BinOp::And => x.min(y),
-                BinOp::Add | BinOp::Or | BinOp::Xor => x.checked_add(y).unwrap_or(UB_TOP),
-                BinOp::Mul => x.checked_mul(y).unwrap_or(UB_TOP),
-                _ => UB_TOP,
-            }
-        }
-        // Zero-extend: the i64 value is the (≤ u32::MAX) source, no wider.
-        Inst::Convert {
-            op: ConvOp::ExtendI32U,
-            a,
-        } => ub(*a).min(0xFFFF_FFFF),
-        Inst::Convert {
-            op: ConvOp::WrapI64,
-            ..
-        } => 0xFFFF_FFFF,
-        _ => UB_TOP,
-    }
-}
-
-/// True iff every access `[addr+offset, addr+offset+width)` is provably within `[0, size)`
-/// given `addr ≤ addr_ub` — i.e. the mask is redundant and can be elided. Saturating/checked
-/// throughout so an overflow can only make this *false* (fall back to masking), never escape.
-fn in_window(addr_ub: u64, offset: u64, width: u32, size: u64) -> bool {
-    match addr_ub
-        .checked_add(offset)
-        .and_then(|s| s.checked_add(width as u64))
-    {
-        Some(top) => top <= size,
-        None => false,
-    }
-}
+// The confinement bound-proof (`UB_TOP`/`ub_at`/`ub_of`/`in_window`) now lives in one audited place,
+// `svm_ir::bounds`, so the native and wasm JITs share a single definition of this veto predicate
+// rather than diverging copies (INVARIANTS #9). Imported at the top of this module.
 
 /// Little-endian, may-trap memory access flags (the window is host memory; the guard
 /// margin absorbs width overrun, so this never faults in practice).
