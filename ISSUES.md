@@ -2402,6 +2402,51 @@ round-trips now agree; existing `debug_info_round_trips_through_binary` /
 `no_debug_info_is_back_compatible` unit tests still pass, and the exact crash input was verified to
 normalize and round-trip through both the binary and text paths.
 
+### I50 — text round-trip dropped a `func_names`-only `debug_info` (the I47 class, one field over), breaking `parse ∘ print = id` (S3, nightly fuzz red) — **FIX LANDED 2026-08-11** (`claude/nightly-ci-failures-x6oj7x`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (roundtrip)` failed 2026-08-11 (input
+`[83, 86, 77, 0, 10, 0, …, 1, 42, 0]` — `SVM\0` + a debug section carrying one function-name entry):
+`text round-trip changed the IR`, with `left` = `Some(DebugInfo { …, func_names: [FuncName { func:
+42, name: "" }] })` and `right` = `None`.
+
+**Root cause.** The same emptiness-check drift I47 fixed on the *decode* side, now on the *print*
+side. `DebugInfo` has six tables (`files`, `locs`, `types`, `vars`, `blobs`, `func_names`), but
+`print_debug_info` (`svm-text/src/lib.rs`) early-returned "print nothing" when the first **five** were
+empty — it never checked `func_names`. So a module whose debug info was *only* a `func_names` entry
+(non-empty, so I47's decode canonicalization leaves it `Some`) printed no debug section at all, and
+the re-parse saw no directives ⇒ `debug_info: None`. Binary round-trip (`decode ∘ encode`) preserved
+the `Some`, so the two round-trips disagreed — exactly the I47 shape, one struct field further along.
+
+**Fix.** Add `&& di.func_names.is_empty()` to the printer's guard so the emptiness test covers every
+`DebugInfo` field. Pinned by `debug_info_with_only_func_names_survives_text_round_trip`
+(`svm-text`), which reconstructs the crash IR and asserts `parse ∘ print = id`; the existing
+`debug_fnames_round_trip` still passes.
+
+### I51 — differential fuzz generator synthesized an **overlapping** `MemCopy`, tripping the interp-oracle (memmove-safe) vs JIT (raw `memcpy`, UB on overlap) divergence (S4, nightly fuzz red — harness bug, not a miscompile) — **FIX LANDED 2026-08-11** (`claude/nightly-ci-failures-x6oj7x`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (opt_ssa_roundtrip)` (and, from the same generator, the
+`diff` target) failed 2026-08-11 under ASan with `memcpy-param-overlap` (input `[0x17,0xa4,0x17,0x1b]`),
+the faulting frames inside JIT-compiled guest code.
+
+**Root cause.** `MemCopy` carries the C `memcpy` contract — source and destination spans **must not
+overlap** — exactly like its only frontend source, `llvm.memcpy`. Both interpreters implement it
+overlap-safely (a snapshot copy = memmove semantics; svm-interp `mem_copy`), but the JIT lowers
+`MemCopy` to a raw platform `memcpy` libcall (`svm-jit` `call_memcpy`, D62 — the two ops "differ only
+in the libcall (overlap safety)"). The differential generator (`crates/svm/tests/support/irgen.rs`
+§26) drew `MemCopy`'s `dst`/`src` from arbitrary runtime pool values it can't prove disjoint, so it
+could name overlapping in-window spans. On such an input the interpreter oracle gives a defined
+(memmove) result while the JIT's `memcpy` is UB — ASan reports the overlap. That is an *out-of-contract
+program*, not a JIT miscompile: no real frontend emits an overlapping `MemCopy`, and the copy is still
+fully confined (no escape).
+
+**Fix.** Have the differential generator emit only the overlap-safe `MemMove` for arbitrary-address
+bulk copies, never `MemCopy` (the confinement lowering it exercises is identical — they differ only in
+the final libcall). `MemCopy`'s non-overlapping lowering stays covered by the fixed-address differential
+unit tests in `svm-jit/tests/bulk_mem.rs`. Pinned by
+`differential_generator_never_emits_overlapping_memcopy` (`svm/tests/jit_fuzz.rs`), which scans 4000
+generated modules and fails the instant a `MemCopy` is reintroduced; the crash seed is also added to
+`DIFF_REGRESSIONS`.
+
 ### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25; **BUILT 2026-08-07** as `cont.resume.block` (DESIGN.md §12)
 
 **What.** After the §3.6 slice-5a fiber-park contract (svm PR #442), a `memory.wait` inside a

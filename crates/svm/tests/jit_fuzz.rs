@@ -33,6 +33,13 @@ use irgen::{fuzz_one, Gen};
 ///   target at those dates but no longer reproduce — the byte→module mapping drifts as the
 ///   generator evolves, so the original modules may be unconstructible from these bytes today.
 ///   Pinned anyway: they are free, and they cover whatever these bytes generate *now*.
+/// - `[0x17, 0xa4, 0x17, 0x1b]` (nightly `opt_ssa_roundtrip`/`diff` ASan, Aug 11): the generator
+///   synthesized an `Inst::MemCopy` whose `dst`/`src` named **overlapping** in-window spans. The
+///   interpreter oracle is overlap-safe (memmove semantics) but the JIT lowers `MemCopy` to a raw
+///   `memcpy` libcall — UB on overlap, which ASan reports as `memcpy-param-overlap`. `MemCopy` carries
+///   the C `memcpy` non-overlap contract (its only frontend source is `llvm.memcpy`), so an
+///   overlapping one is an out-of-contract program, not a miscompile. Fixed by having the differential
+///   generator emit only the overlap-safe `MemMove` for arbitrary-address bulk copies (irgen.rs §26).
 const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0xad, 0xa9, 0xac],
     &[0xe8, 0x01, 0xde, 0xcd],
@@ -40,6 +47,7 @@ const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0x00, 0x71, 0x04, 0x1c],
     &[0x54],
     &[0x79, 0x7c, 0x00, 0x02],
+    &[0x17, 0xa4, 0x17, 0x1b],
 ];
 
 #[test]
@@ -47,6 +55,31 @@ fn jit_matches_interp_on_pinned_regressions() {
     for bytes in DIFF_REGRESSIONS {
         let mut g = Gen::from_bytes(bytes);
         fuzz_one(&mut g);
+    }
+}
+
+#[test]
+fn differential_generator_never_emits_overlapping_memcopy() {
+    // `MemCopy` carries the C `memcpy` non-overlap contract, but the generator draws `dst`/`src` from
+    // arbitrary runtime pool values it cannot prove disjoint — so it must never synthesize a `MemCopy`
+    // at all (only the overlap-safe `MemMove`), or the differential trips on the interp-oracle
+    // (memmove-safe) vs JIT (raw `memcpy`, UB on overlap) divergence that ASan flags as
+    // `memcpy-param-overlap`. Pin that invariant here deterministically: it fails the instant the
+    // `MemCopy` arm is reintroduced, without needing ASan or the exact crashing seed to recur.
+    for seed in 0u32..4000 {
+        let mut g = Gen::from_bytes(&seed.to_le_bytes());
+        let m = irgen::gen_module(&mut g);
+        for (fi, f) in m.funcs.iter().enumerate() {
+            for (bi, blk) in f.blocks.iter().enumerate() {
+                for inst in &blk.insts {
+                    assert!(
+                        !matches!(inst, svm_ir::Inst::MemCopy { .. }),
+                        "seed {seed}: generator emitted a MemCopy (func {fi}, block {bi}) — its \
+                         non-overlap contract can't be guaranteed for arbitrary spans; emit MemMove"
+                    );
+                }
+            }
+        }
     }
 }
 
