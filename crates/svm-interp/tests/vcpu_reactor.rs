@@ -87,10 +87,12 @@ fn run_vcpu(frames: usize, tierup: bool) -> (Vec<u8>, u32) {
     }
     let mut tierups = 0u32;
     for _ in 0..frames {
-        r.frame(1, &[Value::I32(out)], &host, |func, argv| {
+        r.frame(1, &[Value::I32(out)], &host, |func, argv, mapped| {
             tierups += 1;
             // Emulate the emitted `f{func}(argv...)`: run the pure callee standalone.
             assert_eq!(func, 2, "only func 2 is eligible");
+            // #717 host sync: a fully-mapped reactor window reports its full size as the extent.
+            assert_eq!(mapped, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
             let mut fuel = u64::MAX;
             let args: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
             match bytecode::compile_and_run(&m, func, &args, &mut fuel).expect("supported") {

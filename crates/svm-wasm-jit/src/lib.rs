@@ -1079,15 +1079,24 @@ fn module_atomics_ok(m: &Module) -> bool {
     !m.funcs.iter().any(|f| f.uses_concurrency())
 }
 
-/// Whether `f` invokes a **window-remapping** capability op — one that mutates which bytes back a
-/// window page, or its read/write protection, *during the run*. Two ifaces do this:
-/// - **ADDRESS_SPACE** (iface 5): `map` (0), `unmap` (1), `protect` (2). `page_size` (3) / `sub` (4)
-///   are a pure query / attenuation-mint and do **not** count (the emittable [`is_nested_leaf_cap`] set).
-/// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages, `unmap` (1) drops
-///   it. `len` (2) / `page_size` (3) are pure queries and do **not** count.
+/// Whether `f` invokes a **shrinking or aliasing** window-remapping op — one that can make a
+/// previously-accessible page trap, read different bytes, or split the read/write sets *during the
+/// run*. Two ifaces do this:
+/// - **ADDRESS_SPACE** (iface 5): `unmap` (1), `protect` (2). `map` (0) does **not** count (#717):
+///   it only *adds* committed pages, and the emitted tier confines against the live `"mapped"`
+///   global ([`mapped_global_idx`]) the driver re-syncs from the `VcpuEvent::TierUp` entry snapshot
+///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
+///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
+///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
+///   still never emitted (a remapping `cap.call` is not in-subset); only its pure siblings are.
+///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either
+///   (the emittable [`is_nested_leaf_cap`] set).
+/// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages (the emitted
+///   tier would read the window's stale bytes, not the region's), `unmap` (1) drops it.
 ///
-/// All of these desync the mask-only tier from the interpreter (a mapped alias reads different bytes;
-/// an unmapped / RO page should trap), so their presence forbids emitting — see [`module_uses_page_ops`].
+/// These desync the mask-only tier from the interpreter in ways a single monotone bound cannot
+/// carry (an unmapped / RO page should trap; an aliased page reads other bytes), so their presence
+/// forbids emitting — see [`module_uses_page_ops`].
 fn func_uses_page_ops(f: &Func) -> bool {
     f.blocks.iter().any(|b| {
         b.insts.iter().any(|i| {
@@ -1095,7 +1104,7 @@ fn func_uses_page_ops(f: &Func) -> bool {
                 i,
                 Inst::CapCall {
                     type_id: 5,
-                    op: 0..=2,
+                    op: 1..=2,
                     ..
                 } | Inst::CapCall {
                     type_id: 4,
@@ -1108,19 +1117,21 @@ fn func_uses_page_ops(f: &Func) -> bool {
 }
 
 /// **The window-remapping gate** (DESIGN.md §14 "wasm-JIT tier coverage"): does any function reach a
-/// window-remapping op ([`func_uses_page_ops`] — `map`/`unmap`/`protect` or a `SharedRegion`
-/// `map`/`unmap`)? The wasm
-/// tier's confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and
-/// cannot honor per-page state the guest changed, so an emitted load would sail through a page the
-/// interpreter (which enforces `Mem`'s page-protection + backing map) would trap on or back with
-/// different bytes. That divergence is possible for **any** emitted memory access once such an op is
-/// reachable — not just the op's own function — so a module that uses one must run **wholly on the
-/// interpreter** (emit nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for
-/// the un-rooted tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
+/// shrinking/aliasing remapping op ([`func_uses_page_ops`] — `unmap`/`protect` or a `SharedRegion`
+/// `map`/`unmap`)? The wasm tier's confinement is a mask plus **one live bound** (the `"mapped"`
+/// global) — an emitted access is admitted in `[0, live_mapped)` and cannot honor per-page state
+/// beyond that shape, so once such an op is reachable an emitted load could sail through a page the
+/// interpreter (which enforces `Mem`'s full page-protection + backing map) would trap on or back
+/// with different bytes. That divergence is possible for **any** emitted memory access — not just
+/// the op's own function — so a module that uses one must run **wholly on the interpreter** (emit
+/// nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for the un-rooted
+/// tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
 ///
-/// Not covered (deliberately, deferred with the broader D40/§13 question): a guest `grow` only
-/// *commits* within the fixed reservation the mask already allows, so it introduces no
-/// was-accessible-now-different transition an emitted access would get wrong.
+/// **Not** gated: `ADDRESS_SPACE.map` (5,0) — a guest *grow*. Growth only adds committed pages
+/// within the reservation the mask already clamps to, and the live `"mapped"` global carries it to
+/// the emitted bounds check (per-call host sync from `Mem::scalar_extent`; unrepresentable states
+/// decline tier-up) — see [`func_uses_page_ops`] (#717). This realizes the previously deferred
+/// D40/§13 note: a grow introduces no was-accessible-now-different transition.
 fn module_uses_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(func_uses_page_ops)
 }

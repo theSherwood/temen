@@ -69,6 +69,7 @@ fn run_emitted_over_live_window(
     argv: &[i64],
     base: *mut u8,
     win_size: usize,
+    mapped: u64,
 ) -> Outcome {
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
@@ -105,6 +106,14 @@ fn run_emitted_over_live_window(
         .instantiate(&mut store, &module)
         .unwrap()
         .start(&mut store)
+        .unwrap();
+    // #717 host sync: write the event's committed extent to the emitted `"mapped"` global before
+    // the call (a fully-mapped window makes this equal the emit-time default — the sync is a no-op
+    // here, but it is the contract every tier-up host follows).
+    instance
+        .get_global(&store, "mapped")
+        .expect("emitted module exports the live-mapped global")
+        .set(&mut store, Val::I64(mapped as i64))
         .unwrap();
     let f = instance
         .get_func(&store, &format!("f{func}"))
@@ -171,8 +180,8 @@ fn tiered_frame(
         .expect("reactor opens (_start runs, window + data materialized)")
         .with_jit_eligible(Arc::from(eligible.to_vec().into_boxed_slice()));
 
-    let out = reactor.frame(entry, &[Value::I64(arg)], &host, |func, argv| {
-        match run_emitted_over_live_window(m, wasm, func, argv, base, win_size) {
+    let out = reactor.frame(entry, &[Value::I64(arg)], &host, |func, argv, mapped| {
+        match run_emitted_over_live_window(m, wasm, func, argv, base, win_size, mapped) {
             Outcome::Vals(v) => Ok(v),
             Outcome::Trap(TrapKind::OutOfFuel) => Err(Trap::OutOfFuel),
             Outcome::Trap(_) => Err(Trap::MemoryFault),

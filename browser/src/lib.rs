@@ -699,8 +699,12 @@ pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
 pub const PAR_INSTANTIATE: i32 = 6;
 /// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
-/// function. `svm_par_ev_a` = the func index; `svm_par_tierup_argv_ptr`/`_len` give the marshalled
-/// i64 args. The Worker runs the emitted `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
+/// function. `svm_par_ev_a` = the func index; `svm_par_ev_b` = the window's committed extent, which
+/// the Worker MUST write to the emitted module's `"mapped"` global before the call (#717 host sync —
+/// over today's fully-mapped par window it equals the emit-time default, so the write is idempotent;
+/// over a grown window it is what keeps the emitted bounds check in lockstep with the interpreter).
+/// `svm_par_tierup_argv_ptr`/`_len` give the marshalled i64 args. The Worker runs the emitted
+/// `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
 pub const PAR_TIERUP: i32 = 7;
 /// §22 guest-JIT **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5): a guest's `Jit.invoke`
 /// surfaces here (codegen mode on — [`svm_par_powerbox_jit_codegen`]) so the Worker runs the
@@ -1882,8 +1886,12 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
             // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
             // emitted `f{func}` and delivers the results (`svm_par_deliver_tierup`) or a trap.
-            bytecode::VcpuEvent::TierUp { func, argv } => {
+            // Operand `b` carries the window's scalar committed extent — the Worker writes it to the
+            // emitted module's `"mapped"` global before the call, so the emitted bounds check admits
+            // exactly what the interpreter would over a `vm_map`-grown window (#717 host sync).
+            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 v.a = func as i64;
+                v.b = mapped as i64;
                 v.tierup_argv = argv.into_vec();
                 return PAR_TIERUP;
             }
@@ -3838,7 +3846,7 @@ impl SharedOnrampReactor {
         // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
         let result = self
             .reactor
-            .frame(self.tick, &args, &self.host, |_func, _argv| {
+            .frame(self.tick, &args, &self.host, |_func, _argv, _mapped| {
                 Err(Trap::Malformed)
             });
         let status = match result {

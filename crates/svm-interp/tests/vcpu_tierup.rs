@@ -83,8 +83,11 @@ fn tierup_run(
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => return (Ok(vals), tierups),
             bytecode::VcpuEvent::Trapped(t) => return (Err(t), tierups),
-            bytecode::VcpuEvent::TierUp { func, argv } => {
+            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 tierups += 1;
+                // #717 host sync: over a fully-mapped root window the event's committed extent is
+                // exactly the declared window size (the emit-time `"mapped"` default).
+                assert_eq!(mapped, m.memory.map_or(0, |mc| 1u64 << mc.size_log2));
                 // Emulate `f{func}(win, env, ...argv)`: run the callee standalone over its i64 args.
                 let args: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
                 let mut fuel = u64::MAX;

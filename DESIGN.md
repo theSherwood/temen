@@ -2218,23 +2218,31 @@ window via `env.call_interp`, which marshals each arg/result through one 8-byte 
 carry a `v128` signature).
 
 **Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
-confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and cannot honor
-per-page state the guest changed (no `PROT_NONE` sub-region in a wasm linear memory, and V8 exposes no
-way to protect a sub-range of a `WebAssembly.Memory`). `AddressSpace` `map`/`unmap`/`protect` and
-`SharedRegion` `map`/`unmap` mutate which bytes back a page (or its protection) mid-run, so an emitted
-access would sail through a page the interpreter (which enforces `Mem`'s page-protection + backing map,
-§4/§13) traps on or backs with different bytes. A module that reaches any such op therefore emits
-**nothing** and runs wholly on the interpreter — correct by construction (the interpreter is the
-oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is module-wide (the hazard is
-every *other* emitted access, not the op's own function) and covers only the state-mutating ops:
-`page_size`/`sub`/`len` are pure queries, and `grow` only commits within the fixed reservation the mask
-already permits, so neither is gated. (The **grow** case does still need the bound to track the live
-size: emitted accesses confine against the live `mapped` read from the module's exported `mapped`
-global — self-initialized to the emit-time `1 << size_log2`, and raised by a `vm_map`-growing host —
-rather than a baked constant, so an access into a grown region no longer spuriously faults on the wasm
-tier where the interpreter admits it. This is the **size/grow** axis, #717; the **page-state** axis
-below stays fail-closed. The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a
-trap-parity divergence, never an escape.) The rejected alternative — a per-access **software page-check** in
+confinement is a mask plus **one live bound** — an emitted access is admitted in `[0, live_mapped)`
+and cannot honor per-page state beyond that shape (no `PROT_NONE` sub-region in a wasm linear memory,
+and V8 exposes no way to protect a sub-range of a `WebAssembly.Memory`). `AddressSpace`
+`unmap`/`protect` and `SharedRegion` `map`/`unmap` can make a previously-accessible page trap, split
+the read/write sets, or re-back a page's bytes mid-run — states a single monotone bound cannot carry —
+so an emitted access would sail through a page the interpreter (which enforces `Mem`'s full
+page-protection + backing map, §4/§13) traps on or backs with different bytes. A module that reaches
+any such op therefore emits **nothing** and runs wholly on the interpreter — correct by construction
+(the interpreter is the oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is
+module-wide (the hazard is every *other* emitted access, not the op's own function) and covers only
+those shrinking/aliasing ops: `page_size`/`sub`/`len` are pure queries, and `AddressSpace.map` — a
+guest **grow** — only adds committed pages within the reservation the mask already permits, so
+neither is gated. The grow rides the **size/grow** axis (#717), now closed end-to-end: emitted
+accesses confine against the live `mapped` read from the module's exported `mapped` global
+(self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
+event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
+admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
+(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike). A window state
+the scalar cannot represent — a sparse grow, a non-RW mapping — **declines** tier-up at the dispatch
+and interprets the call instead, so emitted code never runs over a state it would mis-admit; the
+map-containing function itself is never emitted either (a remapping `cap.call` is not in-subset).
+`tierup_grow_window.rs` is the differential proof, both directions plus the decline arm, with the
+unsynced divergence pinned as a negative test. The **page-state** axis stays fail-closed as above.
+The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
+divergence, never an escape. The rejected alternative — a per-access **software page-check** in
 emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit
 only page-managing guests see, and even gated + loop-invariant-elided it stays ~1.5–3×+ on the
 random-access tail; a gated, elided page-check is the escalation *iff* a hot page-managing guest ever

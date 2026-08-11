@@ -1,12 +1,19 @@
-//! **Window-remapping gating** (DESIGN.md §14 "wasm-JIT tier coverage"). The wasm-JIT tier confines memory by
-//! masking to `[0, size)` — it cannot honor per-page state (`map`/`unmap`/`protect`, ADDRESS_SPACE
-//! iface 5 ops 0/1/2), so an emitted access would sail through a page the interpreter (the oracle,
-//! which enforces `Mem`'s page-protection map) would trap on. A module that reaches a page op is
-//! therefore compiled to **nothing** and run wholly on the interpreter — correct by construction.
+//! **Window-remapping gating** (DESIGN.md §14 "wasm-JIT tier coverage"). The wasm-JIT tier confines
+//! memory by a mask plus one live bound (the `"mapped"` global) — it cannot honor per-page state a
+//! shrinking/aliasing op establishes (`unmap`/`protect`, ADDRESS_SPACE iface 5 ops 1/2; SharedRegion
+//! `map`/`unmap`, iface 4 ops 0/1), so an emitted access would sail through a page the interpreter
+//! (the oracle, which enforces `Mem`'s page-protection map) would trap on. A module that reaches one
+//! is therefore compiled to **nothing** and run wholly on the interpreter — correct by construction.
 //!
-//! These tests pin the routing: a page-op module yields an `InterpDriven` artifact with an all-`false`
-//! `emitted` bitmap (so even a memory-accessing function in it is *not* emitted), while an otherwise
-//! identical module without the page op still emits — the gate is specific, not a blanket disable.
+//! `ADDRESS_SPACE.map` (5,0) — a guest *grow* — no longer gates the module (#717): growth only adds
+//! committed pages and rides the live `"mapped"` global the driver syncs per emitted call
+//! (`tierup_grow_window.rs` is the differential proof). The map-containing function itself is still
+//! never emitted; only its pure siblings are.
+//!
+//! These tests pin the routing: a gated-op module yields an `InterpDriven` artifact with an
+//! all-`false` `emitted` bitmap (so even a memory-accessing function in it is *not* emitted), while
+//! an otherwise identical module without the op still emits — the gate is specific, not a blanket
+//! disable — and a map(5,0)-only module keeps its pure leaves eligible.
 
 use svm_wasm_jit::{compile_jit, compile_module_tierup, compile_nested, DriveMode, Shape};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store};
@@ -155,6 +162,46 @@ fn tierup_page_op_module_emits_nothing() {
         eligible,
         vec![false, false],
         "a page-op module must emit no tier-up functions (the leaf stays on the interpreter)"
+    );
+}
+
+// The grow split (#717): the same orchestrator+leaf shape but with `map` (op 0) instead of
+// `protect` — a guest growing its heap. The map-containing func 0 stays on the interpreter (a
+// remapping cap.call is not in-subset), but the pure leaf must now be eligible: growth is carried
+// to the emitted bounds check by the live `"mapped"` global, synced per call by the driver.
+const MAP_WITH_LEAF: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vas = i32.wrap_i64 v0
+  voff = i64.const 0
+  vlen = i64.const 4096
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  v1 = call 1 (vr)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 8
+  vld = i64.load va
+  v2 = i64.add vld v0
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn tierup_map_module_keeps_leaf_eligible() {
+    // #717 gate split: a pure-grow (`map`, 5/0) module is NOT interp-only — the mapping func 0
+    // stays on the interpreter, the pure memory leaf tiers up (its emitted access confines against
+    // the live `"mapped"` global the driver syncs).
+    let m = parse(MAP_WITH_LEAF);
+    let (_wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
+    assert_eq!(
+        eligible,
+        vec![false, true],
+        "a map-only module keeps its pure leaf tier-up eligible; the mapping func stays interpreted"
     );
 }
 
