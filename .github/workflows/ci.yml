@@ -2,7 +2,20 @@ name: CI
 on:
   push:
     branches: [main]
+    # Doc-only changes don't affect build/test/fuzz, so skip the (slow) matrix for them.
+    # `paths-ignore` skips a run only when EVERY changed file matches — a mixed code+doc
+    # commit still runs. OPS_PARITY.md is generated + golden-tested, but any change to it
+    # rides with a `.rs` change (regeneration), so mixed-changeset CI still covers it; the
+    # only uncovered case is a lone hand-edit of that generated file, which is a misuse.
+    # NOTE (required checks): if `build · test · fmt · clippy` is a *required* status check
+    # in branch protection, a doc-only PR skips it and GitHub reports it as missing, blocking
+    # the merge (same failure mode as the miri note in workflows_src/README.md). On copy-over,
+    # either exclude doc-only PRs from that requirement or merge them without the gate.
+    paths-ignore:
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "**.md"
   schedule:
     - cron: "0 7 * * *" # daily extended fuzz
   workflow_dispatch:
@@ -678,6 +691,11 @@ jobs:
           # stable key must produce byte-identical stdout every Run and compile exactly once. Uses the
           # committed hello_c/qjs_repl assets; skips cleanly if absent.
           node browser-jit-cache-test.mjs
+          # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
+          # SVM-text compute guest whose root loops calling a window-round-tripping leaf must return the
+          # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
+          # SVM-text 'plain' recipe now defaults on). No assets — parses in-page via svm_parse.
+          node browser-tierup-mainline-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
