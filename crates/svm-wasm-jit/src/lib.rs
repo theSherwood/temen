@@ -1093,8 +1093,9 @@ fn func_uses_page_ops(f: &Func) -> bool {
     })
 }
 
-/// **The Track 3 (c)+(a) gate** (`NESTED_JIT.md`): does any function reach a window-remapping op
-/// ([`func_uses_page_ops`] — `map`/`unmap`/`protect` or a `SharedRegion` `map`/`unmap`)? The wasm
+/// **The window-remapping gate** (DESIGN.md §14 "wasm-JIT tier coverage"): does any function reach a
+/// window-remapping op ([`func_uses_page_ops`] — `map`/`unmap`/`protect` or a `SharedRegion`
+/// `map`/`unmap`)? The wasm
 /// tier's confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and
 /// cannot honor per-page state the guest changed, so an emitted load would sail through a page the
 /// interpreter (which enforces `Mem`'s page-protection + backing map) would trap on or back with
@@ -2043,10 +2044,10 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
             drive: DriveMode::InterpDriven,
         })
     };
-    // Track 3 (c)+(a): a module that manages its own pages (`map`/`unmap`/`protect`) can't be
-    // accelerated on the mask-only tier — an emitted access ignores page state the interpreter would
-    // trap on — so emit nothing and run it wholly on the interpreter (`NESTED_JIT.md`). Checked before
-    // the shape split so it holds for `Threaded`/tier-up too, not just the rooted paths.
+    // A module that manages its own pages (`map`/`unmap`/`protect`) can't be accelerated on the
+    // mask-only tier — an emitted access ignores page state the interpreter would trap on — so emit
+    // nothing and run it wholly on the interpreter (DESIGN.md §14 "wasm-JIT tier coverage"). Checked
+    // before the shape split so it holds for `Threaded`/tier-up too, not just the rooted paths.
     if module_uses_page_ops(m) {
         return compile_interp_only(m, shared_memory, false);
     }

@@ -2187,6 +2187,55 @@ default above still stands for every handle-gated capability.
   capability op and per *virtualized* fault — the best achievable, and the same
   shape as hardware nested virtualization (cheap steady state, cost on exits).
 
+### wasm-JIT tier coverage (the `compile_nested` front door)  [SETTLED — built]
+VM-in-VM runs correctly on **every** tier: fed to the general `compile_jit` front door a §14 unit
+runs interpreter-driven, the interpreter servicing `instantiate`/`join` via `VcpuStop::Instantiate`.
+The wasm-JIT tier (`svm-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is a *performance* path that lowers a
+nesting parent's `instantiate`/`join`/window-carve/`thread`/futex ops to host bounces
+(`env.instantiate` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. `compile_nested`
+is its single front door — the nesting analogue of `compile_jit` — deriving the drive mode from the
+IR, so a verified unit always yields a runnable artifact:
+
+- **No reachable fiber** → the nested emit: the host calls `f{entry}` directly and the §14/§11 ops
+  bounce to their imports (`WasmDriven`). Threads and the futex stay on this fast path — a spawned
+  vCPU runs on its own worker, so it never has to unwind the emitted frame.
+- **A reachable fiber** (`cont.*`/`suspend`) → an interpreter-driven, nested-cap-aware tier-up
+  (`InterpDriven`): the interpreter owns the top frame (a wasm frame can't unwind for a stack switch),
+  servicing the fibers and `instantiate`/`join` natively, while hot in-subset compute — including
+  instantiate/join/thread functions — still tiers up with its bounces intact. Fibers are **never**
+  emitted; a fiber reachable from the entry by call edges drops it from the emitted set, and a
+  `thread.spawn`ed fiber runs in its own spawned interpreter vCPU. Either way the emitted-function
+  bitmap is a sound "safe to call `f{i}` directly" signal (the browser's per-instance
+  `svm_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
+  (INVARIANTS.md #2 untouched). This is the wasm-tier counterpart of the §22 "fibers in a submitted
+  unit" allowance.
+
+**Cross-tier ABI.** A non-emittable function runs as a cross-tier interpreter leaf over the shared
+window via `env.call_interp`, which marshals each arg/result through one 8-byte scratch slot in the
+`env` cell (`i32` widened, `f32`/`f64` written narrow, `i64` as-is). A `v128` needs two slots, so it is
+**not** marshallable and stays off the cross-tier path — deferred (a two-slot encoding + a wider
+`ENV_CELL_BYTES` + every servicer's slot arithmetic; low demand, since non-emittable functions rarely
+carry a `v128` signature).
+
+**Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
+confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and cannot honor
+per-page state the guest changed (no `PROT_NONE` sub-region in a wasm linear memory, and V8 exposes no
+way to protect a sub-range of a `WebAssembly.Memory`). `AddressSpace` `map`/`unmap`/`protect` and
+`SharedRegion` `map`/`unmap` mutate which bytes back a page (or its protection) mid-run, so an emitted
+access would sail through a page the interpreter (which enforces `Mem`'s page-protection + backing map,
+§4/§13) traps on or backs with different bytes. A module that reaches any such op therefore emits
+**nothing** and runs wholly on the interpreter — correct by construction (the interpreter is the
+oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is module-wide (the hazard is
+every *other* emitted access, not the op's own function) and covers only the state-mutating ops:
+`page_size`/`sub`/`len` are pure queries, and `grow` only commits within the fixed reservation the mask
+already permits, so neither is gated. The rejected alternative — a per-access **software page-check** in
+emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit
+only page-managing guests see, and even gated + loop-invariant-elided it stays ~1.5–3×+ on the
+random-access tail; a gated, elided page-check is the escalation *iff* a hot page-managing guest ever
+appears. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
+losing §5 self-corruption detection, but the guest still cannot escape.)
+
 ---
 
 ## 15. Resource monitoring & metering  [SETTLED]
@@ -2886,7 +2935,9 @@ which builds the table/runtime/`cont.*` thunk env post-compile so a submitted un
 backends; a unit names a fiber entry by table slot (`cont.new <slot>`, new→old like `call_indirect`), and
 the reference interpreter resolves it through the module-0 dispatch table in lockstep with the JIT's shared
 `fn_table`. Pinned by `jit_cap::submitted_unit_hosts_a_fiber_agrees` (differential) +
-`submitted_unit_threads_compile_split_by_tier`.
+`submitted_unit_threads_compile_split_by_tier`. On the **wasm-JIT tier** the same fiber allowance holds
+by a different mechanism — fibers stay on the interpreter and the emitted region tiers up around them
+(§14 "wasm-JIT tier coverage").
 
 **Threads in a submitted unit (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11).** The
 compile-time threads/futex veto above is lifted: the hazard it guarded — a spawned vCPU outliving the
