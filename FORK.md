@@ -618,8 +618,22 @@ follow-up (a shim, not a substrate concern).
   - **Sequential** (`a_shell_pipes_the_output_of_one_forked_command_into_another`): fork producer,
     `wait`, `close` the write end, fork consumer — the buffered bytes drain, then EOF.
   - Interp-only (the park lives in the eval loop; the JIT/bytecode tiers don't block a pipe read, so a
-    differential guest must `close` the write end before an empty read — see `pipe.rs`). `cmd > file`
-    redirection and `SIGPIPE`/backpressure (the FIFO is unbounded) remain follow-ups.
+    differential guest must `close` the write end before an empty read — see `pipe.rs`).
+    `SIGPIPE`/backpressure (the FIFO is unbounded) remains a follow-up.
+- **~~file redirection~~ (`cmd > file`). DONE — as a pump over the pipe + fs substrate, no new mechanism.**
+  The shell wires the command's stdout to a pipe **write** end (`exec_io(cmd, argv, fds[1], 0)`), drops its
+  own copies of both ends (so `cmd` is the sole writer), then — instead of forking a second stage — *is*
+  the reader: it loops a **handle-specific** blocking read on the pipe read end and forwards each chunk to
+  a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read EOFs (which arrives when `cmd`
+  exits and the writer refcount hits 0). Two new frontend builtins back the pump: `__vm_read(h,buf,len)` /
+  `__vm_write(h,buf,len)` (`cap.call 0 0|1`) read/write a *specific* Stream handle — the plain `read`/
+  `write` builtins always hit the ambient stdin/stdout, so a shell holding a pipe fd needs these to drain
+  it. The shim exposes them as `read_fd`/`write_fd`. Because `__vm_read` is a **direct `cap.call`** (not a
+  `call.sym` offer), the pipe-read park was added to the direct-`CapCall` eval arm too (it had only been on
+  the `CallSym` route). Proven by `c_fork.rs::a_shell_redirects_a_command_output_to_a_file`: `cmd` writes
+  `"redirected!"` to its stdout, the shell pumps all 11 bytes into `out.txt`, and the shared memfs snapshot
+  holds exactly that file (the shell's own stdout stays empty — the output never touched it). Interp-only,
+  same reason as pipes (the read parks in the eval loop).
 - **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
 - **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
   only (no bytecode/JIT/wasm) — the §9 backend-parity track.

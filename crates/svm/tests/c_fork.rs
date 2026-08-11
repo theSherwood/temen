@@ -1392,6 +1392,125 @@ fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
     );
 }
 
+/// FORK.md §8.6 — **file redirection `cmd > out.txt`**, built as a *pump* over the concurrent-pipe + fs
+/// substrate (no new mechanism). The shell wires the command's stdout to a pipe **write** end, then —
+/// instead of forking a second stage to drain it — the shell itself is the reader: it closes its own
+/// copies of the pipe ends (leaving `cmd` the sole writer), then loops `read_fd(pipe_read)` and forwards
+/// each chunk to a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read returns EOF
+/// (0) — which arrives when `cmd` exits and its write end closes (the writer count hits 0, waking the
+/// blocking read). The read drains through the **direct `cap.call`** route (`__vm_read`), so this also
+/// exercises the pipe-read park on that arm. `cmd` writes `"redirected!"`; the file ends up holding it.
+const REDIRECT_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "redirected!";
+int main(int argc, char **argv) {
+  write(1, msg, 11);
+  return 11;
+}
+"#;
+
+/// The redirect shell (links `FORK_SHIM`): fork `cmd` with its stdout on the pipe write end, drop both of
+/// the shell's own pipe ends, `FS_OPEN` the target (`O_CREATE|O_WRITE`), pump pipe → file until EOF, then
+/// close + reap. Returns the byte count pumped. `__vm_fs(op,a,b,c,d)` is the flat `call.sym "vm_fs"` the
+/// manifest binds to the granted memfs; `read_fd`/`__vm_read` is the handle-specific blocking pipe read.
+const REDIRECT_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char outpath[] = "out.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, fds[1], 0); return 127; }
+  close(fds[1]);                              /* the shell drops its write end: `cmd` is the sole writer */
+  long wfd = __vm_fs(0, (long)outpath, 7, 18, 0);  /* FS_OPEN(out.txt, len=7, O_CREATE|O_WRITE = 16|2) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);         /* FS_WRITE(wfd, buf, n) */
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);                   /* FS_CLOSE(wfd) */
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_command_output_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{REDIRECT_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse redirect shell");
+    verify_module(&guest).expect("verify redirect shell");
+    let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse redirect command");
+    verify_module(&cmd).expect("verify redirect command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // A fresh shared memfs (no seed files): the shell creates `out.txt` and the redirect fills it.
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell pumped all 11 bytes of `cmd`'s output through the pipe into the file, then reaped `cmd`.
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the redirect shell pumped 11 bytes (`cmd`'s output) from the pipe into the file"
+    );
+    // `cmd`'s stdout went to the pipe, not the shell's stdout, so the shared sink stays empty.
+    assert!(
+        host.stdout_bytes().is_empty(),
+        "the redirected command wrote to the pipe, not the shell's stdout"
+    );
+    // The redirect target holds exactly `cmd`'s output — a real file written by draining a real pipe.
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "out.txt")
+        .expect("the shell created out.txt in the shared memfs");
+    assert_eq!(
+        out.1, b"redirected!",
+        "`cmd > out.txt`: the file holds the command's output, pumped through the pipe"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.

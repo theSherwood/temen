@@ -11508,12 +11508,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // FORK.md §8.6 — closing a pipe write end that dropped the writer count to 0 flags
                     // its readers to wake (they re-read → EOF). This is the shell's `close(fd)` path.
                     let pipe_wake = hg.take_pipe_wake();
+                    // FORK.md §8.6 — a blocking pipe read (`__vm_read`) with a live writer and no data
+                    // parks THIS fiber on the pipe id; the wake rewinds it to re-execute the read. The
+                    // shell drains a stage's output through this direct-call route (redirect pump).
+                    let pipe_park = hg.take_pipe_read_parked();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
                     }
                     if let Some(pipe) = pipe_wake {
                         sched.wake_pipe_readers(pipe);
+                    }
+                    if let Some(pipe) = pipe_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the read re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));

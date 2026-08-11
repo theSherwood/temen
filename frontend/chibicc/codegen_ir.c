@@ -1492,6 +1492,23 @@ static int gen_builtin_close(Node *node) {
   return r; // i64 result (0); the C `int __vm_close` return narrows at the use site
 }
 
+// FORK.md §8.6 — `__vm_read(int h, void *buf, long len)` / `__vm_write(int h, void *buf, long len)`:
+// read/write a **specific** `Stream`/pipe-end handle (op 0 / 1), unlike the frontend's `read`/`write`
+// builtins which always hit the ambient stdin/stdout streams (they drop the fd). A shell needs these to
+// pump a pipe fd it holds — e.g. draining a stage's output into a redirect file. Lowers to
+// `cap.call 0 <op> (i64, i64) -> (i64) <h> (buf, len)`; returns the byte count / -errno.
+static int gen_builtin_stream_handle(Node *node, int op, const char *who) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: %s(handle, buf, len) expects 3 arguments", who);
+  int h = gen_expr(a); // i32 capability handle
+  int buf = widen_i64(gen_expr(a->next), a->next->ty);
+  int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int r = nv++;
+  cg("  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
+  return r; // i64 byte count / -errno
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1920,6 +1937,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))
           return gen_builtin_close(node);
+        if (!strcmp(fname, "__vm_read"))
+          return gen_builtin_stream_handle(node, 0, "__vm_read");
+        if (!strcmp(fname, "__vm_write"))
+          return gen_builtin_stream_handle(node, 1, "__vm_write");
         if (!strcmp(fname, "__vm_fs"))
           return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
