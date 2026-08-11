@@ -550,3 +550,54 @@ fn std_fs_round_trips() {
         "fs File/metadata/seek/read_dir/remove round-trip through the posix cap"
     );
 }
+
+/// S2 (process) — `std::process::Command` via the posix-cap path: the svm `process` module reaches the
+/// personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`) through the PAL `host` bridge. A spawn
+/// runs the named command to completion synchronously; `output` captures its stdout by bracketing the
+/// spawn with an `OP_PIPE`+`OP_DUP2` fd-1 redirect (restored afterwards, so captured output does not
+/// leak to the parent's stdout), and `status`/`wait` reap the exit code. The embedder wires a scripted
+/// spawn delegate (`set_spawn`) — `echo` echoes its args, `true`/`false` set the exit code.
+#[test]
+fn std_process_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest process (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::{Command, Stdio};\n\
+         fn main() {\n\
+         \x20   let out = Command::new(\"echo\").arg(\"hello\").arg(\"world\").output().expect(\"output\");\n\
+         \x20   println!(\"echo_code={:?}\", out.status.code());\n\
+         \x20   println!(\"echo_stdout={:?}\", String::from_utf8_lossy(&out.stdout).trim_end());\n\
+         \x20   let st = Command::new(\"false\").status().expect(\"status\");\n\
+         \x20   println!(\"false_code={:?}\", st.code());\n\
+         \x20   let mut child = Command::new(\"true\").stdout(Stdio::null()).spawn().expect(\"spawn\");\n\
+         \x20   println!(\"true_ok={}\", child.wait().expect(\"wait\").success());\n\
+         \x20   println!(\"pid={}\", std::process::id());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_process", src, |p| {
+        p.set_spawn(|name: &str, argv: &[String], _stdin: &[u8]| {
+            let (stdout, status) = match name {
+                "echo" => (format!("{}\n", argv[1..].join(" ")).into_bytes(), 0),
+                "true" => (Vec::new(), 0),
+                "false" => (Vec::new(), 1),
+                _ => (Vec::new(), 127),
+            };
+            svm_posix::SpawnResult { stdout, status }
+        })
+    }) else {
+        eprintln!("note: skipping std_guest process (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "echo_code=Some(0)\n\
+         echo_stdout=\"hello world\"\n\
+         false_code=Some(1)\n\
+         true_ok=true\n\
+         pid=1\n",
+        "Command output/status/spawn+wait round-trip through the posix cap's fork-free spawn"
+    );
+}
