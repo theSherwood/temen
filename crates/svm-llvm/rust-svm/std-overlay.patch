@@ -133,3 +133,24 @@
      _ => {
          mod unsupported;
          use unsupported as imp;
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -11,6 +11,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "svm",
+ ))]
+ mod common;
+ 
+@@ -55,6 +56,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;

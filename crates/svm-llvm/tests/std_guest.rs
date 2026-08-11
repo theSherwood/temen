@@ -456,3 +456,42 @@ fn std_time_reads_the_posix_clock() {
         "std::time reads the seeded posix clock, and Instant is non-decreasing"
     );
 }
+
+/// S2 (env) — `std::env::{var_os, set_var, remove_var}` via the posix-cap path: the svm `env` module
+/// reaches the personality's env map through the PAL `host` bridge (buffer-writing `OP_GETENV_R` /
+/// `OP_SETENV` / `OP_UNSETENV`, so no personality arena contends with the guest heap). A program
+/// reads a seeded var, sets one, and removes one — fully deterministic output.
+///
+/// Note: `std::env::var` / `vars` (the `OsString`→`String` paths) additionally pull in
+/// `core::str::lossy::Debug::fmt`, whose irreducible CFG the on-ramp's SSA→block-args pass can't yet
+/// translate — an orthogonal on-ramp gap (tracked), not an env issue; the ops here are complete.
+#[test]
+fn std_env_var_os_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest env (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   let seeded = std::env::var_os(\"SEEDED\").and_then(|v| v.to_str().map(|s| s.to_owned()));\n\
+         \x20   println!(\"SEEDED={}\", seeded.as_deref().unwrap_or(\"<unset>\"));\n\
+         \x20   std::env::set_var(\"MADE\", \"here\");\n\
+         \x20   let made = std::env::var_os(\"MADE\").and_then(|v| v.to_str().map(|s| s.to_owned()));\n\
+         \x20   println!(\"MADE={}\", made.as_deref().unwrap_or(\"<unset>\"));\n\
+         \x20   std::env::remove_var(\"SEEDED\");\n\
+         \x20   println!(\"after_remove_present={}\", std::env::var_os(\"SEEDED\").is_some());\n\
+         }\n";
+
+    let Some((stdout, _)) =
+        svm_run_std_posix("svm_std_env", src, |p| p.set_env("SEEDED", "from_host"))
+    else {
+        eprintln!("note: skipping std_guest env (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "SEEDED=from_host\nMADE=here\nafter_remove_present=false\n",
+        "env var_os/set_var/remove_var round-trip through the posix cap"
+    );
+}
