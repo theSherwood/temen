@@ -1392,6 +1392,169 @@ fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
     );
 }
 
+/// FORK.md §8.6 (backpressure) — **a full pipe bounds a write to the capacity.** The pipe FIFO is no
+/// longer unbounded: a `write` never grows it past `PIPE_CAP` (64 KiB). This shell mints a pipe, holds
+/// both ends itself (so there is a reader — no EPIPE — and the write does not block), and writes a
+/// 100 000-byte buffer in one call; the write **short-returns** the 65 536 bytes that fit, leaving the
+/// rest for a later call once the reader drains. Proves the buffer is bounded (a runaway producer can't
+/// balloon host memory) without needing a second live stage.
+const BACKPRESSURE_BOUND_SHELL_SRC: &str = r#"
+long __vm_write(int fd, void *buf, long len);
+/* The source is a modest buffer; the write `len` intentionally exceeds both it and PIPE_CAP. The extra
+ * source span is backed (zero-filled) window memory — the point of the test is the *return value*: the
+ * bounded pipe accepts only PIPE_CAP bytes in one call and short-returns, so the FIFO can never balloon. */
+static char src[256];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  return (int)__vm_write(fds[1], src, 100000);   /* fills to PIPE_CAP, short-returns 65536 */
+}
+"#;
+
+#[test]
+fn a_full_pipe_write_is_bounded_to_the_capacity() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{BACKPRESSURE_BOUND_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse backpressure shell");
+    verify_module(&guest).expect("verify backpressure shell");
+    // The shell uses no commands; grant the guest itself as the (unused) one/two module slots.
+    let filler = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse filler");
+    verify_module(&filler).expect("verify filler");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&filler);
+    let mod2 = host.grant_module(&filler);
+
+    let mut fuel = 60_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The 100 000-byte write filled the FIFO to exactly PIPE_CAP (64 KiB) and short-returned — the
+    // buffer never grew past the bound.
+    assert_eq!(
+        r,
+        vec![Value::I64(65536)],
+        "a write to a bounded pipe returns only the bytes that fit (PIPE_CAP = 64 KiB)"
+    );
+}
+
+/// FORK.md §8.6 (SIGPIPE + backpressure) — the **`yes | head`** story: a producer that writes forever
+/// into a consumer that reads a little and quits. The producer `one` writes 1000-byte chunks in a loop,
+/// **checking the return** — so it blocks (backpressure) once the pipe fills, resumes as the consumer
+/// drains, and finally gets `-EPIPE` (returns 88) the moment the consumer's read end is gone. The
+/// consumer `two` reads *once* (up to 10 bytes) and exits, closing the last read end. Without EPIPE the
+/// producer would spin to its 1 000 000-iteration safety cap (returning 99); without backpressure it
+/// would balloon the FIFO to megabytes before the consumer exits. The shell forks both, drops its own
+/// ends, reaps the consumer, then returns the **producer's** status — 88, proving EPIPE terminated it.
+const EPIPE_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char buf[1000];
+int main(int argc, char **argv) {
+  long i, r;
+  for (i = 0; i < 1000000; i = i + 1) {
+    r = write(1, buf, 1000);
+    if (r < 0) return 88;   /* -EPIPE: the consumer's read end is closed */
+  }
+  return 99;                /* safety cap — never reached if EPIPE works */
+}
+"#;
+
+/// The `yes | head` consumer `two`: read *once* (up to 10 bytes) and exit — dropping the last read end,
+/// which flips the producer's next write to `-EPIPE`.
+const EPIPE_CONSUMER_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+static char buf[10];
+int main(int argc, char **argv) {
+  return (int)read(0, buf, 10);
+}
+"#;
+
+const EPIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  close(fds[0]);
+  close(fds[1]);
+  wait_pid(p2);              /* reap the consumer (its exit closes the last read end) */
+  return wait_pid(p1);       /* the producer's status: 88 = it got EPIPE */
+}
+"#;
+
+#[test]
+fn a_producer_gets_epipe_when_its_consumer_exits() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{EPIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse epipe shell");
+    verify_module(&guest).expect("verify epipe shell");
+    let producer = parse_module_raw(&c_to_ir(EPIPE_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    let consumer = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // "one"
+    let mod2 = host.grant_module(&consumer); // "two"
+
+    let mut fuel = 400_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The producer blocked when the pipe filled (backpressure), resumed as the consumer drained, and
+    // got -EPIPE (returned 88) once the consumer exited — it did not spin to its safety cap (99).
+    assert_eq!(
+        r,
+        vec![Value::I64(88)],
+        "yes | head: the producer got EPIPE when the consumer's read end closed"
+    );
+}
+
 /// FORK.md §8.6 — **file redirection `cmd > out.txt`**, built as a *pump* over the concurrent-pipe + fs
 /// substrate (no new mechanism). The shell wires the command's stdout to a pipe **write** end, then —
 /// instead of forking a second stage to drain it — the shell itself is the reader: it closes its own
