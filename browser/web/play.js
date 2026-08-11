@@ -2626,18 +2626,26 @@ async function runText(c) {
     jit: mode === 'jit',
     inst: mode === 'inst',
     io: mode === 'io',
+    // Slice 2 (WASM_AOT.md): the compute-only recipe defaults to the wasm-JIT tier-up path — the
+    // interpreter drives, hot in-subset functions run on emitted wasm over the same live window
+    // (fail-closed per-function; validated interp≡tier-up in `browser-tierup-mainline-test.mjs`). The
+    // §22-`jit`/§14-`inst` recipes have their own JIT; `io` stays on the interpreter for now.
+    tierup: mode === 'plain',
     winSize: winSizeOf(src),
     signal: aborter.signal,
   };
   const t0 = performance.now();
   try {
-    const { value, started } = await run(guest, opts);
-    const ms = runStage(rec, `run:${mode === 'jit' ? 'wasm-JIT' : 'interpreter'}`, performance.now() - t0).toFixed(0);
+    const { value, started, tierups } = await run(guest, opts);
+    const tiered = opts.tierup && tierups > 0;
+    const label = tiered ? 'interpreter+wasm-JIT' : mode === 'jit' ? 'wasm-JIT' : 'interpreter';
+    const ms = runStage(rec, `run:${label}`, performance.now() - t0).toFixed(0);
     c.el.result.textContent = `${value}`;
     if (mode === 'io') c.el.stdout.textContent = readParStdout(eng);
-    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
-    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms`);
-    runNote(rec, { workers: started });
+    const tierNote = tiered ? ` · ${tierups} region${tierups === 1 ? '' : 's'} on emitted wasm` : '';
+    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms${tierNote}`);
+    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms${tierNote}`);
+    runNote(rec, { workers: started, tierups });
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {

@@ -16,12 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-- **`browser-jit-cache-test.mjs` in the `browser-real` job** — one line added to the Chromium test
-  block (right after `browser-jit-reactor-test.mjs`): `node browser-jit-cache-test.mjs`. It validates
-  the slice-1 cross-Run compiled-`WebAssembly.Module` cache (`WASM_AOT.md`): re-Running the same module
-  with a stable key must produce byte-identical stdout every Run and compile exactly once. Uses the
-  committed `hello_c`/`qjs_repl` assets (skips cleanly if absent); reuses the threads module the job
-  already builds — no new toolchain. Verified locally in Chromium.
+- **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
+  test block (right after the already-copied `node browser-jit-cache-test.mjs`):
+  `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
+  slice-0 JACL residual): an SVM-text compute guest run with tier-up on must equal the all-interpreter
+  value and tier-up must fire (no assets — parses in-page via `svm_parse`). Reuses the threads module
+  the job already builds — no new toolchain. Verified locally in Chromium. (The sibling
+  `browser-jit-cache-test.mjs` line was already copied over in commit `90c3b6d`.)
 
 - **Pages-deploy starvation fix (I75) — two cooperating paths in `ci.yml` + `pages.yml`.** The per-push
   (`push: [main]`) Pages deploy was starving: under a burst of agent-PR merges each new merge supersedes

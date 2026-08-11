@@ -159,14 +159,30 @@ over `encode_module`, the same identity the durable module-grant registry alread
   Run of a light script (hello_c 4 ms) now beats interpreter-only (~8 ms) — footgun closed, pinned by
   `browser-jit-cache-test.mjs`.
 
-### Slice 2 — default the JIT tier on where eligible (after slice 0)
+### Slice 2 — default the JIT tier on where eligible — LANDED
 
-- Flip the per-demo checkbox default to on when eligibility passes (`compile_tier_eligibility` /
-  `analyze` stay the single routing predicate — INVARIANTS #9's one-veto rule). Fail-closed
-  behavior unchanged; the checkbox remains as an off-switch and for parity "prove it" runs.
-- Includes the SVM-text editor path where the recipe is compute-only (today it has no JIT toggle at
-  all).
-- **Gate:** the existing per-demo parity assertions run in both default states in `browser-test.mjs`.
+- **Demo cards — already default-on.** Every `ex.jit` card already builds its "wasm-JIT" checkbox
+  `checked = true` (`play.js` `buildCard`), with the checkbox as an off-switch and the "prove it"
+  button for the interp≡JIT parity run. Fail-closed is unchanged: a non-eligible or trapping module
+  throws and the card falls back to the interpreter. `compile_tier_eligibility`/`analyze` stay the
+  single routing predicate (INVARIANTS #9). Nothing to change here.
+- **SVM-text compute recipe — now tiers up (the gap the plan named).** The SVM-text editor's
+  `plain` ("none / compute only") recipe ran pure-interpreter across Workers with no JIT path.
+  `runText` now passes `tierup: true` for it, so the interpreter drives and hot in-subset functions
+  run on emitted wasm over the same live window (fail-closed per-function; the `§22-jit`/`§14-inst`
+  recipes keep their own JIT, `io` stays on the interpreter for now). The done-line reports how many
+  regions tiered up.
+- **This also closes slice 0's browser residual.** That path is the `svm_par_run`/`PAR_TIERUP`
+  **mainline tier-up over a live window** the JACL postmortem flagged — the one piece slice 0 could
+  only pin natively. `browser-tierup-mainline-test.mjs` (new) now validates it in real Chromium: an
+  SVM-text compute guest whose root loops calling a **window-round-tripping** leaf returns the
+  identical value with tier-up on as all-interpreter (INVARIANT 9), with tier-up actually firing
+  (50 000 regions). (Aside surfaced by the test: the SVM-text `run()` path does not materialize
+  `data` segments into the window — a pre-existing property, not introduced here; both tiers read
+  identically, so it's a differential no-op. A follow-on if a hand-written SVM-text guest ever needs
+  a data segment.)
+- **Gate (met):** `browser-test.mjs` (the full playground, tier-up now on for `plain`) stays green,
+  and `browser-tierup-mainline-test.mjs` pins interp≡tier-up + non-vacuity.
 
 ### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever) — LANDED (provable-bound form)
 
