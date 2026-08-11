@@ -335,6 +335,22 @@ try {
   console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
 }
 
+// svm-leng — the in-browser leng→SVM-IR self-host card (NIM.md §3e): the real `svm-leng` translator,
+// compiled to a verified SVM module through the LLVM on-ramp, run over a real hexer Leng file. Unlike
+// chibicc it needs the `-Z build-std`/`llvm-18` toolchain to rebuild, so — like `shell.svmb` — its
+// bytes are the committed in-tree asset (`crates/svm-run/demos/leng_selfhost/svm-leng.svmb`, kept in
+// sync with `svm-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
+// `bash crates/svm-run/demos/leng_selfhost/build_leng_svmb.sh` when `svm-leng`/the encoder changes.
+try {
+  const lengAsset = join(REPO, 'crates', 'svm-run', 'demos', 'leng_selfhost', 'svm-leng.svmb');
+  if (!existsSync(lengAsset)) throw new Error('demos/leng_selfhost/svm-leng.svmb missing (run build_leng_svmb.sh)');
+  copyFileSync(lengAsset, join(ASSETS, 'svm-leng.svmb'));
+  const kb = (readFileSync(lengAsset).length / 1024).toFixed(0);
+  console.log(`  ✓ svm-leng.svmb (${kb} KB)`);
+} catch (e) {
+  console.log(`  – svm-leng skipped (${e.message})`);
+}
+
 // Shell — the `svm-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,
 // the shell is compiled by the in-tree **chibicc** onto the POSIX personality and run on the tree-walk
 // interpreter (it carries Instantiator cap.calls the wasm-JIT/bytecode paths don't take). Its module

@@ -19,6 +19,15 @@ code-coupled-asset discipline as the Postgres/chibicc lanes.
   with ARC, control flow, gotos).
 - `svm-leng.svmb` — **the committed, prebuilt asset** (built by `build_leng_svmb.sh`).
 
+## In the browser
+
+The same asset drives a **playground self-host card** (the chibicc-self-host-card analog): `svm-leng.svmb`
+is copied into `browser/web/assets/` (by `browser/build-onramp-assets.mjs`, and committed so the card works
+out of the box), and `browser/web/play.js` adds a card whose editor holds a real hexer Leng file and whose
+Run pipes it to the asset on stdin via `svm_run_onramp` (the fixed §3e powerbox on the wasm engine),
+showing the emitted SVM IR. Covered by `browser/browser-play-editor-test.mjs` (Chromium) and the
+`check-play-assets.mjs` reference gate.
+
 ## The gate
 
 `crates/svm-run/tests/leng_selfhost_asset.rs` loads the committed `svm-leng.svmb`, re-verifies it, and

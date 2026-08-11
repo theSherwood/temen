@@ -35,3 +35,8 @@ patched*.wasm
 # Shipping the translated `.svmb` in-tree makes the C-compiler card work out of the box; the build
 # script rebuilds it in place when the toolchain is present.
 !/web/assets/chibicc.svmb
+# svm-leng (the in-browser leng→SVM-IR self-host card, NIM.md §3e) is committed prebuilt for the same
+# reason: it's a copy of the in-tree `crates/svm-run/demos/leng_selfhost/svm-leng.svmb` asset (whose own
+# code-coupling gate keeps it in sync), so the self-host card works out of the box even when the
+# `-Z build-std`/`llvm-18` toolchain that rebuilds it is absent. `build-onramp-assets.mjs` copies it.
+!/web/assets/svm-leng.svmb
