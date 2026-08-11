@@ -39,6 +39,7 @@
 
 use svm_ir::{Export, Module, ValType};
 
+mod dethash;
 mod nif;
 mod translate;
 
@@ -213,7 +214,7 @@ fn translate_object_module(
     ext_types: &[(String, translate::Layout)],
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
-    tls_layout: Option<&std::collections::HashMap<String, u64>>,
+    tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
@@ -344,8 +345,8 @@ fn link_selected_with_extra(
     // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
     // unit is handed this map, so a `tvar` defined in one unit and referenced from another lower to
     // the same `vcpu.tls.get()+off` — the offset-agreement a cross-module global gets from `data.sym`.
-    let tls_layout: Option<std::collections::HashMap<String, u64>> = tls.then(|| {
-        let mut layout = std::collections::HashMap::new();
+    let tls_layout: Option<crate::dethash::HashMap<String, u64>> = tls.then(|| {
+        let mut layout = crate::dethash::HashMap::default();
         let mut off = 0u64;
         for (name, size) in &pooled_tls {
             layout.insert(name.clone(), off);
@@ -357,7 +358,7 @@ fn link_selected_with_extra(
     // does — transitively, across module boundaries (`program → seq → alloc → alloc.0.`). Each unit
     // then translates knowing the *final* frame-need of every callee, so a cross-module call to a
     // frame-needing proc passes `$sp` and never mismatches the resolved signature.
-    let mut pooled_frame_procs: std::collections::HashSet<String> = frame_nodes
+    let mut pooled_frame_procs: crate::dethash::HashSet<String> = frame_nodes
         .iter()
         .filter(|(_, own, _)| *own)
         .map(|(name, _, _)| name.clone())
