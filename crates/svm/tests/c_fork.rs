@@ -1182,6 +1182,116 @@ fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
     );
 }
 
+/// FORK.md §8.6 — **a pipe between two forked commands: `one | two`.** The shell mints a pipe with the
+/// `pipe()` self-op (via the shim), forks the producer with the pipe **write** end wired to its
+/// `stdout`, waits, then forks the consumer with the pipe **read** end wired to its `stdin` and the
+/// shell's own `stdout` as its output. The two commands use plain `write(1)` / `read(0)` — they never
+/// know a pipe is there; the shim's `exec_io` re-grants the pipe ends by name, and the FIFO backing
+/// aliases across each `execve`, so the producer's bytes reach the consumer transparently. Sequential
+/// (fill-then-drain) for this slice: the producer completes before the consumer runs, and the
+/// non-blocking FIFO yields EOF when empty. `one` writes `"hi\n"`; `two` uppercases stdin to stdout →
+/// the sink holds `"HI\n"` and `two` returns the 3 bytes it moved.
+const PIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);                       /* fds[0] = read end, fds[1] = write end */
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  wait_pid(p1);                    /* producer fills the pipe, then exits */
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  return wait_pid(p2);             /* consumer drains the pipe → shell stdout */
+}
+"#;
+
+/// The producer `one`: write `"hi\n"` to its stdout (the pipe write end). Plain `write(1, …)`.
+const PIPE_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "hi\n";
+int main(int argc, char **argv) {
+  write(1, msg, 3);
+  return 0;
+}
+"#;
+
+/// The consumer `two`: read stdin (the pipe read end) to EOF, uppercase it, write to stdout (the
+/// shell's sink). Returns the byte count. Plain `read(0, …)` / `write(1, …)`.
+const PIPE_CONSUMER_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+long write(long fd, void *buf, long n);
+int main(int argc, char **argv) {
+  char buf[64];
+  long total = 0, n, k;
+  while ((n = read(0, buf, 64)) > 0) {
+    for (k = 0; k < n; k = k + 1) {
+      char c = buf[k];
+      if (c >= 'a' && c <= 'z') c = c - 32;
+      buf[k] = c;
+    }
+    write(1, buf, n);
+    total = total + n;
+  }
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_pipes_the_output_of_one_forked_command_into_another() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{PIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse pipe shell");
+    verify_module(&guest).expect("verify pipe shell");
+    let producer = parse_module_raw(&c_to_ir(PIPE_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // granted as "one"
+    let mod2 = host.grant_module(&consumer); // granted as "two"
+
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The consumer read all 3 bytes the producer piped to it (returned 3) and uppercased them to the
+    // shell's stdout: `one` wrote "hi\n", `two` turned it into "HI\n".
+    assert_eq!(
+        r,
+        vec![Value::I64(3)],
+        "the consumer drained 3 bytes through the pipe from the producer"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"HI\n",
+        "one | two: the producer's output flowed through the pipe and the consumer uppercased it"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.

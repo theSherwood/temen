@@ -57,16 +57,21 @@ static inline long wait_pid(long pid) {
 /* setpgid(pid, pgid): put child `pid` in process group `pgid` (`0` → its own leader). 0 / -errno. */
 static inline int setpgid(long pid, long pgid) { return (int)__vm_setpgid(pid, pgid); }
 
+/* pipe(fds): POSIX pipe — fds[0] = read end, fds[1] = write end (Stream handles); 0 / -errno. A shell
+ * grants the write end to a stage's `stdout` and the read end to the next stage's `stdin`. */
+long __vm_pipe(int *fds);
+static inline int pipe(int *fds) { return __vm_pipe(fds); }
+
 struct __grant { int name_off; int name_len; int handle; int pad; };
 static char __so_name[] = "stdout";
-static struct __grant __grec;
+static char __si_name[] = "stdin";
+static struct __grant __grants[2];
 
-/* execvp(file, argv): seed the §3e args buffer from a NUL-terminated `argv[]` and the current
- * `environ`, resolve the command module named `file`, inherit `stdout`, and image-replace into it.
- * Returns -1 only on failure (POSIX `execvp` returns only when the exec fails). */
-static inline int execvp(const char *file, char **argv) {
-  int *hdr = (int *)128;   /* POWERBOX_ARGS_BASE: {argc:u32, envc:u32} */
-  char *s = (char *)136;   /* packed NUL-terminated strings: argv[0..argc) then env[0..envc) */
+/* Pack a NUL-terminated `argv[]` and the current `environ` into the §3e args buffer at
+ * POWERBOX_ARGS_BASE (`{argc, envc}` + packed strings) — the marshalling `execvp`/`exec_io` share. */
+static inline void __pack_args(char **argv) {
+  int *hdr = (int *)128;
+  char *s = (char *)136;
   long i = 0, argc = 0, envc = 0, k;
   while (argv[argc]) {
     char *a = argv[argc];
@@ -84,12 +89,35 @@ static inline int execvp(const char *file, char **argv) {
   }
   hdr[0] = (int)argc;
   hdr[1] = (int)envc;
+}
+
+/* exec_io(file, argv, out, in): image-replace into the command `file` with argv/env marshalled, wiring
+ * its `stdout` to Stream handle `out` and `stdin` to `in` (0 = don't grant that end). This is the
+ * redirect-aware exec a shell drives for a pipeline stage: `cmd1` gets the pipe write end as `out`,
+ * `cmd2` the pipe read end as `in`. Returns -1 only on failure. */
+static inline int exec_io(const char *file, char **argv, int out, int in) {
+  __pack_args(argv);
   long mod = __vm_resolve(file, strlen(file));
   if (mod < 0) return -1;
-  long soh = __vm_resolve(__so_name, 6);
-  __grec.name_off = (int)(long)__so_name;
-  __grec.name_len = 6;
-  __grec.handle = (int)soh;
-  __vm_exec_module(mod, (long)&__grec, 1, 0, 17);
+  long n = 0;
+  if (out) {
+    __grants[n].name_off = (int)(long)__so_name;
+    __grants[n].name_len = 6;
+    __grants[n].handle = out;
+    n = n + 1;
+  }
+  if (in) {
+    __grants[n].name_off = (int)(long)__si_name;
+    __grants[n].name_len = 5;
+    __grants[n].handle = in;
+    n = n + 1;
+  }
+  __vm_exec_module(mod, (long)__grants, n, 0, 17);
   return -1;
+}
+
+/* execvp(file, argv): image-replace into `file`, inheriting the caller's own `stdout` (resolved by
+ * name). Returns -1 only on failure (POSIX `execvp` returns only when the exec fails). */
+static inline int execvp(const char *file, char **argv) {
+  return exec_io(file, argv, (int)__vm_resolve(__so_name, 6), 0);
 }

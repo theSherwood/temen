@@ -597,8 +597,17 @@ follow-up (a shim, not a substrate concern).
   (below) and `pipe`/`dup2` are the remaining libc gaps.
 - **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
   `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
-- **pipes / redirection between forked children** (`cmd1 | cmd2`, `cmd > file`) — the Power-2/`Endpoint`
-  or personality-`pipe`/`dup2` work, untouched by the fork surface.
+- **~~pipes between forked children~~ (`cmd1 | cmd2`). DONE (sequential).** A guest-reachable `pipe()`
+  self-op (op 16) mints a host-served FIFO into the shell's own powerbox and hands back the two
+  `Stream`-typed ends (`fds[0]` read / `fds[1]` write, POSIX order); the shim's `exec_io(file, argv,
+  out, in)` re-grants a pipe end to a stage's `stdout`/`stdin` by name. Because a `PipeEnd`'s FIFO
+  backing aliases across `execve` (and across fork), two commands' **plain `write(1)`/`read(0)`**
+  connect transparently — neither knows a pipe is there. Proven by
+  `c_fork.rs::a_shell_pipes_the_output_of_one_forked_command_into_another` (`one` writes `"hi\n"` → the
+  pipe → `two` uppercases to the shell's stdout → `"HI\n"`). **Sequential** for this slice: the shell
+  fills the pipe (fork producer, `wait`) then drains it (fork consumer) — correct for finite output on
+  the non-blocking FIFO (empty read = EOF). *Concurrent* stages (both live, with backpressure/blocking
+  reads and `SIGPIPE`) and `cmd > file` redirection are the follow-ups.
 - **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
 - **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
   only (no bytecode/JIT/wasm) — the §9 backend-parity track.

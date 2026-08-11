@@ -10955,6 +10955,50 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
+                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): mint a host-served pipe into this
+                // domain's own powerbox and write `fds[0]` = read end, `fds[1]` = write end (POSIX
+                // order) as two i32s at the guest pointer. A direct self-op like `setpgid` — the guest
+                // mints its own intra-domain FIFO (no host authority) and later grants the ends to its
+                // pipeline children. `Real` scheduler only (the `PipeEnd`/fork machinery); `-EMFILE` on
+                // a full table, `-EFAULT` on a bad `fds`.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_PIPE,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let fds_ptr = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64() as u64,
+                        None => 0,
+                    };
+                    let minted = if matches!(sched, SchedRef::Real(_)) {
+                        host.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .try_grant_pipe()
+                    } else {
+                        None
+                    };
+                    let r = match minted {
+                        None if !matches!(sched, SchedRef::Real(_)) => EINVAL,
+                        None => EMFILE,
+                        Some((w, rd)) => match mem.as_mut() {
+                            Some(m) => {
+                                let ok0 = m.write_bytes(fds_ptr, &rd.to_le_bytes()).is_some();
+                                let ok1 = m.write_bytes(fds_ptr + 4, &w.to_le_bytes()).is_some();
+                                if ok0 && ok1 {
+                                    0
+                                } else {
+                                    EFAULT
+                                }
+                            }
+                            None => EFAULT,
+                        },
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
                 // domain's remaining fuel. No handler context, no host lock — just the live counter,
                 // so it is answered on every tier (never `-EINVAL`). Deterministic by construction
@@ -15350,6 +15394,17 @@ pub const CAP_SELF_EXEC: u32 = 14;
 /// Pinned at 15 (12 `reap`, 13 `fuel.remaining`, 14 `exec_module`).
 pub const CAP_SELF_SETPGID: u32 = 15;
 
+/// FORK.md §8.6 — the reserved self-namespace op for POSIX `pipe(int fds[2])`: mint a host-served pipe
+/// into the **calling domain's own** powerbox and write its two `Stream`-typed ends to the guest
+/// buffer — `fds[0]` = read end, `fds[1]` = write end (POSIX order). A shell wiring `cmd1 | cmd2`
+/// grants the write end to `cmd1` as `"stdout"` and the read end to `cmd2` as `"stdin"` (both
+/// re-grantable into a child — the FIFO backing aliases across the exec), so the two commands' plain
+/// `write(1)`/`read(0)` connect transparently through the FIFO. A guest minting its own intra-domain
+/// FIFO confers no host authority (a byte buffer, no escape); the ends only reach children the guest
+/// already controls. `0` / `-EMFILE` (table full) / `-EFAULT` (bad `fds`). `Real` scheduler only.
+/// Pinned at 16.
+pub const CAP_SELF_PIPE: u32 = 16;
+
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
 /// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
@@ -17328,6 +17383,22 @@ impl Host {
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (w, r)
+    }
+
+    /// Fail-closed [`Self::grant_pipe`] for the **guest-reachable** `pipe()` self-op ([`CAP_SELF_PIPE`]):
+    /// a guest can exhaust its handle table, so this needs both ends' slots up front — `None` (→
+    /// `-EMFILE`) rather than the infallible `grant`'s panic. Returns `(write, read)` on success.
+    pub fn try_grant_pipe(&mut self) -> Option<(i32, i32)> {
+        // Both ends must land or neither: check two free slots before minting the FIFO, so a
+        // half-granted pipe (a write end with no reader) can never escape.
+        if self.table.iter().filter(|s| s.entry.is_none()).count() < 2 {
+            return None;
+        }
+        let pipe = self.pipes.len() as u32;
+        self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
+        let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
+        let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
+        Some((w, r))
     }
 
     /// Grant a **read-only pipe end** and hand back both its handle and the shared FIFO backing — the
@@ -19370,6 +19441,7 @@ impl Host {
                 | CAP_SELF_REAP
                 | CAP_SELF_EXEC
                 | CAP_SELF_SETPGID
+                | CAP_SELF_PIPE
                     if op >> 8 == 0 =>
                 {
                     Ok(vec![EINVAL])

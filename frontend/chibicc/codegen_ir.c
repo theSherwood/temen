@@ -1462,6 +1462,22 @@ static int gen_builtin_setpgid(Node *node) {
   return r;
 }
 
+// FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
+// `cap.call 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
+// end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
+static int gen_builtin_pipe(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 1)
+    error_tok(node->tok, "codegen_ir: __vm_pipe(fds) expects 1 argument");
+  int fds = widen_i64(gen_expr(node->args), node->args->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = cap.call 4294967295 16 (i64) -> (i64) v%d (v%d)\n", r, h, fds);
+  return r; // i64 result (0 / -errno); the C `long __vm_pipe` return narrows at the use site
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1886,6 +1902,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_exec_module(node);
         if (!strcmp(fname, "__vm_setpgid"))
           return gen_builtin_setpgid(node);
+        if (!strcmp(fname, "__vm_pipe"))
+          return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_fs"))
           return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
