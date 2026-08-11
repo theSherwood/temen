@@ -16,6 +16,20 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Doc-only CI skip (`ci.yml` `on:` triggers).** Added `paths-ignore: ["**.md"]` to both the
+  `push: [main]` and `pull_request` triggers so a changeset that touches **only** Markdown skips the
+  whole CI matrix (it's slow, and prose edits don't affect build/test/fuzz). `paths-ignore` skips a run
+  only when *every* changed file matches, so a mixed code+doc commit still runs the full matrix. The one
+  generated-and-golden-tested Markdown file (`OPS_PARITY.md`, checked by `svm-parity/tests/golden.rs`) is
+  always regenerated alongside a `.rs` change, so mixed-changeset CI still covers it; only a lone
+  hand-edit of that generated file would slip through, which is already a misuse. The `schedule` (nightly
+  fuzz) and `workflow_dispatch` triggers are unaffected — they always run.
+
+  > **Owner action on copy-over (required checks):** if `build · test · fmt · clippy` (or any other
+  > matrix job) is a **required** status check in branch protection, a doc-only PR will skip it and
+  > GitHub will report the required check as never-run, **blocking the merge** — the same footgun as the
+  > `miri` note below. Either drop the requirement for doc-only PRs or merge those without the gate.
+
 - **Pages-deploy starvation fix (I75) — two cooperating paths in `ci.yml` + `pages.yml`.** The per-push
   (`push: [main]`) Pages deploy was starving: under a burst of agent-PR merges each new merge supersedes
   the still-queued deploy (`concurrency: pages`, `cancel-in-progress: false` cancels the *queued* older
