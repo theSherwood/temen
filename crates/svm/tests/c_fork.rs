@@ -495,6 +495,73 @@ fn waitpid_minus_one_with_no_children_is_echild() {
     );
 }
 
+/// FORK.md §8.6 — **per-parent child scoping**: `wait` only reaps a domain's *own* children. The
+/// twin table (`forked_twins`) records each twin's forking parent, so a `wait(-1)` sees only the
+/// twins that parent forked — even though the fork/wait offer (and thus the servicer) is shared.
+///
+/// The guest forks a child; the **child** then calls `wait(-1)` with no children of its own. The
+/// global twin table is *not* empty (it holds the child itself, under the parent's key), so without
+/// parent scoping the child's `wait(-1)` would block forever (nothing of its to reap) and deadlock
+/// the whole run. With scoping the child gets `-ECHILD` at once and returns `77`; the parent then
+/// reaps the child through *its* `wait(-1)` and returns that `77`. So `r == 77` proves both halves:
+/// the child was correctly told it has no children, and the parent reaped only its own. Both the
+/// child and parent retry on `-EAGAIN` (`-11`, the serve/park race); the child stops on `-ECHILD`.
+const WAIT_SCOPE_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_any(void) { return __wait(0, -1); }
+static long pid, s, cs;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    do { cs = wait_any(); } while (cs == -11);
+    if (cs == -10) return 77;
+    return 66;
+  }
+  while ((s = wait_any()) < 0);
+  return s;
+}
+"#;
+
+#[test]
+fn wait_only_reaps_a_domains_own_children() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(WAIT_SCOPE_GUEST_SRC)).expect("parse scope guest");
+    verify_module(&guest).expect("verify scope guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The child's wait(-1) got -ECHILD (it has no children of its own → returned 77), and the parent
+    // reaped only its own child (returning that 77). A cross-reap or a hang would not yield 77.
+    assert_eq!(
+        r,
+        vec![Value::I64(77)],
+        "the child saw -ECHILD (no children of its own) and the parent reaped only its own child"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.

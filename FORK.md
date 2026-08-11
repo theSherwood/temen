@@ -526,14 +526,26 @@ the any-child queue only when unclaimed, so the two waits compose. Empty `forked
 `-EAGAIN` when there is nothing to wait for). The teardown sweeps drain `reap_any_waiters` alongside
 `join_waiters`. Proven in `c_fork.rs`: `a_compiled_c_program_reaps_two_children_with_waitpid_minus_one`
 (fork two children exiting 3/4, reap both with `wait(-1)`, sum = 7 regardless of order — stable 40/40
-under stress) and `waitpid_minus_one_with_no_children_is_echild`. Still coarse in one way — with no
-per-parent child table, `wait(-1)` reaps any twin in the global `forked_twins`, so a multi-parent
-topology could cross-reap; that (and process groups) is the tracking follow-up below.
+under stress) and `waitpid_minus_one_with_no_children_is_echild`.
+
+**Per-parent child scoping — `wait` reaps only a domain's own children. DONE.** `forked_twins` is now a
+map `twin → parent domain` (`domain_key_of` the forking caller, recorded in `fork_parked_caller`)
+rather than a bare set. Every reap path is scoped: `reap_parked_caller` (`wait(pid)`) refuses a twin
+whose recorded parent is not the calling domain (`-ECHILD`, not a foreign reap); `reap_any_parked_caller`
+(`wait(-1)`) ranges only over twins of the calling parent, and `-ECHILD`s when that parent owns none
+even though other parents' twins exist; and `wake_reap_any` wakes only a parked `wait(-1)` caller whose
+domain is the finishing twin's parent. So the shared fork/wait offer no longer lets one shell reap
+another's child. The peek-then-claim ordering keeps the serve/park race retryable (`-EAGAIN`) while
+making cross-parent reaps deterministic `-ECHILD`. Proven by
+`c_fork.rs::wait_only_reaps_a_domains_own_children`: a guest forks a child; the **child**'s `wait(-1)`
+gets `-ECHILD` (the global twin set is non-empty — it holds the child itself under the *parent's* key —
+so without scoping this would deadlock), and the parent reaps only its own child. Stable 40/40 under
+stress.
 
 **Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
 BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control —
-per-parent child tracking (so `waitpid(-1)` and process groups are scoped to a parent's own children,
-not the global `forked_twins` set), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
+**process groups** (`waitpid(-pgid, …)` / `setpgid`, building on the per-parent table now in place) and
+`WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 
