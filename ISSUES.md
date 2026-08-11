@@ -13,6 +13,43 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
+### I75 — fork on the Cranelift JIT folds the whole run to bytecode; no native fork, no mixed-tier routing (S3, current limitation — correctness intact, a perf/tiering gap) — recorded 2026-08-07
+
+**What.** `clone_caller`/`reap` (fork/wait) run natively on the tree-walk oracle and the bytecode
+interpreter, but **not** on the Cranelift JIT (`OPS_PARITY.md` — 🚧 in the `svm-jit` column). A forking
+module fails `serve_qualifies` (the shared serve-park veto keeps `has_fork`), so svm-run's engine
+routing folds it to the bytecode tier. The fold is **run-granular**, not per-function
+(`svm-run/src/lib.rs:3831`/`:5298`/`:5631`): for a same-module fork topology the *entire run* — every
+function, including compute that never touches fork — runs on bytecode instead of Cranelift.
+
+**Why it's a limitation, not a bug.** Correctness is fully intact — the fold is fail-closed with zero
+divergence (a forking guest runs on a reifiable tier). The cost is purely tiering: the shell's own
+control-plane loop runs bytecode-tier rather than native. Compute has native escape valves on both
+sides — command children spawned as separate top-level runs route independently and can be
+Cranelift-compiled, and a domain holding a §22 `Jit` cap can compile-and-invoke compute units natively
+from *within* a bytecode run. So the practical bite is "the shell interpreter loop is not native," and
+fork is a **shell-frequency control op** (F6 / invariant 8) where that loop is the least compute-bound
+piece — hence S3, not higher.
+
+**Root cause (why it's hard).** On the JIT a caller parked mid-`cap.call` has **no reifiable
+continuation**: in both live-offer transports it is a native Rust frame — thread-blocked on the
+`live_impl_call` Condvar (`svm-run:2270`), or suspended *below* the inline handler on the native C
+stack — so a servicer's `clone_caller` finds nothing to clone (fork would degrade to `-EAGAIN`
+forever). The full fix is the **durable-clone capstone** (FORK.md §9.3): make a live-offer `cap.call`
+durable-suspendable so the caller unwinds pre-result to a window-resident continuation instead of
+thread-blocking — a from-scratch JIT execution-mode change touching the durable transform + serve path.
+It is deliberately **deferred**: invariant 1 wants a measured regression before building ahead of need,
+and bash-on-svm doesn't yet run end-to-end to produce one. Reassess when it does (profile bytecode-tier
+shell control plane vs. a JIT'd equivalent).
+
+**Cheaper mitigation — mixed-tier routing (not yet built).** Independent of the capstone: attack the
+*run-granularity* of the fold rather than the reification wall. Route the fork-serving module on
+bytecode while **sibling/child modules of the same run go Cranelift** — the separate-module (compiled-C)
+topology bash will use already has per-module boundaries. This cannot make the *forking guest itself*
+native (the caller-parking wall stands — that needs the capstone), but it un-pessimizes all the
+non-fork compute in the run, capturing most of the practical value at a fraction of the cost. A good
+first move if a measured regression appears before the capstone is justified.
+
 ### I74 — wasm-JIT single-shot runner emits a fall-through `unreachable` where it should compile-veto (S4; opened 2026-08-07 — correctness already handled by the runtime decline, PR #665)
 
 **What.** Some emitted functions in a chibicc-compiled artifact reach the **trailing function-body
