@@ -86,3 +86,37 @@
          _ => {
              let _ = code;
              crate::intrinsics::abort()
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -60,6 +60,10 @@
+         mod zkvm;
+         pub use self::zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use self::svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use self::unsupported::*;
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -10,6 +10,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "svm",
+ ))]
+ mod common;
+ 
+@@ -57,6 +58,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;

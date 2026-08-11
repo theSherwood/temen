@@ -6,14 +6,14 @@ The analog of `NIM.md` for this workstream; fold completed sections into `DESIGN
 and drop this file once the actionable gaps close (the repo convention, cf. the former
 `WASM.md`).
 
-> Status: **real `std` prints on svm (S0 + S1a/b/c done, 2026-08-11).** A `std` binary built for
+> Status: **`std` I/O + args work on svm (S0 + S1a–d done, 2026-08-11).** A `std` binary built for
 > `x86_64-unknown-svm` via `-Zbuild-std` (`crates/svm-llvm/rust-svm/`), translated through the
-> on-ramp, runs on the powerbox: pure compute returns the right exit code, and **`println!` +
-> `process::exit` are byte-identical to a real native run** (`crates/svm-llvm/tests/std_guest.rs`,
-> two gated tests). Cost: **one on-ramp change** (parsing call operand bundles, §9/S1a) + the build
-> lane + a ~90-line svm PAL (alloc/stdio) and 26 overlay lines. Remaining: `env::args` (a PAL
-> `init` hook), distinct `stderr`, and `fs`/`env`/`time` over `__vm_host_call` (S1d/S2+). Route
-> decision in §1/§4.
+> on-ramp, runs on the powerbox: **`println!`, `process::exit`, and `std::env::args` are
+> byte-identical to a real native run** (`crates/svm-llvm/tests/std_guest.rs`, three gated tests).
+> Cost so far: **one on-ramp change** (parsing call operand bundles, §9/S1a) + the build lane + a
+> ~130-line svm PAL (alloc/stdio/pal/args) and 37 overlay lines — no other svm-llvm change. Next:
+> distinct `stderr` (needs a powerbox stderr handle, S1e) and `fs`/`env`/`time` over `__vm_host_call`
+> (S2+). Route decision in §1/§4.
 
 Section numbers like "§7" refer to `DESIGN.md` unless prefixed with a file; "D54" etc. are its
 Decision Log; "I55" is `ISSUES.md`.
@@ -175,7 +175,8 @@ Everything else `std::{io, fs, env, args, process::exit}` needs is **already an 
 | **S1a** | ✅ **DONE.** On-ramp parser accepts call **operand bundles** (`[ "nonnull"(…) ]` on `llvm.assume`) — `skip_call_trailing` in `ll/parse.rs`, the real first gap (§9). | — | Std IR parses past the panic/assume machinery; unit-tested, no regression. |
 | **S1b** | ✅ **core DONE.** Entry/powerbox for std works **as-is** off a bin's C `main` — no on-ramp change needed: malloc-synth + `Memory` grant + `lang_start` all fire. A pure-compute `std` bin (`Vec` + iterators, computed `ExitCode`) runs on the powerbox byte-identical to native (`tests/std_guest.rs`, gated on the build-std lane). | S1a | Real `std` (lang_start + heap) runs on svm. |
 | **S1c** | ✅ **stdout + exit DONE.** The svm PAL's `sys/stdio/svm.rs` reaches the host via `extern "C" write`/`read` (on-ramp Lane C → powerbox `Stream`, POSIX.md 0/1), and `sys/exit.rs`'s svm arm via `extern "C" exit` (Lane C → `Exit`, op 4). `println!` + `process::exit` are **byte-identical to a real native run** (`tests/std_guest.rs::std_stdout_and_exit_match_native`). Note: chose the powerbox Lane C bindings over `__vm_host_call`+posix-cap for stdio/exit — same host caps, far less wiring, no cap grant under `run_powerbox` (§3-revisited). | S1b; powerbox `write`/`exit` (present) | **First `std` `println!` byte-identical to native** — the `powerbox_diff` analog, one language up. |
-| **S1d** | `env::args`: a PAL `init(argc, argv)` hook capturing the powerbox-threaded argv into a static (the unix pattern; the `unsupported` PAL no-ops `init`). `stderr` as a distinct stream once the powerbox grows a stderr handle or the on-ramp keeps `write`'s `fd`. | powerbox argv (present, `main(argc,argv)`) | `env::args` matches native; `eprintln!` separable from stdout. |
+| **S1d** | ✅ **args DONE.** A minimal svm PAL (`sys/pal/svm.rs`, mirroring `unsupported`) whose `init` calls `sys::args::init`, + an svm `args` module (`sys/args/svm.rs`) storing `(argc,argv)` at init and walking it on demand. `std::env::args` matches native (`tests/std_guest.rs::std_env_args_match_native`). No on-ramp change — the powerbox already threads argv into `main(argc,argv)`. | powerbox argv (present) | `env::args` byte-identical to native. |
+| **S1e** | Distinct `stderr`: the powerbox grants no stderr handle (`grant_powerbox_prefix` → stdout/stdin/exit/memory/addrspace/jit) and the on-ramp's `write` drops the `fd`, so `eprintln!` currently merges into stdout (not lost). Fix: grant a 7th `Stream` (stderr) + a named import (or keep `write`'s fd and route fd 2). Touches the sensitive powerbox grant surface → its own slice. | svm-run grant + on-ramp binding | `eprintln!` lands in `Run.stderr`, separable from stdout. |
 | **S2** | PAL `env` (11/12, setenv decision §6) + `time` (new Clock op) — here the richer surface moves to `__vm_host_call`+a granted posix cap (run via `run_with_caps`, not bare `run_powerbox`). | clock op | `env::var` round-trip + `Instant` monotonicity vs native. |
 | **S3** | PAL `fs`: `File` open/read/write/seek/close, `metadata`, `read_dir`, `remove_file` (ops 5–16) | op audit (§6) | Full-file-I/O program over the memfs, byte-identical vs native on a real dir tree. |
 | **S4** | `HashMap` end-to-end (fixed-seed `RandomState`; optionally the getrandom op) | — | Retires the `NIM.md` §3e `RandomState` blocker; a `HashMap`-heavy program byte-identical to native. |

@@ -126,10 +126,28 @@ fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     Some((run.stdout, exit))
 }
 
-/// Build + run the **native-equivalent oracle**: the same program with the svm-only feature gate
-/// stripped, compiled by the default host `rustc`. Returns `(stdout, exit code)`, or `None` if the
-/// host `rustc` is absent.
-fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+/// Translate + verify + run `src` on the powerbox **with argv** → `(stdout, exit code)`.
+/// `argv[0]` is the program name, as in a native run.
+fn svm_run_std_with_args(name: &str, src: &str, argv: &[&[u8]]) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let run = svm_run::run_powerbox_with_args(&t.module, b"", argv, &[]).expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((run.stdout, exit))
+}
+
+/// Build + run the **native-equivalent oracle** with the given extra args (`argv[0]` is supplied by
+/// the OS, so `extra_args` are `argv[1..]`). Returns `(stdout, exit code)`, or `None` if host `rustc`
+/// is absent.
+fn native_oracle_args(name: &str, src: &str, extra_args: &[&str]) -> Option<(Vec<u8>, u8)> {
     let host_src = src.replace("#![feature(restricted_std)]\n", "");
     let dir = std::env::temp_dir().join(format!("svm_std_native_{name}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
@@ -147,8 +165,13 @@ fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     if !built {
         return None;
     }
-    let out = Command::new(&bin).output().ok()?;
+    let out = Command::new(&bin).args(extra_args).output().ok()?;
     Some((out.stdout, out.status.code().unwrap_or(-1) as u8))
+}
+
+/// The no-args oracle (`argv` = just the program name).
+fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    native_oracle_args(name, src, &[])
 }
 
 /// S1b — a real `std` binary (`lang_start` + heap `Vec` + iterator fold) returning a **computed exit
@@ -222,4 +245,64 @@ fn std_stdout_and_exit_match_native() {
         svm_exit, native_exit,
         "std `process::exit` code matches native"
     );
+}
+
+/// S1d — `std::env::args`: the svm PAL's `init` captures the powerbox-threaded `argv`, and the svm
+/// `args` module walks it. A program echoing its arguments matches a native run with the **same
+/// argv** byte-for-byte (`argv[0]` = program name, then the passed args, including one with spaces).
+#[test]
+fn std_env_args_match_native() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest args (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   let args: Vec<String> = std::env::args().collect();\n\
+         \x20   println!(\"argc = {}\", args.len());\n\
+         \x20   for (i, a) in args.iter().enumerate() {\n\
+         \x20       println!(\"argv[{i}] = {a}\");\n\
+         \x20   }\n\
+         }\n";
+
+    // argv[0] is the program name; the on-ramp/powerbox and the native OS each supply their own, so
+    // use a matching program name and compare the whole vector.
+    let extra = ["alpha", "beta gamma"];
+    let svm_argv: &[&[u8]] = &[b"prog", b"alpha", b"beta gamma"];
+
+    let Some((svm_stdout, _)) = svm_run_std_with_args("svm_std_args", src, svm_argv) else {
+        eprintln!("note: skipping std_guest args (build-std produced no .ll)");
+        return;
+    };
+    // The svm side is fully determined; assert it directly (argv[0] = "prog").
+    let expected = "argc = 3\nargv[0] = prog\nargv[1] = alpha\nargv[2] = beta gamma\n";
+    assert_eq!(
+        String::from_utf8_lossy(&svm_stdout),
+        expected,
+        "std::env::args on svm echoes the powerbox-threaded argv"
+    );
+
+    // Cross-check the shape against a native run (its argv[0] is the binary path, so compare from
+    // argv[1] onward — i.e. everything after the first line's count and the argv[0] line).
+    if let Some((native_stdout, _)) = native_oracle_args("svm_std_args", src, &extra) {
+        let svm_tail: Vec<&str> = std::str::from_utf8(&svm_stdout)
+            .unwrap()
+            .lines()
+            .skip(2) // "argc = 3", "argv[0] = prog"
+            .collect();
+        let native_tail: Vec<&str> = std::str::from_utf8(&native_stdout)
+            .unwrap()
+            .lines()
+            .skip(2) // "argc = 3", "argv[0] = <binary path>"
+            .collect();
+        assert_eq!(
+            svm_tail, native_tail,
+            "argv[1..] on svm matches native (argc and the passed args agree)"
+        );
+        assert!(
+            native_stdout.starts_with(b"argc = 3\n"),
+            "native also sees argc = 3"
+        );
+    }
 }
