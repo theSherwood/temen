@@ -542,10 +542,27 @@ gets `-ECHILD` (the global twin set is non-empty — it holds the child itself u
 so without scoping this would deadlock), and the parent reaps only its own child. Stable 40/40 under
 stress.
 
+**Process groups — `setpgid` + `waitpid(-pgid)`. DONE.** Job control's grouping primitive, built on
+the per-parent table. Each twin's [`Twin`] record now also carries a `pgid` (POSIX process group),
+defaulting to the twin's own id at fork — every child starts its own group leader. `setpgid(pid, pgid)`
+is a **direct self-op** (op 15) the *parent* drives — the caller *is* the parent, so its own
+`domain_id` scopes the change with no serve round-trip (unlike `reap`, which needs the servicer to
+reach the parked caller); it retargets a child's `pgid` (`pgid == 0` → the child's own id), confined to
+real children of the caller (`-ESRCH` otherwise). `reap` grew a group form: `reap_any_parked_caller`
+became `reap_group_parked_caller(…, target: Option<TaskId>)` — `None` for `wait(-1)` (any child),
+`Some(pgid)` for `waitpid(-pgid)` (any child in that group) — and the parked-waiter queue carries the
+target so a finishing child wakes only a waiter of its parent whose group it matches. The `waitpid` pid
+selector now decodes POSIX fully enough for a shell: `-1` any child, `< -1` the group `|pid|`, `> 0` a
+named twin. Exposed to compiled C as `__vm_setpgid(pid, pgid)` (chibicc builtin → op 15) alongside the
+existing `__fork`/`__wait`. Proven in `c_fork.rs`: `setpgid_groups_children_and_waitpid_reaps_the_group`
+(fork A/B, `setpgid` B into A's group, `wait(-a_pid)` reaps both → 30; a failed move would sum 0) and
+`waitpid_by_group_does_not_reap_other_groups` (the dual — `wait(-a_pid)` reaps only A, then `-ECHILD`,
+while B waits in its own group). Both stable 30/30 under stress.
+
 **Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control —
-**process groups** (`waitpid(-pgid, …)` / `setpgid`, building on the per-parent table now in place) and
-`WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
+BSS zero, durable-domain exec, exec from a nested serve context), and `WUNTRACED`/`WCONTINUED` once
+stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place, the
+core process-model surface a shell drives is complete.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 

@@ -4281,6 +4281,16 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
     }
 }
 
+/// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
+/// scoping — only the parent may reap it) and its POSIX **process group** (`pgid`, for
+/// `waitpid(-pgid)` / `setpgid`). `pgid` defaults to the twin's own id at fork (each child starts as
+/// its own group leader) and is reassignable by the parent via the `setpgid` self-op.
+#[derive(Clone, Copy)]
+struct Twin {
+    parent: usize,
+    pgid: TaskId,
+}
+
 #[derive(Default)]
 struct Sched {
     /// vCPUs ready to run.
@@ -4289,24 +4299,23 @@ struct Sched {
     results: BTreeMap<TaskId, Outcome>,
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
-    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to the
-    /// **parent domain** that forked it (`domain_key_of` the forking caller). The only ids `reap`
-    /// (servicer-side `wait()`) will act on, and now *scoped to the parent*: a `wait(pid)` /
-    /// `wait(-1)` only reaps a twin whose recorded parent is the calling domain — so one shell
-    /// cannot reap another's child even though the servicer/offer is shared. Inserted when a twin is
-    /// forked, removed when it is reaped; a `pid` not present (or present under a different parent)
-    /// is `-ECHILD`. Confinement is capability-shaped *and* parent-shaped: a domain holding the
-    /// fork/wait offer can drive `reap`, but only over its own real twins.
-    forked_twins: BTreeMap<TaskId, usize>,
-    /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` (`waitpid(-1)`: reap **any**
-    /// child). Unlike `join_waiters` these are not keyed by a specific twin — any [`forked_twins`]
-    /// member finishing wakes one, FIFO. A twin finishing prefers a `join_waiters` waiter (a
-    /// specific `wait(pid)`) first; only an unclaimed twin falls through to this queue. Confinement
-    /// is the same as `reap`: a `wait(-1)` only ever fires over a twin in `forked_twins`, so it
-    /// cannot reap a foreign task — it can, in a multi-parent topology, reap another servicer's
-    /// twin (there is no per-parent child table yet — the same coarseness `reap` already has;
-    /// per-parent tracking is the process-group follow-up).
-    reap_any_waiters: VecDeque<Box<VCpu>>,
+    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to its [`Twin`]
+    /// record (forking parent domain + POSIX process group). The only ids `reap` (servicer-side
+    /// `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)` / `wait(-pgid)` only
+    /// reaps a twin whose recorded parent is the calling domain — so one shell cannot reap another's
+    /// child even though the servicer/offer is shared. Inserted when a twin is forked, removed when
+    /// it is reaped; a `pid` not present (or present under a different parent) is `-ECHILD`.
+    /// Confinement is capability-shaped *and* parent-shaped: a domain holding the fork/wait offer can
+    /// drive `reap`, but only over its own real twins.
+    forked_twins: BTreeMap<TaskId, Twin>,
+    /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
+    /// matching child), each tagged with its target: `None` = any of the caller's children,
+    /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
+    /// specific twin — a finishing child wakes the oldest parked waiter **of that child's parent whose
+    /// target it matches** ([`wake_reap_any`], FIFO). A twin finishing prefers a `join_waiters` waiter
+    /// (a specific `wait(pid)`) first; only an unclaimed twin falls through to this queue. Parent- and
+    /// group-scoped, so a `wait` never reaps another domain's — or another group's — child.
+    reap_any_waiters: VecDeque<(Option<TaskId>, Box<VCpu>)>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
@@ -4765,8 +4774,15 @@ impl Scheduler {
         twin.pending = Some(Pending::CapResult(reply_twin));
         // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
         // deliver its exit status to the parent; removed when reaped (or swept at teardown). The
-        // recorded parent scopes the reap — only `parent_key` may `wait` on this twin.
-        s.forked_twins.insert(twin_id, parent_key);
+        // recorded parent scopes the reap — only `parent_key` may `wait` on this twin — and `pgid`
+        // starts as the twin's own id (its own group leader) until the parent `setpgid`s it.
+        s.forked_twins.insert(
+            twin_id,
+            Twin {
+                parent: parent_key,
+                pgid: twin_id,
+            },
+        );
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
         // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
@@ -4801,7 +4817,7 @@ impl Scheduler {
         nohang: bool,
     ) -> ReapOutcome {
         let mut s = self.lock();
-        let Some(&parent) = s.forked_twins.get(&pid) else {
+        let Some(parent) = s.forked_twins.get(&pid).map(|t| t.parent) else {
             return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
         };
         // Per-parent scope: the twin exists, but only its **own parent** may reap it. Peek the parked
@@ -4848,28 +4864,37 @@ impl Scheduler {
         }
     }
 
-    /// FORK.md §8.6 — the servicer side of `wait(-1)` / `waitpid(-1)`: reap **any** child, not a
-    /// named one. Mirrors [`Self::reap_parked_caller`] but ranges over the calling parent's twins:
+    /// FORK.md §8.6 — the servicer side of `wait(-1)` (any child) and `waitpid(-pgid)` (any child in
+    /// process group `pgid`). `target` is `None` for `wait(-1)` — any of the caller's children — or
+    /// `Some(pgid)` to restrict to that process group. Mirrors [`Self::reap_parked_caller`] but ranges
+    /// over the calling parent's twins matching `target`:
     ///   * no twins anywhere → [`ReapOutcome::NoChild`] (`-ECHILD`, caller-independent fast path).
     ///   * twins exist but the caller has not parked yet (serve/park race) → [`ReapOutcome::Retry`].
-    ///   * the caller has no children of its own (only other parents' twins exist) → `NoChild`.
-    ///   * **some** child of this parent has already finished → reap it now, reply its status.
+    ///   * the caller has no matching children (no own children, or none in `pgid`) → `NoChild`.
+    ///   * **some** matching child has already finished → reap it now, reply its status.
     ///   * `nohang` and none finished → reply `0` at once (POSIX: nothing changed state).
-    ///   * otherwise park the caller in `reap_any_waiters`; the next of *its* twins to finish wakes
-    ///     it (via [`Pending::ReapPid`], the same resume path a named `wait` uses).
-    fn reap_any_parked_caller(&self, callee_id: usize, ticket: u64, nohang: bool) -> ReapOutcome {
+    ///   * otherwise park the caller in `reap_any_waiters` tagged with `target`; the next matching
+    ///     child to finish wakes it (via [`Pending::ReapPid`], the same resume path a named wait uses).
+    fn reap_group_parked_caller(
+        &self,
+        callee_id: usize,
+        ticket: u64,
+        nohang: bool,
+        target: Option<TaskId>,
+    ) -> ReapOutcome {
         let mut s = self.lock();
         if s.forked_twins.is_empty() {
             return ReapOutcome::NoChild; // no children of any parent — a genuine -ECHILD.
         }
         // Scope to the calling parent: peek the caller's domain (twins exist, so a not-yet-parked
-        // caller is the serve/park race → retry). Then require this parent to own ≥1 live twin.
+        // caller is the serve/park race → retry). Then require ≥1 live twin matching `target`.
         let parent = match s.ticket_waiters.get(&(callee_id, ticket)) {
             Some(Waiter::VCpu(v)) => domain_key_of(v),
             _ => return ReapOutcome::Retry,
         };
-        if !s.forked_twins.values().any(|&p| p == parent) {
-            return ReapOutcome::NoChild; // twins exist, but none are this parent's — `-ECHILD`.
+        let matches = |t: &Twin| t.parent == parent && target.is_none_or(|g| t.pgid == g);
+        if !s.forked_twins.values().any(matches) {
+            return ReapOutcome::NoChild; // no matching child — `-ECHILD`.
         }
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(v)) => v,
@@ -4879,11 +4904,11 @@ impl Scheduler {
             }
             None => return ReapOutcome::Retry,
         };
-        // Any already-finished child *of this parent*? (Deterministic: smallest id first.)
+        // Any already-finished matching child? (Deterministic: smallest id first.)
         let finished = s
             .forked_twins
             .iter()
-            .find(|(t, &p)| p == parent && s.results.contains_key(t))
+            .find(|(t, tw)| matches(tw) && s.results.contains_key(t))
             .map(|(t, _)| *t);
         if let Some(pid) = finished {
             s.forked_twins.remove(&pid);
@@ -4901,10 +4926,27 @@ impl Scheduler {
             self.work.notify_one();
             ReapOutcome::Replied(0)
         } else {
-            // Park for *any* child: the next `forked_twins` member to finish re-admits us with
+            // Park for a matching child: the next matching twin to finish re-admits us with
             // `Pending::ReapPid` (set at wake, in the completion path), reusing the named-wait resume.
-            s.reap_any_waiters.push_back(v);
+            s.reap_any_waiters.push_back((target, v));
             ReapOutcome::Replied(0)
+        }
+    }
+
+    /// FORK.md §8.6 — POSIX `setpgid(pid, pgid)`, driven by the **parent** as a direct self-op (no
+    /// serve round-trip: the caller *is* the parent, so its own `domain_id` scopes the change). Sets
+    /// child `pid`'s process group to `pgid` (or, for `pgid == 0`, makes `pid` its own group leader).
+    /// Parent-scoped and confined to real children: `pid` must be a live twin this `parent` forked,
+    /// else `-ESRCH`. Returns `0` on success. (`pid == 0` — "the caller" — is unsupported here: the
+    /// forking domain is not itself a twin, so it has no `pgid` slot to set.)
+    fn set_child_pgid(&self, parent: usize, pid: TaskId, pgid: TaskId) -> i64 {
+        let mut s = self.lock();
+        match s.forked_twins.get_mut(&pid) {
+            Some(t) if t.parent == parent => {
+                t.pgid = if pgid == 0 { pid } else { pgid };
+                0
+            }
+            _ => ESRCH, // not a live child of this domain
         }
     }
 }
@@ -4936,24 +4978,24 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
 }
 
 /// FORK.md §8.6 — a `forked_twins` member `id` just finished and no named `wait(pid)` claimed it:
-/// if a `wait(-1)` caller **of this twin's parent** is parked in `reap_any_waiters`, wake it (the
-/// oldest such, FIFO) to reap this twin via [`Pending::ReapPid`]. Returns whether a waiter was woken.
-/// Parent-scoped: a `wait(-1)` only ever reaps its own children, so a finishing twin skips waiters
-/// belonging to other parents. The twin is left in `forked_twins` / `results` — the woken caller's
-/// `reap_twin` retires it, exactly as a named `wait` does. Called at each completion site *before*
-/// the outcome lands in `results` (the woken caller only runs after the lock releases, by which point
-/// the result is present — the same ordering the named path uses).
+/// if a `wait(-1)` / `waitpid(-pgid)` caller **of this twin's parent whose target matches** is parked
+/// in `reap_any_waiters`, wake it (the oldest such, FIFO) to reap this twin via [`Pending::ReapPid`].
+/// Returns whether a waiter was woken. Parent- and group-scoped: a `wait` only reaps its own children,
+/// and a `waitpid(-pgid)` only its group's, so a finishing twin skips waiters of other parents or
+/// other groups. The twin is left in `forked_twins` / `results` — the woken caller's `reap_twin`
+/// retires it, exactly as a named `wait` does. Called at each completion site *before* the outcome
+/// lands in `results` (the woken caller only runs after the lock releases, by which point the result
+/// is present — the same ordering the named path uses).
 fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
-    let Some(&parent) = s.forked_twins.get(&id) else {
+    let Some(twin) = s.forked_twins.get(&id).copied() else {
         return false;
     };
-    // The oldest parked `wait(-1)` caller whose domain is this twin's parent.
-    let pos = s
-        .reap_any_waiters
-        .iter()
-        .position(|w| domain_key_of(w) == parent);
+    // The oldest parked waiter of this twin's parent whose target (any-child / a pgid) matches it.
+    let pos = s.reap_any_waiters.iter().position(|(target, w)| {
+        domain_key_of(w) == twin.parent && target.is_none_or(|g| g == twin.pgid)
+    });
     if let Some(pos) = pos {
-        let mut waiter = s.reap_any_waiters.remove(pos).expect("position just found");
+        let (_, mut waiter) = s.reap_any_waiters.remove(pos).expect("position just found");
         waiter.pending = Some(Pending::ReapPid { pid: id });
         s.runnable.push_back(waiter);
         true
@@ -5142,13 +5184,13 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             s.join_waiters.insert(k, v);
         }
     }
-    // Parked `wait(-1)` callers of the dying domain are reaped; others stay parked (FIFO order).
+    // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
     let raw = std::mem::take(&mut s.reap_any_waiters);
-    for v in raw {
+    for (target, v) in raw {
         if domain_key_of(&v) == key {
             victims.push(v);
         } else {
-            s.reap_any_waiters.push_back(v);
+            s.reap_any_waiters.push_back((target, v));
         }
     }
     for q in s.wait_waiters.values_mut() {
@@ -5280,7 +5322,12 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
-    victims.extend(std::mem::take(&mut s.reap_any_waiters)); // parked `wait(-1)` callers
+    // parked `wait(-1)`/`waitpid(-pgid)` callers (drop the target tag, keep the vCPU)
+    victims.extend(
+        std::mem::take(&mut s.reap_any_waiters)
+            .into_iter()
+            .map(|(_, v)| v),
+    );
     for (_, q) in std::mem::take(&mut s.wait_waiters) {
         for (_, w) in q {
             if let Waiter::VCpu(v) = w {
@@ -10828,12 +10875,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let callee_id =
                                     host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
                                         as usize;
-                                // `pid == -1` is POSIX `waitpid(-1)` — reap **any** child; any other
-                                // value names a specific twin (`pid > 0`; a bogus/unsupported pid,
-                                // incl. process-group forms `pid < -1` / `0`, casts to no live twin →
-                                // `-ECHILD`, the untracked-group follow-up).
+                                // POSIX `waitpid` pid selector: `-1` = any child (`target None`);
+                                // `< -1` = any child in process group `|pid|` (`target Some(pgid)`);
+                                // `> 0` = a specific twin. `pid == 0` (the caller's own group) is
+                                // unsupported — the forking domain is not itself a twin — and falls
+                                // to the named path, where it matches no live twin → `-ECHILD`.
                                 let outcome = if pid == -1 {
-                                    sr_sched.reap_any_parked_caller(callee_id, ticket, nohang)
+                                    sr_sched
+                                        .reap_group_parked_caller(callee_id, ticket, nohang, None)
+                                } else if pid < -1 {
+                                    let pgid = (-pid) as TaskId;
+                                    sr_sched.reap_group_parked_caller(
+                                        callee_id,
+                                        ticket,
+                                        nohang,
+                                        Some(pgid),
+                                    )
                                 } else {
                                     sr_sched.reap_parked_caller(
                                         callee_id,
@@ -10861,6 +10918,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         _ => EINVAL,
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
+                // FORK.md §8.6 — `setpgid(pid, pgid)` (self-namespace op 15): POSIX process-group
+                // assignment, driven by the **parent directly** (not through the fork/wait offer):
+                // the calling vCPU *is* the parent, so its own `domain_id` scopes the change with no
+                // serve round-trip. Sets child `pid`'s process group to `pgid` (`pgid == 0` → `pid`,
+                // a new group led by the child). Confined to real children of this domain (`-ESRCH`
+                // otherwise). `Real` scheduler only — twins exist only there; other tiers `-EINVAL`.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_SETPGID,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let pid = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let pgid = match args.get(1) {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let r = if let SchedRef::Real(sr_sched) = sched {
+                        let parent =
+                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                        sr_sched.set_child_pgid(parent, pid as TaskId, pgid as TaskId)
+                    } else {
+                        EINVAL
                     };
                     if !sig.results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
@@ -14186,6 +14275,7 @@ const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
 const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this servicer minted
+const ESRCH: i64 = -3; // `setpgid` for a pid that is not a live child of the calling domain
 const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
@@ -15251,6 +15341,14 @@ pub const CAP_SELF_REAP: u32 = 12;
 /// on a forged module, a non-regrantable grant, a window-size mismatch, or a durable domain (the
 /// freeze/thaw image-swap is the separate capstone). Pinned at 14 (13 is `fuel.remaining`).
 pub const CAP_SELF_EXEC: u32 = 14;
+
+/// FORK.md §8.6 — the reserved self-namespace op for POSIX `setpgid(pid, pgid)`: assign a forked
+/// child's **process group** (for `waitpid(-pgid)` job control). Driven by the parent directly (the
+/// caller is the parent, so its `domain_id` scopes the change — no serve round-trip like `reap`).
+/// `pgid == 0` makes `pid` its own group leader. Confined to real children of the calling domain
+/// (`-ESRCH` otherwise); `Real` scheduler only (twins live only there), `-EINVAL` on other tiers.
+/// Pinned at 15 (12 `reap`, 13 `fuel.remaining`, 14 `exec_module`).
+pub const CAP_SELF_SETPGID: u32 = 15;
 
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
@@ -19271,6 +19369,7 @@ impl Host {
                 | CAP_SELF_CLONE_CALLER
                 | CAP_SELF_REAP
                 | CAP_SELF_EXEC
+                | CAP_SELF_SETPGID
                     if op >> 8 == 0 =>
                 {
                     Ok(vec![EINVAL])

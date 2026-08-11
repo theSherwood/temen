@@ -562,6 +562,143 @@ fn wait_only_reaps_a_domains_own_children() {
     );
 }
 
+/// FORK.md §8.6 — **process groups**: `setpgid` + `waitpid(-pgid)`, the job-control primitive a shell
+/// uses to reap a whole pipeline as one group. Each forked child starts as its own group leader
+/// (`pgid == pid`); `__vm_setpgid(pid, pgid)` (the self-op the parent drives directly) reassigns it.
+///
+/// The guest forks two children (A exits `10`, B exits `20`), then `setpgid`s B **into A's group**
+/// (`pgid = a_pid`). It then reaps that group twice with `wait(-a_pid)` (`__wait(0, -a_pid)` →
+/// `waitpid(-pgid)`), retrying only on `-EAGAIN` (`-11`) so a stray `-ECHILD` would corrupt the sum
+/// rather than spin. Both A and B are now in group `a_pid`, so the two reaps sum to `30`. Had
+/// `setpgid` not moved B, the second `wait(-a_pid)` would return `-ECHILD` (B still in its own group)
+/// and the sum would be `10 + (-10) = 0` — so `r == 30` proves B really joined A's group.
+const PGID_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_setpgid(long pid, long pgid);
+long fork(void) { return __fork(0, 0); }
+long wait_group(long pgid) { return __wait(0, -pgid); }
+static long a_pid, b_pid, s, total, n;
+int main(int argc, char **argv) {
+  while ((a_pid = fork()) < 0);
+  if (a_pid == 0) return 10;
+  while ((b_pid = fork()) < 0);
+  if (b_pid == 0) return 20;
+  __vm_setpgid(b_pid, a_pid);
+  total = 0;
+  n = 0;
+  while (n < 2) {
+    do { s = wait_group(a_pid); } while (s == -11);
+    total = total + s;
+    n = n + 1;
+  }
+  return total;
+}
+"#;
+
+#[test]
+fn setpgid_groups_children_and_waitpid_reaps_the_group() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(PGID_GUEST_SRC)).expect("parse pgid guest");
+    verify_module(&guest).expect("verify pgid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // Both children were reaped through wait(-a_pid): B joined A's group via setpgid, so the group
+    // held both and the two reaps summed to 30 (10 + 20). A failed setpgid would have summed to 0.
+    assert_eq!(
+        r,
+        vec![Value::I64(30)],
+        "setpgid moved B into A's group; waitpid(-a_pid) reaped both (10 + 20 = 30)"
+    );
+}
+
+/// FORK.md §8.6 — **`waitpid(-pgid)` is group-scoped**: it never reaps a child in a *different* group.
+/// The dual of the grouping test. The guest forks A (`10`) and B (`20`) and leaves them in their
+/// **default** groups (each its own leader: `pgid == pid`). `wait(-a_pid)` reaps only A; a second
+/// `wait(-a_pid)` then returns `-ECHILD` (`-10`) because group `a_pid` is now empty — B is in group
+/// `b_pid`, *not* reaped by A's group. B is finally reaped by `wait(-b_pid)`. The guest checks the
+/// exact triple (`10`, `-10`, `20`) and returns `99` only if all hold — so a group over-reap (B
+/// wrongly reaped by `wait(-a_pid)`) would not yield `99`.
+const PGID_SCOPE_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_group(long pgid) { return __wait(0, -pgid); }
+static long a_pid, b_pid, s1, s2, s3;
+int main(int argc, char **argv) {
+  while ((a_pid = fork()) < 0);
+  if (a_pid == 0) return 10;
+  while ((b_pid = fork()) < 0);
+  if (b_pid == 0) return 20;
+  do { s1 = wait_group(a_pid); } while (s1 == -11);
+  s2 = wait_group(a_pid);
+  while (s2 == -11) s2 = wait_group(a_pid);
+  do { s3 = wait_group(b_pid); } while (s3 == -11);
+  if (s1 == 10 && s2 == -10 && s3 == 20) return 99;
+  return 1;
+}
+"#;
+
+#[test]
+fn waitpid_by_group_does_not_reap_other_groups() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(PGID_SCOPE_GUEST_SRC)).expect("parse pgid-scope guest");
+    verify_module(&guest).expect("verify pgid-scope guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // wait(-a_pid) reaped only A (10); group a_pid was then empty (-ECHILD, B is in group b_pid);
+    // B was reaped by wait(-b_pid) (20). The guest saw the exact triple → 99. A cross-group reap fails.
+    assert_eq!(
+        r,
+        vec![Value::I64(99)],
+        "waitpid(-a_pid) reaped only A's group, never B (which was in b_pid's group)"
+    );
+}
+
 /// Isolation (no fork/wait): a **nested op-13-spawned** compiled-C guest resolves a re-granted command
 /// module `"cmd"` by name and `execve`s into it — testing the module-regrant + `__vm_resolve` +
 /// `__vm_exec_module` builtins + nested-child image-replace, without the fork/wait topology.
