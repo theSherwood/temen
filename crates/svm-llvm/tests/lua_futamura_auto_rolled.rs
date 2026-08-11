@@ -38,12 +38,18 @@ fn jit(m: &Module, e: u32, a: &[i64]) -> i64 {
 /// The real Lua answer for a `return <int>` chunk, via the reference interpreter (rewrite the trailing
 /// `return X` to `print(X)` and parse stdout). Used as the ground-truth oracle for the coverage test.
 fn real_lua(m: &Module, script: &str) -> i64 {
-    let mut prog = script.replacen("return ", "print(", 1).trim_end().to_string();
+    let mut prog = script
+        .replacen("return ", "print(", 1)
+        .trim_end()
+        .to_string();
     prog.push_str(")\n");
     let out = svm_run::run_powerbox(m, prog.as_bytes())
         .expect("interp run")
         .stdout;
-    String::from_utf8_lossy(&out).trim().parse().expect("int stdout")
+    String::from_utf8_lossy(&out)
+        .trim()
+        .parse()
+        .expect("int stdout")
 }
 
 #[test]
@@ -215,7 +221,11 @@ fn auto_rolled_covers_conditionals_nesting_and_break() {
         let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, n);
         svm_verify::verify_module(&wm).expect("wrapped residual verifies");
         assert_eq!(jit(&wm, we, &r.captured), want, "{name}: jit == real Lua");
-        assert_eq!(tw(&wm, we, &r.captured), want, "{name}: tree-walk == real Lua");
+        assert_eq!(
+            tw(&wm, we, &r.captured),
+            want,
+            "{name}: tree-walk == real Lua"
+        );
         println!("{name}: folds + verifies + correct (= {want})");
     }
 }
