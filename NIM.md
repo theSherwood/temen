@@ -687,8 +687,13 @@ plumbing. Five workstreams, roughly independent:
   spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
   means either driving those phases in-process or giving svm a subprocess/exec personality. This
   is an architecture question, not a translation one, and it's the biggest unknown.
-- **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
-  the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
+- **W5 — Bootstrap + browser** (scoped in detail in §3e). Compile the Rust `svm-leng` to run as an
+  svm guest, and run the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground
+  demo. **Key finding (§3e): the endpoints are all mature (a Rust→svm primitive already works via the
+  `svm-llvm` on-ramp; a byte-exact C self-host template; a mature playground; `svm-leng`'s 3-crate
+  wasm-clean dep graph), and the greenfield middle — the first Rust crate run as an svm guest — is
+  bring-out, not open architecture.** Recommended path: LLVM on-ramp for first light, the wasm on-ramp
+  (the stated goal) after.
 
 **Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
 end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
@@ -973,6 +978,89 @@ compiler is single-threaded — and both tiers are implemented and tested: Tier 
 (`tls_mode`, single- and cross-module) is ready for when a threaded Nim guest appears, needing only the
 additive follow-ups
 above.
+
+## 3e. W5 scope — bootstrap + browser (self-hosting the toolchain on svm)
+
+W5 asks (§3a): compile the Rust `svm-leng` to run **as a guest on svm**, and close the self-hosting
+loop — nimony-on-svm (W4) emits Leng, `svm-leng`-on-svm translates it to SVM-IR, which runs on svm —
+first headless, then as a browser playground card. Unlike W4 (whose "unknown" turned out already-built
+on both sides), W5 has a genuinely **greenfield middle**: **nothing has ever compiled a Rust crate to a
+module that runs on svm's own engines.** But it is bracketed by mature endpoints, so the invention is
+narrow and the risk is bounded.
+
+**The template — C self-host, byte-exact, already in the browser.** chibicc (a C compiler) compiled to
+an svm module compiles *its own source* to valid SVM-IR entirely in-sandbox, byte-for-byte vs native
+(`browser/tests/chibicc_selfhost.rs`, `browser/tests/chibicc_selfhost_asset.rs`, driven through the
+cdylib entry `svm_selfhost_emit_object_fs`; the self-host card seeds the libc headers into an in-window
+memfs). W5 is that exact shape with **`svm-leng` (Rust) in place of chibicc (C)**. Everything the C card
+needs — playground scaffold (`browser/web/play.html`), memfs mount, `.svmb` asset lane — is built and
+reusable.
+
+**The one thing that doesn't exist: a Rust crate running as an svm guest.** Every `svm-wasm` transpile
+fixture is clang-produced C (`crates/svm-wasm/tests/fixtures/*_clang.wasm`); no rustc-emitted wasm has
+ever been fed to `svm_wasm::transpile` and run on svm. So the roadmap's stated chain — *"Rust → wasm →
+the svm-wasm on-ramp → svm-ir"* (§3a) — is unexercised for Rust. **But measuring the seam surfaced a
+lower-risk path the roadmap didn't assume.**
+
+**Two candidate Rust→svm-ir frontends, measured. Both converge on one svm-ir `Module` that runs
+identically (interp/JIT, and in the browser), so the choice is purely the *frontend*:**
+- **Path L — LLVM (already proven for Rust).** `rustc --emit=llvm-ir` → the `svm-llvm` reader
+  (`svm_llvm::translate_ll_path`) → svm. This is a *working lane today*: `bench/src/bin/rustbench.rs`
+  runs Rust on svm exactly this way (`rustbench.rs:14`, `146-173`). The Rust→svm primitive already
+  exists — just via LLVM, not wasm. Its risk is *scale*: rustbench compiles tiny `no_std` benchmarks,
+  not a multi-crate `std` translator. (rustbench's *wasm* lane, by contrast, runs on Wasmtime, not svm —
+  `rustbench.rs:18` — so it is no evidence for Path W.)
+- **Path W — wasm (the stated goal, greenfield for Rust).** `rustc --target wasm32-unknown-unknown` →
+  `svm_wasm::transpile` → svm. The on-ramp is mature and broad — bulk-memory, multi-value,
+  reference-types, `call_indirect`, SIMD (`crates/svm-wasm/src/lib.rs:14-47`) — with only narrow
+  fail-closed gaps (`table.grow`/`table.copy`/`table.init`, passive *element* segments, multi-memory —
+  `lib.rs:44-46`) and a 16 MiB default ceiling on *unbounded* memory (`DEFAULT_MAX_GROW_PAGES = 256`,
+  `lib.rs:113-117`; declare a `maximum` or watch the heap). It has simply never eaten rustc output.
+
+**Recommendation: Path L for first light, Path W as the stated end-goal — they share everything
+downstream.** Because once `svm-leng` is an svm-ir `Module` it runs the same and the browser plays
+`.svmb` either way, start with the path whose Rust→svm primitive already works (L), then bring up W (the
+roadmap's target, and the natural fit since the browser is wasm-native). Same "two seams, pick by the
+pragmatic constraint" call as W4's `exec`-over-`link`.
+
+**Why the endpoints make this bounded, not open.** `svm-leng`'s entire runtime dependency graph is
+**`svm-ir` + `svm-text` + `svm-encode`** (`crates/svm-leng/Cargo.toml`) — the three pure escape-TCB
+crates already proven to compile to wasm inside the browser cdylib (root `Cargo.toml`; `browser/Cargo.toml`
+dep set). Its dev-deps (`svm-verify`/`interp`/`jit`) don't enter the artifact. And `svm-leng` is **pure
+computation** — text in, `Module` out; no `std::fs`/`std::io`/`File` anywhere (`crates/svm-leng/src`).
+So the surface a guest build must satisfy is tiny.
+
+**Bounded gaps/decisions (all additive; none an architecture question):**
+- **Allocator.** `svm-leng` declares no `#[global_allocator]`; a guest build needs one (a bump
+  allocator, the rustbench model — `rustbench.rs`). Additive.
+- **`std` posture + `HashMap` hasher.** `svm-leng` is a `std` crate using `HashMap`/`RefCell`
+  (`translate.rs`); `std`'s default `HashMap` pulls `getrandom` for `RandomState`, unavailable on a
+  bare guest. Fix: a fixed-seed `BuildHasher` (or a light `no_std + alloc` rework). Small, mechanical.
+- **WASI is too thin for a `std`-`wasi` build.** `svm-wasi` provides only `fd_write` + `proc_exit` and
+  fails closed on the rest (`crates/svm-wasi/src/lib.rs:1-15,43-53`), so `wasm32-wasi` is out — which is
+  *why* Path W targets `wasm32-unknown-unknown` (and it's moot for Path L). Since `svm-leng` does no
+  I/O, this is a non-issue once the allocator is supplied.
+- **CI drift.** A guest build lives in a detached workspace (like `browser/`, `bench/`), which the
+  per-PR gate doesn't build (I55, `ISSUES.md`). A W5 asset needs an asset-lane check like `chibicc.svmb`'s.
+
+**Slices (each a checkpoint, smallest first):**
+1. **First light (Path L).** Compile one pure `svm-leng` path — e.g. `translate` on a trivial one-proc
+   module — through `rustc --emit=llvm-ir` → `svm-llvm` → svm, output matching native `svm-leng`.
+   Retires "a Rust `svm-leng` fragment runs on svm."
+2. **Whole `translate`, byte-identical.** The full translator as one svm-ir module (an `svm-leng.svmb`
+   asset), run on svm over a real hexer Leng file, byte-for-byte vs native `svm-leng` — the §18
+   differential, the `chibicc_selfhost_asset` analog.
+3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
+   self-hosting payoff, no browser.
+4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
+   playground over an in-window memfs.
+5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
+   `svm_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
+
+**Status: W5 is the one workstream with real greenfield** — the first Rust-crate-as-svm-guest — but it
+is bracketed by proven endpoints (a working Rust→svm primitive via LLVM, a byte-exact C self-host
+template, a mature playground, and a 3-crate wasm-clean dep graph), so it is **bring-up, not open
+architecture**.
 
 ## 4. Invariants this must respect
 
