@@ -118,10 +118,14 @@ entry unemitted and the pure helper + fiber body tiered up; and the interp-drive
 instantiated under the full eight-import nested linker and its emitted `f1` runs at interpreter parity
 (pinning the `nested_caps` import layout + emitted-function base offset).
 
-**Deferred (not this PR):** rewiring the browser's hand-rolled fallback (`browser/src/lib.rs`
-`1092–1116`) to call `compile_nested`. It's a clean consolidation but changes that path's emitted
-import layout to the nested set (the host must then always provide `env.instantiate`/`join`/`thread_*`
-even for a plain tier-up), so it wants its own change with the Worker-side import wiring.
+**Done (follow-up):** the browser's `svm_par_enable_inst_codegen` now calls `compile_nested`
+directly, retiring its hand-rolled nested→threaded fallback. No Worker change was needed: worker.js
+already offers the whole nested import set for every unit-wasm instantiation (a smaller module simply
+ignores the extra keys), and it only ever calls `f{entry}` when `svm_par_inst_eligible(entry)` — for
+which `compile_nested`'s `emitted` bitmap is a sound signal in both drive modes (a fiber reachable
+from the entry drops it from `emitted`; a `thread.spawn`ed fiber runs in its own spawned interpreter
+vCPU, never across the emitted frame). Net gain: a `thread.spawn`/`instantiate` entry in a unit that
+also contains a fiber now emits, where it previously fell back to whole-unit interpretation.
 
 ---
 
