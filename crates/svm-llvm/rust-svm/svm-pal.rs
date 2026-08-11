@@ -121,6 +121,25 @@ pub(crate) mod host {
         unsafe { __vm_host_call(posix(), 8, path as i64, plen, 0, 0) }
     }
 
+    /// `mkdir(path, plen, mode) -> 0 | -errno` (svm-posix `OP_MKDIR` = 37). Creates an explicit empty
+    /// directory; `mode` is advisory (the memfs has no perm model).
+    #[inline(always)]
+    pub(crate) fn mkdir(path: *const u8, plen: i64, mode: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 37, path as i64, plen, mode, 0) }
+    }
+
+    /// `rename(old, olen, new, nlen) -> 0 | -errno` (svm-posix `OP_RENAME` = 38).
+    #[inline(always)]
+    pub(crate) fn rename(old: *const u8, olen: i64, new: *const u8, nlen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 38, old as i64, olen, new as i64, nlen) }
+    }
+
+    /// `rmdir(path, plen) -> 0 | -errno` (svm-posix `OP_RMDIR` = 39). Removes an empty directory.
+    #[inline(always)]
+    pub(crate) fn rmdir(path: *const u8, plen: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 39, path as i64, plen, 0, 0) }
+    }
+
     /// `read(fd, buf, len) -> n | -errno` (svm-posix `OP_READ` = 1). Distinct from the stdio PAL's
     /// `extern "C" read` (the powerbox stdin stream) — this drives a `posix`-personality file fd.
     #[inline(always)]
