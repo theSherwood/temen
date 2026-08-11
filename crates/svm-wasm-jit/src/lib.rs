@@ -1064,6 +1064,51 @@ fn module_atomics_ok(m: &Module) -> bool {
     !m.funcs.iter().any(|f| f.uses_concurrency())
 }
 
+/// Whether `f` invokes a **window-remapping** capability op — one that mutates which bytes back a
+/// window page, or its read/write protection, *during the run*. Two ifaces do this:
+/// - **ADDRESS_SPACE** (iface 5): `map` (0), `unmap` (1), `protect` (2). `page_size` (3) / `sub` (4)
+///   are a pure query / attenuation-mint and do **not** count (the emittable [`is_nested_leaf_cap`] set).
+/// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages, `unmap` (1) drops
+///   it. `len` (2) / `page_size` (3) are pure queries and do **not** count.
+///
+/// All of these desync the mask-only tier from the interpreter (a mapped alias reads different bytes;
+/// an unmapped / RO page should trap), so their presence forbids emitting — see [`module_uses_page_ops`].
+fn func_uses_page_ops(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::CapCall {
+                    type_id: 5,
+                    op: 0..=2,
+                    ..
+                } | Inst::CapCall {
+                    type_id: 4,
+                    op: 0..=1,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// **The Track 3 (c)+(a) gate** (`NESTED_JIT.md`): does any function reach a window-remapping op
+/// ([`func_uses_page_ops`] — `map`/`unmap`/`protect` or a `SharedRegion` `map`/`unmap`)? The wasm
+/// tier's confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and
+/// cannot honor per-page state the guest changed, so an emitted load would sail through a page the
+/// interpreter (which enforces `Mem`'s page-protection + backing map) would trap on or back with
+/// different bytes. That divergence is possible for **any** emitted memory access once such an op is
+/// reachable — not just the op's own function — so a module that uses one must run **wholly on the
+/// interpreter** (emit nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for
+/// the un-rooted tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
+///
+/// Not covered (deliberately, deferred with the broader D40/§13 question): a guest `grow` only
+/// *commits* within the fixed reservation the mask already allows, so it introduces no
+/// was-accessible-now-different transition an emitted access would get wrong.
+fn module_uses_page_ops(m: &Module) -> bool {
+    m.funcs.iter().any(func_uses_page_ops)
+}
+
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).
 fn func_callees(f: &Func) -> Vec<u32> {
@@ -1316,6 +1361,15 @@ pub fn compile_module_nested_with_eligibility(
     shared_memory: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
+    // Track 3 (c)+(a): a window-remapping op (`map`/`unmap`/`protect`, `SharedRegion` map/unmap)
+    // anywhere in the module makes *every* emitted mask-only access unsound (see
+    // [`module_uses_page_ops`]). Fail closed so a direct caller (the browser's per-instance nested
+    // codegen) falls back to its interpreter path — [`compile_nested`] gates this up front instead.
+    if module_uses_page_ops(m) {
+        return Err(Error::Unsupported(
+            "window-remapping op in a nested unit (needs the interpreter tier)",
+        ));
+    }
     // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
     // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers) reached
     // via `env.call_interp` — whose host callback must therefore carry the run's powerbox (the
@@ -1394,7 +1448,14 @@ pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>,
 /// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `cap.call`s
 /// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
 /// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
+///
+/// A unit that manages its own pages (`map`/`unmap`/`protect`) emits **nothing** and runs wholly on
+/// the interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
+/// [`module_uses_page_ops`]). `page_size`/`sub` (queries/attenuation) are unaffected.
 pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
+    if module_uses_page_ops(m) {
+        return compile_interp_only(m, shared_memory, true);
+    }
     if !reachable_fibers(m, 0) {
         if let Ok((wasm, emitted)) = compile_module_nested_with_eligibility(m, shared_memory) {
             return Ok(Artifact {
@@ -1909,6 +1970,37 @@ fn reachable_fibers(m: &Module, entry: u32) -> bool {
     (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_fibers())
 }
 
+/// Emit **nothing** — a valid wasm module of imports only, with an all-`false` `emitted` bitmap and
+/// [`DriveMode::InterpDriven`]. The whole guest runs on the bytecode interpreter (the oracle), which
+/// alone enforces per-page protection. This is the Track 3 (c)+(a) landing for a page-op module (see
+/// [`module_uses_page_ops`]): correct by construction, since nothing the mask-only tier could emit
+/// ever runs. `nested_caps` only selects the import layout (unused here, but kept uniform with the
+/// caller's other artifacts).
+fn compile_interp_only(
+    m: &Module,
+    shared_memory: bool,
+    nested_caps: bool,
+) -> Result<Artifact, Error> {
+    let n = m.funcs.len();
+    let wasm_of = vec![None; n];
+    let leaf = vec![false; n];
+    let wasm = emit_module(
+        m,
+        shared_memory,
+        &[],
+        &wasm_of,
+        &leaf,
+        None,
+        nested_caps,
+        FuelMode::Global,
+    )?;
+    Ok(Artifact {
+        wasm,
+        emitted: vec![false; n],
+        drive: DriveMode::InterpDriven,
+    })
+}
+
 /// **The single wasm-JIT front door.** The embedder supplies only the invocation [`Shape`]; the
 /// execution *strategy* is derived from the IR: a rooted, suspension-free guest is **wasm-driven**
 /// (the whole hot path is emitted wasm, fastest), everything else is **interpreter-driven** with
@@ -1928,6 +2020,13 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
             drive: DriveMode::InterpDriven,
         })
     };
+    // Track 3 (c)+(a): a module that manages its own pages (`map`/`unmap`/`protect`) can't be
+    // accelerated on the mask-only tier — an emitted access ignores page state the interpreter would
+    // trap on — so emit nothing and run it wholly on the interpreter (`NESTED_JIT.md`). Checked before
+    // the shape split so it holds for `Threaded`/tier-up too, not just the rooted paths.
+    if module_uses_page_ops(m) {
+        return compile_interp_only(m, shared_memory, false);
+    }
     match shape {
         // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
         Shape::Threaded => interp_driven(m),

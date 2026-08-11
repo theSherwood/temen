@@ -16,6 +16,35 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **Pages-deploy starvation fix (I75) — two cooperating paths in `ci.yml` + `pages.yml`.** The per-push
+  (`push: [main]`) Pages deploy was starving: under a burst of agent-PR merges each new merge supersedes
+  the still-queued deploy (`concurrency: pages`, `cancel-in-progress: false` cancels the *queued* older
+  run), so it never wins a runner before the next merge resets it — observed **0 of 30** recent Pages
+  runs completed, one sat queued **8 h with zero jobs ever scheduled**, and the live site froze days
+  behind `main`. The fix has two parts (copy **both** files over):
+
+  1. **`ci.yml` — primary deploy rides the required `browser-real` job (the correct fix).** That job
+     already builds the whole deployable site (wasm + Postgres + chibicc + self-host) on every main push
+     and reliably gets a runner (it's a required gate). It now also (main push only, **fail-soft**)
+     runs `build-onramp-assets.mjs`, assembles `_site` + a `DEPLOYED_SHA` marker, verifies reachability
+     (`check-play-assets --site`), and `upload-pages-artifact`; a new tiny **`deploy-pages`** job
+     (`needs: browser-real`, `id-token`+`pages: write`, `github-pages` environment) publishes it in
+     seconds — no separate heavy job to starve, and the deploy happens the moment main's browser CI is
+     green. The assemble step never exits nonzero, so a Pages-asset hiccup sets `site_ok=false` (deploy
+     skipped) but **cannot red the required `browser-real` gate**.
+  2. **`pages.yml` — scheduled self-healing fallback.** Drop the `push` trigger; run on
+     `schedule: */30 * * * *` + `workflow_dispatch`. Its **`gate`** job compares the published
+     `DEPLOYED_SHA` against `HEAD` and skips when the site is already current — so it is a ~10 s no-op
+     whenever path 1 succeeded, and only does the full standalone build+deploy when path 1 didn't
+     publish HEAD (browser-real failed/was cancelled). The `github-pages` environment serializes the two
+     paths; the gate prevents a double-deploy. `workflow_dispatch` always builds (on-demand /
+     feature-branch preview).
+
+  **On copy-over:** verify the repo's Pages **Source = GitHub Actions** (unchanged); the first green
+  `browser-real` on main is the real validation of the assemble+upload+deploy path (I couldn't run a
+  live Pages deploy from the agent env). Merges publish as soon as `browser-real` is green; the 30-min
+  fallback covers any gap.
+
 - **I67 apt-source hardening (all `apt-get update` steps)** — every job that runs `apt-get update`
   (the mingw cross lanes, the `clang` reference lanes, and all `llvm-18` install blocks — 10 sites)
   now first `sudo rm -f`s the runner's unused `microsoft*`/`azure*` files under

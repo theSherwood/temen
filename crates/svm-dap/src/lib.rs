@@ -201,6 +201,7 @@ impl DapServer {
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
+            "globals" => self.on_globals(),
             "forceSwitch" => self.on_force_switch(args),
             "setVariable" => self.on_set_variable(args),
             "writeMemory" => self.on_write_memory(args),
@@ -768,6 +769,59 @@ impl DapServer {
             Json::obj(vec![("scopes", Json::Arr(vec![scope]))]),
             vec![],
         )
+    }
+
+    /// The custom `globals` request: enumerate the module's module-scoped scalar globals
+    /// (`func == GLOBAL_SCOPE`, `VarLoc::Fixed`) as `{name, addr, size, value}`, reading each
+    /// value from the window and formatting through its structured type when present. This is
+    /// the enumeration the shared-state panel needs — DAP `scopes` only exposes per-frame Locals,
+    /// so there is otherwise no way to list globals by name. Read-only; the consumer joins these
+    /// against the mem model's contested set for last-writer/contested. Fails cleanly with no
+    /// debug info. Aggregates (arrays/structs) are skipped — the panel tracks scalar shared state.
+    fn on_globals(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        let Some(debug) = session.debug.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        // Snapshot (name, addr, width, type_id) first so the immutable `debug` borrow ends before
+        // reading the window. One entry per name (a global is declared once).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut globals: Vec<(String, u64, usize, Option<TypeId>)> = Vec::new();
+        for v in debug.vars.iter().filter(|v| v.func == svm_ir::GLOBAL_SCOPE) {
+            if let VarLoc::Fixed { addr } = v.loc {
+                // Scalars only: an aggregate carries a type_id whose TypeDef is Array/Aggregate.
+                let is_aggregate = v
+                    .type_id
+                    .and_then(|t| debug.types.get(t as usize))
+                    .is_some_and(|t| {
+                        matches!(t, TypeDef::Aggregate { .. } | TypeDef::Array { .. })
+                    });
+                if is_aggregate || !seen.insert(v.name.clone()) {
+                    continue;
+                }
+                let width = scalar_width(&debug.types, v.type_id, &v.ty);
+                globals.push((v.name.clone(), addr, width, v.type_id));
+            }
+        }
+        let mut out = Vec::new();
+        for (name, addr, width, type_id) in globals {
+            let value = match session.inspector.read_window(addr, width) {
+                Ok(bytes) => match type_id {
+                    Some(tid) => fmt_scalar(self.types(), tid, &bytes),
+                    None => le_sint(&bytes, width).to_string(),
+                },
+                Err(_) => "<unreadable>".to_string(),
+            };
+            out.push(Json::obj(vec![
+                ("name", Json::s(name)),
+                ("addr", Json::i(addr as i64)),
+                ("size", Json::i(width as i64)),
+                ("value", Json::s(value)),
+            ]));
+        }
+        (true, Json::obj(vec![("globals", Json::Arr(out))]), vec![])
     }
 
     fn on_variables(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
@@ -1852,6 +1906,19 @@ fn le_uint(bytes: &[u8], n: usize) -> u64 {
         x |= (b as u64) << (8 * i);
     }
     x
+}
+
+/// Little-endian signed decode over `n` bytes (`n <= 8`), sign-extended to `i64`. The fallback for
+/// a scalar with no structured type (name-only debug info) — the typed path uses `fmt_scalar`.
+fn le_sint(bytes: &[u8], n: usize) -> i64 {
+    let n = n.clamp(1, 8);
+    let u = le_uint(bytes, n);
+    let bits = (n as u32) * 8;
+    if bits < 64 && (u >> (bits - 1)) & 1 == 1 {
+        (u | (!0u64 << bits)) as i64
+    } else {
+        u as i64
+    }
 }
 
 /// Format a scalar leaf's window bytes per its structured type: signed/unsigned ints, floats, a

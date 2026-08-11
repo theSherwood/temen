@@ -687,8 +687,13 @@ plumbing. Five workstreams, roughly independent:
   spawns `nifler` → `nimony` → `hexer` → `lengc` as subprocesses. Running the compiler on svm
   means either driving those phases in-process or giving svm a subprocess/exec personality. This
   is an architecture question, not a translation one, and it's the biggest unknown.
-- **W5 — Bootstrap + browser.** Compile the Rust `svm-leng` to wasm, on-ramp it to svm, and run
-  the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground demo.
+- **W5 — Bootstrap + browser** (scoped in detail in §3e). Compile the Rust `svm-leng` to run as an
+  svm guest, and run the loop (nimony-on-svm + svm-leng-on-svm) — first headless, then as a playground
+  demo. **Key finding (§3e): the endpoints are all mature (a Rust→svm primitive already works via the
+  `svm-llvm` on-ramp; a byte-exact C self-host template; a mature playground; `svm-leng`'s 3-crate
+  wasm-clean dep graph), and the greenfield middle — the first Rust crate run as an svm guest — is
+  bring-out, not open architecture.** Recommended path: LLVM on-ramp for first light, the wasm on-ramp
+  (the stated goal) after.
 
 **Near-term milestone — ✅ MET (2026-07-29, see §3b Path B): compile & run one real Nim program
 end-to-end** — source → nimony → hexer → `svm-leng` → svm-ir → runs on both engines with the right
@@ -814,19 +819,31 @@ files down the chain. Two existing options, no new host op:
    (`read_out`) and seeds it as phase N+1's `stdin` (the `CAT_CONSUMER` pattern, `exec_cap.rs:185`).
    Fits a streaming `hexer | lengc` shape.
 2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
-   This is the faithful hand-off, and it needs a small **additive** piece of shared infrastructure —
-   no new host op, but new API surface, so it is not free the way piping is. Measured, the gap is two
-   parts: (a) `mem_fs` grants are independent per domain (`svm-fs/src/lib.rs:745`), and the one shared
-   primitive, `mem_fs_seeded_shared` (`svm-fs/src/lib.rs:820`), returns a **single** `HostProc` + a
-   host-side `MemFsHandle` — built for host↔handle session persistence (browser-Postgres), *not* a
-   `Fn() -> HostProc` factory grantable to N domains; a grantable-to-N shared factory has to be added;
-   (b) `domain_exec` runs each child via plain `run` (`exec.rs:102`), granting it only stdin/stdout —
-   so children receive **no `fs` at all** today. Wiring the file hand-off therefore means: surface a
-   grantable shared memfs in `svm-fs`, and teach the child-spawn path to grant it (either a
-   `domain_exec` that runs children with `run_with_caps`, or the §14 Instantiator's `regrant_into_child`
-   at `crates/svm-interp/src/lib.rs:18485`). Both are additive, but both touch **shared capability
-   infrastructure** and decide *what filesystem authority a spawned child inherits* — a security-shaped
-   call (INVARIANTS §1/§4), so it is owner-reviewed infra, not a nimony-lane edit.
+   This is the faithful hand-off. It has **two** parts, and they sit on opposite sides of the
+   security boundary — worth stating precisely, because the memfs machinery mostly already exists:
+   - (a) **A store shared across domains** — the *data* layer. `mem_fs_seeded_handler` re-seeds a
+     *fresh* store per grant (isolated filesystems), and `mem_fs_seeded_shared` shares one store but
+     only host↔handle (its `MemFsHandle` is host-side, built for browser-Postgres session snapshots;
+     it's used single-guest in `crates/svm/tests/c_link.rs` to seed the cc1 memfs). Neither shares a
+     store **guest↔guest**. That piece is now built and tested: **`mem_fs_shared_factory`**
+     (`svm-fs/src/lib.rs`) mints N `HostProc`s over one `Arc<Mutex<MemFsState>>`, so a file one domain
+     writes another reads — proven at the op level by `two_grants_from_the_factory_share_one_store`
+     (phase A writes `x`, a separate grant reads it back). It's an ordinary additive `svm-fs` helper:
+     it changes no existing grant and hands the *caller* the choice to share, so it is **not** on the
+     security boundary. (`mem_fs_seeded_shared` now delegates to it — one grant from the factory.)
+   - (b) **Granting that store to a spawned child** — the *authority* layer, and the real gate. This
+     decides *what filesystem authority a spawned child inherits* — a security-shaped call (INVARIANTS
+     §1/§4), so it was held as an owner-reviewed decision, not a nimony-lane edit. **Now made, and
+     wired** (`domain_exec_with_fs`, `exec.rs`): plain `domain_exec` still runs each child via `run`
+     with **only stdin/stdout** — the default is unchanged, a child gets **no `fs`** — and a child
+     gains `fs` *only* when the embedder builds the backend with `domain_exec_with_fs`, which runs each
+     child via `run_with_caps` granting the one shared memfs under the name `"fs"`. The grant lives at
+     the parent's construction site; a child cannot widen it, and gets *only* that in-memory store (no
+     host filesystem, no ambient authority). The confinement default is pinned by a test
+     (`a_child_gets_fs_only_when_the_parent_grants_it`: a probe resolves `fs` → granted only under
+     `domain_exec_with_fs`, refused under plain `domain_exec`). This is the same `run_with_caps` seam
+     that would grant the real `system`'s bottom-edge caps to a child — one child-capability-inheritance
+     mechanism covers both.
 
 **v1 gaps to hold (all bounded, none blocking).** `domain_exec` v1 runs each child **blocking and
 one-shot** — no concurrent pipeline (`exec.rs:59`). For a compiler driver this is *fine*: the phases
@@ -853,6 +870,41 @@ driver module, only the phase registry differs — so the abort is the driver re
 real `nifmake` control flow). This retires the "can the driver shape even run on svm" question,
 including its failure handling; what's left (above) is compiling the actual phases and — for the
 file-based hand-off specifically — the shared-memfs infra measured under "passing intermediate files."
+
+**Second slice — ✅ a real compiled program as an isolated `exec` child** (step (iii), on a real
+binary). The first slice's phases are hand-written; this runs output from the actual `Leng → SVM-IR`
+backend as a `domain_exec` child. A Leng module with real control flow (a counted `while` loop) is
+lowered by `svm-leng`, **verified**, registered as a phase, and `exec`d by the same nifmake-shaped
+driver; its `main()` returns 55 (sum 1..10), `domain_exec` maps that return to the child's exit code,
+and the driver reads it back via the status op and re-exits with it — so **exit 55 witnesses the whole
+path**: frontend output → verify → isolated child domain → correct compute → status to driver
+(`crates/svm-run/tests/multibinary.rs::driver_runs_a_real_svm_leng_compiled_program_as_an_exec_child`,
+all three engines; svm-leng is a test-only dep of svm-run, no cycle). This proves a *real* compiled
+binary boots and computes correctly as an isolated child — the previously-open half of (iii).
+
+The remaining half of (iii) is **heap/`system`-backed** phases, and it splits cleanly by what the
+child needs at its window edge. A self-contained program (allocator over its own window, the Path-B
+shim) needs only that the shim **self-seed its brk at startup** rather than rely on harness seeding —
+an in-lane change to the shim, no infra. The mmap-backed real `system` additionally needs
+**bottom-edge host caps granted to the child** (`mmap`/`memcpy`/atomics/`fs`). The *mechanism* for
+that is now in place — `domain_exec_with_fs` runs children via `run_with_caps` (see the third slice
+below), the same seam any bottom-edge cap would ride — so what's left is only *which* caps a
+`system`-backed phase is granted, decided at the parent's construction site.
+
+**Third slice — ✅ the faithful file-based hand-off, with child-fs confinement.** The earlier slices
+hand off via stdout→stdin piping; real `nifmake` passes *files*. This closes that: `domain_exec_with_fs`
+grants every phase child one shared in-memory filesystem (the `mem_fs_shared_factory` store), so a
+phase writes `mid` and a later phase reads it — the data crosses the child boundary through the file,
+not a pipe (`crates/svm-run/tests/multibinary.rs::driver_hands_off_a_file_between_phases_through_a_shared_memfs`,
+all three engines: `gen` writes "OK" → `use` reads and echoes it → driver stdout "OK"). The
+child-capability grant that §3c held as owner-reviewed is **made and wired** as an *explicit,
+attenuated, parent-side opt-in*: the default `domain_exec` still gives a child only stdin/stdout, a
+child gains `fs` only through `domain_exec_with_fs`, and it gets *only* the one seeded in-memory store
+— no host filesystem, no ambient authority, no self-widening. The confinement default is pinned
+(`a_child_gets_fs_only_when_the_parent_grants_it`). With this, W4 is **build-out-complete on the
+mechanism**: driver shape, real compiled child, and the file hand-off all run on svm; what remains is
+compiling the four actual phase binaries (four applications of the on-ramp) and, for a heap phase, the
+self-seeding brk — no open architecture question.
 
 ## 3d. TLS model — nimony's thread-vars onto svm (single-threaded now, `vcpu.tls` later)
 
@@ -926,6 +978,89 @@ compiler is single-threaded — and both tiers are implemented and tested: Tier 
 (`tls_mode`, single- and cross-module) is ready for when a threaded Nim guest appears, needing only the
 additive follow-ups
 above.
+
+## 3e. W5 scope — bootstrap + browser (self-hosting the toolchain on svm)
+
+W5 asks (§3a): compile the Rust `svm-leng` to run **as a guest on svm**, and close the self-hosting
+loop — nimony-on-svm (W4) emits Leng, `svm-leng`-on-svm translates it to SVM-IR, which runs on svm —
+first headless, then as a browser playground card. Unlike W4 (whose "unknown" turned out already-built
+on both sides), W5 has a genuinely **greenfield middle**: **nothing has ever compiled a Rust crate to a
+module that runs on svm's own engines.** But it is bracketed by mature endpoints, so the invention is
+narrow and the risk is bounded.
+
+**The template — C self-host, byte-exact, already in the browser.** chibicc (a C compiler) compiled to
+an svm module compiles *its own source* to valid SVM-IR entirely in-sandbox, byte-for-byte vs native
+(`browser/tests/chibicc_selfhost.rs`, `browser/tests/chibicc_selfhost_asset.rs`, driven through the
+cdylib entry `svm_selfhost_emit_object_fs`; the self-host card seeds the libc headers into an in-window
+memfs). W5 is that exact shape with **`svm-leng` (Rust) in place of chibicc (C)**. Everything the C card
+needs — playground scaffold (`browser/web/play.html`), memfs mount, `.svmb` asset lane — is built and
+reusable.
+
+**The one thing that doesn't exist: a Rust crate running as an svm guest.** Every `svm-wasm` transpile
+fixture is clang-produced C (`crates/svm-wasm/tests/fixtures/*_clang.wasm`); no rustc-emitted wasm has
+ever been fed to `svm_wasm::transpile` and run on svm. So the roadmap's stated chain — *"Rust → wasm →
+the svm-wasm on-ramp → svm-ir"* (§3a) — is unexercised for Rust. **But measuring the seam surfaced a
+lower-risk path the roadmap didn't assume.**
+
+**Two candidate Rust→svm-ir frontends, measured. Both converge on one svm-ir `Module` that runs
+identically (interp/JIT, and in the browser), so the choice is purely the *frontend*:**
+- **Path L — LLVM (already proven for Rust).** `rustc --emit=llvm-ir` → the `svm-llvm` reader
+  (`svm_llvm::translate_ll_path`) → svm. This is a *working lane today*: `bench/src/bin/rustbench.rs`
+  runs Rust on svm exactly this way (`rustbench.rs:14`, `146-173`). The Rust→svm primitive already
+  exists — just via LLVM, not wasm. Its risk is *scale*: rustbench compiles tiny `no_std` benchmarks,
+  not a multi-crate `std` translator. (rustbench's *wasm* lane, by contrast, runs on Wasmtime, not svm —
+  `rustbench.rs:18` — so it is no evidence for Path W.)
+- **Path W — wasm (the stated goal, greenfield for Rust).** `rustc --target wasm32-unknown-unknown` →
+  `svm_wasm::transpile` → svm. The on-ramp is mature and broad — bulk-memory, multi-value,
+  reference-types, `call_indirect`, SIMD (`crates/svm-wasm/src/lib.rs:14-47`) — with only narrow
+  fail-closed gaps (`table.grow`/`table.copy`/`table.init`, passive *element* segments, multi-memory —
+  `lib.rs:44-46`) and a 16 MiB default ceiling on *unbounded* memory (`DEFAULT_MAX_GROW_PAGES = 256`,
+  `lib.rs:113-117`; declare a `maximum` or watch the heap). It has simply never eaten rustc output.
+
+**Recommendation: Path L for first light, Path W as the stated end-goal — they share everything
+downstream.** Because once `svm-leng` is an svm-ir `Module` it runs the same and the browser plays
+`.svmb` either way, start with the path whose Rust→svm primitive already works (L), then bring up W (the
+roadmap's target, and the natural fit since the browser is wasm-native). Same "two seams, pick by the
+pragmatic constraint" call as W4's `exec`-over-`link`.
+
+**Why the endpoints make this bounded, not open.** `svm-leng`'s entire runtime dependency graph is
+**`svm-ir` + `svm-text` + `svm-encode`** (`crates/svm-leng/Cargo.toml`) — the three pure escape-TCB
+crates already proven to compile to wasm inside the browser cdylib (root `Cargo.toml`; `browser/Cargo.toml`
+dep set). Its dev-deps (`svm-verify`/`interp`/`jit`) don't enter the artifact. And `svm-leng` is **pure
+computation** — text in, `Module` out; no `std::fs`/`std::io`/`File` anywhere (`crates/svm-leng/src`).
+So the surface a guest build must satisfy is tiny.
+
+**Bounded gaps/decisions (all additive; none an architecture question):**
+- **Allocator.** `svm-leng` declares no `#[global_allocator]`; a guest build needs one (a bump
+  allocator, the rustbench model — `rustbench.rs`). Additive.
+- **`std` posture + `HashMap` hasher.** `svm-leng` is a `std` crate using `HashMap`/`RefCell`
+  (`translate.rs`); `std`'s default `HashMap` pulls `getrandom` for `RandomState`, unavailable on a
+  bare guest. Fix: a fixed-seed `BuildHasher` (or a light `no_std + alloc` rework). Small, mechanical.
+- **WASI is too thin for a `std`-`wasi` build.** `svm-wasi` provides only `fd_write` + `proc_exit` and
+  fails closed on the rest (`crates/svm-wasi/src/lib.rs:1-15,43-53`), so `wasm32-wasi` is out — which is
+  *why* Path W targets `wasm32-unknown-unknown` (and it's moot for Path L). Since `svm-leng` does no
+  I/O, this is a non-issue once the allocator is supplied.
+- **CI drift.** A guest build lives in a detached workspace (like `browser/`, `bench/`), which the
+  per-PR gate doesn't build (I55, `ISSUES.md`). A W5 asset needs an asset-lane check like `chibicc.svmb`'s.
+
+**Slices (each a checkpoint, smallest first):**
+1. **First light (Path L).** Compile one pure `svm-leng` path — e.g. `translate` on a trivial one-proc
+   module — through `rustc --emit=llvm-ir` → `svm-llvm` → svm, output matching native `svm-leng`.
+   Retires "a Rust `svm-leng` fragment runs on svm."
+2. **Whole `translate`, byte-identical.** The full translator as one svm-ir module (an `svm-leng.svmb`
+   asset), run on svm over a real hexer Leng file, byte-for-byte vs native `svm-leng` — the §18
+   differential, the `chibicc_selfhost_asset` analog.
+3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
+   self-hosting payoff, no browser.
+4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
+   playground over an in-window memfs.
+5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
+   `svm_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
+
+**Status: W5 is the one workstream with real greenfield** — the first Rust-crate-as-svm-guest — but it
+is bracketed by proven endpoints (a working Rust→svm primitive via LLVM, a byte-exact C self-host
+template, a mature playground, and a 3-crate wasm-clean dep graph), so it is **bring-up, not open
+architecture**.
 
 ## 4. Invariants this must respect
 

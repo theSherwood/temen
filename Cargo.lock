@@ -810,6 +810,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-leng",
  "svm-opt",
  "svm-peval",
  "svm-posix",

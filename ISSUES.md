@@ -13,7 +13,7 @@ robustness/quality · **S4** cosmetic/flake.
 
 ## Open
 
-### I75 — fork on the Cranelift JIT folds the whole run to bytecode; no native fork, no mixed-tier routing (S3, current limitation — correctness intact, a perf/tiering gap) — recorded 2026-08-07
+### I76 — fork on the Cranelift JIT folds the whole run to bytecode; no native fork, no mixed-tier routing (S3, current limitation — correctness intact, a perf/tiering gap) — recorded 2026-08-07
 
 **What.** `clone_caller`/`reap` (fork/wait) run natively on the tree-walk oracle and the bytecode
 interpreter, but **not** on the Cranelift JIT (`OPS_PARITY.md` — 🚧 in the `svm-jit` column). A forking
@@ -50,29 +50,70 @@ native (the caller-parking wall stands — that needs the capstone), but it un-p
 non-fork compute in the run, capturing most of the practical value at a fraction of the cost. A good
 first move if a measured regression appears before the capstone is justified.
 
-### I74 — wasm-JIT single-shot runner emits a fall-through `unreachable` where it should compile-veto (S4; opened 2026-08-07 — correctness already handled by the runtime decline, PR #665)
+### I75 — GitHub Pages deploy starves under burst merges, so the published playground freezes days behind `main` (S3, deploy-liveness; opened 2026-08-08 — fix pending copy-over in `workflows_src/pages.yml`)
 
-**What.** Some emitted functions in a chibicc-compiled artifact reach the **trailing function-body
-`unreachable`** (`svm-wasm-jit` `lib.rs:2669`, "every path returned / trapped / re-dispatched") at
-runtime: an emitted block falls through instead of returning or re-dispatching, so the emitted `f0`
-traps mid-run where the tree-walk interpreter completes and prints correctly. Surfaced by the
-`open_memstream` + buffered-`FILE*` stdio path (the memstream card in `browser-play-editor-test.mjs`):
-`printf("A\n")` lands, then the emitted run traps (a wasm `unreachable`, not a cross-tier decline)
-while the interpreter prints the full `[0][1][4] len=9`.
+**What.** The playground on GitHub Pages was stale for days even though the code (playground
+instrumentation + wasm-JIT parity, PR #665) was merged: the live `web/play.js` was the older file
+(byte-size + `last-modified` days behind `main`; the origin served it with `age: 0`, so not a client
+cache). **0 of the last 30 Pages runs completed** — 29 `cancelled`, 1 stuck `pending`; one run
+(`#469`) sat queued **~8 hours with zero jobs ever scheduled**, then was cancelled the instant the next
+merge arrived.
 
-**Correctness is already handled — this is a cleanliness/efficiency gap, not a wrong-result bug.**
-The single-shot runner now reports a trap as `STATUS_TRAP` (not a truncated `STATUS_OK`) and
-`driveJitRun` throws on it, so the caller declines the whole run to the interpreter oracle and shows
-the correct result (the return/exit/trap parity fix, PR #665). The remaining cost is that these
-programs run on the interpreter instead of the wasm-JIT, and emit-then-trap-at-runtime is less clean
-than a veto.
+**Why.** `pages.yml` triggered on `push: [main]` with `concurrency: {group: pages, cancel-in-progress:
+false}`. `cancel-in-progress: false` protects a *running* deploy but a newer merge still cancels the
+older **queued** run. The Pages `build` job is long (~20–40 min: nightly `build-std` wasm + LLVM
+on-ramp + Postgres), and the repo's CI matrix (~25 jobs/push × many open PRs) saturates the Actions
+runner concurrency — so the Pages job waits in the queue and every merge resets it to the back before
+it can win a runner. Under a steady merge cadence it never deploys.
 
-**Why tracked.** Invariant 9 prefers a **compile-time veto** (`Error::Unsupported` → the function
-bounces cross-tier at emit time — decline, don't emit code that traps) over emit-and-trap. The fix:
-diagnose which control-flow / op construct in the memstream functions lowers to a fall-through, then
-either (a) lower it faithfully so the artifact runs fully on the JIT, or (b) decline that function at
-emit time so a run either JITs cleanly or falls back **per-function** rather than **per-run**. Needs a
-wasm-emit + trace loop to map the runtime trap back to the emitted function/block.
+**Fix (pending copy-over).** Deploy on `schedule: */30 * * * *` + `workflow_dispatch` instead of per
+push (`workflows_src/pages.yml`): a scheduled run gets a full interval to grab a runner,
+merge-independent, and `cancel-in-progress: false` lets it finish once started. A tiny `gate` job skips
+the build when `main` is unchanged since the last deploy (a `DEPLOYED_SHA` site-root marker vs `HEAD`),
+so most ticks are a ~10 s no-op. Cost: merges publish within ~30 min instead of instantly
+(`workflow_dispatch` for on-demand). The deeper fix — fold the deploy into the required `browser-real`
+CI job so it rides an already-scheduled slot — is larger (needs `browser-real` to also build the
+on-ramp assets for parity) and deferred.
+
+### I74 — wasm-JIT confines against the **compile-time** `mapped`, so an access into `vm_map`-grown memory faults on the JIT where the interpreter allows it (S3, correctness-of-tier — masking hinge; opened 2026-08-07, root-caused; runtime decline already keeps results correct, PR #665)
+
+**What (root-caused).** The wasm tier's confinement (`emit_confine`, `svm-wasm-jit` `lib.rs:~2792`)
+bounds-checks every access as `eff > mapped - width ⇒ MemoryFault`, where `mapped = 1 << size_log2` is
+the module's **declared** memory size, **baked in at emit time** (`lib.rs:1985`). But a guest grows the
+live mapped region at runtime via `vm_map` (ADDRESS_SPACE op 0). After a grow, an access into
+`[declared_mapped, grown_mapped)` **faults on the JIT** (stale compile-time bound) while the
+interpreter — which tracks the live `Window::mapped` (`svm-mask`) — admits it. Confirmed on the
+`open_memstream` card: `memory 18` (256 KiB declared), the guest's `malloc` calls `vm_map` to extend
+the heap, and the emitted allocator (`IR func 3` = `wasm-function[5]`) traps `TRAP_MEMORY_FAULT`
+(env.trap code `2`) writing the allocation header past 256 KiB. The interpreter prints correctly.
+
+**Why the existing exclusion misses it.** `map`/`unmap`/`protect` are *deliberately* out-of-subset for
+the mask-only tier (`is_nested_leaf_cap`, `lib.rs:784`) — but only in their `Inst::CapCall` form. The
+on-ramp emits heap growth as `Inst::CallSym "vm_map"` (the `<svm.h>` `__vm_map` builtin,
+`svm-llvm:512`), and the CallSym outliner (`lib.rs:~1560`) rewrites **every** symbolic call into an
+emittable cross-tier leaf wrapper unconditionally, so the page-state-changing `vm_map` slips into the
+emitted subset.
+
+**Correctness is already handled — this is a *which-tier* / efficiency gap, not a wrong-result bug.**
+The runner reports the trap as `STATUS_TRAP` and the caller declines the whole run to the interpreter
+oracle (PR #665), so the output is correct. The cost is that a program which grows memory runs on the
+interpreter instead of the wasm-JIT.
+
+**Why not a simple veto.** A static "module contains `vm_map` ⇒ decline" veto **regresses working
+guests**: `qjs_repl.svmb` contains `vm_map` (heap-growth path) yet runs fully on the JIT today (its
+workload never grows past the declared size, so it never faults). Vetoing on static presence would drop
+qjs/SQLite from the JIT (losing the ~7× speedup). Confining against `reserved` instead would be
+**fail-open** — the JIT would sail through unmapped `[mapped, reserved)` pages the interpreter faults
+(the exact divergence `lib.rs:786` rejects). Neither is acceptable.
+
+**The correct fix is the masking hinge (owner territory, INVARIANT 2).** Confine against the **live**
+`mapped` size read at runtime (e.g. from the env cell the emitted code already holds — no new import,
+per the CONSOLIDATION §0 yardstick — kept in sync by the `vm_map` cross-tier handler), instead of the
+emit-time constant. This is the fuzzed confinement lowering ("the most sensitive code in the tree"), so
+it needs owner sign-off and its own masking-fuzz coverage of the dynamic-`mapped` case before landing.
+Until then the runtime decline (PR #665) is the fail-closed resting point. Severity raised S4→S3: it is
+a real interpreter-vs-JIT semantic divergence (masked today only because the JIT declines on the
+resulting fault).
 
 ### I73 — punt-inside-a-fiber: the fast backends blocked the vCPU inline where the tree-walk oracle parks the fiber — **CONVERGED 2026-08-07, all three engines** (S3; opened by FIBER_PARK.md F1, closed by F2+F3 on the same arc)
 
@@ -2398,29 +2439,112 @@ round-trips now agree; existing `debug_info_round_trips_through_binary` /
 `no_debug_info_is_back_compatible` unit tests still pass, and the exact crash input was verified to
 normalize and round-trip through both the binary and text paths.
 
-### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25 by the jacl fiber-timed-wait follow-up
+### I50 — text round-trip dropped a `func_names`-only `debug_info` (the I47 class, one field over), breaking `parse ∘ print = id` (S3, nightly fuzz red) — **FIX LANDED 2026-08-11** (`claude/nightly-ci-failures-x6oj7x`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (roundtrip)` failed 2026-08-11 (input
+`[83, 86, 77, 0, 10, 0, …, 1, 42, 0]` — `SVM\0` + a debug section carrying one function-name entry):
+`text round-trip changed the IR`, with `left` = `Some(DebugInfo { …, func_names: [FuncName { func:
+42, name: "" }] })` and `right` = `None`.
+
+**Root cause.** The same emptiness-check drift I47 fixed on the *decode* side, now on the *print*
+side. `DebugInfo` has six tables (`files`, `locs`, `types`, `vars`, `blobs`, `func_names`), but
+`print_debug_info` (`svm-text/src/lib.rs`) early-returned "print nothing" when the first **five** were
+empty — it never checked `func_names`. So a module whose debug info was *only* a `func_names` entry
+(non-empty, so I47's decode canonicalization leaves it `Some`) printed no debug section at all, and
+the re-parse saw no directives ⇒ `debug_info: None`. Binary round-trip (`decode ∘ encode`) preserved
+the `Some`, so the two round-trips disagreed — exactly the I47 shape, one struct field further along.
+
+**Fix.** Add `&& di.func_names.is_empty()` to the printer's guard so the emptiness test covers every
+`DebugInfo` field. Pinned by `debug_info_with_only_func_names_survives_text_round_trip`
+(`svm-text`), which reconstructs the crash IR and asserts `parse ∘ print = id`; the existing
+`debug_fnames_round_trip` still passes.
+
+### I51 — differential fuzz generator synthesized an **overlapping** `MemCopy`, tripping the interp-oracle (memmove-safe) vs JIT (raw `memcpy`, UB on overlap) divergence (S4, nightly fuzz red — harness bug, not a miscompile) — **FIX LANDED 2026-08-11** (`claude/nightly-ci-failures-x6oj7x`)
+
+**Symptom.** Nightly `cargo-fuzz (all targets) (opt_ssa_roundtrip)` (and, from the same generator, the
+`diff` target) failed 2026-08-11 under ASan with `memcpy-param-overlap` (input `[0x17,0xa4,0x17,0x1b]`),
+the faulting frames inside JIT-compiled guest code.
+
+**Root cause.** `MemCopy` carries the C `memcpy` contract — source and destination spans **must not
+overlap** — exactly like its only frontend source, `llvm.memcpy`. Both interpreters implement it
+overlap-safely (a snapshot copy = memmove semantics; svm-interp `mem_copy`), but the JIT lowers
+`MemCopy` to a raw platform `memcpy` libcall (`svm-jit` `call_memcpy`, D62 — the two ops "differ only
+in the libcall (overlap safety)"). The differential generator (`crates/svm/tests/support/irgen.rs`
+§26) drew `MemCopy`'s `dst`/`src` from arbitrary runtime pool values it can't prove disjoint, so it
+could name overlapping in-window spans. On such an input the interpreter oracle gives a defined
+(memmove) result while the JIT's `memcpy` is UB — ASan reports the overlap. That is an *out-of-contract
+program*, not a JIT miscompile: no real frontend emits an overlapping `MemCopy`, and the copy is still
+fully confined (no escape).
+
+**Fix.** Have the differential generator emit only the overlap-safe `MemMove` for arbitrary-address
+bulk copies, never `MemCopy` (the confinement lowering it exercises is identical — they differ only in
+the final libcall). `MemCopy`'s non-overlapping lowering stays covered by the fixed-address differential
+unit tests in `svm-jit/tests/bulk_mem.rs`. Pinned by
+`differential_generator_never_emits_overlapping_memcopy` (`svm/tests/jit_fuzz.rs`), which scans 4000
+generated modules and fails the instant a `MemCopy` is reintroduced; the crash seed is also added to
+`DIFF_REGRESSIONS`.
+
+### I48 — no **blocking** `cont.resume`: a guest with only a parked fiber has to busy-spin the poll (S3, ergonomics) — raised 2026-07-25; **BUILT 2026-08-07** as `cont.resume.block` (DESIGN.md §12)
 
 **What.** After the §3.6 slice-5a fiber-park contract (svm PR #442), a `memory.wait` inside a
 fiber parks the *fiber* and the resumer polls it with `cont.resume`, seeing `FIBER_PARKED (3)`
-until the event fires. A guest runtime with a runnable sibling just resumes it and comes back;
-but a guest whose **only** pending work is one parked fiber has nothing to do between polls, so
-it busy-spins `cont.resume` (jacl's shape) or approximates an idle by waiting on an unrelated
-cell. There is no primitive to say "idle this vCPU until the parked fiber is due or woken."
+until the event fires. A guest whose **only** pending work is one parked fiber had nothing to do
+between polls, so it busy-spun `cont.resume` (jacl's shape). No primitive said "idle this vCPU
+until the parked fiber is due or woken."
 
-**Why tracked, not built.** One named consumer (jacl) with a working — if spinny — workaround, and
-a blocking-resume primitive lands squarely on the scheduler's park/idle core (the most sensitive
-concurrency surface). INVARIANTS #1 (no machinery without a demonstrated need) says wait for a
-second consumer or a measured cost before adding surface; the poll contract is correct and
-complete as-is, this is only efficiency. jacl itself framed the ask as "only when a second
-consumer demonstrates genuine need."
+**Invariant-1 renegotiation (owner, 2026-08-07).** This was deferred on INVARIANTS #1 ("no
+machinery without a demonstrated need — wait for a second consumer or a measured cost"). The
+owner explicitly requested the primitive be built, which *is* the demonstrated need the invariant
+gates on; invariant 1 is satisfied, not weakened (no standing rule changed). Recorded here dated,
+per the INVARIANTS.md preamble.
 
-**Shape if/when built.** A `cont.resume`-family variant (or a flag) that, on `FIBER_PARKED`, idles
-the vCPU on the same deadline/wake machinery the fiber's `Waiter::Fiber` / `FiberWaitCell` already
-registers — waking on the futex notify or the timeout instead of returning `FIBER_PARKED` to the
-guest. Must stay backend-uniform (tree-walk oracle first, §18) and preserve the #440 teardown
-exits (a blocking resume must still unblock on exit/trap/freeze), and must not reintroduce a
-"blocks the domain" path (DESIGN.md §12: blocks the fiber, never the domain) — the vCPU idles only
-when nothing else in the domain is runnable.
+**BUILT — `cont.resume.block`, an advisory op (DESIGN.md §12).** A new opcode (`0xBF`) that is
+**identical to `cont.resume`** — same `(status, value)` result, same 0/1 statuses — except the
+runtime **may idle the resuming vCPU** on the resumed fiber's own registered waiter instead of
+returning the `FIBER_PARKED (3)` poll status. Advisory is the whole trick: returning
+`FIBER_PARKED` is a *conforming* implementation, so a guest still loops for completion exactly as
+with `cont.resume`, and the design's hard problems dissolve —
+- only the **tree-walk M:N oracle** idles (park into `svc_waiters` keyed on the fiber's domain,
+  the `Blocked::OfferPark` shape — woken for free by the `svc_wake_locked` every fiber-wake
+  already calls; swept by teardown; the idle deadline already includes the fiber's timer). The
+  interception is at both `fiber_park!` (switch-in → fiber parks → idle) and the `cont.resume`
+  `StillParked` re-poll, keyed by a `run_inner`-local marker on the resumed fiber slot;
+- the **bytecode** and **Cranelift JIT** backends and the **deterministic explorer** alias it to
+  `cont.resume` (return `FIBER_PARKED`) — no idle core needed, **no compile veto, nothing
+  de-JITed**, invariant 9 holds by definition;
+- **freeze / durability**: gated on `!durable`, so a durable run takes the `FIBER_PARKED`
+  downgrade (guest loops) and freeze-on-quiesce is untouched (the F1 precedent);
+- **teardown (#440)**: the idle resumer parks through `park_gate` into `svc_waiters`, swept by
+  `teardown_domain`/`teardown_run` on exit/trap/freeze exactly like `OfferPark`.
+
+Pins: `svm-interp/tests/blocking_resume.rs` (oracle idle-on-timer with a **fuel** proof it does
+not spin, cross-vCPU notify wake, sibling-trap frees a blocked resumer);
+`svm/tests/fiber_blocking_resume.rs` (advisory conformance — the looping form agrees
+TreeWalk ≡ Bytecode ≡ Cranelift JIT). jacl swaps one opcode in its existing poll loop.
+
+**PARITY on the production backends (2026-08-08).** #672 idled only the oracle (the test tier); prod
+runs on svm-jit + wasm-jit, so the idle was extended to the tiers that matter:
+- **Bytecode (+ wasm-jit)** — the cooperative `drive` idles the resumer's task as
+  `TaskState::BlockedOnFiber` (rewind the resume op; a top-of-loop scan re-runs it when the fiber
+  wakes via idle-timer / notify / cap-drain), burning zero fuel. wasm-jit folds fibers to this
+  driver (`DriveMode::InterpDriven`), so it is covered for free. Scoped to `drive` via a
+  `cooperative` flag on `step_vcpu`.
+- **Cranelift JIT** — `fiber_resume_block` parks the resumer's **OS thread** on `Domain.futex_cv`
+  and re-resumes, woken by any `notify`/teardown broadcast and bounded by the `KILL_RECHECK`
+  re-poll (so a timed wait's deadline, a kill, a freeze, or teardown is observed with **no timer
+  thread**). A fiber-using module now always builds the `Domain` (the thunk takes its pointer).
+  Correctness does not depend on the broadcast — the bounded re-poll guarantees progress — so
+  there is no lost-wakeup race beyond the futex-core primitives already loom-checked; a bespoke
+  fiber-modeling loom test is out of scope (the loom model doesn't model fibers).
+
+Now pinned on **all three backends** in `svm/tests/fiber_blocking_resume.rs`: a **no-loop**
+`cont.resume.block` of a timed-wait fiber returns the fiber's real result (`102`) — a spinning alias
+would return the transient `300` — plus a cross-vCPU **notify** wake, both across TreeWalk +
+Bytecode + Cranelift JIT.
+
+**Remaining follow-up (small):** the bytecode/JIT **OS-thread-parallel** driver variants
+(`drive_parallel`, the single-vCPU `Vcpu::run`) still take the advisory `FIBER_PARKED` downgrade —
+the same OS-thread-park mechanism, applied to those driver entry points.
 
 ---
 

@@ -634,9 +634,10 @@ fn verify_func(
                 types.push(ValType::I32);
                 continue;
             }
-            // §12 `cont.resume` appends two results `(status: i32, value: i64)`, so —
-            // like `call` — it is checked here rather than in `check_inst`.
-            if let Inst::ContResume { k, arg } = inst {
+            // §12 `cont.resume` (and its I48 blocking variant) appends two results
+            // `(status: i32, value: i64)`, so — like `call` — it is checked here rather than
+            // in `check_inst`. Both variants have identical operand + result typing.
+            if let Inst::ContResume { k, arg } | Inst::ContResumeBlock { k, arg } = inst {
                 let cx = Cx {
                     fi,
                     bi,
@@ -872,7 +873,7 @@ fn block_value_types(b: &Block, funcs: &[Func], has_memory: bool) -> Vec<ValType
             }
             Inst::CallIndirect { ty, .. } => types.extend_from_slice(&ty.results),
             Inst::CapCall { sig, .. } => types.extend_from_slice(&sig.results),
-            Inst::ContResume { .. } => {
+            Inst::ContResume { .. } | Inst::ContResumeBlock { .. } => {
                 types.push(ValType::I32); // status
                 types.push(ValType::I64); // value
             }
@@ -1576,6 +1577,7 @@ fn check_inst(
         | Inst::CallIndirect { .. }
         | Inst::CapCall { .. }
         | Inst::ContResume { .. }
+        | Inst::ContResumeBlock { .. }
         | Inst::SetJmp { .. }
         | Inst::LongJmp { .. }
         | Inst::ThreadSpawn { .. } => return Ok(None),
