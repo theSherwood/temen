@@ -118,6 +118,44 @@ try {
     ? ok('svm-leng self-host card: real hexer Leng → SVM IR in-browser')
     : fail(`svm-leng run: state=${leng.state} result=${leng.result} stdout=${leng.stdout.slice(0, 80)}`);
 
+  // The QuickJS card is wired to the warm-runtime snapshot (WASM_AOT.md): it defaults to the warm path
+  // (svm_warm_open runs the QuickJS runtime init once, svm_warm_eval restores that image + evals per Run).
+  // Its qjs_snapshot.svmb is committed (always present), so no build guard is needed.
+  {
+    const qjsName = 'JavaScript (QuickJS — write & run JS)';
+    const msOf = (t) => { const m = /· (\d+)ms/.exec(t); return m ? Number(m[1]) : NaN; };
+    const readQ = () => page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+      stdout: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(qjsName));
+    const setQ = (src) => page.evaluate(({ sel, src }) =>
+      document.querySelector(`${sel} .CodeMirror`).CodeMirror.setValue(src), { sel: card(qjsName), src });
+    // 1) First Run of the sample program — warms the runtime once; tier reports warm-snapshot.
+    await runCard(page, qjsName, 30_000);
+    const q1 = await readQ();
+    q1.state === 'done' && q1.msg.includes('warm-snapshot')
+      && q1.stdout.includes('fib(0..10): 0 1 1 2 3 5 8 13 21 34 55') && q1.stdout.includes('sorted: 1,2,3,5,7,8,9')
+      ? ok('QuickJS card runs on the warm-runtime snapshot → correct output')
+      : fail(`qjs first run: ${JSON.stringify({ state: q1.state, msg: q1.msg, out: q1.stdout.slice(0, 80) })}`);
+    // 2) Second Run — warm session reused: byte-identical output, and much faster (rebuild paid once).
+    await runCard(page, qjsName, 30_000);
+    const q2 = await readQ();
+    q2.state === 'done' && q2.stdout === q1.stdout && msOf(q2.msg) * 2 < msOf(q1.msg)
+      ? ok(`QuickJS warm reuse: byte-identical, ${msOf(q1.msg)}ms → ${msOf(q2.msg)}ms (runtime rebuilt once)`)
+      : fail(`qjs warm reuse: ${JSON.stringify({ q1: msOf(q1.msg), q2: msOf(q2.msg), same: q2.stdout === q1.stdout })}`);
+    // 3) Fresh-per-Run isolation: a global defined in one Run must NOT survive into the next.
+    await setQ('var leaked = 42; typeof leaked;\n');
+    await runCard(page, qjsName, 30_000);
+    const qd = (await readQ()).stdout;
+    await setQ('typeof leaked;\n');
+    await runCard(page, qjsName, 30_000);
+    const qa = (await readQ()).stdout;
+    qd.trim().endsWith('number') && qa.trim().endsWith('undefined')
+      ? ok('QuickJS fresh-per-Run isolation: a global from one Run does not leak into the next')
+      : fail(`qjs isolation: define=${JSON.stringify(qd.slice(-20))} after=${JSON.stringify(qa.slice(-20))}`);
+  }
+
   // The C-compiler card mounted a C-mode editor.
   const cc = await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`)?.CodeMirror?.getOption('mode'),
     card('C compiler (chibicc → SVM — compile & run)'));
