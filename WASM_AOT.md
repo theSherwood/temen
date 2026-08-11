@@ -42,6 +42,14 @@ Three separate causes, none of which a new backend addresses:
    `chase_rand` ~3.4×). Not V8 compile time (~6 ms for 3 MB), not the giant function itself
    (TurboFan compiles it; relooper A/B'd at zero gain and reverted). BROWSER.md § slice-8 already
    names the real levers: **redundant-check elimination with proof**, or function splitting.
+4. **Program-independent runtime init, re-run every Run.** For a language on-ramp (QuickJS, Lua,
+   Postgres…) each Run rebuilds the whole guest runtime before it touches the user's code —
+   `JS_NewRuntime` + `JS_NewContext` + every intrinsic for QuickJS. It is *fixed* (identical for a
+   trivial program and a heavy one) and it dominates the wall clock of a light script: in Chromium
+   the qjs warm floor is ~380 ms whether the input is empty, `1;`, or the user's fib/sort/JSON
+   program — the program itself contributes ~0. Neither a new backend nor the slice-1 code cache
+   touches this: the cache keeps V8's *compiled code* warm, but `JS_NewRuntime` still runs from
+   scratch every Run. The lever is a **warm-runtime snapshot** (follow-on to slice 1 below).
 
 ## 3. What "pure wasm" would buy, and its sanctioned form
 
@@ -159,6 +167,75 @@ over `encode_module`, the same identity the durable module-grant registry alread
   Run of a light script (hello_c 4 ms) now beats interpreter-only (~8 ms) — footgun closed, pinned by
   `browser-jit-cache-test.mjs`.
 
+### Follow-on to slice 1 — warm-runtime snapshot (PROTOTYPED native; the do-nothing-program floor)
+
+Slice 1 caches *code*; it does nothing about **cause 4** — the program-independent runtime init that
+re-runs every Run. This prototype attacks that directly: run the guest's init **once**, snapshot the
+post-init guest memory, and **restore the snapshot per Run**, evaluating only the user's code on top.
+
+- **Shape.** Split the on-ramp driver into three exports (`crates/svm-run/demos/quickjs/qjs_snapshot.c`):
+  `main` (the original cold read→init→eval→print, the baseline), `warmup` (init runtime+context+bindings
+  into statics, then return — no stdin, no eval, so the produced memory is program-independent), and
+  `eval_run` (read stdin, eval over the warm context, print). The host snapshots after `warmup` and
+  restores before each `eval_run`.
+- **Fresh-per-Run isolation is preserved (INVARIANT #6).** Every Run restores the *same* post-warmup
+  image into a fresh zeroed window, so a `var` defined in one Run cannot leak into the next. Proven by
+  byte-for-byte cold≡warm output parity (below); this is the same fresh-activation guarantee the
+  code cache already holds, extended to a restored-not-rebuilt warm image.
+- **The memory-model wrinkle (why it's not just a memcpy of the window).** These are ordinary exports
+  (`params = [i64 sp]`), not the synthesized `_start` (func 0), so the harness reproduces what `_start`
+  does for the on-ramp: grant the §3e powerbox + bind the module's manifest imports (deterministic
+  handles, re-established per Run), seed the guest heap bump words (`POWERBOX_HEAP_BRK`/`_TOP`), and
+  pass `sp = powerbox_entry_sp`. The on-ramp allocator grows the heap **above** the declared window
+  (`heap_base = 1 << size_log2`), and that growth's mapped-width state lives in the `Mem`, *not* in the
+  window bytes — so a naïve window memcpy restores the bytes but faults on the warm heap
+  (`MemoryFault`). The prototype maps a **larger window** (2^26) so the whole heap stays inside the
+  mapped region: no `vm_map` growth, a contiguous guest image captured by a plain memcpy of the live
+  prefix `[0, brk)`. (The browser already sizes `winSize` to hold the heap — same idea.)
+- **Measured native** (`crates/svm-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
+  same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
+  restore ~3.5 ms (memcpy the live prefix).
+
+  | program | cold ms | warm ms (restore+eval) | speedup |
+  | --- | --- | --- | --- |
+  | `1;` (trivial) | 32 | 8 | **4.0×** |
+  | fib/sort/JSON (user's) | ~150 | ~105 | ~1.4× |
+  | 100k-iter loop | ~3900 | ~3150 | ~1.2× |
+
+  Byte-identical output on all three (`fib 0 1 1 2 …`, sorted array, `JSON.stringify` incl. `Math.PI`,
+  `0.1+0.2`, the loop sum `4999950000`). The fixed ~24 ms init is replaced by a ~3.5 ms restore — the
+  win is largest for light scripts (where init dominated) and shrinks as the eval itself grows, exactly
+  as cause 4 predicts.
+- **Browser plumbing — PROTOTYPED (`svm_warm_open`/`svm_warm_eval`/`svm_warm_close`).** A stateful
+  browser session (`browser/src/lib.rs`, the twin of the native prototype and of the `PgSession`
+  reactor): `svm_warm_open` decodes the two-phase driver, enlarges the mapped window to `WARM_MAPPED_LOG2`
+  (2^26 — the same keep-the-heap-inside trick), runs `warmup` **once** over an owned window, and keeps
+  the live prefix `[0, brk)` as the warm image; `svm_warm_eval` restores that image (zeroing only the
+  heap tail a prior eval grew, for byte-identical fresh state) and runs `eval_run`, staging stdout into
+  the same capture slots `svm_run_onramp` uses; `svm_warm_close` frees it. Reuses `grant_onramp_caps` and
+  `SharedProgram::run_over(seed_data=false)`. Keeping the whole ~4 MiB image (vs the reactor `Session`'s
+  256 KiB `REACTOR_SNAP_CAP`) is what closes the gap for QuickJS.
+- **Measured in Node/V8** (`browser/warm-snapshot-test.mjs`, the shipping engine FFI, the committed
+  `web/assets/qjs_snapshot.svmb`): warmup once ~430 ms — i.e. the QuickJS runtime rebuild **is** the
+  ~380–430 ms warm floor — then:
+
+  | program | cold ms | warm ms (restore+eval) | speedup |
+  | --- | --- | --- | --- |
+  | `1;` (trivial) | ~570 | **2** | **~250×** |
+  | fib/sort/JSON (user's) | ~400 | ~70 | ~6× |
+  | 100k-iter loop | ~4600 | ~2900 | ~1.6× |
+
+  Byte-identical cold≡warm output on all three (`svm_run_onramp` `_start`/cold vs `svm_warm_eval`/warm).
+  The "do-nothing program takes >1 s" case collapses to ~2 ms — the whole fixed init is gone. The win is
+  far larger than native because the browser runs QuickJS init through the interpreter-in-wasm; it also
+  composes with the slice-1 code cache (cache keeps V8's code warm, snapshot skips `JS_NewRuntime`).
+- **Card wiring (next).** The exports exist and are proven; wiring the playground's qjs card to
+  `open`-once-then-`eval`-per-Run (with a warm session cached across Runs, invalidated on module change)
+  is the remaining UI step. Kept separate so the reactor lands with its own test first.
+- **Gate (met):** cold≡warm output parity on the QuickJS on-ramp across trivial/heavy/loop inputs,
+  native (`qjs_snapshot.rs`) and through the wasm FFI (`warm-snapshot-test.mjs`), with the fixed-init
+  cost demonstrably removed from the warm path.
+
 ### Slice 2 — default the JIT tier on where eligible — LANDED
 
 - **Demo cards — already default-on.** Every `ex.jit` card already builds its "wasm-JIT" checkbox
@@ -233,5 +310,5 @@ that consumers can often sidestep the need entirely. Revisit if one shows up.
 | --- | --- |
 | #1 small core | no new backend; cache + default-flip are embedder policy; elision is evidence-gated |
 | #2 confinement = masking pass | slice 3 stays inside the pass, fuzzed per elision form; standalone export deferred behind renegotiation |
-| #6 one world / fresh activation | cache holds code only, never window state; pinned by test |
+| #6 one world / fresh activation | cache holds code only, never window state; the warm-runtime snapshot restores an identical *program-independent* post-init image into a fresh zeroed window per Run (no guest state crosses Runs) — pinned by cold≡warm output parity |
 | #9 oracle; decline, never diverge | routing predicate unchanged and single; parity gates run in both toggle-default states; slice 0 fixes a decline-path fault |
