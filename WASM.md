@@ -56,7 +56,8 @@ Scope caveat: SVM runs **one entry over a fresh window per call**, with no persi
 mutate a global) can't be reproduced and are reported `skip`. The pass is meaningful for **pure**
 assertions — `(invoke "op" const-args) → result` — which is the shape of essentially all the
 numeric/conversion/**SIMD** value tests. (`assert_trap` on an OOB access is `trap-divergence`, not a
-fail — SVM masks into its window per §1a.)
+fail — since D63 SVM *does* trap out-of-window (`MemoryFault`), but at its power-of-two window
+boundary, not wasm's page-granular memory size, so the exact trap boundary can differ.)
 
 Result over the numeric + full SIMD suites (~60 files): **36.7k value assertions pass, 0 fail.** The
 pass surfaced exactly one real gap — SIMD float rounding (`f32x4`/`f64x2` `.ceil/.floor/.trunc/.nearest`)
@@ -323,11 +324,13 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
 
 ### ℹ️ Semantic divergence (not a missing feature)
 
-- **OOB access masks, doesn't trap.** SVM confines an out-of-bounds linear-memory access by **masking**
-  into the power-of-two window (§4), where wasm **traps**. Not a miscompile for well-behaved programs,
-  but a program that *relies on* an OOB trap (conformance tests; defensive trap-probing) diverges. So
-  "passes the wasm spec test suite" is not automatic. (This is the documented §1a confinement model,
-  not a bug.)
+- **OOB trap boundary differs.** Since D63 (trap-confinement, superseding the old mask-and-continue
+  model) SVM **traps** an out-of-window access with `MemoryFault`, like wasm — but at its
+  power-of-two window boundary (`eff > mapped - width`, §4), where wasm traps at the instance's
+  page-granular memory size. Not a miscompile for well-behaved programs, but a program that *relies
+  on* the exact trap boundary (conformance tests; defensive trap-probing near the edge) can diverge
+  where the window size and the wasm memory size disagree. So "passes the wasm spec test suite" is
+  not automatic — though far closer than under the pre-D63 masking model this note used to describe.
 
 ---
 
