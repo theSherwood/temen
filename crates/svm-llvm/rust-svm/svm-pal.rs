@@ -25,3 +25,44 @@ pub fn unsupported_err() -> std_io::Error {
 pub fn abort_internal() -> ! {
     core::intrinsics::abort();
 }
+
+/// The bridge to the **POSIX personality** capability the embedder grants by name (`run_with_caps`
+/// with `("posix", …)`): `__vm_cap_resolve("posix")` → a handle, then `__vm_host_call(handle, op, …)`
+/// drives the op table (svm-posix `OP_*`). This is how the richer `std::sys` surface — `time` here,
+/// `fs`/`env` later — reaches the host, distinct from the powerbox stdout/exit streams. Each op has
+/// its own wrapper so the `op` argument is a **compile-time constant** at the `__vm_host_call` site
+/// (the on-ramp requires it).
+pub(crate) mod host {
+    use crate::sync::atomic::{AtomicI32, Ordering};
+
+    unsafe extern "C" {
+        fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
+        fn __vm_host_call(handle: i32, op: i32, a: i64, b: i64, c: i64, d: i64) -> i64;
+    }
+
+    // `-1` = not-yet-resolved sentinel (a real handle is non-negative); resolved once, then cached.
+    static POSIX: AtomicI32 = AtomicI32::new(-1);
+
+    /// The `posix` personality handle, or a negative value if the embedder granted none.
+    fn posix() -> i32 {
+        let cached = POSIX.load(Ordering::Relaxed);
+        if cached != -1 {
+            return cached;
+        }
+        let h = unsafe { __vm_cap_resolve(b"posix".as_ptr(), 5) };
+        POSIX.store(h, Ordering::Relaxed);
+        h
+    }
+
+    /// Whether a posix personality is available (a time/fs/env op can be attempted).
+    pub(crate) fn have_posix() -> bool {
+        posix() >= 0
+    }
+
+    /// `clock(clock_id) -> nanos` (svm-posix `OP_CLOCK` = 33). `clock_id == 1` is monotonic, else
+    /// realtime. `op` is the literal `33` at the call site.
+    #[inline(always)]
+    pub(crate) fn clock(clock_id: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 33, clock_id, 0, 0, 0) }
+    }
+}

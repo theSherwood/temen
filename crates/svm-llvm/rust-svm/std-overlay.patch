@@ -120,3 +120,16 @@
      _ => {
          mod unsupported;
          pub use unsupported::*;
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -44,6 +44,10 @@
+         mod xous;
+         use xous as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;

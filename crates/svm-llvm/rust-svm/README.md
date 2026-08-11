@@ -13,11 +13,12 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | File | What it is |
 |---|---|
 | `x86_64-unknown-svm.json` | The custom target spec. `os=svm`, `panic=abort`, `singlethread=true` (single-threaded but keeps 64-bit atomics), static reloc, no PIE. |
-| `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the right leaf-module impls: the minimal (no-OS, single-thread) ones for `sys/{alloc,thread_local,random,io/error}` (as `vexos`/`zkvm` do), the new svm `stdio` module, and the powerbox `exit` in `sys/exit.rs`. 26 added lines across 6 files. |
+| `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the right leaf-module impls: the minimal (no-OS, single-thread) ones for `sys/{alloc,thread_local,random,io/error}` (as `vexos`/`zkvm` do), the svm `stdio`/`pal`/`args`/`time` modules, and the powerbox `exit` in `sys/exit.rs`. 42 added lines across 9 files. |
 | `svm-alloc-imp.rs` | The allocator `imp` (copied to `sys/alloc/svm.rs`). Forwards `alloc`/`dealloc`/`realloc` to the C `malloc` family, which the on-ramp synthesizes as an in-window guest bump allocator (LLVM.md slice S). |
 | `svm-stdio-imp.rs` | The stdio PAL (copied to `sys/stdio/svm.rs`). `Stdin`/`Stdout` reach the host through `extern "C" write`/`read` (on-ramp "Lane C" → powerbox stdout/stdin, POSIX.md 0/1); `Stderr` calls `__vm_write_stderr` → the distinct powerbox stderr `Stream`. So `println!` and `eprintln!` write real bytes on separate streams. |
-| `svm-pal.rs` | The svm PAL proper (copied to `sys/pal/svm.rs`). Mirrors the `unsupported` PAL, but its `init` captures the powerbox-threaded `argv` (calls `sys::args::init`) so `std::env::args` works. |
+| `svm-pal.rs` | The svm PAL proper (copied to `sys/pal/svm.rs`). Mirrors the `unsupported` PAL, but its `init` captures the powerbox-threaded `argv` (so `std::env::args` works), and it hosts the `host` bridge — `__vm_cap_resolve("posix")` + per-op `__vm_host_call` wrappers — that the richer surface (`time`, later `fs`/`env`) reaches the host through. |
 | `svm-args-imp.rs` | The args module (copied to `sys/args/svm.rs`). Stores `(argc, argv)` at init and walks them as C strings on demand — the "stored at startup" half of the unix strategy, no `os::unix` dependency. |
+| `svm-time-imp.rs` | The time module (copied to `sys/time/svm.rs`). `Instant`/`SystemTime::now()` call the PAL `host` bridge's `clock` op (svm-posix `OP_CLOCK`) — monotonic for `Instant`, realtime for `SystemTime`. Needs a granted `posix` cap (`run_with_caps`); without one the clock reads zero. |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -66,11 +67,16 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   (`ll/parse.rs`); the earlier "packed-struct globals" suspicion was wrong (those
   parse fine). Everything else — malloc-synth, the `Memory` grant, `lang_start` —
   worked as-is off the bin's `main`.
-- **Working today:** stdout (`println!`), **`stderr` (`eprintln!`, a distinct
-  stream)**, `process::exit`, `env::args`, heap/`Vec`, collections, `fmt`,
-  iterators.
-- **Not yet:** `File`/`fs`, `env`, `time` (S2+, over `__vm_host_call`+posix).
-  Tracked in RUST_STD.md.
+- **Working today:** stdout (`println!`), `stderr` (`eprintln!`), `process::exit`,
+  `env::args`, **`std::time`** (`Instant`/`SystemTime`, via a granted posix cap),
+  heap/`Vec`, collections, `fmt`, iterators.
+- **The two paths:** the powerbox stream/exit handles carry stdio/exit/args (no
+  extra grant); the **posix-cap path** (`run_with_caps` + a `posix` cap, reached
+  via the PAL `host` bridge's `__vm_host_call`) carries `time` now and `fs`/`env`
+  next — this is where the richer, many-op surface scales without growing the
+  powerbox.
+- **Not yet:** `File`/`fs`, `env::var`/`set_var` (S2+ on the posix path). Tracked
+  in RUST_STD.md.
 
 ## Reproducibility note
 

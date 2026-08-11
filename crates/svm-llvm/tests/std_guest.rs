@@ -105,6 +105,38 @@ fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Translate + verify + run `src` on the powerbox **with a granted `posix` cap** (`run_with_caps`),
+/// letting `seed` stage the personality (env, a pinned clock, …) → `(stdout, exit)`. This is the
+/// richer-`std::sys` path (`time` here, `fs`/`env` later) that reaches the host via `__vm_host_call`.
+fn svm_run_std_posix(
+    name: &str,
+    src: &str,
+    seed: impl FnOnce(&svm_posix::Posix),
+) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    seed(&posix);
+    let out = svm_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps(
+            svm_run::Backend::Jit,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap)],
+        )
+        .expect("run_with_caps");
+    let exit = match out.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((out.stdout, exit))
+}
+
 /// Translate + verify + run `src` as a std guest on the powerbox → `(stdout, exit code)`.
 fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     let ll = build_std_bin_ll(name, src)?;
@@ -388,4 +420,39 @@ fn std_env_args_match_native() {
             "native also sees argc = 3"
         );
     }
+}
+
+/// S2 — `std::time` via the **posix-cap path**: `SystemTime`/`Instant` reach the host clock through
+/// the svm PAL's `__vm_host_call` bridge to the granted `posix` personality (`OP_CLOCK`). Run with a
+/// **pinned clock** so the output is deterministic — the first exercise of `run_with_caps` + a posix
+/// cap, and of the §9 constant-`op` requirement (`op` is the literal `33` at the call site).
+#[test]
+fn std_time_reads_the_posix_clock() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest time (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::time::{SystemTime, UNIX_EPOCH, Instant};\n\
+         fn main() {\n\
+         \x20   let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();\n\
+         \x20   println!(\"realtime_secs = {secs}\");\n\
+         \x20   let a = Instant::now();\n\
+         \x20   let b = Instant::now();\n\
+         \x20   println!(\"monotonic_nondecreasing = {}\", b >= a);\n\
+         }\n";
+
+    // Pin the clock to 1.7e18 ns = 1_700_000_000 s, so the output is fully determined.
+    let seeded_nanos: i64 = 1_700_000_000_000_000_000;
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_time", src, |p| p.set_clock(seeded_nanos))
+    else {
+        eprintln!("note: skipping std_guest time (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "realtime_secs = 1700000000\nmonotonic_nondecreasing = true\n",
+        "std::time reads the seeded posix clock, and Instant is non-decreasing"
+    );
 }
