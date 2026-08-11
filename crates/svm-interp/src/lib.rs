@@ -16231,6 +16231,26 @@ impl Host {
                         None => return Err(i as u32),
                     }
                 }
+                // Bash path — a named grant may be a raw **`HostProc`** (an embedder host cap
+                // re-granted to a child by name via the op-13 grant list, e.g. the `"vm_fs"`
+                // memfs seam). Unlike offers/live-impls it carries no typed interface, so there is
+                // no coverage walk — a compiled-C `call.sym "vm_fs"` is a flat `(…)->(i64)` import
+                // that dispatches op-0 on the handle (the fs op rides in arg0). Bind the single
+                // slot straight to the `HostProc` handle; the `CAP_IMPORT_TYPE_ID` translation
+                // then routes the call to the registered closure. Flat imports only (a grouped
+                // interface import can never name a raw host cap).
+                if req_names.len() == 1
+                    && matches!(self.resolve(h, cap_id::HOST_PROC), Ok(Binding::HostProc(_)))
+                {
+                    let b = if rebindable {
+                        BoundImport::rebindable(cap_id::HOST_PROC, 0, Some(h))
+                    } else {
+                        BoundImport::required(cap_id::HOST_PROC, 0, h)
+                    };
+                    bindings.push(b);
+                    remaps.push(None);
+                    continue;
+                }
             }
             // stdio convention (S15b): `write`→the `"stdout"` grant, `read`→the `"stdin"` grant, so a
             // **filter** granted both streams binds each libc call to the right end. Fall back to the

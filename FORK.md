@@ -495,6 +495,27 @@ unchanged (status / `-ECHILD` / `-EAGAIN`). Proven by
 **parks forever** (`atomic.wait`, timeout `-1`) so a blocking `wait` *would* hang — `WNOHANG`
 deterministically returns `0`. Stable 0/40 under stress.
 
+**Run a real command end-to-end — a `cat` reading a real file. DONE (increment 3).** The command the
+child `execve`s is no longer a trivial `write("EXEC")` stub: it `open`/`read`/`close`s a file from a
+granted **`vm_fs` capability** (the shared in-memory filesystem, `crates/svm-fs`) and echoes the bytes
+to stdout — real file I/O by a real separate program running as the child's task. Two increments, both
+in `c_fork.rs`:
+- **3a (isolation, no fork):** `a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap` — a
+  nested op-13-spawned guest `execve`s the `cat` command; the manager re-grants `{stdout, cmd, vm_fs}`
+  and the guest carries `{stdout, vm_fs}` into the exec grant list. Proves the fs-cap-through-exec
+  plumbing on its own.
+- **3b (the full loop):** `a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits`
+  — `fork()` → `execve(cat)` → `wait()`, all compiled C, with the manager re-granting **five** caps
+  (fork/wait offers, stdout, cmd, vm_fs). The parent reaps the `cat`'s exit (the byte count).
+- **The binding half (the one svm-interp change):** `bind_child_manifest` now binds a compiled-C
+  `call.sym "vm_fs"` (chibicc's `__vm_fs`, op-in-arg0) to a **`HostProc`** re-granted to the child by
+  name. A raw host cap carries no typed interface, so there's no coverage walk — a flat import binds
+  op-0 straight to the handle, and the `CAP_IMPORT_TYPE_ID` translation routes the call (with the fs op
+  in `args[0]`) to the registered closure. This is the same op-in-arg0 wrapper `c_link.rs` uses at the
+  top level, now reachable through the op-13 grant list so a spawned/exec'd child inherits fs authority.
+  The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
+  into a child, so the memfs store is shared across the fork.
+
 **Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
 BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control — `wait`
 for **any** child (`waitpid(-1, …)`) and process groups (which need per-parent child tracking, not just

@@ -467,6 +467,169 @@ fn a_nested_compiled_c_guest_execs_a_separate_command() {
     );
 }
 
+/// FORK.md §8.6 (increment 3a) — **a real command reading a real file**: the isolation slice of the
+/// "run a real command end-to-end" milestone. A nested op-13-spawned compiled-C guest `execve`s into a
+/// small `cat`-shaped command that `open`/`read`/`close`s a file from a granted **`vm_fs` capability**
+/// (the shared in-memory filesystem, `crates/svm-fs`) and writes the bytes to stdout — no fork/wait yet,
+/// so this proves the fs-cap-through-exec plumbing on its own. Three caps ride the exec grant list:
+/// `"stdout"` (the inherited stream), `"cmd"` (the command module — a module regrant), and `"vm_fs"`
+/// (the memfs `HostProc`, re-granted by name so `bind_child_manifest` binds the command's
+/// `call.sym "vm_fs"` straight to the closure — the op-in-arg0 fs protocol). The manager seeds
+/// `greeting = "HELLO"` host-side; the command reads it back through the cap and echoes it.
+const FS_CAT_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+long __vm_fs(long op, long a, long b, long c, long d);
+static char path[] = "greeting";
+static char buf[128];
+int main(int argc, char **argv) {
+  long fd = __vm_fs(0, (long)path, 8, 1, 0);   /* FS_OPEN(path, len=8, O_READ) */
+  if (fd < 0) return 1;
+  long n = __vm_fs(1, fd, (long)buf, 128, 0);  /* FS_READ(fd, buf, cap) */
+  if (n > 0) write(1, buf, n);
+  __vm_fs(4, fd, 0, 0, 0);                     /* FS_CLOSE(fd) */
+  return (int)n;
+}
+"#;
+
+/// The nested guest (no fork/wait): resolve the three re-granted caps by name, build a **2-entry** exec
+/// grant list `{"stdout" → stream, "vm_fs" → memfs}` (the command inherits both), and `execve` into the
+/// `"cmd"` command. Mirrors `NEXEC_GUEST_SRC` but carries the fs cap forward to the exec'd image.
+const FS_GUEST_SRC: &str = r#"
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grecs[2];
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static char fs_name[] = "vm_fs";
+int main(int argc, char **argv) {
+  long cmd = __vm_resolve(cmd_name, 3);
+  long soh = __vm_resolve(stdout_name, 6);
+  long fsh = __vm_resolve(fs_name, 5);
+  grecs[0].name_off = (int)(long)stdout_name;
+  grecs[0].name_len = 6;
+  grecs[0].handle = (int)soh;
+  grecs[1].name_off = (int)(long)fs_name;
+  grecs[1].name_len = 5;
+  grecs[1].handle = (int)fsh;
+  __vm_exec_module(cmd, (long)grecs, 2, 0, 17);
+  return -1;
+}
+"#;
+
+/// The manager: `main(inst, stream, guestmod, cmdmod, fscap)` spawns the guest via op 13 with a
+/// **3-entry** grant list `{"stdout" → stream, "cmd" → cmdmod, "vm_fs" → fscap}` (the fs `HostProc`
+/// re-granted by name — `regrant_into_child` re-mints its forkable closure over the shared store), then
+/// joins the guest. Like `NEXEC_MANAGER` with the fs cap added as a third entry.
+const FS_MANAGER: &str = r#"
+memory 19
+data 310 "stdout"
+data 330 "cmd"
+data 340 "vm_fs"
+func (i32, i32, i64, i64, i32) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
+  vq = i64.const 0
+  vcmod32 = i32.wrap_i64 vcmod
+  va0 = i64.const 256
+  vnp0 = i32.const 310
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 330
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  vthree = i32.const 3
+  i32.store va4 vthree
+  va5 = i64.const 280
+  i32.store va5 vcmod32
+  va6 = i64.const 288
+  vnp2 = i32.const 340
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  vfive = i32.const 5
+  i32.store va7 vfive
+  va8 = i64.const 296
+  i32.store va8 vfs
+  vgp = i64.const 256
+  vgn = i64.const 3
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+"#;
+
+#[test]
+fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
+    let manager = Arc::new(parse_module_raw(FS_MANAGER).expect("parse fs manager"));
+    verify_module(&manager).expect("verify fs manager");
+    let guest = parse_module_raw(&c_to_ir(FS_GUEST_SRC)).expect("parse fs guest");
+    verify_module(&guest).expect("verify fs guest");
+    let cmd = parse_module_raw(&c_to_ir(FS_CAT_CMD_SRC)).expect("parse fs command");
+    verify_module(&cmd).expect("verify fs command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // The shared in-memory filesystem, seeded `greeting = "HELLO"`. The cap is granted **forkable**
+    // (a factory that re-mints the closure over the one shared store), the shape `regrant_into_child`
+    // carries into a spawned child; the op-in-arg0 wrapper drops the dispatch op and forwards `args[0]`
+    // as the fs op (matching the compiled-C `call.sym "vm_fs"` protocol, as in `c_link.rs`).
+    let (factory, _memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("greeting".to_string(), b"HELLO".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(5)],
+        "the command read all 5 bytes of `greeting` and returned the count"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"HELLO",
+        "the real `cat` command echoed the file it read through the granted fs cap"
+    );
+}
+
 /// FORK.md §8.6 — **the shell command loop with a *real* `execve`**: `fork()` → **`execve` (image
 /// -replace of a separate command module)** → `wait()`, all in ordinary compiled C. This upgrades the
 /// multicall stand-in above to the true capstone — the forked child *becomes a different program*.
@@ -675,6 +838,229 @@ fn a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command() {
     assert_eq!(
         &out, b"EXEC",
         "the exec'd separate command did real I/O through the inherited stdout"
+    );
+}
+
+/// FORK.md §8.6 (increment 3b) — **run a real command end-to-end**: the capstone of the milestone.
+/// `fork()` → `execve` (into a separate command) → `wait()`, all compiled C — *and* the command the
+/// child becomes is the real `cat` from 3a, doing genuine file I/O through a granted `vm_fs` cap. This
+/// is the full POSIX shell loop over a real program: the parent forks, the twin replaces its image with
+/// `cat`, `cat` `open`/`read`/`close`s `greeting` from the shared memfs and writes `"HELLO"` to the
+/// inherited stdout, and the parent reaps the twin's exit status (the byte count). The manager re-grants
+/// **five** caps (fork/wait offers, stdout, cmd, and now `vm_fs`); the forked child carries `stdout` +
+/// `vm_fs` into its execve grant list so the exec'd `cat` inherits the filesystem authority.
+const FS_FORK_GUEST_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grecs[2];
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static char fs_name[] = "vm_fs";
+static long pid;
+static long status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    long fsh = __vm_resolve(fs_name, 5);
+    grecs[0].name_off = (int)(long)stdout_name;
+    grecs[0].name_len = 6;
+    grecs[0].handle = (int)soh;
+    grecs[1].name_off = (int)(long)fs_name;
+    grecs[1].name_len = 5;
+    grecs[1].handle = (int)fsh;
+    __vm_exec_module(cmd, (long)grecs, 2, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The manager: like `EXECVE_MANAGER` but `main(inst, stream, guestmod, cmdmod, fscap)` re-grants a
+/// **5th** entry `{"vm_fs" → fscap}` (the memfs `HostProc`) so the forked child can carry it into its
+/// execve grant list. Grant list: `{stdout, __fork, __wait, cmd, vm_fs}`.
+const FS_FORK_MANAGER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "fork" 1 { op: 2 }
+export 1 interface "wait" 1 { op: 3 }
+data 400 "__fork"
+data 410 "stdout"
+data 420 "__wait"
+data 430 "cmd"
+data 440 "vm_fs"
+func (i32, i32, i64, i64, i32) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32) {
+  vq = i64.const 0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 262144
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vz0 = i64.const 0
+  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  v1c = i64.const 1
+  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vcmod32 = i32.wrap_i64 vcmod
+  va0 = i64.const 256
+  vnp0 = i32.const 410
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 400
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  i32.store va4 vsix
+  va5 = i64.const 280
+  i32.store va5 vforkoff
+  va6 = i64.const 288
+  vnp2 = i32.const 420
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  i32.store va7 vsix
+  va8 = i64.const 296
+  i32.store va8 vwaitoff
+  va9 = i64.const 304
+  vnp3 = i32.const 430
+  i32.store va9 vnp3
+  va10 = i64.const 308
+  vthree = i32.const 3
+  i32.store va10 vthree
+  va11 = i64.const 312
+  i32.store va11 vcmod32
+  va12 = i64.const 320
+  vnp4 = i32.const 440
+  i32.store va12 vnp4
+  va13 = i64.const 324
+  vfive = i32.const 5
+  i32.store va13 vfive
+  va14 = i64.const 328
+  i32.store va14 vfs
+  vgp = i64.const 256
+  vgn = i64.const 5
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+"#;
+
+#[test]
+fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest = parse_module_raw(&c_to_ir(FS_FORK_GUEST_SRC)).expect("parse fs-fork guest");
+    verify_module(&guest).expect("verify fs-fork guest");
+    let cmd = parse_module_raw(&c_to_ir(FS_CAT_CMD_SRC)).expect("parse fs-fork command");
+    verify_module(&cmd).expect("verify fs-fork command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let (factory, _memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("greeting".to_string(), b"HELLO".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The parent forked, the twin exec'd `cat`, and the parent reaped its exit status (5 bytes read).
+    assert_eq!(
+        r,
+        vec![Value::I64(5)],
+        "the parent's wait reaped the forked+exec'd `cat`'s exit status (5 bytes read)"
+    );
+    // A real command — a different program running as the child's task — read a real file from the
+    // shared memfs and echoed it through the inherited stdout.
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"HELLO",
+        "the forked+exec'd `cat` read `greeting` through the inherited fs cap and wrote it to stdout"
     );
 }
 
