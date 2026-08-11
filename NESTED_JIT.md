@@ -125,27 +125,49 @@ even for a plain tier-up), so it wants its own change with the Worker-side impor
 
 ---
 
-## Track 3 — `map` / `unmap` / `protect` + intra-window page enforcement  [DEFERRED — owner decision]
+## Track 3 — window-remapping ops + intra-window page enforcement  [DECIDED: (c)+(a) — built]
 
-Not in scope for this doc; recorded so the boundary is explicit.
+`AddressSpace` `map`/`unmap`/`protect` (iface 5, ops 0/1/2) and `SharedRegion` `map`/`unmap`
+(iface 4, ops 0/1) mutate which bytes back a window page, or its protection, *during the run*. The
+confinement model on the native tier is **mask + `PROT_NONE` guard region**: unmapped or wrongly
+protected pages fault via the host MMU (DESIGN.md §4:1075–1078, §13). **Wasm linear memory has no
+intra-memory page protection** — no `PROT_NONE` sub-region, and V8 exposes no way to protect a
+sub-range of a `WebAssembly.Memory`, so this holds in-browser too — so an emitted mask-only access
+sails straight through a page the interpreter (which enforces `Mem`'s page-protection + backing map,
+`svm-interp` `Load`/`Store` path) would trap on or back with different bytes.
 
-`AddressSpace` ops 0/1/2 (`map`/`unmap`/`protect`) stay out-of-subset (`lib.rs:784–788`). The
-whole confinement model on the native tier is **mask + `PROT_NONE` guard region**: unmapped or
-wrongly-protected pages fault via the host MMU (DESIGN.md §4:1075–1078, §13). **Wasm linear
-memory has no intra-memory page protection** — there is no `PROT_NONE` sub-region inside a wasm
-memory — so an emitted load sails straight through a page the interpreter would trap on.
+### Decision (owner, this session): **(c) + (a)**
+Not (b). The options weighed were (a) fail-closed to the interpreter; (b) a per-access software
+page-check in emitted code; (c) scope out intra-window page enforcement on the wasm tier. Analysis
+(chat, this session): a **gated** (b) could reach ~parity on cache-friendly, loop-invariant,
+write-scoped accesses but stays 1.5–3×+ on the random-access tail, and — the deciding factor — it
+puts a software-page-table lowering inside the **fuzzed confinement hinge** (INVARIANTS.md #2), TCB
+growth in exactly the place the prime directive says to keep tiny. (c)+(a) is *correct by
+construction* with **zero** TCB growth: the interpreter is the oracle (INVARIANTS.md #9), so running
+a page-managing module wholly on it cannot diverge. The only cost is that such a module gets no JIT
+acceleration — acceptable while no hot page-managing guest is on the horizon; gated-(b)-with-elision
+stays documented above as the escalation if one appears.
 
-Two sub-cases differ in severity:
-- **`unmap`/`protect`-RO then access** is a genuine *semantic divergence* (interp traps, JIT
-  returns stale/zero) — the differential oracle flags it. Must fail closed.
-- **D40 read-only const segments** (`protect` RO at instantiation, backing const globals / string
-  literals) is only a *defense-in-depth* gap: a guest corrupting its own const data can't escape,
-  it just loses the §5 self-corruption detect-and-kill. The wasm tier runs these guests
-  *correctly*, only without the hardening.
+### What "(a)" must mean — emit *nothing*, not "interp-driven with tier-up"
+The interpreter drive mode still **tiers up** in-subset functions, and a tiered-up emitted access is
+still mask-only — so it would diverge just like a wasm-driven one. Correct (a) is therefore: a module
+that reaches a window-remapping op emits **no functions at all** and runs as pure bytecode
+interpretation. (The op's *own* function was already out-of-subset; the hazard is every *other*
+emitted access in the module, which is why the gate is module-wide, not per-function.)
 
-Options (to discuss): (a) fail-closed — a unit using `unmap`/`protect` runs interpreter-driven
-(correct, cheap, gives up accel); (b) per-access software page-check in emitted code (kills §14's
-zero-overhead thesis — almost certainly not worth it); (c) scope it out — declare the wasm tier
-does not enforce intra-window page protection and such units run interpreter-driven (a deliberate
-renegotiation of the §4/§13 confinement invariant *on that tier*). The near-term recommendation
-is (a) + (c); (b) is not recommended.
+### Built (`crates/svm-wasm-jit/src/lib.rs`)
+- `func_uses_page_ops` / `module_uses_page_ops` — detect a reachable window-remapping op (iface 5
+  ops 0/1/2, iface 4 ops 0/1); queries (`page_size`, `sub`, `len`) don't count. Module-wide, like
+  `module_atomics_ok`, so it's sound for the un-rooted tier-up path too.
+- `compile_interp_only` — emit an imports-only module, all-`false` `emitted`, `InterpDriven`.
+- Both front doors gate up front: `compile_jit` and `compile_nested` return `compile_interp_only`
+  when `module_uses_page_ops`. Tests in `tests/page_ops.rs` pin the routing (page-op module emits
+  nothing; the same module minus the op still emits), the `SharedRegion` case, and that the
+  interp-only wasm validates and exports no function.
+
+**Boundary (still deferred with D40/§13):** a guest `grow` only *commits* within the fixed
+reservation the mask already permits, so it introduces no was-accessible-now-different transition and
+is **not** gated. D40 read-only const segments are applied host-side at instantiation (not a guest
+op), and remain a defense-in-depth-only gap on the wasm tier (a write to "const" data succeeds
+instead of faulting → loses §5 self-corruption detection; the guest still can't escape), unchanged by
+this work.
