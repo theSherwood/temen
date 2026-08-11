@@ -574,6 +574,16 @@ jobs:
   browser-real:
     name: real-browser (Chromium via Playwright)
     runs-on: ubuntu-latest
+    # The Pages deploy rides this required job (ISSUES.md I75): it already builds the whole deployable
+    # site (wasm engine + Postgres + chibicc + self-host), so assembling + uploading the Pages artifact
+    # here — on a main push — means the deploy needs no separate heavy job that starves for a runner.
+    # The `deploy-pages` job below publishes it; `site_ok` gates it. `pages: write` is for
+    # `configure-pages`; the assemble step is fail-soft so a Pages-asset hiccup never reds this gate.
+    permissions:
+      contents: read
+      pages: write
+    outputs:
+      site_ok: ${{ steps.pages_site.outputs.ok }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
@@ -678,6 +688,68 @@ jobs:
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
+
+      # ---- Pages deploy (main push only): assemble the site this job already built, then upload it as a
+      # Pages artifact for the `deploy-pages` job. FAIL-SOFT by construction — the step never exits
+      # nonzero, so a Pages-asset hiccup can't red this required gate; a missing REQUIRED asset just sets
+      # `ok=false` and the deploy is skipped (the scheduled `pages.yml` fallback catches it later, via its
+      # DEPLOYED_SHA gate). Mirrors `pages.yml`'s assemble+verify (same working-directory + commands).
+      - name: assemble + verify playground site
+        id: pages_site
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: browser
+        run: |
+          # The on-ramp module assets the site references but this job doesn't otherwise build
+          # (sqlite/lua/tcl/doom/gpu_shader + the shell command chain). Fail-soft: a MAY_BE_ABSENT card
+          # (doom/tcl) degrades to a hint; a required-asset miss is caught by check-play-assets below.
+          node build-onramp-assets.mjs || echo "on-ramp assets: some skipped"
+          SITE="$GITHUB_WORKSPACE/_site"
+          mkdir -p "$SITE/web/assets" "$SITE/target/wasm32-unknown-unknown/release"
+          cp -r web/. "$SITE/web/"
+          cp target/wasm32-unknown-unknown/release/svm_browser.wasm "$SITE/target/wasm32-unknown-unknown/release/"
+          cat > "$SITE/index.html" <<'HTML'
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8" />
+          <meta http-equiv="refresh" content="0; url=web/play.html" />
+          <title>SVM playground</title></head>
+          <body><p>Redirecting to the <a href="web/play.html">SVM playground</a>…</p></body></html>
+          HTML
+          # Marker the scheduled pages.yml gate reads to know the site is already at HEAD (skip its build).
+          echo "$GITHUB_SHA" > "$SITE/DEPLOYED_SHA"
+          echo "assembled:"; find "$SITE" -type f | sed "s|$SITE|_site|"
+          # Reachability gate (ISSUES.md I26/I42/I49): a required asset missing ⇒ skip the deploy rather
+          # than ship a 404 — but never fail this required job over it.
+          if node check-play-assets.mjs --site "$SITE"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "playground site incomplete — skipping Pages deploy (see check-play-assets)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/configure-pages@v5
+        if: steps.pages_site.outputs.ok == 'true'
+        with: { enablement: true }
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.pages_site.outputs.ok == 'true'
+        with: { path: _site }
+
+  # Publish the artifact browser-real uploaded. A seconds-long job that rides browser-real's already-won
+  # slot — no separate heavy build to starve (ISSUES.md I75). Only on a main push where the site
+  # assembled cleanly; a superseded main run is cancelled with the rest of its CI (top-level
+  # concurrency), and the github-pages environment serializes against the scheduled pages.yml fallback.
+  deploy-pages:
+    name: deploy playground to Pages
+    needs: browser-real
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.browser-real.outputs.site_ok == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
 
   embench-differential:
     # Whole-stack differential on the real Embench-IoT suite — every engine's `verify` must equal
