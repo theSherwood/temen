@@ -874,7 +874,16 @@ impl Parser {
             self.pos += 1;
         }
         self.expect(&Token::LBrace)?;
-        let basic_blocks = self.basic_blocks(parameters.len())?;
+        // LLVM's implicit slot counter counts only *unnamed* values; a **named** parameter (`%foo`)
+        // consumes no slot, so the unlabeled entry block's number is the count of *numbered* params
+        // (`%0`, `%1`, …), not the total parameter count. A function with all-named params has its
+        // entry block at slot 0 — getting this wrong shifted the entry block's name and made φ
+        // incoming-by-predecessor lookups miss for it (e.g. `core::str::lossy::Debug::fmt`, #755).
+        let numbered_params = parameters
+            .iter()
+            .filter(|p| matches!(p.name, Name::Number(_)))
+            .count();
+        let basic_blocks = self.basic_blocks(numbered_params)?;
         self.expect(&Token::RBrace)?;
         Ok(Function {
             name,
@@ -3197,6 +3206,45 @@ mod tests {
             "the instruction after the bundles parses as the load",
         );
         assert!(matches!(&bb.term, Terminator::Ret(_)));
+    }
+
+    #[test]
+    fn named_params_dont_consume_entry_block_slot() {
+        // #755: LLVM's implicit slot counter skips **named** params, so a function whose params are
+        // all named has its unlabeled entry block at slot 0 — and a φ can name it `%0`. Getting this
+        // wrong (counting total params) shifted the entry name and broke φ incoming-by-predecessor
+        // lookups for it (e.g. `core::str::lossy::Debug::fmt`). The entry must be `Number(0)` here,
+        // and the whole thing must parse (the `%4` φ names the entry as `%0`).
+        let m = parse_module(
+            "define i1 @f(ptr %a, ptr %b) {\n\
+             \x20 %1 = icmp eq ptr %a, %b\n\
+             \x20 br i1 %1, label %2, label %3\n\
+             2:\n\
+             \x20 br label %4\n\
+             3:\n\
+             \x20 br label %4\n\
+             4:\n\
+             \x20 %5 = phi i1 [ true, %0 ], [ false, %2 ], [ false, %3 ]\n\
+             \x20 ret i1 %5\n\
+             }\n",
+        )
+        .expect("parse");
+        let f = &m.functions[0];
+        assert_eq!(
+            f.basic_blocks[0].name,
+            Name::Number(0),
+            "all-named params ⇒ entry block is slot 0"
+        );
+        // And a numbered-param function still numbers the entry *after* its params (`%2` here).
+        let g = parse_module(
+            "define i32 @g(i32 %0, i32 %1) {\n  %3 = add i32 %0, %1\n  ret i32 %3\n}\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            g.functions[0].basic_blocks[0].name,
+            Name::Number(2),
+            "two numbered params ⇒ entry block is slot 2"
+        );
     }
 
     #[test]
