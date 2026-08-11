@@ -54,4 +54,26 @@ label "kind:flaky-ci" "E4E669" "CI infra flake (the recurring S4 class)"
 # --- invariant flag ---
 label "invariant" "5319E7" "Touches a rule in INVARIANTS.md (verifier/masking/grant-graph)"
 
+# --- topic:*  (optional, additive, zero-or-more; orthogonal to the workstream) ---
+# engines / codegen
+for t in jit bytecode tree-walker guest-jit cranelift llvm wasm simd gpu peval; do
+  label "topic:$t" "D4C5F9" "Topic: $t"
+done
+# languages / frontends
+for t in c nim go rust typescript lua tcl quickjs; do
+  label "topic:$t" "D4C5F9" "Topic: $t"
+done
+# runtime themes
+for t in nesting fork serving snapshot futex; do
+  label "topic:$t" "D4C5F9" "Topic: $t"
+done
+# consumer / demo surfaces
+for t in bash shell chibicc doom sqlite postgres playground; do
+  label "topic:$t" "D4C5F9" "Topic: $t"
+done
+# quality / meta
+for t in ergonomics benchmark test; do
+  label "topic:$t" "D4C5F9" "Topic: $t"
+done
+
 echo "Labels set for $REPO."

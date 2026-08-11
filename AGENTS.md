@@ -12,12 +12,12 @@ itself is deliberately renegotiated with the owner.
 Track work, bugs, and investigations as **GitHub issues on the Project board**,
 not by editing markdown trackers. Each issue is a sub-issue of one of the eleven
 **workstream epics** (the parent = the workstream) and carries `area:` / `sev:` /
-`kind:` labels — `touches:` for cross-cutting overlap, `invariant` when it touches
-`INVARIANTS.md`. Do triage and discussion in the issue: it costs no CI, unlike
-editing `ISSUES.md`/`TODO.md`. Keep an `ISSUES.md` `I##` entry only for a deep
-root-cause writeup a reviewer should read beside the fix, and **link it** from the
-issue — the issue is the status source of truth, not the doc. Flaky CI → a
-`kind:flaky-ci` issue. Full workflow, epic list, and label taxonomy:
+`kind:` labels — `touches:` for cross-cutting overlap, `topic:*` for fine-grained
+subject tags, `invariant` when it touches `INVARIANTS.md`. Do triage and discussion
+in the issue: it costs no CI, unlike editing markdown. Put deep root-cause detail in
+the issue body (or the relevant design doc when it must live beside the code) — the
+issue is the status source of truth. (`ISSUES.md` is **retired**; its history is in
+git.) Flaky CI → a `kind:flaky-ci` issue. Full workflow, epic list, and label taxonomy:
 **`ISSUE_TRACKING.md`** (labels are reproducible via `scripts/setup-labels.sh`).
 
 ## Prime directive: keep it simple

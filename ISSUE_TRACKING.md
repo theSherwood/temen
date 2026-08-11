@@ -2,18 +2,19 @@
 
 How we track work, bugs, and investigations. **TL;DR: live tracking lives in
 GitHub issues on a Project board.** The in-tree design docs (`DESIGN.md`,
-`DURABILITY.md`, …) and the deep root-cause registry (`ISSUES.md`) stay where
-they are and get *linked* from issues — they are not the tracker.
+`DURABILITY.md`, …) hold the design and get *linked* from issues — they are not
+the tracker. (The old `ISSUES.md` registry is **retired**; see [The split](#the-split).)
 
 ## Why GitHub issues (and not more markdown)
 
-- **CI cost.** Editing a markdown tracker (`ISSUES.md`, `TODO.md`) triggers the
-  CI matrix, which is slow. Issue create/edit/comment costs nothing — so
-  investigation and triage churn belongs in issues, not in doc edits.
+- **CI cost.** Editing a markdown tracker triggers the CI matrix, which is slow.
+  Issue create/edit/comment costs nothing — so investigation and triage churn
+  belongs in issues, not in doc edits.
 - Threading, assignees, notifications, cross-links, and a board view you don't
   get in a flat file.
-- The deep, code-adjacent record (a root-cause essay a reviewer reads beside the
-  fix) still belongs in-tree; the issue links to it. See [The split](#the-split).
+- When a root-cause writeup must live beside the code (reviewed in the fixing
+  PR), it goes in the relevant **design doc**; otherwise the issue body carries
+  it. See [The split](#the-split).
 
 ## The board
 
@@ -55,9 +56,18 @@ Eleven. File every issue as a sub-issue of exactly one:
 - **`touches:<workstream>`** — **zero or more.** Cross-cutting overlap. An issue
   has one home but may touch other workstreams; the touched epic's filter still
   surfaces it.
-- **`sev:S1|S2|S3|S4`** — severity, mirroring `ISSUES.md`: S1 corruption/escape ·
-  S2 host crash or wrong result · S3 robustness/quality · S4 cosmetic/flake.
+- **`sev:S1|S2|S3|S4`** — severity: S1 corruption/escape · S2 host crash or wrong
+  result · S3 robustness/quality · S4 cosmetic/flake.
 - **`kind:epic|bug|task|flaky-ci`**.
+- **`topic:*`** — **zero or more**, optional, additive, created on demand.
+  Fine-grained subject tags *orthogonal* to the workstream: languages (`c`, `nim`,
+  `go`, `rust`, `typescript`, `lua`, `tcl`, `quickjs`), engines/codegen (`jit`,
+  `bytecode`, `tree-walker`, `guest-jit`, `cranelift`, `llvm`, `wasm`, `simd`,
+  `gpu`, `peval`), runtime themes (`nesting`, `fork`, `serving`, `snapshot`,
+  `futex`), consumer/demo surfaces (`bash`, `shell`, `chibicc`, `doom`, `sqlite`,
+  `postgres`, `playground`), and quality/meta (`ergonomics`, `benchmark`, `test`).
+  A topic never *homes* an issue (that's `area:`/parent); a topic that accumulates
+  sustained work can graduate to a workstream.
 - **`invariant`** — touches a rule in `INVARIANTS.md` (verifier/masking/grant-graph).
   Flags the sensitive changes.
 
@@ -72,9 +82,9 @@ The taxonomy is reproducible and idempotent: **`scripts/setup-labels.sh`**.
    cause (or why deferred) / Fix sketch / Links.
 4. **Set the parent** — GitHub's "add sub-issue" on the epic, or the sub-issues
    API. This is what puts it in the right swimlane.
-5. If the bug needs a long root-cause essay a reviewer should read beside the
-   fix, put that essay in `ISSUES.md` as an `I##` entry and **link it** from the
-   issue — don't duplicate the prose.
+5. Put the root-cause detail in the issue body. If it must live beside the code
+   (reviewed in the fixing PR), add it to the relevant **design doc** and link it
+   — don't split status across two places.
 
 ## The split
 
@@ -82,20 +92,20 @@ What lives where, so nothing is double-maintained:
 
 - **GitHub issues** — status, triage, discussion, the live work list. The source
   of truth for *what's open and where it stands*.
-- **`ISSUES.md`** — deep root-cause registry. Keep an `I##` entry when the
-  writeup benefits from living beside the code (reviewed in the fixing PR); link
-  it from the issue. **Not** a status tracker — the issue's state is.
-- **Design docs** (`DESIGN.md`, `DURABILITY.md`, …) — the design itself. Issues
-  point at them; the docs don't track status.
+- **Design docs** (`DESIGN.md`, `DURABILITY.md`, …) — the design itself, and the
+  home for a root-cause writeup that must live beside the code (reviewed in the
+  fixing PR), linked from the issue. The docs don't track status.
+- **`ISSUES.md`** — **retired.** The old numbered `I##` registry was migrated to
+  issues (live items) and otherwise left to git history. Do not recreate it; file
+  an issue instead. Old `ISSUES.md I##` references in code comments are frozen
+  provenance — resolve them via `git log`.
 - **`TODO.md`** — the legacy index of deferred work; the board supersedes it for
   indexing open work. Migrate a row to an issue when it goes active.
 
 ## Closing
 
 Close with a `state_reason` (completed / not planned / duplicate) and move the
-card to Done. If the issue had an `ISSUES.md` `I##` entry, move that entry to the
-Resolved section (or delete it and note the fix in the relevant design doc), same
-as before.
+card to Done. If the fix changes a design doc, note it there in the same PR.
 
 ## Attribution
 
