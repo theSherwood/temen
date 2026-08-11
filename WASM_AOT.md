@@ -76,42 +76,87 @@ before any `env.call_interp`. Their ranked hypotheses — all consistent with ou
    past it faults legitimate accesses.
 3. **Subset-classification hole** (least likely — the trap preceded any cross-tier call).
 
-Until this is fixed, "default the JIT on" (slice 2) would ship a path a real consumer has already
-shown to fault. So the bug comes first.
+This came first: "default the JIT on" (slice 2) would otherwise ship a path a real consumer has
+already shown to fault. Slice 0 is now diagnosed and the confirmed defect is fixed (below).
 
 ## 5. Slices
 
 Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
 
-### Slice 0 — mainline tier-up over a live window (bug fix; unblocks slice 2)
+### Slice 0 — mainline tier-up over a live window (DIAGNOSED; gate fix landed)
 
-- **Repro:** a minimal `InterpDriven` guest that (a) has a data segment and (b) is forced through
-  per-function `TierUp` from *mainline* code (not `thread.spawn`), driven through the
-  `svm_par_run` loop in the browser test harness. Per the JACL doc, if it faults the problem is
-  "mainline TierUp over a live window", independent of guest size.
-- **Diagnose:** instrument `env.trap` (test-only) to log trap code + `eff`/`mapped`/`win`; diff the
-  window setup between `svm_run_onramp` and the `svm_par_run`/`PAR_TIERUP` lane (data
-  materialization, provenance of `win` and `size_log2`).
-- **Fix direction:** per the JACL doc's option (a)/(b) — either make mainline tier-up run emitted
-  code over the interpreter's *current* live window as a first-class contract, or enforce (and
-  assert at the seam) that the par lane materializes data and shares the exact window. Whichever it
-  is, the contract gets stated in `svm-wasm-jit`'s module docs and pinned by the repro test.
-- **Gate:** repro test red→green; existing tier-up/threads differentials stay green.
+**Diagnosis (empirical, native).** A new native harness (`svm-wasm-jit/tests/tierup_live_window.rs`)
+drives the real loop — `bytecode::VcpuReactor` opens over a caller-owned window, runs `_start`
+(materializing `m.data`), and tiers up a mainline `Call` onto emitted wasm mirrored over that live
+window. It is the native twin of the browser `svm_par_run`/`PAR_TIERUP` lane, which had **no native
+coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation over a hand-seeded window).
+
+Against the JACL doc's ranked hypotheses:
+- **Hypothesis 1 (data/window-materialization) — ruled out for the native path.** With a
+  window sized to `1 << size_log2` and data materialized by the interpreter, mainline tier-up over
+  the live window (incl. a data-segment read and a write-then-read round-trip) matches the
+  interpreter oracle exactly. The interpreter's `init_data` + the shared `win` base already satisfy
+  the contract; the harness pins it.
+- **Hypothesis 2/3 (baked `size_log2` vs a page-managed window) — confirmed as a real defect.**
+  `compile_module_tierup` (a **public** entry) did **not** apply the `module_uses_page_ops` gate that
+  `compile_jit`/`compile_nested` apply (NESTED_JIT Track 3). So a guest that manages its own pages —
+  which grows/remaps its window at runtime, exactly the JACL compiler's heap shape — got hot leaves
+  emitted with a `mapped = 1 << size_log2` baked at emit time; an emitted mask-only access then
+  ignores the live page state (a grown/remapped region), diverging from the interpreter → the
+  `MemoryFault → unreachable` mid-body, before any `env.call_interp`, that the spike saw. The JACL
+  spike called `compile_module_tierup` directly, bypassing `compile_jit`'s gate.
+
+**Fix (landed).** `compile_module_tierup_caps` now self-applies the page-op gate: a page-op module
+emits nothing (all-`false` bitmap, valid imports-only wasm), identical to `compile_interp_only` and
+to `compile_jit(Threaded)`. The gate now holds regardless of which public entry a host calls.
+Pinned by `tierup_page_op_module_emits_nothing` (red→green: was `[false, true]`, now `[false,
+false]`), a control that still emits without the page op, and a cross-entry agreement test.
+
+**Scope honesty.** This closes the confirmed native-reproducible defect. One JACL hypothesis-1
+residue can only be checked with the browser Worker harness (node + the wasm cdylib), out of reach
+here: whether the `svm_par_run`/`PAR_TIERUP` lane's `win`/`size_log2` provenance matches
+`svm_run_onramp` for a guest that *grows* its window mid-run. The native evidence says the shared-
+`win` contract is sound when sizes match; the remaining risk is purely the grow/remap case, which
+the landed gate now routes to the interpreter anyway (a page-managing guest emits nothing). If a
+future consumer needs a *page-managing* guest accelerated, that is the gated-(b)-with-elision
+escalation NESTED_JIT Track 3 documents — not in scope here.
 
 ### Slice 1 — compiled-output cache (the biggest playground feel-fix)
 
-- **Browser:** cache per module content-hash, across Runs: emitted wasm bytes → the compiled
-  `WebAssembly.Module` (V8 shares compiled code on structured clone; the per-code *instance* cache
-  per Worker already exists for §22 units — extend the pattern to the top-level emitted module).
-  First Run pays emit+compile once; every later Run of the same module (the playground's dominant
-  pattern: edit stdin, re-Run Lua/SQLite/chibicc) skips both.
-- **Native:** the primitive exists (`svm_jit::compile → CompiledModule::run`); add the caching
-  policy at the embedder seam (`svm-run`), keyed the same way.
-- **Fresh-window semantics are untouched:** we cache *code*, never window state — each Run still
-  builds a fresh window (INVARIANTS #6 / DESIGN §12 activation model). A cached-code run must be
-  differentially indistinguishable from a cold one; add that as a test.
-- **Gate:** second Run of a light script ≥ interpreter-only time (kills the "net slower under JIT"
-  footgun); bench the first-vs-second Run delta in the playground recorder.
+Two halves sharing **one content key** (the module's encoded-image digest — `svm_encode::digest256`
+over `encode_module`, the same identity the durable module-grant registry already uses). Cache
+**code**, never window/guest state.
+
+- **Native — LANDED (`svm-run` embedder seam).** `svm_run::CompiledCache`: a content-keyed map of
+  `PowerboxProgram`s (the existing build-once/run-many split, now dedup'd by module identity rather
+  than object identity). `run(&module, stdin)` compiles a module on first sighting and reuses the
+  native code on every later identical module — byte-identical to `run_powerbox` either way. Fills
+  the gap `ISSUES.md` named ("no such API today"). Fresh-window safety is inherited from
+  `PowerboxProgram` (fresh window + host reset per run) and pinned: `tests/compiled_cache.rs` proves
+  reuse-without-recompile, content-not-object keying, `run_powerbox` parity across inputs, no
+  state-leak across reuses, distinct-module isolation, and that a refused (concurrent) module is not
+  cached and does not poison the cache.
+- **Browser — NEXT (two steps, low-risk first).** The playground's dominant pattern is re-Running
+  the same module (edit stdin, re-Run Lua/SQLite/chibicc). Today every Run re-emits (cdylib) and
+  re-compiles (`WebAssembly.compile`, `wasmjit-module.js:32`) with no cross-Run reuse.
+  - **Step 1 (JS-only, no TCB/concurrency change):** a JS `Map` from the module's content digest →
+    the compiled `WebAssembly.Module`, consulted in `driveJitRun` (`wasmjit-module.js`) before
+    `WebAssembly.compile`. Key on the *source/module* the Run was launched with (the same bytes
+    `moduleCache` already holds by URL, or the editor text for editable cards) — not the emitted
+    bytes, so the lookup precedes emit. This skips V8 compile (and, if we also memoize the emitted
+    bytes, the cdylib emit) on a re-Run. It touches no `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN`
+    state, so it can't introduce a cross-Worker race — the reason to do it first.
+  - **Step 2 (cdylib, only if step 1's emit cost still shows):** replace the per-Run `PAR_RUN_GEN`
+    emit-dedup key with the content digest (`svm_encode::digest256` over the decoded module — the
+    *same* key `svm_run::CompiledCache` uses), so the cdylib itself skips re-emit across Runs, not
+    just across Workers within a Run. Higher-risk (it edits the I22 shared-stash lifetime), so gated
+    on a measured need.
+  - **Validation:** not locally runnable here (no wasm toolchain in this environment). Rides CI's
+    `browser-real` Chromium differential suite for correctness (a stale-cache bug shows as a
+    render/output divergence there), plus a first-vs-second-Run timing assertion added to the
+    playground recorder / a `node` bench (`bench_jit.mjs`-style) for the win itself.
+- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser) second Run of
+  a light script ≥ interpreter-only time — kills the "net slower under JIT" footgun.
 
 ### Slice 2 — default the JIT tier on where eligible (after slice 0)
 
@@ -122,17 +167,35 @@ Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
   all).
 - **Gate:** the existing per-demo parity assertions run in both default states in `browser-test.mjs`.
 
-### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever)
+### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever) — LANDED (provable-bound form)
 
-- The BROWSER.md-named lever, scoped conservatively: elide or hoist `emit_confine` only where the
-  invariant is *proven* — e.g. repeated accesses off one base+bounded-offset within a block (the
-  same reasoning `svm-opt`'s D63-sound offset-disjointness already uses), or a dominating check of
-  the same `(base, range)`. Stays entirely inside the masking lowering; every elision form gets its
-  own fuzz corpus entry (this is the security hinge — INVARIANTS #2; AGENTS.md fuzzing rule).
-- **Measured target, not vibes:** Lua 5M-loop and SQLite REPL throughput on the playground path;
-  the bench README's `chase`/`chase_rand` rows for the honest memory-kernel view.
-- If the win plateaus, **function splitting** is the named fallback (BROWSER.md slice-8 findings);
-  stackification and the relooper stay rejected on the recorded A/B evidence.
+The BROWSER.md-named lever, in its most-proven form: the wasm-JIT now elides a memory access's
+bounds-**trap** branch when the address is *provably* in-window, reusing the native Cranelift JIT's
+existing D63 "guard-when-bounded" analysis rather than inventing one.
+
+- **Stage 1 (shared proof).** Lifted `UB_TOP`/`ub_at`/`ub_of`/`in_window` out of the native JIT's
+  private copy into `svm_ir::bounds` — one audited definition of the confinement veto predicate for
+  both JITs (INVARIANTS #9), behavior-preserving for `svm-jit` (jit_diff stays green).
+- **Stage 2 (wasm elision).** `emit_block_body` threads a per-block upper-bound map (`ubs`) in
+  lockstep with the emitter's own value numbering (reset per block; block params = `UB_TOP`), and at
+  each Load/Store/atomic/v128 access `elide_access` consults `in_window`. When proven bounded, the
+  `eff > mapped - width` trap branch is dropped. **The `& MASK` clamp is always emitted** — so this
+  is a *strictly safer subset* of the native JIT's elision (which also drops the clamp): a wrong
+  proof here is at worst a trap-parity divergence (caught by the differential), never an escape.
+- **Fuzzed as its own unit** (AGENTS.md "…or proven bounded"): `differential.rs` gains bounded-index
+  kernels that actually fire the elision (`(v0 & K)*W`, the top-byte boundary, the width-8
+  no-elide edge, a mixed elided/non-elided block), a size proof that the branch is really removed
+  (`elision_actually_removes_bytes`), and a 3000-iteration `elision_boundary_sweep` asserting
+  trap+value parity with the interpreter oracle around the window edge. `svm_ir::bounds` carries unit
+  tests for `in_window` overflow-safety and `ub_of`'s rules.
+- **Scope.** Matches the native proof exactly (const / `& K` / `+`/`|`/`^` / `* W` / `ExtendI32U`) —
+  notably it does **not** yet model `PtrAdd` (the C-frontend address op), so C-guest addresses stay
+  conservatively checked, same as on `svm-jit`. Widening the proof (or the "same-base dominating
+  check" redundancy form) is a follow-on if a measured target needs it.
+- **Measured target (next):** Lua 5M-loop / SQLite REPL throughput on the playground path and the
+  bench README's `chase`/`chase_rand` rows — to quantify the win on real programs. If it plateaus,
+  **function splitting** is the named fallback (BROWSER.md slice-8); stackification and the relooper
+  stay rejected on the recorded A/B evidence.
 
 ### Non-slice — standalone pure-wasm export (deliberately deferred)
 

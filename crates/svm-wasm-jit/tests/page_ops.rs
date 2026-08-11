@@ -8,7 +8,7 @@
 //! `emitted` bitmap (so even a memory-accessing function in it is *not* emitted), while an otherwise
 //! identical module without the page op still emits — the gate is specific, not a blanket disable.
 
-use svm_wasm_jit::{compile_jit, compile_nested, DriveMode, Shape};
+use svm_wasm_jit::{compile_jit, compile_module_tierup, compile_nested, DriveMode, Shape};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store};
 
 fn parse(src: &str) -> svm_ir::Module {
@@ -95,6 +95,93 @@ fn compile_nested_page_op_module_emits_nothing() {
     let a = compile_nested(&m, false).expect("artifact");
     assert_eq!(a.drive, DriveMode::InterpDriven);
     assert_eq!(a.emitted, vec![false]);
+}
+
+// A page-op orchestrator (func 0: `protect`, out of subset — the interpreter drives it) plus a
+// **memory-accessing** compute leaf (func 1: a window load) it calls. This is the JACL tier-up shape
+// (`SVM_BROWSER_TIERUP_FINDINGS.md`): mainline InterpDriven code with a hot leaf, in a guest that
+// manages its own pages. The leaf's emitted load is mask-only, so tiering it up would ignore the page
+// state func 0 established — an emitted access over a page-managed window. The gate must therefore
+// emit **nothing** here too, even though the leaf is in-subset in isolation.
+const PAGE_OP_WITH_LEAF: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vas = i32.wrap_i64 v0
+  voff = i64.const 0
+  vlen = i64.const 4096
+  vprot = i32.const 1
+  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  v1 = call 1 (vr)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 8
+  vld = i64.load va
+  v2 = i64.add vld v0
+  return v2
+  }
+}
+"#;
+
+// The same two functions WITHOUT the page op (func 0 just calls the leaf) — the control: here the
+// leaf must still tier up, proving the gate keys on the page op, not on having a memory leaf.
+const PLAIN_WITH_LEAF: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 8
+  vld = i64.load va
+  v2 = i64.add vld v0
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn tierup_page_op_module_emits_nothing() {
+    // The regression pin for `SVM_BROWSER_TIERUP_FINDINGS.md`: calling the public `compile_module_tierup`
+    // entry directly (as the JACL spike did, bypassing `compile_jit`'s gate) must still emit nothing on
+    // a page-op module — the leaf is NOT tiered up. Before the fix this returned `[false, true]`.
+    let m = parse(PAGE_OP_WITH_LEAF);
+    let (_wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
+    assert_eq!(
+        eligible,
+        vec![false, false],
+        "a page-op module must emit no tier-up functions (the leaf stays on the interpreter)"
+    );
+}
+
+#[test]
+fn tierup_plain_module_still_emits_leaf() {
+    // Control: identical minus the page op → the memory leaf (func 1) tiers up as before.
+    let m = parse(PLAIN_WITH_LEAF);
+    let (_wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
+    assert_eq!(
+        eligible,
+        vec![true, true],
+        "without a page op the leaf (and its pure caller) must still tier up"
+    );
+}
+
+#[test]
+fn tierup_matches_compile_jit_on_page_op_module() {
+    // The two public entries must agree on a page-op module: `compile_jit(Threaded)` already gates
+    // (routes through `compile_module_tierup`), and the direct entry now gates too.
+    let m = parse(PAGE_OP_WITH_LEAF);
+    let via_jit = compile_jit(&m, Shape::Threaded, false).expect("artifact");
+    let (_wasm, via_tierup) = compile_module_tierup(&m, false).expect("tier-up emit");
+    assert_eq!(
+        via_jit.emitted, via_tierup,
+        "gate must agree across entries"
+    );
+    assert!(via_tierup.iter().all(|&e| !e), "both emit nothing");
 }
 
 /// The emit-nothing artifact must still be a **valid** wasm module (imports only, no `f{i}` exports),

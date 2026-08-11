@@ -1382,3 +1382,236 @@ block 0 (v0: i64) {
 fn atomic_cmpxchg_value_semantics() {
     diff("atomic_cmpxchg", ATOMIC_CMPXCHG, ATOMIC_VAL_SWEEP, FUEL);
 }
+
+// ============================================================================================
+// Slice 3 — confinement-check ELISION (WASM_AOT.md). When the address is provably in-window
+// (`svm_ir::bounds::in_window` over the tracked upper bound), the emitter drops the bounds-trap
+// branch but ALWAYS keeps the `& MASK` clamp. These kernels build addresses from the ops `ub_of`
+// models — `& K` (bounded by K), `* W`, const, extend — so the elision path actually fires, and
+// the differential proves it stays trap/value-identical to the interpreter oracle. (The other
+// memory kernels use unbounded function-arg addresses, so they only exercise the un-elided path.)
+
+/// `(v0 & 4095) * 8` — bounded by 32760; a width-8 access tops at 32768 ≤ 65536, so it ELIDES.
+/// Store then load the same slot: returns `v0` for every input, matching the oracle.
+const ELIDE_INDEX: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 4095
+  vi = i64.and v0 vk
+  vw = i64.const 8
+  va = i64.mul vi vw
+  i64.store va v0
+  vr = i64.load va
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn elide_bounded_index_roundtrip() {
+    // Huge / negative inputs still mask to an in-window slot; the elided access must read what the
+    // oracle's (masked) access reads — never a fault, never a different byte.
+    let probe: &[i64] = &[
+        0,
+        1,
+        8,
+        4095,
+        4096,
+        100_000,
+        1 << 20,
+        1 << 40,
+        -1,
+        i64::MIN,
+        i64::MAX,
+    ];
+    diff("elide_index", ELIDE_INDEX, probe, FUEL);
+}
+
+/// `(v0 & 65535)` with a **1-byte** access tops at exactly 65536 == mapped → ELIDES at the very top
+/// boundary (the off-by-one an unsound `in_window` would get wrong). Returns the low byte of `v0`.
+const ELIDE_TOP_BYTE: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 65535
+  va = i64.and v0 vk
+  i64.store8 va v0
+  vr = i64.load8_u va
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn elide_top_byte_boundary() {
+    let probe: &[i64] = &[0, 255, 65534, 65535, 65536, 1 << 20, -1, i64::MIN, i64::MAX];
+    diff("elide_top_byte", ELIDE_TOP_BYTE, probe, FUEL);
+}
+
+/// `(v0 & 65535)` with a **width-8** access tops at 65543 > 65536 → does NOT elide (the check stays).
+/// Near the edge (masked addr in 65529..65535) both engines must fault; below, both succeed. This
+/// pins that `in_window` accounts for `width` and does not wrongly elide.
+const NOELIDE_WIDTH8_EDGE: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 65535
+  va = i64.and v0 vk
+  i64.store va v0
+  vr = i64.load va
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn noelide_width8_at_edge_traps_like_oracle() {
+    let probe: &[i64] = &[
+        0,
+        8,
+        65527,
+        65528,
+        65529,
+        65535,
+        65536,
+        1 << 40,
+        -1,
+        i64::MIN,
+    ];
+    diff("noelide_width8_edge", NOELIDE_WIDTH8_EDGE, probe, FUEL);
+}
+
+/// A block mixing an ELIDED bounded access (`v0 & 4095`) with a NON-elided arg access (`v0`): the
+/// upper-bound map must keep the two straight — eliding the first must not touch the second's check,
+/// which still faults for an out-of-window `v0`.
+const ELIDE_MIX: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 4095
+  vi = i64.and v0 vk
+  i64.store8 vi v0
+  vld1 = i64.load8_u vi
+  i64.store8 v0 vld1
+  vld2 = i64.load8_u v0
+  return vld2
+  }
+}
+"#;
+
+#[test]
+fn elide_mixed_bounded_and_unbounded() {
+    let probe: &[i64] = &[
+        0,
+        1,
+        4095,
+        4096,
+        65535,
+        65536,
+        65537,
+        1 << 40,
+        -1,
+        i64::MIN,
+        i64::MAX,
+    ];
+    diff("elide_mix", ELIDE_MIX, probe, FUEL);
+}
+
+// Size proof that elision actually FIRES: two structurally identical kernels differing only in
+// whether the address is provably bounded — `v0 & K` (bounded → elides) vs `v0 | K` (unbounded, since
+// `ub_of` maps `Or` over an unknown to Top → no elide). The only codegen difference is the elided
+// bounds-check, so the bounded kernel's emitted wasm must be strictly smaller.
+const ELIDES_BOUNDED: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 4095
+  va = i64.and v0 vk
+  i64.store8 va v0
+  vr = i64.load8_u va
+  return vr
+  }
+}
+"#;
+const NO_ELIDE_UNBOUNDED: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 4095
+  va = i64.or v0 vk
+  i64.store8 va v0
+  vr = i64.load8_u va
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn elision_actually_removes_bytes() {
+    let bounded = svm_text::parse_module(ELIDES_BOUNDED).unwrap();
+    svm_verify::verify_module(&bounded).unwrap();
+    let unbounded = svm_text::parse_module(NO_ELIDE_UNBOUNDED).unwrap();
+    svm_verify::verify_module(&unbounded).unwrap();
+    let bounded_wasm = compile_module(&bounded).unwrap();
+    let unbounded_wasm = compile_module(&unbounded).unwrap();
+    // Both have two accesses; the bounded one elides both bounds-checks, so it is smaller. If this
+    // ever regresses to equal, elision silently stopped firing.
+    assert!(
+        bounded_wasm.len() < unbounded_wasm.len(),
+        "elision emitted no fewer bytes ({} vs {}) — the elide path did not fire",
+        bounded_wasm.len(),
+        unbounded_wasm.len()
+    );
+}
+
+/// The elision path fuzzed as its own unit (CLAUDE.md: "fuzz the confinement-masking lowering as its
+/// own unit … *or proven bounded*"). A deterministic sweep drives the mixed elided/non-elided kernel
+/// and the width-8 edge kernel across inputs clustered around the window boundary; every one must
+/// fault iff the oracle faults and return the oracle's value otherwise — so a mis-elision (wrong
+/// bound, off-by-one width, or a desynced upper-bound map) is caught here, not in production.
+#[test]
+fn elision_boundary_sweep() {
+    let mix = svm_text::parse_module(ELIDE_MIX).unwrap();
+    svm_verify::verify_module(&mix).unwrap();
+    let mix_wasm = compile_module(&mix).unwrap();
+    let edge = svm_text::parse_module(NOELIDE_WIDTH8_EDGE).unwrap();
+    svm_verify::verify_module(&edge).unwrap();
+    let edge_wasm = compile_module(&edge).unwrap();
+
+    const ANCHORS: &[i64] = &[
+        0,
+        1,
+        255,
+        4095,
+        4096,
+        32768,
+        65528,
+        65535,
+        65536,
+        65537,
+        1 << 20,
+        1 << 40,
+        -1,
+    ];
+    let mut s: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let jitter = |a: i64, r: u64| a.wrapping_add((r % 33) as i64).wrapping_sub(16);
+    for _ in 0..3000 {
+        let v0 = jitter(ANCHORS[next() as usize % ANCHORS.len()], next());
+        let args = [Value::I64(v0)];
+        for (name, m, wasm) in [
+            ("elide_mix", &mix, &mix_wasm),
+            ("noelide_edge", &edge, &edge_wasm),
+        ] {
+            let want = oracle(m, &args, FUEL);
+            let got = wasm_run(m, wasm, &args, FUEL);
+            assert_eq!(want, got, "{name}: elision MISCOMPILE for v0={v0}");
+        }
+    }
+}
