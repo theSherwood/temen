@@ -7,3 +7,4 @@
 /crates/svm-webgpu/target
 **/*.rs.bk
 rustc-ice-*.txt
+crates/svm-llvm/tests/fixtures/leng_probe/Cargo.lock

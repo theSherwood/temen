@@ -16,6 +16,9 @@ Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
 Type *ty_float = &(Type){TY_FLOAT, 4, 4};
 Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
 Type *ty_ldouble = &(Type){TY_LDOUBLE, 16, 16};
+// __m128: a 16-byte SIMD vector. Not a C floating type (stays out of is_flonum/
+// is_numeric, so no implicit arithmetic conversions — SSE requires the _mm_* intrinsics).
+Type *ty_v128 = &(Type){TY_V128, 16, 16};
 
 static Type *new_type(TypeKind kind, int size, int align) {
   Type *ty = calloc(1, sizeof(Type));
@@ -62,6 +65,7 @@ bool is_compatible(Type *t1, Type *t2) {
   case TY_FLOAT:
   case TY_DOUBLE:
   case TY_LDOUBLE:
+  case TY_V128:
     return true;
   case TY_PTR:
     return is_compatible(t1->base, t2->base);

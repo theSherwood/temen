@@ -4366,6 +4366,132 @@ pub struct Data {
     pub bytes: Vec<u8>,
 }
 
+/// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,
+/// single-definition proof both native and wasm JITs use to decide when a memory access is *provably*
+/// in-window and its bounds check is therefore redundant. Lifted here (from the native JIT's private
+/// copy) so there is **one** audited copy of the veto predicate rather than a per-backend copy that
+/// could diverge (INVARIANTS #9); kept dependency-free and structural so it stays auditable.
+///
+/// **Soundness contract (escape-critical in the native JIT):** [`ub_of`] never *under*-estimates the
+/// real maximum (unknown ⇒ [`UB_TOP`]), and [`in_window`] is checked/saturating so an overflow can
+/// only make it return `false` (fall back to the runtime check), never `true`. The native JIT drops
+/// the confinement mask on an `in_window` proof, so a *wrong* proof there is a confinement escape
+/// (caught by the escape-oracle differential); the wasm JIT keeps its `& MASK` clamp regardless and
+/// only elides the trap branch, so there a wrong proof is at worst a trap-parity divergence (caught
+/// by the interpreter differential), never an escape.
+pub mod bounds {
+    use super::{BinOp, ConvOp, Inst, ValIdx};
+
+    /// The "unknown / no useful bound" element of the upper-bound lattice (`u64::MAX`): any value
+    /// annotated `UB_TOP` forces the runtime check (never elided).
+    pub const UB_TOP: u64 = u64::MAX;
+
+    /// Look up the tracked upper bound of SSA value `i`, defaulting to [`UB_TOP`] when out of range
+    /// (e.g. a block parameter, whose bound does not cross the block boundary).
+    #[inline]
+    pub fn ub_at(ubs: &[u64], i: ValIdx) -> u64 {
+        ubs.get(i as usize).copied().unwrap_or(UB_TOP)
+    }
+
+    /// A **sound, conservative upper bound** on an SSA value's unsigned (`u64`) magnitude, used only
+    /// to decide mask/check elision. Every rule must never under-estimate the real maximum; anything
+    /// not modelled returns [`UB_TOP`]. Lower bounds are irrelevant (a `u64` is `≥ 0`), so only the
+    /// upper bound is tracked. `ubs` is indexed like the value map (block params = [`UB_TOP`]); the
+    /// caller must keep `ubs` in lockstep with the SSA value numbering (a misalignment could
+    /// mis-elide).
+    pub fn ub_of(inst: &Inst, ubs: &[u64]) -> u64 {
+        let ub = |i: ValIdx| ub_at(ubs, i);
+        match inst {
+            Inst::ConstI64(c) => *c as u64,
+            Inst::ConstI32(c) => *c as u32 as u64,
+            Inst::IntBin { op, a, b, .. } => {
+                let (x, y) = (ub(*a), ub(*b));
+                match op {
+                    // a & b ≤ min(a, b); a|b, a^b, a+b ≤ a + b; a*b ≤ a * b (wrap ⇒ Top).
+                    BinOp::And => x.min(y),
+                    BinOp::Add | BinOp::Or | BinOp::Xor => x.checked_add(y).unwrap_or(UB_TOP),
+                    BinOp::Mul => x.checked_mul(y).unwrap_or(UB_TOP),
+                    _ => UB_TOP,
+                }
+            }
+            // Zero-extend: the i64 value is the (≤ u32::MAX) source, no wider.
+            Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a,
+            } => ub(*a).min(0xFFFF_FFFF),
+            Inst::Convert {
+                op: ConvOp::WrapI64,
+                ..
+            } => 0xFFFF_FFFF,
+            _ => UB_TOP,
+        }
+    }
+
+    /// True iff every access `[addr+offset, addr+offset+width)` is provably within `[0, size)` given
+    /// `addr ≤ addr_ub` — i.e. the runtime confinement check is redundant and may be elided.
+    /// Saturating/checked throughout so an overflow can only make this *false* (fall back to the
+    /// check), never escape.
+    #[inline]
+    pub fn in_window(addr_ub: u64, offset: u64, width: u32, size: u64) -> bool {
+        match addr_ub
+            .checked_add(offset)
+            .and_then(|s| s.checked_add(width as u64))
+        {
+            Some(top) => top <= size,
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn in_window_is_fail_closed_on_overflow() {
+            // An addr upper bound near u64::MAX must never prove in-window (overflow ⇒ false).
+            assert!(!in_window(UB_TOP, 0, 1, u64::MAX));
+            assert!(!in_window(u64::MAX - 4, 8, 4, u64::MAX));
+            // Exactly touching the top byte is in-window; one past is not.
+            assert!(in_window(0, 0, 8, 8));
+            assert!(!in_window(1, 0, 8, 8));
+            assert!(in_window(100, 4, 4, 108));
+            assert!(!in_window(100, 4, 4, 107));
+        }
+
+        #[test]
+        fn ub_of_masks_and_extends_bound() {
+            // (v0 & 0xFFFF) is bounded by 0xFFFF regardless of v0's (unknown) bound.
+            let insts = [
+                Inst::ConstI64(0xFFFF), // v-? const K
+            ];
+            // Model: ubs = [UB_TOP (v0 block param), K's bound]
+            let ubs = [UB_TOP, ub_of(&insts[0], &[UB_TOP])];
+            // v2 = v0 & K  → min(UB_TOP, 0xFFFF) = 0xFFFF
+            let band = Inst::IntBin {
+                ty: crate::IntTy::I64,
+                op: BinOp::And,
+                a: 0,
+                b: 1,
+            };
+            assert_eq!(ub_of(&band, &ubs), 0xFFFF);
+            // ExtendI32U caps at u32::MAX.
+            let ext = Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: 0,
+            };
+            assert_eq!(ub_of(&ext, &[UB_TOP]), 0xFFFF_FFFF);
+            // An unmodelled op is Top (fail-closed).
+            let cmp = Inst::IntCmp {
+                ty: crate::IntTy::I64,
+                op: crate::CmpOp::Eq,
+                a: 0,
+                b: 1,
+            };
+            assert_eq!(ub_of(&cmp, &ubs), UB_TOP);
+        }
+    }
+}
+
 #[cfg(test)]
 mod import_tests {
     use super::*;

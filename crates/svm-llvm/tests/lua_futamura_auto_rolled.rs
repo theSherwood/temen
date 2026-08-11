@@ -237,6 +237,42 @@ fn auto_rolled_constant_k_mod_and_idiv_fold_via_frozen_constants() {
     }
 }
 
+/// **Dynamic-index table read (the memory frontier).** `t[i]` with a loop-variable index reads a
+/// read-only table from the frozen heap image. Two things make it fold: freezing the table object (its
+/// struct, array, and node parts, in both const overlays and a readonly data segment, so a constant-index
+/// read folds to an immediate and a dynamic-index read is a masked load from mapped memory), and deopting the
+/// metamethod cold arms — a value *loaded* from a table has a tag the specializer can't prove numeric, so
+/// every consuming op explores its `__index`/`__add`/… arm, which is never taken for integer data. The
+/// result is a correct, verified residual that reproduces real Lua on both backends. (The dynamic
+/// array/hash/deopt branching leaves a few `br_table`s, so the dispatch only *partially* folds — 841→~215
+/// blocks — vs the full fold of the scalar loops; completing that fold is a follow-up.)
+#[test]
+fn auto_rolled_dynamic_index_table_read() {
+    let m = lua_module();
+    let cases = [
+        "local t = {10, 20, 30, 40, 50}\nlocal s = 0\nfor i = 1, 5 do s = s + t[i] end\nreturn s\n",
+        "local t = {2, 4, 6, 8, 10, 12}\nlocal s = 0\nfor i = 1, 6 do s = s + t[i] end\nreturn s\n",
+    ];
+    for script in cases {
+        let want = real_lua(&m, script);
+        let r = auto_rolled(&m, script);
+        let blocks = r.residual.funcs[r.entry as usize].blocks.len();
+        let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, r.dyn_cells.len());
+        svm_verify::verify_module(&wm).expect("wrapped residual verifies");
+        assert!(
+            blocks < 300,
+            "folded substantially ({blocks} blocks from {})",
+            r.base_blocks
+        );
+        assert_eq!(jit(&wm, we, &r.captured), want, "jit == real Lua");
+        assert_eq!(tw(&wm, we, &r.captured), want, "tree-walk == real Lua");
+        println!(
+            "dynamic t[i]: correct (= {want}), {blocks} blocks (base {})",
+            r.base_blocks
+        );
+    }
+}
+
 /// **Control-flow breadth.** The zero-config path was built for a straight numeric-`for` accumulator, but
 /// the specializer already handles richer control flow *inside* that loop with no extra machinery: a
 /// data-dependent `if` in the body (the branch stays dynamic, dispatch still folds), nested `for` loops

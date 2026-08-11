@@ -314,6 +314,7 @@ typedef enum {
   TY_FLOAT,
   TY_DOUBLE,
   TY_LDOUBLE,
+  TY_V128, // 16-byte SIMD vector (__m128), backed by the IR v128 value type
   TY_ENUM,
   TY_PTR,
   TY_FUNC,
@@ -399,6 +400,7 @@ extern Type *ty_ulong;
 extern Type *ty_float;
 extern Type *ty_double;
 extern Type *ty_ldouble;
+extern Type *ty_v128;
 
 bool is_integer(Type *ty);
 bool is_flonum(Type *ty);

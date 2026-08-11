@@ -2549,10 +2549,7 @@ impl Parser {
                 template,
                 constraints,
             };
-            // Trailing attribute-group refs (`#4`).
-            while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
-                self.pos += 1;
-            }
+            self.skip_call_trailing();
             return Ok((Either::Left(asm), function_ty, arguments));
         }
         enum Callee {
@@ -2584,11 +2581,45 @@ impl Parser {
                 ty: self.module.types.pointer(0),
             }),
         };
-        // Trailing attribute-group refs (`#4`).
-        while matches!(self.peek(), Some(Token::Word(w)) if w.starts_with('#')) {
-            self.pos += 1;
-        }
+        self.skip_call_trailing();
         Ok((function, function_ty, arguments))
+    }
+
+    /// Consume the tokens that may trail a call's argument list, in either order, all dropped:
+    /// **attribute-group refs** (`#4`) and **operand bundles** (`[ "tag"(operands), … ]`). LLVM
+    /// attaches bundles like `"align"`/`"nonnull"`/`"dereferenceable"` (on `llvm.assume`) or
+    /// `"funclet"` (on EH calls) after the args and before the fn attributes; they are
+    /// optimization/annotation hints with no bearing on the semantics the on-ramp lowers, so we
+    /// discard them. Without this, the leading `[` desyncs the parser into the next instruction
+    /// (`expected \`%dest =\`, found LBracket`) — the first gap real `std` IR hits (`rustc` emits
+    /// `call void @llvm.assume(i1 true) [ "nonnull"(ptr %p) ]`).
+    fn skip_call_trailing(&mut self) {
+        loop {
+            match self.peek() {
+                Some(Token::Word(w)) if w.starts_with('#') => self.pos += 1,
+                Some(Token::LBracket) => self.skip_operand_bundle(),
+                _ => break,
+            }
+        }
+    }
+
+    /// Drop a single operand bundle list `[ … ]`, tracking bracket nesting so array-typed bundle
+    /// operands don't end it early. The caller has confirmed the cursor is at `[`.
+    fn skip_operand_bundle(&mut self) {
+        let mut depth = 0usize;
+        loop {
+            match self.bump() {
+                Some(Token::LBracket) => depth += 1,
+                Some(Token::RBracket) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                None => return,
+                _ => {}
+            }
+        }
     }
 
     /// A call argument list `( <ty> [attrs] <val>, … )` — returns the operands (attributes dropped, as
@@ -3139,6 +3170,33 @@ mod tests {
             },
             other => panic!("expected ret const, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn call_operand_bundles_are_dropped() {
+        // `rustc`'s real `std` output attaches operand bundles to `llvm.assume`
+        // (`[ "align"(...) ]`, `[ "nonnull"(...) ]`) after the argument list. The parser must
+        // consume them, in either order relative to `#N` fn-attrs, so the *next* instruction
+        // parses — otherwise the leading `[` reads as a missing `%dest =`. (RUST_STD.md S1.)
+        let m = parse_module(
+            "declare void @llvm.assume(i1)\n\
+             define i32 @f(ptr %p) {\n\
+             entry:\n\
+             \x20 call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %p) ]\n\
+             \x20 call void @llvm.assume(i1 true) [ \"align\"(ptr %p, i64 8), \"dereferenceable\"(ptr %p, i64 4) ]\n\
+             \x20 %v = load i32, ptr %p\n\
+             \x20 ret i32 %v\n\
+             }\n",
+        )
+        .expect("parse");
+        let bb = &m.functions[0].basic_blocks[0];
+        // Two dropped-hint calls + the load survive; the terminator is the ret.
+        assert_eq!(bb.instrs.len(), 3, "two assumes + one load parse cleanly");
+        assert!(
+            matches!(&bb.instrs[2], Instruction::Load(l) if l.dest == Name::from_string("v".into())),
+            "the instruction after the bundles parses as the load",
+        );
+        assert!(matches!(&bb.term, Terminator::Ret(_)));
     }
 
     #[test]

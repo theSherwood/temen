@@ -1052,14 +1052,23 @@ So the surface a guest build must satisfy is tiny.
    runs correctly on svm" and exercises the exact `alloc`/string surface the real translator needs. (It
    builds on the already-proven Rust→svm on-ramp — `rustbench`, the `peval` fixtures run real
    multi-crate Rust on svm — so the pipeline itself is mature; this pins the *leng surface* on it.)
-2. **Whole `translate`, byte-identical.** The full translator as one svm-ir module (an `svm-leng.svmb`
-   asset), run on svm over a real hexer Leng file, byte-for-byte vs native `svm-leng` — the §18
-   differential, the `chibicc_selfhost_asset` analog. **Discovered prerequisite (from slice 1):** the
-   on-ramp/fixture model synthesizes `malloc`/`free` and cannot satisfy `std`'s `getrandom`/syscalls,
-   so real `svm-leng` (a `std` crate — `HashMap`'s `RandomState`) must first go **`no_std + alloc` with
-   a fixed-seed hasher and a supplied allocator**. Its deps (`svm-ir`/`svm-text`/`svm-encode`) are pure
-   and take the same posture; the browser cdylib already builds them for wasm, so this is a bounded,
-   mechanical port — but it is the real content of slice 2, not a footnote.
+2. **The real `svm-leng` translator lowers to verified SVM-IR — ✅ DONE; correct *run* is toolchain-gated.**
+   Measurement (2026-08-11) **overturned the feared prerequisite**: slice 1 guessed real `svm-leng`
+   would need a `no_std` port of four crates. It does **not**. Rust generics monomorphize into the
+   crate's own IR, so a plain `std` `svm-leng` compiles to LLVM IR and the on-ramp translates it whole:
+   the `leng_probe` fixture (a `std` powerbox program calling `svm_leng::translate_to_text`) builds
+   `rustc +1.81` → `llvm-link-18` → `opt-18` → `svm-llvm` into a **236-func module that re-verifies**
+   (`crates/svm-llvm/tests/w5_leng_translates.rs`). Two small, real changes made it build: a **seedless
+   FNV hasher** for svm-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
+   and makes output deterministic), and `map_or` for `is_none_or` (the guest toolchain floors at rustc
+   1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools). No `no_std`, no four-crate port.
+   What's *left* to a **correct run** (and the byte-identical §18 differential — the `svm-leng.svmb`
+   asset over a real hexer Leng file, the `chibicc_selfhost_asset` analog) is one **toolchain** step,
+   not code: `translate_to_text` reaches `core::fmt::Display`/`FromStr` (it formats and parses numbers),
+   which stay external libcore/liballoc symbols — stubbed to traps today (so a run would trap), and
+   made *real* by `-Z build-std`. That needs a nightly whose LLVM matches the link/opt tools; this env
+   has only LLVM-18 tools against an LLVM-23 nightly, so build-std is blocked *here* — a toolchain
+   alignment task (a matching nightly, or LLVM-23 `llvm-link`/`opt`), the sole remaining gate.
 3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
    self-hosting payoff, no browser.
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
