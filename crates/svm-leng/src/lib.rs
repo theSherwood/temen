@@ -478,13 +478,14 @@ pub fn link_units_tls_with_runtime(
 /// capabilities — keeping the runtime inside the pure-IR / both-engines model (the seam
 /// [`link_whole_with_runtime`] exists for). The allocator (`mmap`/`munmap`) and syscalls
 /// (`write`/`_exit`/…) still need the Memory cap / POSIX personality (Phase-1 seam); those are *not*
-/// here. `memcmp` (a byte loop) is a deliberate follow-up.
+/// here — every leaf provided here is pure compute.
 ///
 /// Function indices ([`bottom_edge_index`] maps a C leaf name to one):
 /// `0` `memcpy(dst,src,n)->dst` · `1` `memset(dst,c,n)->dst` · `2` `bswap64(x)->x` ·
 /// `3` `clzll(x)` · `4` `ctzll(x)` · `5` `popcountll(x)` · `6` `__atomic_add_fetch(p,v)->new` ·
 /// `7` `__atomic_sub_fetch(p,v)->new` · `8` `__atomic_fetch_add(p,v)->old` ·
-/// `9` `__atomic_exchange(p,v)->old` · `10` `__atomic_load(p)->v` · `11` `__atomic_store(p,v)`.
+/// `9` `__atomic_exchange(p,v)->old` · `10` `__atomic_load(p)->v` · `11` `__atomic_store(p,v)` ·
+/// `12` `memcmp(a,b,n)` (first differing unsigned byte's `a[i]-b[i]`, or `0`).
 /// Atomics are single-threaded lowerings (plain load/modify/store) — correct for a single-vCPU guest
 /// (NIM.md §3d); a threaded ARC guest would bind the `rmw.*` ops instead.
 const BOTTOM_EDGE_RUNTIME: &str = r#"
@@ -598,6 +599,37 @@ block 0 (v0: i64, v1: i64) {
   return
   }
 }
+func (i64, i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 0
+  br 1(v0, v1, v2, v3)
+  }
+block 1 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.lt_u v3 v2
+  br_if v4 2(v0, v1, v2, v3) 4()
+  }
+block 2 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.add v0 v3
+  v5 = i64.load8_u v4
+  v6 = i64.add v1 v3
+  v7 = i64.load8_u v6
+  v8 = i64.eq v5 v7
+  br_if v8 3(v0, v1, v2, v3) 5(v5, v7)
+  }
+block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.const 1
+  v5 = i64.add v3 v4
+  br 1(v0, v1, v2, v5)
+  }
+block 4 () {
+  v0 = i64.const 0
+  return v0
+  }
+block 5 (v0: i64, v1: i64) {
+  v2 = i64.sub v0 v1
+  return v2
+  }
+}
 "#;
 
 /// The **pure-IR C-bottom-edge runtime** module (see [`BOTTOM_EDGE_RUNTIME`]): the compute leaves of
@@ -610,7 +642,7 @@ pub fn bottom_edge_runtime() -> Module {
 
 /// Map a C bottom-edge leaf name (or any import name containing it — nimony spells `copyMem`'s import
 /// as the C `memcpy`) to its [`bottom_edge_runtime`] function index, or `None` if this runtime does
-/// not provide it (the allocator/syscall leaves, or `memcmp`). Substring match, so a stem-qualified
+/// not provide it (the allocator/syscall leaves). Substring match, so a stem-qualified
 /// or namespaced spelling still binds.
 pub fn bottom_edge_index(name: &str) -> Option<u32> {
     Some(match name {
@@ -626,6 +658,7 @@ pub fn bottom_edge_index(name: &str) -> Option<u32> {
         n if n.contains("exchange") => 9,
         n if n.contains("atomic_load") => 10,
         n if n.contains("atomic_store") => 11,
+        n if n.contains("memcmp") => 12,
         _ => return None,
     })
 }

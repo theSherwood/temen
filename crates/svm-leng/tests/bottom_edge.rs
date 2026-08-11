@@ -2,8 +2,8 @@
 //! stdlib's `{.importc.}` surface (`memcpy`/`memset`/`bswap`/`clz`/`ctz`/`popcount`/the `__atomic_*`
 //! family) lowered to plain SVM ops, so they bind as ordinary linked functions — no host capability.
 //! This pins each against a native oracle and asserts **interp == JIT == native** (§9/§18); the
-//! allocator/syscall leaves (which *do* need the Memory cap / POSIX) are out of scope, and `memcmp`
-//! (a byte loop) is a deliberate follow-up.
+//! allocator/syscall leaves (which *do* need the Memory cap / POSIX) are out of scope. `memcmp` (a
+//! byte-compare loop) rounds out the compute set.
 
 use svm_interp::Value;
 use svm_ir::{LinkUnit, Memory, Module};
@@ -66,6 +66,8 @@ fn index_map_matches_c_and_nim_spellings() {
     assert_eq!(bottom_edge_index("__atomic_exchange_n"), Some(9));
     assert_eq!(bottom_edge_index("__atomic_load_8"), Some(10));
     assert_eq!(bottom_edge_index("__atomic_store_8"), Some(11));
+    assert_eq!(bottom_edge_index("memcmp"), Some(12));
+    assert_eq!(bottom_edge_index("nimCmpMem_memcmp.0.sysvq0asl"), Some(12));
     assert_eq!(bottom_edge_index("mmap"), None); // an allocator leaf — not provided here
 }
 
@@ -221,4 +223,41 @@ fn single_thread_atomics_match_native() {
     let (ret, win) = run_both(&m, 11, &[p as i64, 77], &seed(10));
     assert!(ret.is_empty(), "store returns void");
     assert_eq!(word(&win), 77, "store wrote *p");
+}
+
+#[test]
+fn memcmp_matches_native() {
+    let m = runtime();
+    let (a, b, n) = (256usize, 512usize, 16usize);
+    // Oracle: the first differing unsigned byte's `a[i] - b[i]` (signed), else 0.
+    let oracle = |x: &[u8], y: &[u8]| -> i64 {
+        (0..n)
+            .find(|&i| x[i] != y[i])
+            .map_or(0, |i| x[i] as i64 - y[i] as i64)
+    };
+    let base: Vec<u8> = (0..n as u8).collect();
+    let mut a_gt = base.clone();
+    a_gt[5] = 200; // differs at byte 5, a > b
+    let mut a_lo = base.clone();
+    a_lo[0] = 1;
+    let mut b_lo = base.clone();
+    b_lo[0] = 250; // differ at byte 0, a < b
+    let mut a_last = base.clone();
+    a_last[n - 1] = 0xff; // differ at the last byte
+    let cases: [(&[u8], &[u8]); 4] = [
+        (&base, &base),   // equal → 0
+        (&a_gt, &base),   // positive
+        (&a_lo, &b_lo),   // negative
+        (&a_last, &base), // last-byte difference
+    ];
+    for (x, y) in cases {
+        let mut seed = vec![0u8; 4096];
+        seed[a..a + n].copy_from_slice(x);
+        seed[b..b + n].copy_from_slice(y);
+        let (ret, _) = run_both(&m, 12, &[a as i64, b as i64, n as i64], &seed);
+        assert_eq!(ret, [oracle(x, y)], "memcmp {x:?} vs {y:?}");
+    }
+    // n = 0 → 0 regardless of contents (no bytes compared).
+    let (ret, _) = run_both(&m, 12, &[a as i64, b as i64, 0], &vec![0xAA; 4096]);
+    assert_eq!(ret, [0], "memcmp n=0");
 }
