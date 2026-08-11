@@ -175,6 +175,49 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
         Vec::new()
     };
 
+    // **Freeze read-only tables.** A `local t = {…}` read in the loop (`t[i]`) needs the table object in
+    // constant memory for the read to fold: the struct (so `array`, `alimit`, and the null `metatable`
+    // fold), the array part (a constant-index read folds to an immediate; a dynamic-index read becomes a
+    // masked load from it), and the node/hash part (so the slow-path `luaH_get` folds instead of exploring
+    // the rehash machinery). Each frozen region goes in **both** `const_overlays` (spec-time folding) and a
+    // readonly **data segment** (so a dynamic-index runtime load hits mapped, initialized memory — the
+    // object lives on the heap above the register stack, outside every renamed region). Tables are found
+    // generically by scanning the register frame for a collectable-table tag (`0x45`). Lua 5.4 `Table`:
+    // `lsizenode` @+11, `alimit` @+12, `array` @+16, `node` @+24, `metatable` @+40, size 56; `Node` is 24
+    // bytes. A table-free chunk freezes nothing, so this is inert on the numeric/control-flow paths.
+    const TABLE_TAG: u8 = 0x45;
+    let win_len = w.len() as u64;
+    let mut table_overlay: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut table_data: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut seen: Vec<u64> = Vec::new();
+    for reg in 0..32u64 {
+        let addr = base + (reg + 1) * STACKVALUE_SIZE; // +1: VARARGPREP frame shift
+        if addr + 16 > win_len || w[(addr + 8) as usize] != TABLE_TAG {
+            continue;
+        }
+        let tptr = rd_u64(w, addr);
+        if tptr == 0 || tptr + 56 > win_len || seen.contains(&tptr) {
+            continue;
+        }
+        seen.push(tptr);
+        let mut freeze = |lo: u64, len: usize| {
+            table_overlay.push((lo, slice(lo, len)));
+            table_data.push((lo, slice(lo, len)));
+        };
+        freeze(tptr, 56); // the Table struct
+        let alimit = rd_i32(w, tptr + 12);
+        let array = rd_u64(w, tptr + 16);
+        if array != 0 && alimit > 0 && array + alimit as u64 * 16 <= win_len {
+            freeze(array, alimit as usize * 16); // the array part
+        }
+        let node = rd_u64(w, tptr + 24);
+        let nbytes = (1u64 << w[(tptr + 11) as usize]) * 24;
+        if node != 0 && node + nbytes <= win_len && !seen.contains(&node) {
+            seen.push(node);
+            freeze(node, nbytes as usize); // the node / hash part (an array-only table: the shared dummy)
+        }
+    }
+
     // Integer `//` (OP_IDIV) and `%` (OP_MOD) are the only arithmetic ops that *raise* on a bad
     // operand — a zero divisor, or `INT_MIN // -1` overflow — and the register-register forms inline
     // that guard (and its `luaG_runerror` cold arm) directly in `luaV_execute`. The proven recipe
@@ -299,16 +342,42 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
         .enumerate()
         .map(|(f, func)| reaches[f] && never_returns(func) && func.blocks.len() > 1)
         .collect();
-    // The cold-arm blocks of `luaV_execute`: those calling an error raiser (not the recursive
-    // `luaV_execute` self-call — that is the OP_CALL path). Deopting *only* these folds `%` / `//` on
-    // the hot path and sends the actual error case to the baseline.
+    // **Cold-arm deopt targets.** Two families of `luaV_execute` cold arm reach the allocator / throw
+    // machinery and can't be projected, so they deopt to the carried baseline (never taken at runtime for
+    // the hot integer/table path):
+    //   1. **error raisers** — an op like `%` / `//` guarding a zero divisor calls `luaG_runerror` (below);
+    //   2. **metamethod / slow-arm dispatchers** — a `t[i]` read produces a *dynamic* slot pointer, and a
+    //      value *loaded* from a table has a tag the specializer can't prove numeric, so every consuming op
+    //      (`+`, `<`, `#`, …) and the table read itself explore their metamethod arm (`luaV_finishget` /
+    //      `luaT_trybinTM` / …), which invokes a metamethod (→ `luaD_call` → the allocator) or rehashes.
+    //      For integer data in a dense array those arms are never taken, so deopting the `luaV_execute`
+    //      blocks that call one folds the hot read + arithmetic and sends the (impossible) slow case to
+    //      baseline — the same guard-and-deopt shape as `%`/`//`, scoped to the metamethod dispatchers
+    //      (not every allocator-reaching block — the GC checkpoint on the hot loop back-edge folds and must
+    //      not be deopted). A numeric/control-flow chunk reaches none of these arms: inert there.
+    let mm_helpers: Vec<u32> = [
+        "luaV_finishget",
+        "luaV_finishset",
+        "luaT_trybinTM",
+        "luaT_trybiniTM",
+        "luaT_trybinassocTM",
+        "luaT_callorderTM",
+        "luaT_callorderiTM",
+        "luaV_equalobj",
+        "luaV_objlen",
+        "luaV_concat",
+    ]
+    .iter()
+    .filter_map(|nm| m.exports.iter().find(|e| e.name == *nm).map(|e| e.func))
+    .collect();
     let deopt_blocks: Vec<u32> = m.funcs[luav as usize]
         .blocks
         .iter()
         .enumerate()
         .filter(|(_, b)| {
             b.insts.iter().any(|i| {
-                matches!(i, Inst::Call { func, .. } if *func != luav && is_raiser[*func as usize])
+                matches!(i, Inst::Call { func, .. }
+                    if *func != luav && (is_raiser[*func as usize] || mm_helpers.contains(func)))
             })
         })
         .map(|(bi, _)| bi as u32)
@@ -328,6 +397,7 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
                 (closure, slice(closure, 48)),
                 (proto, slice(proto, 128)),
             ],
+            table_overlay.clone(),
             k_overlay.clone(),
         ]
         .concat(),
@@ -343,7 +413,7 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
     // calls nothing). If that hits `Unsupported` (e.g. `%` / `//` projects into the un-foldable
     // setjmp/longjmp error path), fall back to deopting every cold error arm to the carried baseline
     // `luaV_execute` — the hot arithmetic still folds and the residual entry lands at the last function.
-    let (residual, entry) = match specialize_with_config(m, luav, &args, &base_cfg()) {
+    let (mut residual, entry) = match specialize_with_config(m, luav, &args, &base_cfg()) {
         Ok(r) => (r, 0u32),
         Err(_) => {
             let cfg = SpecConfig {
@@ -358,6 +428,15 @@ pub fn auto_rolled(m: &Module, script: &str) -> AutoRolled {
             (r, e)
         }
     };
+    for (off, bytes) in &table_data {
+        if !residual.data.iter().any(|d| d.offset == *off) {
+            residual.data.push(svm_ir::Data {
+                offset: *off,
+                readonly: true,
+                bytes: bytes.clone(),
+            });
+        }
+    }
     svm_verify::verify_module(&residual).expect("residual verifies");
 
     let counter_ix = d.varying.iter().position(|&a| a == d.counter).unwrap();
