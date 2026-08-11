@@ -736,6 +736,18 @@ engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX p
 cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
 already lowers a named import to a host capability (`Cap`) — that's the seam.
 
+**✅ Pure-IR compute leaves — DONE 2026-08-11 (#761, slice 1).** The *compute* half of the bottom
+edge needs **no** host authority, so it binds as ordinary linked SVM functions instead of caps —
+keeping the runtime inside the pure-IR / both-engines model. `svm_leng::bottom_edge_runtime()` is a
+link unit providing `memcpy`/`memset` (→ `mem.copy`/`mem.fill`), `__builtin_bswap64`/`clzll`/`ctzll`/
+`popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the single-thread `__atomic_*` family
+(→ plain load/modify/store — correct for a single-vCPU guest, §3d); `bottom_edge_index` maps a C leaf
+name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/svm-leng/tests/bottom_edge.rs`
+— each leaf **interp == JIT == native**, plus a link test binding a user module's imports to the runtime.
+Remaining for #761: `memcmp` (a byte loop), and emitting the import under its `importc` C name so the
+real `system` module binds without a name map (wired in #762, where the real names are in hand). The
+allocator (`mmap`/`munmap`) + syscalls stay on the Memory cap / POSIX seam — not pure IR.
+
 **Two paths to the near-term milestone (run one real program):**
 
 - **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
