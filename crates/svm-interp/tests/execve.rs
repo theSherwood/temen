@@ -112,6 +112,49 @@ fn exec_module_replaces_the_image_with_a_separate_command_module() {
     );
 }
 
+/// OPS_PARITY.md (`exec_module`) — `exec_module` is eval-loop-only, so the fast tiers must **fold**
+/// the module to the oracle, never run a generic `cap.call` thunk that answers `-EINVAL` where the
+/// oracle image-replaces (a silent divergence, INVARIANTS.md #9). Pin the fail-closed fold: the same
+/// guest run via `run_with_host_fast` (which tries the bytecode engine first) declines and folds, so
+/// it image-replaces and returns the command's `42` — identical to the oracle run above.
+#[test]
+fn exec_module_folds_to_the_oracle_on_the_fast_path() {
+    let guest = module(GUEST);
+    let cmd = module(CMD);
+
+    let mut host = Host::new();
+    host.set_self_module(&guest);
+    let sink = host.shared_stdout();
+    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let stream = host.grant_stream(StreamRole::Out);
+    let cmd_h = host.grant_module(&cmd);
+
+    let mut fuel = 40_000_000u64;
+    let r = svm_interp::run_with_host_fast(
+        &guest,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I64(cmd_h as i64),
+            Value::I32(stream),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the fast path folds the exec module to the oracle and image-replaces (42), not -EINVAL"
+    );
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        &bytes, b"EXEC",
+        "the folded run did the real image-replace + I/O"
+    );
+}
+
 /// The POSIX contract: **`execve` returns only on failure.** A bogus command handle (never granted)
 /// is a probeable `-EINVAL` that leaves the caller running — so the guest falls through to its
 /// `return 99` sentinel, and nothing is written to stdout. (Same guest as above; only the command

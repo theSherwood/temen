@@ -584,6 +584,59 @@ The slices, **all landed for the cooperative driver** (each pinned against the o
    `drive_parallel` (fork currently runs on the cooperative single-threaded driver; the parallel
    driver fails closed), and add fork shapes to the `bytecode_diff` fuzz corpus.
 
-**Cranelift is the remaining backend.** It follows the same arc, reusing `instantiator_rt` + the
-svm-run serve loop; its extra risk is the native-frame twin continuation (the §8 capture risk, on
-compiled code, where there is no `Clone`). Until then `serve_qualifies` folds fork for Cranelift.
+### 9.3 The Cranelift capstone (design, 2026-08-07 — grounded in a full JIT durable map)
+
+Cranelift fork does **not** "follow the same arc" as bytecode — that earlier framing was wrong. The
+bytecode twin works because a parked caller is a **reified `Vm` (Clone-derived)** at its post-call
+resume point. On the JIT there is **no reified continuation to clone**: `cap.call` is a synchronous
+host thunk, so a caller mid-call is a **live native OS-thread stack** — either running the handler
+inline (handoff) or thread-blocked on the `live_impl_call` Condvar (`svm-run/src/lib.rs:2270`). The
+JIT's durable machinery reifies a continuation into shadow-stack bytes **only at a poll safepoint,
+which is always *past* a completed `cap.call`** (a `SuspendKind::Leaf` spills + reloads the
+*already-returned* result; `svm-durable/src/lib.rs:888,929`). There is no `Blocked::CapReply` state
+on the JIT at all (`svm-jit/src/fiber_registry.rs` has no cap-park concept), and `freeze_drive`
+(`svm-jit/src/fiber_rt.rs:1121`) walks only voluntarily-suspended `RUNNABLE` fibers, whole-run.
+
+So the capstone is **not** DURABILITY §10 "clone at a quiescent point" (cheap snapshot/restore) — a
+forking caller is *not* quiescent. It is: **make a JIT `cap.call` a suspendable, pre-result durable
+safepoint**, so a forking caller unwinds to a reified continuation (shadow-stack bytes in the window)
+instead of thread-blocking. The snapshot format is already engine-agnostic and cloneable
+(`svm-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
+so the real work is turning the JIT call into a reifiable park. The four items, in dependency order:
+
+1. **The inject-vs-reload distinction is *runtime*, not a new compile-time `SuspendKind`** (refined
+   2026-08-07). A `cap.call` compiles once; the transform cannot know at compile time whether a given
+   call will be a normal return (reload the host's result) or a fork (inject a per-copy reply). So do
+   **not** add a `LeafInject` kind. Instead the existing `Leaf` reload stays the mechanism — it reloads
+   the result from the spill slot — and **fork writes the injected reply into that slot before thaw**.
+   The gap is therefore not "a new suspend kind" but item 2: getting the caller to reach a *reified,
+   pre-result* park at the fork call so the slot exists to write. (The interp does the runtime version
+   of exactly this — `pending = CapResult(reply)` on the live vCPU.)
+2. **Suspendable `cap.call` on the JIT — the load-bearing re-architecture** (`svm-jit` lowering +
+   `svm-run` serve path). *Why it is unavoidable:* in **both** live-offer transports the caller's
+   continuation is a **native Rust frame**, unreifiable — the enqueue path thread-blocks the caller on
+   the `live_impl_call` Condvar (`svm-run:2270`), and the handoff path runs the handler on the caller's
+   own thread with the caller's guest continuation suspended *below* it on the native C stack. A servicer
+   in another frame/thread cannot reify either. The fix: a live-offer `cap.call` from a durable guest,
+   when the reply is withheld, must **durable-unwind the caller's shadow stack (pre-result) back to the
+   window and return control** — parking the guest as a reified cap-reply-pending continuation — instead
+   of ever entering the native thread-block. This is caller-side parking on the JIT (the I36 slice never
+   built for the JIT), realized via durable unwind. It is a **new JIT execution mode for cross-domain
+   calls**, the sensitive change (handoff fast path + confinement-adjacent serve loop); gate it to
+   durable-instrumented forking guests so ordinary cross-domain calls keep the thunk fast path.
+3. **A targeted (single-continuation) freeze on the JIT.** `freeze_drive` is whole-run today; fork
+   freezes only the caller. Add a single-vCPU freeze entry producing that caller's image.
+4. **Return-twice.** Clone the caller's image + window (`fork_private`) + powerbox (`fork_powerbox`),
+   thaw two copies injecting `reply_orig`/`reply_twin` (the snapshot format already carries the
+   per-copy residue). This is the JIT analogue of `fork_parked_caller`, layered on 1–3.
+
+**Scope honesty:** item 2 re-architects a core JIT execution path (cross-domain `cap.call` becomes a
+durable-suspendable, caller-parking op), so this is a multi-PR capstone touching the durable transform
+(the R8 fork-critical instrumentation) and the confinement-adjacent serve path — built TDD-first,
+differential-pinned against the interp, one increment per PR. It is **not** a bounded slice with a
+safe independently-testable first primitive: items 3–4 are only exercisable once item 2 gives a
+reified mid-call continuation, and item 2 itself is the from-scratch execution-mode change. Until the
+capstone lands, `serve_qualifies` correctly folds fork for Cranelift — no divergence, a forking module
+runs on a reifiable tier. The first PR is item 2's foundation: a durable guest's live-offer `cap.call`
+that unwinds pre-result to a window-resident continuation instead of thread-blocking, pinned by a
+freeze/thaw round-trip that resumes past the call with an injected reply.

@@ -1694,6 +1694,12 @@ fn compile_inst(inst: &Inst, dst: u32, block_base: u32, g: &impl Fn(u32) -> u32)
                 // decline the module so it falls back to the tree-walker, which services op 13
                 // directly. (The JIT does lower it inline — it owns the fuel cell's address.)
                 (svm_ir::CAP_SELF_TYPE_ID, 13) => return None,
+                // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only:
+                // the tree-walker folds it to `Step::Exec` before any host dispatch, so a fast tier
+                // that ran the generic `cap.call` thunk would answer `-EINVAL` where the oracle
+                // image-replaces — a silent divergence (INVARIANTS.md #9). Decline the module so it
+                // folds to the oracle (fail-closed), as op 13 does. (OPS_PARITY.md `exec`.)
+                (svm_ir::CAP_SELF_TYPE_ID, 14) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,

@@ -126,6 +126,8 @@ const SERVE: &str =
 const FORK_GAP: &str =
     "native on tree-walk + bytecode; Cranelift still folds (serve loop in svm-run, native-frame twin) — the next slice (FORK.md §9.1)";
 const FUEL_BC: &str = "declines the module (folds to the oracle) rather than adding a native op";
+const EXEC_GAP: &str =
+    "eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6)";
 
 /// Reserved cap-interface ids and self-namespace op numbers that appear **directly** in `cap.call`
 /// IR encoding. These mirror `svm_interp::cap_id` and the `svm_interp::CAP_SELF_*` op constants
@@ -140,6 +142,7 @@ pub mod capcall {
     pub const CLONE_CALLER: u32 = 11;
     pub const REAP: u32 = 12;
     pub const FUEL_REMAINING: u32 = 13;
+    pub const EXEC: u32 = 14;
 }
 
 /// Classify a `cap.call` sub-op `(type_id, op)` across the four backends. The generic host-cap case
@@ -183,6 +186,17 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         (t, o) if t == self_ty && o == capcall::FUEL_REMAINING => {
             [F, cell(Status::NotYet, FUEL_BC), F, leaf]
         }
+
+        // `exec_module` (14): `execve` image-replace, eval-loop-only (`Step::Exec`). Both fast tiers
+        // decline the module (bytecode `compile_inst` returns `None`; the JIT bails `Unsupported`), so
+        // a forking/exec'ing run folds to the oracle — never a `-EINVAL`-vs-image-replace divergence.
+        // A real gap they *could* close (like `clone_caller` was); wasm-JIT leaf-folds every cap op.
+        (t, o) if t == self_ty && o == capcall::EXEC => [
+            F,
+            cell(Status::NotYet, EXEC_GAP),
+            cell(Status::NotYet, EXEC_GAP),
+            leaf,
+        ],
 
         // Generic host `cap.call` (Stream / Clock / Memory / host-fn / JIT-compile / …) and every
         // other cap sub-op: native on both interpreters and Cranelift's cap-call thunk; wasm leaf.

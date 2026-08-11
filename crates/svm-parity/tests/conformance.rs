@@ -132,4 +132,5 @@ fn capcall_op_numbers_match_the_interpreter() {
     assert_eq!(capcall::CLONE_CALLER, svm_interp::CAP_SELF_CLONE_CALLER);
     assert_eq!(capcall::REAP, svm_interp::CAP_SELF_REAP);
     assert_eq!(capcall::FUEL_REMAINING, svm_interp::CAP_SELF_FUEL_REMAINING);
+    assert_eq!(capcall::EXEC, svm_interp::CAP_SELF_EXEC);
 }

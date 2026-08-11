@@ -6185,6 +6185,15 @@ fn lower_block(
                 ubs.resize(vals.len(), UB_TOP);
                 continue;
             }
+            // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
+            // tree-walker folds it to `Step::Exec` before any host dispatch. The generic `cap.call`
+            // thunk here would answer `-EINVAL` where the oracle image-replaces — a silent divergence
+            // (INVARIANTS.md #9). Decline so the run folds to a reifiable tier (OPS_PARITY.md `exec`).
+            if *type_id == svm_ir::CAP_SELF_TYPE_ID && *op == 14 {
+                return Err(JitError::Unsupported(
+                    "exec_module: eval-loop-only image-replace (op 14)",
+                ));
+            }
             // §14 `Instantiator` (iface 6): when this (parent) compile has a live `Nursery`, lower
             // `instantiate`/`join` to its thunks instead of the generic `cap.call` — spawning a child
             // needs the host compiler, which the flat `cap.call` thunk can't reach. Otherwise (a child
