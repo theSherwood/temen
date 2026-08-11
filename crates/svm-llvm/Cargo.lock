@@ -625,6 +625,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "svm-leng"
+version = "0.0.0"
+dependencies = [
+ "svm-encode",
+ "svm-ir",
+ "svm-text",
+]
+
+[[package]]
 name = "svm-llvm"
 version = "0.0.0"
 dependencies = [
@@ -633,6 +642,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-leng",
  "svm-peval",
  "svm-posix",
  "svm-run",

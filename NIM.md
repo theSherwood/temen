@@ -1070,18 +1070,29 @@ So the surface a guest build must satisfy is tiny.
    module whose **only externals are `malloc`/`free`/`calloc`/`bcmp`** — all four **synthesized** by
    the on-ramp (`svm_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
    real, and the run clears them.
-   **The genuinely-remaining blocker is narrower than "toolchain," and it's in the on-ramp: `svm_llvm`
-   doesn't yet cover every intrinsic Rust's *float* code emits.** Translating the build-std module
-   surfaced two, both in std's float path (reached because svm-leng parses/formats float literals):
-   `llvm.usub.sat.i8` in `dec2flt` — **now fixed** (the on-ramp gained i8/i16
-   `{u,s}{add,sub}.sat`, `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
-   vector funnel shift) in `flt2dec`/dragon4, the u128-bignum formatter, which is **not** yet supported.
-   So the correct run + byte-identical §18 differential (the `svm-leng.svmb` asset over a real hexer
-   Leng file, the `chibicc_selfhost_asset` analog) needs one of: **(a)** hardening `svm_llvm` for the
-   u128/vector ops Rust's float algorithms use (the clean path, a bounded on-ramp pass), or **(b)**
-   a `guest` build of svm-leng that fail-closes on float literals (integer-only self-host first — the
-   float paths are the only ones that reach dragon4/dec2flt). Everything else — integer code, `String`/
-   `Vec`/`HashMap`, the allocator — already translates and runs.
+   **The integer-only self-host RUN is ✅ DONE (2026-08-11, path (b))** — the real `svm-leng`
+   translator now *executes* inside the sandbox to a correct result. `crates/svm-llvm/tests/w5_leng_run.rs`
+   builds the `leng_probe` guest with `-Z build-std` (via `common::build_fixture_bc_std`), translates the
+   ~255-func module, re-verifies it, runs `svm_leng::translate_to_text` on the interpreter, and asserts
+   the emitted SVM text's checksum is **byte-identical to the same translation run host-side** (the §18
+   svm == native differential). Integer-only in two senses: the fixture depends on `svm-leng` with
+   `default-features = false` (float literals fail closed → no `flt2dec`/`dec2flt`), and
+   `build-std-features=panic_immediate_abort` collapses panics to `abort` (no float *formatter* for panic
+   messages). The entry is the guest's exported `main(sp) -> i32` — a plain compute entry (the fixture
+   allocates from a static arena via its own `#[global_allocator]`, so no powerbox caps); the JIT declines
+   the large build-std module (a backend `Malformed`, not a translation gap — it verifies), so the run
+   pins the tree-walker. **This closes W5's core self-host claim: a real `std` Rust translator, compiled
+   the normal way, produces the same SVM-IR inside the sandbox as it does natively.**
+
+   **What path (b) deliberately leaves for (a): float literals.** The two float intrinsics `svm_llvm`
+   doesn't yet lower, both in std's float path (reached only when svm-leng parses/formats float literals):
+   `llvm.usub.sat.i8` in `dec2flt` — **fixed** (the on-ramp gained i8/i16 `{u,s}{add,sub}.sat`,
+   `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a vector funnel shift) in
+   `flt2dec`/dragon4, the u128-bignum formatter, **still unsupported**. So a *float-capable* svm-leng
+   run (and the fuller `svm-leng.svmb` asset over a real hexer Leng file, the `chibicc_selfhost_asset`
+   analog) still needs **(a)** hardening `svm_llvm` for the u128/vector ops Rust's float algorithms use
+   (a bounded on-ramp pass). Everything else — integer code, `String`/`Vec`/`HashMap`, the allocator —
+   already translates and runs.
 3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
    self-hosting payoff, no browser.
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the

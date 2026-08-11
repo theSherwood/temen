@@ -20,7 +20,9 @@ publish = false
 crate-type = ["lib"]
 
 [dependencies]
-svm-leng = { path = "../../../../svm-leng" }
+# `default-features = false` → the **guest** svm-leng: float literals fail-closed, so the module
+# carries no `flt2dec`/`dec2flt` (the u128/vector float code svm-llvm doesn't lower yet). W5 §3e (b).
+svm-leng = { path = "../../../../svm-leng", default-features = false }
 
 [profile.release]
 panic = "abort"
