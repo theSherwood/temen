@@ -3275,8 +3275,11 @@ impl<'a> FuncGen<'a> {
                 if let Ok(n) = parse_int(a) {
                     return Ok(self.emit_const(ValType::I64, n));
                 }
+                // Float literal (2.0, 1.5, 1e3). Gated: with `float` off this parse (`dec2flt`) and
+                // `emit_fconst` (`flt2dec`) are pruned, and a float literal fails closed below (§3e).
+                #[cfg(feature = "float")]
                 if let Ok(f) = a.parse::<f64>() {
-                    return Ok(self.emit_fconst(ValType::F64, f)); // float literal (2.0, 1.5, 1e3)
+                    return Ok(self.emit_fconst(ValType::F64, f));
                 }
                 if let Some(c) = char_literal(a) {
                     return Ok(self.emit_const(ValType::I32, c)); // char literal `'0'` / `'\0A'`
@@ -3360,9 +3363,12 @@ impl<'a> FuncGen<'a> {
                 // The overflow flag (`(ovf)`) — always false: svm integer arithmetic wraps and we
                 // don't track overflow (checks are off), so the `if (ovf)` guard never fires.
                 Some("ovf") => Ok(self.emit_const(ValType::I32, 0)),
-                // Float specials.
+                // Float specials (gated on `float`; else these tags fall through, fail-closed).
+                #[cfg(feature = "float")]
                 Some("inf") => Ok(self.emit_fconst(ValType::F64, f64::INFINITY)),
+                #[cfg(feature = "float")]
                 Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
+                #[cfg(feature = "float")]
                 Some("nan") => Ok(self.emit_fconst(ValType::F64, f64::NAN)),
                 Some("addr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
@@ -3392,13 +3398,22 @@ impl<'a> FuncGen<'a> {
                     }
                     let ty = suf_val_ty(a[1].as_atom().unwrap_or(""));
                     if is_float(ty) {
-                        let f = a[0]
-                            .as_atom()
-                            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
-                            .ok_or_else(|| {
-                                LengError::Unsupported("non-float suf literal".into())
-                            })?;
-                        Ok(self.emit_fconst(ty, f))
+                        #[cfg(not(feature = "float"))]
+                        {
+                            return Err(LengError::Unsupported(
+                                "float literals disabled in this build".into(),
+                            ));
+                        }
+                        #[cfg(feature = "float")]
+                        {
+                            let f = a[0]
+                                .as_atom()
+                                .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
+                                .ok_or_else(|| {
+                                    LengError::Unsupported("non-float suf literal".into())
+                                })?;
+                            Ok(self.emit_fconst(ty, f))
+                        }
                     } else {
                         let n = int_literal(&a[0])
                             .ok_or_else(|| LengError::Unsupported("non-int suf literal".into()))?;
@@ -4052,7 +4067,11 @@ impl<'a> FuncGen<'a> {
         self.slot_of.contains_key(name) || self.mem.contains_key(name)
     }
 
-    /// A float constant (`{:?}` round-trips through svm-text's `parse_float`).
+    /// A float constant (`{:?}` round-trips through svm-text's `parse_float`). Gated on `float`: the
+    /// `{f:?}` decimal formatter is `core::num::flt2dec` (dragon4, u128/vector), which `svm-llvm`
+    /// doesn't lower yet — a guest build (`float` off) has no `emit_fconst` caller, so this and its
+    /// formatter are pruned (W5 §3e).
+    #[cfg(feature = "float")]
     fn emit_fconst(&mut self, ty: ValType, f: f64) -> Val {
         let id = self.fresh();
         self.cur_buf

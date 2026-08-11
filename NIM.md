@@ -1052,7 +1052,7 @@ So the surface a guest build must satisfy is tiny.
    runs correctly on svm" and exercises the exact `alloc`/string surface the real translator needs. (It
    builds on the already-proven Rust→svm on-ramp — `rustbench`, the `peval` fixtures run real
    multi-crate Rust on svm — so the pipeline itself is mature; this pins the *leng surface* on it.)
-2. **The real `svm-leng` translator lowers to verified SVM-IR — ✅ DONE; correct *run* is toolchain-gated.**
+2. **The real `svm-leng` translator lowers to verified SVM-IR *and runs correctly on svm* — ✅ DONE (2026-08-11).**
    Measurement (2026-08-11) **overturned the feared prerequisite**: slice 1 guessed real `svm-leng`
    would need a `no_std` port of four crates. It does **not**. Rust generics monomorphize into the
    crate's own IR, so a plain `std` `svm-leng` compiles to LLVM IR and the on-ramp translates it whole:
@@ -1062,13 +1062,47 @@ So the surface a guest build must satisfy is tiny.
    FNV hasher** for svm-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
    and makes output deterministic), and `map_or` for `is_none_or` (the guest toolchain floors at rustc
    1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools). No `no_std`, no four-crate port.
-   What's *left* to a **correct run** (and the byte-identical §18 differential — the `svm-leng.svmb`
-   asset over a real hexer Leng file, the `chibicc_selfhost_asset` analog) is one **toolchain** step,
-   not code: `translate_to_text` reaches `core::fmt::Display`/`FromStr` (it formats and parses numbers),
-   which stay external libcore/liballoc symbols — stubbed to traps today (so a run would trap), and
-   made *real* by `-Z build-std`. That needs a nightly whose LLVM matches the link/opt tools; this env
-   has only LLVM-18 tools against an LLVM-23 nightly, so build-std is blocked *here* — a toolchain
-   alignment task (a matching nightly, or LLVM-23 `llvm-link`/`opt`), the sole remaining gate.
+   **Toolchain now aligned (2026-08-11).** The correct run needs the external libcore/liballoc symbols
+   (`fmt`/`FromStr`) made *real* via `-Z build-std`. The blocker was LLVM version skew — but
+   `RUSTC_BOOTSTRAP=1` unlocks `-Z build-std` on **stable 1.81 (LLVM 18)**, which matches the existing
+   `llvm-*-18` tools; with `rust-src` added, `build-std=std,panic_abort` +
+   `build-std-features=panic_immediate_abort` compiles std from source and the whole thing links to a
+   module whose **only externals are `malloc`/`free`/`calloc`/`bcmp`** — all four **synthesized** by
+   the on-ramp (`svm_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
+   real, and the run clears them.
+   **The integer-only self-host RUN is ✅ DONE (2026-08-11, path (b))** — the real `svm-leng`
+   translator now *executes* inside the sandbox to a correct result. `crates/svm-llvm/tests/w5_leng_run.rs`
+   builds the `leng_probe` guest with `-Z build-std` (via `common::build_fixture_bc_std`), translates the
+   ~255-func module, re-verifies it, runs `svm_leng::translate_to_text` on the interpreter, and asserts
+   the emitted SVM text's checksum is **byte-identical to the same translation run host-side** (the §18
+   svm == native differential). Integer-only in two senses: the fixture depends on `svm-leng` with
+   `default-features = false` (float literals fail closed → no `flt2dec`/`dec2flt`), and
+   `build-std-features=panic_immediate_abort` collapses panics to `abort` (no float *formatter* for panic
+   messages). The entry is the guest's exported `main(sp) -> i32` — a plain compute entry (the fixture
+   allocates from a static arena via its own `#[global_allocator]`, so no powerbox caps); the JIT declines
+   the large build-std module (a backend `Malformed`, not a translation gap — it verifies), so the run
+   pins the tree-walker. **This closes W5's core self-host claim: a real `std` Rust translator, compiled
+   the normal way, produces the same SVM-IR inside the sandbox as it does natively.**
+
+   **Path (a) — float-capable svm-leng — is now ✅ DONE too (2026-08-11).** The two float intrinsics
+   `svm_llvm` didn't lower, both in std's float path (reached only when svm-leng parses/formats float
+   literals): `llvm.usub.sat.i8` in `dec2flt` — fixed earlier (the on-ramp gained i8/i16
+   `{u,s}{add,sub}.sat`, `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
+   **general, non-rotate vector funnel shift**) in `flt2dec`/dragon4, the u128-bignum formatter. The
+   on-ramp already lowered the rotate idiom and the scalar general funnel shift; the vector general form
+   now scalarizes per lane to `(a << s) | (b >>u (w − s))` with a `select` on the `s == 0` width edge
+   (full-width `i32x4`/`i64x2` lanes only), pinned by `crates/svm-llvm/tests/vector_funnel_shift.rs`
+   (interp == JIT == native across the edge + mod-32 wrap). With that in, the **full float-capable
+   `svm-leng`** (default features on — 278 funcs, up from the 255 of the integer-only guest) translates,
+   re-verifies, and **runs to the same correct checksum** on the interpreter (verified end-to-end;
+   `llvm.fshl.v4i32` was the *only* remaining gap — no cascade of further float intrinsics). The
+   integer-only guest (`default-features = false`) stays a supported lean build; `w5_leng_run.rs` uses it
+   so the committed self-host test avoids a second ~40s `build-std` job, but the on-ramp no longer
+   requires it. Everything — integer code, `String`/`Vec`/`HashMap`, the allocator, and now the float
+   formatter — translates and runs.
+
+   Remaining W5 surface is packaging, not viability: the fuller `svm-leng.svmb` asset over a real hexer
+   Leng file (the `chibicc_selfhost_asset` analog) and the browser card.
 3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
    self-hosting payoff, no browser.
 4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
