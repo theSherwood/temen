@@ -167,17 +167,35 @@ over `encode_module`, the same identity the durable module-grant registry alread
   all).
 - **Gate:** the existing per-demo parity assertions run in both default states in `browser-test.mjs`.
 
-### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever)
+### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever) — LANDED (provable-bound form)
 
-- The BROWSER.md-named lever, scoped conservatively: elide or hoist `emit_confine` only where the
-  invariant is *proven* — e.g. repeated accesses off one base+bounded-offset within a block (the
-  same reasoning `svm-opt`'s D63-sound offset-disjointness already uses), or a dominating check of
-  the same `(base, range)`. Stays entirely inside the masking lowering; every elision form gets its
-  own fuzz corpus entry (this is the security hinge — INVARIANTS #2; AGENTS.md fuzzing rule).
-- **Measured target, not vibes:** Lua 5M-loop and SQLite REPL throughput on the playground path;
-  the bench README's `chase`/`chase_rand` rows for the honest memory-kernel view.
-- If the win plateaus, **function splitting** is the named fallback (BROWSER.md slice-8 findings);
-  stackification and the relooper stay rejected on the recorded A/B evidence.
+The BROWSER.md-named lever, in its most-proven form: the wasm-JIT now elides a memory access's
+bounds-**trap** branch when the address is *provably* in-window, reusing the native Cranelift JIT's
+existing D63 "guard-when-bounded" analysis rather than inventing one.
+
+- **Stage 1 (shared proof).** Lifted `UB_TOP`/`ub_at`/`ub_of`/`in_window` out of the native JIT's
+  private copy into `svm_ir::bounds` — one audited definition of the confinement veto predicate for
+  both JITs (INVARIANTS #9), behavior-preserving for `svm-jit` (jit_diff stays green).
+- **Stage 2 (wasm elision).** `emit_block_body` threads a per-block upper-bound map (`ubs`) in
+  lockstep with the emitter's own value numbering (reset per block; block params = `UB_TOP`), and at
+  each Load/Store/atomic/v128 access `elide_access` consults `in_window`. When proven bounded, the
+  `eff > mapped - width` trap branch is dropped. **The `& MASK` clamp is always emitted** — so this
+  is a *strictly safer subset* of the native JIT's elision (which also drops the clamp): a wrong
+  proof here is at worst a trap-parity divergence (caught by the differential), never an escape.
+- **Fuzzed as its own unit** (AGENTS.md "…or proven bounded"): `differential.rs` gains bounded-index
+  kernels that actually fire the elision (`(v0 & K)*W`, the top-byte boundary, the width-8
+  no-elide edge, a mixed elided/non-elided block), a size proof that the branch is really removed
+  (`elision_actually_removes_bytes`), and a 3000-iteration `elision_boundary_sweep` asserting
+  trap+value parity with the interpreter oracle around the window edge. `svm_ir::bounds` carries unit
+  tests for `in_window` overflow-safety and `ub_of`'s rules.
+- **Scope.** Matches the native proof exactly (const / `& K` / `+`/`|`/`^` / `* W` / `ExtendI32U`) —
+  notably it does **not** yet model `PtrAdd` (the C-frontend address op), so C-guest addresses stay
+  conservatively checked, same as on `svm-jit`. Widening the proof (or the "same-base dominating
+  check" redundancy form) is a follow-on if a measured target needs it.
+- **Measured target (next):** Lua 5M-loop / SQLite REPL throughput on the playground path and the
+  bench README's `chase`/`chase_rand` rows — to quantify the win on real programs. If it plateaus,
+  **function splitting** is the named fallback (BROWSER.md slice-8); stackification and the relooper
+  stay rejected on the recorded A/B evidence.
 
 ### Non-slice — standalone pure-wasm export (deliberately deferred)
 

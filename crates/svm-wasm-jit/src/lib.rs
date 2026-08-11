@@ -65,9 +65,10 @@
 
 #![forbid(unsafe_code)]
 
+use svm_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use svm_ir::{
     AtomicRmwOp, BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module,
-    StoreOp, Terminator, ValType, DEFAULT_RESERVED_LOG2,
+    StoreOp, Terminator, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
@@ -2878,6 +2879,15 @@ fn emit_trap(code: &mut Vec<u8>, trap_code: i32) {
 /// wrapping back in), then compute `win + (eff & MASK)`. The `& MASK` clamp is a no-op past the
 /// check (`eff < mapped ≤ reserved`), kept to mirror the native JIT's check+clamp lowering and to
 /// keep the following `i32.wrap` in-window as defense-in-depth.
+/// Slice-3 elision decision for one memory access: is `[addr+offset, addr+offset+width)` **provably**
+/// within `[0, mapped)` given the block-local upper bound tracked for the address SSA value? Uses the
+/// shared [`svm_ir::bounds`] proof — the same predicate the native JIT uses to elide (there it also
+/// drops the mask; here only the bounds-trap branch, keeping the clamp). Fail-closed: an unknown bound
+/// ([`UB_TOP`]) or any overflow yields `false` (emit the full check).
+fn elide_access(ubs: &[u64], addr: ValIdx, offset: u64, width: u64, mapped: u64) -> bool {
+    in_window(ub_at(ubs, addr), offset, width as u32, mapped)
+}
+
 fn emit_confine(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
@@ -2885,14 +2895,25 @@ fn emit_confine(
     offset: u64,
     width: u64,
     mapped: u64,
+    elide: bool,
 ) {
-    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, mapped, false)
+    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, mapped, false, elide)
 }
 
 /// Like [`emit_confine`] but, when `align`, also traps `MemoryFault` on a **misaligned** effective
 /// address (`eff % width != 0`) — the natural-alignment requirement §12 atomics carry (the
 /// interpreter's `check_align`), which a real hardware atomic would also raise. `width` is a power of
 /// two for the atomic types (4 or 8), so `width - 1` is the alignment mask.
+///
+/// **`elide` — the slice-3 redundant-bounds-check elision.** When the caller has *proven* the access
+/// in-window ([`svm_ir::bounds::in_window`] over the address's upper bound), the `eff > mapped - width`
+/// bounds-trap branch is redundant and skipped. The **`& MASK` clamp is always emitted** regardless of
+/// `elide` (escape safety, INVARIANTS #2): so a *wrong* proof here can only skip a trap the oracle
+/// would raise — a trap-parity divergence the interpreter differential catches — never a
+/// confinement escape. (The native JIT, which also drops the clamp on proof, is the escape-critical
+/// consumer of the same predicate; here we keep the clamp, a strictly safer subset.) The alignment
+/// trap is **independent of bounds** and is emitted whenever `align`, elided or not.
+#[allow(clippy::too_many_arguments)]
 fn emit_confine_maybe_aligned(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
@@ -2901,6 +2922,7 @@ fn emit_confine_maybe_aligned(
     width: u64,
     mapped: u64,
     align: bool,
+    elide: bool,
 ) {
     code.push(OP_LOCAL_GET);
     uleb(code, addr_local as u64);
@@ -2909,15 +2931,21 @@ fn emit_confine_maybe_aligned(
     code.push(0x7c); // i64.add → eff (unmasked)
     code.push(OP_LOCAL_TEE);
     uleb(code, cx.ea_l as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, mapped.wrapping_sub(width) as i64);
-    code.push(0x56); // i64.gt_u: eff > mapped - width ?
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    if !elide {
+        code.push(OP_I64_CONST);
+        sleb64(code, mapped.wrapping_sub(width) as i64);
+        code.push(0x56); // i64.gt_u: eff > mapped - width ?
+        code.push(OP_IF);
+        code.push(BLOCKTYPE_VOID);
+        cx.depth += 1;
+        emit_trap(code, TRAP_MEMORY_FAULT);
+        code.push(OP_END);
+        cx.depth -= 1;
+    } else {
+        // Proven in-window: drop the bounds-trap branch. `ea_l` still holds `eff` for the mask below;
+        // pop the value the `local.tee` left on the stack (the un-elided path consumes it in `gt_u`).
+        code.push(0x1a); // drop
+    }
     if align {
         // `eff & (width - 1) != 0` ⇒ misaligned ⇒ trap (matches `check_align`).
         code.push(OP_LOCAL_GET);
@@ -3071,11 +3099,20 @@ fn emit_block_body(
     nested_caps: bool,
 ) -> Result<(), Error> {
     let mut next_val = b.params.len(); // where the next instruction's results land
+                                       // Slice-3 confinement-check elision: a block-local **upper-bound** map over SSA values, in
+                                       // lockstep with the value numbering `next_val` drives (block params carry no bound → `UB_TOP`;
+                                       // bounds do not cross block boundaries). At each memory access, `elide_access` consults the
+                                       // address value's bound via the shared `svm_ir::bounds` proof to decide whether the runtime
+                                       // bounds check is redundant. Kept aligned to `next_val` by construction below — a misalignment
+                                       // could only mis-elide (a trap-parity divergence the differential catches; never an escape,
+                                       // since the `& MASK` clamp is always emitted).
+    let mut ubs: Vec<u64> = vec![UB_TOP; b.params.len()];
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: svm_ir::ValIdx| {
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[k][v as usize] as u64);
     };
     for inst in &b.insts {
+        let val_before = next_val;
         match inst {
             Inst::ConstI32(v) => {
                 code.push(OP_I32_CONST);
@@ -3156,6 +3193,7 @@ fn emit_block_body(
                     *offset,
                     width,
                     mapped,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
                 set_result(cx, code, k, &mut next_val);
@@ -3175,6 +3213,7 @@ fn emit_block_body(
                     *offset,
                     width,
                     mapped,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
@@ -3195,6 +3234,7 @@ fn emit_block_body(
                     width,
                     mapped,
                     true,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 code.extend_from_slice(&[load, 0x00, 0x00]);
                 set_result(cx, code, k, &mut next_val);
@@ -3215,6 +3255,7 @@ fn emit_block_body(
                     width,
                     mapped,
                     true,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[store, 0x00, 0x00]);
@@ -3237,6 +3278,7 @@ fn emit_block_body(
                     width,
                     mapped,
                     true,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 code.push(OP_LOCAL_SET);
                 uleb(code, cx.atomic_addr_l as u64); // save the confined address
@@ -3278,6 +3320,7 @@ fn emit_block_body(
                     width,
                     mapped,
                     true,
+                    elide_access(&ubs, *addr, *offset, width, mapped),
                 );
                 code.push(OP_LOCAL_SET);
                 uleb(code, cx.atomic_addr_l as u64);
@@ -3605,6 +3648,7 @@ fn emit_block_body(
                     *offset,
                     16,
                     mapped,
+                    elide_access(&ubs, *addr, *offset, 16, mapped),
                 );
                 emit_simd(code, 0); // v128.load
                 code.extend_from_slice(&[0x00, 0x00]); // align=1, offset=0 (offset folded in)
@@ -3623,6 +3667,7 @@ fn emit_block_body(
                     *offset,
                     16,
                     mapped,
+                    elide_access(&ubs, *addr, *offset, 16, mapped),
                 );
                 get(code, cx, *value);
                 emit_simd(code, 11); // v128.store
@@ -3856,8 +3901,23 @@ fn emit_block_body(
             }
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
+        // Keep `ubs` in lockstep with the value numbering `next_val` drives. An instruction that
+        // produced exactly one result gets its (possibly-`UB_TOP`) modeled bound; zero- or
+        // multi-result instructions (stores, fences, calls, cmpxchg pairs) get `UB_TOP` per new
+        // value. `ub_of` reads only operands (values defined earlier, already in `ubs`).
+        if next_val == val_before + 1 {
+            let bound = ub_of(inst, &ubs);
+            ubs.push(bound);
+        } else {
+            ubs.resize(next_val, UB_TOP);
+        }
     }
     debug_assert_eq!(next_val, value_types.len());
+    debug_assert_eq!(
+        ubs.len(),
+        value_types.len(),
+        "ubs must stay in lockstep with values"
+    );
 
     match &b.term {
         Terminator::Br { target, args } => {
