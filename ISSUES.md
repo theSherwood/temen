@@ -347,8 +347,9 @@ delta); whole-program at N=200 is at **parity** (both ≈ 0.95 s, dominated by J
 ~690-function module); specialization is linear at ≈ 48.5 residual blocks / ≈ 0.6 ms per unrolled
 iteration. The pinned-down economics: **unrolled specialization can never pay per-run** (~0.6 ms/iter
 to build vs ~93 ns/iter to interpret) — the payoff shape requires build-once/run-many with a
-compiled-module cache (no such API today: `run_powerbox` compiles per call, `Instance` holds only
-the `Module`) or **rolled** loops (N-independent residual size). This quantifies why rolled +
+compiled-module cache (now landed: `svm_run::CompiledCache`, a content-keyed map of `PowerboxProgram`s
+— `WASM_AOT.md` slice 1; before it, `run_powerbox` compiled per call and `Instance` held only the
+`Module`) or **rolled** loops (N-independent residual size). This quantifies why rolled +
 stitched + cached is the deployment target, and confirms the pipeline costs nothing at runtime
 (residual parity with baseline end-to-end).
 

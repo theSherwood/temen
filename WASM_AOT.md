@@ -123,18 +123,29 @@ escalation NESTED_JIT Track 3 documents — not in scope here.
 
 ### Slice 1 — compiled-output cache (the biggest playground feel-fix)
 
-- **Browser:** cache per module content-hash, across Runs: emitted wasm bytes → the compiled
-  `WebAssembly.Module` (V8 shares compiled code on structured clone; the per-code *instance* cache
-  per Worker already exists for §22 units — extend the pattern to the top-level emitted module).
-  First Run pays emit+compile once; every later Run of the same module (the playground's dominant
-  pattern: edit stdin, re-Run Lua/SQLite/chibicc) skips both.
-- **Native:** the primitive exists (`svm_jit::compile → CompiledModule::run`); add the caching
-  policy at the embedder seam (`svm-run`), keyed the same way.
-- **Fresh-window semantics are untouched:** we cache *code*, never window state — each Run still
-  builds a fresh window (INVARIANTS #6 / DESIGN §12 activation model). A cached-code run must be
-  differentially indistinguishable from a cold one; add that as a test.
-- **Gate:** second Run of a light script ≥ interpreter-only time (kills the "net slower under JIT"
-  footgun); bench the first-vs-second Run delta in the playground recorder.
+Two halves sharing **one content key** (the module's encoded-image digest — `svm_encode::digest256`
+over `encode_module`, the same identity the durable module-grant registry already uses). Cache
+**code**, never window/guest state.
+
+- **Native — LANDED (`svm-run` embedder seam).** `svm_run::CompiledCache`: a content-keyed map of
+  `PowerboxProgram`s (the existing build-once/run-many split, now dedup'd by module identity rather
+  than object identity). `run(&module, stdin)` compiles a module on first sighting and reuses the
+  native code on every later identical module — byte-identical to `run_powerbox` either way. Fills
+  the gap `ISSUES.md` named ("no such API today"). Fresh-window safety is inherited from
+  `PowerboxProgram` (fresh window + host reset per run) and pinned: `tests/compiled_cache.rs` proves
+  reuse-without-recompile, content-not-object keying, `run_powerbox` parity across inputs, no
+  state-leak across reuses, distinct-module isolation, and that a refused (concurrent) module is not
+  cached and does not poison the cache.
+- **Browser — NEXT.** Cache emitted wasm bytes → the compiled `WebAssembly.Module` across Runs,
+  keyed by the *same* content digest (compute it in the cdylib over the decoded module, replacing the
+  per-Run `PAR_RUN_GEN` generation counter — which today re-emits the same module on the next Run —
+  as the emit-dedup key; the per-code `jitInstCache` per Worker is the pattern to extend to the
+  top-level module). First Run pays emit+compile once; every later Run of the same module (edit
+  stdin, re-Run Lua/SQLite/chibicc) skips both. Not locally testable here (no wasm toolchain); it
+  rides CI's `browser-real` differential suite for correctness, plus a first-vs-second-Run timing
+  assertion in the playground recorder for the win itself.
+- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser) second Run of
+  a light script ≥ interpreter-only time — kills the "net slower under JIT" footgun.
 
 ### Slice 2 — default the JIT tier on where eligible (after slice 0)
 

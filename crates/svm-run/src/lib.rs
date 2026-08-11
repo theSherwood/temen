@@ -3940,6 +3940,102 @@ impl PowerboxProgram {
     }
 }
 
+/// **A content-keyed cache of [`PowerboxProgram`]s** — the build-once/run-many split applied across
+/// a *stream* of `(module, stdin)` invocations, so the same module compiled by several calls pays
+/// Cranelift codegen exactly once (`WASM_AOT.md` slice 1; the gap named in `ISSUES.md`: "the payoff
+/// shape requires build-once/run-many with a compiled-module cache").
+///
+/// [`PowerboxProgram`] already amortizes compile when the caller *holds* one program; this adds the
+/// missing piece — **identity by content**, not by object — so a driver that sees modules by value
+/// (a playground re-Run of the same source, a residual re-run against many inputs) reuses the
+/// compiled native code without threading a program handle through. The key is the module's encoded
+/// image ([`svm_encode::digest256`] over [`svm_encode::encode_module`]): two modules that encode
+/// identically compile identically under the fixed powerbox config, so a digest hit is sound.
+///
+/// **Caches code, never window/guest state (INVARIANTS #6 / DESIGN §21 "one entry over a fresh
+/// window per call").** Each [`run`](CompiledCache::run) delegates to [`PowerboxProgram::run`], which
+/// allocates a fresh window, re-applies data segments, and resets the powerbox host every call — so a
+/// cached-code run is byte-identical to a cold [`run_powerbox`], with no state leaking between runs
+/// (pinned in `tests/compiled_cache.rs`).
+///
+/// **Scope mirrors [`PowerboxProgram`].** Only single-threaded compute modules are cacheable; a
+/// module [`PowerboxProgram::compile`] refuses (§12 concurrency, or tree-walker folds) surfaces that
+/// `Err` from [`run`](CompiledCache::run) — the caller falls back to [`run_powerbox`] for those, as
+/// it would without the cache. Nothing is inserted for a module that fails to compile.
+#[derive(Default)]
+pub struct CompiledCache {
+    programs: std::collections::HashMap<[u8; 32], PowerboxProgram>,
+    /// Count of cold compiles performed (cache misses that compiled). Observable so a caller — and
+    /// the tests — can prove reuse without timing.
+    compiles: u64,
+    /// Count of cache hits served from an already-compiled program.
+    hits: u64,
+}
+
+impl CompiledCache {
+    /// An empty cache.
+    pub fn new() -> CompiledCache {
+        CompiledCache::default()
+    }
+
+    /// The content key for `module`: a digest of its encoded image. Public so a caller can pre-check
+    /// membership ([`contains`](CompiledCache::contains)) or key its own bookkeeping the same way.
+    pub fn key(module: &Module) -> [u8; 32] {
+        svm_encode::digest256(&svm_encode::encode_module(module))
+    }
+
+    /// Run `module` against `stdin`, compiling it on the first sighting and reusing the compiled
+    /// native code on every later call with an identical module — byte-identical to
+    /// `run_powerbox(module, stdin)` either way. Returns the compile error for a module
+    /// [`PowerboxProgram`] refuses (the caller falls back to [`run_powerbox`]); such a module is not
+    /// cached, so a later cacheable module is unaffected.
+    pub fn run(&mut self, module: &Module, stdin: &[u8]) -> Result<Run, String> {
+        let key = CompiledCache::key(module);
+        match self.programs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                self.hits += 1;
+                e.get_mut().run(stdin)
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // Compile on miss. A refusal (concurrency / tree-walker fold) or a real error is
+                // propagated and nothing is inserted — the next cacheable module still keys cleanly.
+                let mut prog = PowerboxProgram::compile(module.clone())?;
+                let run = prog.run(stdin);
+                // Insert only once the program is built (compile succeeded); a failed *run* still
+                // caches the code, exactly as holding a `PowerboxProgram` and re-running would.
+                slot.insert(prog);
+                self.compiles += 1;
+                run
+            }
+        }
+    }
+
+    /// Whether `module` is already compiled in this cache (its digest is present).
+    pub fn contains(&self, module: &Module) -> bool {
+        self.programs.contains_key(&CompiledCache::key(module))
+    }
+
+    /// Number of distinct modules compiled (cold-compile count).
+    pub fn compiles(&self) -> u64 {
+        self.compiles
+    }
+
+    /// Number of runs served from an already-compiled program (cache hits).
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Number of distinct compiled modules resident.
+    pub fn len(&self) -> usize {
+        self.programs.len()
+    }
+
+    /// Whether the cache holds no compiled modules.
+    pub fn is_empty(&self) -> bool {
+        self.programs.is_empty()
+    }
+}
+
 /// Run a bare (non-powerbox) kernel — `module`'s entry on the JIT with `args` and no host
 /// capabilities — returning its typed result values. For hand-written IR that is a pure
 /// function rather than a program (e.g. the benchmark kernels). `Err` on compile failure,
