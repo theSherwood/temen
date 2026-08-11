@@ -132,10 +132,10 @@ fn auto_rolled_residual_rolls_and_is_correct() {
 
 /// Integer `%` and `//` fold and roll through the zero-config path: `auto_rolled` marks each op's
 /// divisor + result registers dynamic and deopts the divide-by-zero cold arm to the carried baseline,
-/// so the division stays a residual op on the hot path while the dispatch still folds. The divisor is
-/// a *local* (`d`) — a register operand, so the guard is inline in `luaV_execute` (the constant K-form
-/// `i % 2` calls an un-inlined helper and is out of scope). Correctness is checked against real Lua on
-/// all backends, across a trip sweep, for both operators.
+/// so the division stays a residual op on the hot path while the dispatch still folds. The divisor here
+/// is a *local* (`d`) — a register operand whose guard is inline in `luaV_execute`; the constant K-form
+/// (`i % 2`) instead folds outright via the frozen constants pool, covered by the test below. Correctness
+/// is checked against real Lua on all backends, across a trip sweep, for both operators.
 #[test]
 fn auto_rolled_div_and_mod_fold_roll_and_are_correct() {
     let m = lua_module();
@@ -178,6 +178,60 @@ fn auto_rolled_div_and_mod_fold_roll_and_are_correct() {
         }
         println!(
             "{name}: folds + rolls + correct ({} residual blocks)",
+            f.blocks.len()
+        );
+    }
+}
+
+/// **Constant-divisor `%` / `//` (the K-forms).** `i % 2` compiles to `OP_MODK`, whose divisor is a
+/// constant in the proto's constants pool (`Proto.k`) rather than a register. Un-frozen, that pool is a
+/// separate heap allocation the `proto` overlay misses, so the divisor stays dynamic, the divide-by-zero
+/// (and metamethod/GC) machinery can't be proven dead, and projection hits `Unsupported`. `auto_rolled`
+/// now freezes the constants pool, so `K[C]` folds to the literal `2`, the error arm is dead, and the op
+/// folds outright — no divisor cell, no deopt (unlike the register-operand form above). Checked against
+/// real Lua across a trip sweep on both backends.
+#[test]
+fn auto_rolled_constant_k_mod_and_idiv_fold_via_frozen_constants() {
+    let m = lua_module();
+    type Closed = fn(i64) -> i64;
+    let cases: [(&str, &str, Closed); 2] = [
+        (
+            "i % 2",
+            "local s = 0\nfor i = 1, 50 do s = s + i % 2 end\nreturn s\n",
+            |n| (1..=n).map(|i| i % 2).sum(),
+        ),
+        (
+            "i // 2",
+            "local s = 0\nfor i = 1, 50 do s = s + i // 2 end\nreturn s\n",
+            |n| (1..=n).map(|i| i / 2).sum(),
+        ),
+    ];
+    for (name, script, want_fn) in cases {
+        let r = auto_rolled(&m, script);
+        let f = &r.residual.funcs[r.entry as usize];
+        assert!(!has_br_table(f), "{name}: the dispatch folds");
+        // A constant divisor is provably non-zero, so the K-form needs no divisor deopt: it folds on the
+        // fast path (entry 0), not the whole-module-carry fallback the register form uses.
+        assert_eq!(r.entry, 0, "{name}: folds outright (no deopt fallback)");
+        let n = r.dyn_cells.len();
+        let (wm, we) = with_readback(&r.residual, r.entry, r.acc_addr, n);
+        svm_verify::verify_module(&wm).expect("wrapped residual verifies");
+
+        let counter0 = r.captured[r.counter_ix];
+        assert_eq!(
+            jit(&wm, we, &r.captured),
+            want_fn(counter0 + 1),
+            "{name}: captured"
+        );
+        for c in [0i64, 1, 7, 49, 200] {
+            let mut a = r.captured.clone();
+            a[r.counter_ix] = c;
+            let want = want_fn(c + 1);
+            assert_eq!(tw(&wm, we, &a), want, "{name}: tree-walk c={c}");
+            assert_eq!(jit(&wm, we, &a), want, "{name}: jit c={c}");
+        }
+        println!(
+            "{name}: folds outright + rolls + correct ({} blocks)",
             f.blocks.len()
         );
     }
