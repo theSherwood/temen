@@ -385,27 +385,29 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   return status;
 }
 
-// **Pre-compile** the warm+JIT `eval_run` for `cacheKey` without running it — emit + `WebAssembly.compile`
-// + instantiate + cache the instance, so the first real `runWarmJit` is a full cache hit and pays no
-// ~12.7 MB `WebAssembly.compile` on the first wasm-JIT Run. Called during pre-warm (off the main thread),
-// so that cost is hidden. Best-effort: returns false if `eval_run` isn't wasm-drivable (the card then just
-// uses warm-interp), true once the instance is cached. No `prepare`/run/finish — it only warms the caches.
+// **Pre-warm** the warm+JIT `eval_run` for `cacheKey` — emit + `WebAssembly.compile` + instantiate **and
+// dry-run it once** (empty input, over the restored image), so the first real `runWarmJit` is instant.
+// Called during pre-warm (off the main thread), so all of that cost is hidden.
+//
+// Why the dry run matters (and why compile+instantiate alone did not): V8 compiles a wasm module's
+// **function bodies lazily — on first call**, not during `WebAssembly.compile`. So caching the compiled
+// Module + instance still left the *first* `f0()` call paying ~1.5 s of function compilation on the
+// user's first Run (measured: run1 4.7 s vs run2 2.3 s even with the instance primed). Making one `f0`
+// call here forces that compilation now. Empty input is language-agnostic (QuickJS/Lua) and still enters
+// the interpreter, warming the hot functions; the next real Run does `svm_warm_jit_prepare` (restores the
+// image + resets the powerbox), so the dry run leaves no state and fresh-per-Run isolation holds.
+//
+// Best-effort: returns false if `eval_run` isn't wasm-drivable or the dry run traps (the card then just
+// uses warm-interp), true once compiled + warmed.
 export async function primeWarmJit(ex, memory, cacheKey, shared = 1) {
-  const u8 = () => new Uint8Array(memory.buffer);
-  if (ex.svm_warm_jit_open(shared) !== 0) return false; // eval_run not emittable → interp-only
-  await cachedInstanceF0(
-    memory,
-    cacheKey,
-    () => {
-      const wptr = Number(ex.svm_warm_jit_wasm_ptr());
-      const wlen = ex.svm_warm_jit_wasm_len();
-      return u8().slice(wptr, wptr + wlen);
-    },
-    (func, argsPtr) => {
-      if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
-    },
-  );
-  return true;
+  try {
+    // A full dry Run with no stdin: opens/emits `eval_run`, compiles + instantiates (cached under
+    // `cacheKey`), and — the point — makes the first `f0` call so V8 compiles the bodies now.
+    await runWarmJit(ex, memory, null, cacheKey, shared);
+    return true;
+  } catch {
+    return false; // eval_run not emittable / trapped → card stays warm-interp
+  }
 }
 
 // Run the **chibicc compiler** on the wasm-JIT: feed it the user's C `srcBytes` (seeded at `/in.c`) plus
