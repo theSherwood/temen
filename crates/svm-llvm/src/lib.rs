@@ -842,6 +842,8 @@ fn translate_impl(
             &name2idx,
             &globals,
             &tls_layout.off,
+            tls_layout.block_size,
+            tls_layout.template_base.unwrap_or(0),
             &caps,
             &cstrs,
             &gbytes,
@@ -1572,10 +1574,16 @@ type Globals = (
 struct TlsLayout {
     /// Thread-local name → byte offset within the per-vCPU block.
     off: HashMap<String, u64>,
-    /// Total block size in bytes (what a spawned thread must allocate + zero).
+    /// Total block size in bytes (what a spawned thread must allocate).
     block_size: u64,
     /// Window address of the root vCPU's reserved block, or `None` when there are no thread-locals.
+    /// The root's block is pre-initialized with the TLS init image (below), so the root thread starts
+    /// with correct thread-local values.
     root_base: Option<u64>,
+    /// Window address of the pristine TLS **init image** (`__vm_tls_template()`), or `None` when there
+    /// are no thread-locals. A spawned thread copies `block_size` bytes from here into its fresh block
+    /// (instead of just zeroing), so a non-zero thread-local initializer is honored per-thread.
+    template_base: Option<u64>,
 }
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
@@ -1648,17 +1656,28 @@ fn globals_layout(
     place(&mut off, &mut addr, &mut syms, false)?; // writable + BSS globals
 
     // NIM.md §3d Tier-2: pack thread-local globals into one per-vCPU block addressed off `vcpu.tls`.
-    // Assign each a natural-aligned offset within the block, then reserve the **root** vCPU's block as
-    // a zero-init region in the writable area (its base is `vcpu.tls.set` in `_start`). A thread-local
-    // never gets a fixed window address — every access lowers to `vcpu.tls.get() + off`.
+    // Assign each a natural-aligned offset within the block and build the block's **init image** from
+    // their initializers, then reserve the root vCPU's block (pre-filled with that image) and a
+    // pristine copy of the image (for a spawned thread to copy from). A thread-local never gets a fixed
+    // window address — every access lowers to `vcpu.tls.get() + off`.
     let mut tls = TlsLayout::default();
+    // `(offset, init-bytes)` for each thread-local with a non-zero initializer, used to build the image
+    // once `block_size` is final.
+    let mut tls_inits: Vec<(u64, Vec<u8>)> = Vec::new();
     for g in m.global_vars.iter() {
         if !g.thread_local || name_str(&g.name).starts_with("llvm.") {
             continue;
         }
-        // A non-zero initializer would be lost when a spawned thread zero-allocates its block (and the
-        // root block is zero-init too). Fail closed — per-thread seeding is a follow-up (as in svm-leng
-        // `tls_mode`). std's lazy `thread_local!` statics are zero-init, so this does not bite them.
+        let size = match &g.initializer {
+            Some(init) => const_size(init.as_ref(), &m.types)?,
+            None => type_size(g.ty.as_ref(), &m.types)?,
+        }
+        .max(1);
+        let align = (g.alignment as u64).max(1);
+        tls.block_size = tls.block_size.div_ceil(align) * align;
+        let this_off = tls.block_size;
+        tls.off.insert(name_str(&g.name), this_off);
+        tls.block_size += size;
         if let Some(init) = &g.initializer {
             let empty: Vec<u32> = Vec::new();
             let mut feed = empty.iter().copied();
@@ -1670,28 +1689,27 @@ fn globals_layout(
                     ))
                 })?;
             if bytes.iter().any(|&x| x != 0) {
-                return Err(Error::Unsupported(format!(
-                    "non-zero thread-local initializer for `{}` (the per-vCPU TLS block is zero-init; \
-                     per-thread seeding is a follow-up)",
-                    name_str(&g.name)
-                )));
+                tls_inits.push((this_off, bytes));
             }
         }
-        let size = match &g.initializer {
-            Some(init) => const_size(init.as_ref(), &m.types)?,
-            None => type_size(g.ty.as_ref(), &m.types)?,
-        }
-        .max(1);
-        let align = (g.alignment as u64).max(1);
-        tls.block_size = tls.block_size.div_ceil(align) * align;
-        tls.off.insert(name_str(&g.name), tls.block_size);
-        tls.block_size += size;
     }
+    // The block's initial image (zero except where an initializer places bytes).
+    let mut tls_template: Vec<u8> = Vec::new();
     if tls.block_size > 0 {
-        // 16-byte-align the block base (covers the widest scalar/aggregate alignment std emits), then
-        // reserve `block_size` zero-init bytes for the root vCPU's block within the writable region.
+        tls_template = vec![0u8; tls.block_size as usize];
+        for (o, bytes) in &tls_inits {
+            let o = *o as usize;
+            let end = (o + bytes.len()).min(tls_template.len());
+            tls_template[o..end].copy_from_slice(&bytes[..end - o]);
+        }
+        // Reserve the root block, then the pristine template, both 16-byte-aligned in the writable
+        // region (16 covers the widest scalar/aggregate alignment std emits). Their init segments are
+        // pushed in phase B below; an all-zero image emits no segment (the window is zero-init).
         off = off.div_ceil(16) * 16;
         tls.root_base = Some(off);
+        off += tls.block_size;
+        off = off.div_ceil(16) * 16;
+        tls.template_base = Some(off);
         off += tls.block_size;
     }
 
@@ -1731,6 +1749,23 @@ fn globals_layout(
                 offset: at,
                 readonly: g.is_constant,
                 bytes,
+            });
+        }
+    }
+    // The TLS init image: seed the root vCPU's block and the pristine template (NIM.md §3d Tier-2).
+    // Both are writable (the template is never written by generated code, only read + copied). Skipped
+    // when the image is all-zero — the window is zero-init, so a zeroed block / template needs nothing.
+    if tls_template.iter().any(|&x| x != 0) {
+        if let (Some(root), Some(tmpl)) = (tls.root_base, tls.template_base) {
+            segs.push(svm_ir::Data {
+                offset: root,
+                readonly: false,
+                bytes: tls_template.clone(),
+            });
+            segs.push(svm_ir::Data {
+                offset: tmpl,
+                readonly: false,
+                bytes: tls_template,
             });
         }
     }
@@ -2469,6 +2504,8 @@ fn translate_func(
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
     tls_off: &HashMap<String, u64>,
+    tls_block_size: u64,
+    tls_template_base: u64,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -2569,6 +2606,8 @@ fn translate_func(
             name2idx,
             globals,
             tls_off,
+            tls_block_size,
+            tls_template_base,
             caps,
             cstrs,
             gbytes,
@@ -3012,6 +3051,8 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         // A `landingpad` reads only the reserved EH slots (the current exception/selector), no LLVM
         // value operands — its `{ptr,i32}` result is bound field-wise in `translate_inst`.
         I::LandingPad(_) => Vec::new(),
+        // A standalone `fence` has no value operands (it orders memory, touches none).
+        I::Fence(_) => Vec::new(),
         other => return unsup(format!("instruction {other:?}")),
     };
     Ok(r)
@@ -11946,6 +11987,23 @@ fn lower_vm_builtin(
             ctx.push_effect(Inst::VcpuTlsSet { val });
             Ok(true)
         }
+        // `long __vm_tls_size(void)` → the total size (bytes) of the per-vCPU TLS block (NIM.md §3d
+        // Tier-2), a translate-time constant. The std thread trampoline (#823) allocates + zeroes a
+        // block this size and `vcpu.tls.set`s it before running a spawned closure. Zero when the module
+        // has no thread-locals.
+        "__vm_tls_size" => {
+            let r = ctx.push(Inst::ConstI64(ctx.tls_block_size as i64));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `void *__vm_tls_template(void)` → the window address of the pristine per-vCPU TLS init image
+        // (NIM.md §3d Tier-2). The std thread trampoline copies `__vm_tls_size()` bytes from here into a
+        // spawned thread's block so non-zero thread-local initializers are honored per-thread.
+        "__vm_tls_template" => {
+            let r = ctx.push(Inst::ConstI64(ctx.tls_template_base as i64));
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -15299,6 +15357,10 @@ struct BlockCtx<'a> {
     /// Tier-2). A thread-local is *not* in `globals`; `llvm.threadlocal.address(@G)` lowers to
     /// `vcpu.tls.get() + tls_off[G]`. Empty when the module has no thread-locals.
     tls_off: &'a HashMap<String, u64>,
+    /// Total size (bytes) of the per-vCPU TLS block — what `__vm_tls_size()` returns, so the std
+    /// thread trampoline can allocate a spawned thread's block. 0 when there are no thread-locals.
+    tls_block_size: u64,
+    tls_template_base: u64,
     /// Import name (`write`/`read`/`exit`) → its §7 import index (for lowering a libc call to
     /// `CallImport`); several libc names can share one import (e.g. `puts`/`fwrite` → `write`).
     caps: &'a HashMap<String, u32>,
@@ -16139,6 +16201,8 @@ fn translate_block(
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
     tls_off: &HashMap<String, u64>,
+    tls_block_size: u64,
+    tls_template_base: u64,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -16185,6 +16249,8 @@ fn translate_block(
         name2idx,
         globals,
         tls_off,
+        tls_block_size,
+        tls_template_base,
         caps,
         cstrs,
         gbytes,
@@ -17271,6 +17337,21 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     }
 
     // No-result instructions (effects only): handle and return early.
+    if let I::Fence(f) = instr {
+        // A standalone atomic `fence <order>` (e.g. `Arc`'s acquire fence on drop) → `Inst::AtomicFence`
+        // (interp-honored; the JIT treats it as a no-op, like the other §12 ops). A single-thread-scoped
+        // fence maps the same — it still orders the executing vCPU's own accesses.
+        use crate::ll::ast::MemoryOrdering as MO;
+        let order = match f.atomicity.mem_ordering {
+            MO::Acquire => Ordering::Acquire,
+            MO::Release => Ordering::Release,
+            MO::AcquireRelease => Ordering::AcqRel,
+            MO::Unordered | MO::Monotonic => Ordering::Relaxed,
+            MO::SequentiallyConsistent | MO::NotAtomic => Ordering::SeqCst,
+        };
+        ctx.push_effect(Inst::AtomicFence { order });
+        return Ok(());
+    }
     if let I::Store(st) = instr {
         // A `store atomic` (seq-cst): a native `iN.atomic.store` for i32/i64, or the narrow path for
         // i8/i16 (an `xchg` CAS loop over the enclosing word, discarding the old value).

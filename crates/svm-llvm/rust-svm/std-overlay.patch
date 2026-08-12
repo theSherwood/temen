@@ -264,3 +264,17 @@
 +    }
      _ => {}
  }
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -1,4 +1,11 @@
+ cfg_select! {
++    all(target_os = "svm", target_env = "threads") => {
++        mod svm;
++        pub use svm::{
++            DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, current_os_id, set_name,
++            sleep, yield_now,
++        };
++    }
+     target_os = "hermit" => {
+         mod hermit;
+         pub use hermit::{Thread, available_parallelism, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
