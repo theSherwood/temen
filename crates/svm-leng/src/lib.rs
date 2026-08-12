@@ -207,6 +207,9 @@ enum Select<'a> {
 /// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
 /// `sel` is the named subset or the whole module; `ext_types` are external aggregate layouts
 /// (sibling units' pooled type defs) available while translating — see [`link_units`].
+// The pooled cross-module inputs (types, funcrefs, frame procs, sret procs, TLS) are each a distinct
+// list the linker threads in; grouping them into a struct would obscure more than it clarifies here.
+#[allow(clippy::too_many_arguments)]
 fn translate_object_module(
     stem: &str,
     src: &str,
@@ -214,6 +217,7 @@ fn translate_object_module(
     ext_types: &[(String, translate::Layout)],
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
+    ext_sret: &[(String, translate::TyDesc)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -221,6 +225,7 @@ fn translate_object_module(
     t.import_types(ext_types);
     t.import_funcrefs(ext_funcrefs);
     t.import_proc_frames(ext_frame_procs);
+    t.import_sret_procs(ext_sret);
     // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
     // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
     if let Some(layout) = tls_layout {
@@ -280,6 +285,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
         None,
     )?))
 }
@@ -293,6 +299,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
         &[],
         &[],
         &[],
@@ -314,7 +321,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
-    link_selected_with_extra(units, Vec::new(), false)
+    link_selected_with_extra(units, Vec::new(), false, false)
 }
 
 /// [`link_selected`] with pre-built **runtime** link units appended (e.g. the W3 bottom-edge shim
@@ -325,6 +332,7 @@ fn link_selected_with_extra(
     units: &[(&str, &str, Select)],
     extra: Vec<svm_ir::LinkUnit>,
     tls: bool,
+    manifest: bool,
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     let mut pooled_funcrefs = Vec::new();
@@ -333,14 +341,29 @@ fn link_selected_with_extra(
     // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
     // order, to lay out the one shared per-vCPU block below.
     let mut pooled_tls: Vec<(String, u64)> = Vec::new();
+    // Pooled **sret procs** across all units (stem-suffixed name → returned aggregate). A caller of
+    // an aggregate-returning proc materializes a result temp and passes it as `$sret` — and a proc
+    // that does so becomes frame-needing — so the sret set must be known **before** the frame
+    // fixpoint (`proc_frame_nodes`) runs, hence a first pass over the units to build it.
+    let mut pooled_sret: Vec<(String, translate::TyDesc)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
-        frame_nodes.extend(translate::Translator::proc_frame_nodes(&root, stem)?);
+        pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         if tls {
             pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
         }
+    }
+    // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
+    // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
+    for (stem, src, _) in units {
+        let root = nif::parse(src).map_err(LengError::Parse)?;
+        frame_nodes.extend(translate::Translator::proc_frame_nodes(
+            &root,
+            stem,
+            &pooled_sret,
+        )?);
     }
     // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
     // unit is handed this map, so a `tvar` defined in one unit and referenced from another lower to
@@ -388,6 +411,7 @@ fn link_selected_with_extra(
                 &pooled,
                 &pooled_funcrefs,
                 &pooled_frame_procs,
+                &pooled_sret,
                 tls_layout.as_ref(),
             )?))
         })
@@ -413,7 +437,17 @@ fn link_selected_with_extra(
         });
     }
     link_units.extend(extra);
-    svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
+    // `manifest`: retain any import **no unit exports** (the raw-syscall leaves — `write`/`read`/
+    // `_exit`, spelled by their nim symbol) in the merged manifest instead of failing the link, so
+    // the host binds them at instantiation (NIM.md W3: "raw syscalls → unresolved named imports the
+    // POSIX personality resolves at load"). The fail-closed `link` is the default (a whole-program
+    // link whose every leaf resolves to the pure-IR runtime shim).
+    let linked = if manifest {
+        svm_ir::link_with_manifest(&link_units)
+    } else {
+        svm_ir::link(&link_units)
+    };
+    linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
 }
 
 /// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), each contributing a
@@ -452,7 +486,25 @@ pub fn link_whole_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false)
+    link_selected_with_extra(&sel, runtime, false, false)
+}
+
+/// [`link_whole_with_runtime`], but **retaining the raw-syscall leaves** (`write`/`read`/`_exit`,
+/// spelled by their nim symbol) as manifest imports the host binds at instantiation (NIM.md W3, the
+/// POSIX-personality seam) — instead of fail-closing on them. The compute bottom edge (`memcpy`,
+/// atomics, …) still resolves against `runtime`; only the imports **no unit exports** survive, so a
+/// program that does real I/O links (the `write`/`read`/`_exit` a pure-IR shim can't provide) and
+/// runs once its host grants those slots. Feed the result to a powerbox runner (`run_powerbox`) or
+/// bind each retained slot to a host proc; re-verify like any linked output.
+pub fn link_whole_with_runtime_manifest(
+    units: &[WholeModule],
+    runtime: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Whole))
+        .collect();
+    link_selected_with_extra(&sel, runtime, false, true)
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
@@ -469,7 +521,7 @@ pub fn link_units_tls_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Names(u.names)))
         .collect();
-    link_selected_with_extra(&sel, runtime, true)
+    link_selected_with_extra(&sel, runtime, true, false)
 }
 
 /// The **pure-IR runtime for the C bottom edge** (NIM.md §3b, W3 — issue #761). The compiled Nim
