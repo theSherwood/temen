@@ -18,6 +18,12 @@ let warmUrl = null; // the module URL the warm session is currently open for (nu
 // it settles (compiled, or known non-emittable). A wasm-JIT eval awaits it so the first Run is a cache hit.
 let jitPrimePromise = null;
 let jitPrimed = false;
+// The background warm-**interp** pre-run. Even the interpreter eval path has a first-call cost: V8
+// compiles the engine's `eval_run` interpreter functions lazily on the first real eval, and `warmup`
+// (Tcl_Init / QuickJS init) doesn't exercise all of them — so the user's first warm-snapshot Run paid
+// that codegen (measured ~0.1–0.7 s with the deployed engine). A dry eval at pre-warm compiles them off
+// the main thread; a warm-interp Run awaits it so its first Run reuses the warmed code.
+let interpWarmPromise = null;
 
 const u8 = () => new Uint8Array(memory.buffer);
 // Read a captured stream out of the worker's memory. `.slice` copies to a non-shared buffer (TextDecoder
@@ -94,14 +100,20 @@ self.onmessage = async (e) => {
       // Reply as soon as warm-interp is ready (the ~0.9 s `warmup`) — do NOT block on the JIT pre-compile,
       // so an early interpreter Run isn't delayed by it.
       self.postMessage({ type: 'reply', id: msg.id, ok, status: ok ? 0 : ex.svm_status() });
-      // Then pre-compile the warm+JIT `eval_run` in the background (the ~12.7 MB `WebAssembly.compile`), so
-      // the first wasm-JIT Run is a cache hit instead of paying that compile. Best-effort; a non-emittable
-      // eval just leaves the card on warm-interp. Skipped when `primeJit` is false (a card whose warm+JIT
-      // declines, e.g. Tcl — no point compiling a module that traps).
-      if (ok && msg.primeJit !== false && !jitPrimePromise) {
-        jitPrimePromise = primeWarmJit(ex, memory, `${warmUrl}#eval`, 1)
-          .catch(() => false)
-          .finally(() => { jitPrimed = true; });
+      if (ok && !interpWarmPromise) {
+        // First, a dry warm-**interp** eval (empty input) so V8 compiles the interpreter eval path now,
+        // off the main thread — the first real warm-snapshot Run then pays no first-call codegen.
+        interpWarmPromise = evalWarm('', false).catch(() => {});
+        // Then pre-compile the warm+**JIT** `eval_run` (the ~12.7 MB `WebAssembly.compile` + a dry f0
+        // call), so the first wasm-JIT Run is a cache hit. Chained AFTER the interp warm so the two never
+        // touch the warm session concurrently (each restores + runs over the shared image). Best-effort;
+        // skipped when `primeJit` is false (a card whose warm+JIT declines, e.g. Tcl).
+        if (msg.primeJit !== false && !jitPrimePromise) {
+          jitPrimePromise = interpWarmPromise
+            .then(() => primeWarmJit(ex, memory, `${warmUrl}#eval`, 1))
+            .catch(() => false)
+            .finally(() => { jitPrimed = true; });
+        }
       }
       return;
     }
@@ -110,9 +122,10 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'warm session unavailable' });
         return;
       }
-      // A wasm-JIT Run waits for the in-flight pre-compile (if any) so it reuses the primed instance
-      // rather than kicking off a fresh ~12.7 MB compile on this Run.
-      if (msg.jit && jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmJit falls back */ } }
+      // Wait for the relevant background warm-up so this Run reuses it (and never races the session): a
+      // wasm-JIT Run waits for the JIT pre-compile; a warm-interp Run waits for the dry interp pre-run.
+      if (msg.jit) { if (jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmJit falls back */ } } }
+      else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
       const r = await evalWarm(msg.source, msg.jit);
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
       return;
