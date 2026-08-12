@@ -135,7 +135,13 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
             if let Some(stem) = name.strip_suffix(".x.nif") {
                 if out.iter().all(|(s, _)| s != stem) {
-                    out.push((stem.to_string(), std::fs::read_to_string(&p).unwrap()));
+                    // Lossy: a `.x.nif` may carry non-UTF-8 bytes in a string literal (the sweep hit
+                    // this on `strutils`). Identity for the valid-UTF-8 milestone fixtures.
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.push((
+                        stem.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
                 }
             }
         }
@@ -596,3 +602,193 @@ fn real_formatted_output_runs_end_to_end() {
         "two writeLine calls"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #760 W1 totality sweep (diagnostic, gated on NIM_SWEEP=1). Compiles a corpus of real Nim through
+// the toolchain, links each program whole, and tallies the `Unsupported`/`Malformed` reasons —
+// the ranked worklist for closing residual Leng totality to nimony scale. Not a CI gate.
+// ---------------------------------------------------------------------------------------------
+
+/// Like `compile_to_leng` but never panics: returns `Err(stderr)` if `nimony c` fails, so the sweep
+/// can distinguish a frontend failure from a translator gap.
+fn try_compile_to_leng(
+    nim_path: &str,
+    name: &str,
+    source: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let dir = std::env::temp_dir().join(format!("svm_nim_sweep_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("prog.nim"), source).map_err(|e| e.to_string())?;
+    let out = Command::new("nimony")
+        .args(["c", "--isMain", "prog.nim"])
+        .current_dir(&dir)
+        .env("PATH", nim_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "nimony: {}",
+            msg.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    let mut mods = Vec::new();
+    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(mods)
+}
+
+/// Collapse a translator error message to a stable bucket key: strip backtick-quoted specifics and
+/// parenthetical detail so `named type `foo.0.`` and `named type `bar.1.`` land in one bucket.
+fn bucket(msg: &str) -> String {
+    let mut out = String::new();
+    let mut in_tick = false;
+    for c in msg.chars() {
+        match c {
+            '`' => {
+                in_tick = !in_tick;
+                if in_tick {
+                    out.push_str("`…`");
+                }
+            }
+            _ if in_tick => {}
+            '0'..='9' => out.push('#'),
+            _ => out.push(c),
+        }
+    }
+    out.split(" (").next().unwrap_or(&out).trim().to_string()
+}
+
+#[test]
+fn totality_sweep_760() {
+    if std::env::var("NIM_SWEEP").is_err() {
+        eprintln!("SKIP totality_sweep_760 (set NIM_SWEEP=1 to run)");
+        return;
+    }
+    let path = toolchain_path().expect("toolchain required for the sweep");
+    // Corpus: nimony's own examples + a batch of feature-probe programs. Extendable via NIM_SWEEP_DIR
+    // (a directory of .nim files, each compiled --isMain).
+    let mut corpus: Vec<(String, String)> = Vec::new();
+    if let Ok(dir) = std::env::var("NIM_SWEEP_DIR") {
+        for e in std::fs::read_dir(&dir).expect("sweep dir").flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("nim") {
+                let name = p.file_stem().unwrap().to_string_lossy().to_string();
+                corpus.push((name, std::fs::read_to_string(&p).unwrap()));
+            }
+        }
+    }
+    // Built-in feature probes (always run).
+    for (n, s) in FEATURE_PROBES {
+        corpus.push((n.to_string(), s.to_string()));
+    }
+    // Stdlib import-drivers: a program that `import`s each named module pulls it + its deps through
+    // the toolchain, exercising the translator at real stdlib scale. Set NIM_SWEEP_STD=1 to include.
+    if std::env::var("NIM_SWEEP_STD").is_ok() {
+        for m in STD_MODULES {
+            corpus.push((format!("std_{m}"), format!("import std/{m}\n")));
+        }
+    }
+
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new(); // key -> (count, example prog)
+    let (mut ok, mut nim_fail, mut link_ok) = (0usize, 0usize, 0usize);
+    let total = corpus.len();
+    for (i, (name, src)) in corpus.iter().enumerate() {
+        eprintln!("[{}/{total}] {name} …", i + 1);
+        match try_compile_to_leng(&path, name, src) {
+            Err(e) => {
+                nim_fail += 1;
+                eprintln!("[nimony-fail] {name}: {e}");
+            }
+            Ok(mods) => {
+                let units: Vec<svm_leng::WholeModule> = mods
+                    .iter()
+                    .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+                    .collect();
+                // Manifest link with an *empty* runtime: every unresolved bottom-edge leaf is retained
+                // as a manifest import instead of fail-closing the link, so only genuine translator
+                // `Unsupported` gaps (which surface during translate, before link) are reported — not
+                // "no unit exports `write`" noise.
+                match svm_leng::link_whole_with_runtime_manifest(&units, Vec::new()) {
+                    Ok(_) => {
+                        ok += 1;
+                        link_ok += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("[gap] {name}: {err}");
+                        let (kind, msg) = match &err {
+                            svm_leng::LengError::Unsupported(m) => ("Unsupported", m.clone()),
+                            svm_leng::LengError::Malformed(m) => ("Malformed", m.clone()),
+                            svm_leng::LengError::Parse(m) => ("Parse", m.clone()),
+                        };
+                        let key = format!("[{kind}] {}", bucket(&msg));
+                        let e = buckets.entry(key).or_insert((0, name.clone()));
+                        e.0 += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<_> = buckets.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    eprintln!(
+        "\n===== #760 totality sweep: {} programs, {ok} translated, {nim_fail} nimony-fail =====",
+        corpus.len()
+    );
+    eprintln!("(link_ok={link_ok})");
+    for (key, (count, example)) in &ranked {
+        eprintln!("{count:>3}  {key}   (e.g. {example})");
+    }
+    eprintln!("===== end sweep =====\n");
+}
+
+/// Feature-probe programs — one construct family each, to surface translator gaps without needing a
+/// whole stdlib module. Kept small and self-contained.
+const FEATURE_PROBES: &[(&str, &str)] = &[
+    ("echo_int", "echo 42\n"),
+    ("string_concat", "import std/syncio\nlet s = \"a\" & \"b\"\nwrite(stdout, s)\n"),
+    ("seq_map", "import std/syncio\nvar s = @[1,2,3]\nvar t = 0\nfor x in s: t += x\nwrite(stdout, $t)\n"),
+    ("object_variant", "type K = enum ka, kb\ntype N = object\n  case k: K\n  of ka: a: int\n  of kb: b: int\nvar n = N(k: ka, a: 5)\n"),
+    ("closure", "proc mk(): proc(): int =\n  var c = 0\n  result = proc(): int =\n    c += 1\n    c\nlet f = mk()\ndiscard f()\n"),
+    ("exceptions", "import std/syncio\ntry:\n  raise newException(ValueError, \"x\")\nexcept ValueError:\n  write(stdout, \"caught\")\n"),
+    ("generic_proc", "proc id[T](x: T): T = x\nlet a = id(3)\nlet b = id(\"s\")\n"),
+    ("float_math", "import std/syncio\nimport std/math\nlet x = sqrt(2.0)\nwrite(stdout, $x)\n"),
+];
+
+/// Stdlib modules the sweep exercises via `import std/<m>` drivers (NIM_SWEEP_STD=1). A spread across
+/// strings, containers, numerics, and parsing — the constructs a real program (and nimony itself) hit.
+const STD_MODULES: &[&str] = &[
+    "strutils",
+    "sequtils",
+    "algorithm",
+    "math",
+    "tables",
+    "sets",
+    "hashes",
+    "options",
+    "deques",
+    "heapqueue",
+    "intsets",
+    "bitops",
+    "parseutils",
+    "strformat",
+    "unicode",
+    "times",
+    "json",
+    "base64",
+    "editdistance",
+    "md5",
+    "monotimes",
+    "complex",
+    "rationals",
+    "assertions",
+    "typetraits",
+    "enumutils",
+    "sugar",
+    "setutils",
+    "lists",
+    "packedsets",
+];
