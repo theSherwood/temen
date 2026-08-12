@@ -480,6 +480,108 @@ fn c_a_personality_guest_blocks_on_a_capability_pipe_read() {
     );
 }
 
+/// #799 slice 3 — **faithful EINTR: a *delivered* signal interrupts a blocked capability syscall.** The
+/// payoff of the bridge with the signal split (PROCESS.md §9 / #799): the guest catches SIGINT via the
+/// **personality** (`__px_signal` + `__px_sigaltstack` — policy), then blocks on a **capability**
+/// `__vm_read` (parks on `Blocked::PipeRead`). A sibling thread raises SIGINT via the personality's
+/// `__px_kill`; the *personality* decides it is deliverable (caught + unmasked), and only then does the
+/// **core** interrupt the parked read (`interrupt_interruptible_parks`, driven from the L2 safepoint) so it
+/// returns `-EINTR` (sentinel 42). Nothing signal-specific lives in svm — the interrupt fires exactly when
+/// the personality hands over a delivery. The raiser *retries* (deterministic under the M:N executor): a
+/// `kill` before `main` parks is a no-op interrupt; `main` sets `done` once its read takes EINTR.
+const EINTR_CAUGHT_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static volatile long fired;
+static void handler(int sig) { fired = sig; }
+long done;
+long raiser(long arg) {
+  while (__vm_atomic_load(&done) == 0)
+    __px_kill(0, 0, 2);   /* raise SIGINT via the personality (policy: caught -> deliverable) */
+  return 0;
+}
+int main(void) {
+  __px_signal(0, 2, (long)handler);          /* catch SIGINT */
+  __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  int fds[2];
+  __vm_pipe(fds);                            /* main holds both ends -> a live writer keeps the read blocked */
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);          /* PARKS; a delivered SIGINT interrupts it -> -EINTR */
+  __vm_atomic_add(&done, 1);
+  __vm_thread_join(h);
+  if (n == -4) return 42;                    /* -EINTR: the caught signal interrupted the blocked read */
+  return (int)n;
+}
+"#;
+
+#[test]
+fn c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr() {
+    let e = run_interp_only(EINTR_CAUGHT_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "a caught, delivered SIGINT interrupted the personality-linked guest's blocked capability read"
+    );
+}
+
+/// #799 slice 3 — **disposition-gated: an *ignored* signal does NOT interrupt a blocked syscall.** The
+/// mirror of the caught case, proving the gate is the personality's policy, not svm's: `main` sets SIGINT
+/// to `SIG_IGN` (1) and blocks on `__vm_read`; the raiser raises SIGINT — undeliverable, so the
+/// personality's `take_deliverable` returns `None` and the core never interrupts — and *then writes* the
+/// pipe, so `main`'s read completes with **data** (3), never `-EINTR` (42).
+const EINTR_IGNORED_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static char msg[] = "GO\n";
+long g_wfd;
+long raiser(long arg) {
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* let main reach its read and park */
+  __px_kill(0, 0, 2);          /* SIGINT is SIG_IGN -> undeliverable -> the core never interrupts */
+  __vm_write(g_wfd, msg, 3);   /* so main's read completes with DATA, proving no spurious EINTR */
+  return 0;
+}
+int main(void) {
+  __px_signal(0, 2, 1);        /* SIG_IGN(1): ignore SIGINT */
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* PARKS; the ignored SIGINT must NOT interrupt -> woken by the write */
+  __vm_thread_join(h);
+  if (n == -4) return 42;            /* a wrong EINTR — must not happen */
+  return (int)n;                     /* 3: the read completed with data */
+}
+"#;
+
+#[test]
+fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
+    let e = run_interp_only(EINTR_IGNORED_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(3)],
+        "an ignored SIGINT must not interrupt the blocked read; it completed with data instead"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).

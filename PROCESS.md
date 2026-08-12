@@ -711,7 +711,7 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 | `fork` proper | clone-of-parked via the fork endpoint: needs a durable-instrumented build (R8 on the critical path), full window copy until CoW, and clones **all** vCPUs (forkall) where POSIX forks only the calling thread — benign in practice, since POSIX itself restricts post-fork threaded code to async-signal-safe calls |
 | shell `trap` (INT/TERM/EXIT) | doorbell word checked at command boundaries — the *same* delivery points Bash itself uses (L0 below); compute-bound code waits on L2 |
 | `SIGCHLD` | reap-by-`poll` (L1/L2 below add async delivery when built) |
-| `EINTR` / signals while blocked | interruptible parks — wake-with-interrupted-status (L1 below). **BUILT (#796) for blocking pipe parks** (`raise` interrupts a parked read/write → `-EINTR`); other park kinds are the follow-on |
+| `EINTR` / signals while blocked | interruptible parks — wake-with-interrupted-status (L1 below). **BUILT (#799), disposition-gated**: a *deliverable* (caught, unmasked) signal interrupts a blocked capability pipe read/write → `-EINTR`; an ignored/masked one does not. Other park kinds + embedder-async ^C are the follow-on |
 | async handlers (`SIGTERM`, `setitimer`) | safepoint-injected delivery (L2 below): poll-granularity latency, bounded once Phase-4 back-edge polls land (`DURABILITY.md` R6) — the JVM/Go/wasmtime-epoch norm |
 | catching memory faults | in-window unmapped/protected-page faults are **pager events with retry precision** (§5 faults) — *stronger* than wasm, where every trap is terminal; confinement faults stay terminal by design |
 | `getpid`, pid files | personality-local pids; no cross-tree pid meaning |
@@ -748,21 +748,20 @@ park — and signal delivery is only a question of which action fires at them:
 - **L0 — doorbell (guest convention, ships with the shell).** A word the guest checks at
   its own boundaries. Bash's `trap` is *natively* this model (traps are delivered at
   command boundaries), so shell semantics are exact, not approximated. Zero VM change.
-- **L1 — interruptible parks (small runtime slice). BUILT (#796) for blocking pipe parks.**
-  A parked call wakes with an interrupted status instead of its result; the libc runs pending
-  handlers and re-issues, or returns `EINTR`. Parks are runtime state that already delivers
-  several outcome kinds — this is the signals-while-blocked half of POSIX. **Built:** the
-  capability path's blocking pipe read/write parks (`Blocked::PipeRead`/`PipeWrite`) are now
-  interruptible. A guest-reachable `raise(signum)` self-op (`CAP_SELF_RAISE`, the `__vm_raise`
-  builtin) arms the `SignalSource` (so L2 delivers the handler) *and* drains every interruptible
-  park via the scheduler, re-admitting each waiter with a per-host EINTR flag its rewound
-  read/write consumes at the park site — completing `-EINTR` (a value, invariant 5) instead of
-  re-parking. This is the capability-side of the #799 seam: one guest can hold a personality's
-  signals *and* the capability path's blocking pipes, so a signal interrupts a slow syscall.
-  **Still parked:** interrupting `join`/endpoint/completion parks (only pipe parks so far), the
-  "signal raised *before* the park" pending-check (only the async wake-while-parked path is
-  built), embedder-async raise while parked (needs a scheduler wait-loop poke), and JIT/bytecode
-  parity for the raise op (interp-first, like L2).
+- **L1 — interruptible parks (small runtime slice). BUILT (#799) for blocking pipe parks,
+  disposition-gated.** A parked call wakes with an interrupted status instead of its result; the
+  libc runs pending handlers and re-issues, or returns `EINTR`. **Built the faithful way:** the
+  interrupt is driven from the **L2 safepoint** — when the personality hands the interp a
+  *delivery* (`SignalSource::take_deliverable` returns `Some`, i.e. a **caught + unmasked** signal),
+  the core also `interrupt_interruptible_parks()`, re-admitting every parked interruptible syscall
+  (`Blocked::PipeRead`/`PipeWrite`) with a `-EINTR` (a value, invariant 5). The **disposition gate
+  is free and lives entirely in the personality**: an ignored (`SIG_IGN`) or masked signal yields
+  `None` and never interrupts. Nothing signal-specific lives in svm — the guest raises via the
+  personality's `kill`, and the core only wakes parked syscalls when the personality delivers
+  (invariant 4). This retired the `CAP_SELF_RAISE`/`__vm_raise` mechanism spike from #832.
+  **Still parked:** interrupting `join`/endpoint/completion parks (only pipe parks so far);
+  **embedder-async** raise while *all* fibers are parked (needs the `signal_notify` scheduler-wake
+  hook — the interactive Ctrl-C at an idle prompt); JIT/bytecode parity (interp-first, like L2).
 - **L2 — safepoint-injected handlers (rides existing polls). BUILT (#796).** At the per-op
   poll site (right beside the `kill` poll), if a personality's cheap `sig_armed` flag is set
   and no handler is already running, the interp redirects the fiber into the registered guest
@@ -780,8 +779,10 @@ park — and signal delivery is only a question of which action fires at them:
   the part of POSIX that POSIX itself fences off.
 
 L0 ships with the shell; **L2 async delivery is built (#796)**; **L1 (interruptible parks / `EINTR`)
-is built (#796) for the capability path's blocking pipe parks** — the remaining park kinds
-(`join`/endpoint/completion) and the raise op's JIT/bytecode parity are the follow-ons.
+is built (#799), disposition-gated** — a deliverable signal (the personality's policy) interrupts a
+blocked capability pipe read/write, an ignored/masked one does not, and svm holds no signal policy.
+The remaining park kinds (`join`/endpoint/completion), the embedder-async ^C (`signal_notify` hook),
+and JIT/bytecode parity are the follow-ons.
 
 ## 10. The validation ladder
 
@@ -860,7 +861,7 @@ Unchanged in substance from v1, restated against the substrate:
 | O10 | Endpoint × freeze consistent cut: a frozen domain parked on a call whose servicer is *outside* the cut — the pending call is neither host state (D-scope re-supply) nor captured guest state. v1 rule: freeze-boundary calls are **re-issued** on thaw; idempotence is the personality's problem. Validate against reload-not-reissue (R8/R11 machinery) | §4, §11 | open |
 | O11 | `clone` captures all vCPUs (forkall) vs POSIX calling-thread-only fork — benign for shells (POSIX post-fork threaded code is async-signal-safe-only anyway); pin the divergence in the personality doc | §7 | open |
 | O12 | No stop/continue (SIGSTOP / Ctrl-Z): the L2 safepoint redirect is the natural carrier (stop = park at the next poll instead of running a handler) — fold into the signals ladder rather than mint a bespoke op? | §9 | open |
-| O13 | Signals L1/L2 are designed, not built: until they land, parked calls are uninterruptible short of kill and compute-bound code sees no delivery — scope the POSIX personality's claims to L0 meanwhile | §9 | **mostly addressed (#796)** — L2 safepoint delivery built; L1 built for the capability path's blocking pipe parks (`raise` → parked read/write returns `-EINTR`). Remaining: interruptibility of `join`/endpoint/completion parks, and the raise op's JIT/bytecode parity |
+| O13 | Signals L1/L2 are designed, not built: until they land, parked calls are uninterruptible short of kill and compute-bound code sees no delivery — scope the POSIX personality's claims to L0 meanwhile | §9 | **mostly addressed (#796/#799)** — L2 safepoint delivery built; L1 built disposition-gated for the capability path's blocking pipe parks (a *deliverable* signal → parked read/write returns `-EINTR`; ignored/masked → none). Remaining: `join`/endpoint/completion parks, the embedder-async ^C hook, JIT/bytecode parity |
 | O14 | Attest's `freeze_authority` field requires freeze authority to be *explicit* — today subtree-freeze authority is implicit in nesting; plumbing needed before the report can be truthful | §6 | **partly addressed** — `attest` reports `freeze_exposed = durable` (the conservative truth: a durable nested child *is* ancestor-freezable). Remaining: a durable **freeze/thaw** must capture + restore a child's `Attestation` (the thaw re-attach path currently defaults it) — a `DURABILITY.md` follow-up |
 
 ---
