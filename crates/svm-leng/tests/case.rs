@@ -123,6 +123,38 @@ fn sparse_case_with_range_and_multivalue() {
     assert_eq!(run(&m, 0, &[201]), 0);
 }
 
+#[test]
+fn sparse_case_over_computed_discriminant() {
+    // #858: a sparse `case` whose discriminant lowers to a **fresh temp** — here `(add n n)` = 2n,
+    // the way nimony's real cases spell `(deref iter)` — rather than a bare symbol. A bare-symbol
+    // discriminant resolves to its slot index, a valid block parameter in every block; a computed
+    // one is a temp of the *entry* block, so the 2nd+ comparison blocks in the chain referenced it
+    // out of scope and the emitted IR failed to re-parse ("unknown value"). Now the discriminant is
+    // re-derived in each comparison block. Three branches force a real chain (a 2nd comparison
+    // block); both engines.
+    let leng = "\
+(stmts
+ (proc :f.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (case (add (i +64) n.0 n.0)
+    (of (ranges 0) (stmts . (asgn r.0 1)))
+    (of (ranges 1000000) (stmts . (asgn r.0 2)))
+    (of (ranges 2000000) (stmts . (asgn r.0 3)))
+    (else (stmts . (asgn r.0 0))))
+   (ret r.0))))";
+    let text = svm_leng::translate_to_text(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert!(
+        !text.contains("br_table"),
+        "sparse case must use a comparison chain:\n{text}"
+    );
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[0]), 1); // 2*0 = 0
+    assert_eq!(run(&m, 0, &[500000]), 2); // 2*500000 = 1_000_000 (2nd comparison block)
+    assert_eq!(run(&m, 0, &[1000000]), 3); // 2*1_000_000 = 2_000_000 (3rd comparison block)
+    assert_eq!(run(&m, 0, &[7]), 0); // 14 → no match → else
+}
+
 /// Real nimony `hexer` output for `classify(n): case n of 0/1,2/3/else`. Translate it out of the
 /// module and run — the real `(case … (of (ranges …) …) (else …))` bytes.
 #[test]
