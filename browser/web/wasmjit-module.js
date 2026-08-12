@@ -32,12 +32,52 @@ function cachePut(key, mod) {
   }
   jitModuleCache.set(key, mod);
 }
+// A parallel cross-Run cache of the **instantiated** emitted module (issue #803). The compiled Module
+// skips V8 codegen; caching the instance additionally skips the per-Run `WebAssembly.instantiate` of the
+// ~12.7 MB emitted module *and* the copy of its bytes out of wasm memory (only read on a compile miss).
+// Safe because the emitted entry `f0(win, env, ...slots)` takes win/env/sp as **arguments** and holds no
+// state between calls — the reactor already reuses one instance across every frame the same way — and its
+// linear memory is the imported (stable) engine memory. Keyed by the same stable module identity as
+// `jitModuleCache`; a fresh `win`/`sp` and the dynamic cross-tier bounce are supplied per Run by the
+// caller, so a reused instance always runs against current state.
+const jitInstanceCache = new Map();
 // Test/telemetry hook: how many WebAssembly.compile calls the cache has served vs skipped.
 export const jitCacheStats = { compiles: 0, hits: 0 };
 export function jitCacheClear() {
   jitModuleCache.clear();
+  jitInstanceCache.clear();
   jitCacheStats.compiles = 0;
   jitCacheStats.hits = 0;
+}
+
+// Get-or-build the emitted module's instance for `cacheKey`, reusing it across Runs. `readEmitted` is
+// invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
+// the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
+// Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
+async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
+  const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
+  if (cached) {
+    jitCacheStats.hits++;
+    return cached.f0;
+  }
+  let module = cacheGet(cacheKey);
+  if (module === undefined) {
+    module = await WebAssembly.compile(readEmitted());
+    cachePut(cacheKey, module);
+    jitCacheStats.compiles++;
+  }
+  const instance = await WebAssembly.instantiate(module, {
+    env: { memory, trap: () => {}, call_interp: callInterp },
+  });
+  const f0 = instance.exports.f0;
+  if (typeof f0 !== 'function') throw new Error('emitted module has no f0 export');
+  if (cacheKey !== undefined) {
+    if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
+      jitInstanceCache.delete(jitInstanceCache.keys().next().value);
+    }
+    jitInstanceCache.set(cacheKey, { instance, f0 });
+  }
+  return f0;
 }
 
 // Drive an already-opened single-shot JIT run to completion: copy the emitted `_start` out, compile +
@@ -47,11 +87,7 @@ export function jitCacheClear() {
 // reused across Runs (see `jitModuleCache`).
 async function driveJitRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
-  // Copy the emitted bytes out (a later svm_alloc could move the stash), read the window base + the
-  // powerbox handle slots `_start` takes as params, and the env-cell size.
-  const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
-  const wlen = ex.svm_onramp_jit_run_wasm_len();
-  const emitted = u8().slice(wptr, wptr + wlen);
+  // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
   const win = Number(ex.svm_onramp_jit_run_win_ptr());
   const envBytes = ex.svm_onramp_jit_run_env_bytes();
   const slots = [];
@@ -62,10 +98,15 @@ async function driveJitRun(ex, memory, cacheKey) {
   // `env.call_interp` relays each cross-tier call to the cdylib; a nonzero status (exit/trap) throws to
   // unwind the emitted `f0` (the browser's JS import model — `Exit` and real traps both caught below).
   // Reuse the compiled Module across Runs of the same guest module (skip V8 codegen); compile + cache
-  // on a miss. Instantiation stays per-Run — the Module is stateless code, the instance is not.
+  // on a miss. The emitted bytes are copied out of wasm memory **only on a miss** (skip the ~MBs copy on
+  // a hit). Instantiation stays per-Run here — this path re-opens (a fresh window) each Run, so the win
+  // it passes changes; the warm path (`runWarmJit`) caches the instance too (issue #803).
   let module = cacheGet(cacheKey);
   if (module === undefined) {
-    module = await WebAssembly.compile(emitted);
+    // Copy the emitted bytes out (a later svm_alloc could move the stash) and compile.
+    const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
+    const wlen = ex.svm_onramp_jit_run_wasm_len();
+    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
     cachePut(cacheKey, module);
     jitCacheStats.compiles++;
   } else {
@@ -163,32 +204,25 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
   if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.svm_status()}`);
 
-  const wptr = Number(ex.svm_warm_jit_wasm_ptr());
-  const wlen = ex.svm_warm_jit_wasm_len();
-  const emitted = u8().slice(wptr, wptr + wlen);
   const win = Number(ex.svm_warm_jit_win_ptr());
   const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as f0's i64 slot
   const envBytes = ex.svm_onramp_jit_run_env_bytes();
 
-  let module = cacheGet(cacheKey);
-  if (module === undefined) {
-    module = await WebAssembly.compile(emitted);
-    cachePut(cacheKey, module);
-    jitCacheStats.compiles++;
-  } else {
-    jitCacheStats.hits++;
-  }
-  const instance = await WebAssembly.instantiate(module, {
-    env: {
-      memory,
-      trap: () => {},
-      call_interp: (func, argsPtr) => {
-        if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
-      },
+  // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
+  // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
+  // passed per Run), so one instance serves every Run of this warm session.
+  const f0 = await cachedInstanceF0(
+    memory,
+    cacheKey,
+    () => {
+      const wptr = Number(ex.svm_warm_jit_wasm_ptr());
+      const wlen = ex.svm_warm_jit_wasm_len();
+      return u8().slice(wptr, wptr + wlen);
     },
-  });
-  const f0 = instance.exports.f0;
-  if (typeof f0 !== 'function') throw new Error('emitted warm module has no f0 export');
+    (func, argsPtr) => {
+      if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+    },
+  );
 
   const env = Number(ex.svm_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget

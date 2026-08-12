@@ -11,7 +11,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
-import { runWarmJit } from './web/wasmjit-module.js';
+import { runWarmJit, jitCacheStats } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.svmb';
@@ -123,7 +123,21 @@ for (const [name, js] of programs) {
   if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`  run2: ${JSON.stringify(r2.out)}`); }
 }
 
+// Instance cache (issue #803): every warm+JIT Run above shares one cacheKey, so exactly the first Run
+// compiled the emitted eval_run and every later Run reused the cached instance (skipping compile +
+// instantiate + the byte copy). Assert that accounting so a regression that re-instantiates per Run is
+// caught, not just tolerated.
+{
+  const runs = 1 /* primer */ + programs.length + 2 /* isolation */;
+  const cacheOk = jitCacheStats.compiles === 1 && jitCacheStats.hits === runs - 1;
+  allOk &&= cacheOk;
+  console.log(
+    `\ninstance cache: compiles=${jitCacheStats.compiles} hits=${jitCacheStats.hits} ` +
+    `(expected compiles=1, hits=${runs - 1}) — ${cacheOk ? 'OK — one compile, rest reused' : 'REGRESSION: re-instantiating per Run'}`,
+  );
+}
+
 ex.svm_warm_close();
 
-if (!allOk) fail('warm+JIT parity/isolation mismatch');
-console.log('\nOK: warm+JIT — emitted eval_run matches warm-interp byte-for-byte, isolation holds');
+if (!allOk) fail('warm+JIT parity/isolation/instance-cache mismatch');
+console.log('\nOK: warm+JIT — emitted eval_run matches warm-interp byte-for-byte, isolation + instance cache hold');
