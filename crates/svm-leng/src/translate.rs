@@ -554,6 +554,24 @@ impl Translator {
                                 // reserve the slot zero-initialized. (Relocating a data-pointer global
                                 // initializer to its target is a later refinement, the `data.ptr`
                                 // twin of the funcref case above.)
+                            } else if let Some((bytes, adesc, relocs)) =
+                                self.const_aggregate_bytes(init)?
+                            {
+                                // An **aggregate `gvar` initializer** — an object/array/string constant
+                                // assigned to a *mutable* global (`var x = Obj(a: 1, b: 2)`, a `var`
+                                // string). Materialize its exact bytes into a data segment at the
+                                // global's offset, exactly as an aggregate `const` does; the global just
+                                // stays writable. A blob may exceed the fixed type size (a `string`/
+                                // `LongString` tail), so reserve the larger of the two. Any const-to-const
+                                // pointer inside (a string's `more = (addr strlit)`) becomes a `data.ptr`.
+                                let n = bytes.len() as u64;
+                                self.data_inits.push((off, bytes));
+                                for (rel_at, target) in relocs {
+                                    self.data_ptrs.push((off + rel_at, target));
+                                }
+                                self.globals.insert(name, (off, adesc));
+                                off += n.max(self.sizeof(&desc)).max(8);
+                                continue;
                             } else {
                                 return Err(LengError::Unsupported(format!(
                                     "non-scalar-int global initializer for `{name}`"

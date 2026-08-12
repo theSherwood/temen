@@ -79,17 +79,22 @@ fn nonzero_global_initializer_via_data() {
 }
 
 #[test]
-fn nonint_global_initializer_is_fail_closed() {
-    // A non-scalar-int (here aggregate) initializer still fail-closes.
+fn aggregate_global_initializer_is_materialized() {
+    // A **mutable** global with an aggregate initializer (`var g = Pt(x: 7)`) materializes into a
+    // data segment at the global's offset — the same treatment an aggregate `const` gets, but the
+    // global stays writable. `readG` reads the field back; both engines see 7. (Real nimony emits
+    // these constantly — module-level `var`s of object/string type — so this closes a #760 gap.)
     let leng = "\
 (stmts
  (type :Pt.0. . (object . (fld :x.0 . (i +64))))
- (gvar :g.0. . Pt.0. (oconstr Pt.0. (kv x.0 1)))
- (proc :main.0. . (i +64) . (stmts . (ret 0))))";
-    match svm_leng::translate(leng) {
-        Err(svm_leng::LengError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported for aggregate global init, got {other:?}"),
-    }
+ (gvar :g.0. . Pt.0. (oconstr Pt.0. (kv x.0 7)))
+ (proc :readG.0. . (i +64) . (stmts . (ret (dot g.0. x.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(
+        run(&m, 0, &[]),
+        7,
+        "aggregate gvar init materialized: g.x = 7"
+    );
 }
 
 /// Real nimony `hexer` output for `var counter: int = 42` plus `getCounter`/`addCounter` — the
