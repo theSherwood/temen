@@ -141,6 +141,25 @@ fn store_aggregate_through_lvalue() {
     );
 }
 
+#[test]
+fn read_aggregate_field_in_value_position() {
+    // Reading an aggregate field **in value position** — `discard o.inner`, an object-typed field
+    // evaluated as an expression — now yields the field's address (aggregates are by-address), rather
+    // than fail-closing ("reading aggregate as a value"). Real nimony emits these when an object/
+    // string field flows through an expression. The read translates and re-verifies; the scalar
+    // `tag` field still reads normally alongside it.
+    let leng = "\
+(stmts
+ (type :Inner.0. . (object . (fld :v.0 . (i +64))))
+ (type :Outer.0. . (object . (fld :inner.0 . Inner.0.) (fld :tag.0 . (i +64))))
+ (proc :f.0. (params (param :o.0 . Outer.0.)) (i +64) .
+  (stmts .
+   (discard (dot o.0 inner.0 0))
+   (ret (dot o.0 tag.0 1)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+}
+
 /// Real nimony `hexer` output for `var counter: int = 42` plus `getCounter`/`addCounter` — the
 /// static non-zero initializer must seed the window so `getCounter()` reads 42.
 #[test]

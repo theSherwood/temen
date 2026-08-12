@@ -2440,9 +2440,17 @@ impl<'a> FuncGen<'a> {
             TyDesc::FlexArray(_) => Err(LengError::Unsupported(
                 "reading a flexible array as a value (index it with `at`/`pat`)".into(),
             )),
-            TyDesc::Agg(n) => Err(LengError::Unsupported(format!(
-                "reading aggregate `{n}` as a value (whole-aggregate ops are a later slice)"
-            ))),
+            TyDesc::Agg(_) => {
+                // An aggregate read **as a value** *is* its address — aggregates are by-address in
+                // this model (a call arg, an sret source, an aggregate `asgn` rhs all pass the
+                // address). `addr` already points at the aggregate's bytes; any copy happens at the
+                // consuming site (`assign_aggregate`'s `mem.copy`). Real nimony reads object/string
+                // fields in value position (`discard obj.field`, passing a nested field along).
+                Ok(Val {
+                    id: addr,
+                    ty: ValType::I64,
+                })
+            }
         }
     }
 
