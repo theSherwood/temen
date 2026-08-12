@@ -4942,6 +4942,11 @@ struct WarmSession {
     /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
     /// deterministic powerbox handles match the snapshot's window-relative state.
     module: svm_ir::Module,
+    /// The warmup image's explicit page-state entries (#816, the `Mem::map_info` encoding): the
+    /// on-ramp's `protect`ed rodata inside the prefix and the `vm_map`-grown heap tail alike.
+    /// Re-established (without zeroing) before every eval, so the guest restores to the same
+    /// mapped geometry — and the same write protections — instead of faulting.
+    prots: Vec<(u64, u8)>,
     /// Mapped window size, `1 << WARM_MAPPED_LOG2` (also the owned backing size).
     win: u64,
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
@@ -4983,7 +4988,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     svm_warm_close();
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let mut m = match svm_encode::decode_module(bytes) {
+    let m = match svm_encode::decode_module(bytes) {
         Ok(m) => m,
         Err(_) => {
             set(STATUS_DECODE_ERR);
@@ -4995,8 +5000,10 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         return -1;
     };
     let declared_log2 = mc.size_log2;
-    // Need headroom above the declared window for the heap; the mapped window must exceed it.
-    if declared_log2 >= WARM_MAPPED_LOG2 {
+    // The backing (and the run's reservation) is `1 << WARM_MAPPED_LOG2`; the declared window must
+    // fit inside it. The heap may now `vm_map`-grow into `[declared, backing)` (#816) — the module
+    // is no longer over-sized to swallow the heap.
+    if declared_log2 > WARM_MAPPED_LOG2 {
         set(STATUS_UNSUPPORTED);
         return -1;
     }
@@ -5007,11 +5014,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         set(STATUS_UNSUPPORTED);
         return -1;
     };
-    // Compute the entry sp from the declared (data-segment) layout, then enlarge the mapped window.
     let entry_sp = svm_ir::powerbox_entry_sp(&m);
-    m.memory = Some(svm_ir::Memory {
-        size_log2: WARM_MAPPED_LOG2,
-    });
     let win = 1u64 << WARM_MAPPED_LOG2;
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
@@ -5044,21 +5047,30 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let mut host = Host::new();
     let _ = grant_onramp_caps(&mut host, &m, None);
     let mut fuel = u64::MAX;
-    let ran = prog.run_over(
+    // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
+    // instead of minting pages whose writes the backing silently drops.
+    let (ran, pages) = prog.run_over_grown(
         warmup_fn,
         &[Value::I64(entry_sp as i64)],
         &mut fuel,
         back.clone(),
         &mut host,
         true, // seed the module's data segments once, here
+        WARM_MAPPED_LOG2,
+        None,
     );
-    if !matches!(ran, Ok(_) | Err(Trap::Exit(_))) {
-        drop(back);
-        // SAFETY: no alias remains (back dropped, run returned); free the window.
-        unsafe { std::alloc::dealloc(win_ptr, layout) };
-        set(STATUS_TRAP);
-        return -1;
-    }
+    // Fail closed on a warmup that trapped OR aliased a §13 region page (a byte restore cannot
+    // reproduce an alias; the page falls back to cold runs).
+    let prots = match (&ran, pages) {
+        (Ok(_) | Err(Trap::Exit(_)), Some(entries)) => entries,
+        _ => {
+            drop(back);
+            // SAFETY: no alias remains (back dropped, run returned); free the window.
+            unsafe { std::alloc::dealloc(win_ptr, layout) };
+            set(STATUS_TRAP);
+            return -1;
+        }
+    };
     // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left.
     // SAFETY: `win_ptr` owns `win` bytes; read the post-warmup image, no run in flight.
     let (image, live) = unsafe {
@@ -5071,6 +5083,7 @@ pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         *core::ptr::addr_of_mut!(WARM_SESSION) = Some(WarmSession {
             prog,
             module: m,
+            prots,
             win,
             entry_sp,
             eval_fn,
@@ -5116,14 +5129,21 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
     host.stdin = stdin.to_vec();
     let _ = grant_onramp_caps(&mut host, &s.module, None);
     let mut fuel = u64::MAX;
-    let (status, value, exit_code) = match s.prog.run_over(
+    // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
+    // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
+    // write-protected again (#816). Every eval starts from the SAME captured map — an eval's own
+    // remaps never accumulate (fresh-per-Run isolation).
+    let (ran, eval_pages) = s.prog.run_over_grown(
         s.eval_fn,
         &[Value::I64(s.entry_sp as i64)],
         &mut fuel,
         s.back.clone(),
         &mut host,
         false, // window already carries the warm image — do not re-seed
-    ) {
+        WARM_MAPPED_LOG2,
+        Some(&s.prots),
+    );
+    let (status, value, exit_code) = match ran {
         Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
         Err(_) => (STATUS_TRAP, 0, 0),
         Ok(vals) => match vals.first() {
@@ -5132,11 +5152,24 @@ pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
             _ => (STATUS_OK, 0, 0),
         },
     };
-    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied.
+    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied — both
+    // the brk it advanced and any page it `vm_map`-grew past the warm extent (freshly-mapped pages
+    // are zeroed at map time, but the guest may have written them).
     // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
     unsafe {
         let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
-        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize));
+        // Any page the eval left committed (`Rw`, kind 1) may carry its writes — zero to the top
+        // of the highest one on the next restore (page size from the engine's map_info encoding).
+        let grown = eval_pages
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|&&(_, kind)| kind == 1)
+            .map(|&(off, _)| off.saturating_add(svm_interp::host_page_size()))
+            .max()
+            .unwrap_or(0)
+            .min(s.win) as usize;
+        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize)).max(grown);
     }
     set(status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.

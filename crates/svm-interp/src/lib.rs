@@ -21518,6 +21518,34 @@ impl Mem {
         self.window.reserved()
     }
 
+    /// Re-establish a **restored explicit page-state map** (#816 warm-snapshot restore): re-insert
+    /// each captured [`Mem::map_info`] entry (`(byte offset, kind)` — `0 = Ro`, `1 = Rw`,
+    /// `2 = Unmapped`) **without zeroing** — the caller has already restored the pages' bytes (a
+    /// fresh `map` would wipe them). Covers everything a real warm image holds: the on-ramp's
+    /// `protect`ed rodata inside the prefix AND the `vm_map`-grown tail. A `Backed` (§13) entry is
+    /// never fed here — the capture side rejects it (a byte restore cannot reproduce an alias).
+    /// Offsets past the reservation are ignored.
+    pub(crate) fn seed_pages(&mut self, entries: &[(u64, u8)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let reserved = self.window.reserved();
+        let mut space = self.space_write();
+        for &(off, kind) in entries {
+            if off >= reserved {
+                continue;
+            }
+            let prot = match kind {
+                0 => PageProt::Ro,
+                1 => PageProt::Rw,
+                _ => PageProt::Unmapped,
+            };
+            space.prot.insert(off / self.page, prot);
+        }
+        drop(space);
+        self.prot_dirty.store(true, Ordering::Release);
+    }
+
     /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
     /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
     /// child reads the recorded address and suspends to its parent instead.

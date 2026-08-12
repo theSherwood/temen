@@ -189,9 +189,16 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   pass `sp = powerbox_entry_sp`. The on-ramp allocator grows the heap **above** the declared window
   (`heap_base = 1 << size_log2`), and that growth's mapped-width state lives in the `Mem`, *not* in the
   window bytes — so a naïve window memcpy restores the bytes but faults on the warm heap
-  (`MemoryFault`). The prototype maps a **larger window** (2^26) so the whole heap stays inside the
-  mapped region: no `vm_map` growth, a contiguous guest image captured by a plain memcpy of the live
-  prefix `[0, brk)`. (The browser already sizes `winSize` to hold the heap — same idea.)
+  (`MemoryFault`). The native prototype maps a **larger window** (2^26) so the whole heap stays inside
+  the mapped region: no `vm_map` growth, a contiguous guest image captured by a plain memcpy of the
+  live prefix `[0, brk)`. **The browser session no longer needs that trick (#816):** the module keeps
+  its declared window, the heap `vm_map`-grows into the 2^26 backing (the run's reservation is clamped
+  to it, so over-growth fails probeably instead of silently dropping writes), and the warmup's
+  contiguous committed extent is captured alongside the image and re-established — without re-zeroing —
+  before every eval (`SharedProgram::run_over_grown`, `browser/tests/warm_grow.rs`). A warmup that
+  leaves page state one bound can't represent (sparse/`Ro`/`Unmapped`) fails closed at open. The
+  warm+JIT tier is unchanged: it opens only for `WasmDriven` (no-page-op) modules, so a growing guest
+  evaluates on the interpreter warm path until the tier-up driver work (#809) reaches it.
 - **Measured native** (`crates/svm-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
   same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
   restore ~3.5 ms (memcpy the live prefix).

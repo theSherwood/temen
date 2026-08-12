@@ -2226,20 +2226,71 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
     ) -> Result<Vec<Value>, Trap> {
+        self.run_over_grown(
+            func,
+            args,
+            fuel,
+            back,
+            host,
+            seed_data,
+            DEFAULT_RESERVED_LOG2,
+            None,
+        )
+        .0
+    }
+
+    /// [`run_over`](Self::run_over) for a **restorable warm session** (#816): the reservation is
+    /// caller-chosen (clamp it to the shared backing's size — a reservation past the backing lets
+    /// guest writes silently vanish instead of failing the `map`), and a captured **explicit
+    /// page-state map** can be re-established before the run: `prots = Some(entries)` re-inserts
+    /// each `(byte offset, kind)` entry (the [`Mem::map_info`] encoding — the on-ramp's
+    /// `protect`ed rodata and the `vm_map`-grown tail alike) *without zeroing* the pages the
+    /// caller already restored ([`Mem::seed_pages`]) — so a page-managing warm image survives the
+    /// fresh-`Mem`-per-call shape. Returns the run's result plus the post-run explicit page map:
+    /// `Some(entries)` to seed the next call with (empty for a plain flat window), or `None` if
+    /// the guest aliased a §13 `SharedRegion` page — a byte restore cannot reproduce an alias, so
+    /// a warm driver must fail closed on it. `Some(vec![])` for a memory-less module.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_over_grown(
+        &self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        back: std::sync::Arc<super::Region>,
+        host: &mut Host,
+        seed_data: bool,
+        reserved_log2: u8,
+        prots: Option<&[(u64, u8)]>,
+    ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>) {
         if func as usize >= self.n_funcs {
-            return Err(Trap::Malformed);
+            return (Err(Trap::Malformed), None);
         }
         // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
         // slot vector) — the cross-tier reactor carries no §22 install state between calls.
         let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             if seed_data {
                 mm.init_data(&self.data);
             }
+            if let Some(entries) = prots {
+                mm.seed_pages(entries);
+            }
             mm
         });
-        run(dom, func, args, fuel, &mut mem, host)
+        let out = run(dom, func, args, fuel, &mut mem, host);
+        let pages = match mem.as_ref() {
+            None => Some(Vec::new()),
+            Some(m) => {
+                let (_, _, _, entries) = m.map_info();
+                if entries.iter().any(|&(_, kind)| kind == 3) {
+                    None // §13 Backed alias — unrestorable by a byte snapshot; fail closed
+                } else {
+                    Some(entries)
+                }
+            }
+        };
+        (out, pages)
     }
 }
 
