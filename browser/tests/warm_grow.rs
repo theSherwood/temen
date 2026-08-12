@@ -85,18 +85,27 @@ fn warm_session_restores_a_grown_heap_across_evals() {
         svm_status()
     );
     // The image must cover the grown marker (brk was advanced past it by warmup).
-    assert!(live as u64 >= MARKER_ADDR + 8, "image covers the grown page (live {live})");
+    assert!(
+        live as u64 >= MARKER_ADDR + 8,
+        "image covers the grown page (live {live})"
+    );
 
     // Eval 1: marker restored from the grown page, scratch fresh (0) → MARKER + 0.
     let v1 = svm_warm_eval(core::ptr::null(), 0);
     assert_eq!(svm_status(), 0, "eval 1 status");
-    assert_eq!(v1, MARKER, "eval 1 must read the vm_map-grown marker over a restored extent");
+    assert_eq!(
+        v1, MARKER,
+        "eval 1 must read the vm_map-grown marker over a restored extent"
+    );
 
     // Eval 2: identical — the restore re-establishes the SAME committed extent and the scratch the
     // prior eval wrote is wiped (fresh-per-Run isolation, INVARIANT #6).
     let v2 = svm_warm_eval(core::ptr::null(), 0);
     assert_eq!(svm_status(), 0, "eval 2 status");
-    assert_eq!(v2, MARKER, "eval 2 must see byte-identical warm state (no scratch leak)");
+    assert_eq!(
+        v2, MARKER,
+        "eval 2 must see byte-identical warm state (no scratch leak)"
+    );
 
     svm_warm_close();
     // Ensure the module the test built stays alive to here (the FFI copied what it needed).
