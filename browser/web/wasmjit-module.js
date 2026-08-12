@@ -323,6 +323,29 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   return status;
 }
 
+// **Pre-compile** the warm+JIT `eval_run` for `cacheKey` without running it — emit + `WebAssembly.compile`
+// + instantiate + cache the instance, so the first real `runWarmJit` is a full cache hit and pays no
+// ~12.7 MB `WebAssembly.compile` on the first wasm-JIT Run. Called during pre-warm (off the main thread),
+// so that cost is hidden. Best-effort: returns false if `eval_run` isn't wasm-drivable (the card then just
+// uses warm-interp), true once the instance is cached. No `prepare`/run/finish — it only warms the caches.
+export async function primeWarmJit(ex, memory, cacheKey, shared = 1) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  if (ex.svm_warm_jit_open(shared) !== 0) return false; // eval_run not emittable → interp-only
+  await cachedInstanceF0(
+    memory,
+    cacheKey,
+    () => {
+      const wptr = Number(ex.svm_warm_jit_wasm_ptr());
+      const wlen = ex.svm_warm_jit_wasm_len();
+      return u8().slice(wptr, wptr + wlen);
+    },
+    (func, argsPtr) => {
+      if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+    },
+  );
+  return true;
+}
+
 // Run the **chibicc compiler** on the wasm-JIT: feed it the user's C `srcBytes` (seeded at `/in.c`) plus
 // the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
 // argv (`svm_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver

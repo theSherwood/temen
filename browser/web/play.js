@@ -3462,6 +3462,7 @@ async function main() {
   // critical path. Each pre-warming card shows a "warming up…" indicator until its session is ready.
   try {
     snapshotClient = new SnapshotClient(eng.module);
+    globalThis.__snapshotClient = snapshotClient; // test/telemetry hook (harmless): inspect prewarm state
     const warmCards = cards.filter((c) => c.ex.warm);
     if (warmCards.length) {
       const prewarmAll = () => {

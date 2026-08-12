@@ -66,6 +66,24 @@ try {
     };
   };
 
+  // Prewarm pre-compiles the warm+JIT `eval_run` off the main thread, so the FIRST wasm-JIT Run is a
+  // cache hit rather than paying the ~12.7 MB `WebAssembly.compile`. Before running anything, wait for
+  // each card's worker to finish pre-compiling and assert it compiled exactly once with no eval yet
+  // (compiles=1, hits=0) — i.e. the compile happened during pre-warm, not on the first Run.
+  const statsOf = (c) => page.evaluate((u) => globalThis.__snapshotClient?.stats(u), `./assets/${c.asset}`);
+  for (const c of CARDS) {
+    const tag = c.name.split(' ')[0];
+    let st = null;
+    for (let i = 0; i < 160; i++) { // up to ~40s: engine load + warmup + the background ~12.7 MB compile
+      st = await statsOf(c);
+      if (st && st.ok && st.jitPrimed) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
+      ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
+      : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
+  }
+
   for (const c of CARDS) {
     const tag = c.name.split(' ')[0];
     // warm-snapshot (JIT toggle off, the default): a plain program runs on the card's worker.
@@ -93,6 +111,16 @@ try {
     await setSrc(c, c.leakGet);
     r = await run(c);
     r.state === 'done' && c.leakClean(r.stdout) ? ok(`${tag}: fresh-per-Run isolation holds (no leak across Runs)`) : fail(`${tag} isolation: state=${r.state} stdout=${JSON.stringify(r.stdout)}`);
+  }
+
+  // After all the Runs, each card's warm+JIT compile count is still 1 — the warm+JIT Run reused the
+  // pre-compiled instance instead of recompiling (a hit was recorded).
+  for (const c of CARDS) {
+    const tag = c.name.split(' ')[0];
+    const st = await statsOf(c);
+    st && st.ok && st.compiles === 1 && st.hits >= 1
+      ? ok(`${tag}: warm+JIT Run reused the pre-compiled instance (compiles=1, hits=${st.hits})`)
+      : fail(`${tag}: unexpected JIT recompile: ${JSON.stringify(st)}`);
   }
 
   const total = await workerRuns();

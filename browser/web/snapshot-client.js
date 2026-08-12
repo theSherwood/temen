@@ -78,4 +78,12 @@ export class SnapshotClient {
     if (!warm.ok) return warm;
     return this._request(this._workers.get(url), 'eval', { url, source, jit });
   }
+
+  // Query `url`'s worker for its warm+JIT pre-compile state — `{ ok, jitPrimed, compiles, hits }` (for
+  // tests/telemetry). Resolves `{ ok:false }` if no worker exists for `url` yet.
+  stats(url) {
+    const w = this._workers.get(url);
+    if (!w) return Promise.resolve({ ok: false });
+    return this._request(w, 'stats', {});
+  }
 }
