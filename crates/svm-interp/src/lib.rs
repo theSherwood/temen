@@ -21404,21 +21404,29 @@ impl Mem {
         self.window.reserved()
     }
 
-    /// Re-establish a **restored contiguous committed extent** `[mapped, high)` (#816 warm-snapshot
-    /// restore): insert `Rw` entries for every reserved-tail page below `high` **without zeroing**
-    /// — the caller has already restored the pages' bytes (a fresh `map` would wipe them). The
-    /// scalar twin of a full [`Mem::apply_prots`] restore; a no-op when `high` is within the mapped
-    /// prefix. `high` is clamped to the reservation.
-    pub(crate) fn seed_committed(&mut self, high: u64) {
-        let high = high.min(self.window.reserved());
-        if high <= self.window.mapped() {
+    /// Re-establish a **restored explicit page-state map** (#816 warm-snapshot restore): re-insert
+    /// each captured [`Mem::map_info`] entry (`(byte offset, kind)` — `0 = Ro`, `1 = Rw`,
+    /// `2 = Unmapped`) **without zeroing** — the caller has already restored the pages' bytes (a
+    /// fresh `map` would wipe them). Covers everything a real warm image holds: the on-ramp's
+    /// `protect`ed rodata inside the prefix AND the `vm_map`-grown tail. A `Backed` (§13) entry is
+    /// never fed here — the capture side rejects it (a byte restore cannot reproduce an alias).
+    /// Offsets past the reservation are ignored.
+    pub(crate) fn seed_pages(&mut self, entries: &[(u64, u8)]) {
+        if entries.is_empty() {
             return;
         }
-        let first = self.window.mapped().div_ceil(self.page);
-        let last = high.div_ceil(self.page);
+        let reserved = self.window.reserved();
         let mut space = self.space_write();
-        for page in first..last {
-            space.prot.insert(page, PageProt::Rw);
+        for &(off, kind) in entries {
+            if off >= reserved {
+                continue;
+            }
+            let prot = match kind {
+                0 => PageProt::Ro,
+                1 => PageProt::Rw,
+                _ => PageProt::Unmapped,
+            };
+            space.prot.insert(off / self.page, prot);
         }
         drop(space);
         self.prot_dirty.store(true, Ordering::Release);

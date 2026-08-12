@@ -2239,16 +2239,17 @@ impl SharedProgram {
         .0
     }
 
-    /// [`run_over`](Self::run_over) for a **growable warm session** (#816): the reservation is
+    /// [`run_over`](Self::run_over) for a **restorable warm session** (#816): the reservation is
     /// caller-chosen (clamp it to the shared backing's size — a reservation past the backing lets
-    /// guest writes silently vanish instead of failing the `map`), and a restored **contiguous
-    /// committed extent** can be re-established before the run: `committed = Some(high)` re-commits
-    /// `[declared, high)` *without zeroing* (the caller already restored those bytes —
-    /// [`Mem::seed_committed`]), so a `vm_map`-grown warm image survives the fresh-`Mem`-per-call
-    /// shape. Returns the run's result plus the post-run scalar committed extent
-    /// ([`Mem::scalar_extent`]): `Some(high)` to seed the next call with, `None` if the guest left
-    /// a state one bound cannot represent (sparse/`Ro`/`Unmapped` — a warm driver must fail closed
-    /// on it rather than restore partially), and `Some(0)` for a memory-less module.
+    /// guest writes silently vanish instead of failing the `map`), and a captured **explicit
+    /// page-state map** can be re-established before the run: `prots = Some(entries)` re-inserts
+    /// each `(byte offset, kind)` entry (the [`Mem::map_info`] encoding — the on-ramp's
+    /// `protect`ed rodata and the `vm_map`-grown tail alike) *without zeroing* the pages the
+    /// caller already restored ([`Mem::seed_pages`]) — so a page-managing warm image survives the
+    /// fresh-`Mem`-per-call shape. Returns the run's result plus the post-run explicit page map:
+    /// `Some(entries)` to seed the next call with (empty for a plain flat window), or `None` if
+    /// the guest aliased a §13 `SharedRegion` page — a byte restore cannot reproduce an alias, so
+    /// a warm driver must fail closed on it. `Some(vec![])` for a memory-less module.
     #[allow(clippy::too_many_arguments)]
     pub fn run_over_grown(
         &self,
@@ -2259,8 +2260,8 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
         reserved_log2: u8,
-        committed: Option<u64>,
-    ) -> (Result<Vec<Value>, Trap>, Option<u64>) {
+        prots: Option<&[(u64, u8)]>,
+    ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>) {
         if func as usize >= self.n_funcs {
             return (Err(Trap::Malformed), None);
         }
@@ -2272,17 +2273,24 @@ impl SharedProgram {
             if seed_data {
                 mm.init_data(&self.data);
             }
-            if let Some(high) = committed {
-                mm.seed_committed(high);
+            if let Some(entries) = prots {
+                mm.seed_pages(entries);
             }
             mm
         });
         let out = run(dom, func, args, fuel, &mut mem, host);
-        let extent = match mem.as_ref() {
-            None => Some(0),
-            Some(m) => m.scalar_extent(),
+        let pages = match mem.as_ref() {
+            None => Some(Vec::new()),
+            Some(m) => {
+                let (_, _, _, entries) = m.map_info();
+                if entries.iter().any(|&(_, kind)| kind == 3) {
+                    None // §13 Backed alias — unrestorable by a byte snapshot; fail closed
+                } else {
+                    Some(entries)
+                }
+            }
         };
-        (out, extent)
+        (out, pages)
     }
 }
 

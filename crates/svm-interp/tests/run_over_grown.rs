@@ -1,6 +1,6 @@
-//! **`SharedProgram::run_over_grown`** (#816) — the warm-snapshot growth seam: a `vm_map`-grown
-//! committed extent survives the fresh-`Mem`-per-call shape by round-tripping the scalar extent
-//! (`Mem::scalar_extent` out, `Mem::seed_committed` back in, no zeroing).
+//! **`SharedProgram::run_over_grown`** (#816) — the warm-snapshot restore seam: a `vm_map`-grown
+//! (and `protect`ed) page-state map survives the fresh-`Mem`-per-call shape by round-tripping the
+//! explicit `map_info` entries (`Mem::seed_pages` back in, no zeroing).
 //!
 //! The bytecode differential contract: call 1 grows the window and writes a marker into the grown
 //! page; call 2 over the SAME shared backing must read the marker back **iff** the returned extent
@@ -63,14 +63,14 @@ fn backing() -> Arc<Region> {
     Arc::new(unsafe { Region::shared(base, size as u64) })
 }
 
-fn grow_then(seed: Option<u64>) -> (Result<Vec<Value>, Trap>, Option<u64>) {
+fn grow_then(seed: bool) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>) {
     let prog = build();
     let back = backing();
     let mut host = Host::new();
     let asl = host.grant_memory();
     let mut fuel = u64::MAX;
     // Call 1: grow one host page and write the marker (a whole 16-KiB page covers macOS too).
-    let (ran, extent) = prog.run_over_grown(
+    let (ran, pages) = prog.run_over_grown(
         0,
         &[Value::I32(asl), Value::I64(16384)],
         &mut fuel,
@@ -85,13 +85,15 @@ fn grow_then(seed: Option<u64>) -> (Result<Vec<Value>, Trap>, Option<u64>) {
         vec![Value::I64(0)],
         "the map itself must succeed"
     );
-    let extent = extent.expect("contiguous grow stays scalar-representable");
+    let pages = pages.expect("no region alias — the map must be restorable");
     assert!(
-        extent >= (1 << DECLARED_LOG2) + 16384,
-        "extent must cover the grown page (got {extent})"
+        pages
+            .iter()
+            .any(|&(off, kind)| kind == 1 && off >= 1 << DECLARED_LOG2),
+        "entries must cover the grown page (got {pages:?})"
     );
     // Call 2: fresh Mem over the same backing — the seam under test.
-    let seed = seed.map(|_| extent);
+    let seed = seed.then_some(pages);
     prog.run_over_grown(
         1,
         &[],
@@ -100,26 +102,26 @@ fn grow_then(seed: Option<u64>) -> (Result<Vec<Value>, Trap>, Option<u64>) {
         &mut host,
         false,
         BACKING_LOG2,
-        seed,
+        seed.as_deref(),
     )
 }
 
 #[test]
 fn seeded_extent_restores_the_grown_page() {
-    let (ran, extent) = grow_then(Some(0));
+    let (ran, pages) = grow_then(true);
     assert_eq!(
         ran.expect("seeded probe reads the grown page"),
         vec![Value::I64(424242)],
-        "the marker must survive the re-commit (seed_committed must NOT zero)"
+        "the marker must survive the re-commit (seed_pages must NOT zero)"
     );
-    assert!(extent.is_some(), "probe leaves the state scalar");
+    assert!(pages.is_some(), "probe leaves the state restorable");
 }
 
 #[test]
 fn unseeded_probe_faults_like_a_cold_window() {
     // The pre-#816 warm-restore bug as the negative pin: without the seed, the fresh Mem's empty
     // page map treats the grown page as uncommitted reserved tail — the load faults.
-    let (ran, _) = grow_then(None);
+    let (ran, _) = grow_then(false);
     assert!(
         matches!(ran, Err(Trap::MemoryFault)),
         "unseeded fresh Mem must fault on the grown page (got {ran:?})"
@@ -150,5 +152,99 @@ fn overgrow_past_the_clamped_reservation_fails_probeably() {
     assert!(
         matches!(vals.first(), Some(Value::I64(e)) if *e < 0),
         "over-grow must fail probeably (got {vals:?})"
+    );
+}
+
+/// The real-consumer shape that broke the scalar design (the on-ramp `protect`s its rodata):
+/// func 0 writes a marker INSIDE the declared prefix then protects its page read-only; the seeded
+/// follow-up must read it back (Ro restore keeps bytes + readability) and a seeded store into it
+/// must fault (the protection itself is restored, not just the bytes).
+const PROTECT_SRC: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vas: i32) {
+  vaddr = i64.const 16400
+  vmark = i64.const 777
+  i64.store vaddr vmark
+  voff = i64.const 16384
+  vlen = i64.const 16384
+  vprot = i32.const 1
+  vr = cap.call 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 16400
+  vl = i64.load vaddr
+  return vl
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 16400
+  vx = i64.const 1
+  i64.store vaddr vx
+  return vx
+  }
+}
+"#;
+
+#[test]
+fn protected_rodata_round_trips_readable_and_write_protected() {
+    let m = svm_text::parse_module(PROTECT_SRC).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let prog = bytecode::SharedProgram::compile(&m).expect("compile");
+    let back = backing();
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let mut fuel = u64::MAX;
+    let (ran, pages) = prog.run_over_grown(
+        0,
+        &[Value::I32(asl)],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        true,
+        BACKING_LOG2,
+        None,
+    );
+    assert_eq!(ran.expect("protect runs"), vec![Value::I64(0)]);
+    let pages = pages.expect("restorable");
+    assert!(
+        pages.iter().any(|&(_, kind)| kind == 0),
+        "the protect must appear as an Ro entry (got {pages:?})"
+    );
+
+    // Seeded read: bytes AND readability restored.
+    let (ran, _) = prog.run_over_grown(
+        1,
+        &[],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        false,
+        BACKING_LOG2,
+        Some(&pages),
+    );
+    assert_eq!(
+        ran.expect("seeded Ro read"),
+        vec![Value::I64(777)],
+        "the marker under the restored Ro page must read back"
+    );
+
+    // Seeded store: the PROTECTION is restored too — the write faults.
+    let (ran, _) = prog.run_over_grown(
+        2,
+        &[],
+        &mut fuel,
+        back,
+        &mut host,
+        false,
+        BACKING_LOG2,
+        Some(&pages),
+    );
+    assert!(
+        matches!(ran, Err(Trap::MemoryFault)),
+        "a store into the restored Ro page must fault (got {ran:?})"
     );
 }
