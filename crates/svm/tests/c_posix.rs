@@ -373,6 +373,113 @@ int main() {{\n\
     assert_eq!(jit.file_f, interp.file_f, "jit: memfs must match interp");
 }
 
+/// #799 slice 1 — **coexistence: one guest, both worlds, one Host.** A single compiled program links the
+/// svm-posix **personality** (memfs/stdio via `__px_*` named imports — World A) AND drives the
+/// **capability** path (`__vm_pipe`/`__vm_read`/`__vm_write`, the `cap.self`/Stream builtins — World B) in
+/// one run. The worlds use **disjoint** host state (a HOST_PROC handle + import bindings vs. the Stream
+/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `cap.call` builtins), so they
+/// compose on one `Host` with no conflict — `svm_posix::grant` claims nothing the capability grants touch,
+/// and the `__vm_*` builtins generate no import entries, so the manifest is pure `__px_*`. This is the
+/// bridge #799 is built on: a personality-linked program (eventually bash) that also holds capability
+/// handles. Interp-only — the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`).
+const DUAL_WORLD_SRC: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int main(void) {
+  char *msg = "hi\n";
+  long n = slen(msg);
+  /* World A — the personality: create a memfs file, write it, rewind, read it back. */
+  long fd = open("f", 66);            /* O_CREAT|O_RDWR -> __px_open; the first file fd is 3 */
+  write(fd, (void *)msg, n);          /* __px_write -> memfs "f" */
+  lseek(fd, 0, 0);
+  char a[8];
+  long ra = read(fd, a, 8);           /* __px_read -> "hi\n", ra = 3 */
+  /* World B — the capability path: mint a pipe (two Stream ends), write then read the same bytes.
+     One fiber, so the write lands before the read drains it — no park needed for the coexistence proof. */
+  int fds[2];
+  __vm_pipe(fds);                     /* CAP_SELF_PIPE mints two Stream handles into the powerbox */
+  __vm_write(fds[1], a, ra);          /* STREAM cap.call write */
+  char b[8];
+  long rb = __vm_read(fds[0], b, ra); /* STREAM cap.call read -> ra bytes */
+  return (int)(fd + rb);              /* 3 + 3 = 6 : both worlds ran on one Host */
+}
+"#;
+
+#[test]
+fn c_a_guest_links_the_personality_and_the_capability_pipe_on_one_host() {
+    let src = format!("{SHIM}\n{DUAL_WORLD_SRC}");
+    let e = run_interp_only(&src, |_| {});
+    // Both worlds ran on one Host: World A's memfs holds "hi\n" (the personality write), and main returns
+    // 6 = the personality file fd (3) + the bytes the capability pipe round-tripped (3).
+    assert_eq!(
+        e.result,
+        vec![Value::I32(6)],
+        "one guest reached both the personality (fd 3) and the capability pipe (3 bytes) on one Host"
+    );
+    assert_eq!(
+        e.file_f.as_deref(),
+        Some(&b"hi\n"[..]),
+        "World A (the personality) wrote the memfs file"
+    );
+}
+
+/// #799 slice 2 — **a personality-linked guest genuinely *blocks* on a capability pipe read.** Slice 1
+/// proved coexistence; this proves the parking bridge: `main` (personality-linked) mints a pipe and does a
+/// blocking `__vm_read` on the empty read end while a live writer is open — so it **parks**
+/// (`Blocked::PipeRead`) — and a spawned capability `writer` thread wakes it. This is the shape every
+/// blocking syscall (and, next, `EINTR`) rides: a personality-linked program that can actually suspend on
+/// a capability-world park. It also does one personality op (`open`/`write` a memfs file) to confirm both
+/// worlds still compose. Interp-only (`Real` scheduler: `CAP_SELF_PIPE`, `thread.spawn`, the park/wake).
+const DUAL_WORLD_PARK_SRC: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char msg[] = "GO\n";
+long g_wfd;
+long writer(long arg) {
+  /* burn a little first so `main` reaches its read and parks before we write */
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;
+  __vm_write(g_wfd, msg, 3);   /* wakes main's parked read */
+  return 0;
+}
+int main(void) {
+  /* World A — one personality op, so both worlds still compose. */
+  long fd = open("f", 66);
+  write(fd, msg, 3);           /* __px_write -> memfs "f" = "GO\n" */
+  /* World B — block on a capability pipe read, woken by the writer thread. */
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(writer, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* empty FIFO, writer open -> PARKS; woken -> drains 3 */
+  __vm_thread_join(h);
+  return (int)(fd + n);              /* 3 + 3 = 6 */
+}
+"#;
+
+#[test]
+fn c_a_personality_guest_blocks_on_a_capability_pipe_read() {
+    let src = format!("{SHIM}\n{DUAL_WORLD_PARK_SRC}");
+    let e = run_interp_only(&src, |_| {});
+    // main's blocking `__vm_read` parked and was woken by the writer thread (drained 3 bytes); the
+    // personality op ran too (fd 3, memfs "f" = "GO\n"). 3 + 3 = 6.
+    assert_eq!(
+        e.result,
+        vec![Value::I32(6)],
+        "the personality-linked guest parked on the capability pipe read and was woken"
+    );
+    assert_eq!(
+        e.file_f.as_deref(),
+        Some(&b"GO\n"[..]),
+        "World A (the personality) still ran alongside the capability park"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
