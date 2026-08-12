@@ -1018,6 +1018,40 @@ static int gen_builtin_exit(Node *node) {
   return 0;
 }
 
+// `<setjmp.h>` non-local jump (FORK.md / #795 — the bash keystone). `setjmp`/`_setjmp`/`__setjmp`/
+// `sigsetjmp` lower to the runtime `setjmp` op (svm-ir): it checkpoints the current frame's resume point
+// (block/pc/SSA vals/data-SP) keyed by the `jmp_buf` window address and returns `0` on the direct call; a
+// later `longjmp` on the same buffer unwinds the stack back here and re-enters, returning the long-jump
+// value ("returns twice"). The whole runtime (op, checkpoint table, both dispatch arms) already exists —
+// this only lowers the recognized C call to it. `sigsetjmp(env, savemask)`'s `savemask` is ignored until
+// async signals exist (#796): there is no signal mask to save yet. Returns the i64 op result, which the
+// caller narrows to `int` where the prototype is `int`.
+static int gen_builtin_setjmp(Node *node) {
+  Node *a = node->args;
+  if (!a)
+    error_tok(node->tok, "codegen_ir: setjmp(env) expects an argument");
+  int buf = widen_i64(gen_expr(a), a->ty); // the jmp_buf window address (i64; array decays to a pointer)
+  int r = nv++;
+  cg("  v%d = setjmp v%d\n", r, buf);
+  return r;
+}
+
+// `longjmp`/`_longjmp`/`siglongjmp` — the non-local jump. Lowers to the runtime `longjmp` op, which
+// unwinds the call stack to the matching `setjmp` checkpoint (intervening frames discarded — C has no
+// cleanups) and re-enters it with `val` (a `0` becomes `1`, per C). Noreturn, like `exit`: emit
+// `unreachable` and terminate the block.
+static int gen_builtin_longjmp(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next)
+    error_tok(node->tok, "codegen_ir: longjmp(env, val) expects 2 arguments");
+  int buf = widen_i64(gen_expr(a), a->ty); // jmp_buf window address (i64)
+  int val = gen_expr(a->next);             // the int value the matching setjmp will return
+  cg("  longjmp v%d v%d\n", buf, val);
+  cg("  unreachable\n");
+  term = true;
+  return 0;
+}
+
 // Memory capability builtins (§3e/§4): `__vm_map(off,len,prot)` / `__vm_unmap(off,len)` /
 // `__vm_protect(off,len,prot)` lower to `cap.call` on the stashed Memory handle (type 3,
 // ops 0/1/2). This is how guest libc (`malloc`) commits/decommits window pages and **grows
@@ -1906,6 +1940,15 @@ static int gen_expr(Node *node) {
             return gen_builtin_stream(node, STDIN_SLOT, 0);
           if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
             return gen_builtin_exit(node);
+          // `<setjmp.h>` (#795): the non-local jump. External-only, like the stdio builtins — a guest
+          // definition would shadow them (though setjmp/longjmp can't be written in guest C: they need
+          // the runtime op). `sigsetjmp`/`siglongjmp` share the lowering (mask ignored until #796).
+          if (!strcmp(fname, "setjmp") || !strcmp(fname, "_setjmp") ||
+              !strcmp(fname, "__setjmp") || !strcmp(fname, "sigsetjmp"))
+            return gen_builtin_setjmp(node);
+          if (!strcmp(fname, "longjmp") || !strcmp(fname, "_longjmp") ||
+              !strcmp(fname, "siglongjmp"))
+            return gen_builtin_longjmp(node);
         }
         if (!strcmp(fname, "__vm_map"))
           return gen_builtin_memory(node, 0, 3);
