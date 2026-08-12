@@ -21398,6 +21398,12 @@ impl Mem {
         Some(high.min(self.window.reserved()))
     }
 
+    /// The window's reserved (mask-domain) size — what a #750 page-checked driver writes to the
+    /// emitted `"mapped"` global so the bound check never under-admits a table-admitted page.
+    pub(crate) fn reserved_size(&self) -> u64 {
+        self.window.reserved()
+    }
+
     /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
     /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
     /// child reads the recorded address and suspends to its parent instead.

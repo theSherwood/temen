@@ -2245,11 +2245,22 @@ never emitted either (a remapping `cap.call` is not in-subset). `tierup_grow_win
 `jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
 unsynced divergences pinned as negative tests. The **page-state** axis stays fail-closed as above.
 The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
-divergence, never an escape. The rejected alternative — a per-access **software page-check** in
-emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit
-only page-managing guests see, and even gated + loop-invariant-elided it stays ~1.5–3×+ on the
-random-access tail; a gated, elided page-check is the escalation *iff* a hot page-managing guest ever
-appears. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+divergence, never an escape. The escalation past emit-nothing — a per-access **software page-check** in emitted code — has
+**landed dark** as the strictly opt-in paged entry (#750, `compile_module_tierup_paged`): every
+confined access in a paged module also consults a host-maintained byte-per-page state table
+(`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
+`Mem::map_info` — page state is frozen while emitted code runs, since page ops are `cap.call`s
+that never emit and never hide in a cross-tier leaf), first and last touched page, trapping through
+the existing fault seam exactly where `check_prot` would. The driver writes the table's coverage to
+`"mapped"`, so the bound check traps everything above it — the two checks compose. Paged-mode
+limits, fail-closed: `SharedRegion` aliasing still gates the whole module (a `Backed` page's bytes
+live outside the window), bulk-memory functions stay interpreted, and the page check is never
+elided (an in-window proof says nothing about dynamic page state). Every **unflagged** entry emits
+byte-identical code — the fail-closed default pays zero TCB — and the check runs strictly inside
+the always-emitted `& MASK` clamp, so a wrong table is a trap-parity divergence, never an escape.
+`page_check.rs` is the differential + boundary proof (unmapped load, Ro load/store split, page-edge
+straddle, unsynced-table divergence pin). The cost remains ~1.5–3×+ on the random-access tail for
+guests that opt in; no default flips until a hot page-managing consumer justifies it. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 
