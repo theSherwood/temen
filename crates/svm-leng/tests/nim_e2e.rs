@@ -299,9 +299,14 @@ fn real_allocator_runs_end_to_end() {
         let mut window = vec![0u8; 1 << 20];
         let brk = svm_ir::POWERBOX_HEAP_BRK as usize;
         window[brk..brk + 8].copy_from_slice(&(1i64 << 19).to_le_bytes());
-        let (first, after) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &window);
+        // `osAllocPages` is frame-needing under the funcref ABI — it can reach the OOM/abort path,
+        // whose handler is an indirect call — so its signature is `($sp, size)`. Give it a data-stack
+        // base above the seeded heap region (heap at 1<<19; this run bumps only two pages), well clear
+        // of the heap and globals; `size` is the second arg.
+        let sp = 0xC_0000; // 768 KiB
+        let (first, after) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[sp, 4096], &window);
         assert_eq!(first, 1 << 19, "first page is the seeded heap start");
-        let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &after);
+        let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[sp, 4096], &after);
         assert_eq!(second, (1 << 19) + 4096, "second page bumped by one page");
     });
 }
