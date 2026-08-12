@@ -383,6 +383,112 @@ int main() {
     );
 }
 
+/// #795 (the bash keystone) — `setjmp`/`longjmp`, the `<setjmp.h>` non-local jump. `setjmp` returns `0`
+/// on the direct call; a `longjmp` from **five frames deep** unwinds the whole intervening stack back to
+/// the `setjmp` and makes it "return" the long-jump value. Interpreter-only, like fibers — the JIT does
+/// not lower `setjmp`/`longjmp` yet. (The runtime op + checkpoint machinery already existed; this test
+/// exercises the new chibicc lowering that finally emits it.)
+#[test]
+fn c_setjmp_longjmp_unwinds_a_deep_call() {
+    let src = r#"
+typedef long jmp_buf[8];
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+long write(long fd, void *buf, long n);
+static char ok[] = "OK";
+static jmp_buf jb;
+static void deep(int n) {
+  if (n == 0) longjmp(jb, 42);
+  deep(n - 1);
+}
+int main(void) {
+  int r = setjmp(jb);
+  if (r == 0) { deep(5); return -1; }   /* the -1 fallthrough must never be reached */
+  write(1, ok, 2);
+  return r;                             /* 42 */
+}
+"#;
+    let run = run_c_interp(src);
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(42)]),
+        "setjmp returned the longjmp value after unwinding five frames"
+    );
+    assert_eq!(
+        run.stdout, b"OK",
+        "the post-longjmp path ran and the pre-longjmp fallthrough did not"
+    );
+}
+
+/// #795 — C's rule: `longjmp(env, 0)` makes `setjmp` return **1**, never 0, so a re-entry can't be
+/// mistaken for the direct call.
+#[test]
+fn c_longjmp_zero_becomes_one() {
+    let src = r#"
+typedef long jmp_buf[8];
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+static jmp_buf jb;
+int main(void) {
+  int r = setjmp(jb);
+  if (r == 0) longjmp(jb, 0);   /* asks for 0; C promotes it to 1 */
+  return r;                     /* 1 */
+}
+"#;
+    assert_eq!(
+        run_c_interp(src).outcome,
+        Outcome::Returned(vec![Value::I32(1)])
+    );
+}
+
+/// #795 — `setjmp` as a re-entrant retry point: `longjmp` back to it repeatedly. A **global** counter
+/// (window memory, so it survives the unwind) guards termination, while the returned value (an SSA local,
+/// reset by the checkpoint restore) tracks the fresh long-jump value each re-entry — proving memory
+/// persists across a longjmp while the setjmp result does not.
+#[test]
+fn c_setjmp_retry_loop() {
+    let src = r#"
+typedef long jmp_buf[8];
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+static jmp_buf jb;
+static int count;
+int main(void) {
+  int r = setjmp(jb);          /* 0, then 1, 2, 3 as longjmp re-enters */
+  count = count + 1;           /* the global survives each unwind: 1, 2, 3, 4 */
+  if (count < 4) longjmp(jb, count);
+  return r;                    /* the last re-entry's value: 3 */
+}
+"#;
+    assert_eq!(
+        run_c_interp(src).outcome,
+        Outcome::Returned(vec![Value::I32(3)])
+    );
+}
+
+/// #795 — bash actually uses the `sig`-prefixed variants (`sigsetjmp`/`siglongjmp`), so they must lower
+/// too. Until async signals exist (#796) the `savemask` argument is ignored (there is no mask to save),
+/// but the non-local jump itself works identically to `setjmp`/`longjmp`.
+#[test]
+fn c_sigsetjmp_siglongjmp_alias() {
+    let src = r#"
+typedef long sigjmp_buf[8];
+int sigsetjmp(sigjmp_buf env, int savemask);
+void siglongjmp(sigjmp_buf env, int val);
+static sigjmp_buf jb;
+static void g(void) { siglongjmp(jb, 7); }
+int main(void) {
+  int r = sigsetjmp(jb, 1);
+  if (r == 0) { g(); return -1; }
+  return r;                     /* 7 */
+}
+"#;
+    assert_eq!(
+        run_c_interp(src).outcome,
+        Outcome::Returned(vec![Value::I32(7)])
+    );
+}
+
 /// The shipped `<stdlib.h>` is a real guest libc: `malloc`/`calloc`/`realloc`/`free` that **grow
 /// the window via the Memory cap** — available to any program that just `#include <stdlib.h>`, no
 /// prelude. Allocates 400 KiB (well past the 64 KiB initial window, forcing growth), checks

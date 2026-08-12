@@ -945,9 +945,14 @@ simplification is superseded — see §4 / §3e).
 
 ### Phase-2 C subset (the "compilability proof" target)
 - **In:** `alloca`/VLAs (data-SP bump); computed `goto` (native — irreducible CFG,
-  §3); the full scalar/aggregate/vararg conventions above.
-- **Deferred:** `setjmp`/`longjmp` and C++ EH → lower onto the §12 stack-switch
-  primitive (stubbed in Phase 1); `_Thread_local` (with threads).
+  §3); the full scalar/aggregate/vararg conventions above; **`setjmp`/`longjmp`**
+  (the `<setjmp.h>` non-local jump — chibicc lowers `setjmp`/`_setjmp`/`sigsetjmp`
+  and `longjmp`/`siglongjmp` to the runtime `setjmp`/`longjmp` ops: a checkpoint of
+  the frame's resume point keyed by the `jmp_buf` address, and an unwind-and-re-enter
+  on the same buffer. Interp tier — JIT parity and the `sigsetjmp` mask (pending async
+  signals) are follow-ups. This is the bash keystone, #795).
+- **Deferred:** C++ EH → lower onto the §6/§12 stack-switch primitive;
+  `_Thread_local` (with threads).
 - **Out:** inline asm; 80-bit `long double`.
 
 ---
