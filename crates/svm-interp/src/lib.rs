@@ -8171,6 +8171,11 @@ struct VCpu {
     /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
+    /// #796 L2 async signals — `Some(depth)` while an injected signal **handler** frame is live, where
+    /// `depth` is `frames.len()` just after the handler was pushed. Gates re-entry (no signal delivers
+    /// while a handler runs) and is cleared when that frame returns (`frames.len()` falls below `depth`).
+    /// `None` = not currently in a handler.
+    sig_handler_depth: Option<usize>,
     /// PROCESS.md S3 `kill` — a parent's map from a §14 child's join-table **slot** to that child's
     /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
     /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
@@ -8303,6 +8308,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            sig_handler_depth: None,
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8370,6 +8376,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            sig_handler_depth: None,
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8459,6 +8466,7 @@ impl VCpu {
             invoked_ref_slots,
             debug: None,
             kill: None,
+            sig_handler_depth: None,
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8903,6 +8911,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         invoked_ref_slots,
         debug,
         kill,
+        sig_handler_depth,
         child_kill,
         serve_run,
         handler_parks,
@@ -8916,6 +8925,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let durable = *durable;
     let memop = *memop;
     let fault_pager = *fault_pager;
+    // #796 L2 — pull the async-signal poll pair once per quantum (a single `Host` lock here, never per
+    // op). `None` when no personality installed a `SignalSource`, so the per-op check below compiles to a
+    // predicted `is_some()` branch and the hot path is untouched for every non-signal guest.
+    let signal_poll = host.lock().unwrap_or_else(|e| e.into_inner()).signal_poll();
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -9515,6 +9528,47 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
+            // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
+            // has a caught, unmasked signal pending (its cheap `armed` flag is set) and we are not already
+            // inside a handler, redirect this fiber into the handler `void handler(int)` — on its own
+            // dedicated signal stack — exactly like a `call_indirect`. The interrupted instruction is
+            // **not** advanced, so it re-executes when the handler returns (the empty `Return` restores the
+            // interrupted frame untouched). Same interrupt-at-safepoint shape as `kill`, but non-lethal.
+            if sig_handler_depth.is_none() {
+                if let Some((armed, source)) = &signal_poll {
+                    if armed.load(Ordering::Relaxed) {
+                        // The source owns its own locking; the interp holds no personality lock here.
+                        if let Some((fref, signum, sp)) = source.take_deliverable() {
+                            // The handler's IR shape is `void handler(int)` = `(i64 sp, i32 signum) -> ()`
+                            // — chibicc threads the data-SP as v0. `dispatch_indirect` masks the funcref
+                            // into the table and type-checks; a mis-typed handler is dropped (the signal
+                            // was already consumed), not fatal.
+                            let handler_ty = FuncType {
+                                params: vec![ValType::I64, ValType::I32],
+                                results: vec![],
+                            };
+                            if let Ok((cmod, cfunc)) =
+                                dispatch_indirect(dt, &funcs, units, invoked, fref, &handler_ty)
+                            {
+                                if depth as usize + *parked_frames + frames.len()
+                                    >= MAX_CALL_DEPTH as usize
+                                {
+                                    return Err(Trap::StackOverflow);
+                                }
+                                frames.push(Frame {
+                                    func: cfunc,
+                                    module: cmod,
+                                    block: 0,
+                                    inst: 0,
+                                    vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)],
+                                });
+                                *sig_handler_depth = Some(frames.len());
+                                continue 'frames;
+                            }
+                        }
+                    }
+                }
+            }
             frames[top].inst += 1; // advance first, so a call-return resumes past this inst
 
             // Mid-run freeze trigger (DURABILITY.md §12, "freeze after N safepoints"): on a durable run
@@ -12918,6 +12972,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             Terminator::Return(out) => {
                 collect_into(&mut ret_buf, &frames[top].vals, out)?;
                 let popped = frames.pop();
+                // #796 L2 — if the frame that just returned is the injected signal handler (it sat at
+                // `sig_handler_depth`, now one above the post-pop length), clear the in-handler guard so
+                // the next pending signal can be delivered. A `void` handler's empty `ret_buf` leaves the
+                // interrupted caller's `vals` untouched below, so it resumes at the re-run safepoint op.
+                if *sig_handler_depth == Some(frames.len() + 1) {
+                    *sig_handler_depth = None;
+                }
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     // Copy results straight in — no per-return results `Vec`.
@@ -15964,6 +16025,24 @@ impl RegionMinter for Host {
     }
 }
 
+/// #796 L2 — the **async-signal source**: a personality (e.g. svm-posix) that decides *which* guest
+/// handler the interpreter should run at a safepoint. This trait is the seam that keeps signal **policy**
+/// (POSIX numbers, dispositions, the mask — PROCESS.md §9) in the personality while the **mechanism** (the
+/// safepoint redirect, invariant 4) lives in the interp; svm-interp never names a personality, it only
+/// calls this. The interp polls a cheap [`Host::sig_armed`] flag per op and, when set and not already in a
+/// handler, asks the source for the next delivery.
+pub trait SignalSource: Send + Sync {
+    /// The next deliverable async signal, or `None` if nothing is currently deliverable. Returns
+    /// `(handler_funcref, signum, handler_sp)` — the guest handler's function-table index (§3c), the
+    /// signal number passed as the handler's `int` argument, and the **data-stack pointer** the handler
+    /// runs on (a dedicated signal stack the guest registered — the handler can't reuse the interrupted
+    /// frame's stack). `&self` because the implementation owns its own interior locking (the interp holds
+    /// no personality lock at the safepoint). The implementation must clear the delivered signal's pending
+    /// state and honor the mask, and leave [`Host::sig_armed`] set iff a further signal is already
+    /// deliverable.
+    fn take_deliverable(&self) -> Option<(i32, i32, u64)>;
+}
+
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -16201,6 +16280,14 @@ pub struct Host {
     /// — same reference-cycle discipline as `async_notify`); `None` ⇒ parked callers don't exist
     /// (every waiter is a blocking `Completions::wait`), so no wake is needed.
     completion_notify: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #796 L2 async signals — a **cheap per-op armed flag** the running vCPU polls (like `kill`): a
+    /// [`SignalSource`] sets it when a caught, unmasked signal becomes pending. A relaxed atomic load per
+    /// op when a source is installed, and free (no source ⇒ never consulted) otherwise.
+    sig_armed: Arc<AtomicBool>,
+    /// #796 L2 — the installed [`SignalSource`] (a personality) the interp asks for the next deliverable
+    /// handler when `sig_armed` fires. `None` ⇒ no async signals (poll-only, the default). Installed via
+    /// [`Host::set_signal_source`]; the source holds the *same* `sig_armed` `Arc`, so its arming is visible.
+    sig_source: Option<Arc<dyn SignalSource + Send + Sync>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -16587,6 +16674,8 @@ impl Host {
             pool: None,
             completions: Arc::new(Completions::new()),
             completion_notify: None,
+            sig_armed: Arc::new(AtomicBool::new(false)),
+            sig_source: None,
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),
@@ -16707,6 +16796,10 @@ impl Host {
         twin.out_sink = self.out_sink.clone();
         twin.err_sink = self.err_sink.clone();
         twin.sinks = self.sinks.clone();
+        // #796 L2 — a fork shares the async-signal source + armed flag (the personality's signal state is
+        // shared like the rest of the powerbox); each twin polls the same doorbell.
+        twin.sig_source = self.sig_source.clone();
+        twin.sig_armed = Arc::clone(&self.sig_armed);
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -17448,6 +17541,27 @@ impl Host {
     /// `Arc<Scheduler>`; leaving it would cycle Host → Scheduler → Host).
     pub fn clear_completion_notify(&mut self) {
         self.completion_notify = None;
+    }
+
+    /// #796 L2 — install the async-signal source (a personality) and the shared **armed** flag it sets.
+    /// The `armed` `Arc` must be the *same* one the source mutates, so the interp's per-op poll sees the
+    /// source's arming. Installed at grant time by the personality; enables safepoint signal delivery.
+    pub fn set_signal_source(
+        &mut self,
+        source: Arc<dyn SignalSource + Send + Sync>,
+        armed: Arc<AtomicBool>,
+    ) {
+        self.sig_source = Some(source);
+        self.sig_armed = armed;
+    }
+
+    /// #796 L2 — the async-signal poll pair for the run loop: the cheap per-op `armed` flag and the
+    /// source to consult when it fires. `None` when no source is installed (poll-only — the hot path is
+    /// untouched). Pulled once per `run_inner` quantum so the per-op check needs no `Host` lock.
+    fn signal_poll(&self) -> Option<(Arc<AtomicBool>, Arc<dyn SignalSource + Send + Sync>)> {
+        self.sig_source
+            .clone()
+            .map(|src| (Arc::clone(&self.sig_armed), src))
     }
 
     /// Install a host binding in a free slot and return the guest handle — a forgeable

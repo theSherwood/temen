@@ -194,6 +194,108 @@ fn run_both(src: &str, prep: impl Fn(&Posix)) -> (Effects, Effects) {
     (interp, jit)
 }
 
+/// #796 L2 — like [`run_both`] but **interpreter-only**. Async signal delivery (the safepoint redirect)
+/// lives only in the interpreter, so a program that relies on it can't run on the JIT (which would never
+/// deliver, and here would spin forever). Returns just the interpreter's effects.
+fn run_interp_only(src: &str, prep: impl Fn(&Posix)) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (iposix, ipx) = setup(&mut ih, win);
+    prep(&iposix);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut ih, ipx);
+    let mut fuel = 200_000_000u64;
+    let (result, exited) = match run_with_host(&raw, 0, &[], &mut fuel, &mut ih) {
+        Ok(v) => (v, None),
+        Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
+        Err(e) => panic!("interp trapped: {e:?}\n--- IR ---\n{ir}"),
+    };
+    Effects {
+        result,
+        exited,
+        stdout: iposix.stdout(),
+        file_f: iposix.read_file("f"),
+    }
+}
+
+/// #796 L2 — **async delivery to a running loop**: a signal raised while the guest is compute-bound is
+/// delivered to its handler at a safepoint, with **no `sigcheck` poll** in the loop. The handler sets a
+/// global; the loop (which never polls) observes it and exits. This is the headline "async" win — the
+/// interpreter redirects a running fiber into the handler `void(int)` on its registered signal stack and
+/// resumes. Interpreter-only (the JIT has no safepoint injection yet).
+#[test]
+fn c_async_signal_interrupts_a_compute_loop() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int fired;
+static void handler(int sig) { fired = sig; }
+int main(void) {
+  __px_signal(0, 2, (long)handler);           /* catch SIGINT(2) with `handler` */
+  __px_sigaltstack(0, (long)sigstk, 16384);   /* register the dedicated handler stack */
+  __px_kill(0, 0, 2);                          /* raise SIGINT -- armed for async delivery */
+  long spins = 0;
+  while (!fired) {                             /* compute loop -- NEVER calls sigcheck */
+    spins = spins + 1;
+    if (spins > 100000000) return -1;          /* safety: fail if the handler never fired */
+  }
+  return fired;                                /* 2, set asynchronously by the handler */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(2)],
+        "the async handler ran during the compute loop (no poll) and set `fired = SIGINT`"
+    );
+}
+
+/// #796 L2 — async delivery **honors the mask**: a blocked signal is held (not delivered to a running
+/// loop) until unblocked, then delivered asynchronously. Encodes both checks: `a` (fired while blocked,
+/// must be 0) in the thousands, the post-unblock `fired` (2) in the units → 2. A mask that leaked would
+/// read 2002 instead.
+#[test]
+fn c_async_delivery_respects_the_mask() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_sigprocmask(int cap, long how, long set, long oldset);
+static char sigstk[16384];
+static volatile int fired;
+static unsigned long mask;
+static void handler(int sig) { fired = sig; }
+int main(void) {
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  mask = (1UL << 2);
+  __px_sigprocmask(0, 0, (long)&mask, 0);      /* SIG_BLOCK SIGINT */
+  __px_kill(0, 0, 2);                          /* raise -- blocked, must NOT deliver */
+  long i = 0;
+  while (i < 2000000) i = i + 1;               /* spin while blocked: handler must stay silent */
+  int a = fired;                               /* 0 */
+  __px_sigprocmask(0, 1, (long)&mask, 0);      /* SIG_UNBLOCK -- now deliverable async */
+  while (!fired) { i = i + 1; if (i > 100000000) return -1; }
+  return a * 1000 + fired;                     /* 2 */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(2)],
+        "a blocked signal is not delivered async until unblocked"
+    );
+}
+
 /// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
 /// only**. Each `__px_` extern's first argument is a literal `0` — a dummy handle operand,
 /// vestigial in static dispatch (the slot binding carries the handle); no `__vm_cap`, no stash.
@@ -269,6 +371,81 @@ int main() {{\n\
     assert_eq!(jit.result, vec![Value::I64(3)], "jit: fd must match interp");
     assert_eq!(jit.stdout, interp.stdout, "jit: stdout must match interp");
     assert_eq!(jit.file_f, interp.file_f, "jit: memfs must match interp");
+}
+
+/// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
+/// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
+/// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
+const SIG_SHIM: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigcheck(int cap, long z);
+long __px_sigprocmask(int cap, long how, long set, long oldset);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+static long signal_(long signum, long handler) { return __px_signal(0, signum, handler); }
+static long raise_(long sig) { return __px_kill(0, 0, sig); }
+static long sigcheck_(void) { return __px_sigcheck(0, 0); }
+static long sigprocmask_(long how, void *set, void *oldset) { return __px_sigprocmask(0, how, (long)set, (long)oldset); }
+static long sigaction_(long signum, void *act, void *oldact) { return __px_sigaction(0, signum, (long)act, (long)oldact); }
+"#;
+
+/// #796 — `sigprocmask` blocks a signal: a raised-but-blocked signal is **held** (not delivered by the
+/// doorbell poll) until it is unblocked. Both checks are encoded in the return value: `a` (the poll while
+/// blocked, which must be 0) in the thousands place, `b` (the poll after unblock, which must be the caught
+/// handler 999) in the units → 999. A broken mask that delivered while blocked would read 999000 instead.
+#[test]
+fn c_sigprocmask_holds_a_blocked_signal() {
+    let src = format!(
+        "{SIG_SHIM}\n\
+static unsigned long mask;\n\
+int main(void) {{\n\
+  signal_(2, 999);                 /* catch SIGINT */\n\
+  mask = (1UL << 2);               /* the SIGINT bit */\n\
+  sigprocmask_(0, &mask, 0);       /* SIG_BLOCK */\n\
+  raise_(2);                       /* raise SIGINT -- blocked, so held */\n\
+  long a = sigcheck_();            /* 0: masked */\n\
+  sigprocmask_(1, &mask, 0);       /* SIG_UNBLOCK */\n\
+  long b = sigcheck_();            /* 999: now deliverable */\n\
+  return (int)(a * 1000 + b);      /* 999 */\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(999)],
+        "interp: a blocked signal is held, then delivered after unblock"
+    );
+    assert_eq!(jit.result, vec![Value::I64(999)], "jit parity");
+}
+
+/// #796 — `sigaction` records a disposition (delivered by the doorbell exactly like `signal`) and
+/// round-trips the whole action through `oldact`. Returns the delivered handler (4242) plus 1 iff `oldact`
+/// preserved `sa_handler` and `sa_flags` → 4243.
+#[test]
+fn c_sigaction_installs_and_round_trips() {
+    let src = format!(
+        "{SIG_SHIM}\n\
+struct sigaction {{ long sa_handler; unsigned long sa_mask; long sa_flags; }};\n\
+static struct sigaction act, old;\n\
+int main(void) {{\n\
+  act.sa_handler = 4242;\n\
+  act.sa_mask = 0;\n\
+  act.sa_flags = 7;\n\
+  sigaction_(5, &act, 0);          /* install for signal 5 */\n\
+  sigaction_(5, 0, &old);          /* read it back into old */\n\
+  raise_(5);\n\
+  long h = sigcheck_();            /* 4242 delivered */\n\
+  int rt = (old.sa_handler == 4242 && old.sa_flags == 7) ? 1 : 0;\n\
+  return (int)(h + rt);            /* 4243 */\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(4243)],
+        "interp: sigaction installs a caught handler and round-trips the action"
+    );
+    assert_eq!(jit.result, vec![Value::I64(4243)], "jit parity");
 }
 
 /// The **environment + cwd** surface from compiled C: `getenv` a variable the embedder staged, echo

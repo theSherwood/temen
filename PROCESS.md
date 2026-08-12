@@ -752,19 +752,24 @@ park — and signal delivery is only a question of which action fires at them:
   pipe) wakes with an interrupted status instead of its result; the libc runs pending
   handlers and re-issues, or returns `EINTR`. Parks are runtime state that already
   delivers several outcome kinds — this is the signals-while-blocked half of POSIX.
-- **L2 — safepoint-injected handlers (rides existing polls).** At a kill-poll / fuel
-  check, the slow path redirects the fiber into a registered guest handler, then resumes
-  at the poll site — the same interrupt-at-safepoint pattern the §5 kill path and the
-  durable async STW already use, with a non-lethal action. The hot path pays nothing
-  new. Latency = poll granularity, and the bound is exactly `DURABILITY.md` R6 (tight
-  direct-call loops are poll-free until Phase-4 back-edge polls) — signals inherit the
-  kill/freeze latency work for free. This is the JVM-safepoint / Go-preemption /
-  wasmtime-epoch consensus: handlers run only at consistent states, a *saner* contract
-  than POSIX's async-signal-safety minefield, not a weaker one.
+- **L2 — safepoint-injected handlers (rides existing polls). BUILT (#796).** At the per-op
+  poll site (right beside the `kill` poll), if a personality's cheap `sig_armed` flag is set
+  and no handler is already running, the interp redirects the fiber into the registered guest
+  handler `void handler(int)` — pushed like a `call_indirect` on a guest-registered signal
+  stack (`sigaltstack`; the interp can't reuse the interrupted frame's stack, whose size is
+  baked into the IR) — then resumes at the (un-advanced) poll-site op when the handler returns.
+  The seam is a `SignalSource` trait the interp calls (mechanism) and svm-posix implements
+  (policy: dispositions/mask/pending) — invariant 4, no reverse crate dependency. The hot path
+  pays nothing new (a predicted branch on the flag; no source ⇒ not even that). Latency = poll
+  granularity, bounded exactly by `DURABILITY.md` R6. This is the JVM-safepoint / Go-preemption
+  / wasmtime-epoch consensus: handlers run only at consistent states, a *saner* contract than
+  POSIX's async-signal-safety minefield. **Still parked:** default actions (terminate/stop),
+  `SA_RESTART` / block-during-handler, and nested delivery (a single in-handler guard for now).
 - **Never — instruction-granularity interruption** of arbitrary compute. The residue is
   the part of POSIX that POSIX itself fences off.
 
-L0 ships with the shell; L1/L2 are parked (S13) until a personality claims a consumer.
+L0 ships with the shell; **L2 async delivery is built (#796)**; L1 (interruptible parks / `EINTR`)
+remains parked (S13) until a personality claims a consumer.
 
 ## 10. The validation ladder
 
