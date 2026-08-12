@@ -62,6 +62,23 @@ fn is_importc_proc(proc_node: &Node) -> bool {
         if p.tag() == Some("pragmas") && p.args().iter().any(|x| x.tag() == Some("importc")))
 }
 
+/// If `proc_node` is **variadic** — its params end in one typed `(varargs)`, nimony's spelling of a
+/// `{.varargs.}` C import (`c_snprintf(buf, n, frmt: cstring): cint {.importc, varargs.}` → a final
+/// `(param :vanon.0 . (varargs))`) — return the count of *fixed* params before it (here 3). A
+/// variadic callee can't be a fixed-arity `call.import`, so the caller marshals the trailing args
+/// into a data-stack buffer and passes one pointer (DESIGN §"Varargs → clang-wasm-style"). `None`
+/// for a non-variadic proc.
+fn varargs_fixed_count(proc_node: &Node) -> Option<usize> {
+    let params = proc_node.args().get(1)?;
+    if params.tag() != Some("params") {
+        return None;
+    }
+    params
+        .args()
+        .iter()
+        .position(|p| p.args().get(2).is_some_and(|t| t.tag() == Some("varargs")))
+}
+
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
 /// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
 fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
@@ -342,6 +359,15 @@ pub(crate) struct Translator {
     /// completes; the **real** translation pass (this flag off, sibling types pooled) still
     /// fail-closes on a genuinely unmaterializable aggregate global and materializes the rest.
     scan_lenient: bool,
+    /// **Variadic C imports** (`{.varargs.}`, e.g. `c_snprintf`) → their count of *fixed* params. Such
+    /// a callee can't be a fixed-arity `call.import` (call sites pass different variadic counts), so
+    /// [`call_import`](FnCtx::call_import) marshals the trailing variadic args into a data-stack buffer
+    /// (each in an 8-byte slot, integers widened / floats promoted per C's default argument promotions)
+    /// and passes one pointer — DESIGN §"Varargs → clang-wasm-style". That gives the import a stable
+    /// `fixed + 1` signature regardless of the call site. Populated by
+    /// [`collect_varargs_imports`](Self::collect_varargs_imports) *before* any frame sizing, so
+    /// [`agg_temp_bytes`](Self::agg_temp_bytes) can reserve the buffer.
+    varargs_imports: HashMap<String, usize>,
 }
 
 impl Translator {
@@ -370,6 +396,7 @@ impl Translator {
             ext_tls_layout: HashMap::default(),
             own_stem: String::new(),
             scan_lenient: false,
+            varargs_imports: HashMap::default(),
         }
     }
 
@@ -972,10 +999,37 @@ impl Translator {
     /// aggregate arg passes by-address). Matching emission exactly matters: an aggregate constructor
     /// in *return*/assign position builds in place, not a temp, and must NOT reserve space (else the
     /// proc becomes spuriously frame-needing and its ABI changes). See [`FuncGen::agg_rvalue_temp`].
+    /// Pre-pass: record every **variadic `importc` proc** (`{.varargs.}`) → its fixed-param count in
+    /// [`varargs_imports`](Self::varargs_imports), so a call to it lowers via the va-buffer ABI. Runs
+    /// before frame sizing — a varargs call reserves a data-stack buffer ([`agg_temp_bytes`]) — so it
+    /// must not depend on the decl preceding its callers in the module. Non-import/non-variadic procs
+    /// are skipped.
+    fn collect_varargs_imports(&mut self, root: &Node) -> Result<(), LengError> {
+        for item in root.args() {
+            if item.tag() == Some("proc") && is_importc_proc(item) {
+                if let Some(fixed) = varargs_fixed_count(item) {
+                    let name = sym_def(&item.args()[0])?;
+                    self.varargs_imports.insert(name, fixed);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn agg_temp_bytes(&self, node: &Node) -> u64 {
         let mut total = 0;
         match node.tag() {
             Some("call") => {
+                // A **variadic import** call marshals its trailing variadic args into a data-stack
+                // buffer (one 8-byte slot each), so reserve that here — the frame predicate
+                // (`proc_needs_frame`) and this sizing both route through `agg_temp_bytes`, so they
+                // agree that such a call frames the proc.
+                if let Some(callee) = node.args().first().and_then(|c| c.as_atom()) {
+                    if let Some(&fixed) = self.varargs_imports.get(callee) {
+                        let nargs = node.args().len() - 1;
+                        total += (nargs.saturating_sub(fixed) as u64) * 8;
+                    }
+                }
                 for arg in node.args().iter().skip(1) {
                     if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
                         if let Some(Ok(d @ TyDesc::Agg(_))) =
@@ -1510,6 +1564,7 @@ impl Translator {
         // A funcref target / indirect caller is frame-needing under the funcref ABI (`proc_needs_frame`
         // consults `funcref_targets`), so the fixpoint pre-scan must see the same set the real pass does.
         t.compute_funcref_targets(root)?;
+        t.collect_varargs_imports(root)?;
         // A proc that calls an **sret** proc materializes a result temp → is frame-needing. So the
         // frame predicate (`proc_needs_frame` → `agg_temp_bytes`) must know which callees are sret:
         // pooled sibling procs (`ext_sret`) and this module's own (registered by name here, so a
@@ -1628,6 +1683,7 @@ impl Translator {
         self.collect_types(root)?;
         self.collect_globals(root)?;
         self.compute_funcref_targets(root)?;
+        self.collect_varargs_imports(root)?;
         let mut proc_nodes = Vec::new();
         let mut names = Vec::new();
         for item in root.args() {
@@ -1820,6 +1876,7 @@ impl Translator {
         self.collect_types(root)?;
         self.collect_globals(root)?;
         self.compute_funcref_targets(root)?;
+        self.collect_varargs_imports(root)?;
         for item in root.args() {
             if item.tag() != Some("proc") {
                 continue;
@@ -1867,6 +1924,7 @@ impl Translator {
         self.collect_types(root)?;
         self.collect_globals(root)?;
         self.compute_funcref_targets(root)?;
+        self.collect_varargs_imports(root)?;
         // Register the requested procs first (indices in `names` order), so calls between them bind.
         let mut selected: Vec<&Node> = Vec::new();
         for (index, want) in names.iter().enumerate() {
@@ -4402,7 +4460,14 @@ impl<'a> FuncGen<'a> {
             argvals.push(self.emit_callee_sp(name)?);
             argtys.push(ValType::I64);
         }
-        for arg in args {
+        // A **variadic import** (`c_snprintf`, `{.varargs.}`): the fixed params pass normally; the
+        // trailing variadic args are marshalled into a data-stack buffer and replaced by one pointer,
+        // so the import has a stable `fixed + 1` signature no matter how many variadic args a given
+        // call site passes (DESIGN §"Varargs → clang-wasm-style"). A non-variadic callee keeps every
+        // arg fixed (`fixed_end == args.len()`, no buffer).
+        let varargs_fixed = self.t.varargs_imports.get(name).copied();
+        let fixed_end = varargs_fixed.map_or(args.len(), |f| f.min(args.len()));
+        for arg in &args[..fixed_end] {
             // Aggregate args pass by address (matching by-address params); scalars by value.
             if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
                 argvals.push(addr);
@@ -4416,6 +4481,29 @@ impl<'a> FuncGen<'a> {
                 argvals.push(v.id);
                 argtys.push(v.ty);
             }
+        }
+        if varargs_fixed.is_some() {
+            // Marshal the variadic tail into consecutive 8-byte slots of a fresh data-stack buffer
+            // (reserved by `agg_temp_bytes`). Each arg takes one slot under C's default argument
+            // promotions: an integer/pointer widened to `i64`, a float promoted to `f64` — storing the
+            // value's *bits* (a float is never truncated). The buffer's base pointer is the single
+            // va-list argument the import receives. Zero variadic args → a zero-size buffer whose
+            // pointer is never dereferenced, still passed so every call site agrees on the arity.
+            let variadic = &args[fixed_end..];
+            let buf = self.alloc_temp((variadic.len() as u64) * 8);
+            for (i, arg) in variadic.iter().enumerate() {
+                let v = self.expr(arg)?;
+                let (sty, sval) = match v.ty {
+                    ValType::F32 | ValType::F64 => (ValType::F64, self.convert(v, ValType::F64)),
+                    _ => (ValType::I64, self.convert(v, ValType::I64)),
+                };
+                let slot = self.add_const_off(buf, (i * 8) as u64);
+                self.cur_buf
+                    .push_str(&format!("  {}.store v{slot} v{}\n", prefix(sty), sval.id));
+            }
+            self.used_memory = true;
+            argvals.push(buf);
+            argtys.push(ValType::I64);
         }
         let slot = self.t.register_import(name, &argtys, ret)?;
         let arglist = argvals
