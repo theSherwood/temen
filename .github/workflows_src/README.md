@@ -129,6 +129,18 @@ identical until the next agent edit.
   nim-lang/nimony's own CI and hasn't been run in *this* repo's CI yet, so the first green run is the
   real validation.
 
+- **`std-guest` job** (#821) — a new **nightly** (`schedule` + `workflow_dispatch`) Linux job that runs
+  the `crates/svm-llvm/tests/std_guest.rs` suite, which no CI job previously executed (it auto-skips in
+  the always-on `svm-llvm` job because nightly + `rust-src` + the applied svm std overlay aren't there).
+  The job installs nightly + `rust-src`, runs `rust-svm/apply-overlay.sh`, and runs the suite serially.
+  It exercises **both** target specs — the lean `x86_64-unknown-svm` and the new threaded
+  `x86_64-unknown-svm-threads` (`singlethread=false`: futex `sys/sync` + native TLS) — through
+  `-Zbuild-std` → on-ramp → verify → powerbox. Guards against the #788 build-std wedge two ways: a firm
+  `timeout-minutes: 75`, and a per-build kill-and-skip in the harness (`SVM_STD_BUILD_TIMEOUT_SECS`,
+  set to 480). `RUSTFLAGS: ""` overrides the workflow-global `-D warnings` (build-std recompiles std).
+  First green run on CI is the real validation of the time budget (~12 tests × two targets × ~40 s
+  serial). No new toolchain beyond nightly+rust-src.
+
 *(Previously drained 2026-07-30, when the whole backlog was copied over: the `workflows-in-sync`
 guard, nightly-only `miri`, `cross-os` `CARGO_PROFILE_TEST_DEBUG: "0"`, the `playground-assets` job +
 the `pages.yml` reachability step, the `bench_chibicc_jit.mjs` / `browser-shell-test.mjs` /

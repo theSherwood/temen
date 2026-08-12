@@ -345,6 +345,64 @@ exit:\n\
 }
 
 #[test]
+fn thread_local_address_tier1_and_pause_drop() {
+    // The threaded-`std` build's native TLS shape: a `thread_local` global, addressed via
+    // `llvm.threadlocal.address`, with a `core::hint::spin_loop()` (`llvm.x86.sse2.pause`) between the
+    // store and the reload. On a single vCPU the on-ramp lowers `threadlocal.address` to the global's
+    // plain window address (NIM.md §3d Tier-1 collapse), so the store-then-reload round-trips through
+    // one stable slot; the `pause` hint is dropped. `run(x)` returns `x + 1`.
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-none\"\n\
+@tls = internal thread_local unnamed_addr global i64 0, align 8\n\
+declare ptr @llvm.threadlocal.address.p0(ptr)\n\
+declare void @llvm.x86.sse2.pause()\n\
+define i64 @run(i64 %x) {\n\
+entry:\n\
+  %p = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  store i64 %x, ptr %p, align 8\n\
+  call void @llvm.x86.sse2.pause()\n\
+  %q = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  %v = load i64, ptr %q, align 8\n\
+  %r = add i64 %v, 1\n\
+  ret i64 %r\n\
+}\n";
+    let t = svm_llvm::translate_ll_str(ir).expect("translate thread-local IR");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let run = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|x| x.1)
+        .expect("run export");
+    for x in [0i64, 41, 255] {
+        let mut fuel = 1_000_000u64;
+        let interp = match svm_interp::run(
+            &t.module,
+            run,
+            &[Value::I64(t.entry_sp as i64), Value::I64(x)],
+            &mut fuel,
+        )
+        .expect("interp")[0]
+        {
+            Value::I64(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let jit =
+            match svm_jit::compile_and_run(&t.module, run, &[t.entry_sp as i64, x]).expect("jit") {
+                JitOutcome::Returned(v) => v[0],
+                o => panic!("jit outcome {o:?}"),
+            };
+        assert_eq!(interp, jit, "tls x={x}: interp vs jit");
+        assert_eq!(
+            interp,
+            x + 1,
+            "tls x={x}: store→pause→reload round-trips (Tier-1 slot)"
+        );
+    }
+}
+
+#[test]
 fn byval_sse_struct() {
     // A `{double, double}` struct — two SSE eightbytes, coerced to `(double, double)`.
     let src = "struct DD { double a; double b; }; double useDD(struct DD); \

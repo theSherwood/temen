@@ -14221,6 +14221,28 @@ fn lower_load_relative(
     Ok(Some(ctx.add_i64(p, delta)))
 }
 
+/// `@llvm.threadlocal.address.p0(ptr @G)` → the guest address of the thread-local global `@G`.
+///
+/// The **NIM.md §3d Tier-1** TLS lowering: on a single vCPU a thread-local has exactly one instance,
+/// so its plain-global window address *is* that instance. The on-ramp already parses a `thread_local`
+/// global as an ordinary global (the `thread_local` keyword is a skipped attribute word), so it lands
+/// in `self.globals` with a real window address, and `operand_i64` resolves `@G` to it — identical to
+/// how the C on-ramp strips `__thread` for a single-threaded guest. Exact whenever the guest runs on
+/// one vCPU; the Tier-2 per-thread `vcpu.tls`-block model (real `std::thread::spawn`, so each vCPU
+/// gets its own instance) is the follow-up that lands with thread spawn (#822/#823).
+fn lower_threadlocal_address(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    if !name.starts_with("llvm.threadlocal.address") {
+        return Ok(None);
+    }
+    Ok(Some(ctx.operand_i64(vm_arg(c, 0)?)?))
+}
+
 fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<bool, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(false);
@@ -14558,6 +14580,11 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
             || s.starts_with("llvm.experimental.noalias.scope.decl")
+            // `core::hint::spin_loop()` → the x86 `pause` hint, emitted by the threaded-`std` futex
+            // spin loops (Mutex/RwLock/Once). It is a CPU backoff hint with no architectural effect,
+            // so dropping it is semantics-preserving (the cooperative scheduler makes progress the
+            // spin would otherwise busy-wait for).
+            || s.starts_with("llvm.x86.sse2.pause")
             // Newer `rustc` (≥1.84) emits a `tail call void @…__rust_no_alloc_shim_is_unstable_v2()`
             // marker in every allocating function — a no-op that only exists to keep the allocator
             // shim from being stabilized/DCE'd. It returns `void` and has no runtime effect, so we
@@ -17319,6 +17346,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `llvm.load.relative` (clang's relative lookup table) → load the 32-bit relative offset and
         // add it back to the table base.
         if let Some(idx) = lower_load_relative(ctx, c)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // `llvm.threadlocal.address(ptr @G)` → the address of the thread-local global (NIM.md §3d
+        // Tier-1: one instance per single-vCPU run). Emitted by the threaded `std` build's native TLS.
+        if let Some(idx) = lower_threadlocal_address(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
