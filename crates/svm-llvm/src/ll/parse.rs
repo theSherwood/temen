@@ -684,6 +684,9 @@ impl Parser {
         // An `external`/`extern_weak` global is *declared* here (defined elsewhere) — it has no
         // initializer, so we must not mistake the *next* top-level `@name` for its value.
         let mut is_declaration = false;
+        // `@g = … thread_local … global …` — a thread-local. Recorded so the translator can peel it
+        // into the per-vCPU `vcpu.tls`-relative block (NIM.md §3d Tier-2) instead of the shared window.
+        let mut thread_local = false;
         let is_constant = loop {
             match self.peek() {
                 Some(Token::Word(w)) if w == "global" => {
@@ -699,6 +702,18 @@ impl Parser {
                     if self.peek() == Some(&Token::LParen) {
                         self.pos += 1;
                         addr_space = self.int_lit_u32()?;
+                        self.expect(&Token::RParen)?;
+                    }
+                }
+                Some(Token::Word(w)) if w == "thread_local" => {
+                    self.pos += 1;
+                    thread_local = true;
+                    // An optional TLS-model group: `thread_local(localexec)` / `(initialexec)` / … —
+                    // a hint with no bearing on our lowering, so accept and discard it.
+                    if self.peek() == Some(&Token::LParen) {
+                        while !matches!(self.peek(), Some(&Token::RParen) | None) {
+                            self.pos += 1;
+                        }
                         self.expect(&Token::RParen)?;
                     }
                 }
@@ -751,6 +766,7 @@ impl Parser {
             initializer,
             is_constant,
             alignment,
+            thread_local,
         });
         Ok(())
     }

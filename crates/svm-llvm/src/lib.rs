@@ -684,7 +684,7 @@ fn translate_impl(
     // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
     // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
     let globals_base = if synth { stack_page } else { DATA_BASE };
-    let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols) =
+    let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols, tls_layout) =
         globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
     // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
@@ -841,6 +841,7 @@ fn translate_impl(
             &m.types,
             &name2idx,
             &globals,
+            &tls_layout.off,
             &caps,
             &cstrs,
             &gbytes,
@@ -957,6 +958,7 @@ fn translate_impl(
             &ctors,
             wants_envp,
             stack_page,
+            tls_layout.root_base,
         );
         funcs.insert(0, start);
     }
@@ -1556,7 +1558,25 @@ type Globals = (
     HashMap<String, u64>,
     HashMap<String, Vec<u8>>,
     Vec<DataSymbol>,
+    TlsLayout,
 );
+
+/// The per-vCPU thread-local (TLS) block layout (NIM.md §3d Tier-2). Thread-local globals are peeled
+/// out of the shared window and packed into one contiguous block addressed off the `vcpu.tls` base
+/// register: a thread-local's address is `vcpu.tls.get() + off[name]`. The **root** vCPU's block is a
+/// zero-init window region reserved at `root_base` (its base is set once in `_start`); a spawned
+/// thread allocates its own `block_size`-byte block and `vcpu.tls.set`s it (the std thread trampoline,
+/// #823). Empty (`block_size == 0`) when the module has no thread-locals — the common single-threaded
+/// and lean-target case, where nothing changes.
+#[derive(Default, Clone)]
+struct TlsLayout {
+    /// Thread-local name → byte offset within the per-vCPU block.
+    off: HashMap<String, u64>,
+    /// Total block size in bytes (what a spawned thread must allocate + zero).
+    block_size: u64,
+    /// Window address of the root vCPU's reserved block, or `None` when there are no thread-locals.
+    root_base: Option<u64>,
+}
 
 /// Lay out the module's global variables in the window's globals region (from `base`, each
 /// natural-aligned), returning the name → window-address map, the `data` segments to emit
@@ -1593,6 +1613,11 @@ fn globals_layout(
             if g.is_constant != want_const {
                 continue;
             }
+            // Thread-local globals (NIM.md §3d Tier-2) are peeled out of the shared window into the
+            // per-vCPU `vcpu.tls` block below — never laid out as ordinary window data.
+            if g.thread_local {
+                continue;
+            }
             // LLVM-reserved globals (`llvm.global_ctors`/`global_dtors`/`used`/`compiler.used`)
             // are metadata, never real window data — they are handled out of band (the ctors run
             // in `_start`, the rest are dropped), so never lay them out / serialize them.
@@ -1621,6 +1646,55 @@ fn globals_layout(
         Ok(())
     };
     place(&mut off, &mut addr, &mut syms, false)?; // writable + BSS globals
+
+    // NIM.md §3d Tier-2: pack thread-local globals into one per-vCPU block addressed off `vcpu.tls`.
+    // Assign each a natural-aligned offset within the block, then reserve the **root** vCPU's block as
+    // a zero-init region in the writable area (its base is `vcpu.tls.set` in `_start`). A thread-local
+    // never gets a fixed window address — every access lowers to `vcpu.tls.get() + off`.
+    let mut tls = TlsLayout::default();
+    for g in m.global_vars.iter() {
+        if !g.thread_local || name_str(&g.name).starts_with("llvm.") {
+            continue;
+        }
+        // A non-zero initializer would be lost when a spawned thread zero-allocates its block (and the
+        // root block is zero-init too). Fail closed — per-thread seeding is a follow-up (as in svm-leng
+        // `tls_mode`). std's lazy `thread_local!` statics are zero-init, so this does not bite them.
+        if let Some(init) = &g.initializer {
+            let empty: Vec<u32> = Vec::new();
+            let mut feed = empty.iter().copied();
+            let bytes =
+                const_bytes(init.as_ref(), &m.types, &addr, name2idx, &mut feed).map_err(|_| {
+                    Error::Unsupported(format!(
+                        "thread-local `{}` has an initializer the TLS block layout can't resolve",
+                        name_str(&g.name)
+                    ))
+                })?;
+            if bytes.iter().any(|&x| x != 0) {
+                return Err(Error::Unsupported(format!(
+                    "non-zero thread-local initializer for `{}` (the per-vCPU TLS block is zero-init; \
+                     per-thread seeding is a follow-up)",
+                    name_str(&g.name)
+                )));
+            }
+        }
+        let size = match &g.initializer {
+            Some(init) => const_size(init.as_ref(), &m.types)?,
+            None => type_size(g.ty.as_ref(), &m.types)?,
+        }
+        .max(1);
+        let align = (g.alignment as u64).max(1);
+        tls.block_size = tls.block_size.div_ceil(align) * align;
+        tls.off.insert(name_str(&g.name), tls.block_size);
+        tls.block_size += size;
+    }
+    if tls.block_size > 0 {
+        // 16-byte-align the block base (covers the widest scalar/aggregate alignment std emits), then
+        // reserve `block_size` zero-init bytes for the root vCPU's block within the writable region.
+        off = off.div_ceil(16) * 16;
+        tls.root_base = Some(off);
+        off += tls.block_size;
+    }
+
     let any_const = m.global_vars.iter().any(|g| g.is_constant);
     if any_const && off > base {
         off = off.div_ceil(stack_page) * stack_page; // page-isolate the read-only region
@@ -1660,7 +1734,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off, cstrs, gbytes, syms))
+    Ok((addr, segs, off, cstrs, gbytes, syms, tls))
 }
 
 /// The pointer-cell window addresses the synthesized glibc ctype locators return (`None` = the program
@@ -2394,6 +2468,7 @@ fn translate_func(
     types: &Types,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
+    tls_off: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -2493,6 +2568,7 @@ fn translate_func(
             frame_size,
             name2idx,
             globals,
+            tls_off,
             caps,
             cstrs,
             gbytes,
@@ -3490,7 +3566,7 @@ fn collect_global_ctors(m: &LModule, name2idx: &HashMap<String, u32>) -> Result<
 /// `main(void)`) and [`synth_start_argv`] (`main(int, char**)`): `(main_idx, main_results, entry_sp,
 /// n_handles, heap_base, ctors) -> Func`. A `type` alias so the dispatch can pick one by function
 /// pointer without tripping `clippy::type_complexity`.
-type StartBuilder = fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64) -> Func;
+type StartBuilder = fn(u32, &[ValType], u64, Option<u64>, &[u32], bool, u64, Option<u64>) -> Func;
 
 /// Synthesize the **powerbox entry** (`_start`, function 0) for a program that uses host
 /// capabilities — a **paramless** entry (IMPORTS.md phase 3): capabilities are manifest slots the
@@ -3508,6 +3584,10 @@ fn synth_start(
     // The plain `main(void)` entry bakes the already-page-aligned `entry_sp` directly, so it needs no
     // page granularity of its own; the param exists only to share [`StartBuilder`] with the argv entry.
     _stack_page: u64,
+    // The root vCPU's TLS block base (NIM.md §3d Tier-2), or `None` when the module has no
+    // thread-locals. When present, `_start` sets `vcpu.tls` to it before ctors/`main` so every
+    // thread-local access (`vcpu.tls.get() + off`) lands in the root's block.
+    root_tls_base: Option<u64>,
 ) -> Func {
     use svm_ir::StoreOp;
     let mut insts: Vec<Inst> = Vec::new();
@@ -3538,6 +3618,14 @@ fn synth_start(
     insts.push(Inst::ConstI64(entry_sp as i64));
     let sp = next;
     next += 1;
+    // Seed the root vCPU's TLS base (NIM.md §3d Tier-2) before any thread-local access — the ctors and
+    // `main` read thread-locals as `vcpu.tls.get() + off`, so the base must point at the root's block.
+    if let Some(tls_base) = root_tls_base {
+        insts.push(Inst::ConstI64(tls_base as i64));
+        let b = next;
+        next += 1;
+        insts.push(Inst::VcpuTlsSet { val: b });
+    }
     // Run the C++ global constructors (priority order) before `main` — each is `(i64 sp) -> ()`, so
     // it appends no value (sequential calls, each takes its own frame above `sp`). Static init then
     // happens exactly as native, before the program proper.
@@ -3588,6 +3676,9 @@ fn synth_start_argv(
     // The host page granularity `main`'s frame is aligned to above the argv/env arrays (so the frame
     // never shares a read-only global's page under D40) — 16 KiB native, 64 KiB wasm.
     stack_page: u64,
+    // The root vCPU's TLS block base (NIM.md §3d Tier-2), set into `vcpu.tls` in block 0 before
+    // ctors/`main`; `None` when the module has no thread-locals. See [`synth_start`].
+    root_tls_base: Option<u64>,
 ) -> Func {
     use svm_ir::{LoadOp, StoreOp};
     let args_base = svm_ir::POWERBOX_ARGS_BASE as i64;
@@ -3635,6 +3726,13 @@ fn synth_start_argv(
             next += 1;
             insts.push(store64(addr, val));
         }
+    }
+    // Seed the root vCPU's TLS base (NIM.md §3d Tier-2) before ctors/`main` read any thread-local.
+    if let Some(tls_base) = root_tls_base {
+        insts.push(Inst::ConstI64(tls_base as i64));
+        let b = next;
+        next += 1;
+        insts.push(Inst::VcpuTlsSet { val: b });
     }
     insts.push(Inst::ConstI64(args_base));
     let v_aa = next;
@@ -14223,13 +14321,14 @@ fn lower_load_relative(
 
 /// `@llvm.threadlocal.address.p0(ptr @G)` → the guest address of the thread-local global `@G`.
 ///
-/// The **NIM.md §3d Tier-1** TLS lowering: on a single vCPU a thread-local has exactly one instance,
-/// so its plain-global window address *is* that instance. The on-ramp already parses a `thread_local`
-/// global as an ordinary global (the `thread_local` keyword is a skipped attribute word), so it lands
-/// in `self.globals` with a real window address, and `operand_i64` resolves `@G` to it — identical to
-/// how the C on-ramp strips `__thread` for a single-threaded guest. Exact whenever the guest runs on
-/// one vCPU; the Tier-2 per-thread `vcpu.tls`-block model (real `std::thread::spawn`, so each vCPU
-/// gets its own instance) is the follow-up that lands with thread spawn (#822/#823).
+/// The **NIM.md §3d Tier-2** TLS lowering: `@G` lives in the per-vCPU TLS block, so its address is
+/// `vcpu.tls.get() + tls_off[G]` — the fs/gs-base recipe. The `vcpu.tls` base register holds the
+/// current vCPU's block (the root's set once in `_start`; a spawned thread's set by the std trampoline,
+/// #823), so two vCPUs reading the same thread-local hit disjoint slots.
+///
+/// Fallback: if `@G` is *not* in `tls_off` (no thread-local of that name — e.g. hand-written IR that
+/// addresses an ordinary global through this intrinsic), resolve `@G` to its plain window address, the
+/// old Tier-1 collapse. That is exact for a single vCPU and keeps such IR translating.
 fn lower_threadlocal_address(
     ctx: &mut BlockCtx,
     c: &crate::ll::ast::Call,
@@ -14239,6 +14338,22 @@ fn lower_threadlocal_address(
     };
     if !name.starts_with("llvm.threadlocal.address") {
         return Ok(None);
+    }
+    // Resolve the referenced global's name to look it up in the TLS block layout.
+    let off = match vm_arg(c, 0)? {
+        Operand::ConstantOperand(cr) => match cr.as_ref() {
+            Constant::GlobalReference { name, .. } => ctx.tls_off.get(&name_str(name)).copied(),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(off) = off {
+        let base = ctx.push(Inst::VcpuTlsGet);
+        if off == 0 {
+            return Ok(Some(base));
+        }
+        let k = ctx.push(Inst::ConstI64(off as i64));
+        return Ok(Some(ctx.add_i64(base, k)));
     }
     Ok(Some(ctx.operand_i64(vm_arg(c, 0)?)?))
 }
@@ -15180,6 +15295,10 @@ struct BlockCtx<'a> {
     name2idx: &'a HashMap<String, u32>,
     /// Global variable name → its window address (for resolving a `@global` reference).
     globals: &'a HashMap<String, u64>,
+    /// Thread-local global name → its byte offset within the per-vCPU `vcpu.tls` block (NIM.md §3d
+    /// Tier-2). A thread-local is *not* in `globals`; `llvm.threadlocal.address(@G)` lowers to
+    /// `vcpu.tls.get() + tls_off[G]`. Empty when the module has no thread-locals.
+    tls_off: &'a HashMap<String, u64>,
     /// Import name (`write`/`read`/`exit`) → its §7 import index (for lowering a libc call to
     /// `CallImport`); several libc names can share one import (e.g. `puts`/`fwrite` → `write`).
     caps: &'a HashMap<String, u32>,
@@ -16019,6 +16138,7 @@ fn translate_block(
     frame_size: u64,
     name2idx: &HashMap<String, u32>,
     globals: &HashMap<String, u64>,
+    tls_off: &HashMap<String, u64>,
     caps: &HashMap<String, u32>,
     cstrs: &HashMap<String, u64>,
     gbytes: &HashMap<String, Vec<u8>>,
@@ -16064,6 +16184,7 @@ fn translate_block(
         frame_size,
         name2idx,
         globals,
+        tls_off,
         caps,
         cstrs,
         gbytes,
