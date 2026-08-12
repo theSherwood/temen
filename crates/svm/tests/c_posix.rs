@@ -373,6 +373,215 @@ int main() {{\n\
     assert_eq!(jit.file_f, interp.file_f, "jit: memfs must match interp");
 }
 
+/// #799 slice 1 — **coexistence: one guest, both worlds, one Host.** A single compiled program links the
+/// svm-posix **personality** (memfs/stdio via `__px_*` named imports — World A) AND drives the
+/// **capability** path (`__vm_pipe`/`__vm_read`/`__vm_write`, the `cap.self`/Stream builtins — World B) in
+/// one run. The worlds use **disjoint** host state (a HOST_PROC handle + import bindings vs. the Stream
+/// powerbox slots) and **disjoint** guest dispatch (named imports vs. `cap.call` builtins), so they
+/// compose on one `Host` with no conflict — `svm_posix::grant` claims nothing the capability grants touch,
+/// and the `__vm_*` builtins generate no import entries, so the manifest is pure `__px_*`. This is the
+/// bridge #799 is built on: a personality-linked program (eventually bash) that also holds capability
+/// handles. Interp-only — the capability pipe path needs the `Real` scheduler (`CAP_SELF_PIPE`).
+const DUAL_WORLD_SRC: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int main(void) {
+  char *msg = "hi\n";
+  long n = slen(msg);
+  /* World A — the personality: create a memfs file, write it, rewind, read it back. */
+  long fd = open("f", 66);            /* O_CREAT|O_RDWR -> __px_open; the first file fd is 3 */
+  write(fd, (void *)msg, n);          /* __px_write -> memfs "f" */
+  lseek(fd, 0, 0);
+  char a[8];
+  long ra = read(fd, a, 8);           /* __px_read -> "hi\n", ra = 3 */
+  /* World B — the capability path: mint a pipe (two Stream ends), write then read the same bytes.
+     One fiber, so the write lands before the read drains it — no park needed for the coexistence proof. */
+  int fds[2];
+  __vm_pipe(fds);                     /* CAP_SELF_PIPE mints two Stream handles into the powerbox */
+  __vm_write(fds[1], a, ra);          /* STREAM cap.call write */
+  char b[8];
+  long rb = __vm_read(fds[0], b, ra); /* STREAM cap.call read -> ra bytes */
+  return (int)(fd + rb);              /* 3 + 3 = 6 : both worlds ran on one Host */
+}
+"#;
+
+#[test]
+fn c_a_guest_links_the_personality_and_the_capability_pipe_on_one_host() {
+    let src = format!("{SHIM}\n{DUAL_WORLD_SRC}");
+    let e = run_interp_only(&src, |_| {});
+    // Both worlds ran on one Host: World A's memfs holds "hi\n" (the personality write), and main returns
+    // 6 = the personality file fd (3) + the bytes the capability pipe round-tripped (3).
+    assert_eq!(
+        e.result,
+        vec![Value::I32(6)],
+        "one guest reached both the personality (fd 3) and the capability pipe (3 bytes) on one Host"
+    );
+    assert_eq!(
+        e.file_f.as_deref(),
+        Some(&b"hi\n"[..]),
+        "World A (the personality) wrote the memfs file"
+    );
+}
+
+/// #799 slice 2 — **a personality-linked guest genuinely *blocks* on a capability pipe read.** Slice 1
+/// proved coexistence; this proves the parking bridge: `main` (personality-linked) mints a pipe and does a
+/// blocking `__vm_read` on the empty read end while a live writer is open — so it **parks**
+/// (`Blocked::PipeRead`) — and a spawned capability `writer` thread wakes it. This is the shape every
+/// blocking syscall (and, next, `EINTR`) rides: a personality-linked program that can actually suspend on
+/// a capability-world park. It also does one personality op (`open`/`write` a memfs file) to confirm both
+/// worlds still compose. Interp-only (`Real` scheduler: `CAP_SELF_PIPE`, `thread.spawn`, the park/wake).
+const DUAL_WORLD_PARK_SRC: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char msg[] = "GO\n";
+long g_wfd;
+long writer(long arg) {
+  /* burn a little first so `main` reaches its read and parks before we write */
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;
+  __vm_write(g_wfd, msg, 3);   /* wakes main's parked read */
+  return 0;
+}
+int main(void) {
+  /* World A — one personality op, so both worlds still compose. */
+  long fd = open("f", 66);
+  write(fd, msg, 3);           /* __px_write -> memfs "f" = "GO\n" */
+  /* World B — block on a capability pipe read, woken by the writer thread. */
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(writer, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* empty FIFO, writer open -> PARKS; woken -> drains 3 */
+  __vm_thread_join(h);
+  return (int)(fd + n);              /* 3 + 3 = 6 */
+}
+"#;
+
+#[test]
+fn c_a_personality_guest_blocks_on_a_capability_pipe_read() {
+    let src = format!("{SHIM}\n{DUAL_WORLD_PARK_SRC}");
+    let e = run_interp_only(&src, |_| {});
+    // main's blocking `__vm_read` parked and was woken by the writer thread (drained 3 bytes); the
+    // personality op ran too (fd 3, memfs "f" = "GO\n"). 3 + 3 = 6.
+    assert_eq!(
+        e.result,
+        vec![Value::I32(6)],
+        "the personality-linked guest parked on the capability pipe read and was woken"
+    );
+    assert_eq!(
+        e.file_f.as_deref(),
+        Some(&b"GO\n"[..]),
+        "World A (the personality) still ran alongside the capability park"
+    );
+}
+
+/// #799 slice 3 — **faithful EINTR: a *delivered* signal interrupts a blocked capability syscall.** The
+/// payoff of the bridge with the signal split (PROCESS.md §9 / #799): the guest catches SIGINT via the
+/// **personality** (`__px_signal` + `__px_sigaltstack` — policy), then blocks on a **capability**
+/// `__vm_read` (parks on `Blocked::PipeRead`). A sibling thread raises SIGINT via the personality's
+/// `__px_kill`; the *personality* decides it is deliverable (caught + unmasked), and only then does the
+/// **core** interrupt the parked read (`interrupt_interruptible_parks`, driven from the L2 safepoint) so it
+/// returns `-EINTR` (sentinel 42). Nothing signal-specific lives in svm — the interrupt fires exactly when
+/// the personality hands over a delivery. The raiser *retries* (deterministic under the M:N executor): a
+/// `kill` before `main` parks is a no-op interrupt; `main` sets `done` once its read takes EINTR.
+const EINTR_CAUGHT_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static volatile long fired;
+static void handler(int sig) { fired = sig; }
+long done;
+long raiser(long arg) {
+  while (__vm_atomic_load(&done) == 0)
+    __px_kill(0, 0, 2);   /* raise SIGINT via the personality (policy: caught -> deliverable) */
+  return 0;
+}
+int main(void) {
+  __px_signal(0, 2, (long)handler);          /* catch SIGINT */
+  __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  int fds[2];
+  __vm_pipe(fds);                            /* main holds both ends -> a live writer keeps the read blocked */
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);          /* PARKS; a delivered SIGINT interrupts it -> -EINTR */
+  __vm_atomic_add(&done, 1);
+  __vm_thread_join(h);
+  if (n == -4) return 42;                    /* -EINTR: the caught signal interrupted the blocked read */
+  return (int)n;
+}
+"#;
+
+#[test]
+fn c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr() {
+    let e = run_interp_only(EINTR_CAUGHT_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "a caught, delivered SIGINT interrupted the personality-linked guest's blocked capability read"
+    );
+}
+
+/// #799 slice 3 — **disposition-gated: an *ignored* signal does NOT interrupt a blocked syscall.** The
+/// mirror of the caught case, proving the gate is the personality's policy, not svm's: `main` sets SIGINT
+/// to `SIG_IGN` (1) and blocks on `__vm_read`; the raiser raises SIGINT — undeliverable, so the
+/// personality's `take_deliverable` returns `None` and the core never interrupts — and *then writes* the
+/// pipe, so `main`'s read completes with **data** (3), never `-EINTR` (42).
+const EINTR_IGNORED_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static char msg[] = "GO\n";
+long g_wfd;
+long raiser(long arg) {
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* let main reach its read and park */
+  __px_kill(0, 0, 2);          /* SIGINT is SIG_IGN -> undeliverable -> the core never interrupts */
+  __vm_write(g_wfd, msg, 3);   /* so main's read completes with DATA, proving no spurious EINTR */
+  return 0;
+}
+int main(void) {
+  __px_signal(0, 2, 1);        /* SIG_IGN(1): ignore SIGINT */
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* PARKS; the ignored SIGINT must NOT interrupt -> woken by the write */
+  __vm_thread_join(h);
+  if (n == -4) return 42;            /* a wrong EINTR — must not happen */
+  return (int)n;                     /* 3: the read completed with data */
+}
+"#;
+
+#[test]
+fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
+    let e = run_interp_only(EINTR_IGNORED_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(3)],
+        "an ignored SIGINT must not interrupt the blocked read; it completed with data instead"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).

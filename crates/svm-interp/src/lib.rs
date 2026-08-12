@@ -4624,12 +4624,14 @@ impl Scheduler {
     }
 
     /// #796 L1 — interrupt every vCPU/fiber parked in an **interruptible** blocking pipe op
-    /// ([`Blocked::PipeRead`]/[`Blocked::PipeWrite`]) so its syscall returns `-EINTR` (POSIX). Called by
-    /// the [`CAP_SELF_RAISE`] self-op when a signal is raised. Unlike the pipe wake this is not keyed by a
-    /// pipe id — a signal interrupts *whatever* blocking read/write is outstanding: drain every waiter
-    /// from both park maps, set each waiting vCPU's host EINTR flag ([`Host::set_sig_interrupt`]), and
-    /// re-admit it. Its rewound op re-runs, finds the flag, and completes `-EINTR` rather than re-parking.
-    /// Returns the count interrupted (0 if nothing was blocked — the raise still armed the handler).
+    /// ([`Blocked::PipeRead`]/[`Blocked::PipeWrite`]) so its syscall returns `-EINTR` (POSIX). Called from
+    /// the L2 safepoint when the personality hands the interp a **deliverable** signal ([`SignalSource::
+    /// take_deliverable`] returned `Some` — i.e. caught + unmasked; an ignored/masked signal never gets
+    /// here, so the disposition gating is free and no signal policy lives in svm). Not keyed by a pipe id —
+    /// a signal interrupts *whatever* blocking read/write is outstanding: drain every waiter from both park
+    /// maps, set each waiting vCPU's host EINTR flag ([`Host::set_sig_interrupt`]), and re-admit it. Its
+    /// rewound op re-runs, finds the flag, and completes `-EINTR` rather than re-parking. Returns the count
+    /// interrupted (0 if nothing was blocked — the handler still delivers to the running fiber).
     fn interrupt_interruptible_parks(&self) -> u32 {
         let mut s = self.lock();
         let mut n = 0u32;
@@ -9600,6 +9602,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if armed.load(Ordering::Relaxed) {
                         // The source owns its own locking; the interp holds no personality lock here.
                         if let Some((fref, signum, sp)) = source.take_deliverable() {
+                            // #799 / #796 L1 — a genuinely **deliverable** signal (the personality's policy
+                            // decided so: caught + unmasked — an ignored/masked signal yields `None` here
+                            // and never reaches this point) also **interrupts any parked interruptible
+                            // syscall** in this run, so a blocked read/write/wait returns `-EINTR` (POSIX).
+                            // The disposition gating is free: the core never inspects signal policy, it
+                            // just acts when the source hands it a delivery. (Signal semantics stay in the
+                            // personality; svm only provides the wake mechanism — invariant 4.)
+                            sched.interrupt_interruptible_parks();
                             // The handler's IR shape is `void handler(int)` = `(i64 sp, i32 signum) -> ()`
                             // — chibicc threads the data-SP as v0. `dispatch_indirect` masks the funcref
                             // into the table and type-checks; a mis-typed handler is dropped (the signal
@@ -11304,38 +11314,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     if !sig.results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
-                    }
-                }
-                // #796 L1 — `raise(signum)` (self-namespace op 17): mark the signal pending in the
-                // installed source (a caught handler is delivered at the next safepoint — invariant 4,
-                // policy stays in the personality) and interrupt any interruptible blocking pipe park so
-                // its syscall returns `-EINTR` (POSIX). `Real` scheduler only (the park/wake machinery);
-                // authority-neutral over the domain's own signal state, so it always returns 0. This is
-                // the capability-side of the #799 seam: one guest can hold a personality's signals *and*
-                // the capability path's blocking pipes, and a raise interrupts a parked read/write.
-                Inst::CapCall {
-                    type_id: svm_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_RAISE,
-                    sig,
-                    args,
-                    ..
-                } => {
-                    let signum = match args.first() {
-                        Some(a) => get(&frames[top].vals, *a)?.i64() as i32,
-                        None => 0,
-                    };
-                    if matches!(sched, SchedRef::Real(_)) {
-                        // Arm the handler (best-effort: a source serving only embedder signals no-ops
-                        // `raise`). Take the source Arc, then drop the host lock before the interrupt
-                        // (which locks each parked vCPU's host — a distinct lock; keep scopes disjoint).
-                        let src = host.lock().unwrap_or_else(|e| e.into_inner()).signal_poll();
-                        if let Some((_, src)) = src {
-                            src.raise(signum);
-                        }
-                        sched.interrupt_interruptible_parks();
-                    }
-                    if !sig.results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(0));
                     }
                 }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
@@ -15926,15 +15904,6 @@ pub const CAP_SELF_SETPGID: u32 = 15;
 /// Pinned at 16.
 pub const CAP_SELF_PIPE: u32 = 16;
 
-/// #796 L1 — `raise(signum)`: the self-namespace op a capability-world guest calls to raise a POSIX
-/// signal on its own process. It routes to the installed [`SignalSource::raise`] (marking the signal
-/// pending so a caught handler is delivered at the next safepoint, invariant 4 — policy stays in the
-/// personality) and, on the `Real` scheduler, interrupts every interruptible blocking pipe park so its
-/// syscall returns `-EINTR` (POSIX). Authority-neutral over the domain's own state; `0` always. This
-/// is the capability-side bridge that lets one guest hold both a personality's signals and the
-/// capability path's blocking pipes (the #799 seam). Pinned at 17.
-pub const CAP_SELF_RAISE: u32 = 17;
-
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
 /// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
@@ -16182,14 +16151,6 @@ pub trait SignalSource: Send + Sync {
     /// state and honor the mask, and leave [`Host::sig_armed`] set iff a further signal is already
     /// deliverable.
     fn take_deliverable(&self) -> Option<(i32, i32, u64)>;
-
-    /// #796 L1 — mark `signum` pending (and arm, if it becomes deliverable), the guest-driven
-    /// `raise(3)` half of the signal seam: the [`CAP_SELF_RAISE`] self-op routes here so a
-    /// capability-world guest can raise a signal into whatever personality owns the policy. Default
-    /// no-op — a source serving only embedder-driven signals (a terminal `^C`) need not implement it;
-    /// the interrupt of a parked blocking syscall (the EINTR half) is driven separately by the
-    /// scheduler, so even a no-op `raise` still interrupts.
-    fn raise(&self, _signum: i32) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
@@ -16227,11 +16188,12 @@ pub struct Host {
     /// reader-count-to-zero close landed), so the eval loop should wake any writer parked on this pipe
     /// (it re-issues → progress, or `-EPIPE` if readers hit 0). Taken by [`Self::take_pipe_wake_writers`].
     pipe_wake_writers: Option<u32>,
-    /// #796 L1 — transient: a signal was raised (`CAP_SELF_RAISE`) while this domain has a blocking pipe
+    /// #796 L1 — transient: a deliverable signal interrupted this domain while it has a blocking pipe
     /// read/write parked, so the next re-run of that interruptible op must complete with `-EINTR` (POSIX)
     /// instead of re-parking. The scheduler sets it on the parked vCPU's host as it re-admits the waiter
-    /// ([`Scheduler::interrupt_interruptible_parks`]); the eval-loop park site takes it
-    /// ([`Self::take_sig_interrupt`]) and, when set, returns `-EINTR` rather than rewinding+parking.
+    /// ([`Scheduler::interrupt_interruptible_parks`], driven from the L2 safepoint when the personality
+    /// hands over a delivery); the eval-loop park site takes it ([`Self::take_sig_interrupt`]) and, when
+    /// set, returns `-EINTR` rather than rewinding+parking.
     sig_interrupt: bool,
     /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
     /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
