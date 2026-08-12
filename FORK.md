@@ -459,10 +459,26 @@ it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
 command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
 
 *Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command reuses
-the caller's window (its declared memory must equal the carve) and BSS is not zeroed (a well-formed
+the caller's window (its declared memory must **fit** it — see below) and BSS is not zeroed (a well-formed
 command inits its own state from its data segments); non-durable domains only (durable freeze/thaw
 image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
 fibers).
+
+**A command whose declared window ≥ the default is `exec`-able (#773).** The exec (and the §14 spawn)
+originally required the command's declared memory to **equal** the caller-supplied carve; both the shell
+shim and the test managers hardcode that hint at `17` (128 KiB), so any command whose static/BSS pushed
+its window directive past 128 KiB (a `cat` block buffer, a shell line buffer) was refused — and a manager
+that then `join`ed the failed spawn **wedged** (a negative errno `& mask`ed onto a live slot). The fix: a
+child runs in a window **at least** its declared memory (a larger window is a safe superset — confinement,
+invariant 2, still masks every access to the *actual* window; only an out-of-declared-window access, a
+guest bug, wraps at the larger bound). Concretely, `exec_module` now bounds the command against the
+caller's **actual inherited window** (`GuestMem::window_size`), not the guest's `size_log2` hint (now
+advisory), and op-13 admits a module into any carve `≥` its declared memory. Defense-in-depth: a negative
+"handle" to `join`/`poll`/`detach` now faults (invariant 5) instead of masking onto a live child, so a
+genuinely-too-small spawn surfaces observably rather than hanging. Proven by
+`c_fork.rs::a_shell_execs_a_command_with_a_large_bss_buffer`: a shell spawned into a 256 KiB window forks
+a child that execs a `memory 18` command; the command touches the far end of its 60 KB buffer (only
+reachable in the enlarged window) and writes from it, and the shell reaps its exit.
 
 **Compiled-C `fork → execve → wait` with a *separate* command module. DONE (increment 2).**
 `c_fork.rs::a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command` — an ordinary compiled-C
