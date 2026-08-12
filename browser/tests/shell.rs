@@ -11,8 +11,8 @@
 //! in the personality's captured stdout. Run on the **bytecode** engine — the single-threaded,
 //! wasm-safe interpreter tier (the tree-walk/JIT engines the *native* differential runs use OS threads
 //! + a wall clock, absent under wasm). The whole surface (builtins, redirects, memfs + **ring**
-//! pipelines, external commands, if, vars, globbing) is byte-checked against the tree-walk oracle by
-//! `c_shell`'s three-way interp==JIT==bytecode differential.
+//!   pipelines, external commands, if, vars, globbing) is byte-checked against the tree-walk oracle by
+//!   `c_shell`'s three-way interp==JIT==bytecode differential.
 
 use svm_browser::{posix_shell_exec, posix_shell_exec_with, STATUS_OK};
 

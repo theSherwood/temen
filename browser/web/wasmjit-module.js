@@ -150,6 +150,81 @@ async function driveJitRun(ex, memory, cacheKey) {
   return status;
 }
 
+// Drive an already-opened **leaf tier-up** run (#809) — the InterpDriven complement to `driveJitRun`:
+// the interpreter owns `_start` (it `vm_map`s / does host I/O, so the whole-program emit declined), and
+// each tier-up-eligible pure leaf surfaces as a TIERUP event serviced here on the emitted module. The
+// per-event contract (worker.js's PAR_TIERUP, single-shot edition): re-arm the emitted `"fuel"` global,
+// write the event's committed-extent snapshot to `"mapped"` (#717 host sync), call
+// `f{func}(win, env, ...i64 args)` over the cdylib's shared memory (the run window lives inside it — no
+// copies), and deliver the i64 result slots (or a trap) back to the parked vCPU. On DONE the cdylib has
+// staged stdout/stderr/exit/value into the usual shared slots. A trapped run throws so the caller falls
+// back to the interpreter oracle (INVARIANT 9 — diverge toward refusal).
+async function driveTierupRun(ex, memory, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const i64 = () => new BigInt64Array(memory.buffer);
+  const win = Number(ex.svm_onramp_tierup_win_ptr());
+
+  // Compile + instantiate the emitted leaves once per Run, reused across every TIERUP. The compiled
+  // Module is cached across Runs under a key distinct from the whole-program `_start` emit (a different
+  // artifact: same guest, leaf-only exports). No instance cache: the eligible-leaf set is per-open, and
+  // a Run holds its instance for all its events anyway. An emitted leaf never crosses tiers (eligibility
+  // excludes cap-calls and calls into unemitted code), so `call_interp` throwing is fail-closed.
+  const tierupKey = cacheKey === undefined ? undefined : `${cacheKey}#tierup`;
+  let module = cacheGet(tierupKey);
+  if (module === undefined) {
+    const wptr = Number(ex.svm_onramp_tierup_wasm_ptr());
+    const wlen = ex.svm_onramp_tierup_wasm_len();
+    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
+    cachePut(tierupKey, module);
+    jitCacheStats.compiles++;
+  } else {
+    jitCacheStats.hits++;
+  }
+  const instance = await WebAssembly.instantiate(module, {
+    env: {
+      memory,
+      trap: () => {},
+      call_interp: () => { throw new Error('unexpected cross-tier call from an emitted leaf'); },
+    },
+  });
+  const emitted = instance.exports;
+  const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
+
+  try {
+    for (;;) {
+      const ev = ex.svm_onramp_tierup_run();
+      if (ev !== 1 /* TIERUP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
+      const func = ex.svm_onramp_tierup_func();
+      const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
+      const n = ex.svm_onramp_tierup_argv_len();
+      const args = [];
+      for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
+      // #717 host sync: the event's committed extent → the emitted `"mapped"` global, so the bounds
+      // check admits exactly what the interpreter's page map does for this call.
+      emitted.mapped.value = ex.svm_onramp_tierup_mapped();
+      emitted.fuel.value = 1n << 61n; // re-arm the fuel global across events on the reused instance
+      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+      try {
+        const ret = emitted['f' + func](win, envCell, ...args);
+        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+        const rlen = Math.max(1, rets.length) * 8;
+        const rptr = Number(ex.svm_alloc(rlen));
+        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+        ex.svm_onramp_tierup_deliver(rptr, rets.length);
+        ex.svm_dealloc(rptr, rlen);
+      } catch {
+        ex.svm_onramp_tierup_deliver_trap();
+      }
+    }
+  } finally {
+    ex.svm_dealloc(envCell, ex.svm_wasmjit_env_bytes());
+    ex.svm_onramp_tierup_close();
+  }
+  const status = ex.svm_status();
+  if (status === 3 /* STATUS_TRAP */) throw new Error('tier-up run trapped (declined to the interpreter)');
+  return status;
+}
+
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
 export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
@@ -165,8 +240,18 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // shared=1: this demo instantiates the emitted module against the cdylib's **shared** memory
   // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
   const opened = ex.svm_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
+  // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams, …): try the
+  // leaf tier-up run (#809) before giving the buffers up — the interpreter drives `_start` and its
+  // eligible pure leaves run on emitted wasm. Refused too (nothing eligible / concurrency / §22 JIT)
+  // → fall through to the throw and the caller's plain-interpreter fallback.
+  let tierup = false;
+  if (opened !== 0 && ex.svm_onramp_tierup_open &&
+      ex.svm_onramp_tierup_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
+    tierup = true;
+  }
   ex.svm_dealloc(modP, moduleBytes.length);
   if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
+  if (tierup) return driveTierupRun(ex, memory, cacheKey);
   if (opened !== 0) {
     throw new Error(`JIT module open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
   }

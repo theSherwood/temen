@@ -182,12 +182,14 @@ fn jit(m: &svm_ir::Module, stdin: &[u8]) -> (Out, u128) {
     let run = store.data().as_ref().unwrap();
     // A trap that is the guest's `exit` (unwinding f0 via call_interp) is expected; a trap without an
     // `exit` recorded is a real fault.
-    if call.is_err() && !run.exited() {
-        panic!(
-            "emitted f0 trapped (not an exit): {} ({})",
-            call.unwrap_err(),
-            run.last_trap()
-        );
+    if let Err(e) = &call {
+        if !run.exited() {
+            panic!(
+                "emitted f0 trapped (not an exit): {} ({})",
+                e,
+                run.last_trap()
+            );
+        }
     }
     let value = match results.first() {
         Some(Val::I32(x)) => *x,

@@ -979,6 +979,22 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    lever than locals. If module-guest throughput is ever worth pursuing, that (redundant-check elimination
    with a proof the confinement invariant holds) or **function splitting** are the real targets;
    stackification is not.
+9. **[landed — capability] Single-shot leaf tier-up (#809): the InterpDriven complement to slice 8.**
+   Slice 8 requires a `WasmDriven` `_start`; a guest that `vm_map`-grows its heap or does host I/O in
+   `_start` (the chibicc/QuickJS/JACL shapes) is `InterpDriven` and used to fall all the way back to
+   pure bytecode — discarding the tier-up-eligible pure leaves the #717 gate split kept emittable. Now
+   `svm_onramp_tierup_open` compiles the module with `compile_module_tierup` (window bumped to
+   `JIT_RUN_WIN_LOG2`, reservation clamped to the owned buffer — #816's probeable-overgrow posture),
+   runs `_start` on the interpreter, and surfaces each eligible all-i64 leaf call as a TIERUP event;
+   `svm_onramp_tierup_run` pumps events and stages the usual capture slots at DONE. JS:
+   `driveTierupRun` in `web/wasmjit-module.js` services each event on the emitted module over the
+   shared memory (re-arm `"fuel"`, write the event's committed-extent snapshot to `"mapped"` — the
+   #717 sync — then `f{func}(win, env, ...args)` and deliver), and `runJitModule` tries this opener
+   automatically when the whole-program open declines. Fail-closed at open for concurrency and §22
+   `vm_jit_*` guests (events the single-vCPU pump can't service) and when nothing is eligible; a trap
+   mid-run throws so the page re-runs on the interpreter oracle (INVARIANT 9). Proven observably
+   identical to `onramp_exec` (status/value/stdout, with a tier-up non-vacuity counter) by the native
+   `tests/tierup_driver.rs` with wasmi playing the JS host.
 
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 

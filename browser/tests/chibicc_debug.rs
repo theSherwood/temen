@@ -27,7 +27,7 @@ fn chibicc_svmb() -> Option<Vec<u8>> {
 fn compile_g(chibicc: &svm_ir::Module, src: &str) -> String {
     let mut files = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
-    let image = svm_fs::encode_image(&files, &vec!["include".to_string()]);
+    let image = svm_fs::encode_image(&files, &["include".to_string()]);
     let out = onramp_fs_exec(
         chibicc,
         &image,
@@ -55,7 +55,7 @@ fn response(msgs: &[Json]) -> &Json {
         .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
         .expect("a response")
 }
-fn event<'a>(msgs: &'a [Json], name: &str) -> bool {
+fn event(msgs: &[Json], name: &str) -> bool {
     msgs.iter().any(|m| {
         m.get("type").and_then(|t| t.as_str()) == Some("event")
             && m.get("event").and_then(|e| e.as_str()) == Some(name)

@@ -173,12 +173,14 @@ fn jit_compile(chibicc: &svm_ir::Module, src: &str) -> String {
     let run = store.data().as_ref().unwrap();
     // chibicc's `_start` calls `exit(0)` — that unwinds `f0` through `call_interp` and is expected; a
     // trap without an `exit` recorded is a real fault.
-    if call.is_err() && !run.exited() {
-        panic!(
-            "emitted f0 trapped (not an exit): {} ({})",
-            call.unwrap_err(),
-            run.last_trap()
-        );
+    if let Err(e) = &call {
+        if !run.exited() {
+            panic!(
+                "emitted f0 trapped (not an exit): {} ({})",
+                e,
+                run.last_trap()
+            );
+        }
     }
     String::from_utf8(run.stdout().to_vec()).expect("emitted IR is utf8")
 }
