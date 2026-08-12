@@ -1355,6 +1355,26 @@ fn name_str(n: &Name) -> String {
 /// address, a function's funcref index, or arithmetic over those (`sub`/`add`/`ptrtoint`/`trunc`…).
 /// This is what lets a global hold `&other_global`, a function pointer, or clang's relative-offset
 /// table (`@.str − @table`). GEP-constexprs (`&arr[k]`) are a later addition.
+///
+/// Keep the low `bits` of `v` (zeroing the rest); `None` or `≥ 64` leaves `v` unchanged. Used by the
+/// `trunc`/`zext` constexpr folds.
+fn mask_low(v: i64, bits: Option<u32>) -> i64 {
+    match bits {
+        Some(b) if b < 64 => (v as u64 & ((1u64 << b) - 1)) as i64,
+        _ => v,
+    }
+}
+/// Sign-extend the low `bits` of `v` to `i64`; `None` or `≥ 64` (or `0`) leaves `v` unchanged. Used by
+/// the `sext` constexpr fold.
+fn sign_extend(v: i64, bits: Option<u32>) -> i64 {
+    match bits {
+        Some(b) if (1..64).contains(&b) => {
+            let sh = 64 - b;
+            (v << sh) >> sh
+        }
+        _ => v,
+    }
+}
 fn const_eval(
     c: &Constant,
     globals: &HashMap<String, u64>,
@@ -1381,14 +1401,38 @@ fn const_eval(
                 unsup(format!("constexpr reference to `@{n}`"))
             }
         }
-        // Pointer/width casts pass the value through; the byte width is the *consumer*'s job.
+        // Pointer / same-width casts pass the value through; the byte width is the *consumer*'s job.
         K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
         K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
         K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
-        K::Trunc(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
+        // Width casts fold to the widened/narrowed **value** (the consumer emits it at the result
+        // width): `trunc` keeps the low `to` bits; `zext`/`sext` extend from the *source* width — so a
+        // `zext (i32 ptrtoint(@g) to i64)` zeroes the high bits rather than passing the raw address.
+        K::Trunc(x) => {
+            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
+            Ok(mask_low(v, int_bits(x.to_type.as_ref())))
+        }
+        K::ZExt(x) => {
+            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
+            Ok(mask_low(v, int_bits(x.operand.get_type(types).as_ref())))
+        }
+        K::SExt(x) => {
+            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
+            Ok(sign_extend(v, int_bits(x.operand.get_type(types).as_ref())))
+        }
         K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
         K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
         K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        // Bitwise + left-shift constexprs (e.g. alignment masks `and(ptrtoint(@g), -16)`). All fold
+        // correctly in i64 and mask to the result width at the consumer, since `and`/`or`/`xor`/`shl`
+        // commute with keeping the low N bits (unlike a right shift, which is width-sensitive — those
+        // are deferred). The shift amount is masked to the operand width by `wrapping_shl`.
+        K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a & b),
+        K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a | b),
+        K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a ^ b),
+        K::Shl(x) => {
+            bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_shl(b as u32))
+        }
         // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
         // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
         K::GetElementPtr(g) => {
@@ -16135,12 +16179,23 @@ impl<'a> BlockCtx<'a> {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     Ok(self.push(Inst::ConstI64(v)))
                 }
-                // A constexpr integer/pointer arithmetic fold (`ptrtoint(@g) + k` — an interior global
-                // pointer the threaded codegen materializes as an `add` rather than a `getelementptr`,
-                // and `@a − @b` pointer differences). `const_eval` resolves the global relocations and
-                // literals; honor the result width like `ptrtoint` so a sub-i64 pointer difference
-                // stays `i32` (feeding i64 into i32 arithmetic would be a verify `TypeMismatch`).
-                Constant::Add(_) | Constant::Sub(_) | Constant::Mul(_) => {
+                // A constexpr integer/pointer arithmetic or width-cast fold used as an operand:
+                // `ptrtoint(@g) + k` (an interior global pointer the threaded codegen materializes as
+                // an `add` rather than a `getelementptr`), `@a − @b` pointer differences, and the
+                // integer casts `trunc`/`zext`/`sext` over those. `const_eval` resolves the global
+                // relocations, literals, and cast widths; emit at the result width like `ptrtoint` so a
+                // sub-i64 value stays `i32` (feeding i64 into i32 arithmetic would be a verify
+                // `TypeMismatch`).
+                Constant::Add(_)
+                | Constant::Sub(_)
+                | Constant::Mul(_)
+                | Constant::And(_)
+                | Constant::Or(_)
+                | Constant::Xor(_)
+                | Constant::Shl(_)
+                | Constant::Trunc(_)
+                | Constant::ZExt(_)
+                | Constant::SExt(_) => {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     match int_bits(c.get_type(self.types).as_ref()) {
                         Some(to) if to <= 32 => {

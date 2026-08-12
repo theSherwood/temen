@@ -803,6 +803,10 @@ impl Parser {
                         | "add"
                         | "sub"
                         | "mul"
+                        | "and"
+                        | "or"
+                        | "xor"
+                        | "shl"
                 ) || (w == "c" && matches!(self.peek2(), Some(Token::Str(_))))
             }
             _ => false,
@@ -1627,13 +1631,22 @@ impl Parser {
                     _ => Constant::AddrSpaceCast(u),
                 }
             }
-            Some(Token::Word(w)) if matches!(w.as_str(), "add" | "sub" | "mul") => {
+            Some(Token::Word(w))
+                if matches!(
+                    w.as_str(),
+                    "add" | "sub" | "mul" | "and" | "or" | "xor" | "shl"
+                ) =>
+            {
                 let op = w.clone();
                 let b = self.const_binop()?;
                 match op.as_str() {
                     "add" => Constant::Add(b),
                     "sub" => Constant::Sub(b),
-                    _ => Constant::Mul(b),
+                    "mul" => Constant::Mul(b),
+                    "and" => Constant::And(b),
+                    "or" => Constant::Or(b),
+                    "xor" => Constant::Xor(b),
+                    _ => Constant::Shl(b),
                 }
             }
             // A constant-expression integer compare `icmp <pred> ( <ty> <c0>, <ty> <c1> )` → i1. The
