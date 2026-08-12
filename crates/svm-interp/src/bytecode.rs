@@ -2250,7 +2250,7 @@ impl SharedProgram {
     /// `Some(entries)` to seed the next call with (empty for a plain flat window), or `None` if
     /// the guest aliased a §13 `SharedRegion` page — a byte restore cannot reproduce an alias, so
     /// a warm driver must fail closed on it. `Some(vec![])` for a memory-less module.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn run_over_grown(
         &self,
         func: FuncIdx,
