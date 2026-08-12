@@ -314,6 +314,15 @@ pub(crate) struct Translator {
     /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
     /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
     own_stem: String,
+    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_funcrefs`],
+    /// [`export_tls_vars`]), which run [`collect_globals`](Self::collect_globals) on a *fresh,
+    /// import-less* translator purely to enumerate funcref/thread-var globals. Such a translator
+    /// has no pooled sibling types, so an aggregate global whose constructor type is defined in
+    /// another module (every `var s = "…"` — `string` lives in `system`) can't be materialized. In
+    /// lenient mode that reserves a zeroed placeholder instead of failing closed, so the pre-scan
+    /// completes; the **real** translation pass (this flag off, sibling types pooled) still
+    /// fail-closes on a genuinely unmaterializable aggregate global and materializes the rest.
+    scan_lenient: bool,
 }
 
 impl Translator {
@@ -339,6 +348,7 @@ impl Translator {
             tls_block_size: 0,
             ext_tls_layout: HashMap::default(),
             own_stem: String::new(),
+            scan_lenient: false,
         }
     }
 
@@ -530,14 +540,23 @@ impl Translator {
                         if !init.is_empty_marker() && init.tag() != Some("nil") {
                             if let Some(0) = int_literal(init) {
                                 // zero — the window is already zero-filled.
-                            } else if let (Some(v), TyDesc::Scalar(t)) = (int_literal(init), &desc)
+                            } else if let (Some(v), Some(w)) =
+                                (const_scalar_int(init), int_store_width(&desc))
                             {
-                                let w = match t {
-                                    ValType::I32 | ValType::F32 => 4,
-                                    _ => 8,
-                                };
+                                // A scalar/narrow **integer** global. Fold the constant — seeing
+                                // through a `(conv T int)` wrapper (nimony lowers a typed/distinct
+                                // int literal that way) — and seed the window with its `w`
+                                // little-endian bytes. Narrow (`u8`/`i8`/`u16`/`i16`) globals store
+                                // in their byte width; a float global is excluded here
+                                // (`int_store_width` → `None`) and handled just below.
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if let TyDesc::Scalar(ValType::F32 | ValType::F64) = &desc {
+                                // A **float scalar global** (`var pi = 3.14`, `let x = foo[float]()`
+                                // → `(conv (f 64) 123)`). Fold the constant to its little-endian
+                                // float bytes and seed the window, exactly as the int-scalar case
+                                // above does. Fails closed if unfoldable / `float` off.
+                                self.data_inits.push((off, const_float_bytes(init, &desc)?));
                             } else if let (Some(sym), TyDesc::FnPtr(_)) = (init.as_atom(), &desc) {
                                 // A **funcref gvar** with a static proc initializer (`var oomHandler =
                                 // continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). The func
@@ -554,6 +573,39 @@ impl Translator {
                                 // reserve the slot zero-initialized. (Relocating a data-pointer global
                                 // initializer to its target is a later refinement, the `data.ptr`
                                 // twin of the funcref case above.)
+                            } else if let Some((bytes, adesc, relocs)) =
+                                self.const_aggregate_bytes(init)?
+                            {
+                                // An **aggregate `gvar` initializer** — an object/array/string constant
+                                // assigned to a *mutable* global (`var x = Obj(a: 1, b: 2)`, a `var`
+                                // string). Materialize its exact bytes into a data segment at the
+                                // global's offset, exactly as an aggregate `const` does; the global just
+                                // stays writable. A blob may exceed the fixed type size (a `string`/
+                                // `LongString` tail), so reserve the larger of the two. Any const-to-const
+                                // pointer inside (a string's `more = (addr strlit)`) becomes a `data.ptr`.
+                                let n = bytes.len() as u64;
+                                self.data_inits.push((off, bytes));
+                                for (rel_at, target) in relocs {
+                                    self.data_ptrs.push((off + rel_at, target));
+                                }
+                                self.globals.insert(name, (off, adesc));
+                                off += n.max(self.sizeof(&desc)).max(8);
+                                continue;
+                            } else if self.scan_lenient
+                                && matches!(init.tag(), Some("oconstr") | Some("aconstr"))
+                            {
+                                // A cross-module **aggregate constructor** global we can't fold in a
+                                // pre-scan (its type lives in a sibling module, not pooled here; in a
+                                // fresh translator the type name isn't even known to be an aggregate,
+                                // so `desc` is a scalar fallback — key off the init node). Only the
+                                // funcref/frame pre-passes (`export_funcrefs`, `export_tls_vars`) set
+                                // `scan_lenient`; they run `collect_globals` on a fresh, import-less
+                                // translator purely to enumerate funcref/tls globals, and erroring
+                                // here aborted the whole link for any program with a module-level
+                                // cross-module aggregate `var` (every `var s = "…"`). Fall through to
+                                // reserve a zeroed placeholder slot — the pre-scan's globals are
+                                // discarded anyway. The **real** translation pass (this flag off,
+                                // sibling types pooled) materializes the true bytes above.
                             } else {
                                 return Err(LengError::Unsupported(format!(
                                     "non-scalar-int global initializer for `{name}`"
@@ -834,6 +886,18 @@ impl Translator {
                     }
                     None => return Ok(None),
                 }
+            } else if matches!(fdesc, TyDesc::Scalar(ValType::F32 | ValType::F64)) {
+                // A **float field** value (`(kv x 1.0)`, `(kv y 2.0)` — nimony emits object consts
+                // with float members, e.g. a shared 2-D `Shape`). Fold to the field's-width float
+                // bits. `const_float_bytes` fails closed if the value isn't a foldable float or the
+                // `float` feature is off, in which case we fall to the placeholder path.
+                let Ok(fb) = const_float_bytes(&ka[1], fdesc) else {
+                    return Ok(None);
+                };
+                if bytes.len() < off + fb.len() {
+                    bytes.resize(off + fb.len(), 0);
+                }
+                bytes[off..off + fb.len()].copy_from_slice(&fb);
             } else {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
@@ -1074,6 +1138,41 @@ impl Translator {
         Ok(())
     }
 
+    /// Lay out one `(fld :name pragmas Type)` member: returns `(name, desc, advance)`, where
+    /// `advance` is the bytes the field occupies (0 for a flexible-array tail — `uarray`/`flexarray`,
+    /// an `UncheckedArray` like `LongString.data`, whose own address is the array base and which
+    /// stops the object's fixed size). Shared by the plain-object loop and the variant-object
+    /// `union`-branch layout, so both classify nested aggregate fields and flex tails identically.
+    fn layout_field(
+        &mut self,
+        fld: &Node,
+        raw: &HashMap<String, &Node>,
+    ) -> Result<(String, TyDesc, u64), LengError> {
+        let fa = fld.args();
+        if fa.len() < 3 {
+            return Err(LengError::Malformed("fld needs :name pragmas type".into()));
+        }
+        let fname = sym_def(&fa[0])?;
+        if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
+            let elem = fa[2]
+                .args()
+                .first()
+                .map(|e| self.tydesc(e))
+                .transpose()?
+                .unwrap_or(TyDesc::Narrow {
+                    bytes: 1,
+                    signed: false,
+                });
+            return Ok((fname, TyDesc::FlexArray(Box::new(elem)), 0));
+        }
+        let fdesc = self.tydesc(&fa[2])?;
+        if let TyDesc::Agg(n) = &fdesc {
+            self.resolve_type(n, raw)?;
+        }
+        let fsize = self.sizeof(&fdesc);
+        Ok((fname, fdesc, fsize))
+    }
+
     fn resolve_type(&mut self, name: &str, raw: &HashMap<String, &Node>) -> Result<(), LengError> {
         if self.types.contains_key(name) {
             return Ok(());
@@ -1116,38 +1215,43 @@ impl Translator {
                     }
                 }
                 for fld in body.args() {
-                    if fld.tag() != Some("fld") {
-                        continue; // skip the base/Empty slot
+                    match fld.tag() {
+                        Some("fld") => {
+                            let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                            fields.push((fname, off, fdesc));
+                            off += fsize;
+                        }
+                        Some("union") => {
+                            // A **variant/case object**: `(union (object (fld…))+)` — each `of`
+                            // branch is a sub-object whose fields **overlap** at the same base
+                            // (Nim's tagged union; the discriminant field precedes the union). Lay
+                            // every branch out starting at the current offset, and advance past the
+                            // largest branch. All branch fields join the one flat field list, so a
+                            // `foo.y` access or a `Foo(x: …, y: …)` constructor resolves any
+                            // branch's field — which variant is *live* is guarded by the
+                            // discriminant at run time (nimony emits those checks; overlapping
+                            // storage is the correct layout regardless).
+                            let union_base = off;
+                            let mut union_max = 0u64;
+                            for branch in fld.args() {
+                                if branch.tag() != Some("object") {
+                                    continue;
+                                }
+                                let mut boff = union_base;
+                                for bf in branch.args() {
+                                    if bf.tag() != Some("fld") {
+                                        continue;
+                                    }
+                                    let (fname, fdesc, fsize) = self.layout_field(bf, raw)?;
+                                    fields.push((fname, boff, fdesc));
+                                    boff += fsize;
+                                }
+                                union_max = union_max.max(boff - union_base);
+                            }
+                            off = union_base + union_max;
+                        }
+                        _ => {} // the base/Empty slot (an atom), or anything else
                     }
-                    let fa = fld.args();
-                    if fa.len() < 3 {
-                        return Err(LengError::Malformed("fld needs :name pragmas type".into()));
-                    }
-                    let fname = sym_def(&fa[0])?;
-                    // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
-                    // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
-                    // object's size stops here); its own address is the array base, indexed by
-                    // `at`/`pat`. Record it as a `FlexArray` at the current offset and stop advancing.
-                    if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
-                        let elem = fa[2]
-                            .args()
-                            .first()
-                            .map(|e| self.tydesc(e))
-                            .transpose()?
-                            .unwrap_or(TyDesc::Narrow {
-                                bytes: 1,
-                                signed: false,
-                            });
-                        fields.push((fname, off, TyDesc::FlexArray(Box::new(elem))));
-                        continue;
-                    }
-                    let fdesc = self.tydesc(&fa[2])?;
-                    if let TyDesc::Agg(n) = &fdesc {
-                        self.resolve_type(n, raw)?;
-                    }
-                    let fsize = self.sizeof(&fdesc);
-                    fields.push((fname, off, fdesc));
-                    off += fsize;
                 }
                 Layout::Object { fields, size: off }
             }
@@ -1224,6 +1328,7 @@ impl Translator {
     /// bounded gap; scalar thread-vars, the allocator/exception state, always resolve.)
     pub fn export_tls_vars(root: &Node, stem: &str) -> Result<Vec<(String, u64)>, LengError> {
         let mut t = Translator::new().with_tls();
+        t.scan_lenient = true; // enumerating thread-vars; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         let items: Vec<(String, TyDesc)> = t
@@ -1247,6 +1352,7 @@ impl Translator {
     /// [`export_types`]; [`link_selected`] pools these across its units before translating any.
     pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
         let mut t = Translator::new();
+        t.scan_lenient = true; // enumerating funcref globals; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         let mut out: Vec<(String, FnPtrSig)> = t
@@ -1286,6 +1392,7 @@ impl Translator {
         stem: &str,
     ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
         let mut t = Translator::new();
+        t.scan_lenient = true; // enumerating proc frames; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         // Resolve a callee name to its global form: a local proc's name ends in `.` (the empty
@@ -2343,13 +2450,13 @@ impl<'a> FuncGen<'a> {
     /// the pointer, pointee from the `Ptr` field type). Anything else fail-closes.
     fn pointer_operand(&mut self, operand: &Node) -> Result<(u32, TyDesc), LengError> {
         if let Some(pname) = operand.as_atom() {
-            let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-            })?;
-            let pv = self
-                .lookup(pname)
-                .ok_or_else(|| LengError::Unsupported(format!("unknown pointer `{pname}`")))?;
-            return Ok((pv.id, desc));
+            // A tracked **local** pointer — its SSA value + tracked pointee. If the name isn't a local
+            // pointer (a **global** `var x: ref T`, a pointer-valued field), don't fail here: fall
+            // through to the lvalue path below, which loads a global pointer's value (`lvalue_addr`
+            // yields the global's slot address and a `Ptr` desc) or a `(dot s more)` field pointer.
+            if let (Some(desc), Some(pv)) = (self.pointee.get(pname).cloned(), self.lookup(pname)) {
+                return Ok((pv.id, desc));
+            }
         }
         if operand.tag() == Some("cast") {
             let ca = operand.args();
@@ -2422,9 +2529,17 @@ impl<'a> FuncGen<'a> {
             TyDesc::FlexArray(_) => Err(LengError::Unsupported(
                 "reading a flexible array as a value (index it with `at`/`pat`)".into(),
             )),
-            TyDesc::Agg(n) => Err(LengError::Unsupported(format!(
-                "reading aggregate `{n}` as a value (whole-aggregate ops are a later slice)"
-            ))),
+            TyDesc::Agg(_) => {
+                // An aggregate read **as a value** *is* its address — aggregates are by-address in
+                // this model (a call arg, an sret source, an aggregate `asgn` rhs all pass the
+                // address). `addr` already points at the aggregate's bytes; any copy happens at the
+                // consuming site (`assign_aggregate`'s `mem.copy`). Real nimony reads object/string
+                // fields in value position (`discard obj.field`, passing a nested field along).
+                Ok(Val {
+                    id: addr,
+                    ty: ValType::I64,
+                })
+            }
         }
     }
 
@@ -2447,20 +2562,24 @@ impl<'a> FuncGen<'a> {
                 .push_str(&format!("  i32.store v{addr} v{v}\n"));
             return Ok(());
         }
+        if let TyDesc::Agg(_) = desc {
+            // Storing an aggregate **through an lvalue** — `s.field = other` / `= (oconstr …)`, or
+            // `p[i] = obj`, where the `dot`/`at`/`deref` target is itself an object/array. A
+            // whole-aggregate copy or in-place construct into the field/element address, exactly as an
+            // aggregate `asgn` to a bare local (`assign_aggregate`). Real nimony hits this assigning
+            // one object/string field into another (`x.left = node`, string fields).
+            return self.assign_aggregate(addr, &desc, rhs);
+        }
         let ty = match desc {
             TyDesc::Scalar(t) => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
             TyDesc::FnPtr(_) => unreachable!("handled above"),
+            TyDesc::Agg(_) => unreachable!("handled above"),
             TyDesc::FlexArray(_) => {
                 return Err(LengError::Unsupported(
                     "assigning to a flexible array (index it with `at`/`pat`)".into(),
                 ))
-            }
-            TyDesc::Agg(n) => {
-                return Err(LengError::Unsupported(format!(
-                    "assigning to aggregate lvalue `{n}`"
-                )))
             }
         };
         let v = self.expr_typed(rhs, ty)?;
@@ -3151,10 +3270,68 @@ impl<'a> FuncGen<'a> {
         }
         let span = (hi as i128) - (lo as i128) + 1;
         if !(1..=256).contains(&span) {
-            return Err(LengError::Unsupported(
-                "case span too large/sparse for a br_table (comparison-chain lowering is a later slice)"
-                    .into(),
-            ));
+            // Sparse or huge span (scattered enum/char ordinals, sum-type tags that aren't dense) →
+            // an **if-else comparison chain** instead of a `br_table`: each branch tests `disc == v`
+            // (OR over its values, `l <= disc <= h` for a range) and `br_if`s to its body, else the
+            // next test; the tail falls to the `else`/continuation. Real nimony emits these for
+            // string-dispatch case statements (`tsso`, `tsplit_and_append`) and non-dense tag
+            // matches. Mirrors the `br_table` arm's block/`terminated` bookkeeping.
+            let disc = self.expr(&a[0])?;
+            let cont = self.new_block_id();
+            let nbr = branches.len();
+            let bodies: Vec<u32> = (0..nbr).map(|_| self.new_block_id()).collect();
+            for bi in 0..nbr {
+                let then_id = bodies[bi];
+                let next_id = self.new_block_id(); // next branch's test, or the else/cont
+                                                   // Condition = OR of this branch's value-equalities and range-membership tests.
+                let mut acc: Option<u32> = None;
+                for &v in &branches[bi].vals {
+                    let c = self.emit_const(disc.ty, v);
+                    let eq = self.emit_rel("eq", disc.ty, disc.id, c.id);
+                    acc = Some(match acc {
+                        None => eq,
+                        Some(p) => self.emit_i32bin("or", p, eq),
+                    });
+                }
+                for &(l, h) in &branches[bi].ranges {
+                    let cl = self.emit_const(disc.ty, l);
+                    let ch = self.emit_const(disc.ty, h);
+                    let ge = self.emit_rel("le_s", disc.ty, cl.id, disc.id); // l <= disc
+                    let le = self.emit_rel("le_s", disc.ty, disc.id, ch.id); // disc <= h
+                    let both = self.emit_i32bin("and", ge, le);
+                    acc = Some(match acc {
+                        None => both,
+                        Some(p) => self.emit_i32bin("or", p, both),
+                    });
+                }
+                let cond =
+                    acc.ok_or_else(|| LengError::Malformed("case `of` with no values".into()))?;
+                let args = self.branch_args();
+                self.finish_block(
+                    format!("br_if v{cond} {then_id}{args} {next_id}{args}"),
+                    then_id,
+                );
+                self.stmt_list_or_single(branches[bi].body)?;
+                if !self.terminated {
+                    let a2 = self.branch_args();
+                    self.finish_block(format!("br {cont}{a2}"), next_id);
+                } else {
+                    self.cur_id = next_id;
+                    self.reset_cur_state();
+                }
+            }
+            // `cur` is the last `next_id`: the else arm (or a fallthrough to cont).
+            if let Some(eb) = else_body {
+                self.stmt_list_or_single(eb)?;
+            }
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), cont);
+            } else {
+                self.cur_id = cont;
+                self.reset_cur_state();
+            }
+            return Ok(());
         }
         let span = span as usize;
 
@@ -4046,6 +4223,23 @@ impl<'a> FuncGen<'a> {
         Val { id, ty }
     }
 
+    /// Emit a relational compare `v = <ty>.<op> l r` (result an `i32` bool). Used by the case
+    /// comparison-chain fallback; `op` ∈ {`eq`, `le_s`, …}.
+    fn emit_rel(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.{op} v{l} v{r}\n", prefix(ty)));
+        id
+    }
+
+    /// Emit an `i32` combine `v = i32.<op> l r` (`or`/`and`) of two bool conditions (each 0/1).
+    fn emit_i32bin(&mut self, op: &str, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = i32.{op} v{l} v{r}\n"));
+        id
+    }
+
     /// A relocatable address of this unit's own data at `off` (`data.self`). Resolved to a concrete
     /// window address by `link`; touching the window, so it forces the `memory` declaration.
     fn emit_data_self(&mut self, off: u64) -> u32 {
@@ -4308,6 +4502,67 @@ fn int_literal(node: &Node) -> Option<i64> {
     }
     node.as_atom()
         .and_then(|s| parse_int(s).ok().or_else(|| char_literal(s)))
+}
+
+/// The float value of a constant initializer node, if foldable. Handles a bare float literal
+/// (`1.5`, `3.0`), a suffixed literal (`(suf 2.25 "f32")`), and an int→float conversion
+/// (`(conv (f 64) 123)` — nimony's lowering of a `float`-typed `let x = 123`). Gated on `float`:
+/// with the feature off there is no float path at all (`emit_fconst` and its formatter are pruned),
+/// so a float global fails closed in [`const_float_bytes`].
+#[cfg(feature = "float")]
+fn const_float(node: &Node) -> Option<f64> {
+    match node.tag() {
+        // `(suf 2.25 "f32")` — the value is the first son.
+        Some("suf") => node.args().first().and_then(const_float),
+        // `(conv (f T) operand)` — fold the operand; an int operand becomes its float value.
+        Some("conv") => {
+            let operand = node.args().get(1)?;
+            const_float(operand).or_else(|| int_literal(operand).map(|n| n as f64))
+        }
+        // A bare float literal atom.
+        _ => node.as_atom().and_then(|s| s.parse::<f64>().ok()),
+    }
+}
+
+/// The constant integer value of a scalar/narrow-int global initializer, seeing through a
+/// `(conv T operand)` wrapper — nimony lowers a typed/distinct int literal that way (`let x = 4` at
+/// a `distinct int` becomes `(conv (i 64) 4)`). Suffixed literals (`(suf 3u "u8")`) are folded by
+/// [`int_literal`].
+fn const_scalar_int(node: &Node) -> Option<i64> {
+    match node.tag() {
+        Some("conv") => node.args().get(1).and_then(const_scalar_int),
+        _ => int_literal(node),
+    }
+}
+
+/// The little-endian store width of an **integer-shaped** scalar type — full-width `i32`/`i64` or a
+/// `Narrow` sub-word (`u8`/`i8`/`u16`/`i16`, e.g. `char`). `None` for floats, pointers, and
+/// aggregates, so a float/aggregate global falls through to its own materialization path.
+fn int_store_width(desc: &TyDesc) -> Option<usize> {
+    match desc {
+        TyDesc::Scalar(ValType::I32) => Some(4),
+        TyDesc::Scalar(ValType::I64) => Some(8),
+        TyDesc::Narrow { bytes, .. } => Some(*bytes as usize),
+        _ => None,
+    }
+}
+
+/// The little-endian bytes of a **float scalar global** initializer — F32 → 4-byte `f32` bits,
+/// F64 → 8-byte `f64` bits. Fails closed if the initializer isn't a foldable float constant, or if
+/// the `float` feature is off (a guest build has no float emission path — W5 §3e).
+fn const_float_bytes(init: &Node, desc: &TyDesc) -> Result<Vec<u8>, LengError> {
+    #[cfg(feature = "float")]
+    if let Some(f) = const_float(init) {
+        return Ok(match desc {
+            TyDesc::Scalar(ValType::F32) => (f as f32).to_bits().to_le_bytes().to_vec(),
+            _ => f.to_bits().to_le_bytes().to_vec(),
+        });
+    }
+    #[cfg(not(feature = "float"))]
+    let _ = (init, desc);
+    Err(LengError::Unsupported(
+        "unfoldable float global initializer (or float feature off)".into(),
+    ))
 }
 
 /// A NIF **character literal** — `'0'` (the byte 48), `'\0A'` (a `\HH` hex escape) — to its byte
