@@ -63,7 +63,9 @@ fn backing() -> Arc<Region> {
     Arc::new(unsafe { Region::shared(base, size as u64) })
 }
 
-fn grow_then(seed: bool) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>) {
+type ProbeOutcome = (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>);
+
+fn grow_then(seed: bool) -> ProbeOutcome {
     let prog = build();
     let back = backing();
     let mut host = Host::new();
