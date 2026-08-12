@@ -70,6 +70,32 @@ fn import_runs_when_bound() {
 }
 
 #[test]
+fn proc_name_argument_becomes_funcref() {
+    // A bare **proc name in argument position** is a funcref — its `ref.func` index — not a data
+    // symbol. nimony passes proc addresses this way: `setExitFlush(flushStdStreams)` registering the
+    // at-exit stdout flush, `atexit` handlers, callback tables. `register(cb)` passes local proc
+    // `cb`'s address to a cross-module import; it must lower to `ref.func`, not fall through to the
+    // `data.sym` path (a proc exports as a *func*, never data) and fail to resolve.
+    let leng = "\
+(stmts
+ (proc :cb.0. . (i +64) . (stmts . (ret 7)))
+ (proc :main.0. . (void) .
+  (stmts .
+   (call register.0.other cb.0.))))";
+    let text = svm_leng::translate_to_text(leng).unwrap();
+    assert!(
+        text.contains("ref.func"),
+        "proc-name arg → ref.func:\n{text}"
+    );
+    assert!(
+        text.contains("call.import"),
+        "register is a cross-module import:\n{text}"
+    );
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).expect("verify");
+}
+
+#[test]
 fn stmt_call_import_is_void() {
     // A cross-module call in statement position declares a void import (no result arity).
     let leng = "\

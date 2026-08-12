@@ -314,7 +314,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
-    link_selected_with_extra(units, Vec::new(), false)
+    link_selected_with_extra(units, Vec::new(), false, false)
 }
 
 /// [`link_selected`] with pre-built **runtime** link units appended (e.g. the W3 bottom-edge shim
@@ -325,6 +325,7 @@ fn link_selected_with_extra(
     units: &[(&str, &str, Select)],
     extra: Vec<svm_ir::LinkUnit>,
     tls: bool,
+    manifest: bool,
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     let mut pooled_funcrefs = Vec::new();
@@ -413,7 +414,17 @@ fn link_selected_with_extra(
         });
     }
     link_units.extend(extra);
-    svm_ir::link(&link_units).map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
+    // `manifest`: retain any import **no unit exports** (the raw-syscall leaves — `write`/`read`/
+    // `_exit`, spelled by their nim symbol) in the merged manifest instead of failing the link, so
+    // the host binds them at instantiation (NIM.md W3: "raw syscalls → unresolved named imports the
+    // POSIX personality resolves at load"). The fail-closed `link` is the default (a whole-program
+    // link whose every leaf resolves to the pure-IR runtime shim).
+    let linked = if manifest {
+        svm_ir::link_with_manifest(&link_units)
+    } else {
+        svm_ir::link(&link_units)
+    };
+    linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))
 }
 
 /// **Link several nimony modules into one svm-ir [`Module`]** (NIM.md W2), each contributing a
@@ -452,7 +463,25 @@ pub fn link_whole_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false)
+    link_selected_with_extra(&sel, runtime, false, false)
+}
+
+/// [`link_whole_with_runtime`], but **retaining the raw-syscall leaves** (`write`/`read`/`_exit`,
+/// spelled by their nim symbol) as manifest imports the host binds at instantiation (NIM.md W3, the
+/// POSIX-personality seam) — instead of fail-closing on them. The compute bottom edge (`memcpy`,
+/// atomics, …) still resolves against `runtime`; only the imports **no unit exports** survive, so a
+/// program that does real I/O links (the `write`/`read`/`_exit` a pure-IR shim can't provide) and
+/// runs once its host grants those slots. Feed the result to a powerbox runner (`run_powerbox`) or
+/// bind each retained slot to a host proc; re-verify like any linked output.
+pub fn link_whole_with_runtime_manifest(
+    units: &[WholeModule],
+    runtime: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Whole))
+        .collect();
+    link_selected_with_extra(&sel, runtime, false, true)
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
@@ -469,7 +498,7 @@ pub fn link_units_tls_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Names(u.names)))
         .collect();
-    link_selected_with_extra(&sel, runtime, true)
+    link_selected_with_extra(&sel, runtime, true, false)
 }
 
 /// The **pure-IR runtime for the C bottom edge** (NIM.md §3b, W3 — issue #761). The compiled Nim

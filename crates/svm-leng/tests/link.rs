@@ -338,6 +338,32 @@ fn cross_module_aggregate_global_materializes() {
     );
 }
 
+#[test]
+fn manifest_link_retains_unresolved_syscall_leaves() {
+    // The W3 I/O seam (NIM.md §W3): a raw-syscall leaf (`write`/`read`/`_exit`, spelled by its nim
+    // symbol) that **no unit provides** is *retained* as a manifest import for the host to bind at
+    // instantiation (the POSIX personality / a host proc), instead of fail-closing the link. Here
+    // `caller` calls an undefined `sysWrite.0.`; `link_whole_with_runtime_manifest` keeps it, while
+    // the fail-closed `link_whole_units` rejects the very same program.
+    const PROG: &str =
+        "(stmts (proc :caller.0. . (i +64) . (stmts . (ret (call sysWrite.0. 1 2 3)))))";
+    let unit = || svm_leng::WholeModule {
+        stem: "prog",
+        src: PROG,
+    };
+    let m = svm_leng::link_whole_with_runtime_manifest(&[unit()], vec![])
+        .unwrap_or_else(|e| panic!("manifest link: {e}"));
+    assert!(
+        m.imports.iter().any(|i| i.name == "sysWrite.0."),
+        "sysWrite retained as a manifest import: {:?}",
+        m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+    assert!(
+        svm_leng::link_whole_units(&[unit()]).is_err(),
+        "the fail-closed link must still reject an unresolved syscall leaf"
+    );
+}
+
 /// Real nimony `greet(): string = "hello"` — the SSO literal — linked against a stand-in system
 /// unit carrying the real `string` def under the real system stem. `string.0.sysvq0asl` resolves
 /// from the *linked unit's* type def: no hand-supplied prelude (contrast `strings.rs`, which feeds

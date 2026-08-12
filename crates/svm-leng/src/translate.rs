@@ -3461,6 +3461,19 @@ impl<'a> FuncGen<'a> {
                 if let Some(c) = char_literal(a) {
                     return Ok(self.emit_const(ValType::I32, c)); // char literal `'0'` / `'\0A'`
                 }
+                // A bare **proc name in value position** is a *funcref* — its `i32` function index
+                // (`ref.func`), not a data address. nimony passes proc addresses as arguments
+                // (`setExitFlush(flushStdStreams)` registers the at-exit stdout flush, `atexit`
+                // handlers, callback tables). Without this the name fell to the `data.sym` path
+                // below and failed to resolve (a proc exports as a *func*, not data). Frame-needing
+                // procs still fail closed inside `funcref_value` (no `$sp` to hand an indirect call).
+                if self.t.procs.contains_key(a) {
+                    let id = self.funcref_value(e)?;
+                    return Ok(Val {
+                        id,
+                        ty: ValType::I32,
+                    });
+                }
                 // A link unit: a leftover atom is a cross-module data symbol — load through `data.sym`.
                 if self.t.link_mode {
                     return self.load_lvalue(e);
