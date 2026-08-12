@@ -696,6 +696,10 @@ jobs:
           # `_start` path byte-for-byte while skipping the runtime rebuild. Uses the committed
           # qjs_snapshot.svmb; skips cleanly if absent.
           node warm-snapshot-test.mjs
+          # warm+JIT (WASM_AOT.md warm+JIT): svm_warm_jit_open emits `eval_run` to wasm and runWarmJit
+          # drives it over the restored snapshot — must match warm-interp (svm_warm_eval) byte-for-byte,
+          # keep fresh-per-Run isolation, and accelerate a compute-heavy eval. Same asset; skips if absent.
+          node warm-jit-test.mjs
           # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
           # SVM-text compute guest whose root loops calling a window-round-tripping leaf must return the
           # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
