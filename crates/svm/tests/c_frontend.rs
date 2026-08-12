@@ -2093,6 +2093,64 @@ fn c_thread_shares_powerbox_for_io() {
     assert_eq!(run.stdout, b"hi from a thread\n");
 }
 
+/// #796 L1 — **a signal interrupts a blocking pipe read (`-EINTR`).** `main` mints a pipe and holds
+/// *both* ends, then blocks reading the (empty) read end: with a live writer and no data it **parks** on a
+/// `Blocked::PipeRead`. A spawned `raiser` thread calls `__vm_raise(SIGINT)` — the `CAP_SELF_RAISE`
+/// self-op — which interrupts every interruptible blocking pipe park, so `main`'s parked read completes
+/// `-EINTR` (`-4`, mapped to the sentinel `42`) instead of blocking forever. This is the L1 rung of
+/// PROCESS.md §9: a signal interrupts a slow syscall, surfaced as a value (invariant 5).
+///
+/// **Determinism under the M:N executor.** The interp runs vCPUs on real worker threads, so "raise after
+/// park" cannot be assumed from spawn order. The raiser therefore *retries*: a raise with nothing parked
+/// is a harmless no-op (it only arms the — here absent — signal source and drains an empty wait-set), so
+/// it loops raising until `main`'s read has parked, been interrupted, and set the shared `done` flag. No
+/// timing assumption, no sleep — robust to every interleaving.
+const C_EINTR_PIPE_READ: &str = r#"
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_raise(int signum);
+long __vm_atomic_add(void *p, long v);
+long __vm_atomic_load(void *p);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+
+long done;
+
+long raiser(long arg) {
+  /* Retry until main's blocking read has parked and taken the -EINTR (main sets `done`). A raise with
+     no parked reader is a no-op, so this is correct under any worker interleaving, never a lost wakeup. */
+  while (__vm_atomic_load(&done) == 0)
+    __vm_raise(2);
+  return 0;
+}
+
+int main(void) {
+  int fds[2];
+  __vm_pipe(fds);                        /* fds[0]=read, fds[1]=write; main keeps both -> live writer */
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char buf[8];
+  long n = __vm_read(fds[0], buf, 8);    /* empty FIFO, writers>0 -> parks; a raise interrupts -> -EINTR */
+  __vm_atomic_add(&done, 1);             /* stop the raiser */
+  __vm_thread_join(h);
+  if (n == -4) return 42;                /* -EINTR observed */
+  return (int)n;                         /* any other outcome is a distinct, debuggable value */
+}
+"#;
+
+#[test]
+fn c_signal_interrupts_a_blocking_pipe_read_with_eintr() {
+    // Interpreter-only: the `raise` self-op (CAP_SELF_RAISE) and the park/wake interrupt live in the
+    // tree-walker's scheduler arm; JIT/bytecode parity is a follow-on (like L2 async delivery).
+    match run_c_interp(C_EINTR_PIPE_READ).outcome {
+        Outcome::Returned(v) => assert_eq!(
+            v.as_slice(),
+            [Value::I32(42)],
+            "the parked blocking pipe read was interrupted by the signal and returned -EINTR"
+        ),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
 #[test]
 fn c_threads_deterministic_sweep() {
     // Same compiled C run through the seeded explorer (§18): every interleaving yields 2000, and each

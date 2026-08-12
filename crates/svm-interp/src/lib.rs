@@ -4623,6 +4623,58 @@ impl Scheduler {
         n
     }
 
+    /// #796 L1 — interrupt every vCPU/fiber parked in an **interruptible** blocking pipe op
+    /// ([`Blocked::PipeRead`]/[`Blocked::PipeWrite`]) so its syscall returns `-EINTR` (POSIX). Called by
+    /// the [`CAP_SELF_RAISE`] self-op when a signal is raised. Unlike the pipe wake this is not keyed by a
+    /// pipe id — a signal interrupts *whatever* blocking read/write is outstanding: drain every waiter
+    /// from both park maps, set each waiting vCPU's host EINTR flag ([`Host::set_sig_interrupt`]), and
+    /// re-admit it. Its rewound op re-runs, finds the flag, and completes `-EINTR` rather than re-parking.
+    /// Returns the count interrupted (0 if nothing was blocked — the raise still armed the handler).
+    fn interrupt_interruptible_parks(&self) -> u32 {
+        let mut s = self.lock();
+        let mut n = 0u32;
+        for (_pipe, waiters) in std::mem::take(&mut s.pipe_waiters) {
+            for w in waiters {
+                n += 1;
+                match w {
+                    Waiter::VCpu(v) => {
+                        v.host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_sig_interrupt();
+                        s.runnable.push_back(v);
+                    }
+                    Waiter::Fiber { reg, slot, svc } => {
+                        reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                        svc_wake_locked(&mut s, svc);
+                    }
+                }
+            }
+        }
+        for (_pipe, waiters) in std::mem::take(&mut s.pipe_write_waiters) {
+            for w in waiters {
+                n += 1;
+                match w {
+                    Waiter::VCpu(v) => {
+                        v.host
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_sig_interrupt();
+                        s.runnable.push_back(v);
+                    }
+                    Waiter::Fiber { reg, slot, svc } => {
+                        reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                        svc_wake_locked(&mut s, svc);
+                    }
+                }
+            }
+        }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
     /// §3.6 — deliver a served dispatch's result **atomically** against a racing caller park:
     /// wake the ticket's parked caller, or — under the SAME scheduler lock — stash the value in
     /// the callee's completion cell. The two-step form (a reply-wake miss, then a
@@ -6396,6 +6448,15 @@ impl SchedRef {
     fn wake_pipe_writers(&self, pipe: u32) -> u32 {
         match self {
             SchedRef::Real(s) => s.wake_pipe_writers(pipe),
+            SchedRef::Det(_) => 0,
+        }
+    }
+    /// #796 L1 — interrupt interruptible blocking pipe parks with `-EINTR`
+    /// ([`Scheduler::interrupt_interruptible_parks`]). Real scheduler only; the explorer never parks a
+    /// blocking pipe op (its read/write arms fail closed), so there is nothing to interrupt.
+    fn interrupt_interruptible_parks(&self) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.interrupt_interruptible_parks(),
             SchedRef::Det(_) => 0,
         }
     }
@@ -11245,6 +11306,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
+                // #796 L1 — `raise(signum)` (self-namespace op 17): mark the signal pending in the
+                // installed source (a caught handler is delivered at the next safepoint — invariant 4,
+                // policy stays in the personality) and interrupt any interruptible blocking pipe park so
+                // its syscall returns `-EINTR` (POSIX). `Real` scheduler only (the park/wake machinery);
+                // authority-neutral over the domain's own signal state, so it always returns 0. This is
+                // the capability-side of the #799 seam: one guest can hold a personality's signals *and*
+                // the capability path's blocking pipes, and a raise interrupts a parked read/write.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_RAISE,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let signum = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64() as i32,
+                        None => 0,
+                    };
+                    if matches!(sched, SchedRef::Real(_)) {
+                        // Arm the handler (best-effort: a source serving only embedder signals no-ops
+                        // `raise`). Take the source Arc, then drop the host lock before the interrupt
+                        // (which locks each parked vCPU's host — a distinct lock; keep scopes disjoint).
+                        let src = host.lock().unwrap_or_else(|e| e.into_inner()).signal_poll();
+                        if let Some((_, src)) = src {
+                            src.raise(signum);
+                        }
+                        sched.interrupt_interruptible_parks();
+                    }
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(0));
+                    }
+                }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
                 // domain's remaining fuel. No handler context, no host lock — just the live counter,
                 // so it is answered on every tier (never `-EINVAL`). Deterministic by construction
@@ -11688,6 +11781,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let pipe_park = hg.take_pipe_read_parked();
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
+                    // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
+                    // only when *this* op is actually about to park (a completed read/write must not eat
+                    // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park.
+                    let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
+                        && hg.take_sig_interrupt();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
@@ -11698,22 +11796,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some(pipe) = pipe_wake_w {
                         sched.wake_pipe_writers(pipe);
                     }
+                    let mut eintr_done = false;
                     if let Some(pipe) = pipe_park {
                         if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                            if sig_intr {
+                                // A delivered signal interrupts this blocking read: complete it with
+                                // `-EINTR` instead of rewinding+parking. `inst` is already past the read;
+                                // the caught handler (if any) runs at the next safepoint (L2).
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the read re-executes on wake
+                                return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                            }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
                     if let Some(pipe) = pipe_write_park {
                         if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the write re-executes on wake
+                                return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                            }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
-                    for (s, ty) in results.iter().zip(&sig.results) {
-                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    if !eintr_done {
+                        for (s, ty) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
                     }
                 }
                 // §7 executable named import (IMPORTS.md phase 1): dispatch through the reserved
@@ -12024,19 +12138,34 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // writer; a drained-full read / reader-to-zero close wakes parked writers.
                     let pipe_write_park = hg.take_pipe_write_parked();
                     let pipe_wake_w = hg.take_pipe_wake_writers();
+                    // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
+                    // the `cap.call` arm above), so a raised signal completes it `-EINTR` not re-parks.
+                    let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
+                        && hg.take_sig_interrupt();
                     let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
                     drop(hg);
+                    let mut eintr_done = false;
                     if let Some(pipe) = pipe_park {
                         if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the read re-executes on wake
+                                return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                            }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
                     if let Some(pipe) = pipe_write_park {
                         if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the write re-executes on wake
+                                return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                            }
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
@@ -12046,8 +12175,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some(pipe) = pipe_wake_w {
                         sched.wake_pipe_writers(pipe);
                     }
-                    for (s, ty) in results.iter().zip(&sig.results) {
-                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    if !eintr_done {
+                        for (s, ty) in results.iter().zip(&sig.results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
                     }
                 }
                 // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
@@ -14669,6 +14800,7 @@ const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this
 const ESRCH: i64 = -3; // `setpgid` for a pid that is not a live child of the calling domain
 const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
 const EPIPE: i64 = -32; // FORK.md §8.6 — write to a pipe whose read end is fully closed (SIGPIPE errno)
+const EINTR: i64 = -4; // #796 L1 — a blocking pipe read/write interrupted by a delivered signal (POSIX EINTR)
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
@@ -15794,6 +15926,15 @@ pub const CAP_SELF_SETPGID: u32 = 15;
 /// Pinned at 16.
 pub const CAP_SELF_PIPE: u32 = 16;
 
+/// #796 L1 — `raise(signum)`: the self-namespace op a capability-world guest calls to raise a POSIX
+/// signal on its own process. It routes to the installed [`SignalSource::raise`] (marking the signal
+/// pending so a caught handler is delivered at the next safepoint, invariant 4 — policy stays in the
+/// personality) and, on the `Real` scheduler, interrupts every interruptible blocking pipe park so its
+/// syscall returns `-EINTR` (POSIX). Authority-neutral over the domain's own state; `0` always. This
+/// is the capability-side bridge that lets one guest hold both a personality's signals and the
+/// capability path's blocking pipes (the #799 seam). Pinned at 17.
+pub const CAP_SELF_RAISE: u32 = 17;
+
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
 /// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
@@ -16041,6 +16182,14 @@ pub trait SignalSource: Send + Sync {
     /// state and honor the mask, and leave [`Host::sig_armed`] set iff a further signal is already
     /// deliverable.
     fn take_deliverable(&self) -> Option<(i32, i32, u64)>;
+
+    /// #796 L1 — mark `signum` pending (and arm, if it becomes deliverable), the guest-driven
+    /// `raise(3)` half of the signal seam: the [`CAP_SELF_RAISE`] self-op routes here so a
+    /// capability-world guest can raise a signal into whatever personality owns the policy. Default
+    /// no-op — a source serving only embedder-driven signals (a terminal `^C`) need not implement it;
+    /// the interrupt of a parked blocking syscall (the EINTR half) is driven separately by the
+    /// scheduler, so even a no-op `raise` still interrupts.
+    fn raise(&self, _signum: i32) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
@@ -16078,6 +16227,12 @@ pub struct Host {
     /// reader-count-to-zero close landed), so the eval loop should wake any writer parked on this pipe
     /// (it re-issues → progress, or `-EPIPE` if readers hit 0). Taken by [`Self::take_pipe_wake_writers`].
     pipe_wake_writers: Option<u32>,
+    /// #796 L1 — transient: a signal was raised (`CAP_SELF_RAISE`) while this domain has a blocking pipe
+    /// read/write parked, so the next re-run of that interruptible op must complete with `-EINTR` (POSIX)
+    /// instead of re-parking. The scheduler sets it on the parked vCPU's host as it re-admits the waiter
+    /// ([`Scheduler::interrupt_interruptible_parks`]); the eval-loop park site takes it
+    /// ([`Self::take_sig_interrupt`]) and, when set, returns `-EINTR` rather than rewinding+parking.
+    sig_interrupt: bool,
     /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
     /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
     /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
@@ -16631,6 +16786,7 @@ impl Host {
             pipe_wake: None,
             pipe_write_parked: None,
             pipe_wake_writers: None,
+            sig_interrupt: false,
             mem_map_limit: None,
             mem_mapped_bytes: 0,
             stdout: Vec::new(),
@@ -17122,6 +17278,19 @@ impl Host {
     /// writers (each re-issues its write → progress, or `-EPIPE` if the readers are gone).
     fn take_pipe_wake_writers(&mut self) -> Option<u32> {
         self.pipe_wake_writers.take()
+    }
+
+    /// #796 L1 — set the transient "a signal interrupted a blocking syscall" flag, so the next re-run of
+    /// an interruptible pipe read/write in this domain completes `-EINTR`. Set by the scheduler on a
+    /// parked vCPU's host as it re-admits it ([`Scheduler::interrupt_interruptible_parks`]).
+    fn set_sig_interrupt(&mut self) {
+        self.sig_interrupt = true;
+    }
+
+    /// #796 L1 — take the transient EINTR flag. The eval-loop park site consults it *only* when it is
+    /// about to park a pipe read/write; when set, the op returns `-EINTR` instead of rewinding+parking.
+    fn take_sig_interrupt(&mut self) -> bool {
+        std::mem::take(&mut self.sig_interrupt)
     }
 
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
