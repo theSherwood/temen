@@ -443,9 +443,11 @@ fn real_write_program_prints_to_stdout() {
 }
 
 /// Manifest-link `mods` (retaining `write`/`read`/`_exit`/… as bindable imports), then run the
-/// `exportc` `main` with `sysWrite` bound to a stdout capture and the other syscall leaves stubbed.
-/// `main` is `($sp, argc, argv, envp) -> cint`, so it receives a data-stack base above the globals;
-/// argc/argv/envp are zero (this program reads none). Returns the captured stdout bytes.
+/// `exportc` `main` on **both engines** with `sysWrite` bound to a stdout capture and the other
+/// syscall leaves stubbed, asserting the two capture the same bytes (§9 interp/JIT parity on the
+/// syscall seam). `main` is `($sp, argc, argv, envp) -> cint`, so it receives a data-stack base
+/// above the globals; argc/argv/envp are zero (this program reads none). Returns the captured
+/// stdout bytes.
 fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // Bind the pure-compute bottom edge to the shim (as `link_with_runtime`), but via the *manifest*
     // link so the raw-syscall leaves survive as host-bound imports rather than fail-closing.
@@ -489,7 +491,28 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
         .find(|e| e.name == "main")
         .map(|e| e.func)
         .expect("exportc main");
-    // Bind each retained syscall import: `sysWrite` → the capture buffer, the rest → a no-op stub.
+
+    // Run `main` on both engines under identical host-bound syscall imports and assert the captured
+    // stdout agrees. The two engines reach the retained `call.import` leaves by different plumbing —
+    // the interpreter dispatches each through its host binding table directly; the JIT lowers the
+    // `call.import` to a `cap.call` on the reserved `CAP_IMPORT_TYPE_ID` sentinel and `cap_thunk`
+    // translates *that* through the very same bindings — so a divergence is a real engine bug, not a
+    // harness artifact. Each run gets a fresh `Host` and capture buffer (a shared buffer would
+    // concatenate both engines' output).
+    let interp_out = run_io_capture(&m, main_idx, false);
+    let jit_out = run_io_capture(&m, main_idx, true);
+    assert_eq!(
+        interp_out, jit_out,
+        "§9 interp/JIT parity on the syscall I/O seam"
+    );
+    interp_out
+}
+
+/// Run the linked I/O program's `main` (func `main_idx`) on one engine — the JIT when `jit`, else the
+/// tree-walker — under a fresh `Host` that binds `sysWrite` to a stdout capture and every other
+/// retained syscall leaf to a no-op stub. Returns the captured bytes. The `sysWrite` binding reads
+/// the guest window through the same `GuestMem` both engines hand the host proc.
+fn run_io_capture(m: &Module, main_idx: u32, jit: bool) -> Vec<u8> {
     let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
     let mut host = Host::new();
     let mut bindings = Vec::new();
@@ -518,10 +541,28 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     host.set_import_bindings(bindings);
 
     let sp = svm_ir::POWERBOX_STACK_PAGE as i64 + 0x40000; // data-stack base, well above the globals
-    let args = [Value::I64(sp), Value::I32(0), Value::I64(0), Value::I64(0)];
-    let mut fuel = 500_000_000u64;
-    run_with_host(&m, main_idx, &args, &mut fuel, &mut host)
-        .unwrap_or_else(|e| panic!("run main: {e:?}"));
+    if jit {
+        let ctx = &mut host as *mut Host as *mut std::ffi::c_void;
+        let (outcome, _mem) = svm_jit::compile_and_run_capture_reserved_with_host(
+            m,
+            main_idx,
+            &[sp, 0, 0, 0],
+            &[],
+            svm_ir::DEFAULT_RESERVED_LOG2,
+            svm_run::cap_thunk,
+            ctx,
+        )
+        .unwrap_or_else(|e| panic!("jit compile main: {e:?}"));
+        assert!(
+            matches!(outcome, svm_jit::JitOutcome::Returned(_)),
+            "jit main did not return cleanly: {outcome:?}"
+        );
+    } else {
+        let args = [Value::I64(sp), Value::I32(0), Value::I64(0), Value::I64(0)];
+        let mut fuel = 500_000_000u64;
+        run_with_host(m, main_idx, &args, &mut fuel, &mut host)
+            .unwrap_or_else(|e| panic!("run main: {e:?}"));
+    }
     let out = captured.lock().unwrap().clone();
     out
 }

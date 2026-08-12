@@ -32,3 +32,8 @@ svm-encode = { path = "../svm-encode" }
 svm-verify = { path = "../svm-verify" }
 svm-interp = { path = "../svm-interp" }
 svm-jit = { path = "../svm-jit" }
+# Test-only: the reusable host glue (`cap_thunk`) for driving the JIT under the same host-bound
+# capability imports the interpreter path uses — so the nimony I/O e2e can assert §9 interp/JIT
+# parity on the syscall seam. svm-run's *library* does not depend on svm-leng (only its own tests
+# do), so this dev-edge introduces no cycle.
+svm-run = { path = "../svm-run" }
