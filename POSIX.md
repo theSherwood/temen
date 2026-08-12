@@ -133,11 +133,58 @@ only to mark the boundary.
 | 30 | `signal(signum, handler)` | `-> prev \| -errno` | host signal state | **done (L0)** — records disposition (`SIG_DFL`/`SIG_IGN`/handler ptr); returns previous |
 | 31 | `kill(pid, sig)` | `-> 0 \| -errno` | host signal state | **done (L0)** — sets the pending bit (`raise(s)` = `kill(0,s)`); `sig 0` = liveness no-op |
 | 32 | `sigcheck(_)` | `-> handler \| 0` | host signal state | **done (L0)** — doorbell poll: clears+returns the next pending **caught** handler; ignored/default dropped |
-| — | `fstat/environ` | / `-errno` | memfs + host fd table | todo |
+| 33 | `clock(clock_id)` | `-> nanos` | host clock (pinnable, `set_clock`) | **done** — monotonic (`id 1`) / realtime; the svm `std` `time` PAL path |
+| 34 | `getenv_r(name, nlen, buf, cap)` | `-> len \| -1` | host env map | **done** — buffer-writing `getenv` (no arena); size-then-fetch |
+| 35 | `unsetenv(name, nlen)` | `-> 0 \| -errno` | host env map | **done** — absent name is a success no-op |
+| 36 | `environ(i, buf, cap)` | `-> len \| -1` | host env map | **done** — `i`-th `KEY=VALUE`, keys sorted; `-1` past the end |
+| 37 | `mkdir(path, plen, mode)` | `-> 0 \| -errno` | memfs explicit-dir set | **done** — `-EEXIST`/`-ENOENT` (parent); `mode` ignored |
+| 38 | `rename(old, olen, new, nlen)` | `-> 0 \| -errno` | memfs | **done** — file move or whole-subtree re-key; `-ENOENT` |
+| 39 | `rmdir(path, plen)` | `-> 0 \| -errno` | memfs explicit-dir set | **done** — `-ENOTDIR`/`-ENOTEMPTY`/`-EINVAL` (root) |
+| — | `fstat` | / `-errno` | memfs + host fd table | todo |
 | — | `sigaction` + default actions | doorbell (§9 L1/L2) | host signal state | **partial** — `signal`/`kill`/`sigcheck` (ops 30–32) are the L0 doorbell (exact for `trap`); async interrupt of a running loop + default actions are L1/L2, parked |
-| — | `time/clock_gettime` | `-> t` | `Clock` cap | todo |
 | — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
+
+## 5a. The `net` capability — sockets without growing the libc table
+
+Networking follows the WASI 0.2 lesson (`wasi:sockets`): **authority is an explicit granted
+handle, and the data plane reuses the generic fd path**. It is a **separate named capability**
+(`"net"`, resolved like `"posix"`) over the *same* shared personality state — not more entries
+in the libc op table above. Socket-ness lives only at connection setup; a connected socket is
+an ordinary fd, read and written through ops 0/1 (`read`/`write`) and closed/`dup2`'d like any
+other, so redirects (`dup2(sock, 1)`) work unchanged.
+
+**Request/refuse, not preopen-only.** The guest *requests* (`bind :8080`, `connect host:port`)
+and the host side grants, remaps, or refuses — mechanism in the personality, policy in the
+embedder:
+
+- **Loopback = the memnet** (the memfs analog): binds and connects on `127.0.0.1`/`::1` are
+  served in-personality — private per-instance byte FIFOs (the `pipe` machinery), ephemeral
+  `:0` assignment, deterministic, playground-safe. No external authority exists here, so it
+  needs no grant beyond the `net` cap itself.
+- **Beyond loopback = the embedder's `NetDelegate`** (`Posix::set_net`, the `set_spawn`
+  analog): `connect`/`resolve` route to it — a real socket, a scripted table, an allowlisting
+  proxy. **No delegate ⇒ fail closed** (`-ECONNREFUSED`/`-ENOENT`), exactly like spawn's
+  `-ENOSYS`. Non-loopback `bind` (a delegate-granted real listener) is the noted follow-up —
+  the *op* carries the request today; the delegate hook is what lands later.
+
+Blocking: a memnet `read`/`accept` on empty returns `-EAGAIN` (a single cooperative guest
+blocking on itself would deadlock; lockstep guests never see it, `set_nonblocking` programs
+get `WouldBlock`). A delegate-backed `recv` may block **host-side** inside the call, like a
+spawn running its child. A socket address travels as a tiny blob — `[family u8 (4|6),
+port u16 LE, addr 4|16 bytes]` — sized for the 4-arg call ABI.
+
+Ops on the `net` handle (own numbering; `-errno` on failure):
+
+| # | Function | Shape | Notes |
+|---|----------|-------|-------|
+| 1 | `connect(addr, alen, laddr_out, cap)` | `-> fd \| -errno` | loopback → memnet peer; else delegate or `-ECONNREFUSED`; writes the local addr |
+| 2 | `bind(addr, alen, bound_out, cap)` | `-> fd \| -errno` | bind+listen folded; `:0` assigns an ephemeral port; writes the actual bound addr; non-loopback `-EACCES` (slice 1) |
+| 3 | `accept(fd, peer_out, cap)` | `-> fd \| -EAGAIN \| -errno` | next pending memnet connection; writes the peer addr |
+| 4 | `shutdown(fd, how)` | `-> 0 \| -errno` | write-shutdown makes the peer's empty reads return `0` (EOF), not `-EAGAIN` |
+| 5 | `resolve(name, nlen, out, cap)` | `-> nbytes \| -errno` | `localhost` → loopback; else delegate or `-ENOENT`; writes addr blobs |
+
+UDP (`sendto`/`recvfrom` on the memnet) is a follow-up slice on the same cap.
 
 ## 6. Roadmap
 

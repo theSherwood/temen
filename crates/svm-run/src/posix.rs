@@ -27,3 +27,12 @@ pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Pos
     let (posix, make) = svm_posix::cap(heap_base, heap_end, stdin);
     (HostCap::host_proc(0, make), posix)
 }
+
+/// The **`net` capability** over an existing personality (POSIX.md §5a) — grant it alongside the
+/// posix cap under its own name (e.g. `("net", net_cap(&posix))` in `run_with_caps`). Socket fds it
+/// mints live in the same fd table, so the guest reads/writes them through the posix cap's ordinary
+/// `read`/`write` ops. Loopback is served in-personality (the memnet); anything beyond routes to the
+/// embedder's [`svm_posix::NetDelegate`] ([`Posix::set_net`]) or fails closed.
+pub fn net_cap(posix: &Posix) -> HostCap {
+    HostCap::host_proc(0, svm_posix::net_cap_factory(posix))
+}

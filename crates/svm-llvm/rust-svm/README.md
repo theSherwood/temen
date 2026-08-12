@@ -23,6 +23,7 @@ on-ramp is the ongoing S1 work (see "Status" below).
 | `svm-fs-imp.rs` | The fs module (copied to `sys/fs/svm.rs`). `File` (open/read/write/seek/`try_clone`), `metadata`/`read_dir`/`remove_file`/`exists`, and the directory ops `create_dir`/`create_dir_all`/`rename`/`remove_dir` reach the personality's in-memory filesystem via the `host` bridge's file ops (`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_LSEEK`/`OP_CLOSE`/`OP_UNLINK`/`OP_STAT`/`OP_OPENDIR`/`OP_READDIR`/`OP_CLOSEDIR`/`OP_MKDIR`/`OP_RENAME`/`OP_RMDIR`/`OP_DUP`). The memfs has no symlinks or mutable perms, so `lstat==stat`, perms are always-writable, and `symlink`/hard-link/perms/times/`canonicalize` stay `Unsupported`. Needs a granted `posix` cap. |
 | `svm-pipe-imp.rs` | The anonymous-pipe module (copied to `sys/pipe/svm.rs`). `sys::pipe::Pipe` is a pair of fds over one in-personality byte FIFO (`OP_PIPE`), read/written through `OP_READ`/`OP_WRITE` and closed on drop — the plumbing `std::process` captures child stdout through. |
 | `svm-process-imp.rs` | The process module (copied to `sys/process/svm.rs`). `std::process::Command` over the personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`): a spawn runs the named command to completion synchronously, `output` captures **stdout and stderr** via `OP_PIPE`+`OP_DUP2` fd-1 / fd-2 redirects (saved/restored around the spawn), and `wait`/`status` reap the exit code. The command is resolved by the embedder's spawn delegate (`Posix::set_spawn` → `SpawnResult { stdout, stderr, status }`); without one, spawning is `Unsupported`. Synchronous model ⇒ no live child to stream stdin into (stdin is whatever fd 0 holds). |
+| `svm-net-imp.rs` | The net module (copied to `sys/net/connection/svm.rs`). `TcpStream`/`TcpListener`/`lookup_host` over the **`net` capability** (POSIX.md §5a) — a named handle separate from `posix` holding only the authority surface (`connect`/`bind`/`accept`/`shutdown`/`resolve`); a connected socket is an ordinary fd, so data rides the posix `read`/`write` ops. Loopback = the deterministic in-personality memnet; beyond loopback = the embedder's `NetDelegate` (`Posix::set_net`) or fail closed. Socket knobs with no memnet meaning are accept-and-ignore; `UdpSocket` fails closed (the datagram slice is a follow-up). Needs a granted `net` cap. |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
 ## Why an overlay is needed at all (the S0 finding)
@@ -77,13 +78,17 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   **`std::fs`** (`File` open/read/write/seek/`try_clone`, `metadata`/`read_dir`/
   `remove_file`/`exists`, `create_dir`/`create_dir_all`/`rename`/`remove_dir`, via a
   granted posix cap), **`std::process`** (`Command` spawn/`output`/
-  `status`/`wait`, via a granted posix cap + spawn delegate), heap/`Vec`,
+  `status`/`wait`, via a granted posix cap + spawn delegate), **`std::net`**
+  (`TcpStream`/`TcpListener`/`lookup_host`: loopback over the memnet, egress via a
+  granted `net` cap + `NetDelegate`; `UdpSocket` is a follow-up), heap/`Vec`,
   collections, `fmt`, iterators. (`std::env::var`/`vars` — the `str`-Debug paths —
   light up with the on-ramp entry-block slot-numbering fix, #755.)
 - **The two paths:** the powerbox stream/exit handles carry stdio/exit/args (no
   extra grant); the **posix-cap path** (`run_with_caps` + a `posix` cap, reached
   via the PAL `host` bridge's `__vm_host_call`) carries `time`/`env`/`fs`/`process`
   — this is where the richer, many-op surface scales without growing the powerbox.
+  Networking adds a **second named cap** (`"net"`, POSIX.md §5a) so socket
+  *authority* is its own grant while socket *data* rides the posix fd ops.
 - **Not yet on the fs surface:** `symlink`/hard-link/`set_permissions`/`set_times`/
   `canonicalize` (no host op / no perm-time model on the memfs backend — they return
   `Unsupported`). `create_dir`/`rename`/`remove_dir`/`try_clone` now work (memfs dir

@@ -10572,6 +10572,77 @@ fn i256_u128_magic_division() {
     }
 }
 
+/// The overflow intrinsics at **sub-carrier widths** (`umul.with.overflow.i8` etc., via C's
+/// `__builtin_*_overflow` on narrow types): the flag must be computed at the *intrinsic* width, not
+/// the i32 carrier — `26 * 10` overflows u8 even though 260 fits the carrier — and the returned value
+/// is the **wrapped** one. (Found via `Ipv4Addr` parsing, #775: the carrier-width check silently
+/// mis-flagged u8 checked arithmetic.)
+#[test]
+fn narrow_overflow_intrinsics() {
+    let src = "unsigned f(unsigned char a, unsigned char b) {\n\
+        \x20 unsigned char r;\n\
+        \x20 unsigned ov = __builtin_mul_overflow(a, b, &r);\n\
+        \x20 unsigned char s;\n\
+        \x20 unsigned ov2 = __builtin_add_overflow(a, b, &s);\n\
+        \x20 return (ov << 24) | (ov2 << 16) | (r << 8) | s;\n\
+        }\n";
+    for (a, b) in [(26u8, 10u8), (12, 10), (255, 255), (0, 7), (250, 6)] {
+        let (r, ov) = a.overflowing_mul(b);
+        let (s, ov2) = a.overflowing_add(b);
+        let want = ((ov as u32) << 24) | ((ov2 as u32) << 16) | ((r as u32) << 8) | s as u32;
+        check(
+            "u8_overflow",
+            src,
+            &[Value::I32(a as i32), Value::I32(b as i32)],
+            &[Value::I32(want as i32)],
+        );
+    }
+}
+
+/// `insertvalue` into a **partially-defined constant** base — clang's `{ i1 true, i8 poison }` seed
+/// for an `(ok, value)` pair (the IPv4 parser's single-digit-octet path, #775). The defined `true`
+/// must survive; the old zero-fill-any-constant-base fallback silently dropped it (flag read false ⇒
+/// every single-digit octet failed to parse). Runs the shape from a hand-written `.ll` on the
+/// interpreter, both branch directions.
+#[test]
+fn insertvalue_partial_constant_base() {
+    let ll = "define i32 @probe(i32 %sel) {\n\
+        entry:\n\
+        \x20 %cond = icmp sgt i32 %sel, 0\n\
+        \x20 br i1 %cond, label %ok, label %fail\n\
+        ok:\n\
+        \x20 %v = insertvalue { i1, i8 } { i1 true, i8 poison }, i8 9, 1\n\
+        \x20 br label %join\n\
+        fail:\n\
+        \x20 br label %join\n\
+        join:\n\
+        \x20 %agg = phi { i1, i8 } [ %v, %ok ], [ { i1 false, i8 undef }, %fail ]\n\
+        \x20 %flag = extractvalue { i1, i8 } %agg, 0\n\
+        \x20 %val = extractvalue { i1, i8 } %agg, 1\n\
+        \x20 %z = zext i8 %val to i32\n\
+        \x20 %f = zext i1 %flag to i32\n\
+        \x20 %fh = mul i32 %f, 100\n\
+        \x20 %r = add i32 %fh, %z\n\
+        \x20 ret i32 %r\n\
+        }\n";
+    let dir = std::env::temp_dir().join(format!("svm_aggphi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let path = dir.join("aggphi.ll");
+    std::fs::write(&path, ll).expect("write ll");
+    let t = svm_llvm::translate_ll_path(&path).expect("translate");
+    svm_verify::verify_module(&t.module).expect("verify");
+    for (sel, want) in [(1i32, 109i32), (0, 0)] {
+        let args = vec![Value::I64(t.entry_sp as i64), Value::I32(sel)];
+        let mut fuel = 1_000_000u64;
+        let r = svm_interp::run(&t.module, 0, &args, &mut fuel).expect("interp");
+        assert_eq!(
+            r,
+            vec![Value::I32(want)],
+            "sel={sel}: the constant base's defined `true` field must survive the insertvalue"
+        );
+    }
+}
+
 // ---- I14 tier 3: general i128 arithmetic (every i128 a materialized (lo, hi) pair) ----------------
 
 /// i128 `add`/`sub` with full carry/borrow across the word boundary. Builds two 128-bit values from

@@ -196,3 +196,17 @@
      _ => {
          mod unsupported;
          use unsupported as imp;
+--- a/library/std/src/sys/net/connection/mod.rs
++++ b/library/std/src/sys/net/connection/mod.rs
+@@ -28,7 +28,11 @@
+     target_os = "uefi" => {
+         mod uefi;
+         pub use uefi::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;

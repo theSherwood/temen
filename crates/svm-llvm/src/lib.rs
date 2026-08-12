@@ -2256,6 +2256,9 @@ fn type_size(ty: &Type, types: &Types) -> Result<u64, Error> {
 /// struct = max field align (1 if packed).
 fn type_align(ty: &Type, types: &Types) -> Result<u64, Error> {
     match ty {
+        // A wider-than-64-bit integer's *size* need not be a power of two (i96 → 12 bytes), but its
+        // alignment must be — clamp to the x86-64 ABI's 16 for the >8-byte widths (i65..=i128).
+        Type::IntegerType { bits } if *bits > 64 => Ok(16),
         Type::IntegerType { .. } | Type::PointerType { .. } | Type::FPType(_) => {
             type_size(ty, types)
         }
@@ -2710,7 +2713,13 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // 2-field struct — lets the value **cross block edges**: the per-field fan-out in
                     // `block_params`/`branch_args` threads its `(lo, hi)` as two block params (an i128
                     // loop-carried φ / live-across value), not just same-block.
-                    Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 128 }) => {
+                    // (65..=127-bit results — e.g. a `load i96` SROA folds from an odd struct tail —
+                    // share the pair representation; their producers zero-extend the hi half, so the
+                    // pair is canonical.)
+                    Err(_)
+                        if matches!(ty.as_ref(),
+                            Type::IntegerType { bits } if (65..=128).contains(bits)) =>
+                    {
                         s.agg_layout.insert(id, vec![ValType::I64, ValType::I64]);
                         ValType::I64
                     }
@@ -13789,6 +13798,56 @@ fn lower_overflow_intrinsic(
     let ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
     let a = ctx.operand(args[0])?;
     let b = ctx.operand(args[1])?;
+    let bits = int_bits(args[0].get_type(types).as_ref())
+        .ok_or_else(|| Error::Unsupported("overflow intrinsic on a non-integer".into()))?;
+    // A width narrower than its carrier (i8/i16/i24/…, and the odd 33..=63) must compute the flag at
+    // the **intrinsic width**, not the carrier width — `umul.with.overflow.i8(26, 10)` overflows u8
+    // even though 260 fits the i32 carrier (found via `Ipv4Addr` parsing, #775). Canonicalize the
+    // operands, compute wide in i64, and compare against the width-wrapped result; the returned value
+    // is the canonical **wrapped** one (the intrinsic's defined result), not the raw carrier bin.
+    if bits != 32 && bits != 64 {
+        if arith == BinOp::Mul && bits > 32 {
+            return unsup(format!(
+                "umul/smul.with.overflow.i{bits} (product exceeds i64)"
+            ));
+        }
+        let a64 = emit_ext(ctx, a, bits, 64, signed);
+        let b64 = emit_ext(ctx, b, bits, 64, signed);
+        let wide = i64bin(ctx, arith, a64, b64);
+        let mask = ctx.const_i64(((1u128 << bits) - 1) as u64 as i64);
+        let wrapped = i64bin(ctx, BinOp::And, wide, mask);
+        // The width-canonical reading of `wrapped` under the op's signedness; overflow ⇔ the wide
+        // result isn't representable, i.e. differs from its canonical wrap.
+        let canon = if signed {
+            let sh = ctx.const_i64((64 - bits) as i64);
+            let l = i64bin(ctx, BinOp::Shl, wrapped, sh);
+            i64bin(ctx, BinOp::ShrS, l, sh)
+        } else {
+            wrapped
+        };
+        let overflow = ctx.push(Inst::IntCmp {
+            ty: IntTy::I64,
+            op: CmpOp::Ne,
+            a: wide,
+            b: canon,
+        });
+        // The result in its carrier: a sub-32 width wraps into an i32 container (zero-masked, the
+        // canonical narrow form); 33..=63 stays the masked i64.
+        let r = if bits < 32 {
+            ctx.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: wrapped,
+            })
+        } else {
+            wrapped
+        };
+        if let Some(dest) = &c.dest {
+            if let Some(&vid) = ctx.s.name2id.get(dest) {
+                ctx.agg.insert(vid, vec![r, overflow]);
+            }
+        }
+        return Ok(true);
+    }
     let k = |ctx: &mut BlockCtx, v: i64| {
         ctx.push(if ty == IntTy::I64 {
             Inst::ConstI64(v)
@@ -16529,11 +16588,23 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     use Instruction as I;
     let is_i128 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(128);
     match instr {
-        // zext iN X to i128 (N ≤ 64) → (zext(X, N→64), 0)
+        // zext iN X to i128: N ≤ 64 → (zext(X, N→64), 0); N in 65..=127 → the identity on the value's
+        // `(lo, hi)` pair (its only producers — the wide `load` path — zero-extend the hi half, so the
+        // pair is already canonical i128).
         I::ZExt(x) if int_bits(x.to_type.as_ref()) == Some(128) => {
             let from = int_bits(x.operand.get_type(types).as_ref())
-                .filter(|&w| w <= 64)
+                .filter(|&w| w < 128)
                 .ok_or_else(|| Error::Unsupported("i128 zext from a non-integer source".into()))?;
+            if from > 64 {
+                let parts = ctx
+                    .agg_of(&x.operand)
+                    .filter(|p| p.len() == 2)
+                    .ok_or_else(|| {
+                        Error::Unsupported("zext of a wide integer not held as a pair".into())
+                    })?;
+                set_i128(ctx, &x.dest, parts[0], parts[1]);
+                return Ok(true);
+            }
             let src = ctx.operand(&x.operand)?;
             let lo = if from == 64 {
                 src
@@ -17441,22 +17512,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         return Ok(());
     }
     // `insertvalue` builds a small by-value struct field-wise (no scalar result) — record/update its
-    // field list in the aggregate side-table. The source is a prior aggregate value or a
-    // poison/undef/zero constant (start from zeroed fields). Single-level only (clang's coercion).
+    // field list in the aggregate side-table. The source is a prior aggregate value or a **constant**
+    // base, materialized per-field via `agg_fields` — a partially-defined base like clang's
+    // `{ i1 true, i8 poison }` (the IPv4 parser's `(ok, octet)` seed, #775) keeps its defined `true`;
+    // blanket zero-filling every constant base silently dropped it — a miscompile, not a fail-closed.
+    // Single-level only (clang's coercion).
     if let I::InsertValue(iv) = instr {
         if iv.indices.len() != 1 {
             return unsup("nested insertvalue");
         }
         let i = iv.indices[0] as usize;
-        let mut fields = match ctx.agg_of(&iv.aggregate) {
-            Some(f) => f,
-            None => {
-                let aty = iv.aggregate.get_type(types);
-                let ftys = struct_field_vtypes(aty.as_ref(), types)
-                    .ok_or_else(|| Error::Unsupported("insertvalue into non-struct".into()))??;
-                ftys.into_iter().map(|t| ctx.push(zero_inst(t))).collect()
-            }
-        };
+        let mut fields = ctx
+            .agg_fields(&iv.aggregate)
+            .ok_or_else(|| Error::Unsupported("insertvalue into non-struct".into()))??;
         let v = ctx.operand(&iv.element)?;
         *fields
             .get_mut(i)
@@ -17466,31 +17534,42 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         return Ok(());
     }
-    // i128 is held as a **pair of i64 halves** (`[lo, hi]`) in the aggregate side-table — svm-IR has no
-    // 128-bit type. This covers what `-O2` actually produces: clang coalesces a 16-byte struct/array
-    // equality (e.g. comparing `Known`'s `[u8;16]` payload) into a `load i128` + `icmp eq/ne i128`.
-    // Only those two ops are supported; any other i128 use stays a clean `Unsupported`.
+    // A 65..=128-bit integer is held as a **pair of i64 halves** (`[lo, hi]`) in the aggregate
+    // side-table — svm-IR has no 128-bit type. This covers what `-O2` actually produces: clang
+    // coalesces a 16-byte struct/array equality into `load i128` + `icmp i128`, and SROA folds an
+    // odd-sized struct tail into a sub-128 wide load (`load i96` from `SocketAddr`, #775) whose hi
+    // half is a narrower **zero-extending** load — so the pair is always canonical (top bits zero).
+    // A width whose hi remainder isn't a loadable 8/16/32 bits stays a clean `Unsupported`.
     if let I::Load(l) = instr {
-        if matches!(l.loaded_ty.as_ref(), Type::IntegerType { bits: 128 }) {
-            let addr = ctx.operand(&l.address)?;
-            let lo = ctx.push(Inst::Load {
-                op: svm_ir::LoadOp::I64,
-                addr,
-                offset: 0,
-                align: 0,
-            });
-            let c8 = ctx.const_i64(8);
-            let hi_addr = ctx.add_i64(addr, c8);
-            let hi = ctx.push(Inst::Load {
-                op: svm_ir::LoadOp::I64,
-                addr: hi_addr,
-                offset: 0,
-                align: 0,
-            });
-            if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
-                ctx.agg.insert(vid, vec![lo, hi]);
+        if let Type::IntegerType { bits } = l.loaded_ty.as_ref() {
+            if (65..=128).contains(bits) {
+                let hi_op = match bits - 64 {
+                    64 => svm_ir::LoadOp::I64,
+                    32 => svm_ir::LoadOp::I64_32U,
+                    16 => svm_ir::LoadOp::I64_16U,
+                    8 => svm_ir::LoadOp::I64_8U,
+                    w => return unsup(format!("load i{} (hi remainder {w} bits)", bits)),
+                };
+                let addr = ctx.operand(&l.address)?;
+                let lo = ctx.push(Inst::Load {
+                    op: svm_ir::LoadOp::I64,
+                    addr,
+                    offset: 0,
+                    align: 0,
+                });
+                let c8 = ctx.const_i64(8);
+                let hi_addr = ctx.add_i64(addr, c8);
+                let hi = ctx.push(Inst::Load {
+                    op: hi_op,
+                    addr: hi_addr,
+                    offset: 0,
+                    align: 0,
+                });
+                if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
+                    ctx.agg.insert(vid, vec![lo, hi]);
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
     if let I::ICmp(x) = instr {
@@ -18198,13 +18277,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
         }
         // `extractvalue` reads a field of a small by-value struct — alias the field's value (§3a).
+        // `agg_fields` also materializes a **constant** aggregate base (a struct literal, `undef`,
+        // `zeroinitializer`), the same routing `insertvalue`/φ incoming use.
         I::ExtractValue(ev) => {
             if ev.indices.len() != 1 {
                 return unsup("nested extractvalue");
             }
-            let fields = ctx
-                .agg_of(&ev.aggregate)
-                .ok_or_else(|| Error::Unsupported("extractvalue of non-aggregate value".into()))?;
+            let fields = ctx.agg_fields(&ev.aggregate).ok_or_else(|| {
+                Error::Unsupported("extractvalue of non-aggregate value".into())
+            })??;
             let v = *fields
                 .get(ev.indices[0] as usize)
                 .ok_or_else(|| Error::Unsupported("extractvalue index out of range".into()))?;
