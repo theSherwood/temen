@@ -321,18 +321,54 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
-    link_selected_with_extra(units, Vec::new(), false, false)
+    link_selected_with_extra(units, Vec::new(), false, false, false)
+}
+
+/// Build the **powerbox `_start` link unit** (function 0): a paramless entry that reads the
+/// post-link data-stack base (`data.top`, which the linker resolves to `powerbox_entry_sp` and
+/// reserves stack above) and tail-calls the C-shaped `main($sp, argc, argv, envp)` with
+/// `argc/argv/envp = 0`, returning its `cint`. `main` is a cross-unit symbol resolved at link
+/// (`call.import "main"` → a direct `call` once merged). Injecting the entry **as a unit** (linked
+/// first, so it is function 0) — rather than [`svm_ir::synth_manifest_start`]-prepending it after
+/// the link — is what keeps the program's `data.funcref` initializers valid: the linker numbers
+/// `_start` first and bakes every funcref at its final merged index in one pass, so nothing needs
+/// a post-hoc +1 shift (which the discarded relocation metadata could no longer drive).
+fn synth_start_unit(entry: &str) -> Result<svm_ir::LinkUnit, LengError> {
+    let text = format!(
+        "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
+         func () -> (i32) {{\n\
+         block 0 () {{\n\
+         \x20 v0 = data.top\n\
+         \x20 v1 = i32.const 0\n\
+         \x20 v2 = i64.const 0\n\
+         \x20 v3 = i64.const 0\n\
+         \x20 v4 = call.import 0 (v0, v1, v2, v3)\n\
+         \x20 return v4\n\
+         \x20 }}\n\
+         }}\n"
+    );
+    let module = svm_text::parse_module(&text)
+        .map_err(|e| LengError::Malformed(format!("synth `_start` unit: {e:?}")))?;
+    Ok(svm_ir::LinkUnit {
+        module,
+        exports: vec![("_start".to_string(), 0)],
+        ..Default::default()
+    })
 }
 
 /// [`link_selected`] with pre-built **runtime** link units appended (e.g. the W3 bottom-edge shim
 /// binding `mmap`/`memcpy`/atomics). The nimony units pool their aggregate types and compile as
 /// usual; the extra units link in as-is, so their exports resolve the nimony modules' unbound
 /// bottom-edge imports. This is how a real program links: the compiled stdlib plus a host runtime.
+///
+/// When `synth_start` is set, a powerbox `_start` unit ([`synth_start_unit`]) is linked **first**,
+/// so the merged module is a runnable powerbox entry (function 0 = `_start`, calling `main`).
 fn link_selected_with_extra(
     units: &[(&str, &str, Select)],
     extra: Vec<svm_ir::LinkUnit>,
     tls: bool,
     manifest: bool,
+    synth_start: bool,
 ) -> Result<Module, LengError> {
     let mut pooled = Vec::new();
     let mut pooled_funcrefs = Vec::new();
@@ -416,7 +452,13 @@ fn link_selected_with_extra(
             )?))
         })
         .collect::<Result<_, LengError>>()?;
-    let mut link_units = Vec::with_capacity(objects.len() + extra.len());
+    let mut link_units = Vec::with_capacity(objects.len() + extra.len() + 1);
+    // The powerbox `_start` links **first** so it is function 0 (the manifest entry shape), and so
+    // the linker's single-pass funcref baking numbers the program's `data.funcref` initializers
+    // above it — no fragile post-link index shift. See [`synth_start_unit`].
+    if synth_start {
+        link_units.push(synth_start_unit("main")?);
+    }
     for bytes in &objects {
         let module = svm_encode::decode_unit(bytes)
             .map_err(|e| LengError::Malformed(format!("decode `.svmo` object: {e:?}")))?;
@@ -486,7 +528,7 @@ pub fn link_whole_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false, false)
+    link_selected_with_extra(&sel, runtime, false, false, false)
 }
 
 /// [`link_whole_with_runtime`], but **retaining the raw-syscall leaves** (`write`/`read`/`_exit`,
@@ -504,7 +546,26 @@ pub fn link_whole_with_runtime_manifest(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false, true)
+    link_selected_with_extra(&sel, runtime, false, true, false)
+}
+
+/// [`link_whole_with_runtime_manifest`] **plus a synthesized powerbox `_start`** (function 0): the
+/// merged module is a runnable **powerbox entry** — `_start` reads the post-link data-stack base and
+/// calls the program's C `main($sp, argc, argv, envp)` (with empty argv), returning its `cint`. The
+/// raw-syscall leaves are still retained as manifest imports the host binds at instantiation. This is
+/// the full Path-B I/O shape: hand the result to `run_powerbox`-style caps or bind each retained slot
+/// to a host proc and run function 0 with no args — no hand-provided `$sp`. Re-verify like any linked
+/// output. See [`synth_start_unit`] for why the entry is injected as a first link unit rather than
+/// prepended after the fact.
+pub fn link_whole_powerbox_manifest(
+    units: &[WholeModule],
+    runtime: Vec<svm_ir::LinkUnit>,
+) -> Result<Module, LengError> {
+    let sel: Vec<(&str, &str, Select)> = units
+        .iter()
+        .map(|u| (u.stem, u.src, Select::Whole))
+        .collect();
+    link_selected_with_extra(&sel, runtime, false, true, true)
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
@@ -521,7 +582,7 @@ pub fn link_units_tls_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Names(u.names)))
         .collect();
-    link_selected_with_extra(&sel, runtime, true, false)
+    link_selected_with_extra(&sel, runtime, true, false, false)
 }
 
 /// The **pure-IR runtime for the C bottom edge** (NIM.md §3b, W3 — issue #761). The compiled Nim

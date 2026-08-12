@@ -737,6 +737,7 @@ dependencies = [
  "svm-interp",
  "svm-ir",
  "svm-jit",
+ "svm-run",
  "svm-text",
  "svm-verify",
 ]
