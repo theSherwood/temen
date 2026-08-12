@@ -56,10 +56,19 @@ let failed = false;
 const ok = (m) => console.log(`  ok: ${m}`);
 const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
 
+// A warm card pre-warms its snapshot on page load; a deploy-built asset absent in this job (its card is
+// filtered out of CARDS above) 404s that fetch — a benign console error the browser logs. Ignore a
+// resource-load 404/403 ONLY for an asset that isn't on disk; a 404 for a committed asset still fails.
+const benignAssetMiss = (m) => {
+  if (m.type() !== 'error' || !/Failed to load resource.*\b40[34]\b/.test(m.text())) return false;
+  const hit = (m.location()?.url || '').match(/\/assets\/([^/?#]+)/);
+  return !!hit && !existsSync(join(HERE, 'web', 'assets', hit[1]));
+};
+
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') fail(`console.error: ${m.text()}`); });
+  page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) fail(`console.error: ${m.text()}`); });
   await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
   await page.waitForFunction(() => document.getElementById('engine-state').dataset.state === 'ready', { timeout: 30_000 });
 

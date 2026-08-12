@@ -39,10 +39,19 @@ const runCard = async (page, name, timeout = 20_000) => {
   );
 };
 
+// A warm card pre-warms its snapshot on page load; a deploy-built asset (e.g. tcl_snapshot.svmb) absent
+// in this job 404s that fetch — a benign console error the browser logs and JS can't suppress. Ignore a
+// resource-load 404/403 ONLY for an asset that isn't on disk; a 404 for a committed asset still fails.
+const benignAssetMiss = (m) => {
+  if (m.type() !== 'error' || !/Failed to load resource.*\b40[34]\b/.test(m.text())) return false;
+  const hit = (m.location()?.url || '').match(/\/assets\/([^/?#]+)/);
+  return !!hit && !existsSync(join(HERE, 'web', 'assets', hit[1]));
+};
+
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') fail(`console.error: ${m.text()}`); });
+  page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) fail(`console.error: ${m.text()}`); });
   await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
   await page.waitForFunction(
     () => document.getElementById('engine-state').dataset.state === 'ready',
