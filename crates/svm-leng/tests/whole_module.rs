@@ -117,6 +117,25 @@ fn float_global_initializer_is_materialized() {
 }
 
 #[test]
+fn conv_wrapped_and_narrow_int_global_initializers() {
+    // Two int-scalar global forms `collect_globals` previously fail-closed on:
+    //  - a **conv-wrapped** int (`let x: distinct int = 4` → `(gvar :a (i 64) (conv (i 64) 4))`) —
+    //    `int_literal` doesn't see through the `conv`, so it was "non-scalar-int global";
+    //  - a **narrow** (`u8`) global (`var b: uint8 = 3` → `(gvar :b (u 8) (suf 3u "u8"))`) — the
+    //    old branch matched only `Scalar`, so a `Narrow` type fell through to the error.
+    // Both now fold via `const_scalar_int` + `int_store_width`. `sumi` reads them back: 4 + 3 = 7.
+    let leng = "\
+(stmts
+ (gvar :a.0. . (i +64) (conv (i +64) 4))
+ (gvar :b.0. . (u 8) (suf 3u \"u8\"))
+ (proc :sumi.0. . (i +64) .
+  (stmts .
+   (ret (add (i +64) a.0. (conv (i +64) b.0.))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 7, "conv-wrapped 4 + narrow 3 = 7");
+}
+
+#[test]
 fn global_pointer_deref() {
     // A module-level **pointer global** (`var x: ptr Node` — nimony's `ref NodeObj`, lowered to a
     // pointer) is dereferenced: `roundtrip` builds a frame object, points the global at it, then reads

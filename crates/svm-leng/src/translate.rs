@@ -530,12 +530,15 @@ impl Translator {
                         if !init.is_empty_marker() && init.tag() != Some("nil") {
                             if let Some(0) = int_literal(init) {
                                 // zero — the window is already zero-filled.
-                            } else if let (Some(v), TyDesc::Scalar(t)) = (int_literal(init), &desc)
+                            } else if let (Some(v), Some(w)) =
+                                (const_scalar_int(init), int_store_width(&desc))
                             {
-                                let w = match t {
-                                    ValType::I32 | ValType::F32 => 4,
-                                    _ => 8,
-                                };
+                                // A scalar/narrow **integer** global. Fold the constant — seeing
+                                // through a `(conv T int)` wrapper (nimony lowers a typed/distinct
+                                // int literal that way) — and seed the window with its `w`
+                                // little-endian bytes. Narrow (`u8`/`i8`/`u16`/`i16`) globals store
+                                // in their byte width; a float global is excluded here
+                                // (`int_store_width` → `None`) and handled just below.
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
                             } else if let TyDesc::Scalar(ValType::F32 | ValType::F64) = &desc {
@@ -4363,6 +4366,29 @@ fn const_float(node: &Node) -> Option<f64> {
         }
         // A bare float literal atom.
         _ => node.as_atom().and_then(|s| s.parse::<f64>().ok()),
+    }
+}
+
+/// The constant integer value of a scalar/narrow-int global initializer, seeing through a
+/// `(conv T operand)` wrapper — nimony lowers a typed/distinct int literal that way (`let x = 4` at
+/// a `distinct int` becomes `(conv (i 64) 4)`). Suffixed literals (`(suf 3u "u8")`) are folded by
+/// [`int_literal`].
+fn const_scalar_int(node: &Node) -> Option<i64> {
+    match node.tag() {
+        Some("conv") => node.args().get(1).and_then(const_scalar_int),
+        _ => int_literal(node),
+    }
+}
+
+/// The little-endian store width of an **integer-shaped** scalar type — full-width `i32`/`i64` or a
+/// `Narrow` sub-word (`u8`/`i8`/`u16`/`i16`, e.g. `char`). `None` for floats, pointers, and
+/// aggregates, so a float/aggregate global falls through to its own materialization path.
+fn int_store_width(desc: &TyDesc) -> Option<usize> {
+    match desc {
+        TyDesc::Scalar(ValType::I32) => Some(4),
+        TyDesc::Scalar(ValType::I64) => Some(8),
+        TyDesc::Narrow { bytes, .. } => Some(*bytes as usize),
+        _ => None,
     }
 }
 
