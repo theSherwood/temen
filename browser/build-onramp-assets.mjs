@@ -238,18 +238,21 @@ if (ensureQuickJS() && ensureOpenlibm()) {
 
 // 2c) Tcl (interactive) — the reference Tcl 8.6 interpreter, built by its demo script
 //     (`demos/tcl/build_bitcode.sh`: configure → native oracle → 162-TU bitcode + openlibm → llvm-link).
-//     The script links TWO variants, each translated to a 64 KiB-page `.svmb` with `--stub-externs`:
+//     The script links these variants; the playground translates two to a 64 KiB-page `.svmb` with
+//     `--stub-externs` (the `tcl_init` variant stays behind for the Rust translate test only):
 //       • `tcl_repl.svmb` — the minimal-embedding REPL (`tcl_repl.c`, no `Tcl_Init`, no filesystem).
-//       • `tcl_init.svmb` — the FULL Tcl (`tcl_init.c`: `Tcl_Init` over an in-guest `Tcl_Filesystem`
-//         VFS serving the embedded script library), so `clock`/`file`/`glob`/`auto_load`/`package`
-//         all work — no filesystem capability. Runs byte-identical to native (`demo_tcl_init_stdin`).
-//     The playground card uses the full-init asset. Fail-soft: skipped (example absent) if the
+//       • `tcl_snapshot.svmb` — the two-phase warm-runtime-snapshot driver (`tcl_snapshot.c`:
+//         `warmup` = full `Tcl_Init` over an in-guest `Tcl_Filesystem` VFS serving the embedded script
+//         library so `clock`/`file`/`glob`/`auto_load`/`package` all work; `eval_run` = eval-only), so
+//         the playground warms the Tcl runtime once on the snapshot worker and evals per Run (issue
+//         #805 follow-on). Runs byte-identical to native (`demo_tcl_init_stdin`).
+//     The playground warm Tcl card uses the snapshot asset. Fail-soft: skipped (example absent) if the
 //     toolchain/fetch is unavailable, like SQLite/Doom/chibicc offline.
 try {
   const tclScript = join(REPO, 'crates', 'svm-run', 'demos', 'tcl', 'build_bitcode.sh');
   execFileSync('bash', [tclScript], { stdio: 'inherit' });
   const cache = process.env.SVM_TCL_CACHE ?? '/tmp/svm_tcl_cache';
-  for (const [linkedName, svmbName] of [['tcl_linked.ll', 'tcl_repl.svmb'], ['tcl_init_linked.ll', 'tcl_init.svmb']]) {
+  for (const [linkedName, svmbName] of [['tcl_linked.ll', 'tcl_repl.svmb'], ['tcl_snapshot_linked.ll', 'tcl_snapshot.svmb']]) {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
     const svmb = join(ASSETS, svmbName);

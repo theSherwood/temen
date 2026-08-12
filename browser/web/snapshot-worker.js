@@ -8,11 +8,16 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
-import { runWarmJit } from './wasmjit-module.js';
+import { runWarmJit, primeWarmJit, jitCacheStats } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
 let warmUrl = null; // the module URL the warm session is currently open for (null ⇒ none)
+// The background warm+JIT pre-compile (issue: the first wasm-JIT Run paid the ~12.7 MB `WebAssembly.
+// compile`). `jitPrimePromise` is the in-flight (or settled) `primeWarmJit`; `jitPrimed` flips true once
+// it settles (compiled, or known non-emittable). A wasm-JIT eval awaits it so the first Run is a cache hit.
+let jitPrimePromise = null;
+let jitPrimed = false;
 
 const u8 = () => new Uint8Array(memory.buffer);
 // Read a captured stream out of the worker's memory. `.slice` copies to a non-shared buffer (TextDecoder
@@ -86,7 +91,18 @@ self.onmessage = async (e) => {
     }
     if (msg.type === 'prewarm') {
       const ok = ensureWarm(msg.url, msg.bytes);
+      // Reply as soon as warm-interp is ready (the ~0.9 s `warmup`) — do NOT block on the JIT pre-compile,
+      // so an early interpreter Run isn't delayed by it.
       self.postMessage({ type: 'reply', id: msg.id, ok, status: ok ? 0 : ex.svm_status() });
+      // Then pre-compile the warm+JIT `eval_run` in the background (the ~12.7 MB `WebAssembly.compile`), so
+      // the first wasm-JIT Run is a cache hit instead of paying that compile. Best-effort; a non-emittable
+      // eval just leaves the card on warm-interp. Skipped when `primeJit` is false (a card whose warm+JIT
+      // declines, e.g. Tcl — no point compiling a module that traps).
+      if (ok && msg.primeJit !== false && !jitPrimePromise) {
+        jitPrimePromise = primeWarmJit(ex, memory, `${warmUrl}#eval`, 1)
+          .catch(() => false)
+          .finally(() => { jitPrimed = true; });
+      }
       return;
     }
     if (msg.type === 'eval') {
@@ -94,8 +110,17 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'warm session unavailable' });
         return;
       }
+      // A wasm-JIT Run waits for the in-flight pre-compile (if any) so it reuses the primed instance
+      // rather than kicking off a fresh ~12.7 MB compile on this Run.
+      if (msg.jit && jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmJit falls back */ } }
       const r = await evalWarm(msg.source, msg.jit);
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
+      return;
+    }
+    if (msg.type === 'stats') {
+      // Test/telemetry hook: whether the warm+JIT pre-compile has settled, and the worker's JIT cache
+      // accounting (a primed instance ⇒ the first wasm-JIT Run is a cache hit, not a fresh compile).
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, jitPrimed, compiles: jitCacheStats.compiles, hits: jitCacheStats.hits });
       return;
     }
   } catch (err) {

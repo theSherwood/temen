@@ -8,6 +8,7 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node snapshot-worker-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -37,6 +38,16 @@ const CARDS = [
     leakGet: 'print("leak?", leaked)\n',
     leakClean: (out) => out.includes('nil') && !out.includes('4242'),
   },
+  {
+    // Tcl's warm+JIT declines (the 162-TU interp's emitted eval_run traps), so it's warm-snapshot-only
+    // (`noJit`): no wasm-JIT toggle, no JIT pre-compile. The `tcl_snapshot.svmb` asset is deploy-built,
+    // so this entry is filtered out (skipped) in the committed-asset CI job.
+    name: 'Tcl (8.6 — write & run)', asset: 'tcl_snapshot.svmb', noJit: true,
+    plain: ['puts [expr 6*7]\n', '42'],
+    leakSet: 'set leaked 4242; puts "set $leaked"\n',
+    leakGet: 'puts "exists? [info exists leaked]"\n',
+    leakClean: (out) => out.includes('exists? 0') && !out.includes('4242'),
+  },
 ].filter((c) => existsSync(join(HERE, 'web', 'assets', c.asset)));
 
 const chromium = (await import('playwright')).chromium;
@@ -49,7 +60,7 @@ const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') fail(`console.error: ${m.text()}`); });
+  page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) fail(`console.error: ${m.text()}`); });
   await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
   await page.waitForFunction(() => document.getElementById('engine-state').dataset.state === 'ready', { timeout: 30_000 });
 
@@ -66,10 +77,29 @@ try {
     };
   };
 
+  // Prewarm pre-compiles the warm+JIT `eval_run` off the main thread, so the FIRST wasm-JIT Run is a
+  // cache hit rather than paying the ~12.7 MB `WebAssembly.compile`. Before running anything, wait for
+  // each card's worker to finish pre-compiling and assert it compiled exactly once with no eval yet
+  // (compiles=1, hits=0) — i.e. the compile happened during pre-warm, not on the first Run.
+  const statsOf = (c) => page.evaluate((u) => globalThis.__snapshotClient?.stats(u), `./assets/${c.asset}`);
+  for (const c of CARDS) {
+    if (c.noJit) continue; // warm-snapshot-only cards (Tcl) don't pre-compile a JIT
+    const tag = c.name.split(' ')[0];
+    let st = null;
+    for (let i = 0; i < 160; i++) { // up to ~40s: engine load + warmup + the background ~12.7 MB compile
+      st = await statsOf(c);
+      if (st && st.ok && st.jitPrimed) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
+      ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
+      : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
+  }
+
   for (const c of CARDS) {
     const tag = c.name.split(' ')[0];
     // warm-snapshot (JIT toggle off, the default): a plain program runs on the card's worker.
-    await page.uncheck(`${sel(c)} .jit-label input`).catch(() => {});
+    if (!c.noJit) await page.uncheck(`${sel(c)} .jit-label input`).catch(() => {});
     await setSrc(c, c.plain[0]);
     let before = await workerRuns();
     let r = await run(c);
@@ -77,14 +107,17 @@ try {
     else fail(`${tag} warm-snapshot: state=${r.state} label=${r.label} stdout=${JSON.stringify(r.stdout)}`);
     (await workerRuns()) > before ? ok(`${tag}: ran on the worker (counter +1)`) : fail(`${tag}: did NOT run on the worker — silent main-thread fallback`);
 
-    // warm+JIT (tick the toggle): a compute-heavy program evals near-native on the worker.
-    await page.check(`${sel(c)} .jit-label input`);
-    await setSrc(c, c.heavy[0]);
-    before = await workerRuns();
-    r = await run(c);
-    if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes('warm+JIT')) ok(`${tag}: warm+JIT on the worker → ${JSON.stringify(r.stdout.trim())}`);
-    else fail(`${tag} warm+JIT: state=${r.state} label=${r.label} stdout=${JSON.stringify(r.stdout)}`);
-    (await workerRuns()) > before ? ok(`${tag}: warm+JIT ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
+    // warm+JIT (tick the toggle): a compute-heavy program evals near-native on the worker. Skipped for a
+    // warm-snapshot-only card (Tcl) — it has no wasm-JIT toggle.
+    if (!c.noJit) {
+      await page.check(`${sel(c)} .jit-label input`);
+      await setSrc(c, c.heavy[0]);
+      before = await workerRuns();
+      r = await run(c);
+      if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes('warm+JIT')) ok(`${tag}: warm+JIT on the worker → ${JSON.stringify(r.stdout.trim())}`);
+      else fail(`${tag} warm+JIT: state=${r.state} label=${r.label} stdout=${JSON.stringify(r.stdout)}`);
+      (await workerRuns()) > before ? ok(`${tag}: warm+JIT ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
+    }
 
     // fresh-per-Run isolation: a global in one Run must not leak into the next (snapshot restored each Run).
     await setSrc(c, c.leakSet);
@@ -95,8 +128,23 @@ try {
     r.state === 'done' && c.leakClean(r.stdout) ? ok(`${tag}: fresh-per-Run isolation holds (no leak across Runs)`) : fail(`${tag} isolation: state=${r.state} stdout=${JSON.stringify(r.stdout)}`);
   }
 
+  // After all the Runs, each JIT-capable card's compile count is still 1 — the warm+JIT Run reused the
+  // pre-compiled instance instead of recompiling (a hit was recorded). Warm-snapshot-only cards (Tcl)
+  // never compiled a JIT (compiles=0).
+  for (const c of CARDS) {
+    const tag = c.name.split(' ')[0];
+    const st = await statsOf(c);
+    if (c.noJit) {
+      st && st.ok && st.compiles === 0 ? ok(`${tag}: warm-snapshot-only — no JIT compiled (compiles=0)`) : fail(`${tag}: unexpected JIT compile: ${JSON.stringify(st)}`);
+    } else {
+      st && st.ok && st.compiles === 1 && st.hits >= 1
+        ? ok(`${tag}: warm+JIT Run reused the pre-compiled instance (compiles=1, hits=${st.hits})`)
+        : fail(`${tag}: unexpected JIT recompile: ${JSON.stringify(st)}`);
+    }
+  }
+
   const total = await workerRuns();
-  const expect = CARDS.length * 4;
+  const expect = CARDS.reduce((n, c) => n + (c.noJit ? 3 : 4), 0); // noJit cards do 3 Runs (no warm+JIT)
   total >= expect ? ok(`all ${total} Runs across ${CARDS.length} warm card(s) went through the snapshot workers`) : fail(`only ${total} worker Runs (expected ≥${expect})`);
 } catch (e) {
   fail(`exception: ${e.message}`);

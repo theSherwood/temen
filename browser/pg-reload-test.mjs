@@ -12,6 +12,7 @@
 // artifacts aren't staged — CI's real-browser job only has committed assets. Run locally:
 //   node build-pg-assets.mjs && node pg-reload-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -105,7 +106,7 @@ async function waitSaved(page, pred, label, timeout = 20_000) {
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') fail(`console.error: ${m.text()}`); });
+  page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) fail(`console.error: ${m.text()}`); });
   await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
   await waitEngine(page);
 

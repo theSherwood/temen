@@ -58,14 +58,15 @@ export class SnapshotClient {
   }
 
   // Open the warm session for `url` on its worker (idempotent per URL). `getBytes()` fetches the module
-  // bytes and is awaited only the first time. Resolves `{ ok, status }`.
-  prewarm(url, getBytes) {
+  // bytes and is awaited only the first time. `primeJit` (default true) also pre-compiles the warm+JIT
+  // tier in the worker (skip it for cards whose warm+JIT declines, e.g. Tcl). Resolves `{ ok, status }`.
+  prewarm(url, getBytes, primeJit = true) {
     const w = this._workerFor(url);
     if (w.prewarm) return w.prewarm;
     w.prewarm = (async () => {
       await w.ready;
       const bytes = await getBytes();
-      return this._request(w, 'prewarm', { url, bytes });
+      return this._request(w, 'prewarm', { url, bytes, primeJit });
     })();
     return w.prewarm;
   }
@@ -77,5 +78,13 @@ export class SnapshotClient {
     const warm = await this.prewarm(url, getBytes);
     if (!warm.ok) return warm;
     return this._request(this._workers.get(url), 'eval', { url, source, jit });
+  }
+
+  // Query `url`'s worker for its warm+JIT pre-compile state — `{ ok, jitPrimed, compiles, hits }` (for
+  // tests/telemetry). Resolves `{ ok:false }` if no worker exists for `url` yet.
+  stats(url) {
+    const w = this._workers.get(url);
+    if (!w) return Promise.resolve({ ok: false });
+    return this._request(w, 'stats', {});
   }
 }

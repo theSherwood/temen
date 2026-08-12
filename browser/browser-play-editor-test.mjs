@@ -6,6 +6,7 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -42,7 +43,7 @@ const runCard = async (page, name, timeout = 20_000) => {
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => fail(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') fail(`console.error: ${m.text()}`); });
+  page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) fail(`console.error: ${m.text()}`); });
   await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
   await page.waitForFunction(
     () => document.getElementById('engine-state').dataset.state === 'ready',

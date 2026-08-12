@@ -5,6 +5,7 @@
 // (`openJitReactor` throws on a not-emittable fallback), i.e. the outlining did its job. bounce/life/
 // mandelzoom auto-run deterministically, so the two tiers must produce the identical frame sequence.
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -20,7 +21,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 const res = await page.evaluate(async () => {

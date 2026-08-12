@@ -1159,20 +1159,26 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
   },
   // Tcl — the reference Tcl 8.6 interpreter with FULL Tcl_Init: the standard script library (init.tcl,
   // clock, msgcat, …) is embedded and served through an in-guest Tcl_Filesystem VFS, so clock/file/
-  // glob/auto_load/package all work with no filesystem capability. The `tcl_init.svmb` asset is built
+  // glob/auto_load/package all work with no filesystem capability. The `tcl_snapshot.svmb` asset is built
   // by `build-onramp-assets.mjs`; runs byte-identical to native (`demo_tcl_init_stdin`).
   'Tcl (8.6 — write & run)': {
     kind: 'module',
-    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
+    warm: true, // issue #805 follow-on: the two-phase `tcl_snapshot` driver (warmup = full Tcl_Init,
+    // eval_run = eval-only). Runs on the snapshot worker (pre-warmed off the main thread), so the whole
+    // Tcl_Init (sourcing init.tcl + the standard library) is paid once, not per Run.
+    jit: false, // warm+JIT declines for the 162-TU Tcl interp (the emitted eval_run traps → warm-interp),
+    // so no wasm-JIT toggle; the warm-snapshot init-once win is what matters here.
     editable: true,
     lang: 'tcl',
-    url: './assets/tcl_init.svmb',
+    url: './assets/tcl_snapshot.svmb',
     mode: 'io',
     desc: 'The reference Tcl 8.6.14 interpreter with the full standard library — its bytecode compiler ' +
       '+ execution engine, expr, string/list/dict, Henry Spencer regex, libtommath bignums, plus the ' +
       'script-library commands (clock, file, glob, auto_load, package) served from an embedded ' +
       'in-guest VFS. Edit the Tcl on the left and click Run: your script is piped to the guest as ' +
-      'stdin, evaluated, and its output appears below. Real Tcl, running client-side in the sandbox.',
+      'stdin, evaluated, and its output appears below. Real Tcl, running client-side in the sandbox. ' +
+      'It uses a warm-runtime snapshot (pre-warmed on a worker at page load): Tcl_Init runs once, then ' +
+      'every Run restores that warm image and evaluates only your script (each Run starts clean).',
     src: `# Write Tcl here, then click Run. The full standard library is available.
 proc fib {n} { expr {$n < 2 ? $n : [fib [expr {$n-1}]] + [fib [expr {$n-2}]]} }
 puts "fib(1..10): [lmap i {1 2 3 4 5 6 7 8 9 10} {fib $i}]"
@@ -3462,13 +3468,16 @@ async function main() {
   // critical path. Each pre-warming card shows a "warming up…" indicator until its session is ready.
   try {
     snapshotClient = new SnapshotClient(eng.module);
+    globalThis.__snapshotClient = snapshotClient; // test/telemetry hook (harmless): inspect prewarm state
     const warmCards = cards.filter((c) => c.ex.warm);
     if (warmCards.length) {
       const prewarmAll = () => {
         for (const c of warmCards) {
           setState(c, 'warming', 'warming up runtime…');
           snapshotClient
-            .prewarm(c.ex.url, () => fetchModule(c.ex.url))
+            // `primeJit` (the card's `jit` flag) pre-compiles the warm+JIT tier during pre-warm — but only
+            // for cards that actually use it (QuickJS/Lua); Tcl's warm+JIT declines, so we skip it there.
+            .prewarm(c.ex.url, () => fetchModule(c.ex.url), !!c.ex.jit)
             .then((r) => setState(c, 'ready', r.ok ? 'runtime warm — Run is instant' : 'ready'))
             .catch(() => setState(c, 'ready', 'ready'));
         }
