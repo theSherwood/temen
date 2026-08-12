@@ -711,7 +711,7 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 | `fork` proper | clone-of-parked via the fork endpoint: needs a durable-instrumented build (R8 on the critical path), full window copy until CoW, and clones **all** vCPUs (forkall) where POSIX forks only the calling thread — benign in practice, since POSIX itself restricts post-fork threaded code to async-signal-safe calls |
 | shell `trap` (INT/TERM/EXIT) | doorbell word checked at command boundaries — the *same* delivery points Bash itself uses (L0 below); compute-bound code waits on L2 |
 | `SIGCHLD` | reap-by-`poll` (L1/L2 below add async delivery when built) |
-| `EINTR` / signals while blocked | interruptible parks — wake-with-interrupted-status (L1 below). **BUILT (#799), disposition-gated**: a *deliverable* (caught, unmasked) signal interrupts a blocked capability pipe read/write → `-EINTR`; an ignored/masked one does not. Other park kinds + embedder-async ^C are the follow-on |
+| `EINTR` / signals while blocked | interruptible parks — wake-with-interrupted-status (L1 below). **BUILT (#799), disposition-gated**: a *deliverable* (caught, unmasked) signal interrupts a blocked capability pipe read/write → `-EINTR`; an ignored/masked one does not. Both a guest `kill` and an **embedder `^C`** (from outside the run) work; other park kinds (`join`/reap) are the follow-on |
 | async handlers (`SIGTERM`, `setitimer`) | safepoint-injected delivery (L2 below): poll-granularity latency, bounded once Phase-4 back-edge polls land (`DURABILITY.md` R6) — the JVM/Go/wasmtime-epoch norm |
 | catching memory faults | in-window unmapped/protected-page faults are **pager events with retry precision** (§5 faults) — *stronger* than wasm, where every trap is terminal; confinement faults stay terminal by design |
 | `getpid`, pid files | personality-local pids; no cross-tree pid meaning |
@@ -759,9 +759,12 @@ park — and signal delivery is only a question of which action fires at them:
   `None` and never interrupts. Nothing signal-specific lives in svm — the guest raises via the
   personality's `kill`, and the core only wakes parked syscalls when the personality delivers
   (invariant 4). This retired the `CAP_SELF_RAISE`/`__vm_raise` mechanism spike from #832.
-  **Still parked:** interrupting `join`/endpoint/completion parks (only pipe parks so far);
-  **embedder-async** raise while *all* fibers are parked (needs the `signal_notify` scheduler-wake
-  hook — the interactive Ctrl-C at an idle prompt); JIT/bytecode parity (interp-first, like L2).
+  **Embedder `^C` also built:** when *every* fiber is parked (an idle prompt blocked on `read`) no
+  safepoint fires, so the interp hands the personality a **scheduler-wake** closure at run start
+  (`SignalSource::set_wake`); `Posix::raise_signal` (a terminal `^C`) invokes it **iff the signal is
+  deliverable** (its policy) to interrupt the park from outside — the signal-delivery-as-a-capability
+  half of the split (the embedder holds the `Posix`/signal authority). **Still parked:** interrupting
+  `join`/reap/endpoint parks (only pipe parks so far); JIT/bytecode parity (interp-first, like L2).
 - **L2 — safepoint-injected handlers (rides existing polls). BUILT (#796).** At the per-op
   poll site (right beside the `kill` poll), if a personality's cheap `sig_armed` flag is set
   and no handler is already running, the interp redirects the fiber into the registered guest
@@ -780,9 +783,10 @@ park — and signal delivery is only a question of which action fires at them:
 
 L0 ships with the shell; **L2 async delivery is built (#796)**; **L1 (interruptible parks / `EINTR`)
 is built (#799), disposition-gated** — a deliverable signal (the personality's policy) interrupts a
-blocked capability pipe read/write, an ignored/masked one does not, and svm holds no signal policy.
-The remaining park kinds (`join`/endpoint/completion), the embedder-async ^C (`signal_notify` hook),
-and JIT/bytecode parity are the follow-ons.
+blocked capability pipe read/write, an ignored/masked one does not, and svm holds no signal policy;
+the **embedder `^C`** (a `raise_signal` from outside, via a scheduler-wake closure) interrupts a park
+even when all fibers are idle. The remaining park kinds (`join`/reap/endpoint) and JIT/bytecode
+parity are the follow-ons.
 
 ## 10. The validation ladder
 

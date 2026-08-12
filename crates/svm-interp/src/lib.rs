@@ -2138,6 +2138,20 @@ fn drive_over_cell(
             sched_for_comp.completion_drain(&comps);
         }));
     }
+    // #799 L1 (embedder `^C`) — hand the signal source a scheduler-wake closure so an embedder raise
+    // (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every fiber is parked and no
+    // safepoint fires. The personality invokes it only for a *deliverable* signal (its policy). Cleared at
+    // teardown (it captures the run's scheduler — cycle discipline, like `completion_notify`).
+    if let Some((_, source)) = host_shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .signal_poll()
+    {
+        let sched_for_sig = Arc::clone(&sched);
+        source.set_wake(Arc::new(move || {
+            sched_for_sig.interrupt_interruptible_parks();
+        }));
+    }
     let root_id = {
         let mut s = sched.lock();
         let id = s.next_task;
@@ -2586,6 +2600,11 @@ fn drive_over_cell(
         let mut h = host_shared.lock().unwrap_or_else(|e| e.into_inner());
         h.quiesce_pool();
         h.clear_completion_notify();
+        // #799 L1 — drop the signal-wake closure's `Arc<Scheduler>` too (a no-op replaces it), so an
+        // embedder that keeps the source alive past the run doesn't pin the scheduler.
+        if let Some((_, source)) = h.signal_poll() {
+            source.set_wake(Arc::new(|| {}));
+        }
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
@@ -16151,6 +16170,16 @@ pub trait SignalSource: Send + Sync {
     /// state and honor the mask, and leave [`Host::sig_armed`] set iff a further signal is already
     /// deliverable.
     fn take_deliverable(&self) -> Option<(i32, i32, u64)>;
+
+    /// #799 L1 (embedder `^C`) — install the run's **scheduler-wake** closure so the personality can poke
+    /// the interp from *outside* a running fiber. When every fiber is parked (an idle prompt blocked on
+    /// `read`), no per-op safepoint fires, so an embedder raise (`Posix::raise_signal`, a terminal
+    /// `^C`) would set the pending bit and then sit unnoticed. The interp calls this at run start with a
+    /// closure that runs [`Scheduler::interrupt_interruptible_parks`] (+ wakes idle workers); the
+    /// personality invokes it after a raise **iff the signal is deliverable** (its policy), so a blocked
+    /// syscall returns `-EINTR`. Default no-op — a source with no embedder-raise path need not store it;
+    /// the interp installs `|| {}` at teardown to drop its `Scheduler` reference (cycle discipline).
+    fn set_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock

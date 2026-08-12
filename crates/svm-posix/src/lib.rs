@@ -620,6 +620,12 @@ struct Inner {
     /// unmasked signal may be deliverable, so the interp's per-op poll knows to ask [`SignalSource`]. The
     /// same `Arc` is handed to the `Host` at grant time.
     sig_armed: Arc<AtomicBool>,
+    /// #799 L1 (embedder `^C`) — the interp's **scheduler-wake** closure, installed at run start via
+    /// [`SignalSource::set_wake`] and cleared to a no-op at teardown. [`Posix::raise_signal`] invokes it
+    /// after raising a **deliverable** signal, so an embedder `^C` interrupts a parked blocking syscall
+    /// even when every fiber is parked (no per-op safepoint to notice the arm). `None` until a run installs
+    /// it (and between runs).
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -775,10 +781,27 @@ impl Posix {
     /// bit; the guest delivers it at its next `sigcheck` poll if it has a handler installed. Out-of-range
     /// `signum` (`< 1` or `> 63`) is ignored.
     pub fn raise_signal(&self, signum: i32) {
-        if (1..=63).contains(&signum) {
+        if !(1..=63).contains(&signum) {
+            return;
+        }
+        // Set pending + arm under the lock, then decide (still the personality's policy) whether this is
+        // *deliverable* — a caught, unmasked signal with async delivery on. If so, grab the interp's
+        // scheduler-wake closure and invoke it **after releasing the lock** (it locks the scheduler + the
+        // parked vCPUs' hosts, a distinct lock order), so a blocked syscall parked with no running fiber to
+        // notice the arm gets interrupted → `-EINTR` (#799 L1, the terminal `^C`). An ignored/masked
+        // signal is not deliverable, so `wake` stays untouched and nothing is interrupted.
+        let wake = {
             let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             st.sig_pending |= 1 << signum;
-            st.arm_signals(); // #796 L2 — an embedder ^C may be deliverable async, not just at the next poll
+            st.arm_signals(); // #796 L2 — deliverable async, not just at the next poll
+            if st.deliverable_now() {
+                st.wake.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(w) = wake {
+            w();
         }
     }
 }
@@ -927,6 +950,12 @@ impl SignalSource for SignalDoor {
             // SIG_DFL / SIG_IGN: dropped in L0 (no default actions yet), keep scanning for a caught one.
         }
     }
+
+    /// #799 L1 — store the interp's scheduler-wake closure so [`Posix::raise_signal`] can interrupt a
+    /// parked blocking syscall on an embedder `^C`. Installed at run start, cleared to a no-op at teardown.
+    fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).wake = Some(wake);
+    }
 }
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
@@ -1042,6 +1071,7 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         sig_action_flags: HashMap::new(),
         sig_stack_base: 0,
         sig_armed: Arc::new(AtomicBool::new(false)),
+        wake: None,
     }
 }
 
@@ -1577,6 +1607,26 @@ impl Inner {
         if self.sig_stack_base != 0 {
             self.sig_armed.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// #799 L1 — is a signal **deliverable right now**? Non-destructive twin of [`SignalDoor::
+    /// take_deliverable`]'s gate: a caught (`> SIG_IGN`), unmasked, pending signal with async delivery on
+    /// (a signal stack registered). This is the personality's *policy* the embedder-`^C` path consults
+    /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
+    /// a blocked syscall.
+    fn deliverable_now(&self) -> bool {
+        if self.sig_stack_base == 0 {
+            return false; // async delivery off (poll-only)
+        }
+        let mut d = self.sig_pending & !self.sig_mask;
+        while d != 0 {
+            let s = d.trailing_zeros() as i32;
+            d &= !(1u64 << s);
+            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) > SIG_IGN {
+                return true;
+            }
+        }
+        false
     }
 
     /// `sigaltstack(sp, size) -> 0` (#796 L2): register the guest's dedicated signal-handler stack (the

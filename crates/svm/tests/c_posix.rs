@@ -582,6 +582,74 @@ fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
     );
 }
 
+/// #799 slice 5 — **the embedder `^C`: a signal from *outside* the run interrupts a blocked syscall.** The
+/// interactive terminal case: the guest catches SIGINT and blocks on a capability `__vm_read` in a
+/// **single** fiber — so when it parks (`Blocked::PipeRead`), *every* fiber is parked and no per-op
+/// safepoint fires. A background "terminal" thread calls `Posix::raise_signal(SIGINT)` (the embedder's
+/// signal authority over the guest — the `Posix` handle shares the personality `Inner` with the running
+/// guest); the personality decides it is deliverable and invokes the interp's scheduler-wake closure, so
+/// the parked read completes `-EINTR` (sentinel 42). The raiser retries until the run returns (robust to
+/// install/park ordering — each raise before the guest parks is a harmless no-op).
+const EINTR_EMBEDDER_SRC: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_sigaltstack(int cap, long sp, long size);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+static char sigstk[16384];
+static volatile long fired;
+static void handler(int sig) { fired = sig; }
+int main(void) {
+  __px_signal(0, 2, (long)handler);          /* catch SIGINT */
+  __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  int fds[2];
+  __vm_pipe(fds);                            /* main holds both ends -> a live writer keeps the read blocked */
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);          /* single fiber PARKS -> all parked, no safepoint; ^C -> -EINTR */
+  if (n == -4) return 42;                    /* -EINTR: the terminal ^C interrupted the blocked read */
+  return (int)n;
+}
+"#;
+
+#[test]
+fn c_an_embedder_signal_interrupts_a_blocked_read_ctrl_c() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let ir = c_to_ir(EINTR_EMBEDDER_SRC);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut ih = Host::new();
+    let (posix, px) = setup(&mut ih, win);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    bind_shim(&raw, &mut ih, px);
+    // A background "terminal" raises SIGINT until the guest takes EINTR and the run returns. `raise_signal`
+    // shares the personality `Inner` with the running guest (via the `Posix` handle), so it reaches it
+    // mid-run and — when deliverable — pokes the interp's scheduler-wake to interrupt the parked read.
+    let posix2 = posix.clone();
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let done2 = std::sync::Arc::clone(&done);
+    let terminal = std::thread::spawn(move || {
+        while !done2.load(Ordering::Relaxed) {
+            posix2.raise_signal(2);
+            std::thread::yield_now();
+        }
+    });
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(&raw, 0, &[], &mut fuel, &mut ih);
+    done.store(true, Ordering::Relaxed);
+    terminal.join().unwrap();
+    match r {
+        Ok(v) => assert_eq!(
+            v.as_slice(),
+            [Value::I32(42)],
+            "an embedder ^C (raise_signal from another thread) interrupted the guest's blocked read"
+        ),
+        Err(e) => panic!("interp trapped: {e:?}\n{ir}"),
+    }
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
