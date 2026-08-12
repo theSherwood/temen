@@ -80,11 +80,11 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
   return f0;
 }
 
-// Drive an already-opened single-shot JIT run to completion: copy the emitted `_start` out, compile +
-// instantiate it against the cdylib's shared `memory`, and call `f0(win, env, ...slots)` once. Returns
-// the finish status. The caller must have opened the run (`svm_onramp_jit_run_open*`) already.
-// `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module is
-// reused across Runs (see `jitModuleCache`).
+// Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
+// + instantiated against the cdylib's shared `memory`, reused across Runs) and call `f0(win, env, ...slots)`
+// once. Returns the finish status. The caller must have opened the run (`svm_onramp_jit_run_open*`) already.
+// `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
+// instance are reused across Runs (see `cachedInstanceF0`).
 async function driveJitRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
@@ -97,34 +97,29 @@ async function driveJitRun(ex, memory, cacheKey) {
 
   // `env.call_interp` relays each cross-tier call to the cdylib; a nonzero status (exit/trap) throws to
   // unwind the emitted `f0` (the browser's JS import model — `Exit` and real traps both caught below).
-  // Reuse the compiled Module across Runs of the same guest module (skip V8 codegen); compile + cache
-  // on a miss. The emitted bytes are copied out of wasm memory **only on a miss** (skip the ~MBs copy on
-  // a hit). Instantiation stays per-Run here — this path re-opens (a fresh window) each Run, so the win
-  // it passes changes; the warm path (`runWarmJit`) caches the instance too (issue #803).
-  let module = cacheGet(cacheKey);
-  if (module === undefined) {
-    // Copy the emitted bytes out (a later svm_alloc could move the stash) and compile.
-    const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
-    const wlen = ex.svm_onramp_jit_run_wasm_len();
-    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
-    cachePut(cacheKey, module);
-    jitCacheStats.compiles++;
-  } else {
-    jitCacheStats.hits++;
-  }
-  const instance = await WebAssembly.instantiate(module, {
-    env: {
+  // Reuse the compiled Module **and** the instance across Runs of the same guest module (issue #803):
+  // the emitted bytes are copied out of wasm memory only on a compile miss, and one instance serves every
+  // Run. Safe even though this path re-opens a fresh window each Run — `win` is passed to `f0` per Run,
+  // and the cross-tier bounce routes to the current cdylib run, so a reused instance runs against current
+  // state (the warm path reuses the same way, and the reactor reuses one instance across every frame).
+  let f0;
+  try {
+    f0 = await cachedInstanceF0(
       memory,
-      trap: () => {},
-      call_interp: (func, argsPtr) => {
+      cacheKey,
+      () => {
+        // Copy the emitted bytes out (a later svm_alloc could move the stash).
+        const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
+        const wlen = ex.svm_onramp_jit_run_wasm_len();
+        return u8().slice(wptr, wptr + wlen);
+      },
+      (func, argsPtr) => {
         if (ex.svm_onramp_jit_run_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
       },
-    },
-  });
-  const f0 = instance.exports.f0;
-  if (typeof f0 !== 'function') {
+    );
+  } catch (e) {
     ex.svm_onramp_jit_run_close();
-    throw new Error('emitted module has no f0 export');
+    throw e;
   }
 
   const env = Number(ex.svm_alloc(envBytes));
