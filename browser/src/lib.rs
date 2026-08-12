@@ -7194,8 +7194,15 @@ fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, svm_ir::Resolved)>> {
 /// The browser's [`svm_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
 /// cap: decode the symbol table → `decode_module` (fail-closed) → resolve named imports against the
 /// table (`Slot`/`Cap`) → `verify_module` (the escape-freedom gate) → the memory-match precondition →
-/// reject data segments and concurrency ops. A pure-Rust replica of `svm-run`'s canonical validator
+/// reject data segments and threads/futex ops. A pure-Rust replica of `svm-run`'s canonical validator
 /// (same symtab wire form), so it builds for wasm with no Cranelift dep.
+///
+/// **Fibers are admitted** (#845 — the §22 renegotiated 2026-07-30 split, matching the canonical
+/// gate in `svm-run`): `cont.*`/`suspend` switch stacks within the domain on the caller's thread,
+/// so a unit that runs its own scheduler to completion never parks across the synchronous invoke.
+/// *Emitted* execution of a fiber-using unit stays fail-closed with no gate here: `compile_jit`'s
+/// `reachable_concurrency` guard never yields `WasmDriven` for one, so both wasm emitters return
+/// `None` and the invoke runs on the interpreter (whose nested eval services the fiber ops).
 fn browser_jit_validator(
     bytes: &[u8],
     mem_log2: Option<u8>,
@@ -7220,7 +7227,10 @@ fn browser_jit_validator(
     if m.memory.map(|mc| mc.size_log2) != mem_log2 {
         return Err(EINVAL); // declared memory must equal the parent window
     }
-    if !m.data.is_empty() || m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_concurrency()) {
+    if !m.data.is_empty()
+        || m.funcs.is_empty()
+        || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex())
+    {
         return Err(EINVAL);
     }
     Ok(m.funcs.into())

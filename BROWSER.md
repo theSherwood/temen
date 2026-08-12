@@ -342,8 +342,13 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
 - [x] **§22 guest-JIT** (interpreted — no native backend). The guest holds a `Jit` cap (iface 11),
   `install`s a host-compiled unit (`a*b+100`) into its dispatch table and `call_indirect`s it (→ 142);
   `uninstall` then call → freed-slot trap. The **security validator** (`decode_module` → `verify_module`
-  → memory-match / no-data / no-concurrency preconditions) is a pure-Rust replica of svm-run's, so it
-  runs in wasm with no Cranelift. wasm64 `run_jit() == 142`.
+  → memory-match / no-data / no-threads-futex preconditions) is a pure-Rust replica of svm-run's, so it
+  runs in wasm with no Cranelift. Fibers in a unit are **admitted** (#845 — the §22 renegotiated
+  2026-07-30 split, matching the canonical gate): the bytecode engine's `run_invoke` services
+  `cont.*`/`suspend` against an invoke-confined registry (entries resolve through module 0's natural
+  table, `step_vcpu`'s shape), pinned tree-walker ≡ bytecode by `svm-interp/tests/invoke_fibers.rs`
+  and end-to-end (oracle ≡ pump, and never emitted) by `browser/tests/tierup_driver.rs`. wasm64
+  `run_jit() == 142`.
 - [x] **§22 dynamic linking** (`compile_linked`). A separately-compiled unit's **named import**
   (`call.import "clock"`) is resolved by a guest-provided symbol table to a host capability (Clock,
   iface 2) *before* verify — lowering it to a real `cap.call 2 0` — so a plugin reaches a host service

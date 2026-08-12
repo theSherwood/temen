@@ -8165,9 +8165,16 @@ fn gc_write(
 
 /// Run an invoked §22 unit (`Jit.invoke`) synchronously: a fresh `Vm` for `module`'s entry (func 0)
 /// over the shared window/powerbox and the **shared** dispatch table (so the unit's `call_indirect`
-/// reaches installed units), to completion. An invoked unit is concurrency-/seam-free — the
-/// tree-walker `CapFault`s if it parks, spawns, yields, or re-installs — so anything but a plain
-/// return is an inert `CapFault`; a trap propagates to the invoker.
+/// reaches installed units), to completion. An invoked unit is threads-/seam-free — spawning,
+/// event-parking, or re-installing `CapFault`s — but it **may host fibers** (DESIGN.md §22
+/// "Concurrency", renegotiated 2026-07-30): `cont.*`/`suspend` are serviced here against an
+/// **invoke-confined** registry (a fiber lives and dies within this one invoke — no migration to
+/// the run's fibers), with entries resolved through module 0's natural table exactly as
+/// [`step_vcpu`]'s arms do (a fiber over an *installed* unit function is the same deferred case).
+/// A `suspend` at the invoke root would park the synchronous invoke — `CapFault`, the seam-free
+/// half of the contract ("a unit runs its own scheduler to completion"). No durability shadowing:
+/// a freeze never lands mid-invoke (snapshot paths carry no invoke state), so unlike `step_vcpu`
+/// there is no `fiber_sp`/`shadow_switch` bookkeeping. A trap propagates to the invoker.
 fn run_invoke(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -8178,18 +8185,109 @@ fn run_invoke(
     host: &mut HostCell,
 ) -> Result<Vec<Value>, Trap> {
     let unit = source.get(module).ok_or(Trap::Malformed)?;
-    let mut vm = Vm::new(&unit, 0, args)?;
-    vm.module = module;
+    let mut active = Vm::new(&unit, 0, args)?;
+    active.module = module;
+    // The invoke-confined fiber registry + resumer chain (`(resumer's fiber id, resumer, dst)`).
+    // Invariant: `chain` is non-empty iff `active` is a fiber (`active_id` then indexes `fibers`).
+    let mut fibers: Vec<FiberState> = Vec::new();
+    let mut chain: Vec<(usize, Vm, u32)> = Vec::new();
+    let mut active_id = usize::MAX; // sentinel while the unit entry itself is active
     loop {
-        match vm.resume(source, table, fuel, mem, host, u64::MAX)? {
-            Outcome::Done(vals) => return Ok(vals),
+        match active.resume(source, table, fuel, mem, host, u64::MAX)? {
+            Outcome::Done(vals) => match chain.pop() {
+                // The unit entry finished — the invoke's results.
+                None => return Ok(vals),
+                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` back.
+                Some((rid, resumer, rdst)) => {
+                    fibers[active_id] = FiberState::Done;
+                    let retval = vals.first().copied().unwrap_or(Value::I64(0));
+                    active = resumer;
+                    active_id = rid;
+                    active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                    active.set(rdst + 1, Reg::from_value(retval));
+                }
+            },
             Outcome::Suspended => {}
             // F2 — a punted host call inside an invoked unit keeps the pre-F2 inline wait
             // (the unit is a seam-free atomic leaf, DESIGN §22: no park surface exists here,
-            // so blocking in place is the contract, not a divergence).
+            // so blocking in place is the contract, not a divergence). Because every cap call
+            // completes inline, an invoke fiber is never `CapParked` — no drain arm needed.
             Outcome::CapPending { id, dst } => {
                 let r = host.with(|p| p.completions()).wait(id);
-                vm.set(dst, Reg::from_i64(r));
+                active.set(dst, Reg::from_i64(r));
+            }
+            Outcome::ContNew { funcref, sp, dst } => {
+                if fibers.len() + 1 >= super::MAX_FIBERS {
+                    return Err(Trap::FiberFault);
+                }
+                let h = fibers.len() as i32;
+                fibers.push(FiberState::Pending { funcref, sp });
+                active.set(dst, Reg::from_i32(h));
+            }
+            // Fibers here never event-park (every park surface faults or waits inline above), so
+            // the I48 `blocking` flag is a no-op — `cont.resume.block` behaves like `cont.resume`.
+            Outcome::ContResume {
+                kh,
+                arg,
+                dst,
+                blocking: _,
+                resume_ip: _,
+            } => {
+                let k = kh as usize;
+                let target = match fibers.get_mut(k) {
+                    Some(slot @ FiberState::Pending { .. }) => {
+                        let (funcref, sp) = match std::mem::replace(
+                            slot,
+                            FiberState::Running { blocking_ip: None },
+                        ) {
+                            FiberState::Pending { funcref, sp } => (funcref, sp),
+                            _ => unreachable!(),
+                        };
+                        // Resolve through module 0's natural table + the fiber signature, exactly
+                        // as `step_vcpu` (the raw-slot naming of DESIGN.md §22's renegotiation).
+                        let m0 = source.primary();
+                        let f = (funcref as u32 as usize) & m0.table_mask;
+                        let ok = m0
+                            .sigs
+                            .get(f)
+                            .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
+                        if !ok {
+                            return Err(Trap::FiberFault);
+                        }
+                        Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)])?
+                    }
+                    Some(slot @ FiberState::Parked { .. }) => {
+                        match std::mem::replace(slot, FiberState::Running { blocking_ip: None }) {
+                            FiberState::Parked {
+                                mut vm,
+                                suspend_dst,
+                            } => {
+                                vm.set(suspend_dst, Reg::from_i64(arg));
+                                vm
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => return Err(Trap::FiberFault), // forged / Running / Done
+                };
+                let resumer = std::mem::replace(&mut active, target);
+                chain.push((active_id, resumer, dst));
+                active_id = k;
+            }
+            Outcome::FiberSuspend { value, dst } => {
+                // An empty chain means the unit entry itself tried to `suspend` — that would park
+                // the synchronous invoke, the seam the §22 contract forbids.
+                let Some((rid, resumer, rdst)) = chain.pop() else {
+                    return Err(Trap::CapFault);
+                };
+                let suspended = std::mem::replace(&mut active, resumer);
+                fibers[active_id] = FiberState::Parked {
+                    vm: suspended,
+                    suspend_dst: dst,
+                };
+                active_id = rid;
+                active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
+                active.set(rdst + 1, Reg::from_i64(value));
             }
             _ => return Err(Trap::CapFault),
         }
