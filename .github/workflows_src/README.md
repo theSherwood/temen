@@ -25,6 +25,16 @@ identical until the next agent edit.
   new toolchain. Verified locally in Node/V8. (Until copied over, the `workflows-in-sync` guard stays
   red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`warm-jit-test.mjs` in the `browser-real` job** — one line added right after `node
+  warm-snapshot-test.mjs`: `node warm-jit-test.mjs`. Validates the WASM_AOT.md **warm+JIT** tier
+  (issue #783): `svm_warm_jit_open` emits the QuickJS `eval_run` to wasm once, `runWarmJit` (from
+  `web/wasmjit-module.js`) drives it over the restored snapshot each Run — which must match the
+  interpreter warm path (`svm_warm_eval`) byte-for-byte, keep fresh-per-Run isolation (a `var` in one
+  Run cannot leak into the next), and accelerate a compute-heavy eval (measured ~9× on a 500k-iteration
+  loop; a trivial program stays on warm-interp). Uses the committed `web/assets/qjs_snapshot.svmb`;
+  skips cleanly if absent. Reuses the threads wasm the job already builds — no new toolchain. Verified
+  locally in Node/V8.
+
 - **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
   test block (right after the already-copied `node browser-jit-cache-test.mjs`):
   `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
