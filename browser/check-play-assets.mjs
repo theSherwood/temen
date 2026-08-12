@@ -39,7 +39,6 @@ const BUILT_AT_DEPLOY = new Set([
   'gpu_shader.svmb',      // build-onramp-assets.mjs
   'doom.svmb',            // build-onramp-assets.mjs (id's DOOM source is fetched-and-built)
   'doom1.wad',            // build-onramp-assets.mjs — staged from the vendored demos/doom/doom1.wad
-  'lua_eval.svmb',        // build-onramp-assets.mjs (fetches Lua source)
   'sqlite_repl.svmb',     // build-onramp-assets.mjs (fetches SQLite amalgamation)
   'shell.svmb',           // build-onramp-assets.mjs (copies the committed tests/fixtures/shell.svmb)
   'stage_runner.svmb',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
