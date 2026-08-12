@@ -542,7 +542,7 @@ fn reactor_frame(probe: i64, paged: bool) -> (Result<Vec<Value>, Trap>, u32) {
     let wasm = if paged {
         let (wasm, eligible) =
             compile_module_tierup_paged(&m, false, page.trailing_zeros() as u8).expect("emit");
-        assert_eq!(eligible[2], true, "the load leaf must be paged-eligible");
+        assert!(eligible[2], "the load leaf must be paged-eligible");
         r = r
             .with_jit_eligible(Arc::from(eligible.into_boxed_slice()))
             .with_jit_page_checked();
