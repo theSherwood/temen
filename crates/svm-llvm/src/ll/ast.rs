@@ -468,6 +468,10 @@ pub enum Constant {
     Add(ConstBinaryOp),
     Sub(ConstBinaryOp),
     Mul(ConstBinaryOp),
+    And(ConstBinaryOp),
+    Or(ConstBinaryOp),
+    Xor(ConstBinaryOp),
+    Shl(ConstBinaryOp),
     /// Constant-expression integer compare `icmp <pred> (<ty> <c0>, <ty> <c1>)` → `i1`. clang leaves
     /// one when a comparison of two constants can't be folded to a literal — e.g. a function address
     /// vs. a sentinel (`icmp eq (ptr inttoptr (i64 3 to ptr), ptr @f)`), which appears as an
@@ -537,7 +541,13 @@ impl Typed for Constant {
             | Constant::IntToPtr(u)
             | Constant::BitCast(u)
             | Constant::AddrSpaceCast(u) => u.to_type.clone(),
-            Constant::Add(b) | Constant::Sub(b) | Constant::Mul(b) => types.type_of(&b.operand0),
+            Constant::Add(b)
+            | Constant::Sub(b)
+            | Constant::Mul(b)
+            | Constant::And(b)
+            | Constant::Or(b)
+            | Constant::Xor(b)
+            | Constant::Shl(b) => types.type_of(&b.operand0),
             // An integer compare yields `i1`, exactly like the instruction-level `icmp`.
             Constant::ICmp { .. } => types.int(1),
         }

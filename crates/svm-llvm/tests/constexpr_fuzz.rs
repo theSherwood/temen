@@ -44,6 +44,11 @@ enum E {
     TruncZext(Box<E>),
     /// `sext (i32 trunc (i64 <inner> to i32) to i64)` — the low 32 bits, sign-extended.
     TruncSext(Box<E>),
+    And(Box<E>, Box<E>),
+    Or(Box<E>, Box<E>),
+    Xor(Box<E>, Box<E>),
+    /// `shl (i64 <inner>, i64 <shift>)` with `shift` in `0..64`.
+    Shl(Box<E>, u32),
 }
 
 /// A pointer-typed constexpr node.
@@ -65,21 +70,35 @@ fn gen_e(rng: &mut Rng, depth: u32) -> E {
             E::PtrToInt(Box::new(gen_p(rng, depth.saturating_sub(1))))
         }
     } else {
-        match rng.below(6) {
-            0 => E::Add(
-                Box::new(gen_e(rng, depth - 1)),
-                Box::new(gen_e(rng, depth - 1)),
-            ),
-            1 => E::Sub(
-                Box::new(gen_e(rng, depth - 1)),
-                Box::new(gen_e(rng, depth - 1)),
-            ),
-            2 => E::Mul(
-                Box::new(gen_e(rng, depth - 1)),
-                Box::new(gen_e(rng, depth - 1)),
-            ),
+        let pair = |rng: &mut Rng, d: u32| (Box::new(gen_e(rng, d)), Box::new(gen_e(rng, d)));
+        match rng.below(10) {
+            0 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::Add(a, b)
+            }
+            1 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::Sub(a, b)
+            }
+            2 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::Mul(a, b)
+            }
             3 => E::TruncZext(Box::new(gen_e(rng, depth - 1))),
             4 => E::TruncSext(Box::new(gen_e(rng, depth - 1))),
+            5 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::And(a, b)
+            }
+            6 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::Or(a, b)
+            }
+            7 => {
+                let (a, b) = pair(rng, depth - 1);
+                E::Xor(a, b)
+            }
+            8 => E::Shl(Box::new(gen_e(rng, depth - 1)), rng.below(64)),
             _ => E::PtrToInt(Box::new(gen_p(rng, depth - 1))),
         }
     }
@@ -109,6 +128,10 @@ fn render_e(e: &E) -> String {
         E::Mul(a, b) => format!("i64 mul ({}, {})", render_e(a), render_e(b)),
         E::TruncZext(e) => format!("i64 zext (i32 trunc ({} to i32) to i64)", render_e(e)),
         E::TruncSext(e) => format!("i64 sext (i32 trunc ({} to i32) to i64)", render_e(e)),
+        E::And(a, b) => format!("i64 and ({}, {})", render_e(a), render_e(b)),
+        E::Or(a, b) => format!("i64 or ({}, {})", render_e(a), render_e(b)),
+        E::Xor(a, b) => format!("i64 xor ({}, {})", render_e(a), render_e(b)),
+        E::Shl(a, s) => format!("i64 shl ({}, i64 {s})", render_e(a)),
     }
 }
 
@@ -137,6 +160,10 @@ fn eval_e(e: &E, addrs: &[i64]) -> i64 {
         // low 32 bits, zero- / sign-extended (matching the on-ramp's trunc+zext / trunc+sext folds).
         E::TruncZext(e) => (eval_e(e, addrs) as u32) as u64 as i64,
         E::TruncSext(e) => (eval_e(e, addrs) as i32) as i64,
+        E::And(a, b) => eval_e(a, addrs) & eval_e(b, addrs),
+        E::Or(a, b) => eval_e(a, addrs) | eval_e(b, addrs),
+        E::Xor(a, b) => eval_e(a, addrs) ^ eval_e(b, addrs),
+        E::Shl(a, s) => eval_e(a, addrs).wrapping_shl(*s),
     }
 }
 

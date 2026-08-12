@@ -1423,6 +1423,16 @@ fn const_eval(
         K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
         K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
         K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        // Bitwise + left-shift constexprs (e.g. alignment masks `and(ptrtoint(@g), -16)`). All fold
+        // correctly in i64 and mask to the result width at the consumer, since `and`/`or`/`xor`/`shl`
+        // commute with keeping the low N bits (unlike a right shift, which is width-sensitive — those
+        // are deferred). The shift amount is masked to the operand width by `wrapping_shl`.
+        K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a & b),
+        K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a | b),
+        K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a ^ b),
+        K::Shl(x) => {
+            bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_shl(b as u32))
+        }
         // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
         // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
         K::GetElementPtr(g) => {
@@ -16179,6 +16189,10 @@ impl<'a> BlockCtx<'a> {
                 Constant::Add(_)
                 | Constant::Sub(_)
                 | Constant::Mul(_)
+                | Constant::And(_)
+                | Constant::Or(_)
+                | Constant::Xor(_)
+                | Constant::Shl(_)
                 | Constant::Trunc(_)
                 | Constant::ZExt(_)
                 | Constant::SExt(_) => {
