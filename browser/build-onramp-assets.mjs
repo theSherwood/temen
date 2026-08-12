@@ -261,16 +261,12 @@ try {
   console.log(`  – tcl skipped (${e.message} — offline, or no clang/llvm-link)`);
 }
 
-// 3) Lua (interactive) — Lua 5.4.7 core + base/string/table/math/coroutine/io/os libraries + a guest
-//    snprintf, with a harness that reads a Lua chunk from **stdin** and runs it. The page pipes the
-//    editor's text in as stdin, so the user writes and runs their own Lua. io.write/os.date/coroutine
-//    all work; file I/O (io.open) degrades to nil (no fs cap granted). Committed golden fixture
-//    (`lua_eval.ll` — the textual `.ll` the reader ingests directly; no Lua source needed).
-try {
-  buildBc('lua_eval', join(REPO, 'crates', 'svm-llvm', 'tests', 'fixtures', 'lua', 'lua_eval.ll'));
-} catch (e) {
-  console.log(`  ✗ lua_eval: ${e.message}`);
-}
+// 3) Lua (interactive) — the warm Lua card ships the committed prebuilt **`lua_snapshot.svmb`** (the
+//    two-phase `main`/`warmup`/`eval_run` driver, issue #805), so nothing is built here. It's a
+//    generated binary asset like the vendored `doom1.wad`: regenerate it by hand from
+//    `lua_snapshot_harness.c` + Lua 5.4.7 via the recipe in `crates/svm-llvm/tests/fixtures/lua/README.md`
+//    ("Lua warm-runtime-snapshot fixture") and commit the resulting `.svmb`. We deliberately do NOT
+//    commit the ~76k-line intermediate `.ll` (unlike `lua_eval.ll`, no Rust test consumes it).
 
 // 4) Doom (interactive reactor) — doomgeneric through the on-ramp, driven one `tick` per frame over
 //    the persistent window; `_start` reads the shareware IWAD through the `fs` capability. Two assets:

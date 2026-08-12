@@ -694,16 +694,22 @@ block 0 (sp2: i64, arg2: i64) {
   },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
-    jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
+    warm: true, // issue #805: the two-phase `lua_snapshot` driver (warmup + eval_run) — init the Lua
+    // runtime + editor libs once, snapshot, then restore-and-eval per Run. Runs on the snapshot worker
+    // (pre-warmed off the main thread), so the first Run is instant like the QuickJS card.
+    jit: true, // eval_run is also wasm-JIT-emittable; ticking "wasm-JIT" runs warm+JIT (near-native eval
+    // over the restored snapshot), falling back to warm-interp if the eval declines.
     editable: true,
     lang: 'lua',
-    url: './assets/lua_eval.svmb',
+    url: './assets/lua_snapshot.svmb',
     mode: 'io',
     desc: 'Lua 5.4.7 — its core (lexer, parser, GC, bytecode VM) plus the base/string/table/math/' +
       'coroutine/io/os libraries, compiled through the LLVM on-ramp. Edit the Lua on the left and ' +
       'click Run: your code is piped to the guest as stdin, evaluated, and its output appears below. ' +
-      'Real Lua, running client-side in the sandbox. Toggle "wasm-JIT" to run the whole interpreter ' +
-      'on emitted wasm (near-native — the ~7% cross-tier helpers bounce to the interpreter); ' +
+      'Real Lua, running client-side in the sandbox. By default it uses a warm-runtime snapshot ' +
+      '(pre-warmed on a worker at page load): the Lua runtime + libraries are initialized once, then ' +
+      'every Run restores that warm image and evaluates only your code (each Run starts clean). Tick ' +
+      '"wasm-JIT" to evaluate on emitted wasm over that same warm image (warm+JIT — near-native eval); ' +
       '"Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
     src: `-- Write Lua here, then click Run.
 print("Hello from " .. _VERSION)

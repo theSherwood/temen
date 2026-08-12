@@ -34,6 +34,13 @@ patched*.wasm
 # `qjs_repl.svmb`. `build-onramp-assets.mjs` rebuilds it in place when the sources are fetchable; the
 # committed `warm-snapshot-test.mjs` uses it (and skips cleanly if absent).
 !/web/assets/qjs_snapshot.svmb
+# lua_snapshot.svmb — the two-phase (`main`/`warmup`/`eval_run`) Lua 5.4.7 driver for the warm-runtime
+# snapshot (issue #805), committed prebuilt like `qjs_snapshot.svmb` so the warm Lua card + the
+# `snapshot-worker-test.mjs` browser test work out of the box (browser-real runs on committed assets
+# only). A generated binary asset (like the vendored `doom1.wad`): regenerate from
+# `lua_snapshot_harness.c` via the recipe in crates/svm-llvm/tests/fixtures/lua/README.md and commit it —
+# the ~76k-line intermediate `.ll` is NOT committed (no Rust test consumes it, unlike `lua_eval.ll`).
+!/web/assets/lua_snapshot.svmb
 # chibicc (the in-browser C compiler, SELFHOST_C.md §7 step 5) is committed prebuilt for the same
 # reason: `build-onramp-assets.mjs` builds it fail-soft (skipped when clang/llvm-18 is absent or the
 # build hiccups), so relying on the deploy-time build alone silently ships a 404 (the I26/I42 class).

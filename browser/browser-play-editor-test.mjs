@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path';
 // doesn't run (only committed assets are present there). So the editable-module stdin check only runs
 // when the Lua asset is actually built — otherwise it's SKIPped, not failed.
 const HERE = dirname(fileURLToPath(import.meta.url));
-const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_eval.svmb'));
+const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_snapshot.svmb'));
 const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.svmb'));
 // The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
 // check additionally needs the native `chibicc` (built by that same script) as the reference oracle.
@@ -93,7 +93,7 @@ try {
       card('Lua (5.4.7 — write & run)'));
     luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the card editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
   } else {
-    console.log('  SKIP: editable-module stdin (lua_eval.svmb not built — run build-onramp-assets.mjs)');
+    console.log('  SKIP: editable-module stdin (lua_snapshot.svmb not built — run build-onramp-assets.mjs)');
   }
 
   // The svm-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
@@ -138,11 +138,14 @@ try {
       && q1.stdout.includes('fib(0..10): 0 1 1 2 3 5 8 13 21 34 55') && q1.stdout.includes('sorted: 1,2,3,5,7,8,9')
       ? ok('QuickJS card runs on the warm-runtime snapshot → correct output')
       : fail(`qjs first run: ${JSON.stringify({ state: q1.state, msg: q1.msg, out: q1.stdout.slice(0, 80) })}`);
-    // 2) Second Run — warm session reused: byte-identical output, and much faster (rebuild paid once).
+    // 2) Second Run — warm session reused: byte-identical output. The runtime rebuild is paid once, but
+    // since the card pre-warms on the snapshot worker at page load (issue #804), the FIRST Run is already
+    // warm too — so this asserts output stability across Runs, not a first-vs-second timing gap (that gap
+    // moved into the worker's pre-warm; warm-snapshot-test measures it directly). `msOf` kept for logging.
     await runCard(page, qjsName, 30_000);
     const q2 = await readQ();
-    q2.state === 'done' && q2.stdout === q1.stdout && msOf(q2.msg) * 2 < msOf(q1.msg)
-      ? ok(`QuickJS warm reuse: byte-identical, ${msOf(q1.msg)}ms → ${msOf(q2.msg)}ms (runtime rebuilt once)`)
+    q2.state === 'done' && q2.stdout === q1.stdout
+      ? ok(`QuickJS warm reuse: byte-identical across Runs (${msOf(q1.msg)}ms → ${msOf(q2.msg)}ms)`)
       : fail(`qjs warm reuse: ${JSON.stringify({ q1: msOf(q1.msg), q2: msOf(q2.msg), same: q2.stdout === q1.stdout })}`);
     // 3) Fresh-per-Run isolation: a global defined in one Run must NOT survive into the next.
     await setQ('var leaked = 42; typeof leaked;\n');

@@ -16,6 +16,14 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`lua-warm-snapshot-test.mjs` + Lua coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
+  #805)** — one line added after `node warm-jit-test.mjs`: `node lua-warm-snapshot-test.mjs` (Node/V8
+  cold ≡ warm ≡ warm+JIT byte-for-byte + isolation over the committed `lua_snapshot.svmb`). The existing
+  `node snapshot-worker-test.mjs` line is unchanged, but the test itself now also drives the **Lua** warm
+  card (one worker per module, so QuickJS + Lua stay warm at once). Both use committed assets; skip
+  cleanly if absent. Verified locally (Node + Chromium). (Until copied over, the `workflows-in-sync` guard
+  stays red — the expected mirror-edit friction.)
+
 - **`warm-snapshot-test.mjs` in the `browser-real` job** — one line added to the Chromium test block
   (right after `node browser-jit-cache-test.mjs`): `node warm-snapshot-test.mjs`. Validates the
   WASM_AOT.md warm-runtime snapshot: `svm_warm_open` runs the QuickJS `warmup` export once, then
