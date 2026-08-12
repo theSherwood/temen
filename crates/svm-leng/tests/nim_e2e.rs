@@ -525,3 +525,39 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     let out = captured.lock().unwrap().clone();
     out
 }
+
+/// Richer end-to-end I/O over the same chain — output that actually *formats*, exercising the
+/// cross-module sret `$`(int)→string conversion and the `$sp`-carrying funcref ABI (the at-exit
+/// flush) on top of W1/W2/W3: an `$`-formatted integer, a loop emitting one conversion per iteration,
+/// and a `writeLine` pair. Same manifest-link + `sysWrite`-capture harness as the hello case.
+#[test]
+fn real_formatted_output_runs_end_to_end() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nwrite(stdout, $(20 + 22))\n"
+        )),
+        b"42",
+        "`$`(int)->string then write"
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nfor i in 0..2: write(stdout, $i)\n"
+        )),
+        b"012",
+        "loop with a per-iteration `$` conversion"
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nwriteLine(stdout, \"line one\")\nwriteLine(stdout, \"line two\")\n"
+        )),
+        b"line one\nline two\n",
+        "two writeLine calls"
+    );
+}
