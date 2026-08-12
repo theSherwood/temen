@@ -97,6 +97,27 @@ fn aggregate_global_initializer_is_materialized() {
     );
 }
 
+#[test]
+fn global_pointer_deref() {
+    // A module-level **pointer global** (`var x: ptr Node` — nimony's `ref NodeObj`, lowered to a
+    // pointer) is dereferenced: `roundtrip` builds a frame object, points the global at it, then reads
+    // a field back through the global pointer. `pointer_operand` fail-closed on a global pointer
+    // ("`x.0.` is not a known pointer" — it tracked only *local* pointers); it now falls through to
+    // load the global's value. Real nimony emits these for every module-level `ref` var (binary
+    // trees, linked lists — the #760 pointer-tracking gap).
+    let leng = "\
+(stmts
+ (type :Node.0. . (object . (fld :data.0 . (i +64))))
+ (gvar :x.0. . (ptr Node.0.) .)
+ (proc :roundtrip.0. . (i +64) .
+  (stmts .
+   (var :o.0 . Node.0. (oconstr Node.0. (kv data.0 42)))
+   (asgn x.0. (addr o.0))
+   (ret (dot (deref x.0.) data.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[4096]), 42, "(deref global x).data = 42");
+}
+
 /// Real nimony `hexer` output for `var counter: int = 42` plus `getCounter`/`addCounter` — the
 /// static non-zero initializer must seed the window so `getCounter()` reads 42.
 #[test]

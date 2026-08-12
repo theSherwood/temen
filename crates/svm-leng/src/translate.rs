@@ -2361,13 +2361,13 @@ impl<'a> FuncGen<'a> {
     /// the pointer, pointee from the `Ptr` field type). Anything else fail-closes.
     fn pointer_operand(&mut self, operand: &Node) -> Result<(u32, TyDesc), LengError> {
         if let Some(pname) = operand.as_atom() {
-            let desc = self.pointee.get(pname).cloned().ok_or_else(|| {
-                LengError::Unsupported(format!("`{pname}` is not a known pointer"))
-            })?;
-            let pv = self
-                .lookup(pname)
-                .ok_or_else(|| LengError::Unsupported(format!("unknown pointer `{pname}`")))?;
-            return Ok((pv.id, desc));
+            // A tracked **local** pointer — its SSA value + tracked pointee. If the name isn't a local
+            // pointer (a **global** `var x: ref T`, a pointer-valued field), don't fail here: fall
+            // through to the lvalue path below, which loads a global pointer's value (`lvalue_addr`
+            // yields the global's slot address and a `Ptr` desc) or a `(dot s more)` field pointer.
+            if let (Some(desc), Some(pv)) = (self.pointee.get(pname).cloned(), self.lookup(pname)) {
+                return Ok((pv.id, desc));
+            }
         }
         if operand.tag() == Some("cast") {
             let ca = operand.args();
