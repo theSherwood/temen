@@ -322,12 +322,12 @@ block 0 (v0: i64) {{
 }
 
 /// The `vm_jit_*`-importing guest (#835 — the JACL compiler shape in miniature): `_start` grows
-/// `[64 KiB, 80 KiB)`, stages the unit blob into memory, `vm_jit_compile`s it, `vm_jit_invoke2`s
-/// the compiled unit with the grown-page probe, and streams the result — no tier-up-eligible leaf
-/// at all, so the open admits it purely on the `Jit` import (the widened #835 gate).
-fn jit_guest_text() -> String {
+/// `[64 KiB, 80 KiB)`, stages `blob` into memory, `vm_jit_compile`s it, `vm_jit_invoke2`s the
+/// compiled unit with the grown-page probe, and streams the result — no tier-up-eligible leaf at
+/// all, so the open admits it purely on the `Jit` import (the widened #835 gate). `extra_funcs`
+/// appends program functions after `_start` (e.g. a fiber body a unit names by raw slot — #845).
+fn jit_guest_text_with(blob: &[u8], extra_funcs: &str) -> String {
     let (out_h, mem_h) = onramp_handles();
-    let blob = unit_blob();
     let blob_len = blob.len();
     let mut stores = String::new();
     for (i, chunk) in blob.chunks(8).enumerate() {
@@ -363,9 +363,13 @@ block 0 () {{
   return vres
   }}
 }}
-export 0 func "_start" 0
+{extra_funcs}export 0 func "_start" 0
 "#
     )
+}
+
+fn jit_guest_text_for(blob: &[u8]) -> String {
+    jit_guest_text_with(blob, "")
 }
 
 /// #835 differential: the `vm_jit_*` guest through the pump — its runtime-compiled unit serviced
@@ -375,7 +379,7 @@ export 0 func "_start" 0
 #[test]
 fn jit_invoke_pump_matches_the_bytecode_oracle() {
     let _g = FFI_LOCK.lock().unwrap();
-    let m = svm_text::parse_module(&jit_guest_text()).expect("parse");
+    let m = svm_text::parse_module(&jit_guest_text_for(&unit_blob())).expect("parse");
     svm_verify::verify_module(&m).expect("verify");
     let bytes = svm_encode::encode_module(&m);
 
@@ -437,6 +441,134 @@ fn jit_invoke_pump_matches_the_bytecode_oracle() {
         unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     svm_onramp_tierup_close();
+}
+
+/// What the fiber-hosting unit adds inside its fiber (distinct from `UNIT_K`/`LEAF_K`).
+const FIBER_UNIT_K: i64 = 777;
+
+/// A **fiber-hosting** unit (#845): `f0(x)` spins up a fiber over the *program's* fiber body
+/// (raw natural-table slot 1 — the module-0-entry shape `step_vcpu`'s renegotiated arms resolve;
+/// a fiber over the unit's own function is the engine's documented deferred case), resumes it
+/// twice (the second runs it to completion — the §22 "runs its own scheduler to completion"
+/// contract), and returns the two yielded values summed: `2x + FIBER_UNIT_K`. No threads/futex,
+/// no data — admissible under the renegotiated gate, rejectable only by the pre-#845 coarse
+/// `uses_concurrency` sweep.
+fn fiber_unit_blob() -> Vec<u8> {
+    let src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk v0
+  vs2, vv2 = cont.resume vk v0
+  vr = i64.add vv1 vv2
+  return vr
+  }
+}
+"#;
+    let m = svm_text::parse_module(src).expect("parse fiber unit");
+    svm_verify::verify_module(&m).expect("verify fiber unit");
+    svm_encode::encode_module(&m)
+}
+
+/// The program-side fiber body the unit names (guest func 1): suspends `arg + FIBER_UNIT_K`, then
+/// returns whatever the second resume passes.
+fn fiber_body_func() -> String {
+    format!(
+        r#"func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vk = i64.const {FIBER_UNIT_K}
+  vs = i64.add varg vk
+  vv = suspend vs
+  return vv
+  }}
+}}
+"#
+    )
+}
+
+/// #845 differential: a guest-compiled **fiber-hosting** unit is admitted by the browser validator
+/// (canonical §22 renegotiated gate — pre-fix, `vm_jit_compile` returned `-EINVAL` and the guest
+/// trapped on the bogus code handle) and runs observably identical through the oracle and the pump.
+/// It must run on the **interpreter** on both paths: `compile_jit`'s `reachable_concurrency` guard
+/// never yields `WasmDriven` for a fiber unit, so the pump surfaces **zero** JIT_INVOKE events —
+/// pinned, since emitting one would run fiber ops on a wasm frame (fail-closed stays closed).
+#[test]
+fn fiber_hosting_unit_is_admitted_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let m = svm_text::parse_module(&jit_guest_text_with(&fiber_unit_blob(), &fiber_body_func()))
+        .expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(
+        want.status, STATUS_OK,
+        "the fiber-hosting unit must compile + invoke on the interpreter (pre-#845 this was -EINVAL)"
+    );
+    assert_eq!(
+        want.value,
+        2 * PROBE + FIBER_UNIT_K,
+        "both yielded values arrive (the unit ran its fiber to completion)"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let mut jit_invokes = 0u32;
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_JIT_INVOKE => {
+                jit_invokes += 1;
+                match service_jit_on_wasmi() {
+                    Some(res) => svm_onramp_tierup_deliver_jit(res.as_ptr(), res.len()),
+                    None => svm_onramp_tierup_deliver_jit_trap(),
+                }
+            }
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    assert_eq!(
+        jit_invokes, 0,
+        "a fiber unit never runs emitted (compile_jit declines it) — the invoke stays interpreted"
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    svm_onramp_tierup_close();
+}
+
+/// #845's other half stays closed: a **futex**-using unit (`atomic.notify`) is still refused by
+/// the validator (`-EINVAL` from `vm_jit_compile`), so the guest's invoke of the bogus code handle
+/// traps — on the oracle and the pump identically. (Threads/futex need multi-vCPU orchestration a
+/// synchronous invoke can never host — the un-renegotiated half of the §22 gate.)
+#[test]
+fn futex_unit_is_still_refused() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let unit_src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 0
+  vcnt = i32.const 0
+  vw = atomic.notify vaddr vcnt
+  return v0
+  }
+}
+"#;
+    let unit = svm_text::parse_module(unit_src).expect("parse futex unit");
+    svm_verify::verify_module(&unit).expect("verify futex unit");
+    let blob = svm_encode::encode_module(&unit);
+    let m = svm_text::parse_module(&jit_guest_text_for(&blob)).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let want = onramp_exec(&m, b"");
+    assert_ne!(
+        want.status, STATUS_OK,
+        "a futex unit must fail compile (-EINVAL) → the invoke of the bogus handle traps"
+    );
 }
 
 /// #835 gate pin: a **fiber**-using guest (`cont.new`/`cont.resume`/`suspend` — the JACL scheduler
