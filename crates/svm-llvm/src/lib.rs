@@ -2714,6 +2714,14 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                         s.agg_layout.insert(id, vec![ValType::I64, ValType::I64]);
                         ValType::I64
                     }
+                    // An `i256` result is held as a 4×`i64` limb vector — the tier-3 `lower_i256` idiom
+                    // (`zext i128 → mul i256 → lshr → trunc`, the `u128` formatting `core::fmt` emits,
+                    // #778). An `[i64; 4]` `agg_layout` lets it cross block edges like the i128 pair, a
+                    // word wider.
+                    Err(_) if matches!(ty.as_ref(), Type::IntegerType { bits: 256 }) => {
+                        s.agg_layout.insert(id, vec![ValType::I64; 4]);
+                        ValType::I64
+                    }
                     Err(e) => return Err(e),
                 };
                 s.ty.push(vt);
@@ -3111,6 +3119,14 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
             sig: ft(vec![I64, I64], vec![I64]),
             drop_args: 0,
         },
+        // `long __vm_write_stderr(long buf, long len)` — the powerbox stderr stream, a *second*
+        // write-only `Stream` distinct from stdout (the `"stderr"` manifest import → the appended
+        // stderr handle). The svm `std` PAL routes `Stderr` here so `eprintln!` captures separately.
+        "__vm_write_stderr" => CapSpec {
+            name: "stderr",
+            sig: ft(vec![I64, I64], vec![I64]),
+            drop_args: 0,
+        },
         _ => return None,
     })
 }
@@ -3262,6 +3278,7 @@ fn vm_stream_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_stream_write" => "write",
         "__vm_stream_read" => "read",
+        "__vm_write_stderr" => "stderr",
         _ => return None,
     })
 }
@@ -13204,24 +13221,81 @@ fn lower_int_intrinsic(
             if shape.is_float() {
                 return unsup("vector funnel shift on a float shape");
             }
-            if args[0] != args[1] {
-                return unsup(format!("general vector funnel shift `{name}` (non-rotate)"));
-            }
             let lane_ty = int_ty(shape.lane_val())?;
-            let data = vec_explode(ctx, args[0], types, false)?;
-            let amts = vec_explode(ctx, args[2], types, false)?;
-            let op = if base == "llvm.fshl" {
-                BinOp::Rotl
-            } else {
-                BinOp::Rotr
+            let is_fshl = base == "llvm.fshl";
+            // The **rotate idiom** (`a == b`): svm-ir's lane `Rotl`/`Rotr` masks the count mod width
+            // and accepts a runtime amount, so scalarize to one rotate per lane (the auto-vectorizer
+            // emits per-lane-varying constant amounts, e.g. xxHash's `<1,7,12,18>`).
+            if args[0] == args[1] {
+                let data = vec_explode(ctx, args[0], types, false)?;
+                let amts = vec_explode(ctx, args[2], types, false)?;
+                let op = if is_fshl { BinOp::Rotl } else { BinOp::Rotr };
+                let mut out = Vec::with_capacity(data.len());
+                for (&d, &s) in data.iter().zip(amts.iter()) {
+                    out.push(ctx.push(Inst::IntBin {
+                        ty: lane_ty,
+                        op,
+                        a: d,
+                        b: s,
+                    }));
+                }
+                return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+            }
+            // A **general (non-rotate)** vector funnel shift (distinct value operands): scalarize to a
+            // per-lane `(a << s) | (b >>u (w - s))` (`fshr` mirrors), with a `select` on `s == 0` for
+            // the width-edge case (`w - s == w` would shift by the full width). Only full-width lanes
+            // (`i32x4`/`i64x2`), where the lane container width **is** the shift width `w`, so the
+            // runtime amount is edge-safe with no narrow-container masking. `<4 x i32>` in this form is
+            // what dragon4's u128 bignum (svm-leng's float formatter) emits — W5 §3e path (a).
+            let w = shape.lane_bytes() * 8;
+            if w != 32 && w != 64 {
+                return unsup(format!(
+                    "general vector funnel shift `{name}` (narrow lane i{w})"
+                ));
+            }
+            let a_lanes = vec_explode(ctx, args[0], types, false)?;
+            let b_lanes = vec_explode(ctx, args[1], types, false)?;
+            let s_lanes = vec_explode(ctx, args[2], types, false)?;
+            let kc = |ctx: &mut BlockCtx, n: i64| {
+                if lane_ty == IntTy::I64 {
+                    ctx.push(Inst::ConstI64(n))
+                } else {
+                    ctx.push(Inst::ConstI32(n as i32))
+                }
             };
-            let mut out = Vec::with_capacity(data.len());
-            for (&d, &s) in data.iter().zip(amts.iter()) {
-                out.push(ctx.push(Inst::IntBin {
+            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                ctx.push(Inst::IntBin {
                     ty: lane_ty,
                     op,
-                    a: d,
-                    b: s,
+                    a,
+                    b,
+                })
+            };
+            let mut out = Vec::with_capacity(a_lanes.len());
+            for i in 0..a_lanes.len() {
+                let (a, b, s_raw) = (a_lanes[i], b_lanes[i], s_lanes[i]);
+                // `s = amt mod w` (w is a power of two: mask with `w - 1`).
+                let wmask = kc(ctx, (w - 1) as i64);
+                let s = bin(ctx, BinOp::And, s_raw, wmask);
+                let wc = kc(ctx, w as i64);
+                let comp = bin(ctx, BinOp::Sub, wc, s); // `w - s`
+                let (lsh, rsh) = if is_fshl { (s, comp) } else { (comp, s) };
+                let hi = bin(ctx, BinOp::Shl, a, lsh);
+                let lo = bin(ctx, BinOp::ShrU, b, rsh);
+                let comb = bin(ctx, BinOp::Or, hi, lo);
+                // `s == 0` ⇒ the concatenation is unshifted: `fshl` yields `a`, `fshr` yields `b`.
+                let zero = kc(ctx, 0);
+                let is_zero = ctx.push(Inst::IntCmp {
+                    ty: lane_ty,
+                    op: CmpOp::Eq,
+                    a: s,
+                    b: zero,
+                });
+                let edge = if is_fshl { a } else { b };
+                out.push(ctx.push(Inst::Select {
+                    cond: is_zero,
+                    a: edge,
+                    b: comb,
                 }));
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
@@ -13484,8 +13558,114 @@ fn lower_int_intrinsic(
         // native widths (i32/i64) — a narrow saturating width would need width-specific clamp bounds.
         "llvm.uadd.sat" | "llvm.usub.sat" | "llvm.sadd.sat" | "llvm.ssub.sat" => {
             let bits = src_bits(args[0], types)?;
+            // Narrow widths (i8/i16) saturate to their **own** bounds, not i32's. A narrow value sits
+            // in an i32 container with unspecified high bits (§3b), so canonicalize first — mask
+            // (unsigned) or sign-extend (signed) — then compute at i32 and clamp to the width's bounds.
+            // Rust's `dec2flt` (float parsing, reached by svm-leng) emits `usub.sat.i8`, W5 §3e.
+            if bits == 8 || bits == 16 {
+                let ty = IntTy::I32;
+                let a0 = ctx.operand(args[0])?;
+                let b0 = ctx.operand(args[1])?;
+                let ci = |ctx: &mut BlockCtx, v: i64| ctx.push(Inst::ConstI32(v as i32));
+                let binop = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                    ctx.push(Inst::IntBin { ty, op, a, b })
+                };
+                let signed = base == "llvm.sadd.sat" || base == "llvm.ssub.sat";
+                let (a, b) = if signed {
+                    // sign-extend from `bits`: (x << (32-bits)) >>s (32-bits).
+                    let sh = ci(ctx, (32 - bits) as i64);
+                    let sx = |ctx: &mut BlockCtx, x: ValIdx| {
+                        let l = ctx.push(Inst::IntBin {
+                            ty,
+                            op: BinOp::Shl,
+                            a: x,
+                            b: sh,
+                        });
+                        ctx.push(Inst::IntBin {
+                            ty,
+                            op: BinOp::ShrS,
+                            a: l,
+                            b: sh,
+                        })
+                    };
+                    (sx(ctx, a0), sx(ctx, b0))
+                } else {
+                    let m = ci(ctx, (1i64 << bits) - 1);
+                    (binop(ctx, BinOp::And, a0, m), binop(ctx, BinOp::And, b0, m))
+                };
+                let idx = match base {
+                    // unsigned sub: borrow (a <u b) ⇒ 0. (Lower bound is width-independent.)
+                    "llvm.usub.sat" => {
+                        let under = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::LtU,
+                            a,
+                            b,
+                        });
+                        let diff = binop(ctx, BinOp::Sub, a, b);
+                        let zero = ci(ctx, 0);
+                        ctx.push(Inst::Select {
+                            cond: under,
+                            a: zero,
+                            b: diff,
+                        })
+                    }
+                    // unsigned add: sum > UMAX_w ⇒ UMAX_w.
+                    "llvm.uadd.sat" => {
+                        let s = binop(ctx, BinOp::Add, a, b);
+                        let umax = ci(ctx, (1i64 << bits) - 1);
+                        let over = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::GtU,
+                            a: s,
+                            b: umax,
+                        });
+                        ctx.push(Inst::Select {
+                            cond: over,
+                            a: umax,
+                            b: s,
+                        })
+                    }
+                    // signed add/sub: the i32 result of sign-extended narrow operands can't overflow
+                    // i32 (|operands| ≤ 2^15), so a plain clamp to [SMIN_w, SMAX_w] is exact.
+                    "llvm.sadd.sat" | "llvm.ssub.sat" => {
+                        let op = if base == "llvm.sadd.sat" {
+                            BinOp::Add
+                        } else {
+                            BinOp::Sub
+                        };
+                        let r = binop(ctx, op, a, b);
+                        let smax = ci(ctx, (1i64 << (bits - 1)) - 1);
+                        let smin = ci(ctx, -(1i64 << (bits - 1)));
+                        let hi = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::GtS,
+                            a: r,
+                            b: smax,
+                        });
+                        let c1 = ctx.push(Inst::Select {
+                            cond: hi,
+                            a: smax,
+                            b: r,
+                        });
+                        let lo = ctx.push(Inst::IntCmp {
+                            ty,
+                            op: CmpOp::LtS,
+                            a: c1,
+                            b: smin,
+                        });
+                        ctx.push(Inst::Select {
+                            cond: lo,
+                            a: smin,
+                            b: c1,
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(Some(idx));
+            }
             if bits != 32 && bits != 64 {
-                return unsup(format!("`{name}` (only i32/i64 saturating)"));
+                return unsup(format!("`{name}` (only i8/i16/i32/i64 saturating)"));
             }
             let a = ctx.operand(args[0])?;
             let b = ctx.operand(args[1])?;
@@ -16494,6 +16674,177 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     }
 }
 
+/// Read an i256 operand as its four little-endian i64 limbs `[l0, l1, l2, l3]`. A local i256 is a
+/// four-element `agg` vector (built by [`lower_i256`]); a 256-bit constant materializes as
+/// `(value_lo, value_hi, 0, 0)` — the parser holds a constant's value in a `u128`, so any i256 literal
+/// that reaches here is `< 2^128` (a wider one fails to parse). A cross-block i256 fails closed.
+fn i256_parts(ctx: &mut BlockCtx, op: &Operand) -> Result<[ValIdx; 4], Error> {
+    if let Some(parts) = ctx.agg_of(op) {
+        if parts.len() == 4 {
+            return Ok([parts[0], parts[1], parts[2], parts[3]]);
+        }
+    }
+    if let Operand::ConstantOperand(c) = op {
+        if let Constant::Int { bits: 256, value } = c.as_ref() {
+            let l0 = ctx.const_i64(*value as i64);
+            let l1 = ctx.const_i64((*value >> 64) as i64);
+            let z = ctx.const_i64(0);
+            return Ok([l0, l1, z, z]);
+        }
+    }
+    unsup("i256 operand not available in this block (cross-block / unsupported i256 constant)")
+}
+
+/// Bind a destination i256 value to its four i64 limbs — the `agg` limb-vector representation, one word
+/// wider than the i128 `(lo, hi)` pair.
+fn set_i256(ctx: &mut BlockCtx, dest: &Name, limbs: [ValIdx; 4]) {
+    if let Some(&vid) = ctx.s.name2id.get(dest) {
+        ctx.agg.insert(vid, limbs.to_vec());
+    }
+}
+
+/// Sum a list of i64 terms into `(sum mod 2^64, carry_out)`, where `carry_out` counts the `2^64` wraps
+/// (a small integer `< terms.len()`). The per-column reduction step of the multiword multiply: a
+/// column's partial-product words plus the previous column's carry sum here; the low word is the result
+/// limb and the carry feeds the next column (weight `2^64` in column *k* is weight `2^0` in *k+1*).
+fn add_words(ctx: &mut BlockCtx, terms: &[ValIdx]) -> (ValIdx, ValIdx) {
+    let mut acc = terms[0];
+    let mut carry = ctx.const_i64(0);
+    for &t in &terms[1..] {
+        let s = i64bin(ctx, BinOp::Add, acc, t);
+        let c = i64cmp_ext(ctx, CmpOp::LtU, s, acc); // s <u acc ⇒ this add wrapped
+        carry = i64bin(ctx, BinOp::Add, carry, c);
+        acc = s;
+    }
+    (acc, carry)
+}
+
+/// I14 tier 3 (256-bit): the narrow set of i256 ops real `std` emits — the `zext i128 → mul i256 →
+/// lshr → trunc` magic-number division `core::fmt` uses to print a `u128` (e.g. `Duration::as_nanos`,
+/// #778). Each i256 SSA value is a four-limb `agg` vector: `mul` is the schoolbook 4×4 expansion mod
+/// `2^256`, `lshr` a constant double-word shift, `trunc` reads the low limbs. Any other i256 shape (a
+/// runtime shift, add/sub, div, a cross-block value) fails closed — never a miscompile. `Ok(true)` ⇒
+/// handled an i256 op.
+fn lower_i256(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<bool, Error> {
+    use Instruction as I;
+    let is_i256 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(256);
+    match instr {
+        // zext iN X to i256 (N ≤ 128) → the low limbs of X, zero-padded to four words.
+        I::ZExt(x) if int_bits(x.to_type.as_ref()) == Some(256) => {
+            let from = int_bits(x.operand.get_type(types).as_ref())
+                .filter(|&w| w <= 128)
+                .ok_or_else(|| {
+                    Error::Unsupported("i256 zext from a >128-bit or non-integer source".into())
+                })?;
+            let z = ctx.const_i64(0);
+            let limbs = if from == 128 {
+                let (lo, hi) = i128_parts(ctx, &x.operand)?;
+                [lo, hi, z, z]
+            } else {
+                let src = ctx.operand(&x.operand)?;
+                let lo = if from == 64 {
+                    src
+                } else {
+                    emit_ext(ctx, src, from, 64, false)
+                };
+                [lo, z, z, z]
+            };
+            set_i256(ctx, &x.dest, limbs);
+            Ok(true)
+        }
+        // mul i256: schoolbook 4×4 limb expansion, keeping the low four limbs (mod 2^256). Each
+        // `a[i]·b[j]` is a 128-bit `(lo, hi)`; only `i+j ≤ 3` survive (and `i+j == 3` keeps just `lo`).
+        I::Mul(x) if is_i256(&x.operand0) => {
+            let a = i256_parts(ctx, &x.operand0)?;
+            let b = i256_parts(ctx, &x.operand1)?;
+            let p00l = i64bin(ctx, BinOp::Mul, a[0], b[0]);
+            let p00h = emit_umulhi(ctx, a[0], b[0]);
+            let p01l = i64bin(ctx, BinOp::Mul, a[0], b[1]);
+            let p01h = emit_umulhi(ctx, a[0], b[1]);
+            let p10l = i64bin(ctx, BinOp::Mul, a[1], b[0]);
+            let p10h = emit_umulhi(ctx, a[1], b[0]);
+            let p02l = i64bin(ctx, BinOp::Mul, a[0], b[2]);
+            let p02h = emit_umulhi(ctx, a[0], b[2]);
+            let p11l = i64bin(ctx, BinOp::Mul, a[1], b[1]);
+            let p11h = emit_umulhi(ctx, a[1], b[1]);
+            let p20l = i64bin(ctx, BinOp::Mul, a[2], b[0]);
+            let p20h = emit_umulhi(ctx, a[2], b[0]);
+            let p03l = i64bin(ctx, BinOp::Mul, a[0], b[3]);
+            let p12l = i64bin(ctx, BinOp::Mul, a[1], b[2]);
+            let p21l = i64bin(ctx, BinOp::Mul, a[2], b[1]);
+            let p30l = i64bin(ctx, BinOp::Mul, a[3], b[0]);
+            let r0 = p00l;
+            let (r1, k1) = add_words(ctx, &[p00h, p01l, p10l]);
+            let (r2, k2) = add_words(ctx, &[p01h, p10h, p02l, p11l, p20l, k1]);
+            let (r3, _k3) = add_words(ctx, &[p02h, p11h, p20h, p03l, p12l, p21l, p30l, k2]);
+            set_i256(ctx, &x.dest, [r0, r1, r2, r3]);
+            Ok(true)
+        }
+        // lshr i256 by a **constant** (the only form emitted; a runtime amount fails closed): a
+        // double-word shift right, computed at translate time as `word = shift/64`, `bit = shift%64`.
+        I::LShr(x) if is_i256(&x.operand0) => {
+            let shift = i256_const_shift(&x.operand1)?;
+            let a = i256_parts(ctx, &x.operand0)?;
+            let z = ctx.const_i64(0);
+            let word = (shift / 64) as usize;
+            let bit = (shift % 64) as u32;
+            let limb = |i: usize, a: &[ValIdx; 4]| if i < 4 { a[i] } else { z };
+            let mut out = [z; 4];
+            for (i, slot) in out.iter_mut().enumerate() {
+                let src = limb(i + word, &a);
+                *slot = if bit == 0 {
+                    src
+                } else {
+                    let hi = limb(i + word + 1, &a);
+                    let cb = ctx.const_i64(bit as i64);
+                    let cinv = ctx.const_i64((64 - bit) as i64);
+                    let lo_part = i64bin(ctx, BinOp::ShrU, src, cb);
+                    let hi_part = i64bin(ctx, BinOp::Shl, hi, cinv);
+                    i64bin(ctx, BinOp::Or, lo_part, hi_part)
+                };
+            }
+            set_i256(ctx, &x.dest, out);
+            Ok(true)
+        }
+        // trunc i256 V to iN: the low word (N ≤ 64), or the low two words as an i128 pair (N ≤ 128).
+        I::Trunc(x) if is_i256(&x.operand) => {
+            let to = int_bits(x.to_type.as_ref())
+                .ok_or_else(|| Error::Unsupported("i256 trunc to non-int".into()))?;
+            let a = i256_parts(ctx, &x.operand)?;
+            if to <= 64 {
+                let v = if to == 64 {
+                    a[0]
+                } else {
+                    emit_trunc(ctx, a[0], 64, to)
+                };
+                finish(ctx, &x.dest, v)?;
+            } else {
+                let hi = if to == 128 {
+                    a[1]
+                } else {
+                    emit_trunc(ctx, a[1], 64, to - 64)
+                };
+                set_i128(ctx, &x.dest, a[0], hi);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Read the amount of an `lshr i256` as a constant (`< 256`); a runtime or out-of-range amount fails
+/// closed — the magic-number-division idiom always shifts by a compile-time constant.
+fn i256_const_shift(op: &Operand) -> Result<u128, Error> {
+    if let Operand::ConstantOperand(c) = op {
+        if let Constant::Int { value, .. } = c.as_ref() {
+            if *value < 256 {
+                return Ok(*value);
+            }
+        }
+    }
+    unsup("i256 lshr by a runtime or ≥256 amount")
+}
+
 /// Conditionally two's-complement negate an i128 `(lo, hi)` pair: returns `cond ? -value : value`.
 /// `-value = (0 - lo, 0 - hi - borrow)` with `borrow = (lo != 0)`, selected per word on `cond` (an
 /// `i32` boolean). Used for i128 signed div/rem (abs the operands, re-sign the result).
@@ -16649,6 +17000,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     // I14 tier 3: general i128 ops lower to 64-bit ops over a materialized `(lo, hi)` pair here.
     // `Ok(false)` ⇒ not an i128 op (fall through); an unsupported i128 shape fails closed.
     if lower_i128(ctx, instr, types)? {
+        return Ok(());
+    }
+
+    // The narrow 256-bit idiom (`zext i128 → mul i256 → lshr → trunc`) `core::fmt` emits to print a
+    // `u128` (#778). Four-limb `agg` values; any other i256 shape fails closed. Fall through on non-i256.
+    if lower_i256(ctx, instr, types)? {
         return Ok(());
     }
 

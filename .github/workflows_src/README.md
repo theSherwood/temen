@@ -16,6 +16,47 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`warm-snapshot-test.mjs` in the `browser-real` job** — one line added to the Chromium test block
+  (right after `node browser-jit-cache-test.mjs`): `node warm-snapshot-test.mjs`. Validates the
+  WASM_AOT.md warm-runtime snapshot: `svm_warm_open` runs the QuickJS `warmup` export once, then
+  `svm_warm_eval` restores the post-init image and runs `eval_run`, which must match the cold `_start`
+  path (`svm_run_onramp`) byte-for-byte while skipping the runtime rebuild. Uses the committed
+  `web/assets/qjs_snapshot.svmb`; skips cleanly if absent. Reuses the wasm the job already builds — no
+  new toolchain. Verified locally in Node/V8. (Until copied over, the `workflows-in-sync` guard stays
+  red — the expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`warm-jit-test.mjs` in the `browser-real` job** — one line added right after `node
+  warm-snapshot-test.mjs`: `node warm-jit-test.mjs`. Validates the WASM_AOT.md **warm+JIT** tier
+  (issue #783): `svm_warm_jit_open` emits the QuickJS `eval_run` to wasm once, `runWarmJit` (from
+  `web/wasmjit-module.js`) drives it over the restored snapshot each Run — which must match the
+  interpreter warm path (`svm_warm_eval`) byte-for-byte, keep fresh-per-Run isolation (a `var` in one
+  Run cannot leak into the next), and accelerate a compute-heavy eval (measured ~9× on a 500k-iteration
+  loop; a trivial program stays on warm-interp). Uses the committed `web/assets/qjs_snapshot.svmb`;
+  skips cleanly if absent. Reuses the threads wasm the job already builds — no new toolchain. Verified
+  locally in Node/V8.
+
+- **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
+  test block (right after the already-copied `node browser-jit-cache-test.mjs`):
+  `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
+  slice-0 JACL residual): an SVM-text compute guest run with tier-up on must equal the all-interpreter
+  value and tier-up must fire (no assets — parses in-page via `svm_parse`). Reuses the threads module
+  the job already builds — no new toolchain. Verified locally in Chromium. (The sibling
+  `browser-jit-cache-test.mjs` line was already copied over in commit `90c3b6d`.)
+
+- **Doc-only CI skip (`ci.yml` `on:` triggers).** Added `paths-ignore: ["**.md"]` to both the
+  `push: [main]` and `pull_request` triggers so a changeset that touches **only** Markdown skips the
+  whole CI matrix (it's slow, and prose edits don't affect build/test/fuzz). `paths-ignore` skips a run
+  only when *every* changed file matches, so a mixed code+doc commit still runs the full matrix. The one
+  generated-and-golden-tested Markdown file (`OPS_PARITY.md`, checked by `svm-parity/tests/golden.rs`) is
+  always regenerated alongside a `.rs` change, so mixed-changeset CI still covers it; only a lone
+  hand-edit of that generated file would slip through, which is already a misuse. The `schedule` (nightly
+  fuzz) and `workflow_dispatch` triggers are unaffected — they always run.
+
+  > **Owner action on copy-over (required checks):** if `build · test · fmt · clippy` (or any other
+  > matrix job) is a **required** status check in branch protection, a doc-only PR will skip it and
+  > GitHub will report the required check as never-run, **blocking the merge** — the same footgun as the
+  > `miri` note below. Either drop the requirement for doc-only PRs or merge those without the gate.
+
 - **Pages-deploy starvation fix (I75) — two cooperating paths in `ci.yml` + `pages.yml`.** The per-push
   (`push: [main]`) Pages deploy was starving: under a burst of agent-PR merges each new merge supersedes
   the still-queued deploy (`concurrency: pages`, `cancel-in-progress: false` cancels the *queued* older

@@ -7,6 +7,19 @@ keep it followed. The full design lives in `DESIGN.md`.
 "is this change allowed?". A change that breaks one is wrong until the invariant
 itself is deliberately renegotiated with the owner.
 
+## Tracking work: GitHub issues
+
+Track work, bugs, and investigations as **GitHub issues on the Project board**,
+not by editing markdown trackers. Each issue is a sub-issue of one of the eleven
+**workstream epics** (the parent = the workstream) and carries `area:` / `sev:` /
+`kind:` labels — `touches:` for cross-cutting overlap, `topic:*` for fine-grained
+subject tags, `invariant` when it touches `INVARIANTS.md`. Do triage and discussion
+in the issue: it costs no CI, unlike editing markdown. Put deep root-cause detail in
+the issue body (or the relevant design doc when it must live beside the code) — the
+issue is the status source of truth. (`ISSUES.md` is **retired**; its history is in
+git.) Flaky CI → a `kind:flaky-ci` issue. Full workflow, epic list, and label taxonomy:
+**`ISSUE_TRACKING.md`** (labels are reproducible via `scripts/setup-labels.sh`).
+
 ## Prime directive: keep it simple
 
 This is a sandbox VM whose entire value is a **small, trustworthy core**. Every
@@ -28,7 +41,7 @@ probably wrong. When in doubt, do less.
   early and watch it over time; we are measured *relative to wasm/Wasmtime*
   (`DESIGN.md` §1a). Catch regressions when they're one commit old, not one
   release old.
-  **Update ISSUES.md with any flaky CI problems.** Catch and log flakiness early so that we have visibility and can track a fix.
+  **Log any flaky CI as a `kind:flaky-ci` GitHub issue** (see `ISSUE_TRACKING.md`). Catch and log flakiness early so that we have visibility and can track a fix.
 
 ## Performance philosophy: data-oriented design
 

@@ -86,3 +86,113 @@
          _ => {
              let _ = code;
              crate::intrinsics::abort()
+--- a/library/std/src/sys/pal/mod.rs
++++ b/library/std/src/sys/pal/mod.rs
+@@ -60,6 +60,10 @@
+         mod zkvm;
+         pub use self::zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use self::svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use self::unsupported::*;
+--- a/library/std/src/sys/args/mod.rs
++++ b/library/std/src/sys/args/mod.rs
+@@ -10,6 +10,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "svm",
+ ))]
+ mod common;
+ 
+@@ -57,6 +58,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+--- a/library/std/src/sys/time/mod.rs
++++ b/library/std/src/sys/time/mod.rs
+@@ -44,6 +44,10 @@
+         mod xous;
+         use xous as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+--- a/library/std/src/sys/env/mod.rs
++++ b/library/std/src/sys/env/mod.rs
+@@ -11,6 +11,7 @@
+     target_os = "uefi",
+     target_os = "wasi",
+     target_os = "xous",
++    target_os = "svm",
+ ))]
+ mod common;
+ 
+@@ -55,6 +56,10 @@
+         mod zkvm;
+         pub use zkvm::*;
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::*;
+--- a/library/std/src/sys/fs/mod.rs
++++ b/library/std/src/sys/fs/mod.rs
+@@ -44,7 +44,11 @@
+     target_os = "vexos" => {
+         mod vexos;
+         use vexos as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;
+--- a/library/std/src/sys/pipe/mod.rs
++++ b/library/std/src/sys/pipe/mod.rs
+@@ -12,7 +12,11 @@
+     target_os = "motor" => {
+         mod motor;
+         pub use motor::{Pipe, pipe};
+     }
++    target_os = "svm" => {
++        mod svm;
++        pub use svm::{Pipe, pipe};
++    }
+     _ => {
+         mod unsupported;
+         pub use unsupported::{Pipe, pipe};
+--- a/library/std/src/sys/process/mod.rs
++++ b/library/std/src/sys/process/mod.rs
+@@ -14,7 +14,11 @@
+     target_os = "motor" => {
+         mod motor;
+         use motor as imp;
+     }
++    target_os = "svm" => {
++        mod svm;
++        use svm as imp;
++    }
+     _ => {
+         mod unsupported;
+         use unsupported as imp;

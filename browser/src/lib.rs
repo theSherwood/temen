@@ -699,16 +699,23 @@ pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
 pub const PAR_INSTANTIATE: i32 = 6;
 /// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
-/// function. `svm_par_ev_a` = the func index; `svm_par_tierup_argv_ptr`/`_len` give the marshalled
-/// i64 args. The Worker runs the emitted `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
+/// function. `svm_par_ev_a` = the func index; `svm_par_ev_b` = the window's committed extent, which
+/// the Worker MUST write to the emitted module's `"mapped"` global before the call (#717 host sync —
+/// over today's fully-mapped par window it equals the emit-time default, so the write is idempotent;
+/// over a grown window it is what keeps the emitted bounds check in lockstep with the interpreter).
+/// `svm_par_tierup_argv_ptr`/`_len` give the marshalled i64 args. The Worker runs the emitted
+/// `f{func}` and calls `svm_par_deliver_tierup`/`_trap`.
 pub const PAR_TIERUP: i32 = 7;
 /// §22 guest-JIT **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5): a guest's `Jit.invoke`
 /// surfaces here (codegen mode on — [`svm_par_powerbox_jit_codegen`]) so the Worker runs the
 /// submitted unit on **emitted wasm** (`svm_par_jit_unit_wasm_ptr`/`_len` — one immutable module per
 /// run) instead of the interpreter. `svm_par_jit_code` keys the Worker's per-unit instance cache;
 /// `svm_par_jit_argv_ptr`/`_len` give the args as i64 slots, `svm_par_jit_param_types_ptr` their wasm
-/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. The Worker runs the emitted
-/// `f{entry}(win, env, …args)` and calls `svm_par_deliver_jit_invoke`/`_trap`.
+/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. `svm_par_ev_b` = the
+/// window's committed extent, which the Worker MUST write to the unit instance's `"mapped"` global
+/// before the call (#717 host sync, same contract as [`PAR_TIERUP`] — an invoke whose window state
+/// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
+/// Worker runs the emitted `f{entry}(win, env, …args)` and calls `svm_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
 
 /// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
@@ -1882,8 +1889,12 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
             // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
             // emitted `f{func}` and delivers the results (`svm_par_deliver_tierup`) or a trap.
-            bytecode::VcpuEvent::TierUp { func, argv } => {
+            // Operand `b` carries the window's scalar committed extent — the Worker writes it to the
+            // emitted module's `"mapped"` global before the call, so the emitted bounds check admits
+            // exactly what the interpreter would over a `vm_map`-grown window (#717 host sync).
+            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 v.a = func as i64;
+                v.b = mapped as i64;
                 v.tierup_argv = argv.into_vec();
                 return PAR_TIERUP;
             }
@@ -1963,6 +1974,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 argv,
                 params,
                 results,
+                mapped,
             } => {
                 // Scalar arg/result type codes (i32/i64/f32/f64) the JS host marshals each i64 slot
                 // by; `None` if any operand is v128 (no lane marshalling — the unit stays on interp).
@@ -1972,6 +1984,13 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                         .collect::<Option<Vec<u8>>>()
                 };
                 let (ptypes, rtypes) = (codes(&params), codes(&results));
+                // #717 host sync: operand `b` carries the committed extent for the Worker to write
+                // to the emitted unit's `"mapped"` global before `f0`. An unrepresentable window
+                // state (`None`) declines codegen below — the interpreted delivery honors the full
+                // page map (fail-closed, same contract as PAR_TIERUP).
+                if let Some(h) = mapped {
+                    v.b = h as i64;
+                }
                 if let Some(cfg) = par_jit_rt() {
                     // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared
                     // host, its wasm emitted there; run it on that per-unit wasm (JS instantiates it
@@ -1988,7 +2007,8 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                             let codegen = par_jit_codegen()
                                 && wasm.is_some()
                                 && ptypes.is_some()
-                                && rtypes.is_some();
+                                && rtypes.is_some()
+                                && mapped.is_some();
                             if codegen {
                                 v.jit_argv = argv.into_vec();
                                 v.jit_code = code;
@@ -2010,7 +2030,8 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                             let codegen = par_jit_codegen()
                                 && svm_par_jit_unit_wasm_len() > 0
                                 && ptypes.is_some()
-                                && rtypes.is_some();
+                                && rtypes.is_some()
+                                && mapped.is_some();
                             if codegen {
                                 match par_resolve_unit(pb, handle, code) {
                                     Ok(_) => {
@@ -3838,7 +3859,7 @@ impl SharedOnrampReactor {
         // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
         let result = self
             .reactor
-            .frame(self.tick, &args, &self.host, |_func, _argv| {
+            .frame(self.tick, &args, &self.host, |_func, _argv, _mapped| {
                 Err(Trap::Malformed)
             });
         let status = match result {
@@ -4128,6 +4149,9 @@ pub struct JitOnrampRun {
     emitted_wasm: Vec<u8>,
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// The emitted `f0`'s trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
+    /// 4); the warm+JIT `eval_run` entry (WASM_AOT.md) carries one `I64` — the powerbox `sp` — here.
+    slots: Vec<Value>,
     last_trap: Option<String>,
     /// Set when a cross-tier bounce returns `Trap::Exit(code)` (the guest called `exit`), unwinding the
     /// emitted `f0`; `exited` distinguishes "exited with code 0" from "returned 0".
@@ -4376,12 +4400,98 @@ impl JitOnrampRun {
             emitted_wasm,
             emitted,
             frame,
+            slots: Vec::new(),
             last_trap: None,
             exit_code: 0,
             exited: false,
             returned_value: 0,
             trapped: false,
         })
+    }
+
+    /// Open a **warm+JIT** `eval_run` run (WASM_AOT.md warm+JIT) over the caller-owned warm-session
+    /// window. Three differences from [`open_shared_run`]: the emit is rooted at the module's `eval_run`
+    /// export (not `_start`), the window is **not** re-seeded with data segments (the caller restores the
+    /// warm image before each drive), and the entry's `sp` rides along as the emitted `f0`'s trailing
+    /// slot. Returns [`STATUS_UNSUPPORTED`] if `eval_run` isn't wasm-drivable — the caller then evaluates
+    /// on the interpreter warm path ([`svm_warm_eval`]).
+    ///
+    /// # Safety
+    /// `back` must alias the live warm-session window `[win_ptr, 1 << win_log2)`, kept valid until the
+    /// run is dropped (it is owned by the [`WarmSession`] that holds this run, freed in `svm_warm_close`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn open_warm_eval(
+        m: &svm_ir::Module,
+        back: std::sync::Arc<svm_interp::Region>,
+        win_ptr: *mut u8,
+        win_log2: u8,
+        shared_memory: bool,
+        eval_fn: svm_ir::FuncIdx,
+        entry_sp: u64,
+    ) -> Result<JitOnrampRun, i32> {
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let win_base = win_ptr as usize;
+        let mut module = m.clone();
+        svm_wasm_jit::outline_cap_calls(&mut module);
+        // The warm module already declares the mapped window; keep the belt-and-braces enlarge for parity
+        // with `open_over_run` (a no-op when `size_log2 == win_log2`).
+        if let Some(mc) = module.memory.as_mut() {
+            if (mc.size_log2 as u32) < win_log2 as u32 {
+                mc.size_log2 = win_log2;
+            }
+        }
+        // The powerbox the interpreter warm path grants (`svm_warm_eval`) — a fresh host is re-granted per
+        // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
+        let mut host = Host::new();
+        let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
+        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
+        // Emit rooted at `eval_run` (not `_start`); the reachable-set / concurrency gates are unchanged,
+        // so a driver whose eval can suspect or leaves the subset declines to the interpreter.
+        let artifact = svm_wasm_jit::compile_jit(
+            &module,
+            svm_wasm_jit::Shape::Batch { entry: eval_fn },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let svm_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
+        Ok(JitOnrampRun {
+            module,
+            program,
+            host,
+            _backing: None,
+            back,
+            win_base,
+            emitted_wasm,
+            emitted,
+            frame,
+            slots: vec![Value::I64(entry_sp as i64)],
+            last_trap: None,
+            exit_code: 0,
+            exited: false,
+            returned_value: 0,
+            trapped: false,
+        })
+    }
+
+    /// Reset a cached warm+JIT run for a fresh Run: rebuild the powerbox (a clean `Host` + `grant_onramp_
+    /// caps`, so captured streams and the frame cell start empty) and clear the finish flags. The caller
+    /// restores the warm image into the window separately (`svm_warm_jit_prepare`); together they give the
+    /// same fresh-per-Run state the interpreter warm path gets, so no guest state crosses Runs.
+    fn reset_warm(&mut self, stdin: Vec<u8>) {
+        let mut host = Host::new();
+        host.stdin = stdin;
+        let (frame, _keys) = grant_onramp_caps(&mut host, &self.module, None);
+        self.host = host;
+        self.frame = frame;
+        self.exit_code = 0;
+        self.exited = false;
+        self.returned_value = 0;
+        self.trapped = false;
+        self.last_trap = None;
     }
 
     /// The emitted wasm (the host compiles + instantiates it, then calls `f0(win, env, ...slots)` once).
@@ -4392,11 +4502,11 @@ impl JitOnrampRun {
     pub fn win_base(&self) -> usize {
         self.win_base
     }
-    /// The emitted `f0`'s trailing `...slots` args — always empty since IMPORTS.md phase 4 (the
-    /// paramless `_start` takes no handle params; capabilities arrive via the manifest slot
-    /// bindings). Kept so the JS driver's `f0(win, env, ...slots)` call shape needs no change.
+    /// The emitted `f0`'s trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
+    /// 4 — capabilities arrive via the manifest slot bindings); the warm+JIT `eval_run` entry carries one
+    /// `I64` (the powerbox `sp`), passed by the warm-JIT driver as the emitted `f0`'s third argument.
     pub fn slots(&self) -> &[Value] {
-        &[]
+        &self.slots
     }
     /// The per-function emitted bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest are cross-tier).
     pub fn emitted(&self) -> &[bool] {
@@ -4692,6 +4802,484 @@ pub extern "C" fn svm_run_onramp(
         EXIT_CODE = out.exit_code;
     }
     out.value
+}
+
+// ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
+//
+// WASM_AOT.md § "warm-runtime snapshot". A language on-ramp (QuickJS…) rebuilds its whole runtime on
+// every Run; for a trivial program that fixed init dominates the wall clock. This session runs the
+// guest's `warmup` export **once** (init runtime+context into statics), snapshots the post-init guest
+// image, then restores that image before each `eval_run` — so every Run evaluates the user's code over
+// a warm runtime it did not have to rebuild. Fresh-per-Run isolation holds: each Run restores the SAME
+// program-independent image into the window (no guest state crosses Runs). The native prototype is
+// `crates/svm-llvm/examples/qjs_snapshot.rs`; this is its browser twin, a stateful session like
+// `PgSession`. Requires a two-phase driver module exporting `warmup` + `eval_run` (both `(i64 sp)`).
+//
+// Memory model (the wrinkle the native prototype de-risked): the on-ramp heap grows **above** the
+// declared window (`heap_base = 1 << declared_log2`), and that `vm_map` growth's mapped-width state
+// lives in the `Mem`, not the window bytes — so we run under a **larger mapped window**
+// (`WARM_MAPPED_LOG2`) that keeps the whole heap inside the mapped region, making the guest image a
+// contiguous byte range we snapshot/restore by plain copy.
+
+/// The mapped-window log2 the warm session runs the guest under, overriding the module's declared size
+/// so the on-ramp heap stays inside the mapped region (see the memory-model note above). 2^26 = 64 MiB:
+/// a few MiB of globals/stack + generous heap headroom for QuickJS. Matches the native prototype.
+const WARM_MAPPED_LOG2: u8 = 26;
+
+/// A live warm-runtime snapshot session over an owned window: the compiled program, the warm image, and
+/// the window it restores into. Single-threaded wasm ⇒ held in a plain static ([`WARM_SESSION`]).
+struct WarmSession {
+    prog: bytecode::SharedProgram,
+    /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
+    /// deterministic powerbox handles match the snapshot's window-relative state.
+    module: svm_ir::Module,
+    /// Mapped window size, `1 << WARM_MAPPED_LOG2` (also the owned backing size).
+    win: u64,
+    /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
+    entry_sp: u64,
+    eval_fn: svm_ir::FuncIdx,
+    /// The owned window backing (kept alive for the session; `back` aliases it).
+    win_ptr: *mut u8,
+    win_layout: Layout,
+    back: std::sync::Arc<svm_interp::Region>,
+    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
+    image: Vec<u8>,
+    /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
+    /// `[image.len(), dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    dirty_end: usize,
+    /// The cached warm+JIT run (WASM_AOT.md warm+JIT): `eval_run` emitted to wasm **once**, then driven
+    /// per Run over the restored warm image. `None` until [`svm_warm_jit_open`]; reusing the emit across
+    /// Runs is what keeps a warm+JIT Run off the ~one-time cdylib emit. Held here (not in a global) so
+    /// [`svm_warm_close`] tears it down while its window alias is still valid, before the window is freed.
+    jit: Option<Box<JitOnrampRun>>,
+}
+
+/// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`svm_warm_open`].
+static mut WARM_SESSION: Option<WarmSession> = None;
+
+/// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`) from a window image.
+fn warm_read_brk(win: &[u8]) -> usize {
+    let o = svm_ir::POWERBOX_HEAP_BRK as usize;
+    i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
+}
+
+/// Open a warm session over the two-phase driver module at `[mod_ptr, mod_len)`: run `warmup` once and
+/// keep its post-init guest image for [`svm_warm_eval`]. Returns the live-image byte length on success
+/// (≥ 0), or `-1` with [`svm_status`] set (`UNSUPPORTED` if the module isn't a warm-snapshot driver —
+/// no `warmup`/`eval_run` exports, or its declared window ≥ the mapped window; `TRAP` if `warmup`
+/// traps). Closes any prior session first. Drive with [`svm_warm_eval`], end with [`svm_warm_close`].
+#[no_mangle]
+pub extern "C" fn svm_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    svm_warm_close();
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let mut m = match svm_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -1;
+        }
+    };
+    let Some(mc) = m.memory else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let declared_log2 = mc.size_log2;
+    // Need headroom above the declared window for the heap; the mapped window must exceed it.
+    if declared_log2 >= WARM_MAPPED_LOG2 {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    }
+    let heap_base = 1u64 << declared_log2;
+    let (Some(warmup_fn), Some(eval_fn)) =
+        (m.resolve_export("warmup"), m.resolve_export("eval_run"))
+    else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    // Compute the entry sp from the declared (data-segment) layout, then enlarge the mapped window.
+    let entry_sp = svm_ir::powerbox_entry_sp(&m);
+    m.memory = Some(svm_ir::Memory {
+        size_log2: WARM_MAPPED_LOG2,
+    });
+    let win = 1u64 << WARM_MAPPED_LOG2;
+    let Some(prog) = bytecode::SharedProgram::compile(&m) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    // SAFETY: non-zero 8-aligned size; the buffer is this session's window, freed in `svm_warm_close`.
+    let win_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if win_ptr.is_null() {
+        set(STATUS_TRAP);
+        return -1;
+    }
+    // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
+    // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
+    unsafe {
+        let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);
+        let hb = (heap_base as i64).to_le_bytes();
+        let (b, t) = (
+            svm_ir::POWERBOX_HEAP_BRK as usize,
+            svm_ir::POWERBOX_HEAP_TOP as usize,
+        );
+        w[b..b + 8].copy_from_slice(&hb);
+        w[t..t + 8].copy_from_slice(&hb);
+    }
+    // SAFETY: `[win_ptr, win)` is this session's exclusive window; the engine takes the `Arc<Region>`.
+    let back = std::sync::Arc::new(unsafe { svm_interp::Region::shared(win_ptr, win) });
+    let mut host = Host::new();
+    let _ = grant_onramp_caps(&mut host, &m, None);
+    let mut fuel = u64::MAX;
+    let ran = prog.run_over(
+        warmup_fn,
+        &[Value::I64(entry_sp as i64)],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        true, // seed the module's data segments once, here
+    );
+    if !matches!(ran, Ok(_) | Err(Trap::Exit(_))) {
+        drop(back);
+        // SAFETY: no alias remains (back dropped, run returned); free the window.
+        unsafe { std::alloc::dealloc(win_ptr, layout) };
+        set(STATUS_TRAP);
+        return -1;
+    }
+    // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left.
+    // SAFETY: `win_ptr` owns `win` bytes; read the post-warmup image, no run in flight.
+    let (image, live) = unsafe {
+        let w = core::slice::from_raw_parts(win_ptr, win as usize);
+        let live = warm_read_brk(w).min(win as usize);
+        (w[..live].to_vec(), live)
+    };
+    // SAFETY: single-threaded wasm; the session is read back only via the warm exports.
+    unsafe {
+        *core::ptr::addr_of_mut!(WARM_SESSION) = Some(WarmSession {
+            prog,
+            module: m,
+            win,
+            entry_sp,
+            eval_fn,
+            win_ptr,
+            win_layout: layout,
+            back,
+            image,
+            dirty_end: live,
+            jit: None,
+        });
+    }
+    set(STATUS_OK);
+    live as i64
+}
+
+/// Evaluate `[stdin_ptr, stdin_len)` (the user's source) over the warm session: restore the snapshot
+/// into the window, run `eval_run`, and stage its stdout/stderr/exit into the shared capture slots
+/// (read via `svm_stdout_ptr`/`_len`, `svm_stderr_ptr`/`_len`, `svm_exit_code`; status via
+/// [`svm_status`]). Returns the guest's `i64` result, or `-1` with `UNSUPPORTED` if no session is open.
+#[no_mangle]
+pub extern "C" fn svm_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -1;
+    };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `svm_alloc`ation it filled.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
+    // byte-identical warm state (fresh-per-Run isolation).
+    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
+    unsafe {
+        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        w[..s.image.len()].copy_from_slice(&s.image);
+        w[s.image.len()..s.dirty_end].fill(0);
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    let _ = grant_onramp_caps(&mut host, &s.module, None);
+    let mut fuel = u64::MAX;
+    let (status, value, exit_code) = match s.prog.run_over(
+        s.eval_fn,
+        &[Value::I64(s.entry_sp as i64)],
+        &mut fuel,
+        s.back.clone(),
+        &mut host,
+        false, // window already carries the warm image — do not re-seed
+    ) {
+        Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
+        Err(_) => (STATUS_TRAP, 0, 0),
+        Ok(vals) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_OK, 0, 0),
+        },
+    };
+    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied.
+    // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
+    unsafe {
+        let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
+        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize));
+    }
+    set(status);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        EXIT_CODE = exit_code;
+    }
+    value
+}
+
+/// Tear down the warm session (free its window), if any. Idempotent; the next [`svm_warm_open`] starts
+/// a fresh one.
+#[no_mangle]
+pub extern "C" fn svm_warm_close() {
+    // SAFETY: single-threaded wasm; take the session and free its owned window.
+    unsafe {
+        if let Some(s) = (*core::ptr::addr_of_mut!(WARM_SESSION)).take() {
+            let (win_ptr, layout) = (s.win_ptr, s.win_layout);
+            drop(s); // drops `back` + the cached warm+JIT run (both alias `win_ptr`) before the free
+            std::alloc::dealloc(win_ptr, layout);
+        }
+    }
+}
+
+// ===== warm+JIT: run the warm session's `eval_run` on the emitted-wasm tier ========================
+//
+// WASM_AOT.md warm+JIT. The interpreter warm path ([`svm_warm_eval`]) already skips the QuickJS runtime
+// rebuild, but evaluates on the bytecode interpreter — so a compute-heavy program still pays interpreter
+// speed for the eval itself. This tier emits the module's `eval_run` to wasm **once** and drives it over
+// the restored warm image each Run, so the eval runs near-native while init stays paid-once. The emit is
+// cached in the [`WarmSession`] (a warm+JIT Run never re-pays the cdylib emit); only the powerbox host +
+// the window image are reset per Run, preserving the card's fresh-per-Run isolation. Cross-tier bounces
+// (`write`/`read`/`exit`) route to the run's interpreter over the same window, exactly as the single-shot
+// JIT run does. The JS driver mirrors `wasmjit-module.js`'s `driveJitRun`, but passes the entry `sp` as
+// the emitted `f0`'s third argument (an `i64` slot) and reuses the cached compiled Module across Runs.
+
+/// Borrow the open warm session's cached warm+JIT run, if built.
+fn warm_jit_ref() -> Option<&'static JitOnrampRun> {
+    // SAFETY: single-threaded wasm; the run is touched only by these export accessors, no run in flight.
+    unsafe {
+        (*core::ptr::addr_of!(WARM_SESSION))
+            .as_ref()
+            .and_then(|s| s.jit.as_deref())
+    }
+}
+
+/// Emit the open warm session's `eval_run` to wasm and cache it for the warm+JIT drive. Idempotent — a
+/// second call reuses the cached emit (returns `0`). `shared != 0` ⇒ the emitted module imports a shared
+/// memory (the cross-origin-isolated threads build), matching the memory the host instantiates it against.
+/// Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]): [`STATUS_UNSUPPORTED`] if no warm
+/// session is open or `eval_run` isn't wasm-drivable (the page then evaluates via [`svm_warm_eval`]).
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_open(shared: i32) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    if s.jit.is_some() {
+        set(STATUS_OK);
+        return 0;
+    }
+    // SAFETY: `s.back` aliases the live session window `[s.win_ptr, s.win)`, valid for the session's life.
+    let built = unsafe {
+        JitOnrampRun::open_warm_eval(
+            &s.module,
+            s.back.clone(),
+            s.win_ptr,
+            WARM_MAPPED_LOG2,
+            shared != 0,
+            s.eval_fn,
+            s.entry_sp,
+        )
+    };
+    match built {
+        Ok(run) => {
+            s.jit = Some(Box::new(run));
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// Restore the warm image into the window and reset the cached warm+JIT run's powerbox for a fresh Run
+/// (seeding stdin from `[stdin_ptr, stdin_len)`). Call before each drive. Returns `0`, else
+/// `-STATUS_UNSUPPORTED` if no warm+JIT run is open.
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    if s.jit.is_none() {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
+    // Restore the program-independent warm image, zeroing any tail a prior eval grew into — byte-identical
+    // warm state each Run (identical to [`svm_warm_eval`]'s restore).
+    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
+    unsafe {
+        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        w[..s.image.len()].copy_from_slice(&s.image);
+        w[s.image.len()..s.dirty_end].fill(0);
+    }
+    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `svm_alloc`ation it filled.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    s.jit.as_mut().unwrap().reset_warm(stdin);
+    set(STATUS_OK);
+    0
+}
+
+/// Pointer / length of the emitted `eval_run` wasm bytes (valid until the warm session is closed).
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_wasm_ptr() -> *const u8 {
+    warm_jit_ref().map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_wasm_len() -> usize {
+    warm_jit_ref().map_or(0, |r| r.emitted_wasm().len())
+}
+/// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win` arg.
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_win_ptr() -> usize {
+    warm_jit_ref().map_or(0, |r| r.win_base())
+}
+/// The entry `sp` the emitted `f0` takes as its trailing `i64` slot (the powerbox data-stack base).
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_entry_sp() -> i64 {
+    warm_jit_ref().map_or(0, |r| match r.slots().first() {
+        Some(Value::I64(x)) => *x,
+        Some(Value::I32(x)) => *x as i64,
+        _ => 0,
+    })
+}
+
+/// **Cross-tier bounce** for the warm+JIT run — the emitted `f0`'s `env.call_interp(func, args_ptr)`
+/// relays here (identical contract to [`svm_onramp_jit_run_call_interp`], over the warm run's
+/// window/powerbox).
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the run for this call.
+    let Some(run) = (unsafe {
+        (*core::ptr::addr_of_mut!(WARM_SESSION))
+            .as_mut()
+            .and_then(|s| s.jit.as_deref_mut())
+    }) else {
+        return STATUS_UNSUPPORTED;
+    };
+    let (params, results) = {
+        let (p, r) = run.func_sig(func);
+        (p.to_vec(), r.to_vec())
+    };
+    let read_slot = |i: usize| -> u64 {
+        let mut b = [0u8; 8];
+        // SAFETY: the host guarantees `args_ptr` addresses ≥ max(params, results) i64 slots.
+        unsafe { core::ptr::copy_nonoverlapping(args_ptr.add(i * 8), b.as_mut_ptr(), 8) };
+        u64::from_le_bytes(b)
+    };
+    let args: Vec<Value> = params
+        .iter()
+        .enumerate()
+        .map(|(i, t)| slot_to_value(*t, read_slot(i)))
+        .collect();
+    match run.run_cross_tier(func, &args) {
+        Ok(vals) => {
+            for (i, v) in vals.iter().enumerate() {
+                if i >= results.len() {
+                    break;
+                }
+                let Some(raw) = value_to_slot(v) else {
+                    return STATUS_TRAP;
+                };
+                let b = raw.to_le_bytes();
+                // SAFETY: `args_ptr + i*8` is within the env scratch (result slots overlay arg slots).
+                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), args_ptr.add(i * 8), 8) };
+            }
+            0
+        }
+        Err(Trap::Exit(_)) => STATUS_EXIT,
+        Err(t) => {
+            run.set_last_trap(format!("{t:?}"));
+            STATUS_TRAP
+        }
+    }
+}
+
+/// Record how the emitted warm `f0` finished (see [`svm_onramp_jit_run_report`]). Call before
+/// [`svm_warm_jit_finish`].
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_report(threw: i32, value: i64) {
+    // SAFETY: single-threaded wasm; exclusive access to the run.
+    if let Some(run) = unsafe {
+        (*core::ptr::addr_of_mut!(WARM_SESSION))
+            .as_mut()
+            .and_then(|s| s.jit.as_deref_mut())
+    } {
+        run.record_outcome(threw != 0, value);
+    }
+}
+
+/// Capture the finished warm+JIT run's streams / exit / value into the shared `OUT`/`ERR`/`EXIT_CODE`/
+/// `RUN_VALUE` slots (read via the usual `svm_stdout_*` / `svm_exit_code` / `svm_run_value` accessors),
+/// and advance the session's heap high-water so the next [`svm_warm_jit_prepare`] zeroes the right tail.
+/// Same status contract as [`svm_onramp_jit_run_finish`] — so warm+JIT and the interpreter warm path
+/// agree on result + exit + trap (INVARIANT 9). Call once after `f0` returns/unwinds (and after
+/// [`svm_warm_jit_report`]). Returns the `STATUS_*`.
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_finish() -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
+        return STATUS_UNSUPPORTED;
+    };
+    let Some(run) = s.jit.as_deref() else {
+        return STATUS_UNSUPPORTED;
+    };
+    let stdout = run.stdout().to_vec();
+    let stderr = run.stderr().to_vec();
+    let (status, code, value) = if run.exited() {
+        (STATUS_EXIT, run.exit_code(), 0)
+    } else if run.trapped() {
+        (STATUS_TRAP, 0, 0)
+    } else {
+        (STATUS_OK, 0, run.returned_value())
+    };
+    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied (mirrors
+    // [`svm_warm_eval`]).
+    // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
+    unsafe {
+        let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
+        s.dirty_end = s.dirty_end.max(warm_read_brk(w).min(s.win as usize));
+    }
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
+        EXIT_CODE = code;
+        RUN_VALUE = value;
+        LAST_STATUS = status;
+    }
+    status
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **POSIX personality** (see

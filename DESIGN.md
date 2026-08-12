@@ -945,9 +945,14 @@ simplification is superseded — see §4 / §3e).
 
 ### Phase-2 C subset (the "compilability proof" target)
 - **In:** `alloca`/VLAs (data-SP bump); computed `goto` (native — irreducible CFG,
-  §3); the full scalar/aggregate/vararg conventions above.
-- **Deferred:** `setjmp`/`longjmp` and C++ EH → lower onto the §12 stack-switch
-  primitive (stubbed in Phase 1); `_Thread_local` (with threads).
+  §3); the full scalar/aggregate/vararg conventions above; **`setjmp`/`longjmp`**
+  (the `<setjmp.h>` non-local jump — chibicc lowers `setjmp`/`_setjmp`/`sigsetjmp`
+  and `longjmp`/`siglongjmp` to the runtime `setjmp`/`longjmp` ops: a checkpoint of
+  the frame's resume point keyed by the `jmp_buf` address, and an unwind-and-re-enter
+  on the same buffer. Interp tier — JIT parity and the `sigsetjmp` mask (pending async
+  signals) are follow-ups. This is the bash keystone, #795).
+- **Deferred:** C++ EH → lower onto the §6/§12 stack-switch primitive;
+  `_Thread_local` (with threads).
 - **Out:** inline asm; 80-bit `long double`.
 
 ---
@@ -2218,21 +2223,49 @@ window via `env.call_interp`, which marshals each arg/result through one 8-byte 
 carry a `v128` signature).
 
 **Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
-confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and cannot honor
-per-page state the guest changed (no `PROT_NONE` sub-region in a wasm linear memory, and V8 exposes no
-way to protect a sub-range of a `WebAssembly.Memory`). `AddressSpace` `map`/`unmap`/`protect` and
-`SharedRegion` `map`/`unmap` mutate which bytes back a page (or its protection) mid-run, so an emitted
-access would sail through a page the interpreter (which enforces `Mem`'s page-protection + backing map,
-§4/§13) traps on or backs with different bytes. A module that reaches any such op therefore emits
-**nothing** and runs wholly on the interpreter — correct by construction (the interpreter is the
-oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is module-wide (the hazard is
-every *other* emitted access, not the op's own function) and covers only the state-mutating ops:
-`page_size`/`sub`/`len` are pure queries, and `grow` only commits within the fixed reservation the mask
-already permits, so neither is gated. The rejected alternative — a per-access **software page-check** in
-emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit
-only page-managing guests see, and even gated + loop-invariant-elided it stays ~1.5–3×+ on the
-random-access tail; a gated, elided page-check is the escalation *iff* a hot page-managing guest ever
-appears. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+confinement is a mask plus **one live bound** — an emitted access is admitted in `[0, live_mapped)`
+and cannot honor per-page state beyond that shape (no `PROT_NONE` sub-region in a wasm linear memory,
+and V8 exposes no way to protect a sub-range of a `WebAssembly.Memory`). `AddressSpace`
+`unmap`/`protect` and `SharedRegion` `map`/`unmap` can make a previously-accessible page trap, split
+the read/write sets, or re-back a page's bytes mid-run — states a single monotone bound cannot carry —
+so an emitted access would sail through a page the interpreter (which enforces `Mem`'s full
+page-protection + backing map, §4/§13) traps on or backs with different bytes. A module that reaches
+any such op therefore emits **nothing** and runs wholly on the interpreter — correct by construction
+(the interpreter is the oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is
+module-wide (the hazard is every *other* emitted access, not the op's own function) and covers only
+those shrinking/aliasing ops: `page_size`/`sub`/`len` are pure queries, and `AddressSpace.map` — a
+guest **grow** — only adds committed pages within the reservation the mask already permits, so
+neither is gated. The grow rides the **size/grow** axis (#717), now closed end-to-end: emitted
+accesses confine against the live `mapped` read from the module's exported `mapped` global
+(self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
+event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
+admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
+(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
+`Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
+writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
+sparse grow, a non-RW mapping — **declines** emitted execution for that call and interprets it
+instead (tier-up falls through at the dispatch; an invoke uses the interpreted delivery), so
+emitted code never runs over a state it would mis-admit; the map-containing function itself is
+never emitted either (a remapping `cap.call` is not in-subset). `tierup_grow_window.rs` and
+`jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
+unsynced divergences pinned as negative tests. The **page-state** axis stays fail-closed as above.
+The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
+divergence, never an escape. The escalation past emit-nothing — a per-access **software page-check** in emitted code — has
+**landed dark** as the strictly opt-in paged entry (#750, `compile_module_tierup_paged`): every
+confined access in a paged module also consults a host-maintained byte-per-page state table
+(`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
+`Mem::map_info` — page state is frozen while emitted code runs, since page ops are `cap.call`s
+that never emit and never hide in a cross-tier leaf), first and last touched page, trapping through
+the existing fault seam exactly where `check_prot` would. The driver writes the table's coverage to
+`"mapped"`, so the bound check traps everything above it — the two checks compose. Paged-mode
+limits, fail-closed: `SharedRegion` aliasing still gates the whole module (a `Backed` page's bytes
+live outside the window), bulk-memory functions stay interpreted, and the page check is never
+elided (an in-window proof says nothing about dynamic page state). Every **unflagged** entry emits
+byte-identical code — the fail-closed default pays zero TCB — and the check runs strictly inside
+the always-emitted `& MASK` clamp, so a wrong table is a trap-parity divergence, never an escape.
+`page_check.rs` is the differential + boundary proof (unmapped load, Ro load/store split, page-edge
+straddle, unsynced-table divergence pin). The cost remains ~1.5–3×+ on the random-access tail for
+guests that opt in; no default flips until a hot page-managing consumer justifies it. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 

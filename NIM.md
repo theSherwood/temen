@@ -736,6 +736,18 @@ engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX p
 cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
 already lowers a named import to a host capability (`Cap`) — that's the seam.
 
+**✅ Pure-IR compute leaves — DONE 2026-08-11 (#761, slice 1).** The *compute* half of the bottom
+edge needs **no** host authority, so it binds as ordinary linked SVM functions instead of caps —
+keeping the runtime inside the pure-IR / both-engines model. `svm_leng::bottom_edge_runtime()` is a
+link unit providing `memcpy`/`memset` (→ `mem.copy`/`mem.fill`), `__builtin_bswap64`/`clzll`/`ctzll`/
+`popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the single-thread `__atomic_*` family
+(→ plain load/modify/store — correct for a single-vCPU guest, §3d); `bottom_edge_index` maps a C leaf
+name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/svm-leng/tests/bottom_edge.rs`
+— each leaf **interp == JIT == native**, plus a link test binding a user module's imports to the runtime.
+Remaining for #761: `memcmp` (a byte loop), and emitting the import under its `importc` C name so the
+real `system` module binds without a name map (wired in #762, where the real names are in hand). The
+allocator (`mmap`/`munmap`) + syscalls stay on the Memory cap / POSIX seam — not pure IR.
+
 **Two paths to the near-term milestone (run one real program):**
 
 - **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
@@ -1052,7 +1064,7 @@ So the surface a guest build must satisfy is tiny.
    runs correctly on svm" and exercises the exact `alloc`/string surface the real translator needs. (It
    builds on the already-proven Rust→svm on-ramp — `rustbench`, the `peval` fixtures run real
    multi-crate Rust on svm — so the pipeline itself is mature; this pins the *leng surface* on it.)
-2. **The real `svm-leng` translator lowers to verified SVM-IR — ✅ DONE; correct *run* is toolchain-gated.**
+2. **The real `svm-leng` translator lowers to verified SVM-IR *and runs correctly on svm* — ✅ DONE (2026-08-11).**
    Measurement (2026-08-11) **overturned the feared prerequisite**: slice 1 guessed real `svm-leng`
    would need a `no_std` port of four crates. It does **not**. Rust generics monomorphize into the
    crate's own IR, so a plain `std` `svm-leng` compiles to LLVM IR and the on-ramp translates it whole:
@@ -1062,17 +1074,75 @@ So the surface a guest build must satisfy is tiny.
    FNV hasher** for svm-leng's maps (`dethash.rs` — kills the `getrandom` the default `HashMap` pulls,
    and makes output deterministic), and `map_or` for `is_none_or` (the guest toolchain floors at rustc
    1.81 / LLVM-18, to match the on-ramp's `llvm-*-18` tools). No `no_std`, no four-crate port.
-   What's *left* to a **correct run** (and the byte-identical §18 differential — the `svm-leng.svmb`
-   asset over a real hexer Leng file, the `chibicc_selfhost_asset` analog) is one **toolchain** step,
-   not code: `translate_to_text` reaches `core::fmt::Display`/`FromStr` (it formats and parses numbers),
-   which stay external libcore/liballoc symbols — stubbed to traps today (so a run would trap), and
-   made *real* by `-Z build-std`. That needs a nightly whose LLVM matches the link/opt tools; this env
-   has only LLVM-18 tools against an LLVM-23 nightly, so build-std is blocked *here* — a toolchain
-   alignment task (a matching nightly, or LLVM-23 `llvm-link`/`opt`), the sole remaining gate.
-3. **The loop, headless.** nimony-on-svm (W4) → Leng → `svm-leng`-on-svm → SVM-IR → runs. The
-   self-hosting payoff, no browser.
-4. **The browser card.** The Rust/leng analog of the chibicc self-host card — `svm-leng.svmb` in the
-   playground over an in-window memfs.
+   **Toolchain now aligned (2026-08-11).** The correct run needs the external libcore/liballoc symbols
+   (`fmt`/`FromStr`) made *real* via `-Z build-std`. The blocker was LLVM version skew — but
+   `RUSTC_BOOTSTRAP=1` unlocks `-Z build-std` on **stable 1.81 (LLVM 18)**, which matches the existing
+   `llvm-*-18` tools; with `rust-src` added, `build-std=std,panic_abort` +
+   `build-std-features=panic_immediate_abort` compiles std from source and the whole thing links to a
+   module whose **only externals are `malloc`/`free`/`calloc`/`bcmp`** — all four **synthesized** by
+   the on-ramp (`svm_llvm` §S bump allocator + `bcmp`/`memcmp` recognizer). So `fmt`/parse/panic are
+   real, and the run clears them.
+   **The integer-only self-host RUN is ✅ DONE (2026-08-11, path (b))** — the real `svm-leng`
+   translator now *executes* inside the sandbox to a correct result. `crates/svm-llvm/tests/w5_leng_run.rs`
+   builds the `leng_probe` guest with `-Z build-std` (via `common::build_fixture_bc_std`), translates the
+   ~255-func module, re-verifies it, runs `svm_leng::translate_to_text` on the interpreter, and asserts
+   the emitted SVM text's checksum is **byte-identical to the same translation run host-side** (the §18
+   svm == native differential). Integer-only in two senses: the fixture depends on `svm-leng` with
+   `default-features = false` (float literals fail closed → no `flt2dec`/`dec2flt`), and
+   `build-std-features=panic_immediate_abort` collapses panics to `abort` (no float *formatter* for panic
+   messages). The entry is the guest's exported `main(sp) -> i32` — a plain compute entry (the fixture
+   allocates from a static arena via its own `#[global_allocator]`, so no powerbox caps); the JIT declines
+   the large build-std module (a backend `Malformed`, not a translation gap — it verifies), so the run
+   pins the tree-walker. **This closes W5's core self-host claim: a real `std` Rust translator, compiled
+   the normal way, produces the same SVM-IR inside the sandbox as it does natively.**
+
+   **Path (a) — float-capable svm-leng — is now ✅ DONE too (2026-08-11).** The two float intrinsics
+   `svm_llvm` didn't lower, both in std's float path (reached only when svm-leng parses/formats float
+   literals): `llvm.usub.sat.i8` in `dec2flt` — fixed earlier (the on-ramp gained i8/i16
+   `{u,s}{add,sub}.sat`, `crates/svm-llvm/tests/narrow_saturating.rs`) — and `llvm.fshl.v4i32` (a
+   **general, non-rotate vector funnel shift**) in `flt2dec`/dragon4, the u128-bignum formatter. The
+   on-ramp already lowered the rotate idiom and the scalar general funnel shift; the vector general form
+   now scalarizes per lane to `(a << s) | (b >>u (w − s))` with a `select` on the `s == 0` width edge
+   (full-width `i32x4`/`i64x2` lanes only), pinned by `crates/svm-llvm/tests/vector_funnel_shift.rs`
+   (interp == JIT == native across the edge + mod-32 wrap). With that in, the **full float-capable
+   `svm-leng`** (default features on — 278 funcs, up from the 255 of the integer-only guest) translates,
+   re-verifies, and **runs to the same correct checksum** on the interpreter (verified end-to-end;
+   `llvm.fshl.v4i32` was the *only* remaining gap — no cascade of further float intrinsics). The
+   integer-only guest (`default-features = false`) stays a supported lean build; `w5_leng_run.rs` uses it
+   so the committed self-host test avoids a second ~40s `build-std` job, but the on-ramp no longer
+   requires it. Everything — integer code, `String`/`Vec`/`HashMap`, the allocator, and now the float
+   formatter — translates and runs.
+
+   **The `svm-leng.svmb` self-host asset is now ✅ baked (2026-08-11) — the `chibicc_selfhost_asset`
+   analog.** `crates/svm-run/demos/leng_selfhost/` mirrors the chibicc/Postgres asset lane for the Rust
+   translator: a `leng_guest` powerbox program (reads a Leng-NIF module from stdin, `translate_to_text`,
+   writes SVM text to stdout — raw `read`/`write` + a bump allocator so the only externs are
+   `read`/`write`/`bcmp`), a `build_leng_svmb.sh` pipeline (`-Z build-std` → `llvm-link-18` →
+   `opt-18` → `svm-llvm-translate --binary` → `prep_svmb`, with a stub audit), a `corpus/` of **verbatim
+   `hexer c` output** (Nim's `system/stringimpl` with ARC, control flow, gotos), and the committed
+   **`svm-leng.svmb`** (282 funcs, ~796 KB, decode/verify/bytecode-compile clean). The gate
+   `crates/svm-run/tests/leng_selfhost_asset.rs` runs the committed asset **in-sandbox over each real
+   hexer file** and asserts the emitted SVM text is byte-identical to native `svm_leng::translate_to_text`
+   — a code-coupled gate needing no build toolchain (the oracle is the in-tree crate), so an
+   IR/ABI/encoder or `svm-leng` change that drifts the asset fails the PR (regenerate + commit, per the
+   demo `README.md`). This *is* the loop headless: real hexer Leng → real `svm-leng` running on svm →
+   verified SVM-IR, byte-exact.
+
+   And it now runs **client-side in the browser** too (item 4 below).
+3. **The loop, headless — ✅ demonstrated (2026-08-11).** real hexer Leng → `svm-leng`-on-svm →
+   verified SVM-IR, byte-exact (the `leng_selfhost` asset lane above). The self-hosting payoff, no
+   browser. (Chaining W4's nimony-on-svm to feed the Leng end-to-end in one process is the remaining
+   integration step.)
+4. **The browser card — ✅ shipped (2026-08-11).** The Rust/leng analog of the chibicc self-host card:
+   a playground card (`browser/web/play.js`, `kind: 'module'`) whose editor holds a **real hexer Leng
+   file** (Nim `system/stringimpl` — ARC, `=wasMoved`) and whose Run pipes it to the committed
+   `svm-leng.svmb` (copied into `browser/web/assets/`) on stdin via `svm_run_onramp` — the fixed §3e
+   powerbox on the wasm engine. The translator emits **SVM IR text on stdout**, shown in the pane; the
+   run is ~200 ms and the emitted IR is byte-identical to native (`svm-leng.svmb` is the same asset the
+   `leng_selfhost_asset.rs` gate pins). Verified end-to-end in a real Chromium by
+   `browser/browser-play-editor-test.mjs`; the asset-reference PR gate (`check-play-assets.mjs`) sees it
+   committed. No server, no memfs image needed (stdin/stdout suffice — simpler than chibicc's header
+   closure): the real Rust translator, running on the SVM, in your browser.
 5. **Path W bring-up.** The stated end-goal: the same asset via `wasm32-unknown-unknown` →
    `svm_wasm::transpile`, retiring the "first Rust guest through the wasm on-ramp" gap.
 

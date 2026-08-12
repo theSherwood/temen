@@ -105,6 +105,38 @@ fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Translate + verify + run `src` on the powerbox **with a granted `posix` cap** (`run_with_caps`),
+/// letting `seed` stage the personality (env, a pinned clock, a seeded memfs, …) → `(stdout, exit)`.
+/// This is the richer-`std::sys` path (`time`/`env`/`fs`) that reaches the host via `__vm_host_call`.
+fn svm_run_std_posix(
+    name: &str,
+    src: &str,
+    seed: impl FnOnce(&svm_posix::Posix),
+) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    seed(&posix);
+    let out = svm_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps(
+            svm_run::Backend::Jit,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap)],
+        )
+        .expect("run_with_caps");
+    let exit = match out.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((out.stdout, exit))
+}
+
 /// Translate + verify + run `src` as a std guest on the powerbox → `(stdout, exit code)`.
 fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     let ll = build_std_bin_ll(name, src)?;
@@ -126,10 +158,28 @@ fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     Some((run.stdout, exit))
 }
 
-/// Build + run the **native-equivalent oracle**: the same program with the svm-only feature gate
-/// stripped, compiled by the default host `rustc`. Returns `(stdout, exit code)`, or `None` if the
-/// host `rustc` is absent.
-fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+/// Translate + verify + run `src` on the powerbox **with argv** → `(stdout, exit code)`.
+/// `argv[0]` is the program name, as in a native run.
+fn svm_run_std_with_args(name: &str, src: &str, argv: &[&[u8]]) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let run = svm_run::run_powerbox_with_args(&t.module, b"", argv, &[]).expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((run.stdout, exit))
+}
+
+/// Build + run the **native-equivalent oracle** with the given extra args (`argv[0]` is supplied by
+/// the OS, so `extra_args` are `argv[1..]`). Returns `(stdout, exit code)`, or `None` if host `rustc`
+/// is absent.
+fn native_oracle_args(name: &str, src: &str, extra_args: &[&str]) -> Option<(Vec<u8>, u8)> {
     let host_src = src.replace("#![feature(restricted_std)]\n", "");
     let dir = std::env::temp_dir().join(format!("svm_std_native_{name}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
@@ -147,8 +197,57 @@ fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     if !built {
         return None;
     }
-    let out = Command::new(&bin).output().ok()?;
+    let out = Command::new(&bin).args(extra_args).output().ok()?;
     Some((out.stdout, out.status.code().unwrap_or(-1) as u8))
+}
+
+/// The no-args oracle (`argv` = just the program name).
+fn native_oracle(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    native_oracle_args(name, src, &[])
+}
+
+/// Run `src` on the powerbox → `(stdout, stderr, exit)` — the stderr-separating variant.
+fn svm_run_std_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let run = svm_run::run_powerbox(&t.module, b"").expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((run.stdout, run.stderr, exit))
+}
+
+/// Native oracle returning stdout and stderr **separately**.
+fn native_oracle_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)> {
+    let host_src = src.replace("#![feature(restricted_std)]\n", "");
+    let dir = std::env::temp_dir().join(format!("svm_std_natst_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let rs = dir.join("main.rs");
+    let bin = dir.join("oracle");
+    std::fs::write(&rs, host_src).ok()?;
+    let built = Command::new("rustc")
+        .args(["--edition", "2021", "-O"])
+        .arg(&rs)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .ok()?
+        .success();
+    if !built {
+        return None;
+    }
+    let out = Command::new(&bin).output().ok()?;
+    Some((
+        out.stdout,
+        out.stderr,
+        out.status.code().unwrap_or(-1) as u8,
+    ))
 }
 
 /// S1b — a real `std` binary (`lang_start` + heap `Vec` + iterator fold) returning a **computed exit
@@ -221,5 +320,352 @@ fn std_stdout_and_exit_match_native() {
     assert_eq!(
         svm_exit, native_exit,
         "std `process::exit` code matches native"
+    );
+}
+
+/// S1e — distinct `stderr`: the svm PAL's `Stderr` routes to the powerbox stderr `Stream` (the
+/// `__vm_write_stderr` builtin → the appended `"stderr"` handle), so interleaved `println!`/
+/// `eprintln!` land in **separate** streams, each matching native.
+#[test]
+fn std_stderr_is_distinct_from_stdout() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest stderr (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   println!(\"out line 1\");\n\
+         \x20   eprintln!(\"err line 1\");\n\
+         \x20   println!(\"out line 2\");\n\
+         \x20   eprintln!(\"err line 2\");\n\
+         }\n";
+
+    let Some((svm_out, svm_err, _)) = svm_run_std_streams("svm_std_stderr", src) else {
+        eprintln!("note: skipping std_guest stderr (build-std produced no .ll)");
+        return;
+    };
+    // The svm side is fully determined: stdout has only the `println!` lines, stderr only `eprintln!`.
+    assert_eq!(
+        String::from_utf8_lossy(&svm_out),
+        "out line 1\nout line 2\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&svm_err),
+        "err line 1\nerr line 2\n"
+    );
+
+    // Cross-check both streams against a real native run.
+    if let Some((n_out, n_err, _)) = native_oracle_streams("svm_std_stderr", src) {
+        assert_eq!(svm_out, n_out, "svm stdout matches native stdout");
+        assert_eq!(svm_err, n_err, "svm stderr matches native stderr");
+    }
+}
+
+/// S1d — `std::env::args`: the svm PAL's `init` captures the powerbox-threaded `argv`, and the svm
+/// `args` module walks it. A program echoing its arguments matches a native run with the **same
+/// argv** byte-for-byte (`argv[0]` = program name, then the passed args, including one with spaces).
+#[test]
+fn std_env_args_match_native() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest args (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   let args: Vec<String> = std::env::args().collect();\n\
+         \x20   println!(\"argc = {}\", args.len());\n\
+         \x20   for (i, a) in args.iter().enumerate() {\n\
+         \x20       println!(\"argv[{i}] = {a}\");\n\
+         \x20   }\n\
+         }\n";
+
+    // argv[0] is the program name; the on-ramp/powerbox and the native OS each supply their own, so
+    // use a matching program name and compare the whole vector.
+    let extra = ["alpha", "beta gamma"];
+    let svm_argv: &[&[u8]] = &[b"prog", b"alpha", b"beta gamma"];
+
+    let Some((svm_stdout, _)) = svm_run_std_with_args("svm_std_args", src, svm_argv) else {
+        eprintln!("note: skipping std_guest args (build-std produced no .ll)");
+        return;
+    };
+    // The svm side is fully determined; assert it directly (argv[0] = "prog").
+    let expected = "argc = 3\nargv[0] = prog\nargv[1] = alpha\nargv[2] = beta gamma\n";
+    assert_eq!(
+        String::from_utf8_lossy(&svm_stdout),
+        expected,
+        "std::env::args on svm echoes the powerbox-threaded argv"
+    );
+
+    // Cross-check the shape against a native run (its argv[0] is the binary path, so compare from
+    // argv[1] onward — i.e. everything after the first line's count and the argv[0] line).
+    if let Some((native_stdout, _)) = native_oracle_args("svm_std_args", src, &extra) {
+        let svm_tail: Vec<&str> = std::str::from_utf8(&svm_stdout)
+            .unwrap()
+            .lines()
+            .skip(2) // "argc = 3", "argv[0] = prog"
+            .collect();
+        let native_tail: Vec<&str> = std::str::from_utf8(&native_stdout)
+            .unwrap()
+            .lines()
+            .skip(2) // "argc = 3", "argv[0] = <binary path>"
+            .collect();
+        assert_eq!(
+            svm_tail, native_tail,
+            "argv[1..] on svm matches native (argc and the passed args agree)"
+        );
+        assert!(
+            native_stdout.starts_with(b"argc = 3\n"),
+            "native also sees argc = 3"
+        );
+    }
+}
+
+/// S2 — `std::time` via the **posix-cap path**: `SystemTime`/`Instant` reach the host clock through
+/// the svm PAL's `__vm_host_call` bridge to the granted `posix` personality (`OP_CLOCK`). Run with a
+/// **pinned clock** so the output is deterministic — the first exercise of `run_with_caps` + a posix
+/// cap, and of the §9 constant-`op` requirement (`op` is the literal `33` at the call site).
+#[test]
+fn std_time_reads_the_posix_clock() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest time (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::time::{SystemTime, UNIX_EPOCH, Instant};\n\
+         fn main() {\n\
+         \x20   let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();\n\
+         \x20   println!(\"realtime_secs = {secs}\");\n\
+         \x20   let a = Instant::now();\n\
+         \x20   let b = Instant::now();\n\
+         \x20   println!(\"monotonic_nondecreasing = {}\", b >= a);\n\
+         }\n";
+
+    // Pin the clock to 1.7e18 ns = 1_700_000_000 s, so the output is fully determined.
+    let seeded_nanos: i64 = 1_700_000_000_000_000_000;
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_time", src, |p| p.set_clock(seeded_nanos))
+    else {
+        eprintln!("note: skipping std_guest time (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "realtime_secs = 1700000000\nmonotonic_nondecreasing = true\n",
+        "std::time reads the seeded posix clock, and Instant is non-decreasing"
+    );
+}
+
+/// S2 (env) — `std::env::{var_os, set_var, remove_var}` via the posix-cap path: the svm `env` module
+/// reaches the personality's env map through the PAL `host` bridge (buffer-writing `OP_GETENV_R` /
+/// `OP_SETENV` / `OP_UNSETENV`, so no personality arena contends with the guest heap). A program
+/// reads a seeded var, sets one, and removes one — fully deterministic output.
+///
+/// (`std::env::var` / `vars` — the `OsString`→`String` paths through `core::str::lossy::Debug::fmt` —
+/// now translate too, once the on-ramp's entry-block slot-numbering fix for named params landed; see
+/// `std_fs_round_trips` and the `ll/parse.rs` fix in this change.)
+#[test]
+fn std_env_var_os_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest env (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         fn main() {\n\
+         \x20   let seeded = std::env::var_os(\"SEEDED\").and_then(|v| v.to_str().map(|s| s.to_owned()));\n\
+         \x20   println!(\"SEEDED={}\", seeded.as_deref().unwrap_or(\"<unset>\"));\n\
+         \x20   std::env::set_var(\"MADE\", \"here\");\n\
+         \x20   let made = std::env::var_os(\"MADE\").and_then(|v| v.to_str().map(|s| s.to_owned()));\n\
+         \x20   println!(\"MADE={}\", made.as_deref().unwrap_or(\"<unset>\"));\n\
+         \x20   std::env::remove_var(\"SEEDED\");\n\
+         \x20   println!(\"after_remove_present={}\", std::env::var_os(\"SEEDED\").is_some());\n\
+         }\n";
+
+    let Some((stdout, _)) =
+        svm_run_std_posix("svm_std_env", src, |p| p.set_env("SEEDED", "from_host"))
+    else {
+        eprintln!("note: skipping std_guest env (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "SEEDED=from_host\nMADE=here\nafter_remove_present=false\n",
+        "env var_os/set_var/remove_var round-trip through the posix cap"
+    );
+}
+
+/// S2 (fs) — `std::fs` via the posix-cap path: the svm `fs` module reaches the personality's in-memory
+/// filesystem through the PAL `host` bridge's file ops (`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_LSEEK`/
+/// `OP_CLOSE`/`OP_UNLINK`/`OP_STAT`/`OP_OPENDIR`/`OP_READDIR`/`OP_CLOSEDIR`). One program exercises the
+/// whole surface: `File::create`+`write_all`, `read_to_string`, `metadata`, `Seek`+`read`, `read_dir`,
+/// an `ErrorKind::NotFound` on a missing path, and `remove_file`+`exists` — fully deterministic output.
+/// The memfs is seeded with one extra file so `read_dir` returns a stable, sorted two-entry listing.
+#[test]
+fn std_fs_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest fs (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::fs;\n\
+         use std::io::{Read, Seek, SeekFrom, Write};\n\
+         fn main() {\n\
+         \x20   let mut f = fs::File::create(\"/data/hello.txt\").expect(\"create\");\n\
+         \x20   f.write_all(b\"hello svm fs\").expect(\"write\");\n\
+         \x20   drop(f);\n\
+         \x20   println!(\"read_to_string={:?}\", fs::read_to_string(\"/data/hello.txt\").expect(\"read\"));\n\
+         \x20   let md = fs::metadata(\"/data/hello.txt\").expect(\"metadata\");\n\
+         \x20   println!(\"is_file={} len={}\", md.is_file(), md.len());\n\
+         \x20   let mut g = fs::File::open(\"/data/hello.txt\").expect(\"open\");\n\
+         \x20   g.seek(SeekFrom::Start(6)).expect(\"seek\");\n\
+         \x20   let mut s = String::new();\n\
+         \x20   g.read_to_string(&mut s).expect(\"read\");\n\
+         \x20   println!(\"after_seek={s:?}\");\n\
+         \x20   let mut names: Vec<String> = fs::read_dir(\"/data\").expect(\"read_dir\")\n\
+         \x20       .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();\n\
+         \x20   names.sort();\n\
+         \x20   println!(\"read_dir={names:?}\");\n\
+         \x20   println!(\"missing_kind={:?}\", fs::metadata(\"/data/nope\").unwrap_err().kind());\n\
+         \x20   fs::remove_file(\"/data/hello.txt\").expect(\"remove\");\n\
+         \x20   println!(\"exists_after_remove={}\", fs::exists(\"/data/hello.txt\").unwrap());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_fs", src, |p| {
+        p.write_file("/data/seed.txt", b"seed")
+    }) else {
+        eprintln!("note: skipping std_guest fs (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "read_to_string=\"hello svm fs\"\n\
+         is_file=true len=12\n\
+         after_seek=\"svm fs\"\n\
+         read_dir=[\"hello.txt\", \"seed.txt\"]\n\
+         missing_kind=NotFound\n\
+         exists_after_remove=false\n",
+        "fs File/metadata/seek/read_dir/remove round-trip through the posix cap"
+    );
+}
+
+/// S2 (process) — `std::process::Command` via the posix-cap path: the svm `process` module reaches the
+/// personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`) through the PAL `host` bridge. A spawn
+/// runs the named command to completion synchronously; `output` captures its stdout by bracketing the
+/// spawn with an `OP_PIPE`+`OP_DUP2` fd-1 redirect (restored afterwards, so captured output does not
+/// leak to the parent's stdout), and `status`/`wait` reap the exit code. The embedder wires a scripted
+/// spawn delegate (`set_spawn`) — `echo` echoes its args, `true`/`false` set the exit code.
+#[test]
+fn std_process_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest process (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::{Command, Stdio};\n\
+         fn main() {\n\
+         \x20   let out = Command::new(\"echo\").arg(\"hello\").arg(\"world\").output().expect(\"output\");\n\
+         \x20   println!(\"echo_code={:?}\", out.status.code());\n\
+         \x20   println!(\"echo_stdout={:?}\", String::from_utf8_lossy(&out.stdout).trim_end());\n\
+         \x20   let st = Command::new(\"false\").status().expect(\"status\");\n\
+         \x20   println!(\"false_code={:?}\", st.code());\n\
+         \x20   let mut child = Command::new(\"true\").stdout(Stdio::null()).spawn().expect(\"spawn\");\n\
+         \x20   println!(\"true_ok={}\", child.wait().expect(\"wait\").success());\n\
+         \x20   let noisy = Command::new(\"noisy\").output().expect(\"output\");\n\
+         \x20   println!(\"noisy_out={:?}\", String::from_utf8_lossy(&noisy.stdout).trim_end());\n\
+         \x20   println!(\"noisy_err={:?}\", String::from_utf8_lossy(&noisy.stderr).trim_end());\n\
+         \x20   println!(\"pid={}\", std::process::id());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std_posix("svm_std_process", src, |p| {
+        p.set_spawn(|name: &str, argv: &[String], _stdin: &[u8]| {
+            let (stdout, stderr, status) = match name {
+                "echo" => (
+                    format!("{}\n", argv[1..].join(" ")).into_bytes(),
+                    Vec::new(),
+                    0,
+                ),
+                "true" => (Vec::new(), Vec::new(), 0),
+                "false" => (Vec::new(), Vec::new(), 1),
+                // Emits on *both* streams, so `output()` capturing stderr separately is exercised.
+                "noisy" => (b"on stdout\n".to_vec(), b"on stderr\n".to_vec(), 0),
+                _ => (Vec::new(), Vec::new(), 127),
+            };
+            svm_posix::SpawnResult {
+                stdout,
+                stderr,
+                status,
+            }
+        })
+    }) else {
+        eprintln!("note: skipping std_guest process (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "echo_code=Some(0)\n\
+         echo_stdout=\"hello world\"\n\
+         false_code=Some(1)\n\
+         true_ok=true\n\
+         noisy_out=\"on stdout\"\n\
+         noisy_err=\"on stderr\"\n\
+         pid=1\n",
+        "Command output (stdout+stderr)/status/spawn+wait round-trip through the fork-free spawn"
+    );
+}
+
+/// S2 (fs — directory mutation) — the `std::fs` dir ops the memfs now backs: `create_dir` /
+/// `create_dir_all` (explicit-dir op `OP_MKDIR`, with `AlreadyExists` on a repeat), `rename` (file
+/// move), `remove_dir` (`OP_RMDIR`, `DirectoryNotEmpty` on a populated dir), and `File::try_clone`
+/// (a second fd via `OP_DUP`). Seeded with one file so `/data` exists as a parent directory.
+#[test]
+fn std_fs_dir_ops() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest fs-dir (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::fs;\n\
+         use std::io::Read;\n\
+         fn main() {\n\
+         \x20   fs::create_dir(\"/data/new\").expect(\"create_dir\");\n\
+         \x20   println!(\"is_dir={}\", fs::metadata(\"/data/new\").unwrap().is_dir());\n\
+         \x20   println!(\"exists_err={:?}\", fs::create_dir(\"/data/new\").unwrap_err().kind());\n\
+         \x20   fs::create_dir_all(\"/data/a/b/c\").expect(\"create_dir_all\");\n\
+         \x20   println!(\"deep_is_dir={}\", fs::metadata(\"/data/a/b/c\").unwrap().is_dir());\n\
+         \x20   fs::write(\"/data/f.txt\", b\"hi there\").expect(\"write\");\n\
+         \x20   fs::rename(\"/data/f.txt\", \"/data/g.txt\").expect(\"rename\");\n\
+         \x20   println!(\"renamed={:?}\", fs::read_to_string(\"/data/g.txt\").unwrap());\n\
+         \x20   println!(\"old_gone={}\", !fs::exists(\"/data/f.txt\").unwrap());\n\
+         \x20   fs::remove_dir(\"/data/new\").expect(\"remove_dir\");\n\
+         \x20   println!(\"removed_gone={}\", !fs::exists(\"/data/new\").unwrap());\n\
+         \x20   println!(\"rmdir_nonempty_err={:?}\", fs::remove_dir(\"/data/a\").unwrap_err().kind());\n\
+         \x20   let mut clone = fs::File::open(\"/data/g.txt\").expect(\"open\").try_clone().expect(\"clone\");\n\
+         \x20   let mut s = String::new();\n\
+         \x20   clone.read_to_string(&mut s).expect(\"read clone\");\n\
+         \x20   println!(\"clone_read={s:?}\");\n\
+         }\n";
+
+    let Some((stdout, _)) =
+        svm_run_std_posix("svm_std_fs_dir", src, |p| p.write_file("/data/seed", b"x"))
+    else {
+        eprintln!("note: skipping std_guest fs-dir (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "is_dir=true\n\
+         exists_err=AlreadyExists\n\
+         deep_is_dir=true\n\
+         renamed=\"hi there\"\n\
+         old_gone=true\n\
+         removed_gone=true\n\
+         rmdir_nonempty_err=DirectoryNotEmpty\n\
+         clone_read=\"hi there\"\n",
+        "create_dir/create_dir_all/rename/remove_dir/try_clone over the memfs dir ops"
     );
 }

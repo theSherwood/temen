@@ -196,29 +196,35 @@ function ensureOpenlibm() {
   }
 }
 function buildQuickJS() {
-  const svmb = join(ASSETS, 'qjs_repl.svmb');
   const demos = join(REPO, 'crates', 'svm-run', 'demos');
   const cflags = ['-O2', '-emit-llvm', '-S', '-c', '-fno-vectorize', '-fno-slp-vectorize',
     '-DNDEBUG', '-D_GNU_SOURCE', `-DCONFIG_VERSION="${QJS_VER}"`, '-DASSEMBLER=0'];
   const incs = [QJS_DIR, OL_DIR, join(OL_DIR, 'include'), join(OL_DIR, 'src'), join(OL_DIR, 'amd64')]
     .map((i) => `-I${i}`);
-  const lls = [];
   const cc = (src, tag) => {
     const out = join(ASSETS, `qjs_${tag}.ll`);
     execFileSync('clang', [...cflags, ...incs, src, '-o', out], { stdio: 'inherit' });
-    lls.push(out);
+    return out;
   };
-  for (const tu of ['quickjs', 'libregexp', 'libunicode', 'cutils', 'libbf']) cc(join(QJS_DIR, `${tu}.c`), tu);
-  cc(join(demos, 'quickjs', 'qjs_repl.c'), 'repl');
-  cc(join(demos, 'postgres', 'printf_shim.c'), 'printf_shim');
-  cc(join(demos, 'strtod', 'strtod.c'), 'strtod');
-  cc(join(demos, 'quickjs', 'libc_shim.c'), 'libc_shim');
-  for (const s of OPENLIBM_SRCS) cc(join(OL_DIR, 'src', `${s}.c`), s);
-  const linked = join(ASSETS, 'qjs_repl_linked.ll');
-  execFileSync('llvm-link', ['-S', ...lls, '-o', linked], { stdio: 'inherit' });
-  execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
-  const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
-  console.log(`  ✓ qjs_repl.svmb (${size} B)`);
+  // Compile the shared engine + shims + openlibm once; each driver just re-links against them.
+  const shared = [];
+  for (const tu of ['quickjs', 'libregexp', 'libunicode', 'cutils', 'libbf']) shared.push(cc(join(QJS_DIR, `${tu}.c`), tu));
+  shared.push(cc(join(demos, 'postgres', 'printf_shim.c'), 'printf_shim'));
+  shared.push(cc(join(demos, 'strtod', 'strtod.c'), 'strtod'));
+  shared.push(cc(join(demos, 'quickjs', 'libc_shim.c'), 'libc_shim'));
+  for (const s of OPENLIBM_SRCS) shared.push(cc(join(OL_DIR, 'src', `${s}.c`), s));
+  // Two drivers over the same engine: `qjs_repl` (single `main`, the shipping card) and `qjs_snapshot`
+  // (the WASM_AOT.md warm-runtime-snapshot two-phase driver: `main` + `warmup` + `eval_run`).
+  const drivers = [['qjs_repl.c', 'repl', 'qjs_repl.svmb'], ['qjs_snapshot.c', 'snapshot', 'qjs_snapshot.svmb']];
+  for (const [driverSrc, tag, out] of drivers) {
+    const driverLl = cc(join(demos, 'quickjs', driverSrc), tag);
+    const linked = join(ASSETS, `${out.replace('.svmb', '')}_linked.ll`);
+    execFileSync('llvm-link', ['-S', driverLl, ...shared, '-o', linked], { stdio: 'inherit' });
+    const svmb = join(ASSETS, out);
+    execFileSync(TR, [linked, '-o', svmb, '--host-page', HOST_PAGE], { stdio: 'inherit' });
+    const size = execFileSync('wc', ['-c', svmb]).toString().trim().split(/\s+/)[0];
+    console.log(`  ✓ ${out} (${size} B)`);
+  }
 }
 if (ensureQuickJS() && ensureOpenlibm()) {
   try {
@@ -333,6 +339,22 @@ try {
   console.log(`  ✓ chibicc.svmb (${kb} KB)`);
 } catch (e) {
   console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
+}
+
+// svm-leng — the in-browser leng→SVM-IR self-host card (NIM.md §3e): the real `svm-leng` translator,
+// compiled to a verified SVM module through the LLVM on-ramp, run over a real hexer Leng file. Unlike
+// chibicc it needs the `-Z build-std`/`llvm-18` toolchain to rebuild, so — like `shell.svmb` — its
+// bytes are the committed in-tree asset (`crates/svm-run/demos/leng_selfhost/svm-leng.svmb`, kept in
+// sync with `svm-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
+// `bash crates/svm-run/demos/leng_selfhost/build_leng_svmb.sh` when `svm-leng`/the encoder changes.
+try {
+  const lengAsset = join(REPO, 'crates', 'svm-run', 'demos', 'leng_selfhost', 'svm-leng.svmb');
+  if (!existsSync(lengAsset)) throw new Error('demos/leng_selfhost/svm-leng.svmb missing (run build_leng_svmb.sh)');
+  copyFileSync(lengAsset, join(ASSETS, 'svm-leng.svmb'));
+  const kb = (readFileSync(lengAsset).length / 1024).toFixed(0);
+  console.log(`  ✓ svm-leng.svmb (${kb} KB)`);
+} catch (e) {
+  console.log(`  – svm-leng skipped (${e.message})`);
 }
 
 // Shell — the `svm-posix` shell (STAGE1.md, playground-shell). Unlike the clang/on-ramp guests above,

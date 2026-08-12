@@ -459,10 +459,26 @@ it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
 command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
 
 *Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command reuses
-the caller's window (its declared memory must equal the carve) and BSS is not zeroed (a well-formed
+the caller's window (its declared memory must **fit** it — see below) and BSS is not zeroed (a well-formed
 command inits its own state from its data segments); non-durable domains only (durable freeze/thaw
 image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
 fibers).
+
+**A command whose declared window ≥ the default is `exec`-able (#773).** The exec (and the §14 spawn)
+originally required the command's declared memory to **equal** the caller-supplied carve; both the shell
+shim and the test managers hardcode that hint at `17` (128 KiB), so any command whose static/BSS pushed
+its window directive past 128 KiB (a `cat` block buffer, a shell line buffer) was refused — and a manager
+that then `join`ed the failed spawn **wedged** (a negative errno `& mask`ed onto a live slot). The fix: a
+child runs in a window **at least** its declared memory (a larger window is a safe superset — confinement,
+invariant 2, still masks every access to the *actual* window; only an out-of-declared-window access, a
+guest bug, wraps at the larger bound). Concretely, `exec_module` now bounds the command against the
+caller's **actual inherited window** (`GuestMem::window_size`), not the guest's `size_log2` hint (now
+advisory), and op-13 admits a module into any carve `≥` its declared memory. Defense-in-depth: a negative
+"handle" to `join`/`poll`/`detach` now faults (invariant 5) instead of masking onto a live child, so a
+genuinely-too-small spawn surfaces observably rather than hanging. Proven by
+`c_fork.rs::a_shell_execs_a_command_with_a_large_bss_buffer`: a shell spawned into a 256 KiB window forks
+a child that execs a `memory 18` command; the command touches the far end of its 60 KB buffer (only
+reachable in the enlarged window) and writes from it, and the shell reaps its exit.
 
 **Compiled-C `fork → execve → wait` with a *separate* command module. DONE (increment 2).**
 `c_fork.rs::a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command` — an ordinary compiled-C
@@ -526,14 +542,157 @@ the any-child queue only when unclaimed, so the two waits compose. Empty `forked
 `-EAGAIN` when there is nothing to wait for). The teardown sweeps drain `reap_any_waiters` alongside
 `join_waiters`. Proven in `c_fork.rs`: `a_compiled_c_program_reaps_two_children_with_waitpid_minus_one`
 (fork two children exiting 3/4, reap both with `wait(-1)`, sum = 7 regardless of order — stable 40/40
-under stress) and `waitpid_minus_one_with_no_children_is_echild`. Still coarse in one way — with no
-per-parent child table, `wait(-1)` reaps any twin in the global `forked_twins`, so a multi-parent
-topology could cross-reap; that (and process groups) is the tracking follow-up below.
+under stress) and `waitpid_minus_one_with_no_children_is_echild`.
 
-**Remaining for the shell loop:** the increment-1 exec simplifications as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and the rest of job control —
-per-parent child tracking (so `waitpid(-1)` and process groups are scoped to a parent's own children,
-not the global `forked_twins` set), plus `WUNTRACED`/`WCONTINUED` once stop/continue signals exist.
+**Per-parent child scoping — `wait` reaps only a domain's own children. DONE.** `forked_twins` is now a
+map `twin → parent domain` (`domain_key_of` the forking caller, recorded in `fork_parked_caller`)
+rather than a bare set. Every reap path is scoped: `reap_parked_caller` (`wait(pid)`) refuses a twin
+whose recorded parent is not the calling domain (`-ECHILD`, not a foreign reap); `reap_any_parked_caller`
+(`wait(-1)`) ranges only over twins of the calling parent, and `-ECHILD`s when that parent owns none
+even though other parents' twins exist; and `wake_reap_any` wakes only a parked `wait(-1)` caller whose
+domain is the finishing twin's parent. So the shared fork/wait offer no longer lets one shell reap
+another's child. The peek-then-claim ordering keeps the serve/park race retryable (`-EAGAIN`) while
+making cross-parent reaps deterministic `-ECHILD`. Proven by
+`c_fork.rs::wait_only_reaps_a_domains_own_children`: a guest forks a child; the **child**'s `wait(-1)`
+gets `-ECHILD` (the global twin set is non-empty — it holds the child itself under the *parent's* key —
+so without scoping this would deadlock), and the parent reaps only its own child. Stable 40/40 under
+stress.
+
+**Process groups — `setpgid` + `waitpid(-pgid)`. DONE.** Job control's grouping primitive, built on
+the per-parent table. Each twin's [`Twin`] record now also carries a `pgid` (POSIX process group),
+defaulting to the twin's own id at fork — every child starts its own group leader. `setpgid(pid, pgid)`
+is a **direct self-op** (op 15) the *parent* drives — the caller *is* the parent, so its own
+`domain_id` scopes the change with no serve round-trip (unlike `reap`, which needs the servicer to
+reach the parked caller); it retargets a child's `pgid` (`pgid == 0` → the child's own id), confined to
+real children of the caller (`-ESRCH` otherwise). `reap` grew a group form: `reap_any_parked_caller`
+became `reap_group_parked_caller(…, target: Option<TaskId>)` — `None` for `wait(-1)` (any child),
+`Some(pgid)` for `waitpid(-pgid)` (any child in that group) — and the parked-waiter queue carries the
+target so a finishing child wakes only a waiter of its parent whose group it matches. The `waitpid` pid
+selector now decodes POSIX fully enough for a shell: `-1` any child, `< -1` the group `|pid|`, `> 0` a
+named twin. Exposed to compiled C as `__vm_setpgid(pid, pgid)` (chibicc builtin → op 15) alongside the
+existing `__fork`/`__wait`. Proven in `c_fork.rs`: `setpgid_groups_children_and_waitpid_reaps_the_group`
+(fork A/B, `setpgid` B into A's group, `wait(-a_pid)` reaps both → 30; a failed move would sum 0) and
+`waitpid_by_group_does_not_reap_other_groups` (the dual — `wait(-a_pid)` reaps only A, then `-ECHILD`,
+while B waits in its own group). Both stable 30/30 under stress.
+
+**Shell viability — a real command-dispatch loop runs on the surface.** With the process model in
+place we pointed a shell at it (a compiled-C **microshell**, not the Instantiator-spawn Stage-0 shell):
+a reusable `run(name, arg)` that **forks**, has the child marshal an `argv` from runtime strings into
+the §3e args buffer, **resolves the command module by name** (dynamic dispatch — the shell's PATH is
+the name→module grant map), **`execve`s** it, and the parent **`waitpid`s** the status; `main` runs two
+*different* named commands in sequence and sums their exits. It runs end to end
+(`c_fork.rs::a_microshell_dispatches_two_named_commands_through_fork_exec_wait` → 107). The pivotal
+enabler is that **`execve` delivers argv**: the image-replace preserves the caller's args window, so a
+fork twin seeds `{argc, packed argv}` before `execve` and the command reads `argv[1]`
+(`execve_delivers_argv_to_the_command`). Nothing in the core loop broke — fork, resolve-by-name, argv
+marshalling, image-replace, and repeated fork→exec→wait all compose.
+
+**env delivery through `execve`. DONE.** The gap the microshell surfaced. A `main(argc, argv, envp)`
+entry (3 params) now makes chibicc's `_start` also parse the `envc` env strings — which follow the argv
+strings in the §3e args buffer — into an `envp[]` pointer array placed right after `argv[]`, passed as
+`main`'s third argument (`codegen_ir.c`: `needs_envp` + the env loop, blocks 6–10 of the arg-parsing
+`_start`). A 2-param `main(argc, argv)` is byte-identical to before (the env path is behind
+`needs_envp`). No interpreter change: `execve` already preserves the caller's args window, so a fork
+twin seeds `{argc, envc, packed argv+env}` and the exec'd command reads `envp`. Proven by
+`c_fork.rs::execve_delivers_the_environment_to_the_command` (a forked child seeds `env={"V=7"}`, the
+command returns `envp[0][2]='7'`=55). A libc `getenv` walking `envp`/`environ` is the guest-side
+follow-up (a shim, not a substrate concern).
+
+**What breaks / is still missing** (the honest gap list from that experiment, shell-relevance order):
+- **~~argv/env-seeding ergonomics~~ — a process libc shim. DONE.** `crates/svm/tests/fork_shim.c` is the
+  guest-side layer a shell links so it writes the idiomatic loop —
+  `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` — over a NUL-terminated `argv[]`,
+  instead of hand-marshalling the buffer: `fork`/`wait_pid`(`pid`/`-1`/`-pgid`)/`setpgid`/`execvp`
+  (packs argv **and** `environ` into the §3e buffer, resolves the module by name, inherits `stdout`,
+  image-replaces) + `getenv`/`strlen`. Every entry point is **`static inline`**, so chibicc's dead-code
+  pass drops the ones a program doesn't call — a command that only reads its env pulls in `getenv`, not
+  `fork`/`execvp` and their `__fork`/`__wait` offer imports (which it was never granted; a plain
+  `static` non-inline function is a liveness *root*, so `inline` is load-bearing here). Proven by
+  `c_fork.rs::a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env` (a shim shell `execvp`s a
+  command with argv + env; the command reads both via `argv` and `getenv` → 107). A `$PATH`-dir scan
+  (below) and `pipe`/`dup2` are the remaining libc gaps.
+- **PATH semantics.** Command lookup is a name→module registry by exact name (the grant map), not a
+  `$PATH`-dir `stat` scan — fine as *a* PATH, an impedance mismatch for `execvp("/bin/ls")`.
+- **~~pipes between forked children~~ (`cmd1 | cmd2`). DONE — sequential *and* concurrent.** A
+  guest-reachable `pipe()` self-op (op 16) mints a host-served FIFO into the shell's own powerbox and
+  hands back the two `Stream`-typed ends (`fds[0]` read / `fds[1]` write, POSIX order); the shim's
+  `exec_io(file, argv, out, in)` re-grants a pipe end to a stage's `stdout`/`stdin` by name. Because a
+  `PipeEnd`'s FIFO backing aliases across `execve` (and across fork), two commands' **plain
+  `write(1)`/`read(0)`** connect transparently — neither knows a pipe is there.
+  - **Concurrent (both stages live) — the read *blocks*.** A `read` of an empty FIFO parks the reader
+    (`Blocked::PipeRead`, keyed by pipe id) while any write end is open, and a producer's `write` — or
+    the **last write end closing** — wakes it; the woken read is rewound, so it re-executes and drains
+    the new bytes or EOFs. EOF is a POSIX **writer refcount** on the shared backing: bumped when a write
+    end is minted / re-granted into a child / fork-copied, dropped on explicit `close(fd)` and when a
+    domain execs or exits — so a fork-inherited write end holds the pipe open across the fork→exec gap,
+    race-free against the shell closing its own ends. The shim gained `close(fd)` (`__vm_close` → op 2);
+    a shell closes its copies of the ends after forking the stages, leaving the producer the last
+    writer. Proven by `c_fork.rs::a_shell_runs_a_concurrent_pipe_with_a_blocking_read`: the shell forks
+    both stages and only then waits; the producer *burns a compute loop first*, so the consumer parks on
+    the empty pipe and is woken by the write (a non-blocking read would have EOF'd to empty output).
+    Stable 20/20 under stress.
+  - **Sequential** (`a_shell_pipes_the_output_of_one_forked_command_into_another`): fork producer,
+    `wait`, `close` the write end, fork consumer — the buffered bytes drain, then EOF.
+  - Interp-only (the park lives in the eval loop; the JIT/bytecode tiers don't block a pipe read, so a
+    differential guest must `close` the write end before an empty read — see `pipe.rs`).
+  - **~~SIGPIPE + backpressure~~. DONE — the write side made symmetric to the read side.** The FIFO is
+    now a **bounded buffer** (`PIPE_CAP` = 64 KiB, Linux's default) with two write-side contracts:
+    - **SIGPIPE (`-EPIPE`).** A **read**-end refcount (the third `Arc` in `PipeBacking`) mirrors the
+      writer refcount, bumped/dropped at every read-end lifecycle point (mint / re-grant into a child /
+      fork-copy / explicit `close` / exec / teardown). A `write` to a pipe whose read count is `0`
+      returns `-EPIPE` — the SIGPIPE-ignored contract: a producer whose consumer has quit fails its next
+      write instead of piling into a FIFO nobody drains.
+    - **Backpressure (blocking write).** A `write` that would overflow `PIPE_CAP` **parks** the writer
+      (`Blocked::PipeWrite`, keyed by pipe id) — the exact write-side twin of the read park: a `read` that
+      drains a full pipe (room opened) or the last read end closing (→ `-EPIPE`) wakes it; the woken write
+      is rewound and re-executes. A partially-full pipe short-returns (the freed room), so a well-behaved
+      writer loops. This closes the "the FIFO is unbounded" hole: a runaway producer (`yes | head`) is
+      bounded to one 64 KiB buffer, not host RAM.
+
+      Proven by `c_fork.rs`: `a_producer_gets_epipe_when_its_consumer_exits` (the `yes | head` story — the
+      producer blocks as the pipe fills, resumes as the consumer drains, and gets `-EPIPE` = returns 88
+      the moment the consumer's read end closes, rather than spinning to its safety cap) and
+      `a_full_pipe_write_is_bounded_to_the_capacity` (a 100 000-byte write short-returns exactly 65 536 —
+      the FIFO never grows past the bound). Interp-only, same reason as the read park.
+- **~~file redirection~~ (`cmd > file`). DONE — as a pump over the pipe + fs substrate, no new mechanism.**
+  The shell wires the command's stdout to a pipe **write** end (`exec_io(cmd, argv, fds[1], 0)`), drops its
+  own copies of both ends (so `cmd` is the sole writer), then — instead of forking a second stage — *is*
+  the reader: it loops a **handle-specific** blocking read on the pipe read end and forwards each chunk to
+  a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read EOFs (which arrives when `cmd`
+  exits and the writer refcount hits 0). Two new frontend builtins back the pump: `__vm_read(h,buf,len)` /
+  `__vm_write(h,buf,len)` (`cap.call 0 0|1`) read/write a *specific* Stream handle — the plain `read`/
+  `write` builtins always hit the ambient stdin/stdout, so a shell holding a pipe fd needs these to drain
+  it. The shim exposes them as `read_fd`/`write_fd`. Because `__vm_read` is a **direct `cap.call`** (not a
+  `call.sym` offer), the pipe-read park was added to the direct-`CapCall` eval arm too (it had only been on
+  the `CallSym` route). Proven by `c_fork.rs::a_shell_redirects_a_command_output_to_a_file`: `cmd` writes
+  `"redirected!"` to its stdout, the shell pumps all 11 bytes into `out.txt`, and the shared memfs snapshot
+  holds exactly that file (the shell's own stdout stays empty — the output never touched it). Interp-only,
+  same reason as pipes (the read parks in the eval loop).
+- **~~the rest of redirection~~ (`>>`, `<`, `2>`). DONE — all the same pump over the existing pipe + fs +
+  stream-by-name primitives, still no new mechanism.**
+  - **`cmd >> file` (append).** Identical pump to `>`, only the shell's `FS_OPEN` flags gain `O_APPEND`
+    (`O_CREATE|O_WRITE|O_APPEND`), so the output lands after the file's existing bytes rather than
+    truncating. Proven by `a_shell_appends_a_command_output_to_a_file` (a seeded `log.txt` = `"existing\n"`
+    ends up `"existing\nredirected!"`).
+  - **`cmd < file` (input).** The **reverse** pump: the shell `FS_OPEN`s the source `O_READ`, reads it in
+    chunks, and writes each into a pipe whose *read* end is the command's `stdin` (`exec_io(cmd, argv, out,
+    fds[0])`); draining the file then closing the write end EOFs the command's `stdin`. The command is the
+    consumer, the shell the producer — the concurrent-pipe park/wake, driven from the shell side. Proven by
+    `a_shell_redirects_a_file_into_a_command_stdin` (`in.txt` bytes arrive on the shell's stdout via a `cat`
+    that echoes stdin→stdout).
+  - **`cmd 2> file` (stderr).** The command writes normal output with the ambient `write` builtin (always
+    `stdout`) and diagnostics to a **distinct** `stderr` handle it resolves by name (`__vm_write`); the shim
+    grows an `exec_io3(file, argv, out, in, err)` that adds a `"stderr"` grant, and the shell pumps that end
+    to a file exactly like `>`. Proven by `a_shell_redirects_a_command_stderr_to_a_file`: stdout stays on the
+    shell's stdout while `err.txt` holds only the stderr bytes — the two streams land in different places.
+- **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
+- **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
+  only (no bytecode/JIT/wasm) — the §9 backend-parity track.
+
+**Remaining lower-level items:** the increment-1 exec simplifications as they're needed (fresh window +
+BSS zero, durable-domain exec, exec from a nested serve context), and `WUNTRACED`/`WCONTINUED` once
+stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a
+microshell running on them, the core process-model surface a shell drives is complete.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 

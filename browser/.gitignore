@@ -29,9 +29,19 @@ patched*.wasm
 # playground's JS demo works out of the box. `build-onramp-assets.mjs` rebuilds it in place when the
 # sources *are* fetchable, and otherwise leaves this committed artifact untouched.
 !/web/assets/qjs_repl.svmb
+# qjs_snapshot.svmb — the two-phase (`main`/`warmup`/`eval_run`) QuickJS driver for the WASM_AOT.md
+# warm-runtime snapshot (`svm_warm_*`), committed prebuilt for the same fetch-gated reason as
+# `qjs_repl.svmb`. `build-onramp-assets.mjs` rebuilds it in place when the sources are fetchable; the
+# committed `warm-snapshot-test.mjs` uses it (and skips cleanly if absent).
+!/web/assets/qjs_snapshot.svmb
 # chibicc (the in-browser C compiler, SELFHOST_C.md §7 step 5) is committed prebuilt for the same
 # reason: `build-onramp-assets.mjs` builds it fail-soft (skipped when clang/llvm-18 is absent or the
 # build hiccups), so relying on the deploy-time build alone silently ships a 404 (the I26/I42 class).
 # Shipping the translated `.svmb` in-tree makes the C-compiler card work out of the box; the build
 # script rebuilds it in place when the toolchain is present.
 !/web/assets/chibicc.svmb
+# svm-leng (the in-browser leng→SVM-IR self-host card, NIM.md §3e) is committed prebuilt for the same
+# reason: it's a copy of the in-tree `crates/svm-run/demos/leng_selfhost/svm-leng.svmb` asset (whose own
+# code-coupling gate keeps it in sync), so the self-host card works out of the box even when the
+# `-Z build-std`/`llvm-18` toolchain that rebuilds it is absent. `build-onramp-assets.mjs` copies it.
+!/web/assets/svm-leng.svmb

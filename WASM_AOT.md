@@ -42,6 +42,14 @@ Three separate causes, none of which a new backend addresses:
    `chase_rand` ~3.4×). Not V8 compile time (~6 ms for 3 MB), not the giant function itself
    (TurboFan compiles it; relooper A/B'd at zero gain and reverted). BROWSER.md § slice-8 already
    names the real levers: **redundant-check elimination with proof**, or function splitting.
+4. **Program-independent runtime init, re-run every Run.** For a language on-ramp (QuickJS, Lua,
+   Postgres…) each Run rebuilds the whole guest runtime before it touches the user's code —
+   `JS_NewRuntime` + `JS_NewContext` + every intrinsic for QuickJS. It is *fixed* (identical for a
+   trivial program and a heavy one) and it dominates the wall clock of a light script: in Chromium
+   the qjs warm floor is ~380 ms whether the input is empty, `1;`, or the user's fib/sort/JSON
+   program — the program itself contributes ~0. Neither a new backend nor the slice-1 code cache
+   touches this: the cache keeps V8's *compiled code* warm, but `JS_NewRuntime` still runs from
+   scratch every Run. The lever is a **warm-runtime snapshot** (follow-on to slice 1 below).
 
 ## 3. What "pure wasm" would buy, and its sanctioned form
 
@@ -136,36 +144,122 @@ over `encode_module`, the same identity the durable module-grant registry alread
   reuse-without-recompile, content-not-object keying, `run_powerbox` parity across inputs, no
   state-leak across reuses, distinct-module isolation, and that a refused (concurrent) module is not
   cached and does not poison the cache.
-- **Browser — NEXT (two steps, low-risk first).** The playground's dominant pattern is re-Running
-  the same module (edit stdin, re-Run Lua/SQLite/chibicc). Today every Run re-emits (cdylib) and
-  re-compiles (`WebAssembly.compile`, `wasmjit-module.js:32`) with no cross-Run reuse.
-  - **Step 1 (JS-only, no TCB/concurrency change):** a JS `Map` from the module's content digest →
-    the compiled `WebAssembly.Module`, consulted in `driveJitRun` (`wasmjit-module.js`) before
-    `WebAssembly.compile`. Key on the *source/module* the Run was launched with (the same bytes
-    `moduleCache` already holds by URL, or the editor text for editable cards) — not the emitted
-    bytes, so the lookup precedes emit. This skips V8 compile (and, if we also memoize the emitted
-    bytes, the cdylib emit) on a re-Run. It touches no `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN`
-    state, so it can't introduce a cross-Worker race — the reason to do it first.
-  - **Step 2 (cdylib, only if step 1's emit cost still shows):** replace the per-Run `PAR_RUN_GEN`
-    emit-dedup key with the content digest (`svm_encode::digest256` over the decoded module — the
-    *same* key `svm_run::CompiledCache` uses), so the cdylib itself skips re-emit across Runs, not
-    just across Workers within a Run. Higher-risk (it edits the I22 shared-stash lifetime), so gated
-    on a measured need.
-  - **Validation:** not locally runnable here (no wasm toolchain in this environment). Rides CI's
-    `browser-real` Chromium differential suite for correctness (a stale-cache bug shows as a
-    render/output divergence there), plus a first-vs-second-Run timing assertion added to the
-    playground recorder / a `node` bench (`bench_jit.mjs`-style) for the win itself.
-- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser) second Run of
-  a light script ≥ interpreter-only time — kills the "net slower under JIT" footgun.
+- **Browser — LANDED (step 1, JS-only).** `wasmjit-module.js`'s `driveJitRun` now consults a
+  cross-Run `Map` (`jitModuleCache`) keyed by a caller-supplied **stable module identity** before
+  `WebAssembly.compile`: on a hit the compiled `WebAssembly.Module` is reused verbatim, skipping V8
+  codegen; a miss compiles and caches. `play.js` passes the module's content-addressed URL for on-ramp
+  cards and stable keys for the chibicc compiler/self-host paths (`ex.url` / `'chibicc-compiler'` /
+  `'chibicc-selfhost'`). **Code only** — a fresh instance/window/env cell is built per Run, so no guest
+  state crosses Runs; the cache is bounded (16 entries, LRU-ish) and opt-in (no key ⇒ no caching, so
+  the dynamic in-browser-compiled-C path and the parity prover are unaffected). It touches no
+  `static mut`/`CODEGEN_LOCK`/`PAR_RUN_GEN` state — no cross-Worker race surface.
+  - **Measured in Chromium** (`browser-jit-cache-test.mjs`): re-Running the same module produces
+    byte-identical stdout every Run and compiles exactly once (`{compiles:1, hits:2}`). Warm re-Runs:
+    **hello_c 33 ms → 4 ms** (now *beats* the interpreter's ~8 ms — the "light script slower under
+    JIT" footgun is fixed), **qjs_repl ~4.4 s → ~2.5 s (~1.8×)** — the reused Module keeps V8's
+    tiered-up code warm across Runs, saving far more than the ~30–50 ms `WebAssembly.compile` alone.
+- **Browser — step 2 (deferred, gated on need).** Have the cdylib itself skip *re-emit* across Runs
+  (replace the per-Run `PAR_RUN_GEN` emit-dedup key with the `svm_encode::digest256` content key —
+  the same one `svm_run::CompiledCache` uses). Higher-risk (it edits the I22 shared-stash lifetime).
+  Step 1's warm numbers already clear the footgun gate, so this waits for a measured re-emit cost that
+  step 1 doesn't cover.
+- **Gate:** (native, met) `compiled_cache.rs` green + `run_powerbox` parity; (browser, met) second
+  Run of a light script (hello_c 4 ms) now beats interpreter-only (~8 ms) — footgun closed, pinned by
+  `browser-jit-cache-test.mjs`.
 
-### Slice 2 — default the JIT tier on where eligible (after slice 0)
+### Follow-on to slice 1 — warm-runtime snapshot (PROTOTYPED native; the do-nothing-program floor)
 
-- Flip the per-demo checkbox default to on when eligibility passes (`compile_tier_eligibility` /
-  `analyze` stay the single routing predicate — INVARIANTS #9's one-veto rule). Fail-closed
-  behavior unchanged; the checkbox remains as an off-switch and for parity "prove it" runs.
-- Includes the SVM-text editor path where the recipe is compute-only (today it has no JIT toggle at
-  all).
-- **Gate:** the existing per-demo parity assertions run in both default states in `browser-test.mjs`.
+Slice 1 caches *code*; it does nothing about **cause 4** — the program-independent runtime init that
+re-runs every Run. This prototype attacks that directly: run the guest's init **once**, snapshot the
+post-init guest memory, and **restore the snapshot per Run**, evaluating only the user's code on top.
+
+- **Shape.** Split the on-ramp driver into three exports (`crates/svm-run/demos/quickjs/qjs_snapshot.c`):
+  `main` (the original cold read→init→eval→print, the baseline), `warmup` (init runtime+context+bindings
+  into statics, then return — no stdin, no eval, so the produced memory is program-independent), and
+  `eval_run` (read stdin, eval over the warm context, print). The host snapshots after `warmup` and
+  restores before each `eval_run`.
+- **Fresh-per-Run isolation is preserved (INVARIANT #6).** Every Run restores the *same* post-warmup
+  image into a fresh zeroed window, so a `var` defined in one Run cannot leak into the next. Proven by
+  byte-for-byte cold≡warm output parity (below); this is the same fresh-activation guarantee the
+  code cache already holds, extended to a restored-not-rebuilt warm image.
+- **The memory-model wrinkle (why it's not just a memcpy of the window).** These are ordinary exports
+  (`params = [i64 sp]`), not the synthesized `_start` (func 0), so the harness reproduces what `_start`
+  does for the on-ramp: grant the §3e powerbox + bind the module's manifest imports (deterministic
+  handles, re-established per Run), seed the guest heap bump words (`POWERBOX_HEAP_BRK`/`_TOP`), and
+  pass `sp = powerbox_entry_sp`. The on-ramp allocator grows the heap **above** the declared window
+  (`heap_base = 1 << size_log2`), and that growth's mapped-width state lives in the `Mem`, *not* in the
+  window bytes — so a naïve window memcpy restores the bytes but faults on the warm heap
+  (`MemoryFault`). The prototype maps a **larger window** (2^26) so the whole heap stays inside the
+  mapped region: no `vm_map` growth, a contiguous guest image captured by a plain memcpy of the live
+  prefix `[0, brk)`. (The browser already sizes `winSize` to hold the heap — same idea.)
+- **Measured native** (`crates/svm-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
+  same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
+  restore ~3.5 ms (memcpy the live prefix).
+
+  | program | cold ms | warm ms (restore+eval) | speedup |
+  | --- | --- | --- | --- |
+  | `1;` (trivial) | 32 | 8 | **4.0×** |
+  | fib/sort/JSON (user's) | ~150 | ~105 | ~1.4× |
+  | 100k-iter loop | ~3900 | ~3150 | ~1.2× |
+
+  Byte-identical output on all three (`fib 0 1 1 2 …`, sorted array, `JSON.stringify` incl. `Math.PI`,
+  `0.1+0.2`, the loop sum `4999950000`). The fixed ~24 ms init is replaced by a ~3.5 ms restore — the
+  win is largest for light scripts (where init dominated) and shrinks as the eval itself grows, exactly
+  as cause 4 predicts.
+- **Browser plumbing — PROTOTYPED (`svm_warm_open`/`svm_warm_eval`/`svm_warm_close`).** A stateful
+  browser session (`browser/src/lib.rs`, the twin of the native prototype and of the `PgSession`
+  reactor): `svm_warm_open` decodes the two-phase driver, enlarges the mapped window to `WARM_MAPPED_LOG2`
+  (2^26 — the same keep-the-heap-inside trick), runs `warmup` **once** over an owned window, and keeps
+  the live prefix `[0, brk)` as the warm image; `svm_warm_eval` restores that image (zeroing only the
+  heap tail a prior eval grew, for byte-identical fresh state) and runs `eval_run`, staging stdout into
+  the same capture slots `svm_run_onramp` uses; `svm_warm_close` frees it. Reuses `grant_onramp_caps` and
+  `SharedProgram::run_over(seed_data=false)`. Keeping the whole ~4 MiB image (vs the reactor `Session`'s
+  256 KiB `REACTOR_SNAP_CAP`) is what closes the gap for QuickJS.
+- **Measured in Node/V8** (`browser/warm-snapshot-test.mjs`, the shipping engine FFI, the committed
+  `web/assets/qjs_snapshot.svmb`): warmup once ~430 ms — i.e. the QuickJS runtime rebuild **is** the
+  ~380–430 ms warm floor — then:
+
+  | program | cold ms | warm ms (restore+eval) | speedup |
+  | --- | --- | --- | --- |
+  | `1;` (trivial) | ~570 | **2** | **~250×** |
+  | fib/sort/JSON (user's) | ~400 | ~70 | ~6× |
+  | 100k-iter loop | ~4600 | ~2900 | ~1.6× |
+
+  Byte-identical cold≡warm output on all three (`svm_run_onramp` `_start`/cold vs `svm_warm_eval`/warm).
+  The "do-nothing program takes >1 s" case collapses to ~2 ms — the whole fixed init is gone. The win is
+  far larger than native because the browser runs QuickJS init through the interpreter-in-wasm; it also
+  composes with the slice-1 code cache (cache keeps V8's code warm, snapshot skips `JS_NewRuntime`).
+- **Card wiring (next).** The exports exist and are proven; wiring the playground's qjs card to
+  `open`-once-then-`eval`-per-Run (with a warm session cached across Runs, invalidated on module change)
+  is the remaining UI step. Kept separate so the reactor lands with its own test first.
+- **Gate (met):** cold≡warm output parity on the QuickJS on-ramp across trivial/heavy/loop inputs,
+  native (`qjs_snapshot.rs`) and through the wasm FFI (`warm-snapshot-test.mjs`), with the fixed-init
+  cost demonstrably removed from the warm path.
+
+### Slice 2 — default the JIT tier on where eligible — LANDED
+
+- **Demo cards — already default-on.** Every `ex.jit` card already builds its "wasm-JIT" checkbox
+  `checked = true` (`play.js` `buildCard`), with the checkbox as an off-switch and the "prove it"
+  button for the interp≡JIT parity run. Fail-closed is unchanged: a non-eligible or trapping module
+  throws and the card falls back to the interpreter. `compile_tier_eligibility`/`analyze` stay the
+  single routing predicate (INVARIANTS #9). Nothing to change here.
+- **SVM-text compute recipe — now tiers up (the gap the plan named).** The SVM-text editor's
+  `plain` ("none / compute only") recipe ran pure-interpreter across Workers with no JIT path.
+  `runText` now passes `tierup: true` for it, so the interpreter drives and hot in-subset functions
+  run on emitted wasm over the same live window (fail-closed per-function; the `§22-jit`/`§14-inst`
+  recipes keep their own JIT, `io` stays on the interpreter for now). The done-line reports how many
+  regions tiered up.
+- **This also closes slice 0's browser residual.** That path is the `svm_par_run`/`PAR_TIERUP`
+  **mainline tier-up over a live window** the JACL postmortem flagged — the one piece slice 0 could
+  only pin natively. `browser-tierup-mainline-test.mjs` (new) now validates it in real Chromium: an
+  SVM-text compute guest whose root loops calling a **window-round-tripping** leaf returns the
+  identical value with tier-up on as all-interpreter (INVARIANT 9), with tier-up actually firing
+  (50 000 regions). (Aside surfaced by the test: the SVM-text `run()` path does not materialize
+  `data` segments into the window — a pre-existing property, not introduced here; both tiers read
+  identically, so it's a differential no-op. A follow-on if a hand-written SVM-text guest ever needs
+  a data segment.)
+- **Gate (met):** `browser-test.mjs` (the full playground, tier-up now on for `plain`) stays green,
+  and `browser-tierup-mainline-test.mjs` pins interp≡tier-up + non-vacuity.
 
 ### Slice 3 — redundant confinement-check elimination (the Lua/SQLite lever) — LANDED (provable-bound form)
 
@@ -216,5 +310,5 @@ that consumers can often sidestep the need entirely. Revisit if one shows up.
 | --- | --- |
 | #1 small core | no new backend; cache + default-flip are embedder policy; elision is evidence-gated |
 | #2 confinement = masking pass | slice 3 stays inside the pass, fuzzed per elision form; standalone export deferred behind renegotiation |
-| #6 one world / fresh activation | cache holds code only, never window state; pinned by test |
+| #6 one world / fresh activation | cache holds code only, never window state; the warm-runtime snapshot restores an identical *program-independent* post-init image into a fresh zeroed window per Run (no guest state crosses Runs) — pinned by cold≡warm output parity |
 | #9 oracle; decline, never diverge | routing predicate unchanged and single; parity gates run in both toggle-default states; slice 0 fixes a decline-path fault |

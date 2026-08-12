@@ -10,16 +10,84 @@
 // Both return the run status (0 = returned, 5 = exited) or throw if `_start` isn't emittable (the caller
 // falls back to the interpreter). Synchronous guest work; only the initial `WebAssembly.compile` is async.
 
-// Drive an already-opened single-shot JIT run to completion: copy the emitted `_start` out, compile +
-// instantiate it against the cdylib's shared `memory`, and call `f0(win, env, ...slots)` once. Returns
-// the finish status. The caller must have opened the run (`svm_onramp_jit_run_open*`) already.
-async function driveJitRun(ex, memory) {
+// Slice-1 browser cache (WASM_AOT.md): a cross-Run cache of the compiled `WebAssembly.Module`, keyed
+// by a caller-supplied **stable module identity** (a URL / asset name — the same content key the
+// native `svm_run::CompiledCache` uses, here supplied by the caller so no per-Run hashing is needed).
+// The emitted `_start` is a pure function of the guest module (stdin/source are guest *input*, fed
+// through memfs/stdin, never baked into the code), so the compiled Module is reused verbatim on every
+// later Run of the same module — skipping `WebAssembly.compile` (V8 codegen). Only *code* is cached: a
+// fresh instance, window, and env cell are built per Run, so no guest state crosses Runs. A missing
+// key (undefined) disables caching for that call. Bounded so a session that Runs many distinct modules
+// can't grow it without limit.
+const jitModuleCache = new Map();
+const JIT_MODULE_CACHE_MAX = 16;
+function cacheGet(key) {
+  return key === undefined ? undefined : jitModuleCache.get(key);
+}
+function cachePut(key, mod) {
+  if (key === undefined) return;
+  // Simple LRU-ish bound: drop the oldest insertion when full (Map preserves insertion order).
+  if (jitModuleCache.size >= JIT_MODULE_CACHE_MAX && !jitModuleCache.has(key)) {
+    jitModuleCache.delete(jitModuleCache.keys().next().value);
+  }
+  jitModuleCache.set(key, mod);
+}
+// A parallel cross-Run cache of the **instantiated** emitted module (issue #803). The compiled Module
+// skips V8 codegen; caching the instance additionally skips the per-Run `WebAssembly.instantiate` of the
+// ~12.7 MB emitted module *and* the copy of its bytes out of wasm memory (only read on a compile miss).
+// Safe because the emitted entry `f0(win, env, ...slots)` takes win/env/sp as **arguments** and holds no
+// state between calls — the reactor already reuses one instance across every frame the same way — and its
+// linear memory is the imported (stable) engine memory. Keyed by the same stable module identity as
+// `jitModuleCache`; a fresh `win`/`sp` and the dynamic cross-tier bounce are supplied per Run by the
+// caller, so a reused instance always runs against current state.
+const jitInstanceCache = new Map();
+// Test/telemetry hook: how many WebAssembly.compile calls the cache has served vs skipped.
+export const jitCacheStats = { compiles: 0, hits: 0 };
+export function jitCacheClear() {
+  jitModuleCache.clear();
+  jitInstanceCache.clear();
+  jitCacheStats.compiles = 0;
+  jitCacheStats.hits = 0;
+}
+
+// Get-or-build the emitted module's instance for `cacheKey`, reusing it across Runs. `readEmitted` is
+// invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
+// the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
+// Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
+async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
+  const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
+  if (cached) {
+    jitCacheStats.hits++;
+    return cached.f0;
+  }
+  let module = cacheGet(cacheKey);
+  if (module === undefined) {
+    module = await WebAssembly.compile(readEmitted());
+    cachePut(cacheKey, module);
+    jitCacheStats.compiles++;
+  }
+  const instance = await WebAssembly.instantiate(module, {
+    env: { memory, trap: () => {}, call_interp: callInterp },
+  });
+  const f0 = instance.exports.f0;
+  if (typeof f0 !== 'function') throw new Error('emitted module has no f0 export');
+  if (cacheKey !== undefined) {
+    if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
+      jitInstanceCache.delete(jitInstanceCache.keys().next().value);
+    }
+    jitInstanceCache.set(cacheKey, { instance, f0 });
+  }
+  return f0;
+}
+
+// Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
+// + instantiated against the cdylib's shared `memory`, reused across Runs) and call `f0(win, env, ...slots)`
+// once. Returns the finish status. The caller must have opened the run (`svm_onramp_jit_run_open*`) already.
+// `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
+// instance are reused across Runs (see `cachedInstanceF0`).
+async function driveJitRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
-  // Copy the emitted bytes out (a later svm_alloc could move the stash), read the window base + the
-  // powerbox handle slots `_start` takes as params, and the env-cell size.
-  const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
-  const wlen = ex.svm_onramp_jit_run_wasm_len();
-  const emitted = u8().slice(wptr, wptr + wlen);
+  // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
   const win = Number(ex.svm_onramp_jit_run_win_ptr());
   const envBytes = ex.svm_onramp_jit_run_env_bytes();
   const slots = [];
@@ -29,20 +97,29 @@ async function driveJitRun(ex, memory) {
 
   // `env.call_interp` relays each cross-tier call to the cdylib; a nonzero status (exit/trap) throws to
   // unwind the emitted `f0` (the browser's JS import model — `Exit` and real traps both caught below).
-  const module = await WebAssembly.compile(emitted);
-  const instance = await WebAssembly.instantiate(module, {
-    env: {
+  // Reuse the compiled Module **and** the instance across Runs of the same guest module (issue #803):
+  // the emitted bytes are copied out of wasm memory only on a compile miss, and one instance serves every
+  // Run. Safe even though this path re-opens a fresh window each Run — `win` is passed to `f0` per Run,
+  // and the cross-tier bounce routes to the current cdylib run, so a reused instance runs against current
+  // state (the warm path reuses the same way, and the reactor reuses one instance across every frame).
+  let f0;
+  try {
+    f0 = await cachedInstanceF0(
       memory,
-      trap: () => {},
-      call_interp: (func, argsPtr) => {
+      cacheKey,
+      () => {
+        // Copy the emitted bytes out (a later svm_alloc could move the stash).
+        const wptr = Number(ex.svm_onramp_jit_run_wasm_ptr());
+        const wlen = ex.svm_onramp_jit_run_wasm_len();
+        return u8().slice(wptr, wptr + wlen);
+      },
+      (func, argsPtr) => {
         if (ex.svm_onramp_jit_run_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
       },
-    },
-  });
-  const f0 = instance.exports.f0;
-  if (typeof f0 !== 'function') {
+    );
+  } catch (e) {
     ex.svm_onramp_jit_run_close();
-    throw new Error('emitted module has no f0 export');
+    throw e;
   }
 
   const env = Number(ex.svm_alloc(envBytes));
@@ -74,7 +151,7 @@ async function driveJitRun(ex, memory) {
 }
 
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
-export async function runJitModule(ex, memory, moduleBytes, stdinBytes) {
+export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Hand the module (+ optional stdin) to the cdylib: decode, outline, grant powerbox, emit `_start`.
   const modP = Number(ex.svm_alloc(moduleBytes.length));
@@ -93,14 +170,79 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes) {
   if (opened !== 0) {
     throw new Error(`JIT module open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
   }
-  return driveJitRun(ex, memory);
+  return driveJitRun(ex, memory, cacheKey);
+}
+
+// Run the warm session's `eval_run` on the **warm+JIT** tier (WASM_AOT.md warm+JIT). The warm snapshot
+// (`svm_warm_open`) has already paid the QuickJS runtime init once; this evaluates the user's code on
+// emitted wasm over the restored warm image, so a compute-heavy program runs the eval near-native while
+// init stays paid-once. The engine emits `eval_run` on the first Run and caches it (a warm+JIT Run never
+// re-pays the cdylib emit); the compiled `WebAssembly.Module` is cached across Runs too (keyed by
+// `cacheKey`). Differs from `driveJitRun` only in the accessors it drives and in passing the entry `sp`
+// as the emitted `f0`'s third argument (an i64 slot ⇒ a BigInt). Assumes `svm_warm_open` already
+// succeeded for this module. Returns the run status (0 = returned, 5 = exited); throws if `eval_run`
+// isn't wasm-drivable or the run traps (the caller falls back to the interpreter warm path).
+export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  // Emit `eval_run` (idempotent — cached in the warm session after the first Run).
+  if (ex.svm_warm_jit_open(shared) !== 0) {
+    throw new Error(`warm-JIT open failed: status ${ex.svm_status()} (2 = eval_run not emittable)`);
+  }
+  // Per-Run: restore the warm image + reset the run's powerbox, feeding the editor text as stdin.
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = Number(ex.svm_alloc(stdinLen));
+    u8().set(stdinBytes, stdinP);
+  }
+  const prepared = ex.svm_warm_jit_prepare(stdinP, stdinLen);
+  if (stdinP) ex.svm_dealloc(stdinP, stdinLen);
+  if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.svm_status()}`);
+
+  const win = Number(ex.svm_warm_jit_win_ptr());
+  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as f0's i64 slot
+  const envBytes = ex.svm_onramp_jit_run_env_bytes();
+
+  // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
+  // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
+  // passed per Run), so one instance serves every Run of this warm session.
+  const f0 = await cachedInstanceF0(
+    memory,
+    cacheKey,
+    () => {
+      const wptr = Number(ex.svm_warm_jit_wasm_ptr());
+      const wlen = ex.svm_warm_jit_wasm_len();
+      return u8().slice(wptr, wptr + wlen);
+    },
+    (func, argsPtr) => {
+      if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+    },
+  );
+
+  const env = Number(ex.svm_alloc(envBytes));
+  new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
+  let threw = 0;
+  let value = 0n;
+  try {
+    // f0(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return is
+    // the guest's top-level result (an i32/i64); normalize to i64.
+    const r = f0(win, env, sp);
+    value = r === undefined || r === null ? 0n : BigInt(r);
+  } catch {
+    threw = 1;
+  }
+  ex.svm_dealloc(env, envBytes);
+  ex.svm_warm_jit_report(threw, value);
+  const status = ex.svm_warm_jit_finish();
+  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted warm run trapped (declined to the interpreter)');
+  return status;
 }
 
 // Run the **chibicc compiler** on the wasm-JIT: feed it the user's C `srcBytes` (seeded at `/in.c`) plus
 // the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
 // argv (`svm_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver
 // just hands over the module + source. The emitted SVM-IR comes back on `svm_stdout_*` after finish.
-export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInfo = 0) {
+export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInfo = 0, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const modP = Number(ex.svm_alloc(moduleBytes.length));
   const srcP = Number(ex.svm_alloc(srcBytes.length));
@@ -114,7 +256,7 @@ export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInf
   if (opened !== 0) {
     throw new Error(`JIT compiler open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
   }
-  return driveJitRun(ex, memory);
+  return driveJitRun(ex, memory, cacheKey);
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.svmb compiles one of
@@ -122,7 +264,7 @@ export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInf
 // object, reading the TU + its glibc header closure from `imgBytes` (the committed closure image). Same
 // shape as `runJitCompiler` but through `svm_selfhost_jit_emit_object_fs` (raw image + `--emit-object`
 // argv, 128 MiB window for the giants). The emitted object text comes back on `svm_stdout_*` after finish.
-export async function runJitSelfhost(ex, memory, moduleBytes, imgBytes, tuBytes, debugInfo = 0) {
+export async function runJitSelfhost(ex, memory, moduleBytes, imgBytes, tuBytes, debugInfo = 0, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const modP = Number(ex.svm_alloc(moduleBytes.length));
   const imgP = Number(ex.svm_alloc(imgBytes.length));
@@ -135,5 +277,5 @@ export async function runJitSelfhost(ex, memory, moduleBytes, imgBytes, tuBytes,
   if (opened !== 0) {
     throw new Error(`JIT self-host open failed: status ${ex.svm_status()} (2 = _start not emittable)`);
   }
-  return driveJitRun(ex, memory);
+  return driveJitRun(ex, memory, cacheKey);
 }

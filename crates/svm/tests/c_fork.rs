@@ -77,6 +77,12 @@ fn c_to_ir(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// The reusable guest-side process libc (`fork`/`wait_pid`/`setpgid`/`execvp`/`getenv`) over the
+/// fork/exec/wait surface — the layer a shell links so it writes the idiomatic fork/exec/wait loop
+/// instead of hand-marshalling the args buffer. `#[allow(dead_code)]`-style: all entry points are
+/// `static`, so chibicc drops the ones a given program doesn't call. Prepended to a guest's C source.
+const FORK_SHIM: &str = include_str!("fork_shim.c");
+
 /// The guest: `fork()` (through the `__fork` import → the fork offer), retrying while it returns `< 0`
 /// (the `-EAGAIN` serve/park race — the `while ((pid = fork()) < 0)` shell idiom, ISSUES.md I68), then
 /// write the 8-byte fork return to fd 1 (the granted stdout stream) — in BOTH the original and the twin.
@@ -492,6 +498,1585 @@ fn waitpid_minus_one_with_no_children_is_echild() {
         r,
         vec![Value::I64(55)],
         "wait(-1) with no children is -ECHILD, so the guest took the `s == -10` branch"
+    );
+}
+
+/// FORK.md §8.6 — **per-parent child scoping**: `wait` only reaps a domain's *own* children. The
+/// twin table (`forked_twins`) records each twin's forking parent, so a `wait(-1)` sees only the
+/// twins that parent forked — even though the fork/wait offer (and thus the servicer) is shared.
+///
+/// The guest forks a child; the **child** then calls `wait(-1)` with no children of its own. The
+/// global twin table is *not* empty (it holds the child itself, under the parent's key), so without
+/// parent scoping the child's `wait(-1)` would block forever (nothing of its to reap) and deadlock
+/// the whole run. With scoping the child gets `-ECHILD` at once and returns `77`; the parent then
+/// reaps the child through *its* `wait(-1)` and returns that `77`. So `r == 77` proves both halves:
+/// the child was correctly told it has no children, and the parent reaped only its own. Both the
+/// child and parent retry on `-EAGAIN` (`-11`, the serve/park race); the child stops on `-ECHILD`.
+const WAIT_SCOPE_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_any(void) { return __wait(0, -1); }
+static long pid, s, cs;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    do { cs = wait_any(); } while (cs == -11);
+    if (cs == -10) return 77;
+    return 66;
+  }
+  while ((s = wait_any()) < 0);
+  return s;
+}
+"#;
+
+#[test]
+fn wait_only_reaps_a_domains_own_children() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(WAIT_SCOPE_GUEST_SRC)).expect("parse scope guest");
+    verify_module(&guest).expect("verify scope guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The child's wait(-1) got -ECHILD (it has no children of its own → returned 77), and the parent
+    // reaped only its own child (returning that 77). A cross-reap or a hang would not yield 77.
+    assert_eq!(
+        r,
+        vec![Value::I64(77)],
+        "the child saw -ECHILD (no children of its own) and the parent reaped only its own child"
+    );
+}
+
+/// FORK.md §8.6 — **process groups**: `setpgid` + `waitpid(-pgid)`, the job-control primitive a shell
+/// uses to reap a whole pipeline as one group. Each forked child starts as its own group leader
+/// (`pgid == pid`); `__vm_setpgid(pid, pgid)` (the self-op the parent drives directly) reassigns it.
+///
+/// The guest forks two children (A exits `10`, B exits `20`), then `setpgid`s B **into A's group**
+/// (`pgid = a_pid`). It then reaps that group twice with `wait(-a_pid)` (`__wait(0, -a_pid)` →
+/// `waitpid(-pgid)`), retrying only on `-EAGAIN` (`-11`) so a stray `-ECHILD` would corrupt the sum
+/// rather than spin. Both A and B are now in group `a_pid`, so the two reaps sum to `30`. Had
+/// `setpgid` not moved B, the second `wait(-a_pid)` would return `-ECHILD` (B still in its own group)
+/// and the sum would be `10 + (-10) = 0` — so `r == 30` proves B really joined A's group.
+const PGID_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_setpgid(long pid, long pgid);
+long fork(void) { return __fork(0, 0); }
+long wait_group(long pgid) { return __wait(0, -pgid); }
+static long a_pid, b_pid, s, total, n;
+int main(int argc, char **argv) {
+  while ((a_pid = fork()) < 0);
+  if (a_pid == 0) return 10;
+  while ((b_pid = fork()) < 0);
+  if (b_pid == 0) return 20;
+  __vm_setpgid(b_pid, a_pid);
+  total = 0;
+  n = 0;
+  while (n < 2) {
+    do { s = wait_group(a_pid); } while (s == -11);
+    total = total + s;
+    n = n + 1;
+  }
+  return total;
+}
+"#;
+
+#[test]
+fn setpgid_groups_children_and_waitpid_reaps_the_group() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(PGID_GUEST_SRC)).expect("parse pgid guest");
+    verify_module(&guest).expect("verify pgid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // Both children were reaped through wait(-a_pid): B joined A's group via setpgid, so the group
+    // held both and the two reaps summed to 30 (10 + 20). A failed setpgid would have summed to 0.
+    assert_eq!(
+        r,
+        vec![Value::I64(30)],
+        "setpgid moved B into A's group; waitpid(-a_pid) reaped both (10 + 20 = 30)"
+    );
+}
+
+/// FORK.md §8.6 — **`waitpid(-pgid)` is group-scoped**: it never reaps a child in a *different* group.
+/// The dual of the grouping test. The guest forks A (`10`) and B (`20`) and leaves them in their
+/// **default** groups (each its own leader: `pgid == pid`). `wait(-a_pid)` reaps only A; a second
+/// `wait(-a_pid)` then returns `-ECHILD` (`-10`) because group `a_pid` is now empty — B is in group
+/// `b_pid`, *not* reaped by A's group. B is finally reaped by `wait(-b_pid)`. The guest checks the
+/// exact triple (`10`, `-10`, `20`) and returns `99` only if all hold — so a group over-reap (B
+/// wrongly reaped by `wait(-a_pid)`) would not yield `99`.
+const PGID_SCOPE_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long fork(void) { return __fork(0, 0); }
+long wait_group(long pgid) { return __wait(0, -pgid); }
+static long a_pid, b_pid, s1, s2, s3;
+int main(int argc, char **argv) {
+  while ((a_pid = fork()) < 0);
+  if (a_pid == 0) return 10;
+  while ((b_pid = fork()) < 0);
+  if (b_pid == 0) return 20;
+  do { s1 = wait_group(a_pid); } while (s1 == -11);
+  s2 = wait_group(a_pid);
+  while (s2 == -11) s2 = wait_group(a_pid);
+  do { s3 = wait_group(b_pid); } while (s3 == -11);
+  if (s1 == 10 && s2 == -10 && s3 == 20) return 99;
+  return 1;
+}
+"#;
+
+#[test]
+fn waitpid_by_group_does_not_reap_other_groups() {
+    let manager = Arc::new(parse_module_raw(EXEC_MANAGER).expect("parse exec manager"));
+    verify_module(&manager).expect("verify exec manager");
+    let guest = parse_module_raw(&c_to_ir(PGID_SCOPE_GUEST_SRC)).expect("parse pgid-scope guest");
+    verify_module(&guest).expect("verify pgid-scope guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // wait(-a_pid) reaped only A (10); group a_pid was then empty (-ECHILD, B is in group b_pid);
+    // B was reaped by wait(-b_pid) (20). The guest saw the exact triple → 99. A cross-group reap fails.
+    assert_eq!(
+        r,
+        vec![Value::I64(99)],
+        "waitpid(-a_pid) reaped only A's group, never B (which was in b_pid's group)"
+    );
+}
+
+/// FORK.md §8.6 — **`execve` delivers argv to the command.** A shell running `echo hello` must hand
+/// the command its argument vector. The §3e powerbox args buffer lives at
+/// `[POWERBOX_ARGS_BASE=128, POWERBOX_ARGS_END=16384)` as `{argc:u32, envc:u32}` + packed
+/// NUL-terminated strings, and a `--child-entry` `main(argc, argv)` `_start` parses it. `execve`
+/// replaces the image in the caller's *own* window in place, and a `main(argc,argv)` command's globals
+/// start at `POWERBOX_ARGS_END`, so a forked child seeds the buffer *before* `execve` and the new image
+/// reads it. Proven end to end: the child seeds `argv = {"cmd", "42"}` then `execve`s a command that
+/// returns `argv[1][0]` (`'4'` = 52) — pointer-array delivery, not a flat read (the image-replace
+/// preserves the args window; the command's data lands above it). This is the primitive the microshell
+/// below builds on; env (`envc > 0`) is not yet parsed by the `_start` (the next frontier).
+const EXECVE_ARGV_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static long pid, status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;      /* POWERBOX_ARGS_BASE */
+    hdr[0] = 2;                 /* argc */
+    hdr[1] = 0;                 /* envc */
+    char *s = (char *)136;      /* packed strings: base + 8 */
+    s[0] = 'c'; s[1] = 'm'; s[2] = 'd'; s[3] = 0;
+    s[4] = '4'; s[5] = '2'; s[6] = 0;
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The command: return the first byte of `argv[1]` — `'4'` (52) if argv was delivered.
+const EXECVE_ARGV_CMD_SRC: &str = r#"
+int main(int argc, char **argv) {
+  return argv[1][0];
+}
+"#;
+
+#[test]
+fn execve_delivers_argv_to_the_command() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let guest = parse_module_raw(&c_to_ir(EXECVE_ARGV_GUEST_SRC)).expect("parse argv guest");
+    verify_module(&guest).expect("verify argv guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_ARGV_CMD_SRC)).expect("parse argv command");
+    verify_module(&cmd).expect("verify argv command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(52)],
+        "the exec'd command read argv[1][0] = '4' (52) — argv was delivered through execve"
+    );
+}
+
+/// MICROSHELL (pointing a real shell at the fork/exec/wait surface) — a shell's whole command loop in
+/// ordinary compiled C: a reusable `run(name, arg)` that **forks**, has the child build an `argv` from
+/// runtime strings, **resolves the command module by name** (dynamic dispatch — the shell's PATH is the
+/// name→module grant map), **execve**s it, and the parent **waitpid**s for the status. `main` runs two
+/// *different* named commands in sequence and sums their statuses. This is the real shape — not a single
+/// hardcoded exec — exercising dynamic command lookup, runtime argv marshalling from inside a fork
+/// twin's own window, and repeated fork→exec→wait, all end to end.
+const MICROSHELL_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static long slen(const char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
+static long run(const char *name, const char *arg) {
+  long pid, st, i, k;
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;
+    hdr[0] = 2; hdr[1] = 0;                 /* argc = 2, envc = 0 */
+    char *s = (char *)136;
+    i = 0;
+    for (k = 0; name[k]; k = k + 1) { s[i] = name[k]; i = i + 1; } s[i] = 0; i = i + 1;
+    for (k = 0; arg[k]; k = k + 1) { s[i] = arg[k]; i = i + 1; } s[i] = 0;
+    long cmd = __vm_resolve(name, slen(name));
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((st = wait_pid(pid)) < 0);
+  return st;
+}
+static char n_one[] = "one";
+static char n_two[] = "two";
+static char a_five[] = "5";
+int main(int argc, char **argv) {
+  long r1 = run(n_one, a_five);   /* command "one": returns argv[1][0] = '5' = 53 */
+  long r2 = run(n_two, a_five);   /* command "two": returns argv[1][0] + 1 = 54 */
+  return r1 + r2;                 /* 53 + 54 = 107 */
+}
+"#;
+
+/// The two commands the microshell dispatches — each reads its `argv[1]` (proving per-command argv
+/// delivery) and returns a distinct function of it, so the summed status pins that *both* ran with the
+/// right arguments through *different* name lookups.
+const MICROSHELL_CMD_ONE_SRC: &str = r#"
+int main(int argc, char **argv) { return argv[1][0]; }
+"#;
+const MICROSHELL_CMD_TWO_SRC: &str = r#"
+int main(int argc, char **argv) { return argv[1][0] + 1; }
+"#;
+
+/// The manager: spawns the fork/wait server, then the microshell guest via op 13 with a 5-entry grant
+/// list `{stdout, __fork, __wait, "one"→mod1, "two"→mod2}` (the two commands are the shell's PATH), and
+/// joins. `main(inst, stream, guestmod, mod1, mod2)`.
+const MICROSHELL_MANAGER: &str = r#"
+memory 19
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "fork" 1 { op: 2 }
+export 1 interface "wait" 1 { op: 3 }
+data 400 "__fork"
+data 410 "stdout"
+data 420 "__wait"
+data 430 "one"
+data 440 "two"
+func (i32, i32, i64, i64, i64) -> (i64) {
+block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64) {
+  vq = i64.const 0
+  q0v0 = i64.const 4294967296
+  q0v1 = i64.const 262144
+  q0v2 = i64.const -4294967284
+  q0v3 = i64.const 4294967295
+  q0v4 = i64.const 0
+  q0a0 = i64.const 1152
+  i64.store q0a0 q0v0
+  q0a1 = i64.const 1160
+  i64.store q0a1 q0v1
+  q0a2 = i64.const 1168
+  i64.store q0a2 q0v2
+  q0a3 = i64.const 1176
+  i64.store q0a3 q0v3
+  q0a4 = i64.const 1184
+  i64.store q0a4 q0v4
+  q0a5 = i64.const 1192
+  i64.store q0a5 q0v4
+  q0a6 = i64.const 1200
+  i64.store q0a6 q0v4
+  vs = cap.call 6 17 (i64) -> (i32) v0 (q0a0)
+  vz0 = i64.const 0
+  vforkoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  v1c = i64.const 1
+  vwaitoff = cap.call 6 14 (i32, i64) -> (i32) v0 (vs, v1c)
+  vmod1_32 = i32.wrap_i64 vmod1
+  vmod2_32 = i32.wrap_i64 vmod2
+  va0 = i64.const 256
+  vnp0 = i32.const 410
+  i32.store va0 vnp0
+  va1 = i64.const 260
+  vsix = i32.const 6
+  i32.store va1 vsix
+  va2 = i64.const 264
+  i32.store va2 vstream
+  va3 = i64.const 272
+  vnp1 = i32.const 400
+  i32.store va3 vnp1
+  va4 = i64.const 276
+  i32.store va4 vsix
+  va5 = i64.const 280
+  i32.store va5 vforkoff
+  va6 = i64.const 288
+  vnp2 = i32.const 420
+  i32.store va6 vnp2
+  va7 = i64.const 292
+  i32.store va7 vsix
+  va8 = i64.const 296
+  i32.store va8 vwaitoff
+  va9 = i64.const 304
+  vnp3 = i32.const 430
+  i32.store va9 vnp3
+  va10 = i64.const 308
+  vthree = i32.const 3
+  i32.store va10 vthree
+  va11 = i64.const 312
+  i32.store va11 vmod1_32
+  va12 = i64.const 320
+  vnp4 = i32.const 440
+  i32.store va12 vnp4
+  va13 = i64.const 324
+  i32.store va13 vthree
+  va14 = i64.const 328
+  i32.store va14 vmod2_32
+  vgp = i64.const 256
+  vgn = i64.const 5
+  ve0 = i64.const 0
+  voffg = i64.const 131072
+  vsl = i64.const 17
+  vg = cap.call 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vgmod, vgp, vgn, ve0, voffg, vsl, vq)
+  vjg = cap.call 6 1 (i32) -> (i64) v0 (vg)
+  return vjg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+  }
+block 1 () {
+  vz = i32.const 0
+  vn = cap.call 4294967295 10 () -> (i64) vz ()
+  br 1()
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vzero = i64.const 0
+  vt = cap.call 4294967295 11 (i64) -> (i64) vz (vzero)
+  return vt
+  }
+}
+func (i64) -> (i64) {
+block 0 (vpid: i64) {
+  vz = i32.const 0
+  vt = cap.call 4294967295 12 (i64) -> (i64) vz (vpid)
+  return vt
+  }
+}
+"#;
+
+#[test]
+fn a_microshell_dispatches_two_named_commands_through_fork_exec_wait() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let guest = parse_module_raw(&c_to_ir(MICROSHELL_GUEST_SRC)).expect("parse microshell guest");
+    verify_module(&guest).expect("verify microshell guest");
+    let one = parse_module_raw(&c_to_ir(MICROSHELL_CMD_ONE_SRC)).expect("parse cmd one");
+    verify_module(&one).expect("verify cmd one");
+    let two = parse_module_raw(&c_to_ir(MICROSHELL_CMD_TWO_SRC)).expect("parse cmd two");
+    verify_module(&two).expect("verify cmd two");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&one);
+    let mod2 = host.grant_module(&two);
+
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // Both commands ran through the shell's fork→resolve-by-name→execve→wait loop with their own argv:
+    // "one" returned '5' (53), "two" returned '6' (54); the shell summed them → 107.
+    assert_eq!(
+        r,
+        vec![Value::I64(107)],
+        "the microshell dispatched two named commands via fork/exec/wait (53 + 54 = 107)"
+    );
+}
+
+/// FORK.md §8.6 — **`execve` delivers the environment.** The gap the microshell surfaced: `envc` was
+/// always 0 and chibicc's `_start` never parsed the env portion of the args buffer, so a command could
+/// not read an exported variable. Now a `main(argc, argv, envp)` entry (3 params) makes `_start` also
+/// parse the `envc` env strings — which follow the argv strings in the §3e buffer — into an `envp[]`
+/// pointer array, passed as `main`'s third argument. Here a forked child seeds `argc=1, envc=1` with
+/// `argv={"c"}` and `env={"V=7"}`, then `execve`s a command that returns `envp[0][2]` (`'7'` = 55) —
+/// proving the env vector reaches the exec'd image, indexed through the pointer array.
+const EXECVE_ENV_GUEST_SRC: &str = r#"
+long __fork(int h, long a);
+long __wait(int h, long pid);
+long __vm_resolve(const char *name, long len);
+long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
+long fork(void) { return __fork(0, 0); }
+long wait_pid(long pid) { return __wait(0, pid); }
+struct grant { int name_off; int name_len; int handle; int pad; };
+static struct grant grec;
+static char stdout_name[] = "stdout";
+static char cmd_name[] = "cmd";
+static long pid, status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    int *hdr = (int *)128;
+    hdr[0] = 1;                 /* argc = 1 */
+    hdr[1] = 1;                 /* envc = 1 */
+    char *s = (char *)136;
+    s[0] = 'c'; s[1] = 0;                        /* argv[0] = "c" */
+    s[2] = 'V'; s[3] = '='; s[4] = '7'; s[5] = 0; /* env[0]  = "V=7" */
+    long cmd = __vm_resolve(cmd_name, 3);
+    long soh = __vm_resolve(stdout_name, 6);
+    grec.name_off = (int)(long)stdout_name;
+    grec.name_len = 6;
+    grec.handle = (int)soh;
+    __vm_exec_module(cmd, (long)&grec, 1, 0, 17);
+    return -1;
+  }
+  while ((status = wait_pid(pid)) < 0);
+  return status;
+}
+"#;
+
+/// The command: a 3-arg `main` that returns the third byte of its first env string — `'7'` (55) for
+/// `env[0] = "V=7"`, if the environment was delivered through `execve`.
+const EXECVE_ENV_CMD_SRC: &str = r#"
+int main(int argc, char **argv, char **envp) {
+  return envp[0][2];
+}
+"#;
+
+#[test]
+fn execve_delivers_the_environment_to_the_command() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let guest = parse_module_raw(&c_to_ir(EXECVE_ENV_GUEST_SRC)).expect("parse env guest");
+    verify_module(&guest).expect("verify env guest");
+    let cmd = parse_module_raw(&c_to_ir(EXECVE_ENV_CMD_SRC)).expect("parse env command");
+    verify_module(&cmd).expect("verify env command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(55)],
+        "the exec'd command read envp[0][2] = '7' (55) — the environment was delivered through execve"
+    );
+}
+
+/// FORK.md §8.6 — **the process libc shim in action.** The microshell above hand-marshalled the args
+/// buffer and drove the raw self-ops; a real shell links `fork_shim.c` and writes the idiomatic loop:
+/// `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` with a NUL-terminated `argv[]`.
+/// The shell points `environ` at its own env, `execvp` marshals both argv and env into the §3e buffer,
+/// and the command — also linking the shim — sets `environ = envp` and reads a var back with `getenv`.
+/// The shim's `static` entry points mean the command drags in only `getenv`/`strlen`, **not**
+/// `fork`/`execvp` and their `__fork`/`__wait` offer imports (which it was never granted). The command
+/// returns `argv[1][0] + getenv("V")[0]` = `'4'`(52) + `'7'`(55) = 107.
+const SHIM_SHELL_SRC: &str = r#"
+static char *sh_env[] = { "V=7", 0 };
+static char *cmd_argv[] = { "cmd", "42", 0 };
+int main(int argc, char **argv) {
+  environ = sh_env;
+  long pid = fork();
+  while (pid < 0) pid = fork();
+  if (pid == 0) { execvp("cmd", cmd_argv); return 127; }
+  return wait_pid(pid);
+}
+"#;
+
+/// The command, also over the shim: wire `environ` from `envp`, then return a function of both its
+/// argument (`argv[1]`) and its environment (`getenv("V")`) — so a correct result proves *both* the
+/// argv and the env crossed `execvp`, and that `getenv` reads the delivered env.
+const SHIM_CMD_SRC: &str = r#"
+int main(int argc, char **argv, char **envp) {
+  environ = envp;
+  char *v = getenv("V");
+  return argv[1][0] + (v ? v[0] : 0);
+}
+"#;
+
+#[test]
+fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
+    let manager = Arc::new(parse_module_raw(EXECVE_MANAGER).expect("parse execve manager"));
+    verify_module(&manager).expect("verify execve manager");
+    let shell_src = format!("{FORK_SHIM}\n{SHIM_SHELL_SRC}");
+    let cmd_src = format!("{FORK_SHIM}\n{SHIM_CMD_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse shim shell");
+    verify_module(&guest).expect("verify shim shell");
+    let cmd = parse_module_raw(&c_to_ir(&cmd_src)).expect("parse shim command");
+    verify_module(&cmd).expect("verify shim command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let mut fuel = 160_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell forked, execvp'd "cmd" with argv={"cmd","42"} and env={"V=7"}, and waited: the command
+    // read argv[1][0]='4' (52) + getenv("V")[0]='7' (55) = 107 through the libc shim.
+    assert_eq!(
+        r,
+        vec![Value::I64(107)],
+        "the shim shell ran execvp with argv + env; the command read both (52 + 55 = 107)"
+    );
+}
+
+/// FORK.md §8.6 — **a pipe between two forked commands: `one | two`.** The shell mints a pipe with the
+/// `pipe()` self-op (via the shim), forks the producer with the pipe **write** end wired to its
+/// `stdout`, waits, then forks the consumer with the pipe **read** end wired to its `stdin` and the
+/// shell's own `stdout` as its output. The two commands use plain `write(1)` / `read(0)` — they never
+/// know a pipe is there; the shim's `exec_io` re-grants the pipe ends by name, and the FIFO backing
+/// aliases across each `execve`, so the producer's bytes reach the consumer transparently. Sequential
+/// (fill-then-drain): the producer completes before the consumer runs. After reaping it the shell
+/// **closes its own write end** (`close(fds[1])`) so the pipe has no writers left — the blocking read
+/// then EOFs once the buffered bytes drain. `one` writes `"hi\n"`; `two` uppercases stdin to stdout →
+/// the sink holds `"HI\n"` and `two` returns the 3 bytes it moved.
+const PIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);                       /* fds[0] = read end, fds[1] = write end */
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  wait_pid(p1);                    /* producer fills the pipe, then exits */
+  close(fds[1]);                   /* no writers left → the consumer's read EOFs after draining */
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  return wait_pid(p2);             /* consumer drains the pipe → shell stdout */
+}
+"#;
+
+/// The producer `one`: write `"hi\n"` to its stdout (the pipe write end). Plain `write(1, …)`.
+const PIPE_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "hi\n";
+int main(int argc, char **argv) {
+  write(1, msg, 3);
+  return 0;
+}
+"#;
+
+/// The consumer `two`: read stdin (the pipe read end) to EOF, uppercase it, write to stdout (the
+/// shell's sink). Returns the byte count. Plain `read(0, …)` / `write(1, …)`.
+const PIPE_CONSUMER_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+long write(long fd, void *buf, long n);
+int main(int argc, char **argv) {
+  char buf[64];
+  long total = 0, n, k;
+  while ((n = read(0, buf, 64)) > 0) {
+    for (k = 0; k < n; k = k + 1) {
+      char c = buf[k];
+      if (c >= 'a' && c <= 'z') c = c - 32;
+      buf[k] = c;
+    }
+    write(1, buf, n);
+    total = total + n;
+  }
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_pipes_the_output_of_one_forked_command_into_another() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{PIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse pipe shell");
+    verify_module(&guest).expect("verify pipe shell");
+    let producer = parse_module_raw(&c_to_ir(PIPE_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // granted as "one"
+    let mod2 = host.grant_module(&consumer); // granted as "two"
+
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The consumer read all 3 bytes the producer piped to it (returned 3) and uppercased them to the
+    // shell's stdout: `one` wrote "hi\n", `two` turned it into "HI\n".
+    assert_eq!(
+        r,
+        vec![Value::I64(3)],
+        "the consumer drained 3 bytes through the pipe from the producer"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"HI\n",
+        "one | two: the producer's output flowed through the pipe and the consumer uppercased it"
+    );
+}
+
+/// FORK.md §8.6 — **concurrent pipe: `one | two` with both stages live at once.** Unlike the sequential
+/// test above (fork producer, *wait*, fork consumer), the shell forks **both** stages, closes its own
+/// copies of the pipe ends, and only then waits — so the consumer starts reading before the producer
+/// has written. This exercises the **blocking read**: the producer `one` first burns a long compute
+/// loop, so the consumer `two` reaches its `read(0)` on an empty FIFO and **parks** (writers still open)
+/// rather than seeing a false EOF; when `one` finally writes and exits (the last write end closing), the
+/// parked read wakes — draining the bytes, then EOF. Were the read non-blocking (the pre-slice
+/// behavior) the consumer would EOF immediately and emit nothing. The producer's write end reaches it
+/// through fork+exec; the shell's `close(fds…)` leaves `one` the sole writer so EOF arrives on its exit.
+/// `one` writes `"go\n"`; `two` uppercases → the sink holds `"GO\n"` and `two` returns 3.
+const CONCURRENT_PIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  /* Both stages are live; the shell drops its own ends so `one` is the sole writer (EOF on its exit). */
+  close(fds[0]);
+  close(fds[1]);
+  wait_pid(p1);
+  return wait_pid(p2);   /* the consumer's byte count */
+}
+"#;
+
+/// The concurrent producer `one`: burn a compute loop *first* (so the consumer parks on an empty read),
+/// then write `"go\n"`. The `volatile` accumulator keeps the loop from folding away.
+const CONCURRENT_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "go\n";
+int main(int argc, char **argv) {
+  volatile long acc = 0;
+  long i;
+  for (i = 0; i < 3000000; i = i + 1) acc = acc + i;
+  write(1, msg, 3);
+  return 0;
+}
+"#;
+
+#[test]
+fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{CONCURRENT_PIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse concurrent pipe shell");
+    verify_module(&guest).expect("verify concurrent pipe shell");
+    let producer = parse_module_raw(&c_to_ir(CONCURRENT_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    // Reuse the uppercasing consumer from the sequential test.
+    let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // "one"
+    let mod2 = host.grant_module(&consumer); // "two"
+
+    let mut fuel = 400_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The consumer blocked on the empty pipe, was woken by the producer's write, drained all 3 bytes
+    // (returned 3), and — after the producer exited (EOF) — uppercased "go\n" to "GO\n" on the sink.
+    assert_eq!(
+        r,
+        vec![Value::I64(3)],
+        "the concurrent consumer blocked, woke on the write, and drained 3 bytes"
+    );
+    let out = host.stdout_bytes();
+    assert_eq!(
+        &out, b"GO\n",
+        "concurrent one | two: the blocking read delivered the producer's output in full"
+    );
+}
+
+/// FORK.md §8.6 (backpressure) — **a full pipe bounds a write to the capacity.** The pipe FIFO is no
+/// longer unbounded: a `write` never grows it past `PIPE_CAP` (64 KiB). This shell mints a pipe, holds
+/// both ends itself (so there is a reader — no EPIPE — and the write does not block), and writes a
+/// 100 000-byte buffer in one call; the write **short-returns** the 65 536 bytes that fit, leaving the
+/// rest for a later call once the reader drains. Proves the buffer is bounded (a runaway producer can't
+/// balloon host memory) without needing a second live stage.
+const BACKPRESSURE_BOUND_SHELL_SRC: &str = r#"
+long __vm_write(int fd, void *buf, long len);
+/* The source is a modest buffer; the write `len` intentionally exceeds both it and PIPE_CAP. The extra
+ * source span is backed (zero-filled) window memory — the point of the test is the *return value*: the
+ * bounded pipe accepts only PIPE_CAP bytes in one call and short-returns, so the FIFO can never balloon. */
+static char src[256];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  return (int)__vm_write(fds[1], src, 100000);   /* fills to PIPE_CAP, short-returns 65536 */
+}
+"#;
+
+#[test]
+fn a_full_pipe_write_is_bounded_to_the_capacity() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{BACKPRESSURE_BOUND_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse backpressure shell");
+    verify_module(&guest).expect("verify backpressure shell");
+    // The shell uses no commands; grant the guest itself as the (unused) one/two module slots.
+    let filler = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse filler");
+    verify_module(&filler).expect("verify filler");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&filler);
+    let mod2 = host.grant_module(&filler);
+
+    let mut fuel = 60_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The 100 000-byte write filled the FIFO to exactly PIPE_CAP (64 KiB) and short-returned — the
+    // buffer never grew past the bound.
+    assert_eq!(
+        r,
+        vec![Value::I64(65536)],
+        "a write to a bounded pipe returns only the bytes that fit (PIPE_CAP = 64 KiB)"
+    );
+}
+
+/// FORK.md §8.6 (SIGPIPE + backpressure) — the **`yes | head`** story: a producer that writes forever
+/// into a consumer that reads a little and quits. The producer `one` writes 1000-byte chunks in a loop,
+/// **checking the return** — so it blocks (backpressure) once the pipe fills, resumes as the consumer
+/// drains, and finally gets `-EPIPE` (returns 88) the moment the consumer's read end is gone. The
+/// consumer `two` reads *once* (up to 10 bytes) and exits, closing the last read end. Without EPIPE the
+/// producer would spin to its 1 000 000-iteration safety cap (returning 99); without backpressure it
+/// would balloon the FIFO to megabytes before the consumer exits. The shell forks both, drops its own
+/// ends, reaps the consumer, then returns the **producer's** status — 88, proving EPIPE terminated it.
+const EPIPE_PRODUCER_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char buf[1000];
+int main(int argc, char **argv) {
+  long i, r;
+  for (i = 0; i < 1000000; i = i + 1) {
+    r = write(1, buf, 1000);
+    if (r < 0) return 88;   /* -EPIPE: the consumer's read end is closed */
+  }
+  return 99;                /* safety cap — never reached if EPIPE works */
+}
+"#;
+
+/// The `yes | head` consumer `two`: read *once* (up to 10 bytes) and exit — dropping the last read end,
+/// which flips the producer's next write to `-EPIPE`.
+const EPIPE_CONSUMER_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+static char buf[10];
+int main(int argc, char **argv) {
+  return (int)read(0, buf, 10);
+}
+"#;
+
+const EPIPE_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+static char *a_two[] = { "two", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  int fds[2];
+  pipe(fds);
+  long p1 = fork();
+  while (p1 < 0) p1 = fork();
+  if (p1 == 0) { exec_io("one", a_one, fds[1], 0); return 127; }
+  long p2 = fork();
+  while (p2 < 0) p2 = fork();
+  if (p2 == 0) { exec_io("two", a_two, shell_out, fds[0]); return 127; }
+  close(fds[0]);
+  close(fds[1]);
+  wait_pid(p2);              /* reap the consumer (its exit closes the last read end) */
+  return wait_pid(p1);       /* the producer's status: 88 = it got EPIPE */
+}
+"#;
+
+#[test]
+fn a_producer_gets_epipe_when_its_consumer_exits() {
+    let manager = Arc::new(parse_module_raw(MICROSHELL_MANAGER).expect("parse microshell manager"));
+    verify_module(&manager).expect("verify microshell manager");
+    let shell_src = format!("{FORK_SHIM}\n{EPIPE_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse epipe shell");
+    verify_module(&guest).expect("verify epipe shell");
+    let producer = parse_module_raw(&c_to_ir(EPIPE_PRODUCER_SRC)).expect("parse producer");
+    verify_module(&producer).expect("verify producer");
+    let consumer = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse consumer");
+    verify_module(&consumer).expect("verify consumer");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&producer); // "one"
+    let mod2 = host.grant_module(&consumer); // "two"
+
+    let mut fuel = 400_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The producer blocked when the pipe filled (backpressure), resumed as the consumer drained, and
+    // got -EPIPE (returned 88) once the consumer exited — it did not spin to its safety cap (99).
+    assert_eq!(
+        r,
+        vec![Value::I64(88)],
+        "yes | head: the producer got EPIPE when the consumer's read end closed"
+    );
+}
+
+/// FORK.md §8.6 — **file redirection `cmd > out.txt`**, built as a *pump* over the concurrent-pipe + fs
+/// substrate (no new mechanism). The shell wires the command's stdout to a pipe **write** end, then —
+/// instead of forking a second stage to drain it — the shell itself is the reader: it closes its own
+/// copies of the pipe ends (leaving `cmd` the sole writer), then loops `read_fd(pipe_read)` and forwards
+/// each chunk to a memfs file through the granted `vm_fs` cap (`FS_WRITE`), until the read returns EOF
+/// (0) — which arrives when `cmd` exits and its write end closes (the writer count hits 0, waking the
+/// blocking read). The read drains through the **direct `cap.call`** route (`__vm_read`), so this also
+/// exercises the pipe-read park on that arm. `cmd` writes `"redirected!"`; the file ends up holding it.
+const REDIRECT_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char msg[] = "redirected!";
+int main(int argc, char **argv) {
+  write(1, msg, 11);
+  return 11;
+}
+"#;
+
+/// The redirect shell (links `FORK_SHIM`): fork `cmd` with its stdout on the pipe write end, drop both of
+/// the shell's own pipe ends, `FS_OPEN` the target (`O_CREATE|O_WRITE`), pump pipe → file until EOF, then
+/// close + reap. Returns the byte count pumped. `__vm_fs(op,a,b,c,d)` is the flat `call.sym "vm_fs"` the
+/// manifest binds to the granted memfs; `read_fd`/`__vm_read` is the handle-specific blocking pipe read.
+const REDIRECT_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char outpath[] = "out.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, fds[1], 0); return 127; }
+  close(fds[1]);                              /* the shell drops its write end: `cmd` is the sole writer */
+  long wfd = __vm_fs(0, (long)outpath, 7, 18, 0);  /* FS_OPEN(out.txt, len=7, O_CREATE|O_WRITE = 16|2) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);         /* FS_WRITE(wfd, buf, n) */
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);                   /* FS_CLOSE(wfd) */
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_command_output_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{REDIRECT_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse redirect shell");
+    verify_module(&guest).expect("verify redirect shell");
+    let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse redirect command");
+    verify_module(&cmd).expect("verify redirect command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // A fresh shared memfs (no seed files): the shell creates `out.txt` and the redirect fills it.
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell pumped all 11 bytes of `cmd`'s output through the pipe into the file, then reaped `cmd`.
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the redirect shell pumped 11 bytes (`cmd`'s output) from the pipe into the file"
+    );
+    // `cmd`'s stdout went to the pipe, not the shell's stdout, so the shared sink stays empty.
+    assert!(
+        host.stdout_bytes().is_empty(),
+        "the redirected command wrote to the pipe, not the shell's stdout"
+    );
+    // The redirect target holds exactly `cmd`'s output — a real file written by draining a real pipe.
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "out.txt")
+        .expect("the shell created out.txt in the shared memfs");
+    assert_eq!(
+        out.1, b"redirected!",
+        "`cmd > out.txt`: the file holds the command's output, pumped through the pipe"
+    );
+}
+
+/// `cmd >> file` (append). Identical pump to `>` except the shell opens the target with `O_APPEND`
+/// (`O_CREATE|O_WRITE|O_APPEND` = 22), so the command's output lands **after** the file's existing bytes
+/// rather than truncating. Reuses `REDIRECT_CMD_SRC` (writes `"redirected!"`); the memfs is seeded with a
+/// `log.txt` already holding `"existing\n"`, so the result is the concatenation.
+const APPEND_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char logpath[] = "log.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, fds[1], 0); return 127; }
+  close(fds[1]);
+  long wfd = __vm_fs(0, (long)logpath, 7, 22, 0);  /* FS_OPEN(log.txt, len=7, O_CREATE|O_WRITE|O_APPEND) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_appends_a_command_output_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{APPEND_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse append shell");
+    verify_module(&guest).expect("verify append shell");
+    let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse append command");
+    verify_module(&cmd).expect("verify append command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // Seed `log.txt` with existing content — the append must preserve it and add after it.
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("log.txt".into(), b"existing\n".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the append shell pumped 11 bytes (`cmd`'s output) into the file"
+    );
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "log.txt")
+        .expect("log.txt survives the append");
+    assert_eq!(
+        out.1, b"existing\nredirected!",
+        "`cmd >> log.txt`: the command's output is appended after the pre-existing content"
+    );
+}
+
+/// `cmd < file` (input redirection). The **reverse** pump: the shell opens the source (`O_READ`), reads
+/// it in chunks, and writes each into a pipe whose *read* end is the command's `stdin`; when the file is
+/// drained the shell closes the write end, so the command's `stdin` read EOFs. `cmd` echoes its stdin to
+/// stdout, so the shell's own stdout ends up holding the file's bytes — routed in through a real pipe.
+const INPUT_CMD_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+long write(long fd, void *buf, long n);
+static char buf[64];
+int main(int argc, char **argv) {
+  long n;
+  while ((n = read(0, buf, 64)) > 0) write(1, buf, n);  /* echo stdin -> stdout (fd ignored: stdin/stdout) */
+  return 0;
+}
+"#;
+
+/// The input-redirect shell (links `FORK_SHIM`): mint a pipe, fork `cmd` with the pipe **read** end as
+/// its `stdin`, then pump `in.txt` → pipe **write** end until the file EOFs, close it, and reap.
+const INPUT_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char inpath[] = "in.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);                                  /* fds[0] = read (command's stdin), fds[1] = write (shell pumps) */
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, shell_out, fds[0]); return 127; }
+  close(fds[0]);                              /* the shell drops the read end: `cmd` is the sole reader */
+  long rfd = __vm_fs(0, (long)inpath, 6, 1, 0);  /* FS_OPEN(in.txt, len=6, O_READ) */
+  if (rfd < 0) return -1;
+  long n;
+  while ((n = __vm_fs(1, rfd, (long)buf, 64, 0)) > 0)  /* FS_READ the file... */
+    write_fd(fds[1], buf, n);                          /* ...and pump it into the command's stdin pipe */
+  __vm_fs(4, rfd, 0, 0, 0);
+  close(fds[1]);                              /* EOF for the command's stdin read */
+  return wait_pid(p);
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_file_into_a_command_stdin() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{INPUT_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse input shell");
+    verify_module(&guest).expect("verify input shell");
+    let cmd = parse_module_raw(&c_to_ir(INPUT_CMD_SRC)).expect("parse input command");
+    verify_module(&cmd).expect("verify input command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // Seed the source file the shell reads and pumps into the command's stdin.
+    let (factory, _memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("in.txt".into(), b"hello from a file".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(r, vec![Value::I64(0)], "the shell reaped `cmd`'s exit (0)");
+    assert_eq!(
+        host.stdout_bytes(),
+        b"hello from a file",
+        "`cmd < in.txt`: the file's bytes were pumped through a pipe into the command's stdin and echoed out"
+    );
+}
+
+/// `cmd 2> file` (stderr redirection). The command writes normal output to `stdout` (the frontend `write`
+/// builtin) and diagnostics to a **distinct** `stderr` handle it resolves by name (`__vm_write`). The
+/// shell wires that stderr end to a pipe (via `exec_io3`), pumps it to `err.txt`, and leaves the command's
+/// stdout on the shell's own stdout — so the two streams land in different places, the point of `2>`.
+const STDERR_CMD_SRC: &str = r#"
+long __vm_resolve(const char *name, long len);
+long __vm_write(int h, void *buf, long len);
+long write(long fd, void *buf, long n);
+static char out_msg[] = "stdout-line";
+static char err_msg[] = "stderr-line";
+int main(int argc, char **argv) {
+  int e = (int)__vm_resolve("stderr", 6);
+  write(1, out_msg, 11);            /* normal output -> stdout (the ambient stream) */
+  __vm_write(e, err_msg, 11);       /* diagnostics -> the granted stderr handle */
+  return 0;
+}
+"#;
+
+/// The stderr-redirect shell (links `FORK_SHIM`): fork `cmd` with its `stdout` on the shell's stdout and
+/// its `stderr` on a pipe write end (`exec_io3`), then pump the stderr pipe → `err.txt` and reap.
+const STDERR_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char errpath[] = "err.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io3("cmd", a_cmd, shell_out, 0, fds[1]); return 127; }  /* stderr -> pipe write end */
+  close(fds[1]);
+  long wfd = __vm_fs(0, (long)errpath, 7, 18, 0);  /* FS_OPEN(err.txt, len=7, O_CREATE|O_WRITE) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_command_stderr_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{STDERR_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse stderr shell");
+    verify_module(&guest).expect("verify stderr shell");
+    let cmd = parse_module_raw(&c_to_ir(STDERR_CMD_SRC)).expect("parse stderr command");
+    verify_module(&cmd).expect("verify stderr command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell pumped the 11 stderr bytes into the file; the command's stdout went elsewhere.
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the shell pumped 11 bytes of the command's stderr into the file"
+    );
+    // Stream separation: stdout landed on the shell's stdout, stderr in the file.
+    assert_eq!(
+        host.stdout_bytes(),
+        b"stdout-line",
+        "the command's stdout stayed on the shell's stdout (not redirected)"
+    );
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "err.txt")
+        .expect("the shell created err.txt");
+    assert_eq!(
+        out.1, b"stderr-line",
+        "`cmd 2> err.txt`: the file holds exactly the command's stderr, pumped through the pipe"
+    );
+}
+
+/// #773 (FORK.md §8.6) — **a forked child execs a command with a large static/BSS buffer.** A command
+/// that declares more memory than the default 128 KiB window (its window directive is `memory 18`, 256
+/// KiB, because of the 60 KB array) used to be un-`exec`able: the fork/exec surface required the child's
+/// declared window to **equal** the caller's carve, but the shell shim hardcodes the exec's window hint
+/// (17), so the command was rejected — and a manager that then joined the failed spawn wedged. The fix
+/// admits a command whose declared memory **fits** the inherited window (a larger window is a safe
+/// superset, still masked to its actual size by invariant 2). This shell is spawned into a 256 KiB
+/// window (the manager passes carve size 18 at a 256 KiB-aligned offset), so its forked child inherits
+/// the room to exec the 256 KiB command. The command touches the *far end* of its 60 KB buffer (proving
+/// the big window is genuinely mapped and usable) and writes a byte from it; the shell reaps its exit.
+const BIGEXEC_CMD_SRC: &str = r#"
+long write(long fd, void *buf, long n);
+static char big[60000];
+int main(int argc, char **argv) {
+  big[59999] = 'Z';           /* touch the far end of the 60 KB BSS (only reachable in the big window) */
+  write(1, &big[59999], 1);   /* prove the large window is mapped + usable */
+  return 0;
+}
+"#;
+
+const BIGEXEC_SHELL_SRC: &str = r#"
+static char *a_one[] = { "one", 0 };
+int main(int argc, char **argv) {
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("one", a_one, shell_out, 0); return 127; }
+  return wait_pid(p);         /* the large command's exit status (0) */
+}
+"#;
+
+#[test]
+fn a_shell_execs_a_command_with_a_large_bss_buffer() {
+    // Spawn the shell into a 256 KiB window (carve size 18 at a 256 KiB-aligned offset) instead of the
+    // default 128 KiB (size 17 at 128 KiB) — a `MICROSHELL_MANAGER` with the two carve constants bumped.
+    // The small shell (`memory 17`) into a size-18 carve exercises op-13's window-≥-declared admission;
+    // the forked child's exec of the `memory 18` command exercises op-14's.
+    let bigwin = MICROSHELL_MANAGER
+        .replace("voffg = i64.const 131072", "voffg = i64.const 262144")
+        .replace("vsl = i64.const 17", "vsl = i64.const 18");
+    let manager = Arc::new(parse_module_raw(&bigwin).expect("parse bigwin manager"));
+    verify_module(&manager).expect("verify bigwin manager");
+    let shell_src = format!("{FORK_SHIM}\n{BIGEXEC_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse bigexec shell");
+    verify_module(&guest).expect("verify bigexec shell");
+    let cmd = parse_module_raw(&c_to_ir(BIGEXEC_CMD_SRC)).expect("parse bigexec command");
+    verify_module(&cmd).expect("verify bigexec command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let mod1 = host.grant_module(&cmd); // "one"
+    let mod2 = host.grant_module(&cmd); // "two" (unused)
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(mod1 as i64),
+            Value::I64(mod2 as i64),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The command ran to completion in the big inherited window and the shell reaped its exit (0) —
+    // no wedge, no exec refusal.
+    assert_eq!(
+        r,
+        vec![Value::I64(0)],
+        "the shell reaped the large-BSS command's exit status (0)"
+    );
+    // It genuinely used the far end of its 60 KB buffer and wrote from it.
+    assert_eq!(
+        host.stdout_bytes(),
+        b"Z",
+        "the exec'd command touched its 60 KB buffer (only reachable in the enlarged window) and wrote from it"
     );
 }
 

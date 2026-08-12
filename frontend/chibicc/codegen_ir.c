@@ -307,6 +307,11 @@ static int start_off; // 1 if a `_start` occupies function index 0, else 0
 // globals shift past it. Computed once in `codegen_ir` before `layout_globals`.
 static bool needs_argv;
 
+// True when `main` also takes `envp` (>= 3 params: `main(argc, argv, envp)`), so `_start` additionally
+// parses the env portion of the §3e args buffer into an `envp[]` array and passes it as main's 3rd
+// argument. Implies `needs_argv`. Computed alongside it in `codegen_ir`.
+static bool needs_envp;
+
 // Globals + string literals live at fixed window offsets in the data region [RESERVED_BYTES,
 // data_end); the data stack starts at data_end (main's initial data-SP, baked into `_start`).
 // The low RESERVED_BYTES are the runtime-reserved region holding the powerbox capability handles
@@ -1013,6 +1018,40 @@ static int gen_builtin_exit(Node *node) {
   return 0;
 }
 
+// `<setjmp.h>` non-local jump (FORK.md / #795 — the bash keystone). `setjmp`/`_setjmp`/`__setjmp`/
+// `sigsetjmp` lower to the runtime `setjmp` op (svm-ir): it checkpoints the current frame's resume point
+// (block/pc/SSA vals/data-SP) keyed by the `jmp_buf` window address and returns `0` on the direct call; a
+// later `longjmp` on the same buffer unwinds the stack back here and re-enters, returning the long-jump
+// value ("returns twice"). The whole runtime (op, checkpoint table, both dispatch arms) already exists —
+// this only lowers the recognized C call to it. `sigsetjmp(env, savemask)`'s `savemask` is ignored until
+// async signals exist (#796): there is no signal mask to save yet. Returns the i64 op result, which the
+// caller narrows to `int` where the prototype is `int`.
+static int gen_builtin_setjmp(Node *node) {
+  Node *a = node->args;
+  if (!a)
+    error_tok(node->tok, "codegen_ir: setjmp(env) expects an argument");
+  int buf = widen_i64(gen_expr(a), a->ty); // the jmp_buf window address (i64; array decays to a pointer)
+  int r = nv++;
+  cg("  v%d = setjmp v%d\n", r, buf);
+  return r;
+}
+
+// `longjmp`/`_longjmp`/`siglongjmp` — the non-local jump. Lowers to the runtime `longjmp` op, which
+// unwinds the call stack to the matching `setjmp` checkpoint (intervening frames discarded — C has no
+// cleanups) and re-enters it with `val` (a `0` becomes `1`, per C). Noreturn, like `exit`: emit
+// `unreachable` and terminate the block.
+static int gen_builtin_longjmp(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next)
+    error_tok(node->tok, "codegen_ir: longjmp(env, val) expects 2 arguments");
+  int buf = widen_i64(gen_expr(a), a->ty); // jmp_buf window address (i64)
+  int val = gen_expr(a->next);             // the int value the matching setjmp will return
+  cg("  longjmp v%d v%d\n", buf, val);
+  cg("  unreachable\n");
+  term = true;
+  return 0;
+}
+
 // Memory capability builtins (§3e/§4): `__vm_map(off,len,prot)` / `__vm_unmap(off,len)` /
 // `__vm_protect(off,len,prot)` lower to `cap.call` on the stashed Memory handle (type 3,
 // ops 0/1/2). This is how guest libc (`malloc`) commits/decommits window pages and **grows
@@ -1438,6 +1477,72 @@ static int gen_builtin_exec_module(Node *node) {
   return r;
 }
 
+// FORK.md §8.6 — `__vm_setpgid(pid, pgid)`: POSIX process-group assignment for job control. Lowers
+// to the self-namespace op `cap.call 4294967295 15` — the calling vCPU (the parent) sets a forked
+// child's process group directly, so a later `__wait(-pgid)` reaps any child in that group. Both args
+// are i64; returns 0 or -errno (`-ESRCH` if `pid` is not a live child of the caller).
+static int gen_builtin_setpgid(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 2)
+    error_tok(node->tok, "codegen_ir: __vm_setpgid(pid, pgid) expects 2 arguments");
+  Node *a = node->args;
+  int pid = widen_i64(gen_expr(a), a->ty);
+  int pgid = widen_i64(gen_expr(a->next), a->next->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = cap.call 4294967295 15 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, pid, pgid);
+  return r;
+}
+
+// FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
+// `cap.call 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
+// end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
+static int gen_builtin_pipe(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 1)
+    error_tok(node->tok, "codegen_ir: __vm_pipe(fds) expects 1 argument");
+  int fds = widen_i64(gen_expr(node->args), node->args->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = cap.call 4294967295 16 (i64) -> (i64) v%d (v%d)\n", r, h, fds);
+  return r; // i64 result (0 / -errno); the C `long __vm_pipe` return narrows at the use site
+}
+
+// FORK.md §8.6 — `__vm_close(int handle)`: close a `Stream`/pipe-end handle. Lowers to `cap.call 0 2`
+// (iface `STREAM` = 0, op 2 = close) on the runtime handle. Revokes the handle; closing a pipe **write**
+// end also drops the pipe's writer count (→ EOF for its reader once all writers close). A shell closes
+// its own copies of a pipe's ends after forking the stages, so the producer becomes the last writer.
+static int gen_builtin_close(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_close(handle) expects 1 argument");
+  int h = gen_expr(a); // i32 capability handle
+  int r = nv++;
+  cg("  v%d = cap.call 0 2 () -> (i64) v%d ()\n", r, h);
+  return r; // i64 result (0); the C `int __vm_close` return narrows at the use site
+}
+
+// FORK.md §8.6 — `__vm_read(int h, void *buf, long len)` / `__vm_write(int h, void *buf, long len)`:
+// read/write a **specific** `Stream`/pipe-end handle (op 0 / 1), unlike the frontend's `read`/`write`
+// builtins which always hit the ambient stdin/stdout streams (they drop the fd). A shell needs these to
+// pump a pipe fd it holds — e.g. draining a stage's output into a redirect file. Lowers to
+// `cap.call 0 <op> (i64, i64) -> (i64) <h> (buf, len)`; returns the byte count / -errno.
+static int gen_builtin_stream_handle(Node *node, int op, const char *who) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: %s(handle, buf, len) expects 3 arguments", who);
+  int h = gen_expr(a); // i32 capability handle
+  int buf = widen_i64(gen_expr(a->next), a->next->ty);
+  int len = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int r = nv++;
+  cg("  v%d = cap.call 0 %d (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, op, h, buf, len);
+  return r; // i64 byte count / -errno
+}
+
 // §12 fiber builtins (stack switching). A fiber is a first-class suspendable computation
 // whose continuation is its own call stack (DESIGN §6/§12). Real C reaches them through
 // three intercepted calls (declared, never defined — like the stdio builtins):
@@ -1835,6 +1940,15 @@ static int gen_expr(Node *node) {
             return gen_builtin_stream(node, STDIN_SLOT, 0);
           if (!strcmp(fname, "exit") || !strcmp(fname, "_exit"))
             return gen_builtin_exit(node);
+          // `<setjmp.h>` (#795): the non-local jump. External-only, like the stdio builtins — a guest
+          // definition would shadow them (though setjmp/longjmp can't be written in guest C: they need
+          // the runtime op). `sigsetjmp`/`siglongjmp` share the lowering (mask ignored until #796).
+          if (!strcmp(fname, "setjmp") || !strcmp(fname, "_setjmp") ||
+              !strcmp(fname, "__setjmp") || !strcmp(fname, "sigsetjmp"))
+            return gen_builtin_setjmp(node);
+          if (!strcmp(fname, "longjmp") || !strcmp(fname, "_longjmp") ||
+              !strcmp(fname, "siglongjmp"))
+            return gen_builtin_longjmp(node);
         }
         if (!strcmp(fname, "__vm_map"))
           return gen_builtin_memory(node, 0, 3);
@@ -1860,6 +1974,16 @@ static int gen_expr(Node *node) {
           return gen_builtin_resolve(node);
         if (!strcmp(fname, "__vm_exec_module"))
           return gen_builtin_exec_module(node);
+        if (!strcmp(fname, "__vm_setpgid"))
+          return gen_builtin_setpgid(node);
+        if (!strcmp(fname, "__vm_pipe"))
+          return gen_builtin_pipe(node);
+        if (!strcmp(fname, "__vm_close"))
+          return gen_builtin_close(node);
+        if (!strcmp(fname, "__vm_read"))
+          return gen_builtin_stream_handle(node, 0, "__vm_read");
+        if (!strcmp(fname, "__vm_write"))
+          return gen_builtin_stream_handle(node, 1, "__vm_write");
         if (!strcmp(fname, "__vm_fs"))
           return gen_builtin_fs(node);
         if (!strcmp(fname, "__vm_fiber_new"))
@@ -3067,10 +3191,12 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v%d = i64.const 0\n", vi0);
     cg("  br 1(v%d, v%d, v%d)\n", vac, vi0, vp0);
     cg("  }\n");
-    // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish.
+    // loop_head(argc, i, p): while i <u argc, write argv[i] and scan; else finish. On finish, `p`
+    // points just past the last argv string's NUL — i.e. the first env string — so thread it to
+    // block 5 when `main` also takes `envp` (the env parse starts there).
     cg("block 1 (v0: i64, v1: i64, v2: i64) {\n");
     cg("  v3 = i64.lt_u v1 v0\n");
-    cg("  br_if v3 2(v0, v1, v2) 5(v0)\n");
+    cg("  br_if v3 2(v0, v1, v2) 5(v0%s)\n", needs_envp ? ", v2" : "");
     cg("  }\n");
     // body: argv[i] = p, then scan p to the byte past its NUL.
     cg("block 2 (v0: i64, v1: i64, v2: i64) {\n");
@@ -3095,40 +3221,114 @@ static void emit_start(Obj *main_fn, unsigned cap_mask) {
     cg("  v4 = i64.add v1 v3\n");
     cg("  br 1(v0, v4, v2)\n");
     cg("  }\n");
-    // done: argv[argc] = NULL, main_sp = page-align(entry_sp + (argc+1)*8), call main.
-    cg("block 5 (v0: i64) {\n");
-    emit_data_base_at(1); // v1 = argv[] base (data-stack base)
-    cg("  v2 = i64.const 8\n");
-    cg("  v3 = i64.mul v0 v2\n");
-    cg("  v4 = i64.add v1 v3\n");
-    cg("  v5 = i64.const 0\n");
-    cg("  i64.store v4 v5\n");
-    cg("  v6 = i64.const 1\n");
-    cg("  v7 = i64.add v0 v6\n");
-    cg("  v8 = i64.mul v7 v2\n");
-    cg("  v9 = i64.add v1 v8\n");
-    // `main_sp` = the byte past `argv[]`, rounded up to the 16-byte frame alignment (`data_end` is
-    // already 16-aligned; this only clears the `(argc+1)*8` array). It must sit **just above** the
-    // array — enough that `main`'s upward-growing frame never overwrites `argv[]` — but no higher:
-    // rounding up to a full page (the old `POWERBOX_ARGS_END`) needlessly pushed the frame onto the
-    // next 16 KiB boundary, which collided with a window offset a program mapped a SharedRegion at
-    // (ISSUES.md I35 — a `--child-entry` runner maps rings at a fixed high offset and assumes the
-    // frame stays below it). 16-byte alignment is all the ABI needs (every frame offset is aligned
-    // within the frame; only the base must be 16-aligned).
-    cg("  v10 = i64.const 15\n");
-    cg("  v11 = i64.add v9 v10\n");
-    cg("  v12 = i64.const -16\n");
-    cg("  v13 = i64.and v11 v12\n");
-    cg("  v14 = i32.wrap_i64 v0\n");
+    // done: argv[argc] = NULL, main_sp = align16(argv_base + (argc+1)*8), call main.
+    // `main_sp` sits **just above** the array (16-byte aligned) — enough that `main`'s upward-growing
+    // frame never overwrites `argv[]`/`envp[]`, but no higher (rounding to a full page collided with a
+    // ring-mapping offset, ISSUES.md I35). 16-byte alignment is all the ABI needs.
+    if (!needs_envp) {
+      cg("block 5 (v0: i64) {\n");
+      emit_data_base_at(1); // v1 = argv[] base (data-stack base)
+      cg("  v2 = i64.const 8\n");
+      cg("  v3 = i64.mul v0 v2\n");
+      cg("  v4 = i64.add v1 v3\n");
+      cg("  v5 = i64.const 0\n");
+      cg("  i64.store v4 v5\n"); // argv[argc] = NULL
+      cg("  v6 = i64.const 1\n");
+      cg("  v7 = i64.add v0 v6\n");
+      cg("  v8 = i64.mul v7 v2\n");
+      cg("  v9 = i64.add v1 v8\n");
+      cg("  v10 = i64.const 15\n");
+      cg("  v11 = i64.add v9 v10\n");
+      cg("  v12 = i64.const -16\n");
+      cg("  v13 = i64.and v11 v12\n"); // main_sp
+      cg("  v14 = i32.wrap_i64 v0\n"); // argc (i32)
+      if (is_void) {
+        // A child entry returns an i64 status even for a void main (0); a powerbox entry returns ().
+        cg("  call %d (v13, v14, v1)\n", mi);
+        cg(opt_child_entry ? "  v15 = i64.const 0\n  return v15\n" : "  return\n");
+      } else if (opt_child_entry) {
+        cg("  v15 = call %d (v13, v14, v1)\n", mi);
+        cg("  v16 = i64.extend_i32_u v15\n  return v16\n"); // widen main's int to the i64 status
+      } else {
+        cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
+      }
+      cg("  }\n");
+      cg("}\n\n");
+      return;
+    }
+    // `main(argc, argv, envp)`: after the argv terminator, parse the `envc` env strings (they follow
+    // the argv strings in the §3e buffer, starting at `p` threaded from block 1) into an `envp[]`
+    // pointer array placed **right after** `argv[]` (base `EB = argv_base + (argc+1)*8`), then call
+    // `main(main_sp, argc, argv, envp)`. The env loop (blocks 6–9) mirrors the argv loop.
+    cg("block 5 (v0: i64, v1: i64) {\n"); // (argc, envstart)
+    emit_data_base_at(2);                 // v2 = argv[] base (AB)
+    cg("  v3 = i64.const 8\n");
+    cg("  v4 = i64.mul v0 v3\n");
+    cg("  v5 = i64.add v2 v4\n");
+    cg("  v6 = i64.const 0\n");
+    cg("  i64.store v5 v6\n"); // argv[argc] = NULL
+    cg("  v7 = i64.const %d\n", POWERBOX_ARGS_BASE + 4);
+    cg("  v8 = i32.load v7\n"); // envc (u32)
+    cg("  v9 = i64.extend_i32_u v8\n");
+    cg("  v10 = i64.const 1\n");
+    cg("  v11 = i64.add v0 v10\n");
+    cg("  v12 = i64.mul v11 v3\n");
+    cg("  v13 = i64.add v2 v12\n"); // EB = AB + (argc+1)*8
+    cg("  v14 = i64.const 0\n");    // j = 0
+    cg("  br 6(v0, v13, v9, v14, v1)\n");
+    cg("  }\n");
+    // env loop_head(argc, EB, envc, j, p): while j <u envc, write envp[j] and scan; else finish.
+    cg("block 6 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.lt_u v3 v2\n");
+    cg("  br_if v5 7(v0, v1, v2, v3, v4) 10(v0, v1, v2)\n");
+    cg("  }\n");
+    // body: envp[j] = p, then scan p to the byte past its NUL.
+    cg("block 7 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.const 8\n");
+    cg("  v6 = i64.mul v3 v5\n");
+    cg("  v7 = i64.add v1 v6\n");
+    cg("  i64.store v7 v4\n"); // envp[j] = p
+    cg("  br 8(v0, v1, v2, v3, v4, v4)\n");
+    cg("  }\n");
+    // scan(argc, EB, envc, j, p, q): advance q past the NUL, then step j and loop.
+    cg("block 8 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64, v5: i64) {\n");
+    cg("  v6 = i32.load8_u v5\n");
+    cg("  v7 = i64.const 1\n");
+    cg("  v8 = i64.add v5 v7\n");
+    cg("  v9 = i32.eqz v6\n");
+    cg("  br_if v9 9(v0, v1, v2, v3, v8) 8(v0, v1, v2, v3, v4, v8)\n");
+    cg("  }\n");
+    // next: j++ and loop (p = the byte past this env string's NUL).
+    cg("block 9 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n");
+    cg("  v5 = i64.const 1\n");
+    cg("  v6 = i64.add v3 v5\n");
+    cg("  br 6(v0, v1, v2, v6, v4)\n");
+    cg("  }\n");
+    // env done(argc, EB, envc): envp[envc] = NULL, main_sp = align16(EB + (envc+1)*8), call main.
+    cg("block 10 (v0: i64, v1: i64, v2: i64) {\n");
+    cg("  v3 = i64.const 8\n");
+    cg("  v4 = i64.mul v2 v3\n");
+    cg("  v5 = i64.add v1 v4\n");
+    cg("  v6 = i64.const 0\n");
+    cg("  i64.store v5 v6\n"); // envp[envc] = NULL
+    cg("  v7 = i64.const 1\n");
+    cg("  v8 = i64.add v2 v7\n");
+    cg("  v9 = i64.mul v8 v3\n");
+    cg("  v10 = i64.add v1 v9\n");
+    cg("  v11 = i64.const 15\n");
+    cg("  v12 = i64.add v10 v11\n");
+    cg("  v13 = i64.const -16\n");
+    cg("  v14 = i64.and v12 v13\n"); // main_sp
+    emit_data_base_at(15);          // v15 = argv[] base (AB)
+    cg("  v16 = i32.wrap_i64 v0\n"); // argc (i32)
     if (is_void) {
-      // A child entry returns an i64 status even for a void main (0); a powerbox entry returns ().
-      cg("  call %d (v13, v14, v1)\n", mi);
-      cg(opt_child_entry ? "  v15 = i64.const 0\n  return v15\n" : "  return\n");
+      cg("  call %d (v14, v16, v15, v1)\n", mi);
+      cg(opt_child_entry ? "  v17 = i64.const 0\n  return v17\n" : "  return\n");
     } else if (opt_child_entry) {
-      cg("  v15 = call %d (v13, v14, v1)\n", mi);
-      cg("  v16 = i64.extend_i32_u v15\n  return v16\n"); // widen main's int to the i64 status
+      cg("  v17 = call %d (v14, v16, v15, v1)\n", mi);
+      cg("  v18 = i64.extend_i32_u v17\n  return v18\n");
     } else {
-      cg("  v15 = call %d (v13, v14, v1)\n  return v15\n", mi);
+      cg("  v17 = call %d (v14, v16, v15, v1)\n  return v17\n", mi);
     }
     cg("  }\n");
     cg("}\n\n");
@@ -3449,6 +3649,8 @@ void codegen_ir(Obj *prog, FILE *out) {
   // globals shift past it. Must be known before `layout_globals`. (`guest_params` drops a hidden sret
   // pointer; `main` never returns an aggregate, so it's just the C params.)
   needs_argv = has_main && guest_params(funcs[0]) && guest_params(funcs[0])->next;
+  // `main(argc, argv, envp)` (>= 3 params) also parses the env strings into an `envp[]` array.
+  needs_envp = needs_argv && guest_params(funcs[0])->next->next;
 
   // `_start` stashes the capability handles in the window, so a module with an entry
   // always needs one.

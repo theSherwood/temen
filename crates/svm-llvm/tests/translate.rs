@@ -10538,6 +10538,40 @@ fn i128_widening_mul_lo_and_hi() {
     }
 }
 
+/// I14 tier 3 (256-bit): the `zext i128 → mul i256 → lshr → trunc` **magic-number division** clang/LLVM
+/// emits for `u128 / constant` — the same shape `core::fmt` uses to print a `u128` (#778). Dividing a
+/// 128-bit value (built from `(hi, lo)` halves) by `10^18` produces the 4-limb multiply + double-word
+/// shift the on-ramp's `lower_i256` covers; folding **both** halves of the 128-bit quotient into the
+/// returned word checks the full result (not just a truncated low limb) against a `u128` oracle.
+#[test]
+fn i256_u128_magic_division() {
+    let src = "unsigned long f(unsigned long hi, unsigned long lo) {\n\
+        \x20 unsigned __int128 x = ((unsigned __int128)hi << 64) | lo;\n\
+        \x20 unsigned __int128 q = x / 1000000000000000000ULL;\n\
+        \x20 return (unsigned long)q ^ (unsigned long)(q >> 64);\n\
+        }\n";
+    for (hi, lo) in [
+        (0u64, 0u64),
+        (0, 1),
+        (0, u64::MAX),
+        (1, 0),                                         // 2^64
+        (u64::MAX, u64::MAX),                           // 2^128 - 1
+        (1u64 << 63, 0),                                // 2^127
+        (0x0de0_b6b3_a763_ffff, 0xffff_ffff_ffff_ffff), // ≈ 10^37-ish, near a magic boundary
+        (0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210),
+    ] {
+        let x = ((hi as u128) << 64) | (lo as u128);
+        let q = x / 1_000_000_000_000_000_000u128;
+        let want = (q as u64) ^ ((q >> 64) as u64);
+        check(
+            "i256_u128_div",
+            src,
+            &[Value::I64(hi as i64), Value::I64(lo as i64)],
+            &[Value::I64(want as i64)],
+        );
+    }
+}
+
 // ---- I14 tier 3: general i128 arithmetic (every i128 a materialized (lo, hi) pair) ----------------
 
 /// i128 `add`/`sub` with full carry/borrow across the word boundary. Builds two 128-bit values from

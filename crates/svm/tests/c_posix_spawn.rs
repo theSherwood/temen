@@ -154,6 +154,7 @@ fn up_delegate(
             return SpawnResult {
                 stdout: Vec::new(),
                 status: 127,
+                ..Default::default()
             };
         }
         let win = 1u64 << child.memory.expect("child window").size_log2;
@@ -172,6 +173,7 @@ fn up_delegate(
         };
         SpawnResult {
             stdout: cposix.stdout(),
+            stderr: cposix.stderr(),
             status,
         }
     }

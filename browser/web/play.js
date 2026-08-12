@@ -7,7 +7,7 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
+import { runJitModule, runWarmJit, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -829,6 +829,212 @@ int main(void) {
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
+  'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
+    kind: 'module',
+    jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms
+    editable: true,
+    lang: 'svm',
+    url: './assets/svm-leng.svmb',
+    mode: 'io',
+    desc: "The **leng self-host capstone** (NIM.md §3e): svm-leng — the Leng→SVM-IR translator, itself compiled to a verified SVM module through the LLVM on-ramp — **running client-side in the sandbox**. The editor holds a **real hexer Leng file** (verbatim `hexer c` output from Nim's `system/stringimpl` — string types, `=wasMoved`, ARC). Click Run: the page pipes it to `svm-leng.svmb` on stdin, the translator parses the NIF and emits **SVM IR text** on stdout (shown below), and the run's exit code is the result (0 = ok, 2 = an unsupported/malformed Leng construct). The emitted IR is **byte-identical to running svm-leng natively** (gated in CI by `leng_selfhost_asset.rs`). Edit the Leng to translate your own — the same real translator, no server, all in your browser, on the SVM.",
+    src: `(stmts
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LongString.0.))))
+ (type :LongString.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (proc@,1g,nimony/lib/std/system/stringimpl.nim :=wasMoved.2.@5
+  (params@H
+   (param@1 :s.40 .
+    (ptr@3 string.0.@4))).
+  (pragmas@X
+   (exportc "nimStrWasMoved")
+   (inline 0 0)
+   (smry~X
+    (param 0 0 reads writes)))
+  (stmts@2,1
+   (asgn@8
+    (dot~7
+     (deref~1 s.40)bytes.0 0)
+    (conv@2
+     (u@B,c,nimony/lib/std/system/basic_types.nim 64)0))))
+ (proc@,1j,nimony/lib/std/system/stringimpl.nim :=destroy.2.@5
+  (params@G
+   (param@1 :s.41 . string.0.@3)).
+  (pragmas@S
+   (exportc "nimStrDestroy")
+   (inline 0 150)
+   (smry~S writeGlobal readGlobal callsUnknown
+    (param 0 0 reads writes escapes)))
+  (stmts@2,1
+   (if
+    (elif@3
+     (eq@9
+      (conv~9,~13
+       (i@U,E,nimony/lib/std/system/defaults.nim 64)
+       (deref@1
+        (cast
+         (ptr@5
+          (u@4 8))
+         (addr@K
+          (dot@1 s.41~G,13 bytes.0 0)))))
+      (suf@1,~1Y 255 "i64"))
+     (stmts~1,1
+      (var@3 :\`x.223 .
+       (bool@J,A,nimony/lib/std/system/arcops.nim)
+       (call arcDec.0.
+        (addr@D
+         (dot
+          (deref
+           (dot~5 s.41~1 more.0 0))rc.0 0))))
+      (if
+       (elif@3 \`x.223
+        (stmts~1,1
+         (call dealloc.1.
+          (conv@9
+           (ptr@J,2f,nimony/lib/std/system/memory.nim
+            (void))
+           (dot s.41~1 more.0 0)))))))))))
+ (proc@,1o,nimony/lib/std/system/stringimpl.nim :=copy.2.@5
+  (params@D
+   (param@1 :dest.11 .
+    (ptr@6 string.0.@4))
+   (param@J :src.6 . string.0.@5)).
+  (pragmas@j
+   (exportc "nimStrCopy")
+   (smry~j writeGlobal readGlobal callsUnknown
+    (param 0 0 reads writes escapes)
+    (param 1 1 reads escapes)))
+  (stmts@2,1
+   (var@4 :ssrc.0 .
+    (i@7,~1B 64)
+    (conv~1,~18
+     (i@U,E,nimony/lib/std/system/defaults.nim 64)
+     (deref@1
+      (cast
+       (ptr@5
+        (u@4 8))
+       (addr@K
+        (dot@1 src.6~8,18 bytes.0 0))))))
+   (if@,1
+    (elif@3
+     (le@5 ssrc.0~5
+      (suf@a,~1b 14 "i64"))
+     (stmts~1,2
+      (var@4 :sdest.0 .
+       (i@5,~1E 64)
+       (conv~3,~1B
+        (i@U,E,nimony/lib/std/system/defaults.nim 64)
+        (deref@1
+         (cast
+          (ptr@5
+           (u@4 8))
+          (addr@K
+           (dot@1
+            (deref~5,1B dest.11)bytes.0 0))))))
+      (if@,1
+       (elif@3
+        (eq@6 sdest.0~6
+         (suf@2,~1h 255 "i64"))
+        (stmts~1,1
+         (var@3 :\`x.224 .
+          (bool@J,A,nimony/lib/std/system/arcops.nim)
+          (call arcDec.0.
+           (addr@G
+            (dot
+             (deref
+              (dot~5
+               (deref~4 dest.11)more.0 0))rc.0 0))))
+         (if
+          (elif@3 \`x.224
+           (stmts~1,1
+            (call dealloc.1.
+             (conv@C
+              (ptr@J,2f,nimony/lib/std/system/memory.nim
+               (void))
+              (dot
+               (deref~4 dest.11)more.0 0)))))))))
+      (call@,4 copyMem.0.
+       (conv@D
+        (ptr@P,O,nimony/lib/std/system/memory.nim
+         (void))
+        (addr
+         (dot@4
+          (deref~4 dest.11)bytes.0 0)))
+       (conv@U
+        (ptr@P,O,nimony/lib/std/system/memory.nim
+         (void))
+        (addr
+         (dot@3 src.6~3 bytes.0 0)))
+       (sizeof@l string.0.@1))))
+    (else
+     (stmts
+      (stmts
+       (stmts
+        (stmts@2,9
+         (if
+          (elif@3
+           (eq@B
+            (addr~7
+             (deref@1 dest.11))
+            (addr@7 src.6@1))
+           (stmts@P
+            (ret .))))
+         (var@4,1 :sdest.1 .
+          (i@5,~1M 64)
+          (conv~3,~1J
+           (i@U,E,nimony/lib/std/system/defaults.nim 64)
+           (deref@1
+            (cast
+             (ptr@5
+              (u@4 8))
+             (addr@K
+              (dot@1
+               (deref~5,1J dest.11)bytes.0 0))))))
+         (if@,2
+          (elif@3
+           (eq@6 sdest.1~6
+            (suf@2,~1p 255 "i64"))
+           (stmts~1,1
+            (var@3 :\`x.225 .
+             (bool@J,A,nimony/lib/std/system/arcops.nim)
+             (call arcDec.0.
+              (addr@G
+               (dot
+                (deref
+                 (dot~5
+                  (deref~4 dest.11)more.0 0))rc.0 0))))
+            (if
+             (elif@3 \`x.225
+              (stmts~1,1
+               (call dealloc.1.
+                (conv@C
+                 (ptr@J,2f,nimony/lib/std/system/memory.nim
+                  (void))
+                 (dot
+                  (deref~4 dest.11)more.0 0)))))))))
+         (if@,5
+          (elif@3
+           (eq@5 ssrc.0~5
+            (suf@3,~1s 255 "i64"))
+           (stmts~1,1
+            (call arcInc.0.
+             (addr@F
+              (dot
+               (deref
+                (dot~5 src.6~3 more.0 0))rc.0 0))))))
+         (call@,7 copyMem.0.
+          (conv@D
+           (ptr@P,O,nimony/lib/std/system/memory.nim
+            (void))
+           (addr
+            (dot@4
+             (deref~4 dest.11)bytes.0 0)))
+          (conv@U
+           (ptr@P,O,nimony/lib/std/system/memory.nim
+            (void))
+           (addr
+            (dot@3 src.6~3 bytes.0 0)))
+          (sizeof@l string.0.@1)))))))))))
+`,
+  },
   'Shell (svm-posix — write & run a script)': {
     kind: 'shell',
     jit: false, // the shell carries Instantiator/SharedRegion cap.calls → bytecode cooperative engine
@@ -909,18 +1115,28 @@ SELECT n, a AS fib FROM fib;
   },
   'JavaScript (QuickJS — write & run JS)': {
     kind: 'module',
-    jit: true, // _start is wasm-JIT-emittable (atomics + cap.self.resolve outlining + pooled locals);
-    // ~6× over the interpreter, byte-identical (browser-jit-module-test). See LLVM.md "Active target — QuickJS".
+    warm: true, // WASM_AOT.md warm-runtime snapshot: init the QuickJS runtime once, then restore that
+    // warm image and eval-only per Run — the "trivial program takes >1s" fixed init is paid once, so
+    // later Runs are ~milliseconds. Fresh-per-Run isolation is enforced in the engine (svm_warm_eval
+    // restores the same post-warmup image each Run). Default path for this card.
+    jit: true, // tick "wasm-JIT" for the **warm+JIT** tier (WASM_AOT.md): `eval_run` emitted to wasm and
+    // run over the restored warm image — init stays paid-once, the eval runs near-native (the win is
+    // compute-heavy JS; a trivial program is already ~instant on warm-interp). `runModule` routes a warm
+    // card's JIT toggle to `runWarmJit` (not the cold `_start` path). See LLVM.md "Active target — QuickJS".
     editable: true,
     lang: 'js',
-    url: './assets/qjs_repl.svmb',
+    url: './assets/qjs_snapshot.svmb',
     mode: 'io',
     desc: 'Bellard\'s unmodified QuickJS 2024-01-13 — a full JavaScript engine (NaN-boxing, a bytecode ' +
       'VM with computed-goto dispatch, BigInt, regex, Unicode) compiled through the LLVM on-ramp. Edit ' +
       'the JS on the left and click Run: it evaluates in a fresh runtime (each Run starts clean), and ' +
       'prints anything you print()/console.log() plus the value of the last expression. Real QuickJS, ' +
-      'running client-side in the sandbox — no ambient authority. Toggle "wasm-JIT" to run the whole ' +
-      'engine on emitted wasm (~6× faster); "Prove interp ≡ JIT" checks the stdout is byte-identical on both tiers.',
+      'running client-side in the sandbox — no ambient authority. By default it uses a warm-runtime ' +
+      'snapshot: the first Run initializes the QuickJS runtime (~once), and every Run after restores ' +
+      'that warm image and evaluates only your code — so a trivial program runs in milliseconds instead ' +
+      'of rebuilding the whole engine each time. Tick "wasm-JIT" to evaluate on emitted wasm over that ' +
+      'same warm image (warm+JIT — near-native eval, init still paid once); "Prove interp ≡ JIT" checks ' +
+      'the stdout is byte-identical on both tiers.',
     src: `// Write JavaScript here, then click Run. Each Run is a fresh QuickJS runtime.
 function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
 console.log("fib(0..10):", Array.from({length: 11}, (_, i) => fib(i)).join(" "));
@@ -1196,6 +1412,47 @@ function moduleInterp(bytes, stdinBytes) {
   return { rv, status, stdout };
 }
 
+// ---- warm-runtime snapshot (WASM_AOT.md): init once, restore-per-Run for a two-phase on-ramp guest ----
+// The engine holds ONE warm session (a Rust static: svm_warm_open/eval/close). `warmSessionUrl` tracks
+// which module it's warmed for; a new svm_warm_open replaces any prior session, so we (re)open lazily
+// only when the module URL changes. Fresh-per-Run isolation is enforced in the engine (each eval restores
+// the same post-`warmup` image), so a `var` in one Run can't leak into the next — the card's
+// "each Run starts clean" promise holds.
+let warmSessionUrl = null;
+
+// Ensure the warm session is open for `url`'s module `bytes` (runs the guest's `warmup` once and
+// snapshots the post-init image). Returns true on success; false if the module isn't a warm-snapshot
+// driver (no `warmup`/`eval_run` exports) or open traps — the caller then falls back to the cold path.
+function ensureWarmSession(bytes, url) {
+  if (warmSessionUrl === url) return true;
+  const p = eng.ex.svm_alloc(bytes.length);
+  new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const live = Number(eng.ex.svm_warm_open(p, bytes.length));
+  eng.ex.svm_dealloc(p, bytes.length);
+  if (live < 0 || eng.ex.svm_status() !== 0) {
+    warmSessionUrl = null;
+    return false;
+  }
+  warmSessionUrl = url;
+  return true;
+}
+
+// Evaluate the user's source over the warm session — restore the snapshot + eval only, no runtime
+// rebuild. Returns { rv, status, stdout }. Assumes ensureWarmSession succeeded for this module.
+function warmEval(stdinBytes) {
+  let stdinP = 0;
+  const stdinLen = stdinBytes ? stdinBytes.length : 0;
+  if (stdinLen) {
+    stdinP = eng.ex.svm_alloc(stdinLen);
+    new Uint8Array(eng.memory.buffer).set(stdinBytes, stdinP);
+  }
+  const rv = Number(eng.ex.svm_warm_eval(stdinP, stdinLen));
+  const status = eng.ex.svm_status();
+  const stdout = readModuleStdout();
+  if (stdinP) eng.ex.svm_dealloc(stdinP, stdinLen);
+  return { rv, status, stdout };
+}
+
 // Pack a shell PATH registry — `[{ name, bytes }]` — into the blob `svm_run_shell` parses: a u32 entry
 // count, then per entry u32 name-length + UTF-8 name + u32 module-length + module bytes (all
 // little-endian). The `__stage` ring runner and every external command (`primes`, …) travel in one
@@ -1343,13 +1600,34 @@ async function runModule(c) {
   setState(c, 'running', `running…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
   let rv = 0, status, tier = 'interpreter', stdout = '';
-  if (useJit) {
+  if (useJit && ex.warm) {
+    try {
+      // Warm+JIT (WASM_AOT.md): evaluate the user's code on emitted wasm **over the restored warm image**
+      // — the QuickJS runtime init stays paid-once (the snapshot), and the eval itself runs near-native.
+      // The warm session must be open first (svm_warm_jit_open emits `eval_run` from it); a decline/trap
+      // throws → we fall back to the interpreter warm path below. The compiled Module is cached under a
+      // key distinct from the cold `_start` module (a different emit rooted at `eval_run`).
+      const needOpen = warmSessionUrl !== ex.url;
+      if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
+      if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
+      status = await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
+      rv = Number(eng.ex.svm_run_value());
+      stdout = readModuleStdout();
+      tier = 'warm+JIT';
+    } catch (e) {
+      logTo(c, `warm-JIT unavailable (${e.message}); falling back to the warm interpreter`);
+      runNote(rec, { jitFallbackReason: e.message });
+      status = undefined;
+    }
+  } else if (useJit) {
     try {
       // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit/value into the
       // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
       // is the guest's returned result — the same value `svm_run_onramp` returns on the interpreter, so the
       // result matches on both tiers (a trap throws → we fall back to the interpreter below).
-      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
+      // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
+      // emitted `_start` depends only on the module, not the editor `stdinBytes` (slice 1, WASM_AOT.md).
+      status = await runJitModule(eng.ex, eng.memory, bytes, stdinBytes, ex.url);
       rv = Number(eng.ex.svm_run_value());
       stdout = readModuleStdout();
       tier = 'wasm-JIT';
@@ -1357,6 +1635,21 @@ async function runModule(c) {
       logTo(c, `wasm-JIT module unavailable (${e.message}); falling back to the interpreter`);
       runNote(rec, { jitFallbackReason: e.message });
       status = undefined;
+    }
+  }
+  if (status === undefined && ex.warm) {
+    // Warm-runtime snapshot (the default for the QuickJS card): open the session once (the first Run
+    // pays the ~one-time runtime init), then every Run restores the warm image and evaluates only.
+    const needOpen = warmSessionUrl !== ex.url;
+    if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
+    if (ensureWarmSession(bytes, ex.url)) {
+      const r = warmEval(stdinBytes);
+      rv = r.rv; status = r.status; stdout = r.stdout;
+      tier = 'warm-snapshot';
+    } else {
+      logTo(c, 'warm-snapshot unavailable for this module; falling back to the interpreter');
+      const r = moduleInterp(bytes, stdinBytes);
+      rv = r.rv; status = r.status; stdout = r.stdout;
     }
   }
   if (status === undefined) {
@@ -1428,7 +1721,9 @@ async function runChibicc(c) {
   if (useJit) {
     try {
       // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn);
+      // chibicc's emitted `_start` is source-independent (the C source is fed via memfs, not baked
+      // into the code), so cache it under a stable key — every compile reuses the compiled Module.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn, 'chibicc-compiler');
       compileTier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
@@ -1558,7 +1853,7 @@ async function runSelfhost(c) {
   let cstatus, tier = 'interpreter';
   if (useJit) {
     try {
-      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn);
+      cstatus = await runJitSelfhost(eng.ex, eng.memory, compiler, image, tuBytes, gOn, 'chibicc-selfhost');
       tier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT self-host unavailable (${e.message}); falling back to the interpreter`);
@@ -2181,6 +2476,29 @@ async function proveModuleParity(c) {
   try {
     // Yield a paint so "proving…" lands before the synchronous interpreter run blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
+    // A warm card runs the two **warm** tiers, so prove those agree: warm-interp (`svm_warm_eval`) ≡
+    // warm+JIT (`runWarmJit`), both evaluating over the same restored snapshot.
+    if (ex.warm) {
+      if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
+      const interpOut = warmEval(stdinBytes).stdout;
+      let warmJitOut;
+      try {
+        await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
+        warmJitOut = readModuleStdout();
+      } catch (e) {
+        setState(c, 'error', `✗ warm+JIT unavailable: ${e.message}`);
+        logTo(c, `parity: warm-JIT emit failed: ${e.message}`);
+        return;
+      }
+      if (interpOut === warmJitOut) {
+        setState(c, 'done', `✓ warm-interp ≡ warm+JIT — byte-identical stdout (${warmJitOut.length}B)`);
+        logTo(c, `parity: ${warmJitOut.length}B stdout byte-identical on both warm tiers`);
+      } else {
+        setState(c, 'error', `✗ warm tiers diverged (interp ${interpOut.length}B / jit ${warmJitOut.length}B stdout)`);
+        logTo(c, `parity: warm stdout diverged (interp ${interpOut.length}B vs jit ${warmJitOut.length}B)`);
+      }
+      return;
+    }
     const interp = moduleInterp(bytes, stdinBytes);
     let jitOut;
     try {
@@ -2622,18 +2940,26 @@ async function runText(c) {
     jit: mode === 'jit',
     inst: mode === 'inst',
     io: mode === 'io',
+    // Slice 2 (WASM_AOT.md): the compute-only recipe defaults to the wasm-JIT tier-up path — the
+    // interpreter drives, hot in-subset functions run on emitted wasm over the same live window
+    // (fail-closed per-function; validated interp≡tier-up in `browser-tierup-mainline-test.mjs`). The
+    // §22-`jit`/§14-`inst` recipes have their own JIT; `io` stays on the interpreter for now.
+    tierup: mode === 'plain',
     winSize: winSizeOf(src),
     signal: aborter.signal,
   };
   const t0 = performance.now();
   try {
-    const { value, started } = await run(guest, opts);
-    const ms = runStage(rec, `run:${mode === 'jit' ? 'wasm-JIT' : 'interpreter'}`, performance.now() - t0).toFixed(0);
+    const { value, started, tierups } = await run(guest, opts);
+    const tiered = opts.tierup && tierups > 0;
+    const label = tiered ? 'interpreter+wasm-JIT' : mode === 'jit' ? 'wasm-JIT' : 'interpreter';
+    const ms = runStage(rec, `run:${label}`, performance.now() - t0).toFixed(0);
     c.el.result.textContent = `${value}`;
     if (mode === 'io') c.el.stdout.textContent = readParStdout(eng);
-    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms`);
-    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms`);
-    runNote(rec, { workers: started });
+    const tierNote = tiered ? ` · ${tierups} region${tierups === 1 ? '' : 's'} on emitted wasm` : '';
+    setState(c, 'done', `done: ${started} Worker${started === 1 ? '' : 's'} · ${ms}ms${tierNote}`);
+    logTo(c, `run → ${value} across ${started} Workers in ${ms}ms${tierNote}`);
+    runNote(rec, { workers: started, tierups });
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
@@ -2891,7 +3217,9 @@ function buildCard(name, ex) {
       : 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
     jit = el('input');
     jit.type = 'checkbox';
-    jit.checked = true;
+    // A warm-snapshot card (QuickJS) defaults to the warm path (checkbox off); ticking it opts into the
+    // cold wasm-JIT tier. Every other jit card defaults to the JIT tier on.
+    jit.checked = !ex.warm;
     l.append(jit, ' wasm-JIT');
     controls.appendChild(l);
     // "Prove it": run the guest on both tiers and assert the result is byte-identical.

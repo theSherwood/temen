@@ -111,7 +111,9 @@ pub enum FuelMode {
     None,
 }
 
-/// The wasm global index of the fuel counter in [`FuelMode::Global`] (the only declared global).
+/// The wasm global index of the fuel counter in [`FuelMode::Global`] — global 0, emitted first so the
+/// `mapped` global (below) follows it. (`FuelMode::Memory`/`None` declare no fuel global, so `mapped`
+/// takes index 0 there — see [`mapped_global_idx`].)
 const FUEL_GLOBAL_IDX: u32 = 0;
 /// The fuel global's instantiation-time default — the standard per-region budget every host seed
 /// site writes (`1 << 61`). Because the global self-initializes to this, an emitted module runs
@@ -120,6 +122,18 @@ const FUEL_GLOBAL_IDX: u32 = 0;
 /// export to a smaller value before the call. This keeps fuel-in-global a drop-in for the shipped
 /// linear-memory-cell seeding: the old `env`-cell write becomes a no-op, the budget is unchanged.
 const FUEL_DEFAULT: i64 = 1 << 61;
+
+/// The wasm global index of the **live window `mapped` size** (#717 / issue: wasm-JIT confines against
+/// the compile-time `mapped`). The emitted bounds check (`emit_confine`/`emit_span_check`) reads this
+/// global via `global.get` instead of a baked `1 << size_log2`, so an access into memory the guest grew
+/// at runtime via `vm_map` no longer spuriously faults on the JIT where the interpreter admits it. The
+/// global self-initializes to the emit-time `1 << size_log2`, so a host that never grows the window sees
+/// behavior **identical** to the old constant; a growing host writes the live size through the exported
+/// `"mapped"` global (kept in sync by the `vm_map` cross-tier handler). It sits *after* the fuel global
+/// when one is present, so its index is `1` under [`FuelMode::Global`] and `0` otherwise.
+fn mapped_global_idx(fuel_mode: FuelMode) -> u32 {
+    (fuel_mode == FuelMode::Global) as u32
+}
 
 // ---- wasm binary encoding primitives -------------------------------------------------------------
 
@@ -1065,15 +1079,24 @@ fn module_atomics_ok(m: &Module) -> bool {
     !m.funcs.iter().any(|f| f.uses_concurrency())
 }
 
-/// Whether `f` invokes a **window-remapping** capability op — one that mutates which bytes back a
-/// window page, or its read/write protection, *during the run*. Two ifaces do this:
-/// - **ADDRESS_SPACE** (iface 5): `map` (0), `unmap` (1), `protect` (2). `page_size` (3) / `sub` (4)
-///   are a pure query / attenuation-mint and do **not** count (the emittable [`is_nested_leaf_cap`] set).
-/// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages, `unmap` (1) drops
-///   it. `len` (2) / `page_size` (3) are pure queries and do **not** count.
+/// Whether `f` invokes a **shrinking or aliasing** window-remapping op — one that can make a
+/// previously-accessible page trap, read different bytes, or split the read/write sets *during the
+/// run*. Two ifaces do this:
+/// - **ADDRESS_SPACE** (iface 5): `unmap` (1), `protect` (2). `map` (0) does **not** count (#717):
+///   it only *adds* committed pages, and the emitted tier confines against the live `"mapped"`
+///   global ([`mapped_global_idx`]) the driver re-syncs from the `VcpuEvent::TierUp` entry snapshot
+///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
+///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
+///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
+///   still never emitted (a remapping `cap.call` is not in-subset); only its pure siblings are.
+///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either
+///   (the emittable [`is_nested_leaf_cap`] set).
+/// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages (the emitted
+///   tier would read the window's stale bytes, not the region's), `unmap` (1) drops it.
 ///
-/// All of these desync the mask-only tier from the interpreter (a mapped alias reads different bytes;
-/// an unmapped / RO page should trap), so their presence forbids emitting — see [`module_uses_page_ops`].
+/// These desync the mask-only tier from the interpreter in ways a single monotone bound cannot
+/// carry (an unmapped / RO page should trap; an aliased page reads other bytes), so their presence
+/// forbids emitting — see [`module_uses_page_ops`].
 fn func_uses_page_ops(f: &Func) -> bool {
     f.blocks.iter().any(|b| {
         b.insts.iter().any(|i| {
@@ -1081,7 +1104,7 @@ fn func_uses_page_ops(f: &Func) -> bool {
                 i,
                 Inst::CapCall {
                     type_id: 5,
-                    op: 0..=2,
+                    op: 1..=2,
                     ..
                 } | Inst::CapCall {
                     type_id: 4,
@@ -1094,21 +1117,55 @@ fn func_uses_page_ops(f: &Func) -> bool {
 }
 
 /// **The window-remapping gate** (DESIGN.md §14 "wasm-JIT tier coverage"): does any function reach a
-/// window-remapping op ([`func_uses_page_ops`] — `map`/`unmap`/`protect` or a `SharedRegion`
-/// `map`/`unmap`)? The wasm
-/// tier's confinement is **mask-only** — an emitted access lands in `[0, size)` unconditionally and
-/// cannot honor per-page state the guest changed, so an emitted load would sail through a page the
-/// interpreter (which enforces `Mem`'s page-protection + backing map) would trap on or back with
-/// different bytes. That divergence is possible for **any** emitted memory access once such an op is
-/// reachable — not just the op's own function — so a module that uses one must run **wholly on the
-/// interpreter** (emit nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for
-/// the un-rooted tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
+/// shrinking/aliasing remapping op ([`func_uses_page_ops`] — `unmap`/`protect` or a `SharedRegion`
+/// `map`/`unmap`)? The wasm tier's confinement is a mask plus **one live bound** (the `"mapped"`
+/// global) — an emitted access is admitted in `[0, live_mapped)` and cannot honor per-page state
+/// beyond that shape, so once such an op is reachable an emitted load could sail through a page the
+/// interpreter (which enforces `Mem`'s full page-protection + backing map) would trap on or back
+/// with different bytes. That divergence is possible for **any** emitted memory access — not just
+/// the op's own function — so a module that uses one must run **wholly on the interpreter** (emit
+/// nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for the un-rooted
+/// tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
 ///
-/// Not covered (deliberately, deferred with the broader D40/§13 question): a guest `grow` only
-/// *commits* within the fixed reservation the mask already allows, so it introduces no
-/// was-accessible-now-different transition an emitted access would get wrong.
+/// **Not** gated: `ADDRESS_SPACE.map` (5,0) — a guest *grow*. Growth only adds committed pages
+/// within the reservation the mask already clamps to, and the live `"mapped"` global carries it to
+/// the emitted bounds check (per-call host sync from `Mem::scalar_extent`; unrepresentable states
+/// decline tier-up) — see [`func_uses_page_ops`] (#717). This realizes the previously deferred
+/// D40/§13 note: a grow introduces no was-accessible-now-different transition.
 fn module_uses_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(func_uses_page_ops)
+}
+
+/// Whether `f` invokes a §13 `SharedRegion` `map`/`unmap` (iface 4 ops 0/1) — the aliasing subset of
+/// [`func_uses_page_ops`] that even the #750 paged mode cannot carry: a `Backed` page's bytes live
+/// in the region backing, not the window, so an emitted access reads the wrong bytes no matter what
+/// a trap check decides. Paged mode keeps these module-gated.
+fn func_uses_region_ops(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::CapCall {
+                    type_id: 4,
+                    op: 0..=1,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// Whether `f` uses a D62 bulk-memory op — excluded from the #750 paged subset (the emitted span
+/// check has no per-page walk; such functions stay on the interpreter).
+fn func_uses_bulk_mem(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::MemCopy { .. } | Inst::MemMove { .. } | Inst::MemFill { .. }
+            )
+        })
+    })
 }
 
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
@@ -1285,6 +1342,7 @@ pub fn compile_module_fuel(m: &Module, fuel_mode: FuelMode) -> Result<Vec<u8>, E
         None,
         false,
         fuel_mode,
+        None,
     )
 }
 
@@ -1343,6 +1401,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         None,
         false,
         FuelMode::Global,
+        None,
     )
 }
 
@@ -1421,6 +1480,7 @@ pub fn compile_module_nested_with_eligibility(
         None,
         true,
         FuelMode::Global,
+        None,
     )?;
     Ok((wasm, eligible))
 }
@@ -1506,6 +1566,7 @@ pub fn compile_module_b2(
         Some(table_log2),
         false,
         FuelMode::Global,
+        None,
     )
 }
 
@@ -1748,6 +1809,7 @@ pub fn compile_module_reactor(
         None,
         false,
         FuelMode::Global,
+        None,
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -1807,6 +1869,7 @@ pub fn compile_module_reactor_keep(
         None,
         false,
         FuelMode::Global,
+        None,
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -1844,6 +1907,38 @@ pub fn compile_module_tierup_caps(
     shared_memory: bool,
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(m, shared_memory, nested_caps, None)
+}
+
+/// The **opt-in gated software page-check** entry (#750): like [`compile_module_tierup`], but the
+/// module is compiled in **paged** mode — the shrinking page ops (`unmap`/`protect`, iface 5 ops
+/// 1/2) no longer force emit-nothing, because every emitted access also consults a host-maintained
+/// byte-per-page state table (`0 = Unmapped`, `1 = Rw`, `2 = Ro`; base written to the exported
+/// `"pagestate"` i32 global) and traps exactly where the interpreter's `check_prot` would. The
+/// driver contract extends #717's: before each emitted call, refresh the table from the live page
+/// map (`Mem::map_info`) **and** set `"mapped"` to the table's byte coverage — the bound check
+/// then traps everything above the table exactly where the interpreter (no entries above) faults,
+/// and the page states refine within it. `page_log2` is the run's software page size, baked into
+/// the emitted shift.
+///
+/// Deliberate paged-mode limits (fail-closed): `SharedRegion` `map`/`unmap` (iface 4) still gate
+/// the whole module — a `Backed` page's bytes live outside the window, which no trap check can
+/// honor — and bulk-memory functions (`mem.copy`/`move`/`fill`) stay on the interpreter (their span
+/// check has no per-page walk). Every non-paged entry emits byte-identical code to before #750.
+pub fn compile_module_tierup_paged(
+    m: &Module,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2))
+}
+
+fn compile_module_tierup_inner(
+    m: &Module,
+    shared_memory: bool,
+    nested_caps: bool,
+    paged: Option<u8>,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
     // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
@@ -1852,7 +1947,14 @@ pub fn compile_module_tierup_caps(
     // spike did — `jacl_impl/docs/SVM_BROWSER_TIERUP_FINDINGS.md`, where an emitted leaf over a
     // page-managed window trapped `MemoryFault` mid-body). Self-protect: emit nothing, exactly like
     // `compile_interp_only`, so the gate holds regardless of caller.
-    if module_uses_page_ops(m) {
+    //
+    // Paged mode (#750) narrows the gate to `SharedRegion` aliasing only: `unmap`/`protect` are
+    // carried by the emitted per-access page check instead (see `compile_module_tierup_paged`).
+    let gated = match paged {
+        None => module_uses_page_ops(m),
+        Some(_) => m.funcs.iter().any(func_uses_region_ops),
+    };
+    if gated {
         let wasm_of = vec![None; n];
         let leaf = vec![false; n];
         let wasm = emit_module(
@@ -1864,15 +1966,26 @@ pub fn compile_module_tierup_caps(
             None,
             nested_caps,
             FuelMode::Global,
+            paged,
         )?;
         return Ok((wasm, vec![false; n]));
     }
     let atomics_ok = module_atomics_ok(m);
-    let in_subset: Vec<bool> = m
+    let mut in_subset: Vec<bool> = m
         .funcs
         .iter()
         .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
         .collect();
+    if paged.is_some() {
+        // Paged-mode limit (#750): bulk-memory ops have no per-page walk in the emitted span check,
+        // so their functions stay on the interpreter (which honors the full page map). Fail-closed:
+        // dropping them from the subset can only route more code to the oracle.
+        for (i, f) in m.funcs.iter().enumerate() {
+            if func_uses_bulk_mem(f) {
+                in_subset[i] = false;
+            }
+        }
+    }
     let leaf: Vec<bool> = (0..n)
         .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
         .collect();
@@ -1930,6 +2043,7 @@ pub fn compile_module_tierup_caps(
         None,
         nested_caps,
         FuelMode::Global,
+        paged,
     )?;
     Ok((wasm, emit))
 }
@@ -2017,6 +2131,7 @@ fn compile_interp_only(
         None,
         nested_caps,
         FuelMode::Global,
+        None,
     )?;
     Ok(Artifact {
         wasm,
@@ -2086,6 +2201,7 @@ fn emit_module(
     reserved_table_log2: Option<u32>,
     nested_caps: bool,
     fuel_mode: FuelMode,
+    paged: Option<u8>,
 ) -> Result<Vec<u8>, Error> {
     // An import *manifest* is fine (IMPORTS.md phase 3): executable `call.import`s dispatch on the
     // import-capable interpreter tier, reached through outlined wrappers / cross-tier calls. What
@@ -2293,6 +2409,7 @@ fn emit_module(
             table_size,
             nested_caps,
             fuel_mode,
+            paged,
         )?);
     }
     bodies.extend(extra_bodies);
@@ -2395,23 +2512,55 @@ fn emit_module(
         section(&mut out, 4, &sec);
     }
 
-    if fuel_mode == FuelMode::Global {
-        // Global section (6): one mutable `i64` fuel counter, self-initialized to the standard
-        // per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
-        // or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check` — a
-        // register-allocatable counter that no guest memory store can alias.
+    {
+        // Global section (6): the emitted module's mutable `i64` globals, in index order.
+        //  * global 0 (`FuelMode::Global` only) — the fuel counter, self-initialized to the standard
+        //    per-region budget (`FUEL_DEFAULT`) so an unseeded region still runs; the host may re-arm
+        //    or tighten it via the exported `"fuel"` global. Debited in `emit_fuel_check`.
+        //  * global `mapped_global_idx(fuel_mode)` — the live window `mapped` size (#717), self-
+        //    initialized to the emit-time `1 << size_log2`. A host that never grows behaves exactly as
+        //    the old baked constant; a `vm_map`-growing host writes the live size via the `"mapped"`
+        //    export, and `emit_confine`/`emit_span_check` read it live. Register-allocatable; no guest
+        //    store can alias it.
         let mut sec = Vec::new();
-        uleb(&mut sec, 1); // one global
+        let has_fuel_global = fuel_mode == FuelMode::Global;
+        uleb(
+            &mut sec,
+            1 + has_fuel_global as u64 + paged.is_some() as u64,
+        );
+        if has_fuel_global {
+            sec.push(0x7e); // i64
+            sec.push(0x01); // mutable
+            sec.push(OP_I64_CONST);
+            sleb64(&mut sec, FUEL_DEFAULT);
+            sec.push(OP_END);
+        }
+        // The `mapped` global: default = the emit-time window size (`1 << size_log2`).
         sec.push(0x7e); // i64
         sec.push(0x01); // mutable
         sec.push(OP_I64_CONST);
-        sleb64(&mut sec, FUEL_DEFAULT);
+        sleb64(&mut sec, mapped as i64);
         sec.push(OP_END);
+        if paged.is_some() {
+            // The `pagestate` global (#750, paged modules only): the linear-memory base of the
+            // host-maintained byte-per-page state table, written by the driver before each emitted
+            // call (entry snapshot — emitted code can never reach a page op, so state is frozen
+            // while it runs). Default `0` — an opted-in host that never writes it reads arbitrary
+            // in-memory bytes as states, which mis-traps but stays inside the mask (no escape).
+            sec.push(0x7f); // i32
+            sec.push(0x01); // mutable
+            sec.push(OP_I32_CONST);
+            sleb64(&mut sec, 0);
+            sec.push(OP_END);
+        }
         section(&mut out, 6, &sec);
     }
 
     let mut sec = Vec::new(); // export section (7): "f{svm_idx}" → its wasm index
-    let n_exports = emitted.len() as u64 + (fuel_mode == FuelMode::Global) as u64;
+                              // One `f{i}` per emitted function, the `"mapped"` global (always — #717 host sync), and the
+                              // `"fuel"` global when one is declared (`FuelMode::Global`).
+    let n_exports =
+        emitted.len() as u64 + 1 + (fuel_mode == FuelMode::Global) as u64 + paged.is_some() as u64;
     uleb(&mut sec, n_exports);
     for &fi in emitted {
         let name = format!("f{fi}");
@@ -2426,6 +2575,23 @@ fn emit_module(
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x03); // global export kind
         uleb(&mut sec, FUEL_GLOBAL_IDX as u64);
+    }
+    {
+        // The live-`mapped` global (#717): exported so a `vm_map`-growing host can write the live size.
+        let name = "mapped";
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x03); // global export kind
+        uleb(&mut sec, mapped_global_idx(fuel_mode) as u64);
+    }
+    if paged.is_some() {
+        // The page-state table base (#750, paged modules only): the driver writes it before each
+        // emitted call, alongside `"mapped"`.
+        let name = "pagestate";
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x03); // global export kind
+        uleb(&mut sec, (mapped_global_idx(fuel_mode) + 1) as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -2607,6 +2773,17 @@ struct FnCtx {
     depth: u32,
     /// Where the per-dispatch fuel debit reads/writes its counter.
     fuel_mode: FuelMode,
+    /// Wasm global index of the live-`mapped` window size (#717). `emit_confine`/`emit_span_check`
+    /// read it via `global.get` instead of a baked `1 << size_log2`, so a `vm_map`-grown window no
+    /// longer spuriously faults a legitimate access on the JIT. See [`mapped_global_idx`].
+    mapped_global_idx: u32,
+    /// The **gated software page-check** (#750): `Some((page_log2, pagestate_global_idx))` iff this
+    /// module was compiled by the opt-in paged entry ([`compile_module_tierup_paged`]). Every
+    /// confined access then also consults the host-maintained byte-per-page state table (base in
+    /// the exported `"pagestate"` i32 global; `0 = Unmapped`, `1 = Rw`, `2 = Ro`) and traps where
+    /// the interpreter's `check_prot` would. `None` (every other entry) emits byte-identical code
+    /// to before #750 — the fail-closed default pays nothing.
+    page_check: Option<(u8, u32)>,
 }
 
 impl FnCtx {
@@ -2627,6 +2804,7 @@ fn emit_func(
     table_size: u32,
     nested_caps: bool,
     fuel_mode: FuelMode,
+    paged: Option<u8>,
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the SVM params
 
@@ -2729,6 +2907,9 @@ fn emit_func(
         atomic_addr_l,
         depth: 0,
         fuel_mode,
+        mapped_global_idx: mapped_global_idx(fuel_mode),
+        // The pagestate global (paged mode only) sits immediately after `mapped`.
+        page_check: paged.map(|pl| (pl, mapped_global_idx(fuel_mode) + 1)),
     };
 
     let mut code = Vec::new();
@@ -2895,10 +3076,10 @@ fn emit_confine(
     addr_local: u32,
     offset: u64,
     width: u64,
-    mapped: u64,
     elide: bool,
+    write: bool,
 ) {
-    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, mapped, false, elide)
+    emit_confine_maybe_aligned(cx, code, addr_local, offset, width, false, elide, write)
 }
 
 /// Like [`emit_confine`] but, when `align`, also traps `MemoryFault` on a **misaligned** effective
@@ -2913,7 +3094,57 @@ fn emit_confine(
 /// would raise — a trap-parity divergence the interpreter differential catches — never a
 /// confinement escape. (The native JIT, which also drops the clamp on proof, is the escape-critical
 /// consumer of the same predicate; here we keep the clamp, a strictly safer subset.) The alignment
-/// trap is **independent of bounds** and is emitted whenever `align`, elided or not.
+/// trap is **independent of bounds** and is emitted whenever `align`, elided or not. The elision proof
+/// uses the emit-time `mapped` (`elide_access`), a *lower* bound on the live [`mapped_global_idx`] size
+/// the trap branch actually reads (#717) — the window only grows, so a proven-bounded access stays
+/// bounded.
+/// One page-state consultation of the #750 software page-check: the state byte of the page holding
+/// `(ea_l + delta) & MASK` is loaded from the host-maintained table (base in the `"pagestate"`
+/// global) and mismatches trap through the existing [`TRAP_MEMORY_FAULT`] seam — a read of an
+/// `Unmapped` page, or a write to anything but `Rw`. Emitted only for paged modules
+/// ([`FnCtx::page_check`]); the trap decision happens strictly **inside** the already-masked
+/// window, so a wrong table is a trap-parity divergence (INVARIANTS #9), never an escape (#2).
+fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bool) {
+    let Some((page_log2, ps_gidx)) = cx.page_check else {
+        return;
+    };
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.ea_l as u64);
+    if delta != 0 {
+        code.push(OP_I64_CONST);
+        sleb64(code, delta as i64);
+        code.push(0x7c); // i64.add → the access's last byte
+    }
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and — same clamp domain as the access itself
+    code.push(OP_I64_CONST);
+    sleb64(code, page_log2 as i64);
+    code.push(0x88); // i64.shr_u → window-relative page index
+    code.push(0xa7); // i32.wrap_i64
+    code.push(0x23); // global.get pagestate (table base in linear memory)
+    uleb(code, ps_gidx as u64);
+    code.push(0x6a); // i32.add
+    code.push(0x2d); // i32.load8_u → the page's state byte
+    uleb(code, 0); // align
+    uleb(code, 0); // offset
+    if write {
+        // A store is admitted only on an `Rw` (1) page.
+        code.push(OP_I32_CONST);
+        sleb64(code, 1);
+        code.push(0x47); // i32.ne
+    } else {
+        // A load is admitted on anything committed (`Rw`/`Ro`) — only `Unmapped` (0) traps.
+        code.push(0x45); // i32.eqz
+    }
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_MEMORY_FAULT);
+    code.push(OP_END);
+    cx.depth -= 1;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_confine_maybe_aligned(
     cx: &mut FnCtx,
@@ -2921,9 +3152,9 @@ fn emit_confine_maybe_aligned(
     addr_local: u32,
     offset: u64,
     width: u64,
-    mapped: u64,
     align: bool,
     elide: bool,
+    write: bool,
 ) {
     code.push(OP_LOCAL_GET);
     uleb(code, addr_local as u64);
@@ -2933,9 +3164,16 @@ fn emit_confine_maybe_aligned(
     code.push(OP_LOCAL_TEE);
     uleb(code, cx.ea_l as u64);
     if !elide {
+        // eff > live_mapped - width ?  — #717: the bound is the **live** window size, read from the
+        // `mapped` global (default = the emit-time `1 << size_log2`) rather than a baked constant, so
+        // an access into a `vm_map`-grown region no longer faults on the JIT where the interpreter
+        // admits it. `i64.sub` wraps exactly like the old `mapped.wrapping_sub(width)` constant did.
+        code.push(0x23); // global.get
+        uleb(code, cx.mapped_global_idx as u64);
         code.push(OP_I64_CONST);
-        sleb64(code, mapped.wrapping_sub(width) as i64);
-        code.push(0x56); // i64.gt_u: eff > mapped - width ?
+        sleb64(code, width as i64);
+        code.push(0x7d); // i64.sub → live_mapped - width
+        code.push(0x56); // i64.gt_u: eff > live_mapped - width ?
         code.push(OP_IF);
         code.push(BLOCKTYPE_VOID);
         cx.depth += 1;
@@ -2964,6 +3202,14 @@ fn emit_confine_maybe_aligned(
         code.push(OP_END);
         cx.depth -= 1;
     }
+    // #750 (paged modules only): the software page-check — first and, when the access can straddle
+    // a page boundary (`width > 1`), last touched page, exactly the pages the oracle's `check_prot`
+    // walks. NEVER elided: `elide` proves the access in-window, but page *state* is dynamic, so an
+    // in-window proof says nothing about mapped/RW (#750's honest-limits note). No-op when unpaged.
+    emit_page_check_one(cx, code, 0, write);
+    if width > 1 {
+        emit_page_check_one(cx, code, width - 1, write);
+    }
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
     code.push(OP_I64_CONST);
@@ -2990,28 +3236,24 @@ fn emit_bulk_guard_open(cx: &mut FnCtx, code: &mut Vec<u8>, len_local: u32) {
 
 /// **Whole-span confinement** for a bulk op (`memory.copy`/`memory.fill`) — the `len`-is-a-value
 /// analogue of [`emit_confine`], and the security hinge for D62 bulk memory. Traps `MemoryFault` unless
-/// the span `[base, base+len)` lies within `[0, mapped)` — matching the interpreter's `confine_span` +
-/// `check_prot_span` net behaviour over a fresh window (a span above `mapped` is uncommitted → faults),
-/// and keeping every accessed byte inside the physical window (never the adjacent linear memory). The
-/// check is **overflow-safe**: `base > mapped` then `len > mapped - base` (the second computed only
-/// once `base <= mapped`, so `mapped - base` can't underflow and `base + len` can't overflow).
+/// the span `[base, base+len)` lies within `[0, live_mapped)` — matching the interpreter's
+/// `confine_span`/`check_prot_span` net behaviour (a span above the live `mapped` is uncommitted →
+/// faults), and keeping every accessed byte inside the physical window (never the adjacent linear
+/// memory). The bound is the **live** window size read from the [`mapped_global_idx`] global (#717),
+/// not a baked constant, so a `vm_map`-grown span no longer faults where the interpreter admits it. The
+/// check is **overflow-safe**: `base > live_mapped`, then (only once `base <= live_mapped`)
+/// `len > live_mapped - base`, so `live_mapped - base` can't underflow and `base + len` can't overflow.
 ///
 /// Called **inside an `if len != 0` guard** (see the lowering in `emit_block_body`), so `len >= 1`
-/// here and a passed check guarantees `base < mapped` — which makes [`emit_win_addr`]'s mask a no-op.
+/// here and a passed check guarantees `base < live_mapped` — making [`emit_win_addr`]'s mask a no-op.
 /// Emits nothing to the operand stack; call [`emit_win_addr`] afterwards for each span's confined
 /// address.
-fn emit_span_check(
-    cx: &mut FnCtx,
-    code: &mut Vec<u8>,
-    base_local: u32,
-    len_local: u32,
-    mapped: u64,
-) {
-    // trap if base > mapped
+fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_local: u32) {
+    // trap if base > live_mapped  (#717: live window size from the `mapped` global, not a constant)
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, mapped as i64);
+    code.push(0x23); // global.get
+    uleb(code, cx.mapped_global_idx as u64);
     code.push(0x56); // i64.gt_u
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
@@ -3019,15 +3261,15 @@ fn emit_span_check(
     emit_trap(code, TRAP_MEMORY_FAULT);
     code.push(OP_END);
     cx.depth -= 1;
-    // trap if len > mapped - base
+    // trap if len > live_mapped - base
     code.push(OP_LOCAL_GET);
     uleb(code, len_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, mapped as i64);
+    code.push(0x23); // global.get
+    uleb(code, cx.mapped_global_idx as u64);
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
-    code.push(0x7d); // i64.sub → mapped - base (base <= mapped here)
-    code.push(0x56); // i64.gt_u: len > mapped - base
+    code.push(0x7d); // i64.sub → live_mapped - base (base <= live_mapped here)
+    code.push(0x56); // i64.gt_u: len > live_mapped - base
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
@@ -3193,8 +3435,8 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    false, // read
                 );
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
                 set_result(cx, code, k, &mut next_val);
@@ -3213,8 +3455,8 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    true, // write
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
@@ -3233,9 +3475,9 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    false, // read
                 );
                 code.extend_from_slice(&[load, 0x00, 0x00]);
                 set_result(cx, code, k, &mut next_val);
@@ -3254,9 +3496,9 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    true, // write
                 );
                 get(code, cx, *value);
                 code.extend_from_slice(&[store, 0x00, 0x00]);
@@ -3277,9 +3519,9 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    true, // write (RMW/cmpxchg may store)
                 );
                 code.push(OP_LOCAL_SET);
                 uleb(code, cx.atomic_addr_l as u64); // save the confined address
@@ -3319,9 +3561,9 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     width,
-                    mapped,
                     true,
                     elide_access(&ubs, *addr, *offset, width, mapped),
+                    true, // write (RMW/cmpxchg may store)
                 );
                 code.push(OP_LOCAL_SET);
                 uleb(code, cx.atomic_addr_l as u64);
@@ -3360,7 +3602,7 @@ fn emit_block_body(
                 let dl = cx.local_of[k][*dst as usize];
                 let ll = cx.local_of[k][*len as usize];
                 emit_bulk_guard_open(cx, code, ll);
-                emit_span_check(cx, code, dl, ll, mapped);
+                emit_span_check(cx, code, dl, ll);
                 emit_win_addr(code, dl); // dest addr (i32)
                 get(code, cx, *val); // fill byte (already i32)
                 get(code, cx, *len);
@@ -3376,8 +3618,8 @@ fn emit_block_body(
                 let sl = cx.local_of[k][*src as usize];
                 let ll = cx.local_of[k][*len as usize];
                 emit_bulk_guard_open(cx, code, ll);
-                emit_span_check(cx, code, dl, ll, mapped);
-                emit_span_check(cx, code, sl, ll, mapped);
+                emit_span_check(cx, code, dl, ll);
+                emit_span_check(cx, code, sl, ll);
                 emit_win_addr(code, dl); // dest addr (i32)
                 emit_win_addr(code, sl); // src addr (i32)
                 get(code, cx, *len);
@@ -3648,8 +3890,8 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     16,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, 16, mapped),
+                    false, // read
                 );
                 emit_simd(code, 0); // v128.load
                 code.extend_from_slice(&[0x00, 0x00]); // align=1, offset=0 (offset folded in)
@@ -3667,8 +3909,8 @@ fn emit_block_body(
                     cx.local_of[k][*addr as usize],
                     *offset,
                     16,
-                    mapped,
                     elide_access(&ubs, *addr, *offset, 16, mapped),
+                    true, // write
                 );
                 get(code, cx, *value);
                 emit_simd(code, 11); // v128.store

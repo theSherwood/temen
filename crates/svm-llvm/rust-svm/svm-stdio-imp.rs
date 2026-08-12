@@ -11,11 +11,14 @@ unsafe extern "C" {
     fn sys_write(fd: i32, buf: *const u8, len: usize) -> isize;
     #[link_name = "read"]
     fn sys_read(fd: i32, buf: *mut u8, len: usize) -> isize;
+    // The powerbox stderr stream — a distinct `Stream` from stdout (the on-ramp binds this to the
+    // `"stderr"` manifest handle), so `eprintln!` captures separately. `(buf, len) -> n | -errno`.
+    #[link_name = "__vm_write_stderr"]
+    fn sys_write_stderr(buf: *const u8, len: usize) -> isize;
 }
 
 const STDIN: i32 = 0;
 const STDOUT: i32 = 1;
-const STDERR: i32 = 2;
 
 fn from_ret(n: isize) -> io::Result<usize> {
     if n < 0 { Err(io::Error::from_raw_os_error((-n) as i32)) } else { Ok(n as usize) }
@@ -60,7 +63,7 @@ impl Stderr {
 
 impl io::Write for Stderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        from_ret(unsafe { sys_write(STDERR, buf.as_ptr(), buf.len()) })
+        from_ret(unsafe { sys_write_stderr(buf.as_ptr(), buf.len()) })
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

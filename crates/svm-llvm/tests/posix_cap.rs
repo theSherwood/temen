@@ -47,6 +47,7 @@ fn run_probe(backend: Backend) -> (Outcome, Vec<u8>, Vec<u8>) {
         SpawnResult {
             stdout: stdin.to_ascii_uppercase(),
             status: 42,
+            ..Default::default()
         }
     });
     let out = instance()
@@ -104,14 +105,17 @@ fn run_pipeline(backend: Backend) -> (Outcome, Vec<u8>, Vec<u8>) {
         "gen" => SpawnResult {
             stdout: b"hello".to_vec(),
             status: 0,
+            ..Default::default()
         },
         "up" => SpawnResult {
             stdout: stdin.to_ascii_uppercase(),
             status: 0,
+            ..Default::default()
         },
         _ => SpawnResult {
             stdout: Vec::new(),
             status: 127,
+            ..Default::default()
         },
     });
     let out = pipeline_instance()

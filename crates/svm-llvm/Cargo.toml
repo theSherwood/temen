@@ -36,6 +36,11 @@ svm-posix = { path = "../svm-posix" }
 # The W5 DAP server — drives a *real* LLVM-translated module (its §6 debug info, serialized to text)
 # through the Debug Adapter Protocol end-to-end, proving the LLVM producer feeds the DAP consumer.
 svm-dap = { path = "../svm-dap" }
+# The W5 §3e self-host oracle: `w5_leng_run` runs the guest svm-leng on svm and asserts its in-sandbox
+# translation is byte-identical to the same `translate_to_text` run host-side. `default-features = false`
+# = the integer-only guest build (the fixture is built the same way), though the fixed Leng module has
+# no floats so the emitted text is identical either way.
+svm-leng = { path = "../svm-leng", default-features = false }
 
 # The library is the lib target; the `svm-llvm-translate` CLI is an explicit bin so the
 # **separate-artifact** path is scriptable: translate a `.bc` once to a `.svm`/`.svmb` module plus a

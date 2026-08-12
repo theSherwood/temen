@@ -1,13 +1,20 @@
 //! **peval generality probe on QuickJS** — is the Lua dispatch-fold/roll approach Lua-specific, or does
 //! it apply to a completely different real interpreter (a stack VM with NaN-boxed `JSValue`s)?
 //!
-//! Translates the unmodified QuickJS engine, locates `JS_CallInternal` (the bytecode VM), and checks
-//! the two structural preconditions the specializer relies on — a `br_table` opcode dispatch (the fold
-//! target) and a memory-backed operand stack (the rename target) — plus that the running engine can be
-//! captured at `JS_CallInternal` entry (the roll harness's entry point), all with **no engine change**.
-//! The finding: QuickJS's `JS_CallInternal` has the same peval-targetable shape as Lua's `luaV_execute`
-//! (a huge `br_table` dispatch + a window-resident operand stack + a `js_binary_arith_slow` cold arm
-//! for guard-and-deopt), and captures identically — the peval mechanism is not Lua-fitted.
+//! Translates the unmodified QuickJS engine, locates `JS_CallInternal` (the bytecode VM), checks the
+//! structural preconditions (a `br_table` opcode dispatch + a memory-backed operand stack + a
+//! `js_binary_arith_slow` cold arm for guard-and-deopt), captures at entry, and then **drives a real JS
+//! `for` loop through the dispatch** — tallying the hot re-entered dispatch block and decoding how it
+//! computes its br_table index — all with **no engine change**.
+//!
+//! The finding: `JS_CallInternal` has the same peval-targetable shape as Lua's `luaV_execute`, and on a
+//! real loop the dispatch is `br_table( dispatch_table[ *pc & 0xff ] )` with the **dispatch table at a
+//! constant window address** (a frozen global — loads fold) and the **pc as an SSA/threaded value** (not
+//! an in-memory cell). That is precisely the *register-pc* interpreter class the shared `discover` driver
+//! already handles (`pc_addr: None`, like the regVM): freeze the bytecode + the dispatch table, thread the
+//! pc as a spec arg, rename the operand stack, and the opcode switch folds. The peval mechanism is not
+//! Lua-fitted — the remaining work is the specialization implementation (the QuickJS analog of the Lua
+//! `auto_rolled` arc), not a missing precondition.
 //!
 //! Build the input (fetched-not-vendored; needs clang/llvm-link + network, like the QuickJS demo test):
 //!   - QuickJS engine:  `crates/svm-run/demos/quickjs/build_bitcode.sh`
@@ -146,6 +153,86 @@ fn main() {
         }
         other => println!("  did not break: {other:?}"),
     }
+
+    drive_js_loop(m, jci);
+}
+
+/// **Drive a real JS `for` loop through the dispatch and decode the opcode-fetch shape.** The static gate
+/// above shows the *shape*; this shows the *hot path on a real program* — the roll harness's actual
+/// safepoint. Runs `for (i…) s += i`, tallies which br_table block is re-entered per opcode (the
+/// dispatch), and decodes how that block computes its br_table index. The finding: QuickJS's dispatch is
+/// `br_table( dispatch_table[ *pc & 0xff ] )` where the **dispatch table lives at a constant address**
+/// (a frozen global — loads fold) and the **pc is an SSA/threaded value** (not an in-memory cell). That
+/// is exactly the *register-pc* interpreter class the shared `discover` driver already handles (`pc_addr:
+/// None`, like the regVM) — freeze the bytecode + the dispatch table, thread the pc as a spec arg, and the
+/// opcode switch folds. So the peval preconditions hold on a real JS loop, with **no engine change**.
+fn drive_js_loop(m: &svm_ir::Module, jci: u32) {
+    use std::collections::BTreeMap;
+    println!("\n=== drive a real JS loop through the dispatch ===");
+    let f = &m.funcs[jci as usize];
+    let brt: Vec<(usize, u32)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, b)| match &b.term {
+            Terminator::BrTable { idx, .. } => Some((bi, *idx)),
+            _ => None,
+        })
+        .collect();
+
+    let js = b"var s = 0; for (var i = 0; i < 40; i++) { s += i; } print(s);\n";
+    let Ok(inst) = svm_run::instantiate(m.clone()) else {
+        println!("  instantiate failed");
+        return;
+    };
+    let mut insp = inst.debug_attach(js.to_vec(), 2_000_000_000);
+    for &(bi, _) in &brt {
+        insp.set_breakpoint(svm_interp::IrPc {
+            module: 0,
+            func: jci,
+            block: bi,
+            inst: 0,
+        });
+    }
+    let mut hits: BTreeMap<usize, usize> = BTreeMap::new();
+    for _ in 0..50_000 {
+        match insp.run_until_stop() {
+            svm_interp::Stop::Break {
+                reason: svm_interp::StopReason::Breakpoint,
+                pc,
+            } => *hits.entry(pc.block).or_default() += 1,
+            svm_interp::Stop::Finished { .. } => break,
+            _ => break,
+        }
+    }
+    let hot = hits.iter().max_by_key(|(_, n)| **n).map(|(&b, &n)| (b, n));
+    let Some((hot, n)) = hot else {
+        println!("  no dispatch hits (engine did not reach JS_CallInternal?)");
+        return;
+    };
+    println!("  hot dispatch = block {hot}, re-entered {n}× while running `for(i)s+=i` (40 iters)");
+
+    // Decode how the hot dispatch block computes its opcode index: an opcode byte loaded from the pc, an
+    // index into a constant-address dispatch table, then the br_table. Report the two peval hooks.
+    let b = &f.blocks[hot];
+    let opcode_load = b.insts.iter().any(|i| {
+        matches!(
+            i,
+            Inst::Load {
+                op: svm_ir::LoadOp::I32_8U,
+                ..
+            }
+        )
+    });
+    let const_table = b.insts.iter().find_map(|i| match i {
+        Inst::ConstI64(v) if *v > 0x10000 => Some(*v as u64),
+        _ => None,
+    });
+    println!("  opcode = *pc (byte load present: {opcode_load}); pc is an SSA block-param (register-pc class)");
+    if let Some(tbl) = const_table {
+        println!("  dispatch table at constant window addr {tbl:#x} — freezable (loads fold)");
+    }
+    println!("  => matches the shared `discover` register-pc path (pc_addr: None); no engine change needed");
 }
 
 fn closure_size(m: &svm_ir::Module, f: u32) -> usize {

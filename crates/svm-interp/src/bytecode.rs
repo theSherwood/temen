@@ -2480,9 +2480,12 @@ impl VcpuReactor {
     }
 
     /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
-    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv)` — return the callee's i64 result
-    /// slots (or an `Err(Trap)` to propagate the emitted region's trap). With no eligibility set,
-    /// `service` is never called. The window persists after the call (reclaimed for the next frame).
+    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped)` — return the callee's i64
+    /// result slots (or an `Err(Trap)` to propagate the emitted region's trap). `mapped` is the
+    /// window's scalar committed extent at call entry: `service` MUST write it to the emitted
+    /// module's `"mapped"` global before invoking `f{func}` (#717 host sync). With no eligibility
+    /// set, `service` is never called. The window persists after the call (reclaimed for the next
+    /// frame).
     pub fn frame<F>(
         &mut self,
         func: FuncIdx,
@@ -2491,7 +2494,7 @@ impl VcpuReactor {
         mut service: F,
     ) -> Result<Vec<Value>, Trap>
     where
-        F: FnMut(u32, &[i64]) -> Result<Vec<i64>, Trap>,
+        F: FnMut(u32, &[i64], u64) -> Result<Vec<i64>, Trap>,
     {
         let mem = self.mem.take();
         let result;
@@ -2506,10 +2509,12 @@ impl VcpuReactor {
                 match vcpu.run() {
                     VcpuEvent::Done(v) => break Ok(v),
                     VcpuEvent::Trapped(t) => break Err(t),
-                    VcpuEvent::TierUp { func, argv } => match service(func, &argv) {
-                        Ok(vals) => vcpu.deliver_tierup(&vals),
-                        Err(t) => vcpu.deliver_tierup_trap(t),
-                    },
+                    VcpuEvent::TierUp { func, argv, mapped } => {
+                        match service(func, &argv, mapped) {
+                            Ok(vals) => vcpu.deliver_tierup(&vals),
+                            Err(t) => vcpu.deliver_tierup_trap(t),
+                        }
+                    }
                     // Single-vCPU reactor: no spawn/join/wait/JIT-install events.
                     _ => break Err(Trap::Malformed),
                 }
@@ -2536,7 +2541,13 @@ pub enum VcpuEvent {
     /// catchable `RuntimeError` and never corrupts the engine — then calls [`Vcpu::deliver_tierup`]
     /// with the results, or [`Vcpu::deliver_tierup_trap`] if the region trapped. `argv` is the
     /// marshalled arguments as raw i64 slots (the host reads them per `func`'s signature).
-    TierUp { func: u32, argv: Box<[i64]> },
+    TierUp {
+        func: u32,
+        argv: Box<[i64]>,
+        /// The window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — write it to
+        /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
+        mapped: u64,
+    },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
     /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
@@ -2571,12 +2582,21 @@ pub enum VcpuEvent {
     /// §22 `Jit.invoke`: the host resolves the unit's funcs (authority + cross-domain), then calls
     /// [`Vcpu::deliver_jit_invoke`]; the vCPU compiles, arity-checks, and runs the unit synchronously
     /// over its window, writing the results to the awaiting dst.
+    ///
+    /// A **codegen** host runs the unit on emitted wasm instead ([`Vcpu::deliver_jit_invoke_vals`]).
+    /// `mapped` is the window's scalar committed extent at the invoke ([`Mem::scalar_extent`]):
+    /// `Some(H)` MUST be written to the emitted unit's `"mapped"` global before running it (#717
+    /// host sync — same contract as [`VcpuEvent::TierUp`]); `None` means the window state is not
+    /// representable by the single bound, so the host must **decline** emitted execution for this
+    /// invoke and use the interpreted delivery — fail-closed, the interpreter honors the full page
+    /// map. `Some(0)` for a memory-less module (nothing to bound).
     JitInvoke {
         handle: i32,
         code: i32,
         argv: Box<[i64]>,
         params: Box<[ValType]>,
         results: Box<[ValType]>,
+        mapped: Option<u64>,
     },
     /// §14 `Instantiator.instantiate` / `instantiate_module` (THREADS.md 4c-domain §14-D2): start a
     /// **confined executor child** vCPU over the carve, then call [`Vcpu::deliver_handle`] with the
@@ -2678,6 +2698,9 @@ pub struct Vcpu<'p> {
     /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
     /// embedder computes it (e.g. from `svm_wasm_jit::analyze`).
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 paged tier-up: see the `Vm` field of the same name; mirrored here for the `JitInvoke`
+    /// surfacing (which reads the Vcpu, not the Vm).
+    jit_page_checked: bool,
     /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
     /// slots — the caller's window base is the one the spill persisted).
@@ -2744,6 +2767,30 @@ impl<'p> Vcpu<'p> {
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation(reserved_log2, sl);
+            mm.seed(init_mem);
+            mm.init_data(&prog.data);
+            mm
+        });
+        Vcpu::with_mem(prog, func, args, mem, host)
+    }
+
+    /// [`new_root_reserved_with_powerbox`](Self::new_root_reserved_with_powerbox), but the backing
+    /// is **caller-provided** (a [`Region::shared`](super::Region) over the host's own window
+    /// buffer) rather than engine-owned — the native vehicle for driving wasm-JIT tier-up over a
+    /// live, `vm_map`-growable window whose bytes the host must also read (the browser's
+    /// shared-linear-memory shape; `tierup_grow_window.rs`). `back` must address the full
+    /// `1 << reserved_log2` reservation so grown tail pages land in the caller's buffer.
+    pub fn new_root_reserved_over_with_powerbox(
+        prog: &'p VcpuProgram,
+        func: u32,
+        args: &[Value],
+        init_mem: &[u8],
+        host: Host,
+        reserved_log2: u8,
+        back: std::sync::Arc<super::Region>,
+    ) -> Result<Vcpu<'p>, Trap> {
+        let mem = prog.mem_size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm
@@ -2848,6 +2895,7 @@ impl<'p> Vcpu<'p> {
             pending_jit: None,
             trap: None,
             jit_eligible: None,
+            jit_page_checked: false,
             pending_tierup: None,
         })
     }
@@ -2922,6 +2970,7 @@ impl<'p> Vcpu<'p> {
             pending_jit: None,
             trap: None,
             jit_eligible: None,
+            jit_page_checked: false,
             pending_tierup: None,
         })
     }
@@ -2946,6 +2995,25 @@ impl<'p> Vcpu<'p> {
         self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
         self.jit_eligible = Some(eligible);
         self
+    }
+
+    /// #750 **paged tier-up**: mark the eligible set as emitted with the software page-check
+    /// (`compile_module_tierup_paged`). The dispatch then surfaces tier-up regardless of the
+    /// window's scalar representability — the event's `mapped` is the reserved window size, and the
+    /// driver's page-state table (refreshed per call from [`mem_map_info`](Vcpu::mem_map_info))
+    /// carries the per-page fidelity the scalar cannot.
+    pub fn with_jit_page_checked(mut self) -> Vcpu<'p> {
+        self.vt.active.jit_page_checked = true;
+        self.jit_page_checked = true;
+        self
+    }
+
+    /// The run's window memory-map introspection ([`MemMapInfo`]) — what a #750 page-checked
+    /// driver rebuilds its byte-per-page state table from before each emitted call (page state is
+    /// frozen while emitted code runs: page ops are `cap.call`s, which are never emitted and never
+    /// reachable through a cross-tier leaf). `None` for a memory-less module.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
+        self.mem.as_ref().map(|m| m.map_info())
     }
 
     /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
@@ -3036,9 +3104,10 @@ impl<'p> Vcpu<'p> {
                     argv,
                     dst,
                     results,
+                    mapped,
                 }) => {
                     self.pending_tierup = Some((dst, results));
-                    return VcpuEvent::TierUp { func, argv };
+                    return VcpuEvent::TierUp { func, argv, mapped };
                 }
                 Ok(VcpuStop::Spawn {
                     func,
@@ -3122,12 +3191,24 @@ impl<'p> Vcpu<'p> {
                         results: results.clone(),
                         dst,
                     });
+                    // #717 host sync: snapshot the window's scalar committed extent for a codegen
+                    // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
+                    // (unrepresentable page state) tells it to decline emitted execution and use
+                    // the interpreted delivery instead. A memory-less module has nothing to bound.
+                    // #750: a page-checked run surfaces the reserved size instead (see the tier-up
+                    // dispatch), the table carrying per-page fidelity.
+                    let mapped = match self.mem.as_ref() {
+                        None => Some(0),
+                        Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+                        Some(m) => m.scalar_extent(),
+                    };
                     return VcpuEvent::JitInvoke {
                         handle: h,
                         code,
                         argv,
                         params,
                         results,
+                        mapped,
                     };
                 }
                 // §14 executor children (THREADS.md 4c-domain §14-D2): this vCPU does all the
@@ -7381,11 +7462,16 @@ enum Outcome {
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible module-0
     /// function. The host runs the emitted `f{func}` region and delivers its `n_results` results to
     /// the absolute register slot `dst`. `argv` is the marshalled arguments (raw i64 slots).
+    /// `mapped` is the window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — the
+    /// host MUST write it to the emitted module's `"mapped"` global before invoking `f{func}`, so the
+    /// emitted bounds check admits exactly what the interpreter would (#717). Surfaced only when the
+    /// extent is scalar-representable; otherwise the call is interpreted (fail-closed decline).
     TierUp {
         func: u32,
         argv: Box<[i64]>,
         dst: usize,
         results: Box<[ValType]>,
+        mapped: u64,
     },
     /// F2 (FIBER_PARK.md) — a punted offloadable dispatch (`Pending(completion_id)`) with an
     /// exactly-`i64` reply, surfaced so the DRIVER decides the wait shape: the cooperative
@@ -8044,11 +8130,14 @@ enum VcpuStop {
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
     /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
+    /// `mapped` is the entry-snapshot scalar committed extent the host must write to the emitted
+    /// `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
     TierUp {
         func: u32,
         argv: Box<[i64]>,
         dst: usize,
         results: Box<[ValType]>,
+        mapped: u64,
     },
     Spawn {
         func: u32,
@@ -8429,12 +8518,14 @@ fn step_vcpu(
                 argv,
                 dst,
                 results,
+                mapped,
             } => {
                 return Ok(VcpuStop::TierUp {
                     func,
                     argv,
                     dst,
                     results,
+                    mapped,
                 })
             }
             Outcome::ThreadSpawn {
@@ -10932,6 +11023,12 @@ struct Vm {
     /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
     /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
+    /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
+    /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
+    /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
+    /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
+    jit_page_checked: bool,
     /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket — `Some`
     /// between admitting a handler activation (whose return linkage rewinds into the `SvcPoll`
     /// op) and the re-execution that settles its result — and the count of dispatches completed
@@ -10974,6 +11071,7 @@ impl Vm {
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_page_checked: false,
             serve_ticket: None,
             serve_count: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
@@ -11417,20 +11515,39 @@ impl Vm {
                             .as_ref()
                             .is_some_and(|e| e.get(callee).copied().unwrap_or(false))
                     {
-                        let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
-                        let results: Box<[ValType]> = c.result_types[callee].clone().into();
-                        // Spill past the call with the caller's window intact (no callee frame pushed);
-                        // `deliver_tierup` writes the results into `dst` relative to this base.
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc + 1;
-                        return Ok(Outcome::TierUp {
-                            func: callee as u32,
-                            argv,
-                            dst: *dst as usize,
-                            results,
-                        });
+                        // #717 host sync: snapshot the window's scalar committed extent for the host
+                        // to write into the emitted `"mapped"` global. A window whose page state is
+                        // not representable by one bound (sparse grow, `Ro`/`Unmapped`/aliased pages)
+                        // declines tier-up — fall through to the interpreted call below, which honors
+                        // the full per-page map (fail-closed; the interpreter is always right). A
+                        // memory-less module has nothing to bound (no emitted access): sync `0`.
+                        //
+                        // #750 paged tier: the emitted code carries a per-access page check, so an
+                        // unrepresentable window must NOT decline — surface with the reserved size
+                        // (the bound must never under-admit a page the driver's table admits).
+                        let extent = match mem.as_ref() {
+                            None => Some(0),
+                            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+                            Some(m) => m.scalar_extent(),
+                        };
+                        if let Some(mapped) = extent {
+                            let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
+                            let results: Box<[ValType]> = c.result_types[callee].clone().into();
+                            // Spill past the call with the caller's window intact (no callee frame
+                            // pushed); `deliver_tierup` writes the results into `dst` relative to
+                            // this base.
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc + 1;
+                            return Ok(Outcome::TierUp {
+                                func: callee as u32,
+                                argv,
+                                dst: *dst as usize,
+                                results,
+                                mapped,
+                            });
+                        }
                     }
                     // A direct call stays in the current module.
                     let nb = base + c.progs[cur].nslots as usize;

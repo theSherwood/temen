@@ -796,6 +796,9 @@ struct RecordingMem<'a> {
 }
 
 impl GuestMem for RecordingMem<'_> {
+    fn window_size(&self) -> u64 {
+        self.inner.window_size()
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.inner.read_bytes(ptr, len)
     }
@@ -4082,6 +4085,17 @@ enum Blocked {
     /// wakes it today: a scheduler-run blocking read with no closer blocks forever, which is
     /// what blocking means.
     CapRead { handle: i32 },
+    /// FORK.md §8.6 — a **blocking pipe read** parked on an empty FIFO whose writer count is still
+    /// `> 0`. Keyed by pipe id in `pipe_waiters`; woken by another domain's `write` to the pipe or by
+    /// the last write end closing (writer count → 0, which re-issues the read to EOF). On wake the read
+    /// re-executes from the top (no partial state), like [`Blocked::CapRead`] / the stdin park.
+    PipeRead { pipe: u32 },
+    /// FORK.md §8.6 (backpressure) — a **blocking pipe write** parked on a full FIFO whose reader count
+    /// is still `> 0`. Keyed by pipe id in `pipe_write_waiters`; woken by a `read` that drains the pipe
+    /// (room opened) or by the last read end closing (reader count → 0, which re-issues the write to
+    /// `-EPIPE`). The write-side twin of [`Blocked::PipeRead`]: the write op was rewound, so on wake it
+    /// re-executes from the top and either writes into the freed room or fails `-EPIPE`.
+    PipeWrite { pipe: u32 },
     /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
     /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
     /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
@@ -4281,6 +4295,53 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
     }
 }
 
+/// FORK.md §8.6 — wake every reader parked on `pipe` under an **already-held** scheduler lock (the
+/// domain-exit hook holds it). Re-admits each waiting vCPU with no pending value — its rewound read
+/// re-executes. The `Scheduler::wake_pipe_readers` method wraps this with the lock + a `notify_all`.
+fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
+    let woken = s.pipe_waiters.remove(&pipe).unwrap_or_default();
+    let n = woken.len() as u32;
+    for w in woken {
+        match w {
+            Waiter::VCpu(v) => s.runnable.push_back(v),
+            Waiter::Fiber { reg, slot, svc } => {
+                reg.wake_blocked(slot, Reg::from_i64(0));
+                svc_wake_locked(s, svc);
+            }
+        }
+    }
+    n
+}
+
+/// FORK.md §8.6 (backpressure) — the write-side twin of [`wake_pipe_readers_locked`]: wake every writer
+/// parked on `pipe` under an already-held scheduler lock (the domain-exit hook holds it). Re-admits each
+/// waiting vCPU with no pending value — its rewound write re-executes (into the freed room, or `-EPIPE`
+/// if the readers are gone). `Scheduler::wake_pipe_writers` wraps this with the lock + a `notify_all`.
+fn wake_pipe_writers_locked(s: &mut Sched, pipe: u32) -> u32 {
+    let woken = s.pipe_write_waiters.remove(&pipe).unwrap_or_default();
+    let n = woken.len() as u32;
+    for w in woken {
+        match w {
+            Waiter::VCpu(v) => s.runnable.push_back(v),
+            Waiter::Fiber { reg, slot, svc } => {
+                reg.wake_blocked(slot, Reg::from_i64(0));
+                svc_wake_locked(s, svc);
+            }
+        }
+    }
+    n
+}
+
+/// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
+/// scoping — only the parent may reap it) and its POSIX **process group** (`pgid`, for
+/// `waitpid(-pgid)` / `setpgid`). `pgid` defaults to the twin's own id at fork (each child starts as
+/// its own group leader) and is reassignable by the parent via the `setpgid` self-op.
+#[derive(Clone, Copy)]
+struct Twin {
+    parent: usize,
+    pgid: TaskId,
+}
+
 #[derive(Default)]
 struct Sched {
     /// vCPUs ready to run.
@@ -4289,21 +4350,23 @@ struct Sched {
     results: BTreeMap<TaskId, Outcome>,
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
-    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, the only ids `reap`
-    /// (servicer-side `wait()`) will act on. Inserted when a twin is forked, removed when it is
-    /// reaped; a `pid` not present is `-ECHILD` (so a bogus/foreign pid cannot park a waiter
-    /// forever). Confinement is capability-shaped: only a domain holding the fork/wait offer can
-    /// drive `reap` at all, and even then only over a real twin.
-    forked_twins: BTreeSet<TaskId>,
-    /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` (`waitpid(-1)`: reap **any**
-    /// child). Unlike `join_waiters` these are not keyed by a specific twin — any [`forked_twins`]
-    /// member finishing wakes one, FIFO. A twin finishing prefers a `join_waiters` waiter (a
-    /// specific `wait(pid)`) first; only an unclaimed twin falls through to this queue. Confinement
-    /// is the same as `reap`: a `wait(-1)` only ever fires over a twin in `forked_twins`, so it
-    /// cannot reap a foreign task — it can, in a multi-parent topology, reap another servicer's
-    /// twin (there is no per-parent child table yet — the same coarseness `reap` already has;
-    /// per-parent tracking is the process-group follow-up).
-    reap_any_waiters: VecDeque<Box<VCpu>>,
+    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to its [`Twin`]
+    /// record (forking parent domain + POSIX process group). The only ids `reap` (servicer-side
+    /// `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)` / `wait(-pgid)` only
+    /// reaps a twin whose recorded parent is the calling domain — so one shell cannot reap another's
+    /// child even though the servicer/offer is shared. Inserted when a twin is forked, removed when
+    /// it is reaped; a `pid` not present (or present under a different parent) is `-ECHILD`.
+    /// Confinement is capability-shaped *and* parent-shaped: a domain holding the fork/wait offer can
+    /// drive `reap`, but only over its own real twins.
+    forked_twins: BTreeMap<TaskId, Twin>,
+    /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
+    /// matching child), each tagged with its target: `None` = any of the caller's children,
+    /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
+    /// specific twin — a finishing child wakes the oldest parked waiter **of that child's parent whose
+    /// target it matches** ([`wake_reap_any`], FIFO). A twin finishing prefers a `join_waiters` waiter
+    /// (a specific `wait(pid)`) first; only an unclaimed twin falls through to this queue. Parent- and
+    /// group-scoped, so a `wait` never reaps another domain's — or another group's — child.
+    reap_any_waiters: VecDeque<(Option<TaskId>, Box<VCpu>)>,
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
@@ -4312,6 +4375,16 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
+    /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
+    /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
+    /// as `cap_waiters`, a different key (a shared pipe, not a single domain's handle).
+    pipe_waiters: BTreeMap<u32, Vec<Waiter>>,
+    /// FORK.md §8.6 (backpressure) — the write-side twin of `pipe_waiters`: vCPUs/fibers parked in a
+    /// **blocking pipe write** ([`Blocked::PipeWrite`]), keyed by pipe id. Woken by a `read` that drains
+    /// a full pipe (room available) or by its last read end closing (reader count → 0, `-EPIPE`); both
+    /// drain the entry into `runnable` and the write re-issues.
+    pipe_write_waiters: BTreeMap<u32, Vec<Waiter>>,
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
     /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
     /// cell runs at most one sub-run at a time — the `busy` gate). Drained smallest-id-first by
@@ -4518,6 +4591,32 @@ impl Scheduler {
                 }
             }
         }
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// FORK.md §8.6 — wake every reader parked in a blocking pipe read on `pipe` ([`Blocked::PipeRead`]).
+    /// Called after a `write` to the pipe (data available) or when its last write end closes (writer
+    /// count → 0, EOF). The woken vCPU carries **no pending value**: its read op was rewound before
+    /// parking, so it re-executes and either drains the new bytes or returns EOF.
+    fn wake_pipe_readers(&self, pipe: u32) -> u32 {
+        let mut s = self.lock();
+        let n = wake_pipe_readers_locked(&mut s, pipe);
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// FORK.md §8.6 (backpressure) — wake every writer parked in a blocking pipe write on `pipe`
+    /// ([`Blocked::PipeWrite`]). Called after a `read` drained a full pipe (room opened) or when its last
+    /// read end closes (reader count → 0, `-EPIPE`). The woken vCPU carries **no pending value**: its
+    /// write op was rewound before parking, so it re-executes and either writes into the room or fails.
+    fn wake_pipe_writers(&self, pipe: u32) -> u32 {
+        let mut s = self.lock();
+        let n = wake_pipe_writers_locked(&mut s, pipe);
         if n > 0 {
             self.work.notify_all();
         }
@@ -4757,11 +4856,20 @@ impl Scheduler {
         let twin_id = s.next_task;
         s.next_task += 1;
         s.live += 1;
+        let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.pending = Some(Pending::CapResult(reply_twin));
         // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
-        // deliver its exit status to the parent; removed when reaped (or swept at teardown).
-        s.forked_twins.insert(twin_id);
+        // deliver its exit status to the parent; removed when reaped (or swept at teardown). The
+        // recorded parent scopes the reap — only `parent_key` may `wait` on this twin — and `pgid`
+        // starts as the twin's own id (its own group leader) until the parent `setpgid`s it.
+        s.forked_twins.insert(
+            twin_id,
+            Twin {
+                parent: parent_key,
+                pgid: twin_id,
+            },
+        );
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
         // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
@@ -4796,8 +4904,16 @@ impl Scheduler {
         nohang: bool,
     ) -> ReapOutcome {
         let mut s = self.lock();
-        if !s.forked_twins.contains(&pid) {
+        let Some(parent) = s.forked_twins.get(&pid).map(|t| t.parent) else {
             return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
+        };
+        // Per-parent scope: the twin exists, but only its **own parent** may reap it. Peek the parked
+        // caller's domain without committing to remove it. A caller not parked yet (serve/park race)
+        // is retryable (`-EAGAIN`); a parked caller of the *wrong* domain is `-ECHILD` (not its child).
+        match s.ticket_waiters.get(&(callee_id, ticket)) {
+            Some(Waiter::VCpu(v)) if domain_key_of(v) == parent => {}
+            Some(Waiter::VCpu(_)) => return ReapOutcome::NoChild,
+            _ => return ReapOutcome::Retry,
         }
         // Claim the parked caller — the same shape `fork_parked_caller` removes. A miss means the
         // caller's `CapReply` waiter is not registered yet (the serve/park race) — the twin is real
@@ -4835,18 +4951,37 @@ impl Scheduler {
         }
     }
 
-    /// FORK.md §8.6 — the servicer side of `wait(-1)` / `waitpid(-1)`: reap **any** child, not a
-    /// named one. Mirrors [`Self::reap_parked_caller`] but ranges over the whole `forked_twins` set:
-    ///   * no twins at all → [`ReapOutcome::NoChild`] (`-ECHILD`).
-    ///   * the caller has not parked yet (serve/park race) → [`ReapOutcome::Retry`] (`-EAGAIN`).
-    ///   * **some** twin has already finished → reap it now, reply its status.
+    /// FORK.md §8.6 — the servicer side of `wait(-1)` (any child) and `waitpid(-pgid)` (any child in
+    /// process group `pgid`). `target` is `None` for `wait(-1)` — any of the caller's children — or
+    /// `Some(pgid)` to restrict to that process group. Mirrors [`Self::reap_parked_caller`] but ranges
+    /// over the calling parent's twins matching `target`:
+    ///   * no twins anywhere → [`ReapOutcome::NoChild`] (`-ECHILD`, caller-independent fast path).
+    ///   * twins exist but the caller has not parked yet (serve/park race) → [`ReapOutcome::Retry`].
+    ///   * the caller has no matching children (no own children, or none in `pgid`) → `NoChild`.
+    ///   * **some** matching child has already finished → reap it now, reply its status.
     ///   * `nohang` and none finished → reply `0` at once (POSIX: nothing changed state).
-    ///   * otherwise park the caller in `reap_any_waiters`; the next twin to finish wakes it (via
-    ///     [`Pending::ReapPid`], the same resume path a named `wait` uses).
-    fn reap_any_parked_caller(&self, callee_id: usize, ticket: u64, nohang: bool) -> ReapOutcome {
+    ///   * otherwise park the caller in `reap_any_waiters` tagged with `target`; the next matching
+    ///     child to finish wakes it (via [`Pending::ReapPid`], the same resume path a named wait uses).
+    fn reap_group_parked_caller(
+        &self,
+        callee_id: usize,
+        ticket: u64,
+        nohang: bool,
+        target: Option<TaskId>,
+    ) -> ReapOutcome {
         let mut s = self.lock();
         if s.forked_twins.is_empty() {
-            return ReapOutcome::NoChild; // no children of any pid — a genuine -ECHILD.
+            return ReapOutcome::NoChild; // no children of any parent — a genuine -ECHILD.
+        }
+        // Scope to the calling parent: peek the caller's domain (twins exist, so a not-yet-parked
+        // caller is the serve/park race → retry). Then require ≥1 live twin matching `target`.
+        let parent = match s.ticket_waiters.get(&(callee_id, ticket)) {
+            Some(Waiter::VCpu(v)) => domain_key_of(v),
+            _ => return ReapOutcome::Retry,
+        };
+        let matches = |t: &Twin| t.parent == parent && target.is_none_or(|g| t.pgid == g);
+        if !s.forked_twins.values().any(matches) {
+            return ReapOutcome::NoChild; // no matching child — `-ECHILD`.
         }
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(v)) => v,
@@ -4856,12 +4991,12 @@ impl Scheduler {
             }
             None => return ReapOutcome::Retry,
         };
-        // Any already-finished twin? (Deterministic: smallest id first — `forked_twins` is ordered.)
+        // Any already-finished matching child? (Deterministic: smallest id first.)
         let finished = s
             .forked_twins
             .iter()
-            .copied()
-            .find(|t| s.results.contains_key(t));
+            .find(|(t, tw)| matches(tw) && s.results.contains_key(t))
+            .map(|(t, _)| *t);
         if let Some(pid) = finished {
             s.forked_twins.remove(&pid);
             let status = match s.results.remove(&pid) {
@@ -4878,10 +5013,27 @@ impl Scheduler {
             self.work.notify_one();
             ReapOutcome::Replied(0)
         } else {
-            // Park for *any* child: the next `forked_twins` member to finish re-admits us with
+            // Park for a matching child: the next matching twin to finish re-admits us with
             // `Pending::ReapPid` (set at wake, in the completion path), reusing the named-wait resume.
-            s.reap_any_waiters.push_back(v);
+            s.reap_any_waiters.push_back((target, v));
             ReapOutcome::Replied(0)
+        }
+    }
+
+    /// FORK.md §8.6 — POSIX `setpgid(pid, pgid)`, driven by the **parent** as a direct self-op (no
+    /// serve round-trip: the caller *is* the parent, so its own `domain_id` scopes the change). Sets
+    /// child `pid`'s process group to `pgid` (or, for `pgid == 0`, makes `pid` its own group leader).
+    /// Parent-scoped and confined to real children: `pid` must be a live twin this `parent` forked,
+    /// else `-ESRCH`. Returns `0` on success. (`pid == 0` — "the caller" — is unsupported here: the
+    /// forking domain is not itself a twin, so it has no `pgid` slot to set.)
+    fn set_child_pgid(&self, parent: usize, pid: TaskId, pgid: TaskId) -> i64 {
+        let mut s = self.lock();
+        match s.forked_twins.get_mut(&pid) {
+            Some(t) if t.parent == parent => {
+                t.pgid = if pgid == 0 { pid } else { pgid };
+                0
+            }
+            _ => ESRCH, // not a live child of this domain
         }
     }
 }
@@ -4913,18 +5065,26 @@ fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
 }
 
 /// FORK.md §8.6 — a `forked_twins` member `id` just finished and no named `wait(pid)` claimed it:
-/// if a `wait(-1)` caller is parked in `reap_any_waiters`, wake one (FIFO) to reap this twin via
-/// [`Pending::ReapPid`]. Returns whether a waiter was woken. The twin is left in `forked_twins` /
-/// `results` — the woken caller's `reap_twin` retires it, exactly as a named `wait` does. Called at
-/// each completion site *before* the outcome lands in `results` (the woken caller only runs after
-/// the lock releases, by which point the result is present — the same ordering the named path uses).
+/// if a `wait(-1)` / `waitpid(-pgid)` caller **of this twin's parent whose target matches** is parked
+/// in `reap_any_waiters`, wake it (the oldest such, FIFO) to reap this twin via [`Pending::ReapPid`].
+/// Returns whether a waiter was woken. Parent- and group-scoped: a `wait` only reaps its own children,
+/// and a `waitpid(-pgid)` only its group's, so a finishing twin skips waiters of other parents or
+/// other groups. The twin is left in `forked_twins` / `results` — the woken caller's `reap_twin`
+/// retires it, exactly as a named `wait` does. Called at each completion site *before* the outcome
+/// lands in `results` (the woken caller only runs after the lock releases, by which point the result
+/// is present — the same ordering the named path uses).
 fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
-    if !s.forked_twins.contains(&id) {
+    let Some(twin) = s.forked_twins.get(&id).copied() else {
         return false;
-    }
-    if let Some(mut parent) = s.reap_any_waiters.pop_front() {
-        parent.pending = Some(Pending::ReapPid { pid: id });
-        s.runnable.push_back(parent);
+    };
+    // The oldest parked waiter of this twin's parent whose target (any-child / a pgid) matches it.
+    let pos = s.reap_any_waiters.iter().position(|(target, w)| {
+        domain_key_of(w) == twin.parent && target.is_none_or(|g| g == twin.pgid)
+    });
+    if let Some(pos) = pos {
+        let (_, mut waiter) = s.reap_any_waiters.remove(pos).expect("position just found");
+        waiter.pending = Some(Pending::ReapPid { pid: id });
+        s.runnable.push_back(waiter);
         true
     } else {
         false
@@ -5111,13 +5271,13 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             s.join_waiters.insert(k, v);
         }
     }
-    // Parked `wait(-1)` callers of the dying domain are reaped; others stay parked (FIFO order).
+    // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
     let raw = std::mem::take(&mut s.reap_any_waiters);
-    for v in raw {
+    for (target, v) in raw {
         if domain_key_of(&v) == key {
             victims.push(v);
         } else {
-            s.reap_any_waiters.push_back(v);
+            s.reap_any_waiters.push_back((target, v));
         }
     }
     for q in s.wait_waiters.values_mut() {
@@ -5249,7 +5409,12 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
-    victims.extend(std::mem::take(&mut s.reap_any_waiters)); // parked `wait(-1)` callers
+    // parked `wait(-1)`/`waitpid(-pgid)` callers (drop the target tag, keep the vCPU)
+    victims.extend(
+        std::mem::take(&mut s.reap_any_waiters)
+            .into_iter()
+            .map(|(_, v)| v),
+    );
     for (_, q) in std::mem::take(&mut s.wait_waiters) {
         for (_, w) in q {
             if let Waiter::VCpu(v) = w {
@@ -5699,6 +5864,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     .map(|&(_, t)| t)
                     .chain(v.serve_run.as_ref().map(|r| r.ticket))
                     .collect();
+                // FORK.md §8.6 — a domain finishing (cleanly or trapping) releases its pipe write ends,
+                // so a producer that exits lets its consumer see EOF. Collect the pipes that thereby
+                // hit 0 writers; wake their parked readers once the scheduler lock is held below. It
+                // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
+                // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
+                let (pipe_eofs, pipe_epipes) = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
+                };
                 let mut outcome = Outcome {
                     result,
                     mem: v.mem.take(),
@@ -5708,6 +5882,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 drop(v);
                 let mut s = sched.lock();
+                for pipe in &pipe_eofs {
+                    wake_pipe_readers_locked(&mut s, *pipe);
+                }
+                for pipe in &pipe_epipes {
+                    wake_pipe_writers_locked(&mut s, *pipe);
+                }
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
                 // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
                 // true origin. A clean finish leaves it untouched.
@@ -5829,6 +6009,69 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     v.pending = Some(Pending::CapResult(CAP_REVOKED));
                     s.runnable.push_back(v);
                     sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::PipeRead { pipe }) => {
+                // FORK.md §8.6 — park a blocking pipe read, keyed by pipe id. The read op was rewound,
+                // so a re-admit just re-executes it. Park-vs-wake race (mirrors `CapRead`): a `write` /
+                // last-writer-close that ran between the empty-read decision and this insert found no
+                // waiter — so re-check under the lock. If the FIFO now has bytes or every writer closed,
+                // re-admit (the read re-runs and completes / EOFs) rather than park forever.
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let ready = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    match hg.pipes.get(pipe as usize) {
+                        Some((fifo, writers, _)) => {
+                            !fifo.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
+                        }
+                        None => true, // vanished — re-run to fail closed
+                    }
+                };
+                if ready {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.pipe_waiters
+                        .entry(pipe)
+                        .or_default()
+                        .push(Waiter::VCpu(v));
+                }
+            }
+            Step::Park(Blocked::PipeWrite { pipe }) => {
+                // FORK.md §8.6 (backpressure) — park a blocking pipe write, keyed by pipe id. The write
+                // op was rewound, so a re-admit just re-executes it. Park-vs-wake race (mirrors
+                // `PipeRead`): a `read` / last-reader-close that ran between the full-write decision and
+                // this insert found no waiter — so re-check under the lock. If the FIFO now has room or
+                // every reader closed, re-admit (the write re-runs and writes / `-EPIPE`s) rather than
+                // park forever.
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                let ready = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    match hg.pipes.get(pipe as usize) {
+                        Some((fifo, _, readers)) => {
+                            fifo.lock().unwrap_or_else(|e| e.into_inner()).len() < PIPE_CAP
+                                || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
+                        }
+                        None => true, // vanished — re-run to fail closed
+                    }
+                };
+                if ready {
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                } else {
+                    s.pipe_write_waiters
+                        .entry(pipe)
+                        .or_default()
+                        .push(Waiter::VCpu(v));
                 }
             }
             Step::Park(Blocked::CapPending { id }) => {
@@ -6137,6 +6380,22 @@ impl SchedRef {
     fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
         match self {
             SchedRef::Real(s) => s.cap_revoke(handle, status),
+            SchedRef::Det(_) => 0,
+        }
+    }
+    /// FORK.md §8.6 — wake readers parked on a pipe (real scheduler only; the explorer never parks a
+    /// blocking pipe read — its read arm fails closed, so there is nothing to wake).
+    fn wake_pipe_readers(&self, pipe: u32) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.wake_pipe_readers(pipe),
+            SchedRef::Det(_) => 0,
+        }
+    }
+    /// FORK.md §8.6 (backpressure) — wake writers parked on a pipe (real scheduler only; the explorer
+    /// never parks a blocking pipe write — its write arm fails closed, so there is nothing to wake).
+    fn wake_pipe_writers(&self, pipe: u32) -> u32 {
+        match self {
+            SchedRef::Real(s) => s.wake_pipe_writers(pipe),
             SchedRef::Det(_) => 0,
         }
     }
@@ -6733,6 +6992,8 @@ impl SchedDriver {
                 // other non-resumable drivers). Fail closed rather than wedge.
                 Step::Park(
                     Blocked::CapRead { .. }
+                    | Blocked::PipeRead { .. }
+                    | Blocked::PipeWrite { .. }
                     | Blocked::CapPending { .. }
                     | Blocked::CapReply { .. }
                     | Blocked::SvcWait { .. }
@@ -7693,7 +7954,12 @@ fn fiber_sig() -> FuncType {
 /// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
 /// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
 fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
-    if threads.is_empty() {
+    // #773 defense-in-depth: a join handle is a small non-negative slot; a **negative** value is never
+    // one — it is a forged handle or (the real footgun) a failed-spawn errno the guest forwarded to
+    // `join`/`poll`/`detach` without checking. Reject it (invariant 5: a trap for forgery) rather than
+    // let the `& mask` fold it onto a live slot (e.g. a background server), which would wedge the join
+    // on a child that never exits. `threads.is_empty()` alone missed this.
+    if handle < 0 || threads.is_empty() {
         return Err(Trap::ThreadFault);
     }
     let mask = threads.len().next_power_of_two() - 1;
@@ -9847,17 +10113,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             });
                             // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
                             // — a child can only get what the holder sub-allocates (§14/D19). A
-                            // separate-module child's carve must **equal its declared memory** (§14
-                            // transparency: the plugin runs exactly as it would standalone — same
-                            // window size, same wrap behaviour; a module with no memory can't nest).
+                            // separate-module child's carve must be **at least its declared memory**
+                            // (FORK.md §8.6 / #773: a larger window is a safe superset — confinement,
+                            // invariant 2, still masks every access to the actual carve; the only
+                            // relaxation vs. an exact-equal carve is that an *out-of-declared-window*
+                            // access — a guest bug — wraps at the carve, not at the declared size. This
+                            // lets a shell spawn a small program into a generous window so its own
+                            // `exec` of a larger command has room. A module with no memory can't nest).
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
                                 0
                             };
-                            let mod_ok = child_mod
-                                .as_ref()
-                                .is_none_or(|cm| cm.memory_log2 == Some(size_log2 as u8));
+                            let mod_ok = child_mod.as_ref().is_none_or(|cm| {
+                                cm.memory_log2.is_some_and(|ml| ml <= size_log2 as u8)
+                            });
                             let fits = child_size != 0
                                 && child_size <= isize
                                 && off & (child_size - 1) == 0
@@ -10797,12 +11067,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let callee_id =
                                     host.lock().unwrap_or_else(|e| e.into_inner()).domain_id()
                                         as usize;
-                                // `pid == -1` is POSIX `waitpid(-1)` — reap **any** child; any other
-                                // value names a specific twin (`pid > 0`; a bogus/unsupported pid,
-                                // incl. process-group forms `pid < -1` / `0`, casts to no live twin →
-                                // `-ECHILD`, the untracked-group follow-up).
+                                // POSIX `waitpid` pid selector: `-1` = any child (`target None`);
+                                // `< -1` = any child in process group `|pid|` (`target Some(pgid)`);
+                                // `> 0` = a specific twin. `pid == 0` (the caller's own group) is
+                                // unsupported — the forking domain is not itself a twin — and falls
+                                // to the named path, where it matches no live twin → `-ECHILD`.
                                 let outcome = if pid == -1 {
-                                    sr_sched.reap_any_parked_caller(callee_id, ticket, nohang)
+                                    sr_sched
+                                        .reap_group_parked_caller(callee_id, ticket, nohang, None)
+                                } else if pid < -1 {
+                                    let pgid = (-pid) as TaskId;
+                                    sr_sched.reap_group_parked_caller(
+                                        callee_id,
+                                        ticket,
+                                        nohang,
+                                        Some(pgid),
+                                    )
                                 } else {
                                     sr_sched.reap_parked_caller(
                                         callee_id,
@@ -10830,6 +11110,82 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                         _ => EINVAL,
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
+                // FORK.md §8.6 — `setpgid(pid, pgid)` (self-namespace op 15): POSIX process-group
+                // assignment, driven by the **parent directly** (not through the fork/wait offer):
+                // the calling vCPU *is* the parent, so its own `domain_id` scopes the change with no
+                // serve round-trip. Sets child `pid`'s process group to `pgid` (`pgid == 0` → `pid`,
+                // a new group led by the child). Confined to real children of this domain (`-ESRCH`
+                // otherwise). `Real` scheduler only — twins exist only there; other tiers `-EINVAL`.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_SETPGID,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let pid = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let pgid = match args.get(1) {
+                        Some(a) => get(&frames[top].vals, *a)?.i64(),
+                        None => 0,
+                    };
+                    let r = if let SchedRef::Real(sr_sched) = sched {
+                        let parent =
+                            host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+                        sr_sched.set_child_pgid(parent, pid as TaskId, pgid as TaskId)
+                    } else {
+                        EINVAL
+                    };
+                    if !sig.results.is_empty() {
+                        frames[top].vals.push(Reg::from_i64(r));
+                    }
+                }
+                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): mint a host-served pipe into this
+                // domain's own powerbox and write `fds[0]` = read end, `fds[1]` = write end (POSIX
+                // order) as two i32s at the guest pointer. A direct self-op like `setpgid` — the guest
+                // mints its own intra-domain FIFO (no host authority) and later grants the ends to its
+                // pipeline children. `Real` scheduler only (the `PipeEnd`/fork machinery); `-EMFILE` on
+                // a full table, `-EFAULT` on a bad `fds`.
+                Inst::CapCall {
+                    type_id: svm_ir::CAP_SELF_TYPE_ID,
+                    op: CAP_SELF_PIPE,
+                    sig,
+                    args,
+                    ..
+                } => {
+                    let fds_ptr = match args.first() {
+                        Some(a) => get(&frames[top].vals, *a)?.i64() as u64,
+                        None => 0,
+                    };
+                    let minted = if matches!(sched, SchedRef::Real(_)) {
+                        host.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .try_grant_pipe()
+                    } else {
+                        None
+                    };
+                    let r = match minted {
+                        None if !matches!(sched, SchedRef::Real(_)) => EINVAL,
+                        None => EMFILE,
+                        Some((w, rd)) => match mem.as_mut() {
+                            Some(m) => {
+                                let ok0 = m.write_bytes(fds_ptr, &rd.to_le_bytes()).is_some();
+                                let ok1 = m.write_bytes(fds_ptr + 4, &w.to_le_bytes()).is_some();
+                                if ok0 && ok1 {
+                                    0
+                                } else {
+                                    EFAULT
+                                }
+                            }
+                            None => EFAULT,
+                        },
                     };
                     if !sig.results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
@@ -10912,12 +11268,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         Some(list)
                     })();
-                    // Admissibility: a resolvable non-durable command whose declared window equals the
-                    // caller's carve, a real entry, a clean root context (no serve handler / fibers), a
-                    // non-durable domain, and a fully-regrantable grant list. Anything else is a
-                    // probeable `-EINVAL` that leaves the caller running. `want_as` = the §14 child-entry
-                    // takes (Instantiator, AddressSpace) rather than just (Instantiator).
+                    // Admissibility: a resolvable non-durable command whose declared window **fits the
+                    // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
+                    // window in place, so the command runs there iff its declared memory ≤ that window —
+                    // a larger window is a safe superset, still masked to the actual size by invariant 2).
+                    // The guest-passed `size_log2` is now advisory: the real bound is the caller's own
+                    // window (`mem.window_size()`), so a shell whose window is bigger than the shim's
+                    // hardcoded hint can exec a command that declares more memory than that hint. A real
+                    // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
+                    // fully-regrantable grant list are also required. Anything else is a probeable
+                    // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
+                    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
+                    // (Instantiator).
                     let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
+                    let win_bytes = mem.as_ref().map(|m| m.window_size()).unwrap_or(0);
+                    let win_log2 = win_bytes
+                        .is_power_of_two()
+                        .then(|| win_bytes.trailing_zeros() as u8);
                     let entry_params = cmod
                         .as_ref()
                         .and_then(|cm| cm.funcs.get(entry as usize))
@@ -10932,15 +11299,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && grants.is_some()
                         && (0..64).contains(&size_log2)
                         && entry_params.is_some()
-                        && cmod
-                            .as_ref()
-                            .is_some_and(|cm| cm.memory_log2 == Some(size_log2 as u8));
+                        && win_log2.is_some_and(|wl| {
+                            cmod.as_ref()
+                                .is_some_and(|cm| cm.memory_log2.is_some_and(|ml| ml <= wl))
+                        });
                     // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
                     // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
                     // manifest bound, its module registered as the self module. Only then commit to the
-                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly.
+                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly. The command's
+                    // window (its Instantiator/AddressSpace authority + the data-materialization bound) is
+                    // the **caller's** window, not the guest's `size_log2` hint — it runs where the shell did.
                     let built = if admissible {
-                        let child_size = 1u64 << size_log2;
+                        let child_size = 1u64 << win_log2.expect("admissible");
                         let cm = cmod.as_ref().expect("admissible");
                         let grants = grants.as_ref().expect("admissible");
                         let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -10961,6 +11331,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mut entry_args = vec![Value::I64(cinst as i64)];
                             if want_as {
                                 entry_args.push(Value::I64(cas as i64));
+                            }
+                            // FORK.md §8.6 — the old powerbox is about to be dropped by the image
+                            // -replace: release its pipe write *and* read ends (the fork-inherited ones
+                            // this exec did not carry into the new image) and wake any pipe that thereby
+                            // reached 0 writers (→ EOF for its readers) or 0 readers (→ `-EPIPE` for its
+                            // writers). The new image's grants already bumped their own ends
+                            // (`install_pipe_end`), so the shared counts never dip through this.
+                            let (zeroed_w, zeroed_r) = {
+                                let hg = host.lock().unwrap_or_else(|e| e.into_inner());
+                                (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
+                            };
+                            for pipe in zeroed_w {
+                                sched.wake_pipe_readers(pipe);
+                            }
+                            for pipe in zeroed_r {
+                                sched.wake_pipe_writers(pipe);
                             }
                             return Ok(Inner::Exec(Box::new(ExecReq {
                                 funcs: cm.funcs,
@@ -11237,9 +11623,40 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (b) a `Stream.close` that just revoked `h` wakes every sibling fiber
                     //     parked in a call through it, each completing with a probeable errno.
                     let closed = *type_id == cap_id::STREAM && *op == 2;
+                    // FORK.md §8.6 — closing a pipe write end that dropped the writer count to 0 flags
+                    // its readers to wake (they re-read → EOF). This is the shell's `close(fd)` path.
+                    let pipe_wake = hg.take_pipe_wake();
+                    // FORK.md §8.6 — a blocking pipe read (`__vm_read`) with a live writer and no data
+                    // parks THIS fiber on the pipe id; the wake rewinds it to re-execute the read. The
+                    // shell drains a stage's output through this direct-call route (redirect pump). The
+                    // write twin (`__vm_write` to a full pipe) parks the writer (backpressure); a drained
+                    // full pipe / reader-to-zero close flags `pipe_wake_writers` to wake parked writers.
+                    let pipe_park = hg.take_pipe_read_parked();
+                    let pipe_write_park = hg.take_pipe_write_parked();
+                    let pipe_wake_w = hg.take_pipe_wake_writers();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
+                    }
+                    if let Some(pipe) = pipe_wake {
+                        sched.wake_pipe_readers(pipe);
+                    }
+                    if let Some(pipe) = pipe_wake_w {
+                        sched.wake_pipe_writers(pipe);
+                    }
+                    if let Some(pipe) = pipe_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the read re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    if let Some(pipe) = pipe_write_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the write re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
@@ -11541,7 +11958,40 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = host.lock().unwrap_or_else(|e| e.into_inner());
                     let results =
                         hg.cap_dispatch_slots(svm_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read` are
+                    // `call.sym` imports bound to pipe ends). A `read` that found an empty FIFO with
+                    // writers open flagged `pipe_read_parked`: rewind the op so it re-executes (re-drains)
+                    // on wake and park on the pipe. A `write` (or a writer-to-zero close) flagged
+                    // `pipe_wake`: wake that pipe's parked readers. Root-fiber readers only (a forked
+                    // command's `main`); a thread reading a pipe takes the placeholder (a follow-up).
+                    let pipe_park = hg.take_pipe_read_parked();
+                    let pipe_wake = hg.take_pipe_wake();
+                    // FORK.md §8.6 (backpressure) — the write twin: a `write` to a full pipe parks the
+                    // writer; a drained-full read / reader-to-zero close wakes parked writers.
+                    let pipe_write_park = hg.take_pipe_write_parked();
+                    let pipe_wake_w = hg.take_pipe_wake_writers();
                     let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
+                    drop(hg);
+                    if let Some(pipe) = pipe_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the read re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    if let Some(pipe) = pipe_write_park {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            frames[top].inst -= 1; // rewind: the write re-executes on wake
+                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
+                        }
+                        // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
+                    }
+                    if let Some(pipe) = pipe_wake {
+                        sched.wake_pipe_readers(pipe);
+                    }
+                    if let Some(pipe) = pipe_wake_w {
+                        sched.wake_pipe_writers(pipe);
+                    }
                     for (s, ty) in results.iter().zip(&sig.results) {
                         frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
                     }
@@ -14155,7 +14605,9 @@ const EFAULT: i64 = -14; // buffer not fully within the window
 const EINVAL: i64 = -22; // bad op / argument
 const EMFILE: i64 = -24; // handle table full — a guest-minted handle has nowhere to go (§3c)
 const ECHILD: i64 = -10; // `reap`/`wait` for a pid that is not a live twin this servicer minted
+const ESRCH: i64 = -3; // `setpgid` for a pid that is not a live child of the calling domain
 const ENOSPC: i64 = -28; // no free table slot — the Jit install table is full
+const EPIPE: i64 = -32; // FORK.md §8.6 — write to a pipe whose read end is fully closed (SIGPIPE errno)
 
 /// Per-region cap on a **guest-minted** region (`AddressSpace.create_region`, §13/§14): an anti-bomb
 /// ceiling so a single mint can't exhaust the host. Aggregate quota metering is §15 (D48: DoS is
@@ -14208,7 +14660,35 @@ pub type RegionBacking = Arc<dyn SharedBacking>;
 /// **re-granted into a §14 child** (the child's `Host` clones the `Arc`, aliasing the same queue) and
 /// so concurrent parent/child access — the interpreter runs children on its M:N executor — is
 /// serialized. The `write` end appends, the `read` end drains.
-type PipeBacking = Arc<Mutex<VecDeque<u8>>>;
+///
+/// FORK.md §8.6 — the second `Arc` is the count of **open write-end handles** across every domain,
+/// which drives the concurrent-pipe EOF contract: a `read` of an empty FIFO **parks** while the count
+/// is `> 0` (a producer may still write) and returns `0` (EOF) only once it hits `0` (every write end
+/// closed / its holder exited). It is a *separate* shared `Arc` (not a field inside the queue) so
+/// [`Host::grant_input_pipe`]'s public `Arc<Mutex<VecDeque<u8>>>` return — the FIFO the POSIX
+/// personality feeds — is untouched. Refcounted at every write-end lifecycle point: minted
+/// (`grant_pipe`/`try_grant_pipe`), re-granted into a child (`install_pipe_end`), fork-copied (a
+/// post-fork table scan), explicitly closed, or dropped when a domain execs/tears down — so a forked
+/// child's inherited write end keeps the pipe open across the fork→exec gap (the POSIX refcount,
+/// race-free against the shell closing its own ends).
+///
+/// FORK.md §8.6 (SIGPIPE) — the **third** `Arc` is the symmetric count of **open read-end handles**,
+/// refcounted at the same lifecycle points (a read end this time). A `write` to a pipe whose read
+/// count is `0` (every read end closed / its holder exited) returns `-EPIPE` — the SIGPIPE-ignored
+/// contract: a producer whose consumer has quit (`yes | head`) fails its next write instead of
+/// filling the FIFO forever. Paired with the FIFO bound ([`PIPE_CAP`]) this makes the pipe a true
+/// bounded buffer: a `write` that would overflow **parks** the writer (backpressure) until the reader
+/// drains room or every reader closes (→ `-EPIPE`).
+type PipeBacking = (
+    Arc<Mutex<VecDeque<u8>>>,
+    Arc<std::sync::atomic::AtomicUsize>, // open write-end handles (EOF contract)
+    Arc<std::sync::atomic::AtomicUsize>, // open read-end handles (EPIPE contract)
+);
+
+/// FORK.md §8.6 — the **pipe FIFO capacity** (bytes): a `write` never grows the buffer past this; a
+/// write to a full pipe blocks (backpressure) until the reader drains. Linux's default pipe buffer is
+/// 64 KiB — matched here so a runaway producer (`yes | head`) is bounded to one buffer, not RAM.
+const PIPE_CAP: usize = 64 * 1024;
 
 /// The reference [`SharedBacking`]: a plain in-process buffer behind a `Mutex` (so it is `Send +
 /// Sync` and safe to alias across vCPU threads). The interpreter models aliasing by reading/writing
@@ -14245,6 +14725,14 @@ impl SharedBacking for VecBacking {
 pub trait GuestMem {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>>;
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
+
+    /// The logical window size in bytes — `[0, window_size)` is this domain's confinement bound
+    /// (invariant 2). FORK.md §8.6 / #773: `exec_module` reuses the caller's window, so it admits a
+    /// command whose declared memory **fits** this size (a larger window is a safe superset). The
+    /// default `0` means "unknown / no window" — a domain that can't host an exec.
+    fn window_size(&self) -> u64 {
+        0
+    }
 
     /// `Memory` capability ops (§3e): (re)commit / decommit / re-protect window pages. `offset`
     /// is page-aligned and `[offset, offset+len)` window-relative; `prot` is `READ|WRITE`. Each
@@ -14318,6 +14806,9 @@ impl<'a> WindowMem<'a> {
 }
 
 impl GuestMem for WindowMem<'_> {
+    fn window_size(&self) -> u64 {
+        self.size
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         let end = ptr.checked_add(len)?;
         if end > self.size {
@@ -14369,8 +14860,10 @@ enum Binding {
     /// A **host-served pipe** end (§4/S4, the personality's byte IPC): resolves under iface `STREAM`
     /// (a pipe end *is* a stream — the personality treats it as an fd), carrying the index of its FIFO
     /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
-    /// drains it (op 0) — non-blocking: a read of an empty pipe returns `0`. Index-carrying, so
-    /// non-durable and non-copyable, like [`Binding::SharedRegion`].
+    /// drains it (op 0). **Blocking + bounded** (FORK.md §8.6): an empty read parks while a writer is
+    /// open (else EOF); a write to a full FIFO parks (backpressure, `PIPE_CAP`) and a write to a
+    /// reader-closed pipe is `-EPIPE`. Index-carrying, so non-durable and non-copyable, like
+    /// [`Binding::SharedRegion`].
     PipeEnd {
         pipe: u32,
         write: bool,
@@ -15221,6 +15714,25 @@ pub const CAP_SELF_REAP: u32 = 12;
 /// freeze/thaw image-swap is the separate capstone). Pinned at 14 (13 is `fuel.remaining`).
 pub const CAP_SELF_EXEC: u32 = 14;
 
+/// FORK.md §8.6 — the reserved self-namespace op for POSIX `setpgid(pid, pgid)`: assign a forked
+/// child's **process group** (for `waitpid(-pgid)` job control). Driven by the parent directly (the
+/// caller is the parent, so its `domain_id` scopes the change — no serve round-trip like `reap`).
+/// `pgid == 0` makes `pid` its own group leader. Confined to real children of the calling domain
+/// (`-ESRCH` otherwise); `Real` scheduler only (twins live only there), `-EINVAL` on other tiers.
+/// Pinned at 15 (12 `reap`, 13 `fuel.remaining`, 14 `exec_module`).
+pub const CAP_SELF_SETPGID: u32 = 15;
+
+/// FORK.md §8.6 — the reserved self-namespace op for POSIX `pipe(int fds[2])`: mint a host-served pipe
+/// into the **calling domain's own** powerbox and write its two `Stream`-typed ends to the guest
+/// buffer — `fds[0]` = read end, `fds[1]` = write end (POSIX order). A shell wiring `cmd1 | cmd2`
+/// grants the write end to `cmd1` as `"stdout"` and the read end to `cmd2` as `"stdin"` (both
+/// re-grantable into a child — the FIFO backing aliases across the exec), so the two commands' plain
+/// `write(1)`/`read(0)` connect transparently through the FIFO. A guest minting its own intra-domain
+/// FIFO confers no host authority (a byte buffer, no escape); the ends only reach children the guest
+/// already controls. `0` / `-EMFILE` (table full) / `-EFAULT` (bad `fds`). `Real` scheduler only.
+/// Pinned at 16.
+pub const CAP_SELF_PIPE: u32 = 16;
+
 /// CALLS.md §10.6 / increment 5 — the reserved self-namespace op for `fuel.remaining`: report this
 /// domain's **remaining fuel** as an `i64`. Authority-neutral (it reads the domain's own counter and
 /// confers nothing), so it rides `cap.call CAP_SELF_TYPE_ID` like the rest of the namespace — no
@@ -15470,6 +15982,23 @@ pub struct Host {
     /// Transient: the last `Stream{In}` `read` parked (buffer empty under [`Self::stdin_block`]). The
     /// bytecode `CapCall` arm takes this to yield [`Outcome::StdinPark`] instead of completing the read.
     stdin_parked: bool,
+    /// FORK.md §8.6 — transient: the last pipe `read` found an empty FIFO with writers still open, so
+    /// the reader must **park** on this pipe id (the eval loop turns it into a `Blocked::PipeRead` and
+    /// re-issues the read on wake). Distinct from `stdin_parked`: a pipe reader is woken by another
+    /// domain's `write`/close, not the embedder pushing input. Taken by [`Self::take_pipe_read_parked`].
+    pipe_read_parked: Option<u32>,
+    /// FORK.md §8.6 — transient: the last pipe `write` (or a writer-count-to-zero close) landed on this
+    /// pipe id, so the eval loop should wake any reader parked on it. Taken by [`Self::take_pipe_wake`].
+    pipe_wake: Option<u32>,
+    /// FORK.md §8.6 (backpressure) — transient: the last pipe `write` found a full FIFO (readers still
+    /// open), so the writer must **park** on this pipe id (the eval loop turns it into a
+    /// `Blocked::PipeWrite` and re-issues the write on wake). The write-side twin of `pipe_read_parked`.
+    /// Taken by [`Self::take_pipe_write_parked`].
+    pipe_write_parked: Option<u32>,
+    /// FORK.md §8.6 (backpressure) — transient: the last pipe `read` drained a *full* FIFO (or a
+    /// reader-count-to-zero close landed), so the eval loop should wake any writer parked on this pipe
+    /// (it re-issues → progress, or `-EPIPE` if readers hit 0). Taken by [`Self::take_pipe_wake_writers`].
+    pipe_wake_writers: Option<u32>,
     /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
     /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
     /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
@@ -16011,6 +16540,10 @@ impl Host {
             stdin_pos: 0,
             stdin_block: false,
             stdin_parked: false,
+            pipe_read_parked: None,
+            pipe_wake: None,
+            pipe_write_parked: None,
+            pipe_wake_writers: None,
             mem_map_limit: None,
             mem_mapped_bytes: 0,
             stdout: Vec::new(),
@@ -16131,6 +16664,20 @@ impl Host {
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
         twin.regions = self.regions.clone();
         twin.pipes = self.pipes.clone();
+        // FORK.md §8.6 — the twin's copied table carries copies of every pipe end (POSIX fork inherits
+        // fds): each is a new open write/read end, so bump the matching shared count. This keeps a pipe
+        // open across the fork→exec gap — the inherited end holds it until the twin execs (its old
+        // powerbox is dropped, decrementing) or closes it — so the reader never sees a false EOF (write
+        // end) and the writer never sees a premature EPIPE (read end) in the window between the shell
+        // forking a stage and that stage installing its own ends.
+        for s in &twin.table {
+            if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
+                if let Some((_, writers, readers)) = twin.pipes.get(pipe as usize) {
+                    let counter = if write { writers } else { readers };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
         twin.region_hook = self.region_hook.clone();
         twin.region_factory = self.region_factory;
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
@@ -16457,6 +17004,87 @@ impl Host {
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
     pub(crate) fn take_stdin_parked(&mut self) -> bool {
         core::mem::take(&mut self.stdin_parked)
+    }
+
+    /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
+    /// eval loop can register a `Blocked::PipeRead` and re-issue the read on wake.
+    fn take_pipe_read_parked(&mut self) -> Option<u32> {
+        self.pipe_read_parked.take()
+    }
+
+    /// FORK.md §8.6 — take the transient "wake readers of this pipe" flag (`Some(pipe)`) a `write` (or a
+    /// writer-to-zero close) set, so the eval loop can drain that pipe's parked readers.
+    fn take_pipe_wake(&mut self) -> Option<u32> {
+        self.pipe_wake.take()
+    }
+
+    /// FORK.md §8.6 (backpressure) — take the transient "the last pipe write must park" flag
+    /// (`Some(pipe)`), so the eval loop can register a `Blocked::PipeWrite` and re-issue the write on wake.
+    fn take_pipe_write_parked(&mut self) -> Option<u32> {
+        self.pipe_write_parked.take()
+    }
+
+    /// FORK.md §8.6 (backpressure) — take the transient "wake writers of this pipe" flag (`Some(pipe)`) a
+    /// full-FIFO `read` (or a reader-to-zero close) set, so the eval loop can drain that pipe's parked
+    /// writers (each re-issues its write → progress, or `-EPIPE` if the readers are gone).
+    fn take_pipe_wake_writers(&mut self) -> Option<u32> {
+        self.pipe_wake_writers.take()
+    }
+
+    /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
+    /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
+    /// parked readers (they re-issue their read, see writers == 0, and get EOF).
+    fn drop_pipe_writer(&self, pipe: u32) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.pipes.get(pipe as usize) {
+            // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
+            Some((_, writers, _)) if writers.load(SeqCst) > 0 => writers.fetch_sub(1, SeqCst) == 1,
+            _ => false,
+        }
+    }
+
+    /// FORK.md §8.6 (EPIPE) — decrement a pipe's shared **reader** count by one (a read end closed or
+    /// its holder exited). Returns `true` if the count reached `0` — the caller must then wake that
+    /// pipe's parked writers (they re-issue their write, see readers == 0, and get `-EPIPE`).
+    fn drop_pipe_reader(&self, pipe: u32) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        match self.pipes.get(pipe as usize) {
+            Some((_, _, readers)) if readers.load(SeqCst) > 0 => readers.fetch_sub(1, SeqCst) == 1,
+            _ => false,
+        }
+    }
+
+    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
+    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
+    /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
+    /// by crashing — releases its write ends and never wedges a downstream consumer.
+    fn drop_all_pipe_writers(&self) -> Vec<u32> {
+        let mut zeroed = Vec::new();
+        for s in &self.table {
+            if let Some(Binding::PipeEnd { pipe, write: true }) = s.entry {
+                if self.drop_pipe_writer(pipe) {
+                    zeroed.push(pipe);
+                }
+            }
+        }
+        zeroed
+    }
+
+    /// FORK.md §8.6 (EPIPE) — the read-end counterpart of [`Self::drop_all_pipe_writers`]: decrement the
+    /// reader count for **every** live pipe *read* end this Host holds, returning the pipe ids that
+    /// reached `0` readers (writers of those must be woken → `-EPIPE`). Called on exec/teardown so a
+    /// consumer that exits — even by crashing — releases its read ends and never wedges a parked
+    /// upstream producer (backpressure) forever.
+    fn drop_all_pipe_readers(&self) -> Vec<u32> {
+        let mut zeroed = Vec::new();
+        for s in &self.table {
+            if let Some(Binding::PipeEnd { pipe, write: false }) = s.entry {
+                if self.drop_pipe_reader(pipe) {
+                    zeroed.push(pipe);
+                }
+            }
+        }
+        zeroed
     }
 
     /// Whether this domain runs a durable module (see [`Host::set_durable`]). Read by `drive`.
@@ -17188,17 +17816,45 @@ impl Host {
 
     /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
     /// read_handle)`. Both are `Stream`-typed (a pipe end is a stream: read/write/close), backed by one
-    /// FIFO in [`Host::pipes`]: bytes written to the write end are drained by the read end (non-blocking,
-    /// FIFO order). The personality's byte-IPC primitive — a shell wiring `cmd1 | cmd2` grants each side
+    /// FIFO in [`Host::pipes`]: bytes written to the write end are drained by the read end in FIFO order,
+    /// with POSIX **blocking + bounded** semantics (FORK.md §8.6 — empty read parks, full write parks,
+    /// reader-closed write is `-EPIPE`). The personality's byte-IPC primitive — a shell wiring `cmd1 |
+    /// cmd2` grants each side
     /// one end. (Cross-domain granting of an end into a child is a follow-up — the FIFO would move to a
     /// shared backing, like `SharedRegion`; today both ends live in the minting domain, e.g. between its
     /// own fibers.)
     pub fn grant_pipe(&mut self) -> (i32, i32) {
         let pipe = self.pipes.len() as u32;
-        self.pipes.push(Arc::new(Mutex::new(VecDeque::new())));
+        // One write end + one read end minted here, so both shared counts start at 1 (§8.6 EOF/EPIPE).
+        self.pipes.push((
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (w, r)
+    }
+
+    /// Fail-closed [`Self::grant_pipe`] for the **guest-reachable** `pipe()` self-op ([`CAP_SELF_PIPE`]):
+    /// a guest can exhaust its handle table, so this needs both ends' slots up front — `None` (→
+    /// `-EMFILE`) rather than the infallible `grant`'s panic. Returns `(write, read)` on success.
+    pub fn try_grant_pipe(&mut self) -> Option<(i32, i32)> {
+        // Both ends must land or neither: check two free slots before minting the FIFO, so a
+        // half-granted pipe (a write end with no reader) can never escape.
+        if self.table.iter().filter(|s| s.entry.is_none()).count() < 2 {
+            return None;
+        }
+        let pipe = self.pipes.len() as u32;
+        // One write end + one read end minted → both counts start at 1 (§8.6 EOF/EPIPE contract).
+        self.pipes.push((
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
+        let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
+        let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
+        Some((w, r))
     }
 
     /// Grant a **read-only pipe end** and hand back both its handle and the shared FIFO backing — the
@@ -17210,7 +17866,14 @@ impl Host {
     pub fn grant_input_pipe(&mut self) -> (i32, Arc<Mutex<std::collections::VecDeque<u8>>>) {
         let pipe = self.pipes.len() as u32;
         let backing = Arc::new(Mutex::new(VecDeque::new()));
-        self.pipes.push(Arc::clone(&backing));
+        // No write end is exposed — the source is the embedder's buffer — so the writer count is 0,
+        // preserving the non-blocking "empty ⇒ EOF" contract (a filter reading it terminates cleanly).
+        // One read end is minted, so the read count starts at 1 (§8.6 EPIPE contract).
+        self.pipes.push((
+            Arc::clone(&backing),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
     }
@@ -17222,7 +17885,7 @@ impl Host {
     fn resolve_pipe_end(&self, handle: i32) -> Option<(bool, PipeBacking)> {
         match self.resolve(handle, cap_id::STREAM) {
             Ok(Binding::PipeEnd { pipe, write }) => {
-                Some((write, Arc::clone(self.pipes.get(pipe as usize)?)))
+                Some((write, self.pipes.get(pipe as usize)?.clone()))
             }
             _ => None,
         }
@@ -17230,8 +17893,12 @@ impl Host {
 
     /// Install a re-granted pipe end (its shared `backing` aliased from the granting domain) into this
     /// `Host` and return its handle. The child sees the **same** FIFO as the parent's other end — how a
-    /// pipe crosses a §14 domain boundary.
+    /// pipe crosses a §14 domain boundary. A **write** end re-granted here bumps the shared writer
+    /// count (§8.6); a **read** end bumps the read count (§8.6 EPIPE): the child is a new writer/reader,
+    /// so the pipe stays open (no false EOF / no premature EPIPE) until it too closes/exits.
     fn install_pipe_end(&mut self, write: bool, backing: PipeBacking) -> i32 {
+        let counter = if write { &backing.1 } else { &backing.2 };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pipe = self.pipes.len() as u32;
         self.pipes.push(backing);
         self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write })
@@ -19240,6 +19907,8 @@ impl Host {
                 | CAP_SELF_CLONE_CALLER
                 | CAP_SELF_REAP
                 | CAP_SELF_EXEC
+                | CAP_SELF_SETPGID
+                | CAP_SELF_PIPE
                     if op >> 8 == 0 =>
                 {
                     Ok(vec![EINVAL])
@@ -19477,6 +20146,22 @@ impl Host {
                 Ok(vec![0])
             }
             Binding::Stream { role, sink } => self.stream_op(role, sink, op, args, mem),
+            // FORK.md §8.6 — closing a pipe **write** end decrements the shared writer count; when it
+            // reaches 0 (every write end gone) the pipe is at EOF, so flag its readers to wake (they
+            // re-read → EOF). Closing a **read** end decrements the reader count; when it reaches 0
+            // (every read end gone) any parked writer must wake to `-EPIPE`. The handle is revoked either
+            // way. This is the shell's `close(fd)` on a pipe end it holds.
+            Binding::PipeEnd { pipe, write } if op == 2 => {
+                if write {
+                    if self.drop_pipe_writer(pipe) {
+                        self.pipe_wake = Some(pipe);
+                    }
+                } else if self.drop_pipe_reader(pipe) {
+                    self.pipe_wake_writers = Some(pipe);
+                }
+                self.close(handle);
+                Ok(vec![0])
+            }
             Binding::PipeEnd { pipe, write } => self.pipe_op(pipe, write, op, args, mem),
             // A wired interface offer (IMPORTS.md §3.2): run op `op`'s function — **v1 pure
             // dispatch**. The op executes as a fresh reference run over the offer's own function
@@ -20216,10 +20901,12 @@ impl Host {
     }
 
     /// §4 / S4 host-served **pipe** end, dispatched under iface `STREAM` (a pipe end *is* a stream).
-    /// Non-blocking: the `read` half drains bytes the `write` half has queued (op 0), a `read` of an
-    /// empty pipe returns `0`; the `write` half appends (op 1). Wrong-direction ops are `-EINVAL`. Same
-    /// `(buf, len) -> n | -errno` shapes as `stream_op`, so a personality's fd layer treats a pipe end
-    /// and a stdio stream identically.
+    /// FORK.md §8.6 — **blocking** read: the `read` half drains bytes the `write` half queued (op 0); an
+    /// empty FIFO **parks** the reader (sets [`Self::pipe_read_parked`], which the eval loop turns into a
+    /// `Blocked::PipeRead` park) while the shared writer count is `> 0`, and returns `0` (EOF) only once
+    /// it hits `0`. The `write` half appends (op 1) and flags [`Self::pipe_wake`] so the eval loop wakes
+    /// any parked reader. Wrong-direction ops are `-EINVAL`. Same `(buf, len) -> n | -errno` shapes as
+    /// `stream_op`, so a personality's fd layer treats a pipe end and a stdio stream identically.
     fn pipe_op(
         &mut self,
         pipe: u32,
@@ -20228,11 +20915,14 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
+        use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(vec![v]);
-        let Some(backing) = self.pipes.get(pipe as usize) else {
+        // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
+        let Some((fifo_arc, writers_arc, readers_arc)) = self.pipes.get(pipe as usize).cloned()
+        else {
             return ret(EINVAL);
         };
-        let mut fifo = backing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fifo = fifo_arc.lock().unwrap_or_else(|e| e.into_inner());
         match op {
             0 => {
                 // read(buf, len) -> n; only the read end is readable.
@@ -20241,8 +20931,26 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                if fifo.is_empty() {
+                    // Empty FIFO: block while a producer may still write (writers > 0), else EOF.
+                    // A zero-length read never blocks — the guest asked for nothing.
+                    if len > 0 && writers_arc.load(SeqCst) > 0 {
+                        drop(fifo);
+                        self.pipe_read_parked = Some(pipe);
+                        return ret(0); // placeholder; the eval loop parks and re-issues on wake
+                    }
+                    return ret(0); // EOF (all writers closed) or a zero-length read
+                }
+                let was_full = fifo.len() >= PIPE_CAP;
                 let n = (len as usize).min(fifo.len());
                 let chunk: Vec<u8> = fifo.drain(..n).collect();
+                drop(fifo);
+                // FORK.md §8.6 (backpressure) — draining a full pipe opens room, so wake any writer
+                // parked on it (it re-issues its write). Only flag when it *was* full: an unfull pipe
+                // never had a parked writer, so the wake would be a no-op scan.
+                if was_full {
+                    self.pipe_wake_writers = Some(pipe);
+                }
                 let Some(m) = mem else {
                     return ret(EFAULT);
                 };
@@ -20260,16 +20968,34 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                // FORK.md §8.6 (SIGPIPE) — no reader can ever consume these bytes: fail the write with
+                // `-EPIPE` (the SIGPIPE-ignored contract) rather than pile them into a FIFO nobody drains.
+                if readers_arc.load(SeqCst) == 0 {
+                    return ret(EPIPE);
+                }
+                // FORK.md §8.6 (backpressure) — a full FIFO blocks the writer until the reader drains
+                // (or every reader closes → EPIPE on re-issue). A zero-length write never blocks.
+                if len > 0 && fifo.len() >= PIPE_CAP {
+                    drop(fifo);
+                    self.pipe_write_parked = Some(pipe);
+                    return ret(0); // placeholder; the eval loop parks and re-issues on wake
+                }
                 let Some(m) = mem else {
                     return ret(EFAULT);
                 };
-                let Some(bytes) = m.read_bytes(ptr, len) else {
+                // Write only up to the remaining room, so the FIFO never exceeds `PIPE_CAP`. A short
+                // count (< len) makes a well-behaved writer loop; the next call blocks once full.
+                let room = PIPE_CAP - fifo.len();
+                let n = (len as usize).min(room);
+                let Some(bytes) = m.read_bytes(ptr, n as u64) else {
                     return ret(EFAULT);
                 };
                 fifo.extend(bytes);
-                ret(len as i64)
+                drop(fifo);
+                self.pipe_wake = Some(pipe); // eval loop wakes readers parked on this pipe
+                ret(n as i64)
             }
-            2 => ret(0), // close: no-op in the MVP (exit reclaims all)
+            2 => ret(0), // close: refcount decrement is handled in the dispatch arm (it sees the handle)
             _ => ret(EINVAL),
         }
     }
@@ -20640,6 +21366,42 @@ impl Mem {
             }
         }
         Ok(())
+    }
+
+    /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
+    /// admitted byte set — for loads and stores alike — is exactly `[0, H)`, i.e. the fixed mapped
+    /// prefix extended by a contiguous run of explicitly-`Rw` pages. Any other explicit page state
+    /// breaks the single-bound shape (`Ro` splits the read/write sets, `Unmapped`/`Backed` change
+    /// admitted-or-bytes anywhere, an `Rw` page beyond a hole leaves the set non-contiguous) and
+    /// returns `None`, telling the tier-up driver to **decline** emitted code for the call and
+    /// interpret it instead — fail-closed, the interpreter is always right. An `Rw` re-commit
+    /// inside the prefix is set-neutral and ignored. The value is window-relative, matching the
+    /// emitted tier's `win`-relative bounds check (its `"mapped"` global).
+    pub(crate) fn scalar_extent(&self) -> Option<u64> {
+        // Lock-free fast path: the address space has never been mutated, so the admitted set is
+        // the region default — exactly the mapped prefix.
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            return Some(self.window.mapped());
+        }
+        let space = self.space_read();
+        let mut high = self.window.mapped();
+        // BTreeMap iteration is ascending, so a contiguous grown tail is consumed page-by-page at
+        // exactly the running boundary; anything else is unrepresentable.
+        for (&page, prot) in space.prot.iter() {
+            let start = page.saturating_mul(self.page);
+            match prot {
+                PageProt::Rw if start < high => {} // set-neutral re-commit inside [0, high)
+                PageProt::Rw if start == high => high = high.saturating_add(self.page),
+                _ => return None, // Ro/Unmapped/Backed anywhere, or Rw beyond a hole
+            }
+        }
+        Some(high.min(self.window.reserved()))
+    }
+
+    /// The window's reserved (mask-domain) size — what a #750 page-checked driver writes to the
+    /// emitted `"mapped"` global so the bound check never under-admits a table-admitted page.
+    pub(crate) fn reserved_size(&self) -> u64 {
+        self.window.reserved()
     }
 
     /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
@@ -21678,6 +22440,9 @@ impl Mem {
 }
 
 impl GuestMem for Mem {
+    fn window_size(&self) -> u64 {
+        self.window.size()
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         self.read_bytes_impl(ptr, len)
     }

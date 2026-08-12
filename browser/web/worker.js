@@ -390,6 +390,10 @@ self.onmessage = async (e) => {
       const argvPtr = Number(ex.svm_par_tierup_argv_ptr(v)), n = Number(ex.svm_par_tierup_argv_len(v));
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
+      // #717 host sync: the event's committed-extent snapshot → the emitted `"mapped"` global, so
+      // the emitted bounds check admits exactly what the interpreter would (idempotent over today's
+      // fully-mapped par window; load-bearing once the window can `vm_map`-grow).
+      emitted.mapped.value = ex.svm_par_ev_b(v);
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel; preempt = write < 0
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
@@ -428,6 +432,10 @@ self.onmessage = async (e) => {
         unit = jitUnitFor(ex.svm_par_jit_code(v));
       }
       if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      // #717 host sync: the event's committed-extent snapshot → the unit instance's `"mapped"`
+      // global (same contract as TIERUP above; an invoke the scalar can't describe never surfaces
+      // here — the engine services it on the interpreter instead).
+      unit.mapped.value = ex.svm_par_ev_b(v);
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
