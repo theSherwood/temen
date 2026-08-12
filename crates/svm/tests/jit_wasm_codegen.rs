@@ -297,7 +297,12 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                 argv,
                 params: _,
                 results: _,
+                mapped,
             } => {
+                // #717 host sync: a fully-mapped guest window reports its declared size as the
+                // committed extent (the emitted unit's `"mapped"` default — the sync is a no-op
+                // here, but a codegen host must still receive the representable value).
+                assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
                 let resolved = resolve(vcpu.host_mut(), handle, code);
                 match mode {
                     Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(f, _)| f)),

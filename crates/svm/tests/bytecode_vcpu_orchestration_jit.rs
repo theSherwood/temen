@@ -295,6 +295,7 @@ fn drive<'s, 'e>(
                 argv: _,
                 params: _,
                 results: _,
+                mapped: _, // interpreted delivery below — the codegen sync value is unused
             } => {
                 vcpu.deliver_jit_invoke(orch.resolve_unit(handle, code));
             }

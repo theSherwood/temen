@@ -711,8 +711,11 @@ pub const PAR_TIERUP: i32 = 7;
 /// submitted unit on **emitted wasm** (`svm_par_jit_unit_wasm_ptr`/`_len` — one immutable module per
 /// run) instead of the interpreter. `svm_par_jit_code` keys the Worker's per-unit instance cache;
 /// `svm_par_jit_argv_ptr`/`_len` give the args as i64 slots, `svm_par_jit_param_types_ptr` their wasm
-/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. The Worker runs the emitted
-/// `f{entry}(win, env, …args)` and calls `svm_par_deliver_jit_invoke`/`_trap`.
+/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. `svm_par_ev_b` = the
+/// window's committed extent, which the Worker MUST write to the unit instance's `"mapped"` global
+/// before the call (#717 host sync, same contract as [`PAR_TIERUP`] — an invoke whose window state
+/// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
+/// Worker runs the emitted `f{entry}(win, env, …args)` and calls `svm_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
 
 /// A boxed resumable vCPU plus the operands of its last [`svm_par_run`] event (flattened to four
@@ -1971,6 +1974,7 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                 argv,
                 params,
                 results,
+                mapped,
             } => {
                 // Scalar arg/result type codes (i32/i64/f32/f64) the JS host marshals each i64 slot
                 // by; `None` if any operand is v128 (no lane marshalling — the unit stays on interp).
@@ -1980,6 +1984,13 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                         .collect::<Option<Vec<u8>>>()
                 };
                 let (ptypes, rtypes) = (codes(&params), codes(&results));
+                // #717 host sync: operand `b` carries the committed extent for the Worker to write
+                // to the emitted unit's `"mapped"` global before `f0`. An unrepresentable window
+                // state (`None`) declines codegen below — the interpreted delivery honors the full
+                // page map (fail-closed, same contract as PAR_TIERUP).
+                if let Some(h) = mapped {
+                    v.b = h as i64;
+                }
                 if let Some(cfg) = par_jit_rt() {
                     // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared
                     // host, its wasm emitted there; run it on that per-unit wasm (JS instantiates it
@@ -1996,7 +2007,8 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                             let codegen = par_jit_codegen()
                                 && wasm.is_some()
                                 && ptypes.is_some()
-                                && rtypes.is_some();
+                                && rtypes.is_some()
+                                && mapped.is_some();
                             if codegen {
                                 v.jit_argv = argv.into_vec();
                                 v.jit_code = code;
@@ -2018,7 +2030,8 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
                             let codegen = par_jit_codegen()
                                 && svm_par_jit_unit_wasm_len() > 0
                                 && ptypes.is_some()
-                                && rtypes.is_some();
+                                && rtypes.is_some()
+                                && mapped.is_some();
                             if codegen {
                                 match par_resolve_unit(pb, handle, code) {
                                     Ok(_) => {

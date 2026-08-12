@@ -432,6 +432,10 @@ self.onmessage = async (e) => {
         unit = jitUnitFor(ex.svm_par_jit_code(v));
       }
       if (!unit) { ex.svm_par_deliver_jit_invoke_trap(v); continue; }
+      // #717 host sync: the event's committed-extent snapshot → the unit instance's `"mapped"`
+      // global (same contract as TIERUP above; an invoke the scalar can't describe never surfaces
+      // here — the engine services it on the interpreter instead).
+      unit.mapped.value = ex.svm_par_ev_b(v);
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
