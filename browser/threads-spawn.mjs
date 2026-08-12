@@ -41,7 +41,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
+    smod, entry, slog, fuel, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -60,7 +60,9 @@ async function worker() {
   // still emits) and instantiates the emitted module against the ONE shared memory. Each Worker
   // instantiates its own (wasm tables aren't shareable across Workers). On TIERUP it runs `f{func}`.
   let emitted = null, envCell = 0;
-  if (tierup && ex.svm_par_enable_jit(gptr, glen) === 1) {
+  // #750: `tierupPaged` (SVM_TIERUP_PAGED=1) opts the run into the paged tier, exactly as worker.js.
+  const enableJit = tierupPaged ? ex.svm_par_enable_jit_paged : ex.svm_par_enable_jit;
+  if (tierup && enableJit(gptr, glen) === 1) {
     const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
@@ -291,6 +293,15 @@ async function worker() {
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
       emitted.fuel.value = 1n << 61n; // ample fuel (emitted `fuel` global)
+      // #717 host sync: the event's committed-extent snapshot → the emitted `"mapped"` global
+      // (operand b; on a #750 paged run it is the page-state table's coverage). This driver
+      // predates the contract and ran unsynced — idempotent for fully-mapped guests, wrong the
+      // day one grows; now it follows worker.js line-for-line.
+      emitted.mapped.value = ex.svm_par_ev_b(v);
+      // #750 paged runs: the emitted `"pagestate"` global ← the engine-built table's address
+      // (one shared memory, zero copies). Empty (and the global absent) on unpaged runs.
+      if (Number(ex.svm_par_tierup_pagestate_len(v)) > 0)
+        emitted.pagestate.value = Number(ex.svm_par_tierup_pagestate_ptr(v));
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
         const ret = emitted['f' + tfunc](win, envCell, ...args);
@@ -399,6 +410,7 @@ async function main() {
   // (kept live at `gptr`) and runs eligible compute regions on emitted wasm. The guest still runs on
   // the interpreter — only direct calls to emitted pure leaves tier up.
   const tierup = process.env.SVM_TIERUP === '1';
+  const tierupPaged = process.env.SVM_TIERUP_PAGED === '1'; // #750: paged tier opt-in
   // A shared i32 cell every Worker atomically bumps on each tier-up / JIT-codegen invoke — proves the
   // seam actually fired (a result match alone couldn't distinguish "ran emitted wasm" from "silently
   // interpreted"). Shared by the tier-up and §22-codegen paths (they never run in the same run).
@@ -411,7 +423,7 @@ async function main() {
   const startVcpu = (cfg) => {
     started++;
     const w = new Worker(new URL(import.meta.url), {
-      workerData: { module, memory, prog, win, winSize, tierup, jitCodegen, instCodegen, jitService, gptr, glen: guest.length, tierupCell, ...cfg },
+      workerData: { module, memory, prog, win, winSize, tierup, tierupPaged, jitCodegen, instCodegen, jitService, gptr, glen: guest.length, tierupCell, ...cfg },
     });
     workers.add(w);
     w.on('message', (m) => {

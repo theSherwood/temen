@@ -180,13 +180,18 @@ fn tiered_frame(
         .expect("reactor opens (_start runs, window + data materialized)")
         .with_jit_eligible(Arc::from(eligible.to_vec().into_boxed_slice()));
 
-    let out = reactor.frame(entry, &[Value::I64(arg)], &host, |func, argv, mapped| {
-        match run_emitted_over_live_window(m, wasm, func, argv, base, win_size, mapped) {
+    let out = reactor.frame(
+        entry,
+        &[Value::I64(arg)],
+        &host,
+        |func, argv, mapped, _info| match run_emitted_over_live_window(
+            m, wasm, func, argv, base, win_size, mapped,
+        ) {
             Outcome::Vals(v) => Ok(v),
             Outcome::Trap(TrapKind::OutOfFuel) => Err(Trap::OutOfFuel),
             Outcome::Trap(_) => Err(Trap::MemoryFault),
-        }
-    });
+        },
+    );
 
     // SAFETY: reactor (and its `Mem` aliasing `back`) dropped above; free the window buffer.
     unsafe { std::alloc::dealloc(base, layout) };
