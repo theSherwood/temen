@@ -11,7 +11,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
-import { runWarmJit, jitCacheStats } from './web/wasmjit-module.js';
+import { runWarmJit, primeWarmJit, jitCacheStats } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.svmb';
@@ -83,18 +83,37 @@ const programs = [
   ['500k loop', 'let s=0;for(let i=0;i<500000;i++)s+=i;console.log("sum",s);\n'],
 ];
 
-// Prime the compiled-Module cache with one throwaway Run: the first warm+JIT Run pays the one-time
-// `WebAssembly.compile` of the ~12.7 MiB emitted eval_run (V8 codegen), reused on every later Run. Time
-// it separately so the per-program numbers below reflect steady-state (cache-hit) warm+JIT, not the
-// first-Run codegen — the same way the card behaves after its first JIT Run.
+let allOk = true;
+
+// Pre-warm the warm+JIT tier **exactly as the snapshot worker does** — `primeWarmJit` (the shipping
+// prime path), which emits + `WebAssembly.compile`s + instantiates AND dry-runs `eval_run` once. That
+// dry run is load-bearing: V8 compiles a wasm module's function bodies **lazily, on first call**, so a
+// prime that only compiled + instantiated (no call) still left the user's *first* real Run paying
+// ~1.5–2 s of function codegen (the live QuickJS card's first wasm-JIT Run was ~1.4 s "despite priming").
 {
   const t = performance.now();
-  await warmJit('1;\n');
-  console.error(`warm+JIT primed: one-time WebAssembly.compile of the emitted eval_run took ${(performance.now() - t).toFixed(0)} ms (amortized across Runs)`);
+  const primed = await primeWarmJit(ex, ex.memory ?? memory, `${modPath}#eval`, 1);
+  if (!primed) fail('primeWarmJit returned false (QuickJS eval_run should be wasm-emittable)');
+  console.error(`warm+JIT primed via primeWarmJit (compile + instantiate + dry f0 call): ${(performance.now() - t).toFixed(0)} ms (all off the main thread at pre-warm)`);
+}
+
+// Regression guard for that exact bug: after `primeWarmJit`, the FIRST real Run must be about as fast as
+// the second — no first-call codegen spike. A trivial program isolates the effect (its own work is ~0, so
+// run1 is dominated by any unpaid codegen). If the prime ever reverts to compile-only, run1 balloons to
+// ~1.5–2 s while run2 stays a few ms, and this fails. (The instance is already cached, so this is pure
+// V8-codegen timing, not a `WebAssembly.compile`.)
+{
+  const r1 = await warmJit('1;\n');
+  const r2 = await warmJit('1;\n');
+  const warmed = r1.ms < r2.ms + 500;
+  allOk &&= warmed;
+  console.error(
+    `prewarm codegen guard: first-Run=${r1.ms.toFixed(0)}ms second-Run=${r2.ms.toFixed(0)}ms — ` +
+    `${warmed ? 'OK — prime warmed V8; first Run pays no codegen spike' : 'REGRESSION: first Run paid function codegen (prime did not dry-call f0)'}`,
+  );
 }
 
 console.log(`\n${'program'.padEnd(16)}${'interp ms'.padStart(11)}${'warm+JIT ms'.padStart(13)}${'speedup'.padStart(9)}  parity`);
-let allOk = true;
 for (const [name, js] of programs) {
   const ci = warmInterp(js);
   if (ci.status !== 0) fail(`warm-interp ${name}: status ${ci.status}`);
@@ -128,7 +147,7 @@ for (const [name, js] of programs) {
 // instantiate + the byte copy). Assert that accounting so a regression that re-instantiates per Run is
 // caught, not just tolerated.
 {
-  const runs = 1 /* primer */ + programs.length + 2 /* isolation */;
+  const runs = 1 /* primeWarmJit (the one compile) */ + 2 /* codegen guard */ + programs.length + 2 /* isolation */;
   const cacheOk = jitCacheStats.compiles === 1 && jitCacheStats.hits === runs - 1;
   allOk &&= cacheOk;
   console.log(
