@@ -110,6 +110,45 @@ fn stmt_call_import_is_void() {
     );
 }
 
+#[test]
+fn variadic_import_marshals_a_va_buffer() {
+    // A `{.varargs.}` C import (`c_snprintf`) is spelled by nimony as a final `(varargs)`-typed param.
+    // Its call sites pass different numbers of trailing args, which used to trip "import called with
+    // inconsistent arity" (a fixed-arity `call.import` can't vary). Now the fixed params pass through
+    // and the variadic tail is marshalled into a data-stack buffer (an `i64` slot per integer, an
+    // `f64` slot per float — C default argument promotions), replaced by one pointer — so every call
+    // site collapses to the same `fixed + 1` signature. Here `vfn(a, …)`: one call with a single int
+    // vararg, one with an int + a float, both declaring `import 0 "vfn.0." (i64, i64) -> ()`.
+    let leng = "\
+(stmts
+ (proc :vfn.0. (params (param :a.0 . (i +64)) (param :va.0 . (varargs))) (i +64) (pragmas (importc \"vfn\")) (stmts .))
+ (proc :callit.0. (params (param :x.0 . (i +64)) (param :y.0 . (f +64))) (i +64) .
+  (stmts .
+   (call vfn.0. x.0 x.0)
+   (call vfn.0. x.0 x.0 y.0)
+   (ret x.0))))";
+    let text = svm_leng::translate_to_text(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // One import, fixed arity 2 (the `a` param + the va-list pointer) despite the 2-vs-3-arg calls.
+    assert!(
+        text.contains("import 0 \"vfn.0.\" (i64, i64) -> ()"),
+        "collapsed varargs import signature:\n{text}"
+    );
+    assert!(
+        !text.contains("import 1 \"vfn.0.\""),
+        "the two call sites must share one import slot:\n{text}"
+    );
+    // The variadic tail is marshalled by value: an `i64` slot for the int arg, an `f64` slot for the
+    // float — proving the float's bits are stored, not truncated to an integer.
+    assert!(
+        text.contains("i64.store") && text.contains("f64.store"),
+        "va-buffer marshalling stores:\n{text}"
+    );
+    // The frontend's job is a verifier-accepted module (the buffer stores are confined); the embedder
+    // binds `snprintf`.
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    svm_verify::verify_module(&m).expect("verify (varargs buffer stores are confined)");
+}
+
 /// The real payoff: nimony's own `sumto` — `while i <= n: (inc(addr i); result += i)` — where `inc`
 /// is a **cross-module system import**. It also uses an address-taken loop counter (a frame) and a
 /// `while`. Translating it out of the real hexer module now succeeds and verifies.

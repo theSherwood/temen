@@ -100,6 +100,20 @@ fn named_pointer_alias_stores_through_field() {
 }
 
 #[test]
+fn pointer_constant_global_folds_cast_sentinel() {
+    // `MAP_FAILED = cast[pointer](-1)` (the shape times/monotimes open with) — a `pointer` global is
+    // an `i64` scalar, so the C-style `cast` of the `-1` sentinel folds to eight `0xFF` bytes seeded
+    // into the global's data window. Before the fold saw through `cast` (only `conv`), this errored
+    // "non-scalar-int global initializer". Read the global back: its value is `-1` on both engines.
+    let leng = "\
+(stmts
+ (gvar :mf.0. . (ptr (void)) (cast (ptr (void)) -1))
+ (proc :readMf.0. . (i +64) . (stmts . (ret mf.0.))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), -1);
+}
+
+#[test]
 fn no_memory_decl_without_pointers() {
     // A pure-integer proc must NOT declare a window (memory only appears when actually used).
     let leng = "(stmts (proc :id.0 (params (param :x.0 . (i +64))) (i +64) . (stmts . (ret x.0))))";
