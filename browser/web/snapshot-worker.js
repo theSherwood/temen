@@ -96,8 +96,9 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'reply', id: msg.id, ok, status: ok ? 0 : ex.svm_status() });
       // Then pre-compile the warm+JIT `eval_run` in the background (the ~12.7 MB `WebAssembly.compile`), so
       // the first wasm-JIT Run is a cache hit instead of paying that compile. Best-effort; a non-emittable
-      // eval just leaves the card on warm-interp.
-      if (ok && !jitPrimePromise) {
+      // eval just leaves the card on warm-interp. Skipped when `primeJit` is false (a card whose warm+JIT
+      // declines, e.g. Tcl — no point compiling a module that traps).
+      if (ok && msg.primeJit !== false && !jitPrimePromise) {
         jitPrimePromise = primeWarmJit(ex, memory, `${warmUrl}#eval`, 1)
           .catch(() => false)
           .finally(() => { jitPrimed = true; });

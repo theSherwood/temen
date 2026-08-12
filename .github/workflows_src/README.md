@@ -24,6 +24,15 @@ identical until the next agent edit.
   cleanly if absent. Verified locally (Node + Chromium). (Until copied over, the `workflows-in-sync` guard
   stays red — the expected mirror-edit friction.)
 
+- **`tcl-warm-snapshot-test.mjs` + Tcl coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
+  #805 follow-on)** — one line added after `node lua-warm-snapshot-test.mjs`: `node
+  tcl-warm-snapshot-test.mjs` (Node/V8 cold ≡ warm byte-for-byte + isolation over `tcl_snapshot.svmb`;
+  Tcl's warm+JIT declines, so interpreter-only). The `snapshot-worker-test.mjs` line is unchanged, but
+  the test now also drives the **Tcl** warm card (`noJit` — warm-snapshot-only). Tcl's `.svmb` is
+  **deploy-built** (the Tcl fetch + toolchain isn't in this job), so both tests SKIP/filter cleanly when
+  it's absent — no new toolchain, no gating. Verified locally (Node + Chromium). (Until copied over, the
+  `workflows-in-sync` guard stays red — the expected mirror-edit friction.)
+
 - **`warm-snapshot-test.mjs` in the `browser-real` job** — one line added to the Chromium test block
   (right after `node browser-jit-cache-test.mjs`): `node warm-snapshot-test.mjs`. Validates the
   WASM_AOT.md warm-runtime snapshot: `svm_warm_open` runs the QuickJS `warmup` export once, then

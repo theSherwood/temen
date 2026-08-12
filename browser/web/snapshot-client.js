@@ -58,14 +58,15 @@ export class SnapshotClient {
   }
 
   // Open the warm session for `url` on its worker (idempotent per URL). `getBytes()` fetches the module
-  // bytes and is awaited only the first time. Resolves `{ ok, status }`.
-  prewarm(url, getBytes) {
+  // bytes and is awaited only the first time. `primeJit` (default true) also pre-compiles the warm+JIT
+  // tier in the worker (skip it for cards whose warm+JIT declines, e.g. Tcl). Resolves `{ ok, status }`.
+  prewarm(url, getBytes, primeJit = true) {
     const w = this._workerFor(url);
     if (w.prewarm) return w.prewarm;
     w.prewarm = (async () => {
       await w.ready;
       const bytes = await getBytes();
-      return this._request(w, 'prewarm', { url, bytes });
+      return this._request(w, 'prewarm', { url, bytes, primeJit });
     })();
     return w.prewarm;
   }

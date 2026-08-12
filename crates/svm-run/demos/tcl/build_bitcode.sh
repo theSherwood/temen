@@ -86,6 +86,9 @@ DRV="$CACHE/drivers"; mkdir -p "$DRV"
 python3 "$HERE/gen_tcl_library.py" "$SRC/library" "$DRV/tcl_library.h" 2>&1 | tail -1
 clang "${CF[@]}" "$HERE/tcl_repl.c" -o "$DRV/repl.ll" || { echo "tcl_repl FAIL"; exit 14; }
 clang "${CF[@]}" "-I$DRV" "$HERE/tcl_init.c" -o "$DRV/init.ll" || { echo "tcl_init FAIL"; exit 14; }
+# The two-phase warm-runtime-snapshot driver (issue #805 follow-on): same full Tcl_Init as tcl_init.c,
+# split into `warmup` + `eval_run` so the playground can snapshot after Tcl_Init and eval-only per Run.
+clang "${CF[@]}" "-I$DRV" "$HERE/tcl_snapshot.c" -o "$DRV/snapshot.ll" || { echo "tcl_snapshot FAIL"; exit 14; }
 clang "${CF[@]}" "$HERE/tcl_shim.c" -o "$OUT/_tclshim.ll" || { echo "tcl_shim FAIL"; exit 14; }
 # Reused waist (see README): the Postgres printf/scanf engines, the guest strtod. (ctype tables are
 # pulled from the Postgres shim set too if your resolve stage reports them undefined.)
@@ -131,12 +134,16 @@ echo "=== [6/6] llvm-link both variants → translate through the on-ramp ==="
 #   tcl_init_linked.ll  — the full Tcl (tcl_init.c: Tcl_Init over the embedded-library VFS)
 LINKED="$CACHE/tcl_linked.ll"
 INIT_LINKED="$CACHE/tcl_init_linked.ll"
+SNAP_LINKED="$CACHE/tcl_snapshot_linked.ll"
 llvm-link -S "$OUT"/*.ll "$DRV/repl.ll" -o "$LINKED" 2>"$CACHE/llvm-link.err" \
   || { echo "LINK FAILED (repl):"; tail -5 "$CACHE/llvm-link.err"; exit 15; }
 llvm-link -S "$OUT"/*.ll "$DRV/init.ll" -o "$INIT_LINKED" 2>"$CACHE/llvm-link-init.err" \
   || { echo "LINK FAILED (init):"; tail -5 "$CACHE/llvm-link-init.err"; exit 15; }
+llvm-link -S "$OUT"/*.ll "$DRV/snapshot.ll" -o "$SNAP_LINKED" 2>"$CACHE/llvm-link-snap.err" \
+  || { echo "LINK FAILED (snapshot):"; tail -5 "$CACHE/llvm-link-snap.err"; exit 15; }
 echo "linked: repl $(stat -c%s "$LINKED") B → $LINKED"
 echo "linked: init $(stat -c%s "$INIT_LINKED") B → $INIT_LINKED"
+echo "linked: snapshot $(stat -c%s "$SNAP_LINKED") B → $SNAP_LINKED"
 TR="$HERE/../../../svm-llvm/target/release/examples/try_translate"
 if [ -x "$TR" ]; then
   # `SVM_STUB_EXTERNS=1`: trap-stub the OS surface unreached by the guest (zlib/scanf/fts). The

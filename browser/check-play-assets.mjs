@@ -44,7 +44,7 @@ const BUILT_AT_DEPLOY = new Set([
   'stage_runner.svmb',    // build-onramp-assets.mjs (the shell's __stage ring-filter runner)
   'primes.svmb',          // build-onramp-assets.mjs (the shell's `primes` external command)
   'upper.svmb',           // build-onramp-assets.mjs (the shell's `upper` stdin-filter command)
-  'tcl_init.svmb',        // build-onramp-assets.mjs (fetches Tcl + openlibm; full Tcl_Init)
+  'tcl_snapshot.svmb',    // build-onramp-assets.mjs (fetches Tcl + openlibm; two-phase warm Tcl_Init driver)
   'postgres_resolved.svmb', // build-pg-assets.mjs
   'pgdata.img',           // build-pg-assets.mjs
   'chibicc_selfhost.img', // build-selfhost-assets.mjs (chibicc's own TU sources + their glibc header closure)
@@ -57,7 +57,7 @@ const BUILT_AT_DEPLOY = new Set([
 // (retiring the dead-mirror class, ISSUES.md I42/I43). Every other referenced asset MUST be present.
 const MAY_BE_ABSENT = new Set([
   'doom.svmb',
-  'tcl_init.svmb', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link
+  'tcl_snapshot.svmb', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link — the warm Tcl card degrades to a hint if absent
   'chibicc_selfhost.img', // build-selfhost-assets.mjs needs a native chibicc + the glibc header tree
 ]);
 

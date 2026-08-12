@@ -1,0 +1,72 @@
+// V8 (Node) check of the **Tcl warm-runtime snapshot** driver (issue #805 follow-on), the Tcl twin of
+// `lua-warm-snapshot-test.mjs`. Drives the shipping engine FFI (`svm_warm_open`/`svm_warm_eval`) over a
+// `tcl_snapshot.svmb` (the two-phase `warmup` = full `Tcl_Init` / `eval_run` = eval-only driver), and
+// asserts warm `eval_run` over the restored snapshot matches the cold `_start` (`svm_run_onramp`) output
+// byte-for-byte while skipping the `Tcl_Init` rebuild, plus fresh-per-Run isolation. Tcl's warm+JIT
+// declines (the 162-TU interp's emitted `eval_run` traps → warm-interp), so this is interpreter-only.
+//
+//   node tcl-warm-snapshot-test.mjs [svm_browser.wasm] [tcl_snapshot.svmb]
+//
+// The `.svmb` is deploy-built (the Tcl fetch+toolchain isn't in the committed-asset CI job), so this
+// SKIPs cleanly when it's absent — like the other Tcl demos.
+import { readFileSync, existsSync } from 'node:fs';
+import { engineImports } from './engine-imports.mjs';
+
+const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
+const modPath = process.argv[3] ?? 'web/assets/tcl_snapshot.svmb';
+if (!existsSync(modPath)) {
+  console.log(`SKIP: ${modPath} not built (Tcl fetch/toolchain unavailable) — run build-onramp-assets.mjs`);
+  process.exit(0);
+}
+
+const mod = await WebAssembly.compile(readFileSync(wasmPath));
+const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
+const membuf = () => (ex.memory ?? memory).buffer;
+const put = (bytes) => { const p = ex.svm_alloc(bytes.length); new Uint8Array(membuf()).set(bytes, Number(p)); return { p, len: bytes.length, free: () => ex.svm_dealloc(p, bytes.length) }; };
+const readStdout = () => { const p = Number(ex.svm_stdout_ptr()), l = Number(ex.svm_stdout_len()); return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : ''; };
+const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
+const enc = (s) => Buffer.from(s);
+const modBytes = readFileSync(modPath);
+
+function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.svm_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); m.free(); return { out, st }; }
+function warm(js) { const s = put(enc(js)); ex.svm_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); return { out, st }; }
+
+const m = put(modBytes);
+const live = Number(ex.svm_warm_open(m.p, m.len));
+m.free();
+if (live < 0 || ex.svm_status() !== 0) fail(`svm_warm_open: status ${ex.svm_status()}`);
+console.error(`warm session opened: live image ${(live / (1 << 20)).toFixed(2)} MiB`);
+
+const programs = [
+  ['expr', 'puts [expr 6*7]\n'],
+  ['string', 'puts [string toupper hello]\n'],
+  ['lsort', 'puts [lsort -integer {5 3 8 1 9 2}]\n'],
+  ['for-loop', 'set s 0; for {set i 1} {$i <= 100} {incr i} { set s [expr $s+$i] }; puts $s\n'],
+  ['proc', 'proc sq {x} {expr $x*$x}; puts [sq 9]\n'],
+  ['format', 'puts [format "%.4f 0x%X" 3.14159265 255]\n'],
+];
+
+console.log(`\n${'program'.padEnd(12)}${'cold≡warm'.padStart(11)}`);
+let allOk = true;
+for (const [name, js] of programs) {
+  const c = cold(js);
+  if (c.st !== 0) fail(`cold ${name}: status ${c.st}`);
+  const w = warm(js);
+  const ok = c.out === w.out && w.st === 0;
+  allOk = allOk && ok;
+  console.log(`${name.padEnd(12)}${(ok ? 'OK' : 'MISMATCH').padStart(11)}`);
+  if (!ok) { console.log(`  cold: ${JSON.stringify(c.out)}`); console.log(`  warm: ${JSON.stringify(w.out)}`); }
+}
+
+// Fresh-per-Run isolation: a variable set in one Run must not exist in the next (snapshot restored each Run).
+const r1 = warm('set leaked 4242; puts "set $leaked"\n');
+const r2 = warm('puts "exists? [info exists leaked]"\n');
+const isolated = r1.out.includes('set 4242') && r2.out.includes('exists? 0') && !r2.out.includes('4242');
+allOk = allOk && isolated;
+console.log(`\nfresh-per-Run isolation: ${isolated ? 'OK — no variable leak across Runs' : 'LEAK!'}`);
+if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`  run2: ${JSON.stringify(r2.out)}`); }
+
+ex.svm_warm_close();
+if (!allOk) fail('Tcl warm snapshot parity/isolation mismatch');
+console.log('\nOK: Tcl warm snapshot — warm eval_run matches cold _start byte-for-byte, isolation holds');
