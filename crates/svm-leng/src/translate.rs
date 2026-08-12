@@ -3230,10 +3230,68 @@ impl<'a> FuncGen<'a> {
         }
         let span = (hi as i128) - (lo as i128) + 1;
         if !(1..=256).contains(&span) {
-            return Err(LengError::Unsupported(
-                "case span too large/sparse for a br_table (comparison-chain lowering is a later slice)"
-                    .into(),
-            ));
+            // Sparse or huge span (scattered enum/char ordinals, sum-type tags that aren't dense) →
+            // an **if-else comparison chain** instead of a `br_table`: each branch tests `disc == v`
+            // (OR over its values, `l <= disc <= h` for a range) and `br_if`s to its body, else the
+            // next test; the tail falls to the `else`/continuation. Real nimony emits these for
+            // string-dispatch case statements (`tsso`, `tsplit_and_append`) and non-dense tag
+            // matches. Mirrors the `br_table` arm's block/`terminated` bookkeeping.
+            let disc = self.expr(&a[0])?;
+            let cont = self.new_block_id();
+            let nbr = branches.len();
+            let bodies: Vec<u32> = (0..nbr).map(|_| self.new_block_id()).collect();
+            for bi in 0..nbr {
+                let then_id = bodies[bi];
+                let next_id = self.new_block_id(); // next branch's test, or the else/cont
+                                                   // Condition = OR of this branch's value-equalities and range-membership tests.
+                let mut acc: Option<u32> = None;
+                for &v in &branches[bi].vals {
+                    let c = self.emit_const(disc.ty, v);
+                    let eq = self.emit_rel("eq", disc.ty, disc.id, c.id);
+                    acc = Some(match acc {
+                        None => eq,
+                        Some(p) => self.emit_i32bin("or", p, eq),
+                    });
+                }
+                for &(l, h) in &branches[bi].ranges {
+                    let cl = self.emit_const(disc.ty, l);
+                    let ch = self.emit_const(disc.ty, h);
+                    let ge = self.emit_rel("le_s", disc.ty, cl.id, disc.id); // l <= disc
+                    let le = self.emit_rel("le_s", disc.ty, disc.id, ch.id); // disc <= h
+                    let both = self.emit_i32bin("and", ge, le);
+                    acc = Some(match acc {
+                        None => both,
+                        Some(p) => self.emit_i32bin("or", p, both),
+                    });
+                }
+                let cond =
+                    acc.ok_or_else(|| LengError::Malformed("case `of` with no values".into()))?;
+                let args = self.branch_args();
+                self.finish_block(
+                    format!("br_if v{cond} {then_id}{args} {next_id}{args}"),
+                    then_id,
+                );
+                self.stmt_list_or_single(branches[bi].body)?;
+                if !self.terminated {
+                    let a2 = self.branch_args();
+                    self.finish_block(format!("br {cont}{a2}"), next_id);
+                } else {
+                    self.cur_id = next_id;
+                    self.reset_cur_state();
+                }
+            }
+            // `cur` is the last `next_id`: the else arm (or a fallthrough to cont).
+            if let Some(eb) = else_body {
+                self.stmt_list_or_single(eb)?;
+            }
+            if !self.terminated {
+                let a2 = self.branch_args();
+                self.finish_block(format!("br {cont}{a2}"), cont);
+            } else {
+                self.cur_id = cont;
+                self.reset_cur_state();
+            }
+            return Ok(());
         }
         let span = span as usize;
 
@@ -4123,6 +4181,23 @@ impl<'a> FuncGen<'a> {
         self.cur_buf
             .push_str(&format!("  v{id} = {}.const {n}\n", prefix(ty)));
         Val { id, ty }
+    }
+
+    /// Emit a relational compare `v = <ty>.<op> l r` (result an `i32` bool). Used by the case
+    /// comparison-chain fallback; `op` ∈ {`eq`, `le_s`, …}.
+    fn emit_rel(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.{op} v{l} v{r}\n", prefix(ty)));
+        id
+    }
+
+    /// Emit an `i32` combine `v = i32.<op> l r` (`or`/`and`) of two bool conditions (each 0/1).
+    fn emit_i32bin(&mut self, op: &str, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = i32.{op} v{l} v{r}\n"));
+        id
     }
 
     /// A relocatable address of this unit's own data at `off` (`data.self`). Resolved to a concrete

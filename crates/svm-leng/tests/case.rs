@@ -71,8 +71,11 @@ fn case_with_range() {
 }
 
 #[test]
-fn sparse_case_is_fail_closed() {
-    // A huge span is out of br_table range → clean Unsupported, never a giant table.
+fn sparse_case_lowers_to_comparison_chain() {
+    // A span too large/sparse for a br_table (0 vs 1_000_000) now lowers to an **if-else
+    // comparison chain** — each `of` tests `disc == v` and br_ifs to its body — instead of
+    // fail-closing or emitting a million-entry table. Real nimony emits these for scattered
+    // enum/tag ordinals and string-dispatch case statements. Both engines; no br_table.
     let leng = "\
 (stmts
  (proc :f.0 (params (param :n.0 . (i +64))) (i +64) .
@@ -83,10 +86,41 @@ fn sparse_case_is_fail_closed() {
     (of (ranges 1000000) (stmts . (asgn r.0 2)))
     (else (stmts . (asgn r.0 0))))
    (ret r.0))))";
-    match svm_leng::translate(leng) {
-        Err(svm_leng::LengError::Unsupported(_)) => {}
-        other => panic!("expected Unsupported for sparse case, got {other:?}"),
-    }
+    let text = svm_leng::translate_to_text(leng).unwrap();
+    assert!(
+        !text.contains("br_table"),
+        "sparse case must use a comparison chain, not a br_table:\n{text}"
+    );
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[0]), 1);
+    assert_eq!(run(&m, 0, &[1000000]), 2);
+    assert_eq!(run(&m, 0, &[5]), 0); // no match → else
+    assert_eq!(run(&m, 0, &[999999]), 0);
+}
+
+#[test]
+fn sparse_case_with_range_and_multivalue() {
+    // A comparison chain with a **multi-value** `of` and a **range** `of` over a sparse span:
+    // 0|5 → 10, 100..200 → 20, else → 0. Exercises the OR-of-equalities and the `l <= disc <= h`
+    // range predicate on the chain path.
+    let leng = "\
+(stmts
+ (proc :g.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) .)
+   (case n.0
+    (of (ranges 0 5) (stmts . (asgn r.0 10)))
+    (of (ranges (range 100 200)) (stmts . (asgn r.0 20)))
+    (else (stmts . (asgn r.0 0))))
+   (ret r.0))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[0]), 10);
+    assert_eq!(run(&m, 0, &[5]), 10);
+    assert_eq!(run(&m, 0, &[3]), 0); // between the two multi-values, no match
+    assert_eq!(run(&m, 0, &[150]), 20);
+    assert_eq!(run(&m, 0, &[100]), 20);
+    assert_eq!(run(&m, 0, &[200]), 20);
+    assert_eq!(run(&m, 0, &[201]), 0);
 }
 
 /// Real nimony `hexer` output for `classify(n): case n of 0/1,2/3/else`. Translate it out of the
