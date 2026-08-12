@@ -4,6 +4,7 @@
 // then serve hits. Measurement: report the per-Run breakdown (cdylib emit vs `WebAssembly.compile` vs
 // run) so we know whether skipping compile actually helps the "light script slower under JIT" footgun.
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -20,7 +21,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // Light + heavy cases: hello_c is the footgun shape (tiny guest, emit/compile overhead dominates);

@@ -8,6 +8,7 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node snapshot-worker-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -55,15 +56,6 @@ const browser = await chromium.launch({ args: ['--no-sandbox'] });
 let failed = false;
 const ok = (m) => console.log(`  ok: ${m}`);
 const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
-
-// A warm card pre-warms its snapshot on page load; a deploy-built asset absent in this job (its card is
-// filtered out of CARDS above) 404s that fetch — a benign console error the browser logs. Ignore a
-// resource-load 404/403 ONLY for an asset that isn't on disk; a 404 for a committed asset still fails.
-const benignAssetMiss = (m) => {
-  if (m.type() !== 'error' || !/Failed to load resource.*\b40[34]\b/.test(m.text())) return false;
-  const hit = (m.location()?.url || '').match(/\/assets\/([^/?#]+)/);
-  return !!hit && !existsSync(join(HERE, 'web', 'assets', hit[1]));
-};
 
 try {
   const page = await browser.newPage();

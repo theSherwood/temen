@@ -7,6 +7,7 @@
 // value match with tierups==0 would be a vacuous pass (nothing tiered up). A stale/mis-based window or
 // unmaterialized data would make the emitted leaf compute the wrong sum, caught here.
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -22,7 +23,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // Mainline root (func 0) loops N times calling the eligible leaf (func 1), which **round-trips through

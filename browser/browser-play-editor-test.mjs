@@ -6,6 +6,7 @@
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -37,15 +38,6 @@ const runCard = async (page, name, timeout = 20_000) => {
     (sel) => ['done', 'error', 'stopped'].includes(document.querySelector(sel).dataset.state),
     `${card(name)} .state`, { timeout },
   );
-};
-
-// A warm card pre-warms its snapshot on page load; a deploy-built asset (e.g. tcl_snapshot.svmb) absent
-// in this job 404s that fetch — a benign console error the browser logs and JS can't suppress. Ignore a
-// resource-load 404/403 ONLY for an asset that isn't on disk; a 404 for a committed asset still fails.
-const benignAssetMiss = (m) => {
-  if (m.type() !== 'error' || !/Failed to load resource.*\b40[34]\b/.test(m.text())) return false;
-  const hit = (m.location()?.url || '').match(/\/assets\/([^/?#]+)/);
-  return !!hit && !existsSync(join(HERE, 'web', 'assets', hit[1]));
 };
 
 try {

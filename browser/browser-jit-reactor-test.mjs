@@ -5,19 +5,10 @@
 // (`openJitReactor` throws on a not-emittable fallback), i.e. the outlining did its job. bounce/life/
 // mandelzoom auto-run deterministically, so the two tiers must produce the identical frame sequence.
 import { startServer } from './serve.mjs';
-import { existsSync } from 'node:fs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 const ROOT = dirname(fileURLToPath(import.meta.url));
-// A warm card pre-warms its snapshot on page load; a deploy-built asset (e.g. tcl_snapshot.svmb) is
-// absent in the committed-asset browser job, so that fetch 404s — a benign console error the browser
-// logs and JS can't suppress. Ignore a resource-load 404/403 ONLY for an asset that isn't on disk (i.e.
-// legitimately deploy-built-absent); a 404 for a committed asset is a real regression and still fails.
-const benignAssetMiss = (m) => {
-  if (m.type() !== 'error' || !/Failed to load resource.*\b40[34]\b/.test(m.text())) return false;
-  const hit = (m.location()?.url || '').match(/\/assets\/([^/?#]+)/);
-  return !!hit && !existsSync(join(ROOT, 'web', 'assets', hit[1]));
-};
 async function loadChromium() {
   for (const s of ['playwright', '/opt/node22/lib/node_modules/playwright/index.js']) {
     try { const m = await import(s); return m.chromium ?? m.default?.chromium; } catch {}

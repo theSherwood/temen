@@ -9,6 +9,7 @@
 // Skipped cleanly if the assets or a Chromium/Playwright install is unavailable (like the other
 // on-ramp browser checks). Run: node browser-shell-test.mjs
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -34,7 +35,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The script exercises the read-eval loop, $VAR expansion, a redirect+cat over the memfs, a

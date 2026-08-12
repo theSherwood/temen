@@ -5,6 +5,7 @@
 // stackTrace → variables → continue to termination. Asserts the source frame binds and the loop
 // locals read back correctly, proving the debugger runs on the engine the playground ships.
 import { startServer } from './serve.mjs';
+import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -20,7 +21,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // A tiny SVM guest with a §6 debug section: a source line at the loop body (sum.c:7) and the two loop
