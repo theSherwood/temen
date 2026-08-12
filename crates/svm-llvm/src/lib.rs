@@ -16118,6 +16118,25 @@ impl<'a> BlockCtx<'a> {
                     let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
                     Ok(self.push(Inst::ConstI64(v)))
                 }
+                // A constexpr integer/pointer arithmetic fold (`ptrtoint(@g) + k` — an interior global
+                // pointer the threaded codegen materializes as an `add` rather than a `getelementptr`,
+                // and `@a − @b` pointer differences). `const_eval` resolves the global relocations and
+                // literals; honor the result width like `ptrtoint` so a sub-i64 pointer difference
+                // stays `i32` (feeding i64 into i32 arithmetic would be a verify `TypeMismatch`).
+                Constant::Add(_) | Constant::Sub(_) | Constant::Mul(_) => {
+                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
+                    match int_bits(c.get_type(self.types).as_ref()) {
+                        Some(to) if to <= 32 => {
+                            let mask = if to == 32 {
+                                u32::MAX as u64
+                            } else {
+                                (1u64 << to) - 1
+                            };
+                            Ok(self.push(Inst::ConstI32((v as u64 & mask) as i32)))
+                        }
+                        _ => Ok(self.push(Inst::ConstI64(v))),
+                    }
+                }
                 // A constexpr `ptrtoint` folds the same way, but honors its **target width**: a
                 // `ptrtoint (ptr @g to i32)` (pointer-difference idioms over globals, e.g. ltests'
                 // `strchr(ops, op) - ops` as `int`) is an `i32` value — emitting the raw `i64`
