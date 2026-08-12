@@ -1085,8 +1085,14 @@ fn std_threads_spec_yield_and_sleep() {
         eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
         return;
     };
-    assert_eq!(exit, 15, "worker completes 15 yield-separated increments across main's sleep");
+    assert_eq!(
+        exit, 15,
+        "worker completes 15 yield-separated increments across main's sleep"
+    );
     if let Some((_, oracle)) = native_oracle("svm_stdt_yieldsleep_oracle", src) {
-        assert_eq!(exit, oracle, "yield_now/sleep progress matches the native oracle");
+        assert_eq!(
+            exit, oracle,
+            "yield_now/sleep progress matches the native oracle"
+        );
     }
 }
