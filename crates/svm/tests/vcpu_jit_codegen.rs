@@ -142,37 +142,44 @@ fn run(guest_src: &str, unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> 
                 argv,
                 params: _,
                 results,
-            } => match mode {
-                Mode::Interp => vcpu.deliver_jit_invoke(resolve_unit(handle, code)),
-                Mode::Codegen => {
-                    // Authority still resolves through the powerbox (a forged handle must trap
-                    // identically); then run the unit standalone over argv — what emitted `f0` computes.
-                    match resolve_unit(handle, code) {
-                        Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok(_funcs) => {
-                            let args: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
-                            let mut fuel = u64::MAX;
-                            match bytecode::compile_and_run(&unit_m, 0, &args, &mut fuel)
-                                .expect("unit supported")
-                            {
-                                Ok(vals) => {
-                                    let slots: Vec<i64> = vals
-                                        .iter()
-                                        .zip(results.iter())
-                                        .map(|(v, _)| match v {
-                                            Value::I64(x) => *x,
-                                            Value::I32(x) => *x as i64,
-                                            _ => panic!("non-integer unit result"),
-                                        })
-                                        .collect();
-                                    vcpu.deliver_jit_invoke_vals(&slots);
+                mapped,
+            } => {
+                // #717 host sync: the fully-mapped guest window's extent rides the event (the
+                // value a codegen host writes to the emitted unit's `"mapped"` global).
+                assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
+                match mode {
+                    Mode::Interp => vcpu.deliver_jit_invoke(resolve_unit(handle, code)),
+                    Mode::Codegen => {
+                        // Authority still resolves through the powerbox (a forged handle must trap
+                        // identically); then run the unit standalone over argv — what emitted `f0` computes.
+                        match resolve_unit(handle, code) {
+                            Err(t) => vcpu.deliver_jit_invoke_trap(t),
+                            Ok(_funcs) => {
+                                let args: Vec<Value> =
+                                    argv.iter().map(|&s| Value::I64(s)).collect();
+                                let mut fuel = u64::MAX;
+                                match bytecode::compile_and_run(&unit_m, 0, &args, &mut fuel)
+                                    .expect("unit supported")
+                                {
+                                    Ok(vals) => {
+                                        let slots: Vec<i64> = vals
+                                            .iter()
+                                            .zip(results.iter())
+                                            .map(|(v, _)| match v {
+                                                Value::I64(x) => *x,
+                                                Value::I32(x) => *x as i64,
+                                                _ => panic!("non-integer unit result"),
+                                            })
+                                            .collect();
+                                        vcpu.deliver_jit_invoke_vals(&slots);
+                                    }
+                                    Err(t) => vcpu.deliver_jit_invoke_trap(t),
                                 }
-                                Err(t) => vcpu.deliver_jit_invoke_trap(t),
                             }
                         }
                     }
                 }
-            },
+            }
             _ => panic!("unexpected event (this guest only invokes)"),
         }
     }

@@ -2235,12 +2235,15 @@ accesses confine against the live `mapped` read from the module's exported `mapp
 (self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
 event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
 admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
-(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike). A window state
-the scalar cannot represent — a sparse grow, a non-RW mapping — **declines** tier-up at the dispatch
-and interprets the call instead, so emitted code never runs over a state it would mis-admit; the
-map-containing function itself is never emitted either (a remapping `cap.call` is not in-subset).
-`tierup_grow_window.rs` is the differential proof, both directions plus the decline arm, with the
-unsynced divergence pinned as a negative test. The **page-state** axis stays fail-closed as above.
+(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
+`Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
+writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
+sparse grow, a non-RW mapping — **declines** emitted execution for that call and interprets it
+instead (tier-up falls through at the dispatch; an invoke uses the interpreted delivery), so
+emitted code never runs over a state it would mis-admit; the map-containing function itself is
+never emitted either (a remapping `cap.call` is not in-subset). `tierup_grow_window.rs` and
+`jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
+unsynced divergences pinned as negative tests. The **page-state** axis stays fail-closed as above.
 The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
 divergence, never an escape. The rejected alternative — a per-access **software page-check** in
 emitted code — was declined because it grows the fuzzed masking hinge (INVARIANTS.md #2) for a benefit

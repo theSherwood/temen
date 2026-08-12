@@ -2582,12 +2582,21 @@ pub enum VcpuEvent {
     /// §22 `Jit.invoke`: the host resolves the unit's funcs (authority + cross-domain), then calls
     /// [`Vcpu::deliver_jit_invoke`]; the vCPU compiles, arity-checks, and runs the unit synchronously
     /// over its window, writing the results to the awaiting dst.
+    ///
+    /// A **codegen** host runs the unit on emitted wasm instead ([`Vcpu::deliver_jit_invoke_vals`]).
+    /// `mapped` is the window's scalar committed extent at the invoke ([`Mem::scalar_extent`]):
+    /// `Some(H)` MUST be written to the emitted unit's `"mapped"` global before running it (#717
+    /// host sync — same contract as [`VcpuEvent::TierUp`]); `None` means the window state is not
+    /// representable by the single bound, so the host must **decline** emitted execution for this
+    /// invoke and use the interpreted delivery — fail-closed, the interpreter honors the full page
+    /// map. `Some(0)` for a memory-less module (nothing to bound).
     JitInvoke {
         handle: i32,
         code: i32,
         argv: Box<[i64]>,
         params: Box<[ValType]>,
         results: Box<[ValType]>,
+        mapped: Option<u64>,
     },
     /// §14 `Instantiator.instantiate` / `instantiate_module` (THREADS.md 4c-domain §14-D2): start a
     /// **confined executor child** vCPU over the carve, then call [`Vcpu::deliver_handle`] with the
@@ -3158,12 +3167,21 @@ impl<'p> Vcpu<'p> {
                         results: results.clone(),
                         dst,
                     });
+                    // #717 host sync: snapshot the window's scalar committed extent for a codegen
+                    // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
+                    // (unrepresentable page state) tells it to decline emitted execution and use
+                    // the interpreted delivery instead. A memory-less module has nothing to bound.
+                    let mapped = match self.mem.as_ref() {
+                        None => Some(0),
+                        Some(m) => m.scalar_extent(),
+                    };
                     return VcpuEvent::JitInvoke {
                         handle: h,
                         code,
                         argv,
                         params,
                         results,
+                        mapped,
                     };
                 }
                 // §14 executor children (THREADS.md 4c-domain §14-D2): this vCPU does all the
