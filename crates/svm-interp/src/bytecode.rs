@@ -2698,6 +2698,9 @@ pub struct Vcpu<'p> {
     /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
     /// embedder computes it (e.g. from `svm_wasm_jit::analyze`).
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 paged tier-up: see the `Vm` field of the same name; mirrored here for the `JitInvoke`
+    /// surfacing (which reads the Vcpu, not the Vm).
+    jit_page_checked: bool,
     /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
     /// slots — the caller's window base is the one the spill persisted).
@@ -2892,6 +2895,7 @@ impl<'p> Vcpu<'p> {
             pending_jit: None,
             trap: None,
             jit_eligible: None,
+            jit_page_checked: false,
             pending_tierup: None,
         })
     }
@@ -2966,6 +2970,7 @@ impl<'p> Vcpu<'p> {
             pending_jit: None,
             trap: None,
             jit_eligible: None,
+            jit_page_checked: false,
             pending_tierup: None,
         })
     }
@@ -2990,6 +2995,25 @@ impl<'p> Vcpu<'p> {
         self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
         self.jit_eligible = Some(eligible);
         self
+    }
+
+    /// #750 **paged tier-up**: mark the eligible set as emitted with the software page-check
+    /// (`compile_module_tierup_paged`). The dispatch then surfaces tier-up regardless of the
+    /// window's scalar representability — the event's `mapped` is the reserved window size, and the
+    /// driver's page-state table (refreshed per call from [`mem_map_info`](Vcpu::mem_map_info))
+    /// carries the per-page fidelity the scalar cannot.
+    pub fn with_jit_page_checked(mut self) -> Vcpu<'p> {
+        self.vt.active.jit_page_checked = true;
+        self.jit_page_checked = true;
+        self
+    }
+
+    /// The run's window memory-map introspection ([`MemMapInfo`]) — what a #750 page-checked
+    /// driver rebuilds its byte-per-page state table from before each emitted call (page state is
+    /// frozen while emitted code runs: page ops are `cap.call`s, which are never emitted and never
+    /// reachable through a cross-tier leaf). `None` for a memory-less module.
+    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
+        self.mem.as_ref().map(|m| m.map_info())
     }
 
     /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
@@ -3171,8 +3195,11 @@ impl<'p> Vcpu<'p> {
                     // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
                     // (unrepresentable page state) tells it to decline emitted execution and use
                     // the interpreted delivery instead. A memory-less module has nothing to bound.
+                    // #750: a page-checked run surfaces the reserved size instead (see the tier-up
+                    // dispatch), the table carrying per-page fidelity.
                     let mapped = match self.mem.as_ref() {
                         None => Some(0),
+                        Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                         Some(m) => m.scalar_extent(),
                     };
                     return VcpuEvent::JitInvoke {
@@ -10996,6 +11023,12 @@ struct Vm {
     /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
     /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
+    /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
+    /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
+    /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
+    /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
+    jit_page_checked: bool,
     /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket — `Some`
     /// between admitting a handler activation (whose return linkage rewinds into the `SvcPoll`
     /// op) and the re-execution that settles its result — and the count of dispatches completed
@@ -11038,6 +11071,7 @@ impl Vm {
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_page_checked: false,
             serve_ticket: None,
             serve_count: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
@@ -11487,8 +11521,13 @@ impl Vm {
                         // declines tier-up — fall through to the interpreted call below, which honors
                         // the full per-page map (fail-closed; the interpreter is always right). A
                         // memory-less module has nothing to bound (no emitted access): sync `0`.
+                        //
+                        // #750 paged tier: the emitted code carries a per-access page check, so an
+                        // unrepresentable window must NOT decline — surface with the reserved size
+                        // (the bound must never under-admit a page the driver's table admits).
                         let extent = match mem.as_ref() {
                             None => Some(0),
+                            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                             Some(m) => m.scalar_extent(),
                         };
                         if let Some(mapped) = extent {
