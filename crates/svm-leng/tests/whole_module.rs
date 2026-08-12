@@ -98,6 +98,25 @@ fn aggregate_global_initializer_is_materialized() {
 }
 
 #[test]
+fn float_global_initializer_is_materialized() {
+    // A **float scalar global** — nimony emits `let x = foo[float]()` as `(gvar :x (f 64)
+    // (conv (f 64) 123))` (an int→float const conversion), and `var pi = 3.14` as a bare float
+    // literal. `collect_globals` only folded *integer* scalars, so any float module-level `var`/
+    // `let` fail-closed ("non-scalar-int global initializer"). It now folds the three constant
+    // float forms (bare literal, `(suf N "f32")`, `(conv (f T) int)`) into window bytes. `sumf`
+    // reads `a` (via a conv-of-int init) plus `b` (a bare literal) back; both engines see 3.5.
+    let leng = "\
+(stmts
+ (gvar :a.0. . (f +64) (conv (f +64) 1))
+ (gvar :b.0. . (f +64) 2.5)
+ (proc :sumf.0. . (i +64) .
+  (stmts .
+   (ret (conv (i +64) (add (f +64) a.0. b.0.))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 3, "1.0 + 2.5 = 3.5, truncated to 3");
+}
+
+#[test]
 fn global_pointer_deref() {
     // A module-level **pointer global** (`var x: ptr Node` — nimony's `ref NodeObj`, lowered to a
     // pointer) is dereferenced: `roundtrip` builds a frame object, points the global at it, then reads

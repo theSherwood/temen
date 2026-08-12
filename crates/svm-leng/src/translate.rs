@@ -538,6 +538,12 @@ impl Translator {
                                 };
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
+                            } else if let TyDesc::Scalar(ValType::F32 | ValType::F64) = &desc {
+                                // A **float scalar global** (`var pi = 3.14`, `let x = foo[float]()`
+                                // → `(conv (f 64) 123)`). Fold the constant to its little-endian
+                                // float bytes and seed the window, exactly as the int-scalar case
+                                // above does. Fails closed if unfoldable / `float` off.
+                                self.data_inits.push((off, const_float_bytes(init, &desc)?));
                             } else if let (Some(sym), TyDesc::FnPtr(_)) = (init.as_atom(), &desc) {
                                 // A **funcref gvar** with a static proc initializer (`var oomHandler =
                                 // continueAfterOutOfMem`, `var gExitFlush = nimNoopFlush`). The func
@@ -4338,6 +4344,44 @@ fn int_literal(node: &Node) -> Option<i64> {
     }
     node.as_atom()
         .and_then(|s| parse_int(s).ok().or_else(|| char_literal(s)))
+}
+
+/// The float value of a constant initializer node, if foldable. Handles a bare float literal
+/// (`1.5`, `3.0`), a suffixed literal (`(suf 2.25 "f32")`), and an int→float conversion
+/// (`(conv (f 64) 123)` — nimony's lowering of a `float`-typed `let x = 123`). Gated on `float`:
+/// with the feature off there is no float path at all (`emit_fconst` and its formatter are pruned),
+/// so a float global fails closed in [`const_float_bytes`].
+#[cfg(feature = "float")]
+fn const_float(node: &Node) -> Option<f64> {
+    match node.tag() {
+        // `(suf 2.25 "f32")` — the value is the first son.
+        Some("suf") => node.args().first().and_then(const_float),
+        // `(conv (f T) operand)` — fold the operand; an int operand becomes its float value.
+        Some("conv") => {
+            let operand = node.args().get(1)?;
+            const_float(operand).or_else(|| int_literal(operand).map(|n| n as f64))
+        }
+        // A bare float literal atom.
+        _ => node.as_atom().and_then(|s| s.parse::<f64>().ok()),
+    }
+}
+
+/// The little-endian bytes of a **float scalar global** initializer — F32 → 4-byte `f32` bits,
+/// F64 → 8-byte `f64` bits. Fails closed if the initializer isn't a foldable float constant, or if
+/// the `float` feature is off (a guest build has no float emission path — W5 §3e).
+fn const_float_bytes(init: &Node, desc: &TyDesc) -> Result<Vec<u8>, LengError> {
+    #[cfg(feature = "float")]
+    if let Some(f) = const_float(init) {
+        return Ok(match desc {
+            TyDesc::Scalar(ValType::F32) => (f as f32).to_bits().to_le_bytes().to_vec(),
+            _ => f.to_bits().to_le_bytes().to_vec(),
+        });
+    }
+    #[cfg(not(feature = "float"))]
+    let _ = (init, desc);
+    Err(LengError::Unsupported(
+        "unfoldable float global initializer (or float feature off)".into(),
+    ))
 }
 
 /// A NIF **character literal** — `'0'` (the byte 48), `'\0A'` (a `\HH` hex escape) — to its byte
