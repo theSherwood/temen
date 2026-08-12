@@ -302,6 +302,16 @@ pub(crate) struct Translator {
     /// exactly as a local sret call assigned to an aggregate destination does. Empty unless the
     /// linker pooled sibling units' sret procs.
     ext_sret_procs: HashMap<String, TyDesc>,
+    /// **Funcref targets** — proc names taken as a funcref (`ref.func`) anywhere in the program: a
+    /// proc name in value position (a call argument, a `gvar`/field initializer), not a call head.
+    /// The **funcref ABI** gives every funcref a leading `$sp` param (so an indirect call can thread
+    /// the stack pointer a frame-needing target needs, exactly as a direct call to a frame-needing
+    /// proc does), so a funcref target is compiled frame-needing whether or not its body needs a
+    /// frame — the extra `$sp` slot is harmless for a frameless one, and a *missing* one is an ABI
+    /// mismatch. Populated per module before proc signatures are fixed, and pooled across the link
+    /// (a proc funcref'd in a sibling unit must still carry `$sp`). See [`funcref_value`] /
+    /// [`emit_call_indirect`].
+    funcref_targets: HashSet<String>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
     /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
@@ -353,6 +363,7 @@ impl Translator {
             ext_funcrefs: HashMap::default(),
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
+            funcref_targets: HashSet::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
             tls_block_size: 0,
@@ -1482,6 +1493,9 @@ impl Translator {
         t.scan_lenient = true; // enumerating proc frames; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
+        // A funcref target / indirect caller is frame-needing under the funcref ABI (`proc_needs_frame`
+        // consults `funcref_targets`), so the fixpoint pre-scan must see the same set the real pass does.
+        t.compute_funcref_targets(root)?;
         // A proc that calls an **sret** proc materializes a result temp → is frame-needing. So the
         // frame predicate (`proc_needs_frame` → `agg_temp_bytes`) must know which callees are sret:
         // pooled sibling procs (`ext_sret`) and this module's own (registered by name here, so a
@@ -1599,6 +1613,7 @@ impl Translator {
         }
         self.collect_types(root)?;
         self.collect_globals(root)?;
+        self.compute_funcref_targets(root)?;
         let mut proc_nodes = Vec::new();
         let mut names = Vec::new();
         for item in root.args() {
@@ -1682,6 +1697,49 @@ impl Translator {
         }
     }
 
+    /// True if `body` performs an **indirect call** — a `(call HEAD …)` whose `HEAD` is a funcref
+    /// value, not a named proc: a non-atom (a `(cast <proctype> …)`, or a funcref field/slot lvalue
+    /// `(dot …)`/`(deref …)`/`(pat …)`), a funcref-typed param/local (`funcref_locals`), or a
+    /// **funcref global** — a local `proctype` gvar, or a pooled cross-module funcref gvar
+    /// ([`ext_funcrefs`](Self::ext_funcrefs)). Such a proc must own a frame to hand `$sp` to the
+    /// callee (the funcref ABI). A bare-atom head naming a proc/import is a direct call — it does not
+    /// count (a call *to* the proc, resolved by name).
+    fn body_has_indirect_call(&self, node: &Node, funcref_locals: &HashSet<String>) -> bool {
+        if node.tag() == Some("call") {
+            if let Some(head) = node.args().first() {
+                match head.as_atom() {
+                    None => return true, // a computed funcref head (cast / field / slot)
+                    Some(a) if funcref_locals.contains(a) => return true,
+                    Some(a) if self.ext_funcrefs.contains_key(a) => return true,
+                    Some(a) if matches!(self.globals.get(a), Some((_, TyDesc::FnPtr(_)))) => {
+                        return true
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Node::List(items) = node {
+            return items
+                .iter()
+                .any(|c| self.body_has_indirect_call(c, funcref_locals));
+        }
+        false
+    }
+
+    /// Populate [`funcref_targets`](Self::funcref_targets) from a module root — the local procs taken
+    /// as funcrefs. Must run **before** proc signatures are fixed, since [`proc_needs_frame`] consults
+    /// it to give a funcref target the funcref ABI's leading `$sp`.
+    fn compute_funcref_targets(&mut self, root: &Node) -> Result<(), LengError> {
+        let mut proc_names: HashSet<String> = HashSet::default();
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_importc_proc(item) {
+                proc_names.insert(sym_def(&item.args()[0])?);
+            }
+        }
+        collect_funcref_targets(root, &proc_names, &mut self.funcref_targets);
+        Ok(())
+    }
+
     /// A proc's **own** frame need — computed exactly as `proc_body` decides `frame_size > 0`, so the
     /// two never disagree: a `(var …)` is frame-resident iff it is a true aggregate (`object`/`array`,
     /// via `tydesc` — a scalar enum/distinct named type is not) *or* its address is taken; plus any
@@ -1712,7 +1770,30 @@ impl Translator {
                 addr.contains(pn) && !matches!(self.tydesc(tnode), Ok(TyDesc::Agg(_)))
             })
         });
-        framed_var || spilled_param || self.agg_temp_bytes(body) > 0
+        // The **funcref ABI** frames a proc that is a funcref *target* (it must carry the leading
+        // `$sp` an indirect caller hands it, whether or not its body needs a frame) or that performs
+        // an **indirect call** (it must own an `$sp` to hand the callee down — the funcref twin of
+        // `body_calls_framed`). Funcref-typed params/locals are the possible indirect-call heads.
+        #[allow(clippy::unnecessary_map_or)]
+        let is_funcref_target =
+            sym_def(&p.args()[0]).map_or(false, |n| self.funcref_targets.contains(&n));
+        let mut funcref_locals: HashSet<String> = var_descs
+            .iter()
+            .filter(|(_, d)| matches!(d, TyDesc::FnPtr(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if let Ok(pts) = self.param_types(&p.args()[1]) {
+            for (pn, tnode) in pts {
+                if matches!(self.tydesc(tnode), Ok(TyDesc::FnPtr(_))) {
+                    funcref_locals.insert(pn);
+                }
+            }
+        }
+        framed_var
+            || spilled_param
+            || self.agg_temp_bytes(body) > 0
+            || is_funcref_target
+            || self.body_has_indirect_call(body, &funcref_locals)
     }
 
     /// Translate a **single named proc** as func 0 (NIM.md Phase 2 "go deep"): the real hexer output
@@ -1724,6 +1805,7 @@ impl Translator {
         }
         self.collect_types(root)?;
         self.collect_globals(root)?;
+        self.compute_funcref_targets(root)?;
         for item in root.args() {
             if item.tag() != Some("proc") {
                 continue;
@@ -1770,6 +1852,7 @@ impl Translator {
         }
         self.collect_types(root)?;
         self.collect_globals(root)?;
+        self.compute_funcref_targets(root)?;
         // Register the requested procs first (indices in `names` order), so calls between them bind.
         let mut selected: Vec<&Node> = Vec::new();
         for (index, want) in names.iter().enumerate() {
@@ -2963,16 +3046,12 @@ impl<'a> FuncGen<'a> {
 
     /// Evaluate a **funcref-producing** expression to its `i32` function index. A bare proc symbol
     /// becomes `ref.func <idx>` (its function index); anything else is an already-computed funcref
-    /// value (a funcref field/param/local), loaded as an `i32`. A proc that needs a stack frame can't
-    /// be reached indirectly (no `$sp` to hand down), so taking its address fails closed.
+    /// value (a funcref field/param/local), loaded as an `i32`. A proc taken as a funcref is compiled
+    /// frame-needing (the funcref ABI's leading `$sp`, forced via [`funcref_targets`]), so an indirect
+    /// call through it hands `$sp` down exactly as a direct call to a frame-needing proc does.
     fn funcref_value(&mut self, expr: &Node) -> Result<u32, LengError> {
         if let Some(name) = expr.as_atom() {
             if let Some(sig) = self.t.procs.get(name) {
-                if sig.needs_frame {
-                    return Err(LengError::Unsupported(format!(
-                        "cannot take a funcref of frame-needing proc `{name}` (indirect calls pass no `$sp`)"
-                    )));
-                }
                 let idx = sig.index;
                 let id = self.fresh();
                 self.cur_buf
@@ -4104,7 +4183,10 @@ impl<'a> FuncGen<'a> {
                 sig.params.len()
             )));
         }
-        let mut argvals = Vec::new();
+        // Funcref ABI: every funcref target carries a leading `$sp`, so the indirect call passes
+        // `sp + frame_size` as arg 0 and the call_indirect signature gains a leading `i64`.
+        let sp = self.emit_indirect_sp()?;
+        let mut argvals = vec![sp];
         for (arg, want) in args.iter().zip(&sig.params) {
             argvals.push(self.call_arg(arg, *want)?);
         }
@@ -4113,10 +4195,8 @@ impl<'a> FuncGen<'a> {
             .map(|id| format!("v{id}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let plist = sig
-            .params
-            .iter()
-            .map(|t| prefix(*t))
+        let plist = std::iter::once("i64".to_string())
+            .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
             .collect::<Vec<_>>()
             .join(", ");
         let rlist = sig
@@ -4163,7 +4243,10 @@ impl<'a> FuncGen<'a> {
                 visible.len()
             )));
         }
-        let mut argvals = vec![dest_addr];
+        // Funcref ABI: prepend `$sp` (slot order `[$sp] [$sret] [visible]`), matching the frame-needing
+        // sret target's signature and the leading `i64` added to the call_indirect type.
+        let sp = self.emit_indirect_sp()?;
+        let mut argvals = vec![sp, dest_addr];
         for (arg, want) in args.iter().zip(visible) {
             argvals.push(self.call_arg(arg, *want)?);
         }
@@ -4172,10 +4255,8 @@ impl<'a> FuncGen<'a> {
             .map(|id| format!("v{id}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let plist = sig
-            .params
-            .iter()
-            .map(|t| prefix(*t))
+        let plist = std::iter::once("i64".to_string())
+            .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
             .collect::<Vec<_>>()
             .join(", ");
         self.cur_buf.push_str(&format!(
@@ -4260,6 +4341,24 @@ impl<'a> FuncGen<'a> {
             return Err(LengError::Unsupported(format!(
                 "frameless proc calls frame-needing `{callee}` (no stack pointer to hand down)"
             )));
+        }
+        let sp = self.cur[0];
+        let fs = self.emit_const(ValType::I64, self.frame_size as i64);
+        let spid = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{spid} = i64.add v{sp} v{}\n", fs.id));
+        Ok(spid)
+    }
+
+    /// The `$sp` an **indirect call** hands its funcref callee: `sp + frame_size`, the top of this
+    /// proc's own frame — identical to [`emit_callee_sp`], but a funcref target's name isn't known at
+    /// the call site (the callee is a computed index). A proc that makes an indirect call is forced
+    /// frame-needing ([`proc_needs_frame`] via [`body_has_indirect_call`]), so `has_sp` holds here.
+    fn emit_indirect_sp(&mut self) -> Result<u32, LengError> {
+        if !self.has_sp {
+            return Err(LengError::Unsupported(
+                "frameless proc makes an indirect call (no stack pointer to hand down)".into(),
+            ));
         }
         let sp = self.cur[0];
         let fs = self.emit_const(ValType::I64, self.frame_size as i64);
@@ -4548,6 +4647,40 @@ fn collect_calls(node: &Node, out: &mut HashSet<String>) {
     if let Node::List(items) = node {
         for c in items {
             collect_calls(c, out);
+        }
+    }
+}
+
+/// Collect proc names taken as a **funcref** — a proc-name atom (in `procs`) that appears anywhere
+/// except a `call`'s head position (a direct call *to* it). A call argument, a `gvar`/field
+/// initializer, an `(addr …)` operand, etc. — all funcref uses that lower to `ref.func`. The head of
+/// a *direct* call is skipped (not a funcref of the proc); a computed/indirect head (a non-atom) is
+/// recursed into. See [`Translator::funcref_targets`].
+fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashSet<String>) {
+    if node.tag() == Some("call") {
+        let args = node.args();
+        // The head: recurse *unless* it is a bare proc-name atom (a direct call, not a funcref use).
+        // `map_or` not `is_none_or` — svm-leng compiles under the rustc 1.81 W5 guest toolchain floor.
+        #[allow(clippy::unnecessary_map_or)]
+        if let Some(head) = args.first() {
+            if head.as_atom().map_or(true, |a| !procs.contains(a)) {
+                collect_funcref_targets(head, procs, out);
+            }
+        }
+        for arg in args.iter().skip(1) {
+            collect_funcref_targets(arg, procs, out);
+        }
+        return;
+    }
+    if let Some(a) = node.as_atom() {
+        if procs.contains(a) {
+            out.insert(a.to_string());
+        }
+        return;
+    }
+    if let Node::List(items) = node {
+        for c in items {
+            collect_funcref_targets(c, procs, out);
         }
     }
 }

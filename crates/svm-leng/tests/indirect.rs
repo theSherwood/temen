@@ -49,8 +49,10 @@ fn store_funcref_then_call_through_field() {
     );
     // dbl = func 0, run = func 1. Box at offset 128: fn@0 (overwritten by the store), v@8 = 21.
     // run(128) stores ref.func dbl into b.fn, then b.fn(b.v) = dbl(21) = 21*21 = 441.
+    // `run` makes an indirect call, so under the funcref ABI it is frame-needing: it takes a leading
+    // `$sp` (2048 — well above the Box, never dereferenced since neither proc uses its frame).
     let b = 128usize;
-    assert_eq!(run_with_seed(&m, 1, &[b as i64], b + 8, 21), 441);
+    assert_eq!(run_with_seed(&m, 1, &[2048, b as i64], b + 8, 21), 441);
 }
 
 /// Like `run`, but pre-seed an i64 at `off` in the window before running (both engines, parity).
@@ -86,15 +88,19 @@ fn call_through_funcref_param() {
  (proc :dbl.0 (params (param :x.0 . (i +64))) (i +64) .
   (stmts . (ret (mul (i +64) x.0 x.0))))
  (proc :apply.0 (params (param :f.0 . IntFn.0.) (param :x.0 . (i +64))) (i +64) .
-  (stmts . (ret (call f.0 x.0)))))";
+  (stmts . (ret (call f.0 x.0))))
+ (proc :ref_dbl.0 . (i +64) .
+  (stmts . (discard dbl.0) (ret 0))))";
     let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = svm_leng::translate_to_text(leng).unwrap();
     assert!(
         text.contains("call_indirect"),
         "apply dispatches indirectly:\n{text}"
     );
-    // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49.
-    assert_eq!(run(&m, 1, &[0, 7]), 49);
+    // apply = func 1; f is the i32 funcref index of dbl (func 0), x = 7 → 49. `apply` makes an
+    // indirect call, so it is frame-needing under the funcref ABI: a leading `$sp` (2048) precedes
+    // the visible params (f, x).
+    assert_eq!(run(&m, 1, &[2048, 0, 7]), 49);
 }
 
 #[test]
@@ -116,7 +122,9 @@ fn virtual_dispatch_through_a_vtable() {
   (stmts .
    (ret (call
      (cast GetterP.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
-     o.0)))))";
+     o.0))))
+ (proc :ref_getX.0 . (i +64) .
+  (stmts . (discard getX.0) (ret 0))))";
     let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let text = svm_leng::translate_to_text(leng).unwrap();
@@ -134,13 +142,21 @@ fn virtual_dispatch_through_a_vtable() {
     seed[obj..obj + 8].copy_from_slice(&(vt as u64).to_le_bytes()); // o.vt = &Vtbl
     seed[obj + 8..obj + 16].copy_from_slice(&42u64.to_le_bytes()); // o.x = 42
 
+    // `dispatch` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
     let mut fuel = u64::MAX;
-    let (ir, _) = svm_interp::run_capture(&m, 1, &[Value::I64(obj as i64)], &mut fuel, &seed);
+    let (ir, _) = svm_interp::run_capture(
+        &m,
+        1,
+        &[Value::I64(2048), Value::I64(obj as i64)],
+        &mut fuel,
+        &seed,
+    );
     let iword = match ir.expect("interp").as_slice() {
         [Value::I64(n)] => *n,
         o => panic!("unexpected {o:?}"),
     };
-    let (jout, _) = svm_jit::compile_and_run_capture(&m, 1, &[obj as i64], &seed).expect("jit");
+    let (jout, _) =
+        svm_jit::compile_and_run_capture(&m, 1, &[2048, obj as i64], &seed).expect("jit");
     let jword = match jout {
         svm_jit::JitOutcome::Returned(v) => v,
         o => panic!("jit: {o:?}"),

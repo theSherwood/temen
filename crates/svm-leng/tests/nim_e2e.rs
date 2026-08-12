@@ -13,7 +13,8 @@
 //! the fast, toolchain-free unit tests.
 
 use std::process::Command;
-use svm_interp::Value;
+use std::sync::{Arc, Mutex};
+use svm_interp::{cap_id, run_with_host, BoundImport, Host, Value};
 use svm_ir::{LinkUnit, Module};
 
 /// The runtime shim's function indices, keyed by the C symbol each bottom-edge import lowers to.
@@ -298,9 +299,14 @@ fn real_allocator_runs_end_to_end() {
         let mut window = vec![0u8; 1 << 20];
         let brk = svm_ir::POWERBOX_HEAP_BRK as usize;
         window[brk..brk + 8].copy_from_slice(&(1i64 << 19).to_le_bytes());
-        let (first, after) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &window);
+        // `osAllocPages` is frame-needing under the funcref ABI — it can reach the OOM/abort path,
+        // whose handler is an indirect call — so its signature is `($sp, size)`. Give it a data-stack
+        // base above the seeded heap region (heap at 1<<19; this run bumps only two pages), well clear
+        // of the heap and globals; `size` is the second arg.
+        let sp = 0xC_0000; // 768 KiB
+        let (first, after) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[sp, 4096], &window);
         assert_eq!(first, 1 << 19, "first page is the seeded heap start");
-        let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[4096], &after);
+        let (second, _) = run_export_seeded(m, "osAllocPages.0.sysvq0asl", &[sp, 4096], &after);
         assert_eq!(second, (1 << 19) + 4096, "second page bumped by one page");
     });
 }
@@ -411,5 +417,147 @@ fn nim_for_in_seq_iterator_runs_end_to_end() {
                 "for x in s: sum of squares"
             );
         },
+    );
+}
+
+/// **The end-to-end I/O milestone (Path B).** A real `std/syncio` program that writes to stdout —
+/// compiled by the nimony toolchain, lowered and linked by svm-leng (this time *retaining* the raw
+/// syscall leaves as manifest imports, `link_whole_with_runtime_manifest`), then run with `sysWrite`
+/// bound to a capture buffer. It carries the whole Path-B chain — nimony → hexer → svm-leng →
+/// manifest-link → run — end to end, exercising W1 (aggregate globals, variant objects, cross-module
+/// sret, the `$`/string machinery), W2 (linking), and W3 (the syscall seam + the `$sp`-carrying
+/// funcref ABI the at-exit stdout flush registered via `setExitFlush` depends on). Interp only: the
+/// host-proc import binding is the tree-walker's path; the pure-compute e2e tests above cover §9
+/// interp/JIT parity.
+#[test]
+fn real_write_program_prints_to_stdout() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nwrite(stdout, \"hello, svm\\n\")\n",
+    );
+    assert_eq!(run_io_program(&mods), b"hello, svm\n", "captured stdout");
+}
+
+/// Manifest-link `mods` (retaining `write`/`read`/`_exit`/… as bindable imports), then run the
+/// `exportc` `main` with `sysWrite` bound to a stdout capture and the other syscall leaves stubbed.
+/// `main` is `($sp, argc, argv, envp) -> cint`, so it receives a data-stack base above the globals;
+/// argc/argv/envp are zero (this program reads none). Returns the captured stdout bytes.
+fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
+    // Bind the pure-compute bottom edge to the shim (as `link_with_runtime`), but via the *manifest*
+    // link so the raw-syscall leaves survive as host-bound imports rather than fail-closing.
+    let mut import_names: Vec<String> = Vec::new();
+    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
+        let obj = svm_encode::decode_unit(
+            &svm_leng::compile_whole_object(&svm_leng::WholeModule { stem, src })
+                .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
+        )
+        .expect("decode object");
+        for imp in &obj.imports {
+            if import_names.iter().all(|n| n != &imp.name) {
+                import_names.push(imp.name.clone());
+            }
+        }
+    }
+    const SHIM: &str = include_str!("fixtures/system_runtime.svm.txt");
+    let shim = svm_text::parse_module(SHIM).expect("runtime shim parses");
+    let exports: Vec<(String, u32)> = import_names
+        .iter()
+        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
+        .collect();
+    let runtime = LinkUnit {
+        module: shim,
+        exports,
+        ..Default::default()
+    };
+    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
+    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    let units: Vec<svm_leng::WholeModule> = ordered
+        .iter()
+        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .collect();
+    let m = svm_leng::link_whole_with_runtime_manifest(&units, vec![runtime])
+        .unwrap_or_else(|e| panic!("manifest link: {e}"));
+    svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+
+    let main_idx = m
+        .exports
+        .iter()
+        .find(|e| e.name == "main")
+        .map(|e| e.func)
+        .expect("exportc main");
+    // Bind each retained syscall import: `sysWrite` → the capture buffer, the rest → a no-op stub.
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut host = Host::new();
+    let mut bindings = Vec::new();
+    for imp in &m.imports {
+        let handle = if imp.name.starts_with("sysWrite") {
+            let cap = captured.clone();
+            host.grant_host_proc(Box::new(move |_op, args, mem, _| {
+                // sysWrite(fd, buf, n): copy the `n` bytes at `buf` out of the guest window.
+                let (buf, n) = (args[1] as u64, args[2] as u64);
+                if let Some(mm) = mem {
+                    if let Some(bytes) = mm.read_bytes(buf, n) {
+                        cap.lock().unwrap().extend_from_slice(&bytes);
+                    }
+                }
+                Ok(vec![n as i64])
+            }))
+        } else {
+            host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])))
+        };
+        bindings.push(BoundImport::required(
+            cap_id::HOST_PROC,
+            bindings.len() as u32,
+            handle,
+        ));
+    }
+    host.set_import_bindings(bindings);
+
+    let sp = svm_ir::POWERBOX_STACK_PAGE as i64 + 0x40000; // data-stack base, well above the globals
+    let args = [Value::I64(sp), Value::I32(0), Value::I64(0), Value::I64(0)];
+    let mut fuel = 500_000_000u64;
+    run_with_host(&m, main_idx, &args, &mut fuel, &mut host)
+        .unwrap_or_else(|e| panic!("run main: {e:?}"));
+    let out = captured.lock().unwrap().clone();
+    out
+}
+
+/// Richer end-to-end I/O over the same chain — output that actually *formats*, exercising the
+/// cross-module sret `$`(int)→string conversion and the `$sp`-carrying funcref ABI (the at-exit
+/// flush) on top of W1/W2/W3: an `$`-formatted integer, a loop emitting one conversion per iteration,
+/// and a `writeLine` pair. Same manifest-link + `sysWrite`-capture harness as the hello case.
+#[test]
+fn real_formatted_output_runs_end_to_end() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nwrite(stdout, $(20 + 22))\n"
+        )),
+        b"42",
+        "`$`(int)->string then write"
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nfor i in 0..2: write(stdout, $i)\n"
+        )),
+        b"012",
+        "loop with a per-iteration `$` conversion"
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(
+            &path,
+            "import std/syncio\nwriteLine(stdout, \"line one\")\nwriteLine(stdout, \"line two\")\n"
+        )),
+        b"line one\nline two\n",
+        "two writeLine calls"
     );
 }
