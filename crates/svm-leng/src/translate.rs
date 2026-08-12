@@ -1138,6 +1138,41 @@ impl Translator {
         Ok(())
     }
 
+    /// Lay out one `(fld :name pragmas Type)` member: returns `(name, desc, advance)`, where
+    /// `advance` is the bytes the field occupies (0 for a flexible-array tail — `uarray`/`flexarray`,
+    /// an `UncheckedArray` like `LongString.data`, whose own address is the array base and which
+    /// stops the object's fixed size). Shared by the plain-object loop and the variant-object
+    /// `union`-branch layout, so both classify nested aggregate fields and flex tails identically.
+    fn layout_field(
+        &mut self,
+        fld: &Node,
+        raw: &HashMap<String, &Node>,
+    ) -> Result<(String, TyDesc, u64), LengError> {
+        let fa = fld.args();
+        if fa.len() < 3 {
+            return Err(LengError::Malformed("fld needs :name pragmas type".into()));
+        }
+        let fname = sym_def(&fa[0])?;
+        if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
+            let elem = fa[2]
+                .args()
+                .first()
+                .map(|e| self.tydesc(e))
+                .transpose()?
+                .unwrap_or(TyDesc::Narrow {
+                    bytes: 1,
+                    signed: false,
+                });
+            return Ok((fname, TyDesc::FlexArray(Box::new(elem)), 0));
+        }
+        let fdesc = self.tydesc(&fa[2])?;
+        if let TyDesc::Agg(n) = &fdesc {
+            self.resolve_type(n, raw)?;
+        }
+        let fsize = self.sizeof(&fdesc);
+        Ok((fname, fdesc, fsize))
+    }
+
     fn resolve_type(&mut self, name: &str, raw: &HashMap<String, &Node>) -> Result<(), LengError> {
         if self.types.contains_key(name) {
             return Ok(());
@@ -1180,38 +1215,43 @@ impl Translator {
                     }
                 }
                 for fld in body.args() {
-                    if fld.tag() != Some("fld") {
-                        continue; // skip the base/Empty slot
+                    match fld.tag() {
+                        Some("fld") => {
+                            let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                            fields.push((fname, off, fdesc));
+                            off += fsize;
+                        }
+                        Some("union") => {
+                            // A **variant/case object**: `(union (object (fld…))+)` — each `of`
+                            // branch is a sub-object whose fields **overlap** at the same base
+                            // (Nim's tagged union; the discriminant field precedes the union). Lay
+                            // every branch out starting at the current offset, and advance past the
+                            // largest branch. All branch fields join the one flat field list, so a
+                            // `foo.y` access or a `Foo(x: …, y: …)` constructor resolves any
+                            // branch's field — which variant is *live* is guarded by the
+                            // discriminant at run time (nimony emits those checks; overlapping
+                            // storage is the correct layout regardless).
+                            let union_base = off;
+                            let mut union_max = 0u64;
+                            for branch in fld.args() {
+                                if branch.tag() != Some("object") {
+                                    continue;
+                                }
+                                let mut boff = union_base;
+                                for bf in branch.args() {
+                                    if bf.tag() != Some("fld") {
+                                        continue;
+                                    }
+                                    let (fname, fdesc, fsize) = self.layout_field(bf, raw)?;
+                                    fields.push((fname, boff, fdesc));
+                                    boff += fsize;
+                                }
+                                union_max = union_max.max(boff - union_base);
+                            }
+                            off = union_base + union_max;
+                        }
+                        _ => {} // the base/Empty slot (an atom), or anything else
                     }
-                    let fa = fld.args();
-                    if fa.len() < 3 {
-                        return Err(LengError::Malformed("fld needs :name pragmas type".into()));
-                    }
-                    let fname = sym_def(&fa[0])?;
-                    // A flexible-array tail (`uarray`/`flexarray` — an `UncheckedArray`, e.g.
-                    // `LongString.data`): unsized inline data. It occupies no *fixed* size (the
-                    // object's size stops here); its own address is the array base, indexed by
-                    // `at`/`pat`. Record it as a `FlexArray` at the current offset and stop advancing.
-                    if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
-                        let elem = fa[2]
-                            .args()
-                            .first()
-                            .map(|e| self.tydesc(e))
-                            .transpose()?
-                            .unwrap_or(TyDesc::Narrow {
-                                bytes: 1,
-                                signed: false,
-                            });
-                        fields.push((fname, off, TyDesc::FlexArray(Box::new(elem))));
-                        continue;
-                    }
-                    let fdesc = self.tydesc(&fa[2])?;
-                    if let TyDesc::Agg(n) = &fdesc {
-                        self.resolve_type(n, raw)?;
-                    }
-                    let fsize = self.sizeof(&fdesc);
-                    fields.push((fname, off, fdesc));
-                    off += fsize;
                 }
                 Layout::Object { fields, size: off }
             }

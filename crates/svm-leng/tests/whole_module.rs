@@ -152,6 +152,31 @@ fn aggregate_const_with_float_fields() {
 }
 
 #[test]
+fn variant_object_union_fields_resolve() {
+    // A **variant / case object** (`type Foo = object; case k: bool; of false: y: int; of true:
+    // z: int; w: int`). `hexer` emits it as `(object (fld k …) (union (object (fld y …)) (object
+    // (fld z …) (fld w …))))`. `collect_types` skipped the `union`, so `foo.y`/`foo.z` and any
+    // `Foo(k: …, y: …)` constructor fail-closed ("no field"/"const field not in"). The union's
+    // branches now lay out **overlapping** at the same base (Nim's tagged union): `y` and `z`
+    // share the slot after `k`; `w` follows `z`. `f` writes `k`+`y`, reads them back = 1 + 42.
+    let leng = "\
+(stmts
+ (type :Foo.0. .
+  (object .
+   (fld :k.0 . (i +64))
+   (union
+    (object . (fld :y.0 . (i +64)))
+    (object . (fld :z.0 . (i +64)) (fld :w.0 . (i +64))))))
+ (proc :f.0. (params (param :p.0 . (ptr Foo.0.))) (i +64) .
+  (stmts .
+   (asgn (dot (deref p.0) k.0 0) 1)
+   (asgn (dot (deref p.0) y.0 1) 42)
+   (ret (add (i +64) (dot (deref p.0) k.0 0) (dot (deref p.0) y.0 1))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[4096]), 43, "k(1) + y(42) via variant fields");
+}
+
+#[test]
 fn global_pointer_deref() {
     // A module-level **pointer global** (`var x: ptr Node` — nimony's `ref NodeObj`, lowered to a
     // pointer) is dereferenced: `roundtrip` builds a frame object, points the global at it, then reads
