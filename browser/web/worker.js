@@ -31,7 +31,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime } = e.data;
+    jitB2, jitRuntime, tierupPaged } = e.data;
   // I22 liveness backstop. The `svm_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, svm_par_enable_jit / _jit_codegen /
   // _inst_codegen, svm_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -68,7 +68,10 @@ self.onmessage = async (e) => {
   // instantiates the emitted module against the ONE shared memory (each Worker instantiates its own —
   // wasm tables aren't shareable across Workers). On PAR_TIERUP it calls `f{func}` here.
   let emitted = null, envCell = 0;
-  if (tierup && ex.svm_par_enable_jit(gptr, glen) === 1) {
+  // #750: `tierupPaged` opts the run into the paged tier — unmap/protect guests keep their pure
+  // leaves eligible; each TIERUP then also carries a page-state table (see the handler below).
+  const enableJit = tierupPaged ? ex.svm_par_enable_jit_paged : ex.svm_par_enable_jit;
+  if (tierup && enableJit(gptr, glen) === 1) {
     const wptr = Number(ex.svm_wasmjit_ptr()), wlen = ex.svm_wasmjit_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
@@ -392,8 +395,14 @@ self.onmessage = async (e) => {
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]); // i64 args → BigInt
       // #717 host sync: the event's committed-extent snapshot → the emitted `"mapped"` global, so
       // the emitted bounds check admits exactly what the interpreter would (idempotent over today's
-      // fully-mapped par window; load-bearing once the window can `vm_map`-grow).
+      // fully-mapped par window; load-bearing once the window can `vm_map`-grow). On a #750 paged
+      // run, operand b is the page-state table's COVERAGE (the engine computes it with the table).
       emitted.mapped.value = ex.svm_par_ev_b(v);
+      // #750 paged runs: point the emitted `"pagestate"` global at the engine-built table — its
+      // Rust-heap address is a linear-memory address (one shared memory, zero copies). Empty (and
+      // the global absent) on unpaged runs.
+      if (Number(ex.svm_par_tierup_pagestate_len(v)) > 0)
+        emitted.pagestate.value = Number(ex.svm_par_tierup_pagestate_ptr(v));
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel; preempt = write < 0
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {

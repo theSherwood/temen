@@ -87,7 +87,7 @@ fn run_vcpu(frames: usize, tierup: bool) -> (Vec<u8>, u32) {
     }
     let mut tierups = 0u32;
     for _ in 0..frames {
-        r.frame(1, &[Value::I32(out)], &host, |func, argv, mapped| {
+        r.frame(1, &[Value::I32(out)], &host, |func, argv, mapped, _info| {
             tierups += 1;
             // Emulate the emitted `f{func}(argv...)`: run the pure callee standalone.
             assert_eq!(func, 2, "only func 2 is eligible");

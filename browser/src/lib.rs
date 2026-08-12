@@ -747,6 +747,11 @@ pub struct ParVcpu {
     /// caching the instance by [`jit_code`](ParVcpu::jit_code). `None` for the fixed-unit codegen path
     /// (that reads the run-wide [`JIT_UNIT_WASM`] stash). The `Arc` keeps the bytes alive for the read.
     jit_wasm: Option<std::sync::Arc<[u8]>>,
+    /// #750 paged runs: the page-state table for a pending [`PAR_TIERUP`], rebuilt from the live
+    /// page map at each event ([`bytecode::build_pagestate_table`]). Its bytes live in this
+    /// module's linear memory, so [`svm_par_tierup_pagestate_ptr`] IS the address the Worker
+    /// writes to the emitted module's `"pagestate"` global. Empty on unpaged runs.
+    pagestate: Vec<u8>,
 }
 
 /// SVM scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
@@ -775,6 +780,7 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         jit_param_types: Vec::new(),
         jit_result_types: Vec::new(),
         jit_wasm: None,
+        pagestate: Vec::new(),
     }))
 }
 
@@ -783,7 +789,16 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
 /// run different modules/windows, so they stay on the interpreter.
 fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
     match par_jit_eligible() {
-        Some(e) => inner.with_jit_eligible(e),
+        Some(e) => {
+            let inner = inner.with_jit_eligible(e);
+            // #750: a paged eligible set needs the dispatch to skip the scalar decline (the
+            // per-event page-state table carries the fidelity the scalar cannot).
+            if par_jit_paged() {
+                inner.with_jit_page_checked()
+            } else {
+                inner
+            }
+        }
         None => inner,
     }
 }
@@ -796,6 +811,16 @@ static mut PAR_JIT_ELIGIBLE: Option<std::sync::Arc<[bool]>> = None;
 fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
     // SAFETY: single-threaded per instance (the page, or one Worker) — same access model as `WASMJIT_MOD`.
     unsafe { (*core::ptr::addr_of!(PAR_JIT_ELIGIBLE)).clone() }
+}
+
+/// #750: whether this instance's tier-up module was emitted **paged**
+/// ([`svm_par_enable_jit_paged`]) — the vCPUs then skip the scalar decline and every `PAR_TIERUP`
+/// carries a freshly built page-state table (operand `b` = its coverage).
+static mut PAR_JIT_PAGED: bool = false;
+
+fn par_jit_paged() -> bool {
+    // SAFETY: single-threaded per instance — same access model as `PAR_JIT_ELIGIBLE`.
+    unsafe { *core::ptr::addr_of!(PAR_JIT_PAGED) }
 }
 
 // ==== I22 fix: emit each per-Worker codegen unit exactly ONCE per run ============================
@@ -927,6 +952,58 @@ pub extern "C" fn svm_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 
             stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
             *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
             *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
+            *core::ptr::addr_of_mut!(PAR_JIT_PAGED) = false;
+        }
+        1
+    })();
+    TIERUP_RESULT.store(result, Ordering::Relaxed);
+    TIERUP_DONE_GEN.store(generation, Ordering::Relaxed);
+    result
+}
+
+/// [`svm_par_enable_jit`], but the tier-up module is emitted **paged** (#750,
+/// `compile_module_tierup_paged` with this instance's software page size): `unmap`/`protect`
+/// guests keep their pure leaves eligible, and every emitted access consults the per-event
+/// page-state table (see [`svm_par_tierup_pagestate_ptr`]; the Worker writes its base to the
+/// emitted `"pagestate"` global and event operand `b` — the table's coverage — to `"mapped"`).
+/// A run calls exactly ONE of the two enable entries (they share the once-per-run stash).
+/// Same contract otherwise: call on every instance before building vCPUs, same bytes.
+#[no_mangle]
+pub extern "C" fn svm_par_enable_jit_paged(mod_ptr: *const u8, mod_len: usize) -> i32 {
+    use std::sync::atomic::Ordering;
+    par_install_panic_capture();
+    let guard = CodegenGuard::acquire();
+    let generation = guard.generation();
+    if TIERUP_DONE_GEN.load(Ordering::Relaxed) == generation {
+        return TIERUP_RESULT.load(Ordering::Relaxed);
+    }
+    let result = (|| {
+        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `svm_alloc`ation it just filled.
+        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+        let Ok(m) = svm_encode::decode_module(bytes) else {
+            return 0;
+        };
+        let page_log2 = svm_interp::host_page_size().trailing_zeros() as u8;
+        let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup_paged(&m, true, page_log2)
+        else {
+            return 0;
+        };
+        let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
+        let eligible: Vec<bool> = m
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
+            .collect();
+        if !eligible.iter().any(|&e| e) {
+            return 0; // nothing safely tier-up-able → leave everything on the interpreter
+        }
+        // SAFETY: written once per run while CODEGEN_LOCK is held; Workers read it stable.
+        unsafe {
+            stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
+            *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
+            *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
+            *core::ptr::addr_of_mut!(PAR_JIT_PAGED) = true;
         }
         1
     })();
@@ -1894,7 +1971,22 @@ pub extern "C" fn svm_par_run(v: *mut ParVcpu) -> i32 {
             // exactly what the interpreter would over a `vm_map`-grown window (#717 host sync).
             bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 v.a = func as i64;
-                v.b = mapped as i64;
+                if par_jit_paged() {
+                    // #750: rebuild the page-state table from the live map (frozen while emitted
+                    // code runs); operand `b` becomes the table's COVERAGE — the value the Worker
+                    // writes to the emitted `"mapped"` global — and the table bytes are read via
+                    // `svm_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
+                    // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
+                    let info = v
+                        .inner
+                        .mem_map_info()
+                        .unwrap_or((1, 0, 0, Vec::new()));
+                    let (table, cover) = bytecode::build_pagestate_table(&info);
+                    v.pagestate = table;
+                    v.b = cover as i64;
+                } else {
+                    v.b = mapped as i64;
+                }
                 v.tierup_argv = argv.into_vec();
                 return PAR_TIERUP;
             }
@@ -2123,6 +2215,23 @@ pub extern "C" fn svm_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) 
 pub extern "C" fn svm_par_tierup_argv_ptr(v: *mut ParVcpu) -> *const i64 {
     // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
     unsafe { (*v).tierup_argv.as_ptr() }
+}
+
+/// #750: the pending [`PAR_TIERUP`]'s page-state table base (paged runs only — see
+/// [`svm_par_enable_jit_paged`]). The bytes live in this module's linear memory, so this pointer
+/// is exactly the value the Worker writes to the emitted module's `"pagestate"` global.
+#[no_mangle]
+pub extern "C" fn svm_par_tierup_pagestate_ptr(v: *mut ParVcpu) -> *const u8 {
+    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
+    unsafe { (*v).pagestate.as_ptr() }
+}
+
+/// Byte length of the pending tier-up's page-state table (`0` on an unpaged run — the Worker
+/// skips the `"pagestate"` write, which the unpaged module doesn't export anyway).
+#[no_mangle]
+pub extern "C" fn svm_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe { (*v).pagestate.len() }
 }
 
 /// Number of tier-up args (see [`svm_par_tierup_argv_ptr`]).
@@ -3859,7 +3968,7 @@ impl SharedOnrampReactor {
         // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
         let result = self
             .reactor
-            .frame(self.tick, &args, &self.host, |_func, _argv, _mapped| {
+            .frame(self.tick, &args, &self.host, |_func, _argv, _mapped, _info| {
                 Err(Trap::Malformed)
             });
         let status = match result {

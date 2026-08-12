@@ -3203,11 +3203,14 @@ fn emit_confine_maybe_aligned(
         cx.depth -= 1;
     }
     // #750 (paged modules only): the software page-check — first and, when the access can straddle
-    // a page boundary (`width > 1`), last touched page, exactly the pages the oracle's `check_prot`
-    // walks. NEVER elided: `elide` proves the access in-window, but page *state* is dynamic, so an
-    // in-window proof says nothing about mapped/RW (#750's honest-limits note). No-op when unpaged.
+    // a page boundary, last touched page, exactly the pages the oracle's `check_prot` walks. An
+    // `align`ed access never straddles (the align trap above already fired for a misaligned
+    // address, and a `width`-aligned access of power-of-two `width` ≤ page size lies in one page),
+    // so only unaligned multi-byte accesses consult the second page. NEVER elided: `elide` proves
+    // the access in-window, but page *state* is dynamic, so an in-window proof says nothing about
+    // mapped/RW (#750's honest-limits note). No-op when unpaged.
     emit_page_check_one(cx, code, 0, write);
-    if width > 1 {
+    if width > 1 && !align {
         emit_page_check_one(cx, code, width - 1, write);
     }
     code.push(OP_LOCAL_GET);

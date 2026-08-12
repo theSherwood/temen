@@ -21011,7 +21011,7 @@ impl Host {
 /// same value, so they agree page-for-page on any platform (4 KiB / 16 KiB / …). Lazy paging keeps
 /// interpreter memory bounded by what a (fuel-limited) run touches, so a huge declared window never
 /// eagerly allocates — safe to fuzz.
-fn host_page_size() -> u64 {
+pub fn host_page_size() -> u64 {
     // This is the **software** protection granularity of the interpreter's `Mem` (the `map`/`unmap`/
     // `protect` prot-map and the `Paged` chunking) — NOT wasm's 64 KiB linear-memory page. A guest's
     // `map` calls must align to it, and an on-ramp C guest (svm-llvm-translate) emits 4 KiB-granular

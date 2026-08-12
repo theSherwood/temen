@@ -2436,6 +2436,11 @@ pub struct VcpuReactor {
     mem: Option<Mem>,
     /// The tier-up eligibility bitmap (`None` ⇒ everything interprets — the pure-substitute mode).
     eligible: Option<std::sync::Arc<[bool]>>,
+    /// #750 **paged tier-up**: the eligible set was emitted with the software page-check
+    /// (`compile_module_tierup_paged`). Frames then surface tier-up regardless of the window's
+    /// scalar representability, and each `TierUp` hands `service` the live [`MemMapInfo`] to build
+    /// its page-state table from ([`build_pagestate_table`]).
+    page_checked: bool,
 }
 
 impl VcpuReactor {
@@ -2468,6 +2473,7 @@ impl VcpuReactor {
             prog,
             mem,
             eligible: None,
+            page_checked: false,
         })
     }
 
@@ -2479,13 +2485,24 @@ impl VcpuReactor {
         self
     }
 
+    /// #750 paged tier-up: mark the eligible set as page-checked (see [`Vcpu::with_jit_page_checked`]).
+    /// Each frame's `TierUp` then carries the live [`MemMapInfo`] to `service` so the driver can
+    /// refresh its page-state table ([`build_pagestate_table`]) before running emitted code.
+    pub fn with_jit_page_checked(mut self) -> VcpuReactor {
+        self.page_checked = true;
+        self
+    }
+
     /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
-    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped)` — return the callee's i64
-    /// result slots (or an `Err(Trap)` to propagate the emitted region's trap). `mapped` is the
-    /// window's scalar committed extent at call entry: `service` MUST write it to the emitted
-    /// module's `"mapped"` global before invoking `f{func}` (#717 host sync). With no eligibility
-    /// set, `service` is never called. The window persists after the call (reclaimed for the next
-    /// frame).
+    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped, map_info)` — return the
+    /// callee's i64 result slots (or an `Err(Trap)` to propagate the emitted region's trap).
+    /// `mapped` is the window's scalar committed extent at call entry: `service` MUST write it to
+    /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
+    /// `map_info` is `Some` only on a [`with_jit_page_checked`](Self::with_jit_page_checked)
+    /// reactor: the live page map, from which `service` builds its page-state table
+    /// ([`build_pagestate_table`]) and writes the returned coverage to `"mapped"` **instead** of
+    /// the event's value (#750). With no eligibility set, `service` is never called. The window
+    /// persists after the call (reclaimed for the next frame).
     pub fn frame<F>(
         &mut self,
         func: FuncIdx,
@@ -2494,7 +2511,7 @@ impl VcpuReactor {
         mut service: F,
     ) -> Result<Vec<Value>, Trap>
     where
-        F: FnMut(u32, &[i64], u64) -> Result<Vec<i64>, Trap>,
+        F: FnMut(u32, &[i64], u64, Option<MemMapInfo>) -> Result<Vec<i64>, Trap>,
     {
         let mem = self.mem.take();
         let result;
@@ -2505,12 +2522,22 @@ impl VcpuReactor {
             if let Some(e) = &self.eligible {
                 vcpu = vcpu.with_jit_eligible(e.clone());
             }
+            if self.page_checked {
+                vcpu = vcpu.with_jit_page_checked();
+            }
             result = loop {
                 match vcpu.run() {
                     VcpuEvent::Done(v) => break Ok(v),
                     VcpuEvent::Trapped(t) => break Err(t),
                     VcpuEvent::TierUp { func, argv, mapped } => {
-                        match service(func, &argv, mapped) {
+                        // Paged reactors snapshot the live page map for the driver's table build;
+                        // computed only here (page state is frozen while emitted code runs).
+                        let info = if self.page_checked {
+                            vcpu.mem_map_info()
+                        } else {
+                            None
+                        };
+                        match service(func, &argv, mapped, info) {
                             Ok(vals) => vcpu.deliver_tierup(&vals),
                             Err(t) => vcpu.deliver_tierup_trap(t),
                         }
@@ -4169,6 +4196,44 @@ pub type AccessSinkFn = Box<dyn FnMut(u64, usize, super::MemEvent) + Send>;
 /// The window memory-map introspection tuple — `(page_size, mapped, reserved, explicit-state
 /// pages)`, the shape `Mem::map_info` returns (INTERACTIVE_EMBEDDING.md slice 5).
 pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
+
+/// Build the #750 paged-driver **page-state table** from a window's [`MemMapInfo`]: one byte per
+/// page over `[0, coverage)` — `0 = Unmapped`, `1 = Rw`, `2 = Ro` (the emitted check's encoding) —
+/// where `coverage` (also returned) is `max(mapped prefix, highest explicit entry end)` in bytes.
+///
+/// This is THE per-emitted-call driver contract for a page-checked run (refresh from
+/// [`Vcpu::mem_map_info`], write the table where emitted code can read it, its base to the
+/// `"pagestate"` global, and **`coverage` — not the reserved mask-domain size — to `"mapped"`**):
+/// the bound check then traps everything above the table exactly where the interpreter (no
+/// entries above) faults, and the page states refine within. Returning the coverage alongside the
+/// table is what makes the contract hard to get wrong. A `Backed` (§13 region-aliased) page is
+/// marked `Unmapped` — fail-closed (the emitted tier cannot read a region's bytes), and
+/// unreachable for a paged module anyway (SharedRegion gates the whole module off the paged tier).
+pub fn build_pagestate_table(info: &MemMapInfo) -> (Vec<u8>, u64) {
+    let (page, mapped, _reserved, entries) = info;
+    let top = entries
+        .iter()
+        .map(|(off, _)| off / page + 1)
+        .max()
+        .unwrap_or(0)
+        .max(mapped / page);
+    let mut t = vec![0u8; top as usize];
+    for (i, b) in t.iter_mut().enumerate() {
+        if (i as u64) * page < *mapped {
+            *b = 1; // Rw default inside the mapped prefix
+        }
+    }
+    for (off, kind) in entries {
+        // `map_info` kinds: 0 = Ro, 1 = Rw, 2 = Unmapped, 3 = Backed (§13 alias).
+        t[(off / page) as usize] = match kind {
+            0 => 2,
+            1 => 1,
+            _ => 0, // Unmapped, and Backed fail-closed (see above)
+        };
+    }
+    let coverage = t.len() as u64 * page;
+    (t, coverage)
+}
 
 /// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
 /// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
