@@ -8,6 +8,7 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import { runJitModule, runWarmJit, runJitCompiler, runJitSelfhost } from './wasmjit-module.js';
+import { SnapshotClient } from './snapshot-client.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -1225,6 +1226,7 @@ function winSizeOf(src) {
 // a time (a fresh Run supersedes any running reactor). `eng`/`run` are the shared wasm engine; `broken`
 // latches when a threaded run is Stopped mid-flight (shared state may wedge → every card's Run disables).
 let eng, run, aborter = null, broken = false;
+let snapshotClient = null; // the snapshot worker (issue #804): owns warm-card sessions off the main thread
 let engineReady = false; // set once the wasm engine loads; gates the per-card Debug/Run enablement
 const cards = [];
 
@@ -1600,7 +1602,28 @@ async function runModule(c) {
   setState(c, 'running', `running…${useJit ? ' [wasm-JIT]' : ''}`);
   const t0 = performance.now();
   let rv = 0, status, tier = 'interpreter', stdout = '';
-  if (useJit && ex.warm) {
+  // Warm cards run their snapshot on the dedicated **snapshot worker** (issue #804): the ~one-time warmup
+  // and the eval happen off the main thread, so the UI never blocks. The worker was (usually) pre-warmed
+  // on page load, so this is just an eval round-trip. A worker miss (not available, or the module isn't a
+  // warm driver) leaves `status` undefined and falls through to the main-thread warm/JIT/interpreter path.
+  if (ex.warm && snapshotClient) {
+    try {
+      const source = ex.editable ? c.editor.getValue() : '';
+      if (!snapshotClient.isWarming(ex.url)) setState(c, 'running', 'warming up runtime (first Run)…');
+      const r = await snapshotClient.evalWarm(ex.url, () => Promise.resolve(bytes), source, useJit);
+      if (r.ok) {
+        rv = r.value; status = r.status; stdout = r.stdout; tier = r.tier;
+        // Observability hook (harmless): lets the browser test confirm the run actually went through the
+        // worker rather than silently falling back to the main thread.
+        globalThis.__snapshotWorkerRuns = (globalThis.__snapshotWorkerRuns || 0) + 1;
+      } else {
+        logTo(c, `snapshot worker: ${r.error}; falling back to the main thread`);
+      }
+    } catch (e) {
+      logTo(c, `snapshot worker unavailable (${e.message}); falling back to the main thread`);
+    }
+  }
+  if (status === undefined && useJit && ex.warm) {
     try {
       // Warm+JIT (WASM_AOT.md): evaluate the user's code on emitted wasm **over the restored warm image**
       // — the QuickJS runtime init stays paid-once (the snapshot), and the eval itself runs near-native.
@@ -1619,7 +1642,7 @@ async function runModule(c) {
       runNote(rec, { jitFallbackReason: e.message });
       status = undefined;
     }
-  } else if (useJit) {
+  } else if (status === undefined && useJit) {
     try {
       // Emit `_start` and run it on wasm; svm_onramp_jit_run_finish captures stdout/exit/value into the
       // shared slots (read back via the usual accessors, exactly like the interpreter path). `svm_run_value`
@@ -3425,6 +3448,32 @@ async function main() {
     else if (c.el.debug) c.el.debug.disabled = false;
   }
   setEngineState('ready', 'engine ready');
+
+  // Spin up the snapshot worker (issue #804) and pre-warm every warm card off the main thread, so the
+  // ~one-time QuickJS warmup is done before the user's first Run and never blocks the UI. Best-effort: if
+  // the worker fails to start, warm cards silently fall back to the main-thread warm path on Run. Deferred
+  // to idle so it doesn't compete with initial page setup, and the 4 MiB snapshot fetch stays off the
+  // critical path. Each pre-warming card shows a "warming up…" indicator until its session is ready.
+  try {
+    snapshotClient = new SnapshotClient(eng.module);
+    const warmCards = cards.filter((c) => c.ex.warm);
+    if (warmCards.length) {
+      const prewarmAll = () => {
+        for (const c of warmCards) {
+          setState(c, 'warming', 'warming up runtime…');
+          snapshotClient
+            .prewarm(c.ex.url, () => fetchModule(c.ex.url))
+            .then((r) => setState(c, 'ready', r.ok ? 'runtime warm — Run is instant' : 'ready'))
+            .catch(() => setState(c, 'ready', 'ready'));
+        }
+      };
+      if (typeof requestIdleCallback === 'function') requestIdleCallback(prewarmAll, { timeout: 3000 });
+      else setTimeout(prewarmAll, 0);
+    }
+  } catch (e) {
+    snapshotClient = null;
+    console.warn('[SVM playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
+  }
 }
 
 main().catch((e) => setEngineState('error', `fatal: ${e.message}`));
