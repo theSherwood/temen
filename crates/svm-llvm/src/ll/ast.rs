@@ -747,6 +747,10 @@ pub struct GlobalVariable {
     pub initializer: Option<ConstantRef>,
     pub is_constant: bool,
     pub alignment: u32,
+    /// `@g = … thread_local … global …` — a thread-local (TLS) variable. When set, the translator
+    /// peels this global out of the shared window and into the per-vCPU `vcpu.tls`-relative TLS block
+    /// (NIM.md §3d Tier-2); every access lowers to `vcpu.tls.get() + offset`.
+    pub thread_local: bool,
 }
 
 /// A global alias (`@a = alias … @b`). Mirrors the consumed subset of `llvm_ir::GlobalAlias`.

@@ -345,61 +345,83 @@ exit:\n\
 }
 
 #[test]
-fn thread_local_address_tier1_and_pause_drop() {
-    // The threaded-`std` build's native TLS shape: a `thread_local` global, addressed via
-    // `llvm.threadlocal.address`, with a `core::hint::spin_loop()` (`llvm.x86.sse2.pause`) between the
-    // store and the reload. On a single vCPU the on-ramp lowers `threadlocal.address` to the global's
-    // plain window address (NIM.md §3d Tier-1 collapse), so the store-then-reload round-trips through
-    // one stable slot; the `pause` hint is dropped. `run(x)` returns `x + 1`.
+fn thread_local_tier2_vcpu_tls_isolation_and_pause_drop() {
+    // The threaded-`std` build's native TLS shape (NIM.md §3d Tier-2): a `thread_local` global,
+    // addressed via `llvm.threadlocal.address`, lowers to `vcpu.tls.get() + off` — so the *same*
+    // thread-local resolves to disjoint slots under different `vcpu.tls` bases. `iso(b0, b1)` stores
+    // 10 at `@tls` under base `b0`, 20 under `b1`, then re-reads under `b0`: it must read back **10**
+    // (not 20), proving the thread-local is base-relative and the two bases isolate. A
+    // `core::hint::spin_loop()` (`llvm.x86.sse2.pause`) sits between writes and is dropped.
+    //
+    // `@scratch0`/`@scratch1` are ordinary window globals; their addresses are the two TLS bases, so
+    // `@tls`'s slot (offset 0 in the block) lands inside each scratch buffer. `__vm_vcpu_tls_set`
+    // lowers to `vcpu.tls.set` (there is no `_start` here to seed the root base).
     let ir = "\
 target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
 target triple = \"x86_64-unknown-none\"\n\
 @tls = internal thread_local unnamed_addr global i64 0, align 8\n\
+@scratch0 = internal global [64 x i8] zeroinitializer, align 16\n\
+@scratch1 = internal global [64 x i8] zeroinitializer, align 16\n\
 declare ptr @llvm.threadlocal.address.p0(ptr)\n\
 declare void @llvm.x86.sse2.pause()\n\
-define i64 @run(i64 %x) {\n\
+declare void @__vm_vcpu_tls_set(i64)\n\
+define i64 @iso(i64 %b0, i64 %b1) {\n\
 entry:\n\
-  %p = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
-  store i64 %x, ptr %p, align 8\n\
+  call void @__vm_vcpu_tls_set(i64 %b0)\n\
+  %p0 = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  store i64 10, ptr %p0, align 8\n\
   call void @llvm.x86.sse2.pause()\n\
-  %q = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
-  %v = load i64, ptr %q, align 8\n\
-  %r = add i64 %v, 1\n\
-  ret i64 %r\n\
+  call void @__vm_vcpu_tls_set(i64 %b1)\n\
+  %p1 = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  store i64 20, ptr %p1, align 8\n\
+  call void @__vm_vcpu_tls_set(i64 %b0)\n\
+  %p0b = call ptr @llvm.threadlocal.address.p0(ptr @tls)\n\
+  %v = load i64, ptr %p0b, align 8\n\
+  ret i64 %v\n\
 }\n";
     let t = svm_llvm::translate_ll_str(ir).expect("translate thread-local IR");
     svm_verify::verify_module(&t.module).expect("verify");
-    let run = t
+    let sym = |n: &str| {
+        t.data_symbols
+            .iter()
+            .find(|s| s.name == n)
+            .unwrap_or_else(|| panic!("missing data symbol @{n}"))
+            .addr as i64
+    };
+    let (b0, b1) = (sym("scratch0"), sym("scratch1"));
+    let iso = t
         .exports
         .iter()
-        .find(|(n, _)| n == "run")
+        .find(|(n, _)| n == "iso")
         .map(|x| x.1)
-        .expect("run export");
-    for x in [0i64, 41, 255] {
-        let mut fuel = 1_000_000u64;
-        let interp = match svm_interp::run(
-            &t.module,
-            run,
-            &[Value::I64(t.entry_sp as i64), Value::I64(x)],
-            &mut fuel,
-        )
-        .expect("interp")[0]
-        {
-            Value::I64(v) => v,
-            other => panic!("unexpected {other:?}"),
-        };
-        let jit =
-            match svm_jit::compile_and_run(&t.module, run, &[t.entry_sp as i64, x]).expect("jit") {
-                JitOutcome::Returned(v) => v[0],
-                o => panic!("jit outcome {o:?}"),
-            };
-        assert_eq!(interp, jit, "tls x={x}: interp vs jit");
-        assert_eq!(
-            interp,
-            x + 1,
-            "tls x={x}: store→pause→reload round-trips (Tier-1 slot)"
-        );
-    }
+        .expect("iso export");
+    let mut fuel = 1_000_000u64;
+    let interp = match svm_interp::run(
+        &t.module,
+        iso,
+        &[
+            Value::I64(t.entry_sp as i64),
+            Value::I64(b0),
+            Value::I64(b1),
+        ],
+        &mut fuel,
+    )
+    .expect("interp")[0]
+    {
+        Value::I64(v) => v,
+        other => panic!("unexpected {other:?}"),
+    };
+    let jit = match svm_jit::compile_and_run(&t.module, iso, &[t.entry_sp as i64, b0, b1])
+        .expect("jit")
+    {
+        JitOutcome::Returned(v) => v[0],
+        o => panic!("jit outcome {o:?}"),
+    };
+    assert_eq!(interp, jit, "tls isolation: interp vs jit");
+    assert_eq!(
+        interp, 10,
+        "the thread-local is `vcpu.tls`-base-relative: b0's slot keeps 10 despite b1's write of 20"
+    );
 }
 
 #[test]

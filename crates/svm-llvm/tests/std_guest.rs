@@ -970,9 +970,82 @@ fn std_threads_spec_thread_local_round_trips() {
     // 100 + 23 = 123.
     assert_eq!(
         exit, 123,
-        "native thread_local read-modify-write (Tier-1 collapse)"
+        "native thread_local read-modify-write (Tier-2 block, root base set in _start)"
     );
     if let Some((_, oracle)) = native_oracle("svm_stdt_tls_oracle", src) {
         assert_eq!(exit, oracle, "threaded-spec TLS matches the native oracle");
+    }
+}
+
+/// `std::thread::spawn` + `JoinHandle::join`: a spawned vCPU runs a `move` closure (capturing an
+/// outer value) and its return value comes back through `join`. Exercises the whole `sys/thread/svm`
+/// path — the fixed `__rust_thread_start` trampoline over `__vm_thread_spawn`, the per-thread TLS
+/// block (`__vm_tls_size`/`template`), a guest-carved stack, and `__vm_thread_join`. Differential
+/// against the native oracle; deterministic on the cooperative driver.
+#[test]
+fn std_threads_spec_spawn_join_returns_value() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let base = 30u32;\n\
+         \x20   let h = std::thread::spawn(move || base.wrapping_add(12));\n\
+         \x20   let v = h.join().unwrap();\n\
+         \x20   ExitCode::from((v & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_spawn", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(exit, 42, "spawn(move || 30+12).join() == 42");
+    if let Some((_, oracle)) = native_oracle("svm_stdt_spawn_oracle", src) {
+        assert_eq!(exit, oracle, "spawn/join matches the native oracle");
+    }
+}
+
+/// Several spawned threads sharing an `Arc<AtomicU32>`, each `fetch_add`-ing, joined back — the
+/// Rust analog of the THREADS.md counter kernel. Exercises real cross-thread state: `Arc` (whose
+/// drop uses the acquire `fence` the on-ramp now lowers), `AtomicU32` RMW, per-thread TLS isolation
+/// (each thread's `thread::current` handle is its own), and N spawn/joins. On the cooperative
+/// deterministic driver the total is exact (4 × 10 = 40).
+#[test]
+fn std_threads_spec_shared_atomic_counter() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::Arc;\n\
+         use std::sync::atomic::{AtomicU32, Ordering};\n\
+         fn main() -> ExitCode {\n\
+         \x20   let counter = Arc::new(AtomicU32::new(0));\n\
+         \x20   let mut handles = Vec::new();\n\
+         \x20   for _ in 0..4 {\n\
+         \x20       let c = Arc::clone(&counter);\n\
+         \x20       handles.push(std::thread::spawn(move || {\n\
+         \x20           for _ in 0..10 { c.fetch_add(1, Ordering::SeqCst); }\n\
+         \x20       }));\n\
+         \x20   }\n\
+         \x20   for h in handles { h.join().unwrap(); }\n\
+         \x20   ExitCode::from((counter.load(Ordering::SeqCst) & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_counter", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(exit, 40, "4 threads × 10 fetch_add = 40");
+    if let Some((_, oracle)) = native_oracle("svm_stdt_counter_oracle", src) {
+        assert_eq!(
+            exit, oracle,
+            "shared atomic counter matches the native oracle"
+        );
     }
 }

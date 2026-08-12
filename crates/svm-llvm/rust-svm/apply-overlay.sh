@@ -40,16 +40,19 @@ cp "${HERE}/svm-net-imp.rs" "${STD}/sys/net/connection/svm.rs"
 # The futex primitive backing `sys/sync` under the threaded target (`x86_64-unknown-svm-threads`,
 # `target_env = "threads"`). Only referenced by that target; the lean target keeps std's `no_threads`.
 cp "${HERE}/svm-futex-imp.rs" "${STD}/sys/sync/futex/svm.rs"
+# The thread PAL (`std::thread::spawn`/join over the §12 thread ops) — threaded target only; the lean
+# target keeps `sys/thread/unsupported.rs` (spawn fails closed).
+cp "${HERE}/svm-thread-imp.rs" "${STD}/sys/thread/svm.rs"
 
 # 2) The cfg-arm additions. Skip if already applied (patch is not idempotent on its own).
-# The `futex` svm arm is the marker for *this* (threaded) overlay version; the `alloc` svm arm marks
-# *any* overlay. A tree that has `alloc` but not the `futex` arm carries a stale pre-threads overlay:
-# the patch can't apply on top of it, so fail loudly with the fix rather than silently skipping (which
-# would leave the threaded target unbuildable).
-if grep -q 'target_os = "svm"' "${STD}/sys/sync/futex/mod.rs" 2>/dev/null; then
+# The `sys/thread` svm arm is the marker for *this* overlay version; the `alloc` svm arm marks *any*
+# overlay. A tree that has `alloc` but not the `sys/thread` arm carries a stale earlier overlay: the
+# patch can't apply on top of it, so fail loudly with the fix rather than silently skipping (which
+# would leave the new surface unbuildable).
+if grep -q 'target_os = "svm"' "${STD}/sys/thread/mod.rs" 2>/dev/null; then
   echo "svm std overlay already applied to ${SRC}"
 elif grep -q 'target_os = "svm"' "${STD}/sys/alloc/mod.rs"; then
-  echo "error: a stale (pre-threads) svm std overlay is applied to ${SRC}" >&2
+  echo "error: a stale (older) svm std overlay is applied to ${SRC}" >&2
   echo "  reinstall a clean rust-src and re-run, e.g.:" >&2
   echo "    rustup component remove rust-src --toolchain ${TOOLCHAIN}" >&2
   echo "    rustup component add    rust-src --toolchain ${TOOLCHAIN}" >&2
