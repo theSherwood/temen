@@ -668,6 +668,23 @@ follow-up (a shim, not a substrate concern).
   `"redirected!"` to its stdout, the shell pumps all 11 bytes into `out.txt`, and the shared memfs snapshot
   holds exactly that file (the shell's own stdout stays empty — the output never touched it). Interp-only,
   same reason as pipes (the read parks in the eval loop).
+- **~~the rest of redirection~~ (`>>`, `<`, `2>`). DONE — all the same pump over the existing pipe + fs +
+  stream-by-name primitives, still no new mechanism.**
+  - **`cmd >> file` (append).** Identical pump to `>`, only the shell's `FS_OPEN` flags gain `O_APPEND`
+    (`O_CREATE|O_WRITE|O_APPEND`), so the output lands after the file's existing bytes rather than
+    truncating. Proven by `a_shell_appends_a_command_output_to_a_file` (a seeded `log.txt` = `"existing\n"`
+    ends up `"existing\nredirected!"`).
+  - **`cmd < file` (input).** The **reverse** pump: the shell `FS_OPEN`s the source `O_READ`, reads it in
+    chunks, and writes each into a pipe whose *read* end is the command's `stdin` (`exec_io(cmd, argv, out,
+    fds[0])`); draining the file then closing the write end EOFs the command's `stdin`. The command is the
+    consumer, the shell the producer — the concurrent-pipe park/wake, driven from the shell side. Proven by
+    `a_shell_redirects_a_file_into_a_command_stdin` (`in.txt` bytes arrive on the shell's stdout via a `cat`
+    that echoes stdin→stdout).
+  - **`cmd 2> file` (stderr).** The command writes normal output with the ambient `write` builtin (always
+    `stdout`) and diagnostics to a **distinct** `stderr` handle it resolves by name (`__vm_write`); the shim
+    grows an `exec_io3(file, argv, out, in, err)` that adds a `"stderr"` grant, and the shell pumps that end
+    to a file exactly like `>`. Proven by `a_shell_redirects_a_command_stderr_to_a_file`: stdout stays on the
+    shell's stdout while `err.txt` holds only the stderr bytes — the two streams land in different places.
 - **signals L1/L2** (async `SIGINT`/`SIGCHLD`) and a **stdin line reader / tty** — both parked.
 - **interp-only.** The serve substrate is eval-loop-only, so the whole fork/exec surface is tree-walk
   only (no bytecode/JIT/wasm) — the §9 backend-parity track.
