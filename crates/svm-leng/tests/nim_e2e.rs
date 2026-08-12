@@ -481,26 +481,32 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
         .iter()
         .map(|(stem, src)| svm_leng::WholeModule { stem, src })
         .collect();
-    let m = svm_leng::link_whole_with_runtime_manifest(&units, vec![runtime])
-        .unwrap_or_else(|e| panic!("manifest link: {e}"));
+    // Link with a synthesized **powerbox `_start`** at function 0: it reads the post-link data-stack
+    // base (`data.top` → `powerbox_entry_sp`, page-aligned above the globals) and calls the C-shaped
+    // `main($sp, argc, argv, envp)` with `argc/argv/envp = 0` — a real powerbox entry, not a
+    // hand-provided `$sp`. Injecting `_start` as a first link unit (rather than prepending it after
+    // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
+    // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
+    // index.
+    let m = svm_leng::link_whole_powerbox_manifest(&units, vec![runtime])
+        .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
+    // exported by name — exactly what `run_powerbox`/`instantiate` bind manifest slots against.
+    assert!(
+        svm_run::is_named_powerbox_entry(&m),
+        "linked module is a powerbox entry (paramless func-0 `_start`)"
+    );
 
-    let main_idx = m
-        .exports
-        .iter()
-        .find(|e| e.name == "main")
-        .map(|e| e.func)
-        .expect("exportc main");
-
-    // Run `main` on both engines under identical host-bound syscall imports and assert the captured
-    // stdout agrees. The two engines reach the retained `call.import` leaves by different plumbing —
-    // the interpreter dispatches each through its host binding table directly; the JIT lowers the
-    // `call.import` to a `cap.call` on the reserved `CAP_IMPORT_TYPE_ID` sentinel and `cap_thunk`
-    // translates *that* through the very same bindings — so a divergence is a real engine bug, not a
-    // harness artifact. Each run gets a fresh `Host` and capture buffer (a shared buffer would
-    // concatenate both engines' output).
-    let interp_out = run_io_capture(&m, main_idx, false);
-    let jit_out = run_io_capture(&m, main_idx, true);
+    // Run `_start` (function 0) on both engines under identical host-bound syscall imports and assert
+    // the captured stdout agrees. The two engines reach the retained `call.import` leaves by different
+    // plumbing — the interpreter dispatches each through its host binding table directly; the JIT
+    // lowers the `call.import` to a `cap.call` on the reserved `CAP_IMPORT_TYPE_ID` sentinel and
+    // `cap_thunk` translates *that* through the very same bindings — so a divergence is a real engine
+    // bug, not a harness artifact. Each run gets a fresh `Host` and capture buffer (a shared buffer
+    // would concatenate both engines' output).
+    let interp_out = run_io_capture(&m, false);
+    let jit_out = run_io_capture(&m, true);
     assert_eq!(
         interp_out, jit_out,
         "§9 interp/JIT parity on the syscall I/O seam"
@@ -508,11 +514,11 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     interp_out
 }
 
-/// Run the linked I/O program's `main` (func `main_idx`) on one engine — the JIT when `jit`, else the
-/// tree-walker — under a fresh `Host` that binds `sysWrite` to a stdout capture and every other
-/// retained syscall leaf to a no-op stub. Returns the captured bytes. The `sysWrite` binding reads
-/// the guest window through the same `GuestMem` both engines hand the host proc.
-fn run_io_capture(m: &Module, main_idx: u32, jit: bool) -> Vec<u8> {
+/// Run the linked I/O program's powerbox `_start` (function 0) on one engine — the JIT when `jit`,
+/// else the tree-walker — under a fresh `Host` that binds `sysWrite` to a stdout capture and every
+/// other retained syscall leaf to a no-op stub. Returns the captured bytes. The `sysWrite` binding
+/// reads the guest window through the same `GuestMem` both engines hand the host proc.
+fn run_io_capture(m: &Module, jit: bool) -> Vec<u8> {
     let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
     let mut host = Host::new();
     let mut bindings = Vec::new();
@@ -540,28 +546,27 @@ fn run_io_capture(m: &Module, main_idx: u32, jit: bool) -> Vec<u8> {
     }
     host.set_import_bindings(bindings);
 
-    let sp = svm_ir::POWERBOX_STACK_PAGE as i64 + 0x40000; // data-stack base, well above the globals
+    // `_start` (function 0) is paramless — it sets up `$sp` and the C `main` args itself.
     if jit {
         let ctx = &mut host as *mut Host as *mut std::ffi::c_void;
         let (outcome, _mem) = svm_jit::compile_and_run_capture_reserved_with_host(
             m,
-            main_idx,
-            &[sp, 0, 0, 0],
+            0,
+            &[],
             &[],
             svm_ir::DEFAULT_RESERVED_LOG2,
             svm_run::cap_thunk,
             ctx,
         )
-        .unwrap_or_else(|e| panic!("jit compile main: {e:?}"));
+        .unwrap_or_else(|e| panic!("jit compile _start: {e:?}"));
         assert!(
             matches!(outcome, svm_jit::JitOutcome::Returned(_)),
-            "jit main did not return cleanly: {outcome:?}"
+            "jit _start did not return cleanly: {outcome:?}"
         );
     } else {
-        let args = [Value::I64(sp), Value::I32(0), Value::I64(0), Value::I64(0)];
         let mut fuel = 500_000_000u64;
-        run_with_host(m, main_idx, &args, &mut fuel, &mut host)
-            .unwrap_or_else(|e| panic!("run main: {e:?}"));
+        run_with_host(m, 0, &[], &mut fuel, &mut host)
+            .unwrap_or_else(|e| panic!("run _start: {e:?}"));
     }
     let out = captured.lock().unwrap().clone();
     out
