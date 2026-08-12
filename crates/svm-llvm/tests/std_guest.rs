@@ -261,6 +261,36 @@ fn svm_run_std_threads(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     Some((run.stdout, exit))
 }
 
+/// Translate + verify + run `src` built for the **threaded** target with the **`posix` + `net`** caps
+/// granted (`run_with_caps`) → `(stdout, exit code)`. This is the seam for genuinely-concurrent I/O:
+/// several vCPUs share one personality (its `Inner` is behind a host-side `Mutex`), so a second thread
+/// can drive the memnet peer of a socket the first thread blocks (retries) on.
+fn svm_run_std_threads_net(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-svm-threads.json")?;
+    let t = svm_llvm::translate_ll_path(&ll)
+        .expect("on-ramp translates the threaded std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
+    let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    let net = svm_run::posix::net_cap(&posix);
+    let out = svm_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps(
+            svm_run::Backend::Jit,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap), ("net", net)],
+        )
+        .expect("run_with_caps");
+    let exit = match out.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((out.stdout, exit))
+}
+
 /// Translate + verify + run `src` on the powerbox **with argv** → `(stdout, exit code)`.
 /// `argv[0]` is the program name, as in a native run.
 fn svm_run_std_with_args(name: &str, src: &str, argv: &[&[u8]]) -> Option<(Vec<u8>, u8)> {
@@ -1094,5 +1124,116 @@ fn std_threads_spec_yield_and_sleep() {
             exit, oracle,
             "yield_now/sleep progress matches the native oracle"
         );
+    }
+}
+
+/// #825 — **genuinely concurrent I/O across two vCPUs** over the loopback memnet. `main` binds a
+/// listener and moves it to a server thread, then acts as the client: connect, send, and read the
+/// echo. The memnet is nonblocking (an empty accept/read is `WouldBlock`, never a deadlocking block —
+/// "a cooperative guest cannot block on itself"), so the server's `accept`/`read` **retry with
+/// `thread::yield_now()`** until the client's op lands — the second vCPU drains the peer the first is
+/// spinning on. This proves the EAGAIN + retry-yield contract composes with real threads (the personality's
+/// `Inner` is `Mutex`-guarded host-side) and exercises the real `yield_now`. Deterministic on the
+/// cooperative driver, so it differentials against native.
+#[test]
+fn std_threads_spec_two_thread_memnet_echo() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::io::{Read, Write};\n\
+         use std::net::{TcpListener, TcpStream};\n\
+         use std::process::ExitCode;\n\
+         // Block on a would-block memnet op by retrying with a yield, so the peer vCPU can run.\n\
+         fn until<T>(mut op: impl FnMut() -> std::io::Result<T>) -> T {\n\
+         \x20   loop {\n\
+         \x20       match op() {\n\
+         \x20           Ok(v) => return v,\n\
+         \x20           Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),\n\
+         \x20           Err(e) => panic!(\"io: {e}\"),\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n\
+         fn main() -> ExitCode {\n\
+         \x20   let listener = TcpListener::bind(\"127.0.0.1:0\").expect(\"bind\");\n\
+         \x20   let port = listener.local_addr().expect(\"local_addr\").port();\n\
+         \x20   let server = std::thread::spawn(move || {\n\
+         \x20       let (mut s, _) = until(|| listener.accept());\n\
+         \x20       let mut buf = [0u8; 16];\n\
+         \x20       let n = until(|| {\n\
+         \x20           let n = s.read(&mut buf)?;\n\
+         \x20           if n == 0 { Err(std::io::ErrorKind::WouldBlock.into()) } else { Ok(n) }\n\
+         \x20       });\n\
+         \x20       let up: Vec<u8> = buf[..n].iter().map(|b| b.to_ascii_uppercase()).collect();\n\
+         \x20       s.write_all(&up).expect(\"server echo\");\n\
+         \x20   });\n\
+         \x20   let mut client = until(|| TcpStream::connect((\"127.0.0.1\", port)));\n\
+         \x20   client.write_all(b\"ping\").expect(\"client write\");\n\
+         \x20   let mut buf = [0u8; 16];\n\
+         \x20   let n = until(|| {\n\
+         \x20       let n = client.read(&mut buf)?;\n\
+         \x20       if n == 0 { Err(std::io::ErrorKind::WouldBlock.into()) } else { Ok(n) }\n\
+         \x20   });\n\
+         \x20   server.join().expect(\"join\");\n\
+         \x20   // Echo is the upper-cased request: \"ping\" -> \"PING\".\n\
+         \x20   let ok = &buf[..n] == b\"PING\";\n\
+         \x20   ExitCode::from(if ok { n as u8 } else { 0 })\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads_net("svm_stdt_netecho", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 4,
+        "server thread echoed \"PING\" (4 bytes) back to the client thread"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_netecho_oracle", src) {
+        assert_eq!(
+            exit, oracle,
+            "two-thread loopback echo matches the native oracle"
+        );
+    }
+}
+
+/// #824 follow-through — `std::sync::mpsc` across two vCPUs (no per-target code; it rides the
+/// futex-backed `sys/sync`). A producer thread sends 1..=9 down a channel and drops the sender; the
+/// main thread's `for v in rx` blocks on `recv` until the channel closes, summing to 45. Unlike the
+/// lock-free atomic-counter test, this exercises the futex **notify/wake** path (an empty `recv`
+/// parks the consumer until the producer's `send` wakes it) end to end. Differential vs native.
+#[test]
+fn std_threads_spec_mpsc_channel() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::mpsc;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let (tx, rx) = mpsc::channel();\n\
+         \x20   let producer = std::thread::spawn(move || {\n\
+         \x20       for i in 1..=9u32 { tx.send(i).expect(\"send\"); }\n\
+         \x20       // tx drops here → the channel closes, ending the consumer's loop.\n\
+         \x20   });\n\
+         \x20   let mut sum = 0u32;\n\
+         \x20   for v in rx { sum = sum.wrapping_add(v); }\n\
+         \x20   producer.join().expect(\"join\");\n\
+         \x20   ExitCode::from((sum & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_mpsc", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 45,
+        "mpsc producer/consumer summed 1..=9 = 45 across two threads"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_mpsc_oracle", src) {
+        assert_eq!(exit, oracle, "mpsc channel matches the native oracle");
     }
 }
