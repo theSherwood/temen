@@ -136,6 +136,22 @@ fn conv_wrapped_and_narrow_int_global_initializers() {
 }
 
 #[test]
+fn aggregate_const_with_float_fields() {
+    // An aggregate global/const with **float members** — `var c = Shape(x: 1.5, y: 2.0)` →
+    // `(oconstr Shape (kv x 1.5) (kv y 2.0))`. `const_aggregate_bytes` folded int, string, and
+    // pointer field values but not floats, so any object const with a float field fail-closed
+    // (a placeholder, then a read fault). It now folds float field values to their width's bits.
+    // `readY` reads the `y` member (offset 8) back; both engines see 2.0 (truncated to 2).
+    let leng = "\
+(stmts
+ (type :Shape.0. . (object . (fld :x.0 . (f +64)) (fld :y.0 . (f +64))))
+ (gvar :c.0. . Shape.0. (oconstr Shape.0. (kv x.0 1.5) (kv y.0 2.0)))
+ (proc :readY.0. . (i +64) . (stmts . (ret (conv (i +64) (dot c.0. y.0 1))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 2, "c.y = 2.0, truncated to 2");
+}
+
+#[test]
 fn global_pointer_deref() {
     // A module-level **pointer global** (`var x: ptr Node` — nimony's `ref NodeObj`, lowered to a
     // pointer) is dereferenced: `roundtrip` builds a frame object, points the global at it, then reads

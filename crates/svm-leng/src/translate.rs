@@ -861,6 +861,18 @@ impl Translator {
                     }
                     None => return Ok(None),
                 }
+            } else if matches!(fdesc, TyDesc::Scalar(ValType::F32 | ValType::F64)) {
+                // A **float field** value (`(kv x 1.0)`, `(kv y 2.0)` — nimony emits object consts
+                // with float members, e.g. a shared 2-D `Shape`). Fold to the field's-width float
+                // bits. `const_float_bytes` fails closed if the value isn't a foldable float or the
+                // `float` feature is off, in which case we fall to the placeholder path.
+                let Ok(fb) = const_float_bytes(&ka[1], fdesc) else {
+                    return Ok(None);
+                };
+                if bytes.len() < off + fb.len() {
+                    bytes.resize(off + fb.len(), 0);
+                }
+                bytes[off..off + fb.len()].copy_from_slice(&fb);
             } else {
                 return Ok(None); // an unsupported const field value — fall back to a placeholder
             }
