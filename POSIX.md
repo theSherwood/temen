@@ -140,8 +140,10 @@ only to mark the boundary.
 | 37 | `mkdir(path, plen, mode)` | `-> 0 \| -errno` | memfs explicit-dir set | **done** — `-EEXIST`/`-ENOENT` (parent); `mode` ignored |
 | 38 | `rename(old, olen, new, nlen)` | `-> 0 \| -errno` | memfs | **done** — file move or whole-subtree re-key; `-ENOENT` |
 | 39 | `rmdir(path, plen)` | `-> 0 \| -errno` | memfs explicit-dir set | **done** — `-ENOTDIR`/`-ENOTEMPTY`/`-EINVAL` (root) |
+| 40 | `sigprocmask(how, set, oldset)` | `-> 0 \| -errno` | host signal state | **done (#796)** — the blocked set (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`); a pending **blocked** signal is held by `sigcheck`, not delivered, until unblocked. `sigset_t` = a `u64` bitset; `SIGKILL`/`SIGSTOP` unblockable |
+| 41 | `sigaction(signum, act, oldact)` | `-> 0 \| -errno` | host signal state | **done (#796)** — the richer `signal`: records the disposition (delivered by the doorbell) + `sa_mask`/`sa_flags`, round-tripped through `oldact`. `struct sigaction` = `{sa_handler:i64, sa_mask:u64, sa_flags:i64}` |
 | — | `fstat` | / `-errno` | memfs + host fd table | todo |
-| — | `sigaction` + default actions | doorbell (§9 L1/L2) | host signal state | **partial** — `signal`/`kill`/`sigcheck` (ops 30–32) are the L0 doorbell (exact for `trap`); async interrupt of a running loop + default actions are L1/L2, parked |
+| — | async delivery + default actions | doorbell (§9 L1/L2) | host signal state | **partial** — ops 30–32/40/41 are the L0 doorbell + mask (exact for `trap`); **async interrupt of a running loop (L2), default actions, `EINTR` (L1), and `SA_RESTART`/block-during-handler remain parked** (#796) |
 | — | `fork/vfork/execve` | Stage 3 | durable clone (§7) | **parked** — return-twice / image-replace need the durable-clone capstone (R8 ✓); `spawn`+`waitpid` (ops 27–29) cover the fork-free process model a shell drives today |
 | — | `strlen/memcpy/snprintf/qsort/ctype/math` | pure | **guest code** (no cap) | n/a |
 

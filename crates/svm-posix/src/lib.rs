@@ -154,6 +154,17 @@ pub const OP_RENAME: u32 = 38;
 /// if the path is a file, `-ENOENT` if it isn't a directory, `-ENOTEMPTY` if it still has children,
 /// `-EINVAL` for the root or a non-UTF-8 path.
 pub const OP_RMDIR: u32 = 39;
+/// `sigprocmask(how, set, oldset) -> 0 | -errno` (#796 — PROCESS.md §9) — examine/change the blocked
+/// signal set. `how` is `SIG_BLOCK`(0) / `SIG_UNBLOCK`(1) / `SIG_SETMASK`(2); `set`/`oldset` (either may be
+/// null) point at an 8-byte `sigset_t` in this personality's ABI — a `u64` bitset, signal `s` = bit `s`.
+/// A pending **blocked** signal is held (not delivered by `sigcheck`) until unblocked. `SIGKILL`/`SIGSTOP`
+/// can never be blocked. Bad `how` (with a non-null `set`) is `-EINVAL`.
+pub const OP_SIGPROCMASK: u32 = 40;
+/// `sigaction(signum, act, oldact) -> 0 | -errno` (#796) — the richer `signal`. `act`/`oldact` (either may
+/// be null) point at a 24-byte `struct sigaction` in this personality's ABI: `{ sa_handler: i64@0,
+/// sa_mask: u64@8, sa_flags: i64@16 }`. Records the disposition (like op 30 `signal`) plus `sa_mask` and
+/// `sa_flags` for round-trip fidelity. Out-of-range `signum` is `-EINVAL`.
+pub const OP_SIGACTION: u32 = 41;
 
 /// **`net` capability ops** (POSIX.md §5a) — a **separate named handle** (`"net"`), not entries in the
 /// libc table above: authority is its own granted capability (the WASI 0.2 lesson), while the data
@@ -170,6 +181,13 @@ pub const NET_RESOLVE: u32 = 5;
 /// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
 const SIG_DFL: i64 = 0;
 const SIG_IGN: i64 = 1;
+/// `sigprocmask` `how` values (Linux ABI, so a guest's `<signal.h>` agrees).
+const SIG_BLOCK: i64 = 0;
+const SIG_UNBLOCK: i64 = 1;
+const SIG_SETMASK: i64 = 2;
+/// The signals POSIX forbids blocking — `SIGKILL` (9) and `SIGSTOP` (19). Cleared out of any requested
+/// mask so a guest can never wedge them.
+const UNMASKABLE: u64 = (1 << 9) | (1 << 19);
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
@@ -576,8 +594,18 @@ struct Inner {
     /// [`Posix::raise_signal`]) and not yet polled. Signals are `1..=63` (one `u64`).
     sig_pending: u64,
     /// **Signal dispositions**: `signum → handler` (`SIG_DFL`/`SIG_IGN`/a guest handler pointer), set by
-    /// `signal`. Absent ⇒ `SIG_DFL`. `sigcheck` consults this to deliver caught signals and drop the rest.
+    /// `signal`/`sigaction`. Absent ⇒ `SIG_DFL`. `sigcheck` consults this to deliver caught signals and
+    /// drop the rest.
     sig_handler: HashMap<i32, i64>,
+    /// **Signal mask** — the blocked set (`sigprocmask`, #796). Bit `s` set ⇒ signal `s` is blocked: a
+    /// pending blocked signal is held (not delivered by `sigcheck`) until unblocked. `SIGKILL`/`SIGSTOP`
+    /// are never blockable, so those bits stay clear.
+    sig_mask: u64,
+    /// **Per-signal `sigaction` extras** (`sa_mask` / `sa_flags`), kept for round-trip fidelity (`oldact`).
+    /// The poll model does not yet auto-block `sa_mask` while a handler runs, nor act on `SA_RESTART` —
+    /// those land with the L2 async-delivery / L1 EINTR slices of #796.
+    sig_action_mask: HashMap<i32, u64>,
+    sig_action_flags: HashMap<i32, i64>,
 }
 
 /// A handle to a granted POSIX personality's shared state — read the captured output after a run.
@@ -793,6 +821,8 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "signal" => OP_SIGNAL,
         "kill" => OP_KILL,
         "sigcheck" => OP_SIGCHECK,
+        "sigprocmask" => OP_SIGPROCMASK,
+        "sigaction" => OP_SIGACTION,
         _ => return None,
     };
     Some(ResolvedCap {
@@ -948,6 +978,9 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
         next_pid: 1000,
         sig_pending: 0,
         sig_handler: HashMap::new(),
+        sig_mask: 0,
+        sig_action_mask: HashMap::new(),
+        sig_action_flags: HashMap::new(),
     }
 }
 
@@ -993,6 +1026,8 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_SIGNAL => Ok(vec![st.signal(args)]),
                 OP_KILL => Ok(vec![st.kill(args)]),
                 OP_SIGCHECK => Ok(vec![st.sigcheck()]),
+                OP_SIGPROCMASK => st.sigprocmask(args, mem),
+                OP_SIGACTION => st.sigaction(args, mem),
                 OP_GETCWD => st.getcwd(args, mem),
                 OP_CHDIR => st.chdir(args, mem),
                 OP_GETENV => st.getenv(args, mem),
@@ -1468,20 +1503,96 @@ impl Inner {
     }
 
     /// `sigcheck(_) -> handler | 0`: the L0 doorbell poll. Clear and return the handler pointer of the
-    /// lowest-numbered pending **caught** signal (`handler > SIG_IGN`); pending **ignored** (`SIG_IGN`) and
-    /// **default** (`SIG_DFL`) signals are cleared and skipped (L0 does not deliver default actions). `0`
-    /// when nothing is deliverable — so the guest runs `((void(*)(void))handler)()` at its safe point.
+    /// lowest-numbered pending **caught and unblocked** signal (`handler > SIG_IGN`); pending **ignored**
+    /// (`SIG_IGN`) and **default** (`SIG_DFL`) signals are cleared and skipped (L0 does not deliver default
+    /// actions). A pending **blocked** signal (`sig_mask`, #796) is **held** — neither delivered nor cleared
+    /// — until `sigprocmask` unblocks it. `0` when nothing is deliverable — so the guest runs
+    /// `((void(*)(void))handler)()` at its safe point.
     fn sigcheck(&mut self) -> i64 {
-        while self.sig_pending != 0 {
-            let s = self.sig_pending.trailing_zeros() as i32;
+        loop {
+            let deliverable = self.sig_pending & !self.sig_mask;
+            if deliverable == 0 {
+                return 0; // nothing pending, or all pending signals are blocked (held)
+            }
+            let s = deliverable.trailing_zeros() as i32;
             self.sig_pending &= !(1u64 << s);
             let handler = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
             if handler > SIG_IGN {
                 return handler;
             }
-            // SIG_DFL / SIG_IGN: dropped in L0, keep scanning for a caught one.
+            // SIG_DFL / SIG_IGN: dropped in L0, keep scanning for a caught, unblocked one.
         }
-        0
+    }
+
+    /// `sigprocmask(how, set, oldset) -> 0 | -errno` (#796): examine/change the blocked-signal set. Writes
+    /// the current mask to `oldset` first (when non-null), then applies `set` per `how`. `SIGKILL`/`SIGSTOP`
+    /// are silently kept unblocked ([`UNMASKABLE`]). A bad `how` (with a non-null `set`) is `-EINVAL`. The
+    /// mask is a `u64` `sigset_t` read/written as 8 little-endian bytes.
+    fn sigprocmask(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let how = *args.first().unwrap_or(&0);
+        let set_ptr = *args.get(1).unwrap_or(&0) as u64;
+        let oldset_ptr = *args.get(2).unwrap_or(&0) as u64;
+        let mem = mem.ok_or(Trap::Malformed)?;
+        if oldset_ptr != 0 {
+            mem.write_bytes(oldset_ptr, &self.sig_mask.to_le_bytes())
+                .ok_or(Trap::Malformed)?;
+        }
+        if set_ptr != 0 {
+            let bytes = mem.read_bytes(set_ptr, 8).ok_or(Trap::Malformed)?;
+            let set = u64::from_le_bytes(bytes.try_into().map_err(|_| Trap::Malformed)?);
+            let new = match how {
+                SIG_BLOCK => self.sig_mask | set,
+                SIG_UNBLOCK => self.sig_mask & !set,
+                SIG_SETMASK => set,
+                _ => return Ok(vec![EINVAL]),
+            };
+            self.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
+        }
+        Ok(vec![0])
+    }
+
+    /// `sigaction(signum, act, oldact) -> 0 | -errno` (#796): the richer `signal`. Records `signum`'s
+    /// disposition (`sa_handler`) plus its `sa_mask`/`sa_flags`, writing the previous action to `oldact`
+    /// first (when non-null). The `struct sigaction` ABI is 24 bytes: `sa_handler` (i64@0), `sa_mask`
+    /// (u64@8), `sa_flags` (i64@16). Out-of-range `signum` is `-EINVAL`. (The poll model does not yet
+    /// auto-block `sa_mask` while the handler runs, nor honor `SA_RESTART` — those land with L2/L1.)
+    fn sigaction(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let signum = *args.first().unwrap_or(&0);
+        let act_ptr = *args.get(1).unwrap_or(&0) as u64;
+        let oldact_ptr = *args.get(2).unwrap_or(&0) as u64;
+        if !(1..=63).contains(&signum) {
+            return Ok(vec![EINVAL]);
+        }
+        let s = signum as i32;
+        let mem = mem.ok_or(Trap::Malformed)?;
+        if oldact_ptr != 0 {
+            let mut buf = [0u8; 24];
+            let h = self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+            let m = self.sig_action_mask.get(&s).copied().unwrap_or(0);
+            let f = self.sig_action_flags.get(&s).copied().unwrap_or(0);
+            buf[0..8].copy_from_slice(&h.to_le_bytes());
+            buf[8..16].copy_from_slice(&m.to_le_bytes());
+            buf[16..24].copy_from_slice(&f.to_le_bytes());
+            mem.write_bytes(oldact_ptr, &buf).ok_or(Trap::Malformed)?;
+        }
+        if act_ptr != 0 {
+            let b = mem.read_bytes(act_ptr, 24).ok_or(Trap::Malformed)?;
+            let handler = i64::from_le_bytes(b[0..8].try_into().map_err(|_| Trap::Malformed)?);
+            let mask = u64::from_le_bytes(b[8..16].try_into().map_err(|_| Trap::Malformed)?);
+            let flags = i64::from_le_bytes(b[16..24].try_into().map_err(|_| Trap::Malformed)?);
+            self.sig_handler.insert(s, handler);
+            self.sig_action_mask.insert(s, mask);
+            self.sig_action_flags.insert(s, flags);
+        }
+        Ok(vec![0])
     }
 
     /// `unlink(path_ptr, path_len) -> 0 | -errno`: remove a memfs file. Already-open fds keep their
@@ -3131,6 +3242,27 @@ block 0 (vph: i32) {\n\
             0x1234,
             "raise_signal delivers to the caught handler"
         );
+
+        // #796: the signal mask **holds** a pending blocked signal — `sigcheck` skips it and leaves it
+        // pending, until it is unblocked. (`sigprocmask` itself needs guest memory to read the sigset;
+        // the compiled-C `c_posix` tests cover that path on both backends. Here we drive the mask field
+        // directly to unit-test the `sigcheck` hold-vs-deliver decision.)
+        st.signal(&[4, 0xCAFE]); // catch signal 4
+        st.sig_mask = 1 << 4; // block it
+        st.kill(&[0, 4]); // raise -> pending but blocked
+        assert_eq!(
+            st.sigcheck(),
+            0,
+            "a blocked pending signal is held, not delivered"
+        );
+        assert_eq!(
+            st.sig_pending & (1 << 4),
+            1 << 4,
+            "the held signal stays pending across the poll"
+        );
+        st.sig_mask = 0; // unblock
+        assert_eq!(st.sigcheck(), 0xCAFE, "delivered once unblocked");
+        assert_eq!(st.sigcheck(), 0, "delivered exactly once");
     }
 
     // func 0 `(handle) -> i64`: `signal(SIGINT=2, 999)` (a caught handler), `kill(0, 2)` (raise), then

@@ -271,6 +271,81 @@ int main() {{\n\
     assert_eq!(jit.file_f, interp.file_f, "jit: memfs must match interp");
 }
 
+/// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
+/// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
+/// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
+const SIG_SHIM: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigcheck(int cap, long z);
+long __px_sigprocmask(int cap, long how, long set, long oldset);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+static long signal_(long signum, long handler) { return __px_signal(0, signum, handler); }
+static long raise_(long sig) { return __px_kill(0, 0, sig); }
+static long sigcheck_(void) { return __px_sigcheck(0, 0); }
+static long sigprocmask_(long how, void *set, void *oldset) { return __px_sigprocmask(0, how, (long)set, (long)oldset); }
+static long sigaction_(long signum, void *act, void *oldact) { return __px_sigaction(0, signum, (long)act, (long)oldact); }
+"#;
+
+/// #796 — `sigprocmask` blocks a signal: a raised-but-blocked signal is **held** (not delivered by the
+/// doorbell poll) until it is unblocked. Both checks are encoded in the return value: `a` (the poll while
+/// blocked, which must be 0) in the thousands place, `b` (the poll after unblock, which must be the caught
+/// handler 999) in the units → 999. A broken mask that delivered while blocked would read 999000 instead.
+#[test]
+fn c_sigprocmask_holds_a_blocked_signal() {
+    let src = format!(
+        "{SIG_SHIM}\n\
+static unsigned long mask;\n\
+int main(void) {{\n\
+  signal_(2, 999);                 /* catch SIGINT */\n\
+  mask = (1UL << 2);               /* the SIGINT bit */\n\
+  sigprocmask_(0, &mask, 0);       /* SIG_BLOCK */\n\
+  raise_(2);                       /* raise SIGINT -- blocked, so held */\n\
+  long a = sigcheck_();            /* 0: masked */\n\
+  sigprocmask_(1, &mask, 0);       /* SIG_UNBLOCK */\n\
+  long b = sigcheck_();            /* 999: now deliverable */\n\
+  return (int)(a * 1000 + b);      /* 999 */\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(999)],
+        "interp: a blocked signal is held, then delivered after unblock"
+    );
+    assert_eq!(jit.result, vec![Value::I64(999)], "jit parity");
+}
+
+/// #796 — `sigaction` records a disposition (delivered by the doorbell exactly like `signal`) and
+/// round-trips the whole action through `oldact`. Returns the delivered handler (4242) plus 1 iff `oldact`
+/// preserved `sa_handler` and `sa_flags` → 4243.
+#[test]
+fn c_sigaction_installs_and_round_trips() {
+    let src = format!(
+        "{SIG_SHIM}\n\
+struct sigaction {{ long sa_handler; unsigned long sa_mask; long sa_flags; }};\n\
+static struct sigaction act, old;\n\
+int main(void) {{\n\
+  act.sa_handler = 4242;\n\
+  act.sa_mask = 0;\n\
+  act.sa_flags = 7;\n\
+  sigaction_(5, &act, 0);          /* install for signal 5 */\n\
+  sigaction_(5, 0, &old);          /* read it back into old */\n\
+  raise_(5);\n\
+  long h = sigcheck_();            /* 4242 delivered */\n\
+  int rt = (old.sa_handler == 4242 && old.sa_flags == 7) ? 1 : 0;\n\
+  return (int)(h + rt);            /* 4243 */\n\
+}}\n"
+    );
+    let (interp, jit) = run_both(&src, |_| {});
+    assert_eq!(
+        interp.result,
+        vec![Value::I32(4243)],
+        "interp: sigaction installs a caught handler and round-trips the action"
+    );
+    assert_eq!(jit.result, vec![Value::I64(4243)], "jit parity");
+}
+
 /// The **environment + cwd** surface from compiled C: `getenv` a variable the embedder staged, echo
 /// its value; then `chdir` and read the new directory back with `getcwd`, echo that. Proves the
 /// host-side env map and cwd (POSIX.md §3) are reachable through the same named-import path — the
