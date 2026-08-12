@@ -1186,8 +1186,54 @@ fn std_threads_spec_two_thread_memnet_echo() {
         eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
         return;
     };
-    assert_eq!(exit, 4, "server thread echoed \"PING\" (4 bytes) back to the client thread");
+    assert_eq!(
+        exit, 4,
+        "server thread echoed \"PING\" (4 bytes) back to the client thread"
+    );
     if let Some((_, oracle)) = native_oracle("svm_stdt_netecho_oracle", src) {
-        assert_eq!(exit, oracle, "two-thread loopback echo matches the native oracle");
+        assert_eq!(
+            exit, oracle,
+            "two-thread loopback echo matches the native oracle"
+        );
+    }
+}
+
+/// #824 follow-through — `std::sync::mpsc` across two vCPUs (no per-target code; it rides the
+/// futex-backed `sys/sync`). A producer thread sends 1..=9 down a channel and drops the sender; the
+/// main thread's `for v in rx` blocks on `recv` until the channel closes, summing to 45. Unlike the
+/// lock-free atomic-counter test, this exercises the futex **notify/wake** path (an empty `recv`
+/// parks the consumer until the producer's `send` wakes it) end to end. Differential vs native.
+#[test]
+fn std_threads_spec_mpsc_channel() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::mpsc;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let (tx, rx) = mpsc::channel();\n\
+         \x20   let producer = std::thread::spawn(move || {\n\
+         \x20       for i in 1..=9u32 { tx.send(i).expect(\"send\"); }\n\
+         \x20       // tx drops here → the channel closes, ending the consumer's loop.\n\
+         \x20   });\n\
+         \x20   let mut sum = 0u32;\n\
+         \x20   for v in rx { sum = sum.wrapping_add(v); }\n\
+         \x20   producer.join().expect(\"join\");\n\
+         \x20   ExitCode::from((sum & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_mpsc", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 45,
+        "mpsc producer/consumer summed 1..=9 = 45 across two threads"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_mpsc_oracle", src) {
+        assert_eq!(exit, oracle, "mpsc channel matches the native oracle");
     }
 }

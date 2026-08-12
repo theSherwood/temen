@@ -459,7 +459,51 @@ entry:\n\
         Value::I64(v) => v,
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!(got, base + 7, "add(ptrtoint(@g), 7) folds to the global address + 7");
+    assert_eq!(
+        got,
+        base + 7,
+        "add(ptrtoint(@g), 7) folds to the global address + 7"
+    );
+}
+
+#[test]
+fn llvm_is_constant_lowers_to_false() {
+    // `llvm.is.constant.*` (the `__builtin_constant_p` hint, emitted by std's `mpsc`/`Arc` fast paths)
+    // lowers to `i1 0`, as LLVM's own codegen does for a call that survives optimization. `f(x)`
+    // zero-extends the result, so it returns 0 for any argument.
+    let ir = "\
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\
+target triple = \"x86_64-unknown-none\"\n\
+declare i1 @llvm.is.constant.i32(i32)\n\
+define i64 @f(i32 %x) {\n\
+entry:\n\
+  %c = call i1 @llvm.is.constant.i32(i32 %x)\n\
+  %r = zext i1 %c to i64\n\
+  ret i64 %r\n\
+}\n";
+    let t = svm_llvm::translate_ll_str(ir).expect("translate is.constant IR");
+    svm_verify::verify_module(&t.module).expect("verify");
+    let f = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "f")
+        .map(|x| x.1)
+        .expect("f export");
+    for x in [0i64, 7, 12345] {
+        let mut fuel = 100_000u64;
+        let got = match svm_interp::run(
+            &t.module,
+            f,
+            &[Value::I64(t.entry_sp as i64), Value::I64(x)],
+            &mut fuel,
+        )
+        .expect("interp")[0]
+        {
+            Value::I64(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(got, 0, "is.constant(x={x}) → 0");
+    }
 }
 
 #[test]

@@ -14416,6 +14416,23 @@ fn lower_threadlocal_address(
     Ok(Some(ctx.operand_i64(vm_arg(c, 0)?)?))
 }
 
+/// `llvm.is.constant.*(x)` → `i1 0`. This is the `__builtin_constant_p` hint: true iff `x` is a
+/// compile-time constant. It exists only to guard optimizations (both arms compute the same value),
+/// and LLVM's own rule is that any call surviving to codegen lowers to **false** — so we do the same.
+/// (std's `mpsc`/`Arc` fast paths emit it.) The result is an `i1`, represented as an `i32` 0/1.
+fn lower_is_constant(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    if !name.starts_with("llvm.is.constant") {
+        return Ok(None);
+    }
+    Ok(Some(ctx.push(Inst::ConstI32(0))))
+}
+
 fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<bool, Error> {
     let Some(name) = callee_name(c) else {
         return Ok(false);
@@ -17577,6 +17594,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `llvm.threadlocal.address(ptr @G)` → the address of the thread-local global (NIM.md §3d
         // Tier-1: one instance per single-vCPU run). Emitted by the threaded `std` build's native TLS.
         if let Some(idx) = lower_threadlocal_address(ctx, c)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // `llvm.is.constant.*` → `i1 0` (the `__builtin_constant_p` hint; folds to false post-codegen).
+        if let Some(idx) = lower_is_constant(ctx, c)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
