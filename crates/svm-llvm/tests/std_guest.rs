@@ -1049,3 +1049,50 @@ fn std_threads_spec_shared_atomic_counter() {
         );
     }
 }
+
+/// `thread::yield_now` and `thread::sleep` are real (futex-park) rather than inert: a spawned worker
+/// increments a shared `AtomicU32` with a `yield_now` between steps while `main` `sleep`s, then both
+/// join at the sum. This exercises the park/resume path (the worker must make progress across the
+/// main thread's sleep, and the yields must not hang or trap) and pins the result against native.
+#[test]
+fn std_threads_spec_yield_and_sleep() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::Arc;\n\
+         use std::sync::atomic::{AtomicU32, Ordering};\n\
+         use std::time::Duration;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let c = Arc::new(AtomicU32::new(0));\n\
+         \x20   let cw = Arc::clone(&c);\n\
+         \x20   let h = std::thread::spawn(move || {\n\
+         \x20       for _ in 0..15 {\n\
+         \x20           cw.fetch_add(1, Ordering::SeqCst);\n\
+         \x20           std::thread::yield_now();\n\
+         \x20       }\n\
+         \x20   });\n\
+         \x20   std::thread::sleep(Duration::from_millis(1));\n\
+         \x20   std::thread::yield_now();\n\
+         \x20   h.join().unwrap();\n\
+         \x20   ExitCode::from((c.load(Ordering::SeqCst) & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_yieldsleep", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 15,
+        "worker completes 15 yield-separated increments across main's sleep"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_yieldsleep_oracle", src) {
+        assert_eq!(
+            exit, oracle,
+            "yield_now/sleep progress matches the native oracle"
+        );
+    }
+}

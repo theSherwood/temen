@@ -14,10 +14,11 @@
 //! Only compiled for `x86_64-unknown-svm-threads` (`target_env = "threads"`); the lean target keeps
 //! `sys/thread/unsupported.rs` (spawn fails closed).
 //!
-//! Cooperative-scheduler notes (fail-safe simplifications, revisited as the model firms up): the
-//! per-thread TLS block leaks at thread exit (there is no thread-exit hook yet — the same
-//! "leak everything" stance as the wasm/svm TLS guard); `yield_now`/`sleep`/`set_name` are inert;
-//! `current_os_id` is `None`. Spawn/join + futex-backed `sys/sync` are the load-bearing surface.
+//! Cooperative-scheduler notes: `set_name` is inert and `current_os_id` is `None` (no per-vCPU name
+//! or OS-tid surface). `yield_now`/`sleep` ride the §12 futex — there is no dedicated yield/sleep op,
+//! but a `memory.wait` on a private word with `value == expected` parks the vCPU (yielding to other
+//! runnable vCPUs) until its deadline, which is exactly a cooperative yield / timed sleep. Spawn/join
+//! + futex-backed `sys/sync` are the load-bearing surface.
 
 use crate::alloc::{Layout, alloc, dealloc};
 use crate::ffi::CStr;
@@ -35,6 +36,30 @@ unsafe extern "C" {
     fn __vm_vcpu_tls_set(base: usize);
     fn __vm_tls_size() -> usize;
     fn __vm_tls_template() -> *const u8;
+    // §12 futex wait: park this vCPU while `*addr == expected`, until a notify or `timeout_ns`
+    // nanoseconds elapse. Returns 0 (woken), 1 (value mismatch — no wait), 2 (timed out). Backs
+    // `yield_now`/`sleep` here; the same op backs `sys/sync/futex/svm.rs`.
+    fn __vm_wait32(addr: *mut i32, expected: i32, timeout_ns: i64) -> i32;
+}
+
+/// Park the current vCPU for `timeout_ns` nanoseconds by futex-waiting on a private stack word whose
+/// value matches `expected`, so no notify can target it — it only wakes on the deadline. `timeout_ns
+/// == 0` yields exactly one scheduler turn (a park with an already-reached deadline). A spurious wake
+/// (`0`, possible only under the parallel driver's real futex) re-parks, so the vCPU sleeps at least
+/// the requested time.
+fn futex_park(timeout_ns: i64) {
+    // A fresh, never-notified word: value 0, expected 0 → the wait parks rather than returning early.
+    let word: i32 = 0;
+    let addr = &word as *const i32 as *mut i32;
+    loop {
+        // SAFETY: `addr` is an aligned, in-window i32; the op only reads it and parks.
+        let r = unsafe { __vm_wait32(addr, 0, timeout_ns) };
+        // 0 = spurious/notify wake (re-park); 2 = timed out; 1 = mismatch (unreachable here). Only a
+        // spurious wake loops — and a zero timeout never parks long enough to be worth re-parking.
+        if r != 0 || timeout_ns == 0 {
+            break;
+        }
+    }
 }
 
 /// A spawned vCPU and the data-stack region allocated for it (freed on `join`).
@@ -84,7 +109,9 @@ impl Thread {
             unsafe {
                 // NIM.md §3d Tier-2: give this vCPU its own TLS block, initialized from the pristine
                 // template (so non-zero thread-local initializers are honored), and point `vcpu.tls` at
-                // it before any thread-local is touched — so `vcpu.tls.get() + off` is isolated.
+                // it before any thread-local is touched — so `vcpu.tls.get() + off` is isolated. The
+                // block is freed at the very end, once nothing reads a thread-local again.
+                let mut tls_block: Option<(*mut u8, Layout)> = None;
                 let tls_size = __vm_tls_size();
                 if tls_size > 0 {
                     if let Ok(layout) = Layout::from_size_align(tls_size, 16) {
@@ -92,17 +119,22 @@ impl Thread {
                         if !block.is_null() {
                             ptr::copy_nonoverlapping(__vm_tls_template(), block, tls_size);
                             __vm_vcpu_tls_set(block.addr());
+                            tls_block = Some((block, layout));
                         }
                     }
-                    // (The block leaks at thread exit — no thread-exit hook yet.)
                 }
                 let init = Box::from_raw(ptr::with_exposed_provenance_mut::<ThreadInit>(data));
                 let rust_start = init.init();
                 rust_start();
                 // Run the thread's TLS destructors and the std runtime cleanup, as every platform's
-                // `thread_start` does.
+                // `thread_start` does — both may read thread-locals, so they precede the block free.
                 crate::sys::thread_local::destructors::run();
                 crate::rt::thread_cleanup();
+                // Nothing touches a thread-local past this point (the vCPU is about to exit), so the
+                // per-thread TLS block can be reclaimed — no leak.
+                if let Some((block, layout)) = tls_block {
+                    dealloc(block, layout);
+                }
             }
             0
         }
@@ -126,8 +158,17 @@ pub fn current_os_id() -> Option<u64> {
     None
 }
 
-pub fn yield_now() {}
+pub fn yield_now() {
+    // A zero-timeout park: yield one scheduler turn to other runnable vCPUs, then resume.
+    futex_park(0);
+}
 
 pub fn set_name(_name: &CStr) {}
 
-pub fn sleep(_dur: Duration) {}
+pub fn sleep(dur: Duration) {
+    // Park until the deadline. On the cooperative driver the wait clock is deterministic (advanced to
+    // the earliest deadline only when every vCPU is stuck-waiting), so a sleeping thread yields to
+    // runnable ones and resumes in deadline order. Clamp the nanosecond count to the op's i64 range.
+    let ns = i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX);
+    futex_park(ns);
+}
