@@ -733,7 +733,7 @@ fn totality_sweep_760() {
         }
     }
     let mut ranked: Vec<_> = buckets.into_iter().collect();
-    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1 .0));
     eprintln!(
         "\n===== #760 totality sweep: {} programs, {ok} translated, {nim_fail} nimony-fail =====",
         corpus.len()
