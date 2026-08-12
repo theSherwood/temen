@@ -8163,11 +8163,45 @@ pub mod live {
 static mut TIERUP_RUN: Option<TierupRun> = None;
 
 /// [`svm_onramp_tierup_run`] event codes: the run finished (statuses + capture slots staged), a
-/// TIERUP awaits servicing (operands via the `svm_onramp_tierup_*` accessors), or it trapped
-/// (statuses staged; the page re-runs on the interpreter oracle — INVARIANT 9 refusal).
+/// TIERUP awaits servicing (operands via the `svm_onramp_tierup_*` accessors), it trapped
+/// (statuses staged; the page re-runs on the interpreter oracle — INVARIANT 9 refusal), or a §22
+/// `Jit.invoke` awaits servicing on its unit's emitted wasm (#835 — operands via the
+/// `svm_onramp_tierup_jit_*` accessors + the shared `mapped`/`argv` ones).
 pub const TIERUP_RUN_DONE: i32 = 0;
 pub const TIERUP_RUN_TIERUP: i32 = 1;
 pub const TIERUP_RUN_TRAP: i32 = 2;
+pub const TIERUP_RUN_JIT_INVOKE: i32 = 3;
+
+/// The single-shot pump's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
+/// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
+/// flag and its window log2. Stored at [`svm_onramp_tierup_open`]; single-threaded wasm.
+static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The wasm emitter the single-shot pump installs for a `vm_jit_*`-importing guest (#835): emit a
+/// validated closed unit's entry as `f0(win, env, args…)`, or `None` if outside the emitter subset —
+/// then the invoke runs on the interpreter, fail-closed ([`browser_jit_wasm_emitter`]'s contract,
+/// minus the par-only B2 shape). The unit's mask is bumped to the pump's run window first — the
+/// driver convention everywhere ([`svm_onramp_tierup_open`] bumps the main module the same way):
+/// the unit declares the guest's memory (the validator's memory-match precondition), but the run
+/// window is larger, and a declared-size mask would alias `vm_map`-grown addresses.
+fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut m = svm_encode::decode_module(blob).ok()?;
+    let win_log2 = TIERUP_UNIT_WIN_LOG2.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(mc) = m.memory.as_mut() {
+        mc.size_log2 = mc.size_log2.max(win_log2);
+    }
+    let shared = TIERUP_UNIT_SHARED.load(std::sync::atomic::Ordering::Relaxed);
+    match svm_wasm_jit::compile_jit(&m, svm_wasm_jit::Shape::Batch { entry: 0 }, shared) {
+        Ok(svm_wasm_jit::Artifact {
+            wasm,
+            drive: svm_wasm_jit::DriveMode::WasmDriven { .. },
+            ..
+        }) => Some(wasm),
+        _ => None,
+    }
+}
 
 struct TierupRun {
     vcpu: bytecode::Vcpu<'static>,
@@ -8177,10 +8211,18 @@ struct TierupRun {
     /// address it directly through the one shared `env.memory`.
     backing: Box<[u8]>,
     emitted_wasm: Vec<u8>,
-    /// Pending TIERUP operands.
+    /// Pending TIERUP operands (`mapped`/`argv` double as the pending JIT_INVOKE's — one event
+    /// is pending at a time).
     func: u32,
     mapped: u64,
     argv: Vec<i64>,
+    /// Pending JIT_INVOKE operands (#835): the invoked unit's code handle (the JS host's
+    /// instance-cache key), its emitted wasm, and the per-arg/-result scalar type codes the JS
+    /// host marshals the i64 slots by.
+    jit_code: i32,
+    jit_wasm: Option<std::sync::Arc<[u8]>>,
+    jit_param_types: Vec<u8>,
+    jit_result_types: Vec<u8>,
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -8188,10 +8230,13 @@ struct TierupRun {
 
 /// Open a **leaf tier-up run** over the on-ramp module at `[mod_ptr, mod_len)` with stdin seeded:
 /// the interpreter drives `_start`; every all-i64 tier-up-eligible function is emitted for the JS
-/// host to run on TIERUP events. Returns `0`, else a negative `STATUS_*` (also in [`svm_status`]) —
-/// [`STATUS_UNSUPPORTED`] when nothing is eligible (or the guest uses concurrency, whose events this
-/// single-vCPU pump cannot service; the page then runs the plain bytecode path). Replaces any prior
-/// run. Drive with [`svm_onramp_tierup_run`] + the deliver calls; close with
+/// host to run on TIERUP events. A `vm_jit_*`-importing guest (#835, the JACL compiler shape) is
+/// admitted too: its runtime-compiled units get a wasm emitter, and a codegen-eligible `Jit.invoke`
+/// surfaces as a [`TIERUP_RUN_JIT_INVOKE`] event. Returns `0`, else a negative `STATUS_*` (also in
+/// [`svm_status`]) — [`STATUS_UNSUPPORTED`] when nothing could ever run emitted (no eligible leaf
+/// and no `Jit` import), or the guest uses threads/futex, whose events this single-vCPU pump cannot
+/// service (fibers are serviced in-engine); the page then runs the plain bytecode path. Replaces
+/// any prior run. Drive with [`svm_onramp_tierup_run`] + the deliver calls; close with
 /// [`svm_onramp_tierup_close`].
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_open(
@@ -8213,15 +8258,17 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // A spawning/fiber guest — or a §22 `vm_jit_*`-importing one (the JACL compiler-guest) — would
-    // surface events this single-vCPU pump can't service — fail closed to the bytecode path, which
-    // multiplexes/services them cooperatively.
-    if m.funcs.iter().any(|f| f.uses_concurrency())
-        || m.imports.iter().any(|im| im.name.starts_with("vm_jit_"))
-    {
+    // A threads/futex guest would surface `Spawn`/`Join`/`Wait`/`Notify` events this single-vCPU
+    // pump can't service — fail closed to the bytecode path, which multiplexes them cooperatively.
+    // Fibers are admitted (`step_vcpu` services `cont.*`/`suspend` internally — the §22
+    // "renegotiated 2026-07-30" split, `Func::uses_concurrency` doc), and so are §22
+    // `vm_jit_*`-importing guests (#835): install/uninstall and interpreter-serviced invokes are
+    // handled inline below, and a codegen-eligible invoke surfaces as [`TIERUP_RUN_JIT_INVOKE`].
+    if m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
+    let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
     let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
     // Emit with the mask bumped to the run window (the driver convention everywhere): the emitted
@@ -8243,7 +8290,10 @@ pub extern "C" fn svm_onramp_tierup_open(
         .enumerate()
         .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
-    if !eligible.iter().any(|&e| e) {
+    // Nothing for the emitted tier to ever run → refuse (the page's bytecode path is strictly
+    // simpler). A `vm_jit_*` importer stays eligible even with no emittable leaf: its win is the
+    // *runtime-compiled units* running emitted (#835 — the JACL macro-staging shape).
+    if !eligible.iter().any(|&e| e) && !jit_importer {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
@@ -8265,6 +8315,15 @@ pub extern "C" fn svm_onramp_tierup_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted the
+    // `Jit` cap + validator; only the runtime-compile par powerbox installs an emitter otherwise), so
+    // a guest-compiled unit can run emitted. The emitter is a bare `fn` — its two run parameters
+    // (the memory-share flag and the window bump) ride the statics it reads.
+    if jit_importer {
+        TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
+        TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+        host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
+    }
     // Declared prefix mapped, reservation clamped to the buffer: the guest `vm_map`-grows into
     // `[declared, 1 << win_log2)`, and an over-grow fails with `-EINVAL` (#816).
     let vcpu = match bytecode::Vcpu::new_root_reserved_over_with_powerbox(
@@ -8294,6 +8353,10 @@ pub extern "C" fn svm_onramp_tierup_open(
             func: 0,
             mapped: 0,
             argv: Vec::new(),
+            jit_code: 0,
+            jit_wasm: None,
+            jit_param_types: Vec::new(),
+            jit_result_types: Vec::new(),
             value: 0,
             frame,
         });
@@ -8304,10 +8367,13 @@ pub extern "C" fn svm_onramp_tierup_open(
 
 /// Pump the open tier-up run: interpret until it finishes ([`TIERUP_RUN_DONE`] — statuses, stdout/
 /// stderr, exit code, and framebuffer staged in the shared capture slots), traps
-/// ([`TIERUP_RUN_TRAP`] — statuses staged), or reaches an eligible call ([`TIERUP_RUN_TIERUP`] —
-/// run the emitted `f{func}` and deliver). The host contract per TIERUP: write
-/// [`svm_onramp_tierup_mapped`] to the emitted module's `"mapped"` global (and arm its `"fuel"`)
-/// before calling `f{func}(win, env, ...argv)`.
+/// ([`TIERUP_RUN_TRAP`] — statuses staged), reaches an eligible call ([`TIERUP_RUN_TIERUP`] —
+/// run the emitted `f{func}` and deliver), or reaches a codegen-eligible §22 `Jit.invoke`
+/// ([`TIERUP_RUN_JIT_INVOKE`] — instantiate the unit's wasm from the `svm_onramp_tierup_jit_*`
+/// accessors, cached per code handle, run its `f0` and deliver via
+/// [`svm_onramp_tierup_deliver_jit`]). The host contract per TIERUP/JIT_INVOKE: write
+/// [`svm_onramp_tierup_mapped`] to the emitted module's/unit's `"mapped"` global (and arm the
+/// fuel env cell) before calling `f{func}(win, env, ...argv)` / `f0(win, env, ...argv)`.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_run() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
@@ -8315,23 +8381,75 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
         unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
         return TIERUP_RUN_TRAP;
     };
-    let (status, value, exit_code, ev) = match s.vcpu.run() {
-        bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
-            s.func = func;
-            s.mapped = mapped;
-            s.argv = argv.into_vec();
-            return TIERUP_RUN_TIERUP;
+    let (status, value, exit_code, ev) = loop {
+        match s.vcpu.run() {
+            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
+                s.func = func;
+                s.mapped = mapped;
+                s.argv = argv.into_vec();
+                return TIERUP_RUN_TIERUP;
+            }
+            // §22 install/uninstall mutate only engine/host state — resolve authority against this
+            // run's own powerbox and deliver inline; the JS host is involved only when a unit *runs*.
+            // `svm_par_run`'s arms minus the B2 table mirror: an installed unit's `call_indirect`
+            // dispatch stays interpreted here (inline in the caller's frames, where fibers work).
+            bytecode::VcpuEvent::JitInstall { handle, code } => {
+                let resolved = par_resolve_unit_rt(s.vcpu.host_mut(), handle, code).map(|(f, _)| f);
+                let _ = s.vcpu.deliver_jit_install(resolved);
+            }
+            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
+                let authorized = s.vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
+                let _ = s.vcpu.deliver_jit_uninstall(authorized);
+            }
+            // §22 `Jit.invoke` (#835): a runtime-compiled unit with emitted wasm, all-scalar
+            // operands, and a representable window state runs on the JS host (the pending operands
+            // staged for the `svm_onramp_tierup_jit_*` accessors); anything else is serviced on the
+            // interpreter — fail-closed, it honors the full page map (the PAR_JIT_INVOKE contract).
+            bytecode::VcpuEvent::JitInvoke {
+                handle,
+                code,
+                argv,
+                params,
+                results,
+                mapped,
+            } => {
+                let codes = |ts: &[svm_ir::ValType]| {
+                    ts.iter()
+                        .map(|t| scalar_type_code(*t))
+                        .collect::<Option<Vec<u8>>>()
+                };
+                let (ptypes, rtypes) = (codes(&params), codes(&results));
+                match par_resolve_unit_rt(s.vcpu.host_mut(), handle, code) {
+                    Err(t) => s.vcpu.deliver_jit_invoke(Err(t)),
+                    Ok((funcs, wasm)) => {
+                        if let (Some(w), Some(pt), Some(rt), Some(h)) =
+                            (wasm, ptypes, rtypes, mapped)
+                        {
+                            s.jit_code = code;
+                            s.mapped = h;
+                            s.argv = argv.into_vec();
+                            s.jit_wasm = Some(w);
+                            s.jit_param_types = pt;
+                            s.jit_result_types = rt;
+                            return TIERUP_RUN_JIT_INVOKE;
+                        }
+                        s.vcpu.deliver_jit_invoke(Ok(funcs));
+                    }
+                }
+            }
+            bytecode::VcpuEvent::Done(vals) => match vals.first() {
+                Some(Value::I64(x)) => break (STATUS_OK, *x, 0, TIERUP_RUN_DONE),
+                Some(Value::I32(x)) => break (STATUS_OK, *x as i64, 0, TIERUP_RUN_DONE),
+                None => break (STATUS_OK, 0, 0, TIERUP_RUN_DONE),
+                _ => break (STATUS_BAD_RESULT, 0, 0, TIERUP_RUN_DONE),
+            },
+            bytecode::VcpuEvent::Trapped(Trap::Exit(code)) => {
+                break (STATUS_EXIT, 0, code, TIERUP_RUN_DONE)
+            }
+            bytecode::VcpuEvent::Trapped(_) => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
+            // Unreachable given the threads/futex gate at open; fail closed like the reactor does.
+            _ => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
         }
-        bytecode::VcpuEvent::Done(vals) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0, TIERUP_RUN_DONE),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0, TIERUP_RUN_DONE),
-            None => (STATUS_OK, 0, 0, TIERUP_RUN_DONE),
-            _ => (STATUS_BAD_RESULT, 0, 0, TIERUP_RUN_DONE),
-        },
-        bytecode::VcpuEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, TIERUP_RUN_DONE),
-        bytecode::VcpuEvent::Trapped(_) => (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
-        // Unreachable given the concurrency gate at open; fail closed like the reactor does.
-        _ => (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
     };
     s.value = value;
     let host = s.vcpu.host_mut();
@@ -8363,14 +8481,15 @@ pub extern "C" fn svm_onramp_tierup_func() -> i32 {
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.func as i32)
 }
 
-/// The pending TIERUP's committed extent — the value for the emitted `"mapped"` global (#717).
+/// The pending TIERUP's/JIT_INVOKE's committed extent — the value for the emitted `"mapped"`
+/// global (#717).
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_mapped() -> i64 {
     // SAFETY: single-threaded wasm; read of the pending operands.
     unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.mapped as i64)
 }
 
-/// The pending TIERUP's marshalled i64 args (base pointer; valid until the next event).
+/// The pending TIERUP's/JIT_INVOKE's marshalled i64 args (base pointer; valid until the next event).
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_argv_ptr() -> *const i64 {
     // SAFETY: single-threaded wasm; read of the pending operands.
@@ -8441,6 +8560,87 @@ pub extern "C" fn svm_onramp_tierup_deliver_trap() {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
         s.vcpu.deliver_tierup_trap(Trap::Unreachable);
+    }
+}
+
+// ---- pending JIT_INVOKE operands (#835) — the §22 unit half of the pump ----------------------
+
+/// The pending JIT_INVOKE's code handle — the JS host keys its per-unit instance cache by this
+/// (one wasm instance per compiled unit; args differ per invoke — worker.js's `jitUnitFor` shape).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_code() -> i32 {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.jit_code)
+}
+
+/// The pending JIT_INVOKE's emitted unit wasm (instantiate against this module's memory; the bytes
+/// stay valid until the next event — the session holds its own `Arc`).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_wasm_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
+        s.jit_wasm
+            .as_ref()
+            .map_or(core::ptr::null(), |w| w.as_ptr())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_wasm_len() -> usize {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
+        .map_or(0, |s| s.jit_wasm.as_ref().map_or(0, |w| w.len()))
+}
+
+/// Per-arg scalar type codes of the pending JIT_INVOKE (`0` = i32, `1` = i64, `2` = f32, `3` =
+/// f64), one byte per arg — the JS host marshals each [`svm_onramp_tierup_argv_ptr`] i64 slot to
+/// the wasm type the unit's `f0` declares. Length equals [`svm_onramp_tierup_argv_len`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_param_types_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.jit_param_types.as_ptr())
+}
+
+/// Per-result scalar type codes of the pending JIT_INVOKE (encoding as
+/// [`svm_onramp_tierup_jit_param_types_ptr`]) — the JS host marshals each `f0` result back to its
+/// i64 slot (a float's bits, an integer's value) for [`svm_onramp_tierup_deliver_jit`].
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_result_types_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |s| s.jit_result_types.as_ptr())
+}
+
+/// Number of pending JIT_INVOKE results (see [`svm_onramp_tierup_jit_result_types_ptr`]).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_jit_result_types_len() -> usize {
+    // SAFETY: single-threaded wasm; read of the pending operands.
+    unsafe { (*core::ptr::addr_of!(TIERUP_RUN)).as_ref() }.map_or(0, |s| s.jit_result_types.len())
+}
+
+/// Deliver the unit `f0`'s i64 result slots for the pending JIT_INVOKE — the vCPU resumes exactly
+/// as if the interpreter had run the unit ([`Vcpu::deliver_jit_invoke_vals`]'s contract).
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_deliver_jit(rptr: *const i64, n: usize) {
+    // SAFETY: single-threaded wasm; `[rptr, n)` is a live `svm_alloc`ation the host just filled.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
+        let vals = if rptr.is_null() || n == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(rptr, n) }
+        };
+        s.vcpu.deliver_jit_invoke_vals(vals);
+    }
+}
+
+/// Deliver a trap from the pending JIT_INVOKE's emitted unit (a wasm trap or an SVM fault) — the
+/// vCPU traps on its next pump, as an interpreted invoke trap would.
+#[no_mangle]
+pub extern "C" fn svm_onramp_tierup_deliver_jit_trap() {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
+        s.vcpu.deliver_jit_invoke_trap(Trap::Unreachable);
     }
 }
 

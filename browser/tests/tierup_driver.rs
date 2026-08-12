@@ -12,12 +12,14 @@
 use std::sync::Mutex;
 use svm_browser::{
     onramp_exec, svm_onramp_tierup_argv_len, svm_onramp_tierup_argv_ptr, svm_onramp_tierup_close,
-    svm_onramp_tierup_deliver, svm_onramp_tierup_deliver_trap, svm_onramp_tierup_func,
-    svm_onramp_tierup_mapped, svm_onramp_tierup_open, svm_onramp_tierup_run,
-    svm_onramp_tierup_value, svm_onramp_tierup_wasm_len, svm_onramp_tierup_wasm_ptr,
-    svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr, svm_run_value, svm_status,
-    svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_UNSUPPORTED, TIERUP_RUN_DONE,
-    TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
+    svm_onramp_tierup_deliver, svm_onramp_tierup_deliver_jit, svm_onramp_tierup_deliver_jit_trap,
+    svm_onramp_tierup_deliver_trap, svm_onramp_tierup_func, svm_onramp_tierup_jit_param_types_ptr,
+    svm_onramp_tierup_jit_result_types_len, svm_onramp_tierup_jit_wasm_len,
+    svm_onramp_tierup_jit_wasm_ptr, svm_onramp_tierup_mapped, svm_onramp_tierup_open,
+    svm_onramp_tierup_run, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
+    svm_onramp_tierup_wasm_ptr, svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr,
+    svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_UNSUPPORTED,
+    TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
 };
 use svm_interp::{Host, StreamRole};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -101,12 +103,45 @@ fn service_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     let wasm = unsafe {
         std::slice::from_raw_parts(svm_onramp_tierup_wasm_ptr(), svm_onramp_tierup_wasm_len())
     };
+    let func = svm_onramp_tierup_func();
+    run_emitted_on_wasmi(wasm, &format!("f{func}"), n_results)
+}
+
+/// Service one JIT_INVOKE on wasmi (#835 — `driveTierupRun`'s §22 unit arm): same window-mirror /
+/// `"mapped"`-sync mechanics, but the wasm is the *invoked unit*'s emit and the entry is its `f0`.
+/// The result count comes from the event's own result-type operand (the JS host reads it the same
+/// way). All-i64 operands only in this harness — asserted against the event's type codes.
+fn service_jit_on_wasmi() -> Option<Vec<i64>> {
+    // SAFETY: the vCPU is parked inside the JIT_INVOKE event; the session stash is stable until
+    // the deliver call, and this thread is the only accessor (FFI_LOCK).
+    let wasm = unsafe {
+        std::slice::from_raw_parts(
+            svm_onramp_tierup_jit_wasm_ptr(),
+            svm_onramp_tierup_jit_wasm_len(),
+        )
+    };
+    let ptypes = unsafe {
+        std::slice::from_raw_parts(
+            svm_onramp_tierup_jit_param_types_ptr(),
+            svm_onramp_tierup_argv_len(),
+        )
+    };
+    assert!(
+        ptypes.iter().all(|&t| t == 1),
+        "this harness marshals i64 slots only (type codes {ptypes:?})"
+    );
+    run_emitted_on_wasmi(wasm, "f0", svm_onramp_tierup_jit_result_types_len())
+}
+
+/// The shared wasmi half of both service arms: instantiate `wasm` over a mirrored window, write the
+/// pending event's `"mapped"` sync (#717), call `entry(win, env, ...argv)`, copy the window back.
+fn run_emitted_on_wasmi(wasm: &[u8], entry: &str, n_results: usize) -> Option<Vec<i64>> {
+    // SAFETY: as the callers' — the pending event's operand stash is stable until the deliver.
     let argv = unsafe {
         std::slice::from_raw_parts(svm_onramp_tierup_argv_ptr(), svm_onramp_tierup_argv_len())
     };
     let win_len = svm_onramp_tierup_win_len();
     let win_ptr = svm_onramp_tierup_win_ptr() as *mut u8;
-    let func = svm_onramp_tierup_func();
     let mapped = svm_onramp_tierup_mapped();
 
     let engine = Engine::default();
@@ -150,8 +185,8 @@ fn service_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
         .set(&mut store, Val::I64(mapped))
         .unwrap();
     let f = instance
-        .get_func(&store, &format!("f{func}"))
-        .unwrap_or_else(|| panic!("f{func} not exported"));
+        .get_func(&store, entry)
+        .unwrap_or_else(|| panic!("{entry} not exported"));
 
     let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
     params.extend(argv.iter().map(|a| Val::I64(*a)));
@@ -251,6 +286,308 @@ fn tierup_pump_matches_the_bytecode_oracle() {
         got_out, want.stdout,
         "stdout parity with the bytecode oracle"
     );
+    svm_onramp_tierup_close();
+}
+
+// ---- #835: the §22 vm_jit_* half of the pump -------------------------------------------------
+
+/// What the guest-compiled unit adds to its probe (distinct from `LEAF_K` so a cross-wire shows).
+const UNIT_K: i64 = 90909;
+/// Where `_start` stages the unit blob bytes before `vm_jit_compile`.
+const BLOB_BASE: i64 = 4096;
+
+/// The unit the guest compiles at runtime: all-i64 `f(x) = *(x+8) after *(x+8) = x + UNIT_K` — a
+/// store/load over the `vm_map`-grown page, so the emitted unit's masked window (bumped past the
+/// declared 2^16 by the pump's emitter) and the per-invoke `"mapped"` sync are both load-bearing.
+/// Declares the guest's memory (16) — the validator's memory-match precondition.
+fn unit_blob() -> Vec<u8> {
+    let src = format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {UNIT_K}
+  vsum = i64.add v0 vk
+  vp = i64.const 8
+  vaddr = i64.add v0 vp
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse unit");
+    svm_verify::verify_module(&m).expect("verify unit");
+    svm_encode::encode_module(&m)
+}
+
+/// The `vm_jit_*`-importing guest (#835 — the JACL compiler shape in miniature): `_start` grows
+/// `[64 KiB, 80 KiB)`, stages the unit blob into memory, `vm_jit_compile`s it, `vm_jit_invoke2`s
+/// the compiled unit with the grown-page probe, and streams the result — no tier-up-eligible leaf
+/// at all, so the open admits it purely on the `Jit` import (the widened #835 gate).
+fn jit_guest_text() -> String {
+    let (out_h, mem_h) = onramp_handles();
+    let blob = unit_blob();
+    let blob_len = blob.len();
+    let mut stores = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let val = i64::from_le_bytes(word);
+        let addr = BLOB_BASE + (i as i64) * 8;
+        stores.push_str(&format!(
+            "  va{i} = i64.const {addr}\n  vv{i} = i64.const {val}\n  i64.store va{i} vv{i}\n"
+        ));
+    }
+    format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {PROBE}
+  vres = call.import 1 (vcode, vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// #835 differential: the `vm_jit_*` guest through the pump — its runtime-compiled unit serviced
+/// on wasmi via the JIT_INVOKE event — must match the bytecode oracle (`onramp_exec`, which
+/// services the invoke on the interpreter), with the emitted-invoke non-vacuity counter and the
+/// grown-extent `"mapped"` operand pinned.
+#[test]
+fn jit_invoke_pump_matches_the_bytecode_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let m = svm_text::parse_module(&jit_guest_text()).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        PROBE + UNIT_K,
+        "oracle invokes the guest-compiled unit through the grown page"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "open must admit the vm_jit_* guest (#835) even with no eligible leaf (status {})",
+        svm_status()
+    );
+
+    let mut jit_invokes = 0u32;
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_JIT_INVOKE => {
+                jit_invokes += 1;
+                // The event's committed extent is the grown window — the value the JS host writes
+                // to the unit's `"mapped"` global (#717; a declared-only bound would refuse the
+                // probe and diverge).
+                assert_eq!(
+                    svm_onramp_tierup_mapped(),
+                    65536 + 16384,
+                    "the JIT_INVOKE mapped operand carries the grown extent"
+                );
+                match service_jit_on_wasmi() {
+                    Some(res) => svm_onramp_tierup_deliver_jit(res.as_ptr(), res.len()),
+                    None => svm_onramp_tierup_deliver_jit_trap(),
+                }
+            }
+            TIERUP_RUN_TIERUP => {
+                // No eligible leaf exists in this guest; reaching here is a wiring bug.
+                panic!("unexpected TIERUP from the leafless vm_jit_* guest");
+            }
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    assert!(
+        jit_invokes >= 1,
+        "the unit must actually run on its emitted wasm (non-vacuity)"
+    );
+
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    svm_onramp_tierup_close();
+}
+
+/// #835 gate pin: a **fiber**-using guest (`cont.new`/`cont.resume`/`suspend` — the JACL scheduler
+/// shape) is admitted now (`step_vcpu` services fibers in-engine; only threads/futex refuse) and
+/// runs through the pump observably identical to the oracle, its eligible leaf still tiering up.
+#[test]
+fn fiber_guest_is_admitted_and_matches_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let src = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 2
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 7
+  vs1, vv1 = cont.resume v2 v3
+  vs2, vv2 = cont.resume v2 v3
+  vprobe = i64.const 1234
+  vres = call 1 (vprobe)
+  va = i64.add vv1 vres
+  vb = i64.add va vv2
+  vs1e = i64.extend_i32_s vs1
+  vk1 = i64.const 1000000
+  vc = i64.mul vs1e vk1
+  vs2e = i64.extend_i32_s vs2
+  vk2 = i64.const 10000000
+  vd = i64.mul vs2e vk2
+  ve = i64.add vb vc
+  vf = i64.add ve vd
+  return vf
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 40404
+  vsum = i64.add v0 vk
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vk = i64.const 100
+  vs = i64.add varg vk
+  vv = suspend vs
+  return vv
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = svm_text::parse_module(src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened,
+        0,
+        "a fiber guest must be admitted now (#835 gate — status {})",
+        svm_status()
+    );
+    let n_results = m.funcs[1].results.len();
+    let mut tierups = 0u32;
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_TIERUP => {
+                tierups += 1;
+                match service_on_wasmi(n_results) {
+                    Some(res) => svm_onramp_tierup_deliver(res.as_ptr(), res.len()),
+                    None => svm_onramp_tierup_deliver_trap(),
+                }
+            }
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    assert!(tierups >= 1, "the leaf still tiers up beside the fibers");
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    svm_onramp_tierup_close();
+}
+
+/// #835 capstone (asset-gated): the real JACL self-hosted compiler-guest — `vm_jit_*` imports +
+/// fiber scheduler — runs through the pump observably identical to the interpreter oracle. Emitted
+/// events are serviced when they surface (a symtab-linked macro unit may stay interpreted — the
+/// emitter admits closed units only — so no non-vacuity is asserted here; the synthetic tests above
+/// pin that). Cross-repo asset (see `jacl_selfhost_jit.rs`); absent ⇒ SKIP.
+#[test]
+fn jacl_compiler_runs_through_the_pump() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../codegen/selfhost/build/jacl_compiler.svmb"
+    );
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("SKIP: jacl_compiler.svmb absent (run codegen/selfhost/build_compiler_svmb.sh)");
+        return;
+    };
+    let compiler = svm_encode::decode_module(&bytes).expect("decode jacl_compiler.svmb");
+    const MACRO_SRC: &[u8] = b"defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
+                               mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
+
+    let want = onramp_exec(&compiler, MACRO_SRC);
+    let opened = svm_onramp_tierup_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        MACRO_SRC.as_ptr(),
+        MACRO_SRC.len(),
+        0,
+    );
+    if opened != 0 {
+        // The pump may still refuse the giant module (e.g. its tier-up emit declines) — the
+        // fail-closed contract; the page then runs the bytecode path. Pin the refusal is clean.
+        assert_eq!(opened, -STATUS_UNSUPPORTED, "refusal must be clean");
+        eprintln!("SKIP: pump refused the compiler-guest (clean bytecode fallback)");
+        return;
+    }
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_TIERUP => {
+                let f = svm_onramp_tierup_func() as usize;
+                let n_results = compiler.funcs[f].results.len();
+                match service_on_wasmi(n_results) {
+                    Some(res) => svm_onramp_tierup_deliver(res.as_ptr(), res.len()),
+                    None => svm_onramp_tierup_deliver_trap(),
+                }
+            }
+            TIERUP_RUN_JIT_INVOKE => match service_jit_on_wasmi() {
+                Some(res) => svm_onramp_tierup_deliver_jit(res.as_ptr(), res.len()),
+                None => svm_onramp_tierup_deliver_jit_trap(),
+            },
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
     svm_onramp_tierup_close();
 }
 
