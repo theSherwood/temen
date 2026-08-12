@@ -1512,6 +1512,23 @@ static int gen_builtin_pipe(Node *node) {
   return r; // i64 result (0 / -errno); the C `long __vm_pipe` return narrows at the use site
 }
 
+// #796 L1 — `__vm_raise(int signum)`: raise a POSIX signal on this process. Lowers to the self-namespace
+// op `cap.call 4294967295 17`: it marks the signal pending in the installed signal source (a caught
+// handler is delivered at the next safepoint) and interrupts any interruptible blocking pipe read/write
+// this domain has parked, so that syscall returns -EINTR (POSIX). Returns 0 (int).
+static int gen_builtin_raise(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 1)
+    error_tok(node->tok, "codegen_ir: __vm_raise(signum) expects 1 argument");
+  int signum = widen_i64(gen_expr(node->args), node->args->ty);
+  int h = dummy_handle();
+  int r = nv++;
+  cg("  v%d = cap.call 4294967295 17 (i64) -> (i64) v%d (v%d)\n", r, h, signum);
+  return r; // i64 result (0); the C `int __vm_raise` return narrows at the use site
+}
+
 // FORK.md §8.6 — `__vm_close(int handle)`: close a `Stream`/pipe-end handle. Lowers to `cap.call 0 2`
 // (iface `STREAM` = 0, op 2 = close) on the runtime handle. Revokes the handle; closing a pipe **write**
 // end also drops the pipe's writer count (→ EOF for its reader once all writers close). A shell closes
@@ -1978,6 +1995,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_setpgid(node);
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
+        if (!strcmp(fname, "__vm_raise"))
+          return gen_builtin_raise(node);
         if (!strcmp(fname, "__vm_close"))
           return gen_builtin_close(node);
         if (!strcmp(fname, "__vm_read"))
