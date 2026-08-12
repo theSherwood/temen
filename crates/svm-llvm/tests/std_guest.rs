@@ -137,6 +137,39 @@ fn svm_run_std_posix(
     Some((out.stdout, exit))
 }
 
+/// [`svm_run_std_posix`] with the **`net` capability** granted alongside `posix` (POSIX.md §5a) —
+/// the `std::net` path: loopback rides the in-personality memnet; `seed` may wire a `NetDelegate`
+/// (`set_net`) for scripted egress.
+fn svm_run_std_net(
+    name: &str,
+    src: &str,
+    seed: impl FnOnce(&svm_posix::Posix),
+) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll(name, src)?;
+    let t = svm_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated std binary verifies");
+    let (cap, posix) = svm_run::posix::posix_cap(0, 0, Vec::new());
+    let net = svm_run::posix::net_cap(&posix);
+    seed(&posix);
+    let out = svm_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps(
+            svm_run::Backend::Jit,
+            &svm_run::RunConfig::default(),
+            &[("posix", cap), ("net", net)],
+        )
+        .expect("run_with_caps");
+    let exit = match out.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((out.stdout, exit))
+}
+
 /// Translate + verify + run `src` as a std guest on the powerbox → `(stdout, exit code)`.
 fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     let ll = build_std_bin_ll(name, src)?;
@@ -667,5 +700,95 @@ fn std_fs_dir_ops() {
          rmdir_nonempty_err=DirectoryNotEmpty\n\
          clone_read=\"hi there\"\n",
         "create_dir/create_dir_all/rename/remove_dir/try_clone over the memfs dir ops"
+    );
+}
+
+/// S2 (net) — `std::net` via the **`net` capability** (POSIX.md §5a): a lockstep self-connect over
+/// the loopback **memnet** (bind `:0` → ephemeral port, connect, accept, bytes both ways, EOF on
+/// drop, `ConnectionRefused` with no listener, `localhost` resolution — all deterministic, no
+/// delegate), then scripted **egress through a `NetDelegate`** (`set_net`): the guest resolves
+/// `example.com` and connects to it purely through the embedder's script — the personality itself
+/// holds no network authority. Data rides the ordinary posix fd `read`/`write` ops.
+#[test]
+fn std_net_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest net (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    struct Canned;
+    impl svm_posix::NetStream for Canned {
+        fn send(&mut self, buf: &[u8]) -> i64 {
+            assert_eq!(buf, b"GET /");
+            buf.len() as i64
+        }
+        fn recv(&mut self, buf: &mut [u8]) -> i64 {
+            let msg = b"HTTP/1.1 200 OK";
+            buf[..msg.len()].copy_from_slice(msg);
+            msg.len() as i64
+        }
+    }
+    struct Scripted;
+    impl svm_posix::NetDelegate for Scripted {
+        fn connect(
+            &mut self,
+            addr: &svm_posix::NetAddr,
+        ) -> Result<Box<dyn svm_posix::NetStream>, i64> {
+            assert_eq!(addr.port, 80);
+            assert_eq!(&addr.addr[..4], &[93, 184, 216, 34]);
+            Ok(Box::new(Canned))
+        }
+        fn resolve(&mut self, host: &str) -> Result<Vec<svm_posix::NetAddr>, i64> {
+            assert_eq!(host, "example.com");
+            let mut addr = [0u8; 16];
+            addr[..4].copy_from_slice(&[93, 184, 216, 34]);
+            Ok(vec![svm_posix::NetAddr {
+                v6: false,
+                port: 0,
+                addr,
+            }])
+        }
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::io::{Read, Write};\n\
+         use std::net::{TcpListener, TcpStream};\n\
+         fn main() {\n\
+         \x20   let listener = TcpListener::bind(\"127.0.0.1:0\").expect(\"bind\");\n\
+         \x20   let addr = listener.local_addr().expect(\"local_addr\");\n\
+         \x20   println!(\"bound_port_ephemeral={}\", addr.port() >= 49152);\n\
+         \x20   let mut client = TcpStream::connect(addr).expect(\"connect\");\n\
+         \x20   let (mut server, peer) = listener.accept().expect(\"accept\");\n\
+         \x20   println!(\"peer_is_loopback={}\", peer.ip().is_loopback());\n\
+         \x20   client.write_all(b\"ping\").expect(\"cwrite\");\n\
+         \x20   let mut buf = [0u8; 32];\n\
+         \x20   let n = server.read(&mut buf).expect(\"sread\");\n\
+         \x20   println!(\"server_got={:?}\", core::str::from_utf8(&buf[..n]).unwrap());\n\
+         \x20   server.write_all(b\"pong!\").expect(\"swrite\");\n\
+         \x20   let n = client.read(&mut buf).expect(\"cread\");\n\
+         \x20   println!(\"client_got={:?}\", core::str::from_utf8(&buf[..n]).unwrap());\n\
+         \x20   drop(client);\n\
+         \x20   println!(\"eof={}\", server.read(&mut buf).expect(\"eof read\") == 0);\n\
+         \x20   println!(\"refused={:?}\", TcpStream::connect(\"127.0.0.1:12345\").unwrap_err().kind());\n\
+         \x20   let mut egress = TcpStream::connect(\"example.com:80\").expect(\"delegate connect\");\n\
+         \x20   egress.write_all(b\"GET /\").expect(\"ewrite\");\n\
+         \x20   let n = egress.read(&mut buf).expect(\"eread\");\n\
+         \x20   println!(\"egress={:?}\", core::str::from_utf8(&buf[..n]).unwrap());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std_net("svm_std_net", src, |p| p.set_net(Scripted)) else {
+        eprintln!("note: skipping std_guest net (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "bound_port_ephemeral=true\n\
+         peer_is_loopback=true\n\
+         server_got=\"ping\"\n\
+         client_got=\"pong!\"\n\
+         eof=true\n\
+         refused=ConnectionRefused\n\
+         egress=\"HTTP/1.1 200 OK\"\n",
+        "TcpListener/TcpStream over the memnet + scripted delegate egress"
     );
 }

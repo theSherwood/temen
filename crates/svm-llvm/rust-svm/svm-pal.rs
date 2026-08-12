@@ -219,4 +219,62 @@ pub(crate) mod host {
     pub(crate) fn waitpid(pid: i64, status_ptr: *mut u8, options: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 28, pid, status_ptr as i64, options, 0) }
     }
+
+    // ---- the `net` capability (POSIX.md §5a — `std::net`) ---------------------------------------
+    // A **separate named handle** from `posix`: authority is its own grant. Addresses travel as the
+    // blob `[family u8 (4|6), port u16 LE, addr 4|16 bytes]`. Connected sockets are ordinary fds —
+    // `TcpStream` read/write ride the posix `read_fd`/`write_fd` ops above.
+
+    // `-1` = not-yet-resolved sentinel; resolved once, then cached (like `POSIX`).
+    static NET: AtomicI32 = AtomicI32::new(-1);
+
+    /// The `net` capability handle, or a negative value if the embedder granted none.
+    fn net() -> i32 {
+        let cached = NET.load(Ordering::Relaxed);
+        if cached != -1 {
+            return cached;
+        }
+        let h = unsafe { __vm_cap_resolve(b"net".as_ptr(), 3) };
+        NET.store(h, Ordering::Relaxed);
+        h
+    }
+
+    /// Whether a `net` capability is available (a socket op can be attempted).
+    pub(crate) fn have_net() -> bool {
+        net() >= 0
+    }
+
+    /// `connect(addr, alen, laddr_out, cap) -> fd | -errno` (svm-posix `NET_CONNECT` = 1). Writes the
+    /// connection's local address blob.
+    #[inline(always)]
+    pub(crate) fn net_connect(addr: *const u8, alen: i64, laddr_out: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(net(), 1, addr as i64, alen, laddr_out as i64, cap) }
+    }
+
+    /// `bind(addr, alen, bound_out, cap) -> listener_fd | -errno` (svm-posix `NET_BIND` = 2).
+    /// Bind+listen folded; `:0` assigns an ephemeral port; writes the actual bound address.
+    #[inline(always)]
+    pub(crate) fn net_bind(addr: *const u8, alen: i64, bound_out: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(net(), 2, addr as i64, alen, bound_out as i64, cap) }
+    }
+
+    /// `accept(fd, peer_out, cap) -> fd | -EAGAIN | -errno` (svm-posix `NET_ACCEPT` = 3). Writes the
+    /// peer's address blob.
+    #[inline(always)]
+    pub(crate) fn net_accept(fd: i64, peer_out: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(net(), 3, fd, peer_out as i64, cap, 0) }
+    }
+
+    /// `shutdown(fd, how) -> 0 | -errno` (svm-posix `NET_SHUTDOWN` = 4; `0` read / `1` write / `2` both).
+    #[inline(always)]
+    pub(crate) fn net_shutdown(fd: i64, how: i64) -> i64 {
+        unsafe { __vm_host_call(net(), 4, fd, how, 0, 0) }
+    }
+
+    /// `resolve(name, nlen, out, cap) -> nbytes | -errno` (svm-posix `NET_RESOLVE` = 5). Writes address
+    /// blobs back-to-back when they fit; the total length is returned either way (size-then-fetch).
+    #[inline(always)]
+    pub(crate) fn net_resolve(name: *const u8, nlen: i64, out: *mut u8, cap: i64) -> i64 {
+        unsafe { __vm_host_call(net(), 5, name as i64, nlen, out as i64, cap) }
+    }
 }

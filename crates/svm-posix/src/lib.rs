@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use svm_interp::{cap_id, GuestMem, Host, HostProc, Trap};
@@ -154,6 +155,18 @@ pub const OP_RENAME: u32 = 38;
 /// `-EINVAL` for the root or a non-UTF-8 path.
 pub const OP_RMDIR: u32 = 39;
 
+/// **`net` capability ops** (POSIX.md §5a) — a **separate named handle** (`"net"`), not entries in the
+/// libc table above: authority is its own granted capability (the WASI 0.2 lesson), while the data
+/// plane rides the ordinary fd `read`/`write`/`close`/`dup2` ops. `connect`/`bind` take a socket-address
+/// **blob** — `[family u8 (4|6), port u16 LE, addr 4|16 bytes]` — and write the resulting local/bound
+/// address back through an out-blob. Loopback is served by the in-personality **memnet**; anything
+/// beyond routes to the embedder's [`NetDelegate`] ([`Posix::set_net`]) or fails closed.
+pub const NET_CONNECT: u32 = 1;
+pub const NET_BIND: u32 = 2;
+pub const NET_ACCEPT: u32 = 3;
+pub const NET_SHUTDOWN: u32 = 4;
+pub const NET_RESOLVE: u32 = 5;
+
 /// `signal` dispositions (the low, non-pointer handler values): default action, or ignore.
 const SIG_DFL: i64 = 0;
 const SIG_IGN: i64 = 1;
@@ -169,6 +182,12 @@ const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
 const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
 const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
 const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
+const EAGAIN: i64 = -11; // read/accept on an empty memnet socket (would block a cooperative guest)
+const EACCES: i64 = -13; // bind beyond loopback (no delegate-granted listener path yet, POSIX.md §5a)
+const EPIPE: i64 = -32; // write on a socket whose write side is shut down
+const ENOTSOCK: i64 = -88; // a net op on an fd that is not a socket/listener
+const EADDRINUSE: i64 = -98; // bind on a loopback port another listener holds
+const ECONNREFUSED: i64 = -111; // connect with no listener (loopback) or no delegate (beyond)
 
 /// `fcntl` commands this personality serves (Linux `<fcntl.h>` values). `F_DUPFD`/`F_DUPFD_CLOEXEC`
 /// duplicate to the lowest free fd `>= arg`; `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` are accepted no-ops
@@ -239,6 +258,163 @@ pub struct SpawnResult {
 /// scripted table, a real subprocess). Runs to completion synchronously (the sequential, no-fork model).
 type SpawnFn = Box<dyn FnMut(&str, &[String], &[u8]) -> SpawnResult + Send>;
 
+// ---- net (POSIX.md §5a): the memnet + the embedder delegate ------------------------------------
+
+/// A socket address, parsed from / encoded to the wire blob `[family u8 (4|6), port u16 LE,
+/// addr 4|16 bytes]` — sized so an address fits the 4-arg host-call ABI as one `(ptr, len)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NetAddr {
+    pub v6: bool,
+    pub port: u16,
+    /// The address bytes; a v4 address uses the first 4.
+    pub addr: [u8; 16],
+}
+
+impl NetAddr {
+    /// The loopback address for `port` (v4 `127.0.0.1`).
+    pub fn loopback(port: u16) -> NetAddr {
+        let mut addr = [0u8; 16];
+        addr[0] = 127;
+        addr[3] = 1;
+        NetAddr {
+            v6: false,
+            port,
+            addr,
+        }
+    }
+
+    fn parse(blob: &[u8]) -> Option<NetAddr> {
+        let (&family, rest) = blob.split_first()?;
+        let port = u16::from_le_bytes(rest.get(0..2)?.try_into().ok()?);
+        let mut addr = [0u8; 16];
+        match family {
+            4 => addr[..4].copy_from_slice(rest.get(2..6)?),
+            6 => addr.copy_from_slice(rest.get(2..18)?),
+            _ => return None,
+        }
+        Some(NetAddr {
+            v6: family == 6,
+            port,
+            addr,
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let n = if self.v6 { 16 } else { 4 };
+        let mut out = Vec::with_capacity(3 + n);
+        out.push(if self.v6 { 6 } else { 4 });
+        out.extend_from_slice(&self.port.to_le_bytes());
+        out.extend_from_slice(&self.addr[..n]);
+        out
+    }
+
+    fn is_loopback(&self) -> bool {
+        if self.v6 {
+            self.addr[..15] == [0; 15] && self.addr[15] == 1
+        } else {
+            self.addr[0] == 127
+        }
+    }
+}
+
+/// The embedder's **network delegate** — the authority for anything beyond the loopback memnet
+/// (the [`Posix::set_spawn`] analog; POSIX.md §5a). The personality itself holds no network
+/// authority: absent a delegate, a non-loopback `connect` is `-ECONNREFUSED` and `resolve` of a
+/// non-`localhost` name is `-ENOENT` — fail closed. Policy (allowlists, remapping, scripting)
+/// lives here, host-side; the guest never sees a raw socket.
+pub trait NetDelegate: Send {
+    /// Connect to a non-loopback destination; return a live byte stream, or a negative errno
+    /// (e.g. `-ECONNREFUSED`).
+    fn connect(&mut self, addr: &NetAddr) -> Result<Box<dyn NetStream>, i64>;
+
+    /// Resolve a host name (no port) to addresses. Default: refuse (`-ENOENT`).
+    fn resolve(&mut self, _host: &str) -> Result<Vec<NetAddr>, i64> {
+        Err(ENOENT)
+    }
+}
+
+/// One delegate-backed connected stream (the embedder owns the real I/O). `recv` **may block
+/// host-side** — the guest is suspended inside the host call, like a spawn running its child.
+/// Return the byte count, `0` for EOF, or a negative errno.
+pub trait NetStream: Send {
+    fn send(&mut self, buf: &[u8]) -> i64;
+    fn recv(&mut self, buf: &mut [u8]) -> i64;
+    fn shutdown(&mut self, _how: i64) -> i64 {
+        0
+    }
+}
+
+/// A memnet write-side liveness token: dropped when the **last** fd-table entry holding this end
+/// (the original plus every `dup`) closes, flipping the peer's empty reads from `-EAGAIN` ("no data
+/// *yet*") to `0` (EOF). `shutdown(SHUT_WR)` sets the flag directly, ahead of the drop.
+struct WriteToken {
+    closed: Arc<AtomicBool>,
+}
+
+impl Drop for WriteToken {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+/// One end of a memnet connection: crosswise-shared byte FIFOs (my `tx` is the peer's `rx`) plus the
+/// liveness flags that give reads correct EOF-vs-would-block semantics. `Clone` shares everything —
+/// a `dup` is another reference to the same connection end.
+#[derive(Clone)]
+struct MemSock {
+    rx: PipeBuf,
+    tx: PipeBuf,
+    /// Set when the **peer's** write side is gone (its token dropped or it shut down writing):
+    /// an empty `rx` then reads `0` (EOF) instead of `-EAGAIN`.
+    peer_write_closed: Arc<AtomicBool>,
+    /// Set by our own `shutdown(SHUT_RD)`: reads return `0` regardless of buffered data.
+    read_shut: Arc<AtomicBool>,
+    /// Our write-side token (shared by dups) — see [`WriteToken`].
+    write_token: Arc<WriteToken>,
+    local: NetAddr,
+    peer: NetAddr,
+}
+
+/// A memnet listener: the bound address and the queue of not-yet-accepted server-side ends
+/// (each pushed by a `connect` to this port). `Clone` shares the queue (`dup`).
+#[derive(Clone)]
+struct MemListener {
+    addr: NetAddr,
+    pending: Arc<Mutex<VecDeque<MemSock>>>,
+}
+
+/// Build a connected memnet pair for `client_addr → server_addr`: two FIFOs wired crosswise, with
+/// each side's write-liveness flag observed by the other. Returns `(client_end, server_end)`.
+fn mem_pair(client_addr: NetAddr, server_addr: NetAddr) -> (MemSock, MemSock) {
+    let c2s: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+    let s2c: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+    let client_wclosed = Arc::new(AtomicBool::new(false));
+    let server_wclosed = Arc::new(AtomicBool::new(false));
+    let client = MemSock {
+        rx: Arc::clone(&s2c),
+        tx: Arc::clone(&c2s),
+        peer_write_closed: Arc::clone(&server_wclosed),
+        read_shut: Arc::new(AtomicBool::new(false)),
+        write_token: Arc::new(WriteToken {
+            closed: Arc::clone(&client_wclosed),
+        }),
+        local: client_addr,
+        peer: server_addr,
+    };
+    let server = MemSock {
+        rx: c2s,
+        tx: s2c,
+        peer_write_closed: client_wclosed,
+        read_shut: Arc::new(AtomicBool::new(false)),
+        write_token: Arc::new(WriteToken {
+            closed: server_wclosed,
+        }),
+        local: server_addr,
+        peer: client_addr,
+    };
+    (client, server)
+}
+
 /// One entry in the host-side fd table. The three stdio streams start as sentinels (`Stdin`/`Stdout`/
 /// `Stderr`) so `dup2`/`dup`/`close` treat fds `0`/`1`/`2` uniformly with the rest; `open` adds `File`;
 /// `pipe` adds a `PipeRead`/`PipeWrite` pair sharing one [`PipeBuf`]. `dup`/`dup2` clone an entry —
@@ -251,6 +427,12 @@ enum FdEntry {
     File(OpenFile),
     PipeRead(PipeBuf),
     PipeWrite(PipeBuf),
+    /// A connected memnet socket end (loopback; POSIX.md §5a).
+    NetSock(MemSock),
+    /// A delegate-backed connected stream (beyond loopback; the embedder owns the I/O).
+    NetStream(Arc<Mutex<Box<dyn NetStream>>>),
+    /// A memnet listener (`bind`+listen folded); `accept` pops its pending queue.
+    NetListener(MemListener),
 }
 
 impl FdEntry {
@@ -268,6 +450,12 @@ impl FdEntry {
             }),
             FdEntry::PipeRead(p) => FdEntry::PipeRead(Arc::clone(p)),
             FdEntry::PipeWrite(p) => FdEntry::PipeWrite(Arc::clone(p)),
+            // Socket ends and listeners share their connection state (`Arc` clones throughout) —
+            // a dup is another reference to the same socket, and the write-liveness token's
+            // last-drop EOF accounts for every dup.
+            FdEntry::NetSock(s) => FdEntry::NetSock(s.clone()),
+            FdEntry::NetStream(d) => FdEntry::NetStream(Arc::clone(d)),
+            FdEntry::NetListener(l) => FdEntry::NetListener(l.clone()),
         }
     }
 }
@@ -324,6 +512,15 @@ struct Inner {
     /// `open`/`pipe`/`dup` allocate the lowest free slot; a closed fd (including a closed stdio fd) is
     /// reused, matching POSIX "lowest available".
     fds: Vec<Option<FdEntry>>,
+    /// Loopback memnet listeners: bound port → the pending-connection queue its `accept` pops and a
+    /// loopback `connect` pushes into. (The queue is shared with the listener's `FdEntry`; this index
+    /// exists so `connect` can find it by port and `bind` can detect `-EADDRINUSE`.)
+    net_listeners: HashMap<u16, Arc<Mutex<VecDeque<MemSock>>>>,
+    /// The next ephemeral port a `bind :0` (or a connect's synthesized source) is assigned from.
+    net_next_port: u16,
+    /// The embedder's network delegate ([`Posix::set_net`]) — authority beyond loopback. `None` ⇒
+    /// non-loopback fails closed.
+    net_delegate: Option<Box<dyn NetDelegate>>,
     /// Open directory streams (`opendir`/`readdir`/`closedir`), indexed by the `DIR*`-analog handle
     /// `opendir` returns. Each holds the immediate child names snapshotted at `opendir` time and a
     /// read cursor. Separate from [`Inner::fds`] (a directory stream is not a file fd here).
@@ -520,6 +717,17 @@ impl Posix {
             .spawn_fn = Some(Box::new(f));
     }
 
+    /// Wire the **network delegate** — the authority for anything beyond the loopback memnet
+    /// (POSIX.md §5a; the [`Self::set_spawn`] analog). Until one is set, a non-loopback `connect`
+    /// is `-ECONNREFUSED` and a non-`localhost` `resolve` is `-ENOENT` — fail closed. The delegate
+    /// is where policy lives: a real socket, a scripted table, an allowlisting proxy.
+    pub fn set_net(&self, delegate: impl NetDelegate + 'static) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .net_delegate = Some(Box::new(delegate));
+    }
+
     /// Raise a signal from the **embedder** — how a terminal `^C` (SIGINT) or a `kill(1)` reaches the
     /// guest (the L0 doorbell's external door, the twin of the guest's own `kill` op). Sets the pending
     /// bit; the guest delivers it at its next `sigcheck` poll if it has a handler installed. Out-of-range
@@ -674,6 +882,33 @@ pub fn cap(
     (posix, make)
 }
 
+/// The **`net` capability** as a factory over an existing personality (POSIX.md §5a) — the same
+/// shape as [`cap`], granted under its **own name** (e.g. `"net"`). Each call produces a `HostProc`
+/// over the *same* shared state, so the socket fds it mints live in the same fd table the libc
+/// `read`/`write`/`close`/`dup2` ops serve — the data plane needs no new surface.
+pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> HostProc + Send + Sync + 'static {
+    let inner = Arc::clone(&posix.inner);
+    move || net_handler(Arc::clone(&inner))
+}
+
+/// Build the `net` capability's [`HostProc`] handler over shared `inner`: the tiny authority surface
+/// (connect / bind / accept / shutdown / resolve). An unknown op is a clean `CapFault`.
+fn net_handler(inner: Arc<Mutex<Inner>>) -> HostProc {
+    Box::new(
+        move |op, args, mem, _minter: Option<&mut dyn svm_interp::RegionMinter>| {
+            let mut st = inner.lock().unwrap_or_else(|e| e.into_inner());
+            match op {
+                NET_CONNECT => st.net_connect(args, mem),
+                NET_BIND => st.net_bind(args, mem),
+                NET_ACCEPT => st.net_accept(args, mem),
+                NET_SHUTDOWN => Ok(vec![st.net_shutdown(args)]),
+                NET_RESOLVE => st.net_resolve(args, mem),
+                _ => Err(Trap::CapFault),
+            }
+        },
+    )
+}
+
 /// A fresh personality state: preloaded `stdin`, the window-heap arena bounded by `[heap_base, heap_end)`,
 /// and the three stdio sentinels seeded in the fd table. Shared by [`grant`] and [`cap`].
 fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
@@ -694,6 +929,9 @@ fn new_inner(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Inner {
             Some(FdEntry::Stdout),
             Some(FdEntry::Stderr),
         ],
+        net_listeners: HashMap::new(),
+        net_next_port: 49152, // the IANA ephemeral range start
+        net_delegate: None,
         dirs: Vec::new(),
         args: Vec::new(),
         cwd: "/".to_string(),
@@ -801,6 +1039,8 @@ impl Inner {
             Stderr,
             File,
             Pipe(PipeBuf),
+            Net(MemSock),
+            NetDelegate(Arc<Mutex<Box<dyn NetStream>>>),
             Bad,
         }
         let sink = match self.fd(fd) {
@@ -808,6 +1048,8 @@ impl Inner {
             Some(FdEntry::Stderr) => Sink::Stderr,
             Some(FdEntry::File(_)) => Sink::File,
             Some(FdEntry::PipeWrite(p)) => Sink::Pipe(Arc::clone(p)),
+            Some(FdEntry::NetSock(s)) => Sink::Net(s.clone()),
+            Some(FdEntry::NetStream(d)) => Sink::NetDelegate(Arc::clone(d)),
             _ => Sink::Bad,
         };
         match sink {
@@ -824,6 +1066,19 @@ impl Inner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(data.iter().copied()),
+            // A memnet write appends to the peer-facing FIFO (unbounded); a shut-down write side
+            // is `-EPIPE`, matching a closed peer.
+            Sink::Net(s) => {
+                if s.write_token.closed.load(Ordering::Acquire) {
+                    return EPIPE;
+                }
+                s.tx.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(data.iter().copied());
+            }
+            Sink::NetDelegate(d) => {
+                return d.lock().unwrap_or_else(|e| e.into_inner()).send(data);
+            }
             Sink::Bad => return EBADF,
         }
         data.len() as i64
@@ -841,12 +1096,16 @@ impl Inner {
             Stdin,
             File,
             Pipe(PipeBuf),
+            Net(MemSock),
+            NetDelegate(Arc<Mutex<Box<dyn NetStream>>>),
             Bad,
         }
         let src = match self.fd(fd) {
             Some(FdEntry::Stdin) => Src::Stdin,
             Some(FdEntry::File(_)) => Src::File,
             Some(FdEntry::PipeRead(p)) => Src::Pipe(Arc::clone(p)),
+            Some(FdEntry::NetSock(s)) => Src::Net(s.clone()),
+            Some(FdEntry::NetStream(d)) => Src::NetDelegate(Arc::clone(d)),
             _ => Src::Bad,
         };
         let chunk: Vec<u8> = match src {
@@ -864,6 +1123,31 @@ impl Inner {
                 let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
                 let n = len.min(g.len());
                 g.drain(..n).collect()
+            }
+            // Memnet read: drain what's buffered; on empty, EOF (`0`) once the peer's write side is
+            // gone or our read side is shut, else `-EAGAIN` (blocking would deadlock a cooperative
+            // guest waiting on itself — POSIX.md §5a).
+            Src::Net(s) => {
+                if s.read_shut.load(Ordering::Acquire) {
+                    Vec::new()
+                } else {
+                    let mut g = s.rx.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = len.min(g.len());
+                    if n == 0 && !s.peer_write_closed.load(Ordering::Acquire) {
+                        return Ok(vec![EAGAIN]);
+                    }
+                    g.drain(..n).collect()
+                }
+            }
+            // A delegate-backed recv may block host-side (the embedder owns the real I/O).
+            Src::NetDelegate(d) => {
+                let mut tmp = vec![0u8; len];
+                let n = d.lock().unwrap_or_else(|e| e.into_inner()).recv(&mut tmp);
+                if n < 0 {
+                    return Ok(vec![n]);
+                }
+                tmp.truncate(n as usize);
+                tmp
             }
             Src::Bad => return Ok(vec![EBADF]),
         };
@@ -914,9 +1198,21 @@ impl Inner {
     fn close(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
         if fd >= 0 {
-            if let Some(slot @ Some(_)) = self.fds.get_mut(fd as usize) {
-                *slot = None;
-                return 0;
+            if let Some(slot) = self.fds.get_mut(fd as usize) {
+                if let Some(entry) = slot.take() {
+                    // Closing a memnet listener releases its port — but only if the registry still
+                    // points at *this* listener's queue (a stale dup must not evict a later binder).
+                    if let FdEntry::NetListener(l) = &entry {
+                        if self
+                            .net_listeners
+                            .get(&l.addr.port)
+                            .is_some_and(|q| Arc::ptr_eq(q, &l.pending))
+                        {
+                            self.net_listeners.remove(&l.addr.port);
+                        }
+                    }
+                    return 0;
+                }
             }
         }
         EBADF
@@ -1319,6 +1615,216 @@ impl Inner {
             return Ok(vec![0]);
         }
         Ok(vec![ENOENT])
+    }
+
+    // ---- net ops (POSIX.md §5a) — the `net` capability's dispatch targets ----------------------
+
+    /// The next free ephemeral port (49152..), skipping bound listeners; wraps within the range.
+    fn net_alloc_ephemeral(&mut self) -> u16 {
+        loop {
+            let p = self.net_next_port;
+            self.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
+            if !self.net_listeners.contains_key(&p) {
+                return p;
+            }
+        }
+    }
+
+    /// Write an address blob to the caller's out-buffer when one was supplied (`out != 0`); a buffer
+    /// too small for the blob is `-ERANGE` (returned as `Err(errno)` for the caller to surface).
+    fn net_write_addr(
+        mem: &mut dyn GuestMem,
+        out: u64,
+        cap: u64,
+        addr: &NetAddr,
+    ) -> Result<Result<(), i64>, Trap> {
+        if out == 0 {
+            return Ok(Ok(()));
+        }
+        let enc = addr.encode();
+        if enc.len() as u64 > cap {
+            return Ok(Err(ERANGE));
+        }
+        mem.write_bytes(out, &enc).ok_or(Trap::Malformed)?;
+        Ok(Ok(()))
+    }
+
+    /// `connect(addr, alen, laddr_out, cap) -> fd | -errno`: loopback → a memnet pair pushed onto the
+    /// target listener's pending queue (`-ECONNREFUSED` if no listener holds the port); beyond
+    /// loopback → the embedder's [`NetDelegate`] or `-ECONNREFUSED` (fail closed). Writes the
+    /// connection's local address into `laddr_out`.
+    fn net_connect(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let alen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let out = *args.get(2).unwrap_or(&0) as u64;
+        let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
+        let blob = mem.read_bytes(ptr, alen).ok_or(Trap::Malformed)?;
+        let Some(dst) = NetAddr::parse(&blob) else {
+            return Ok(vec![EINVAL]);
+        };
+        if dst.is_loopback() {
+            let Some(q) = self.net_listeners.get(&dst.port).map(Arc::clone) else {
+                return Ok(vec![ECONNREFUSED]);
+            };
+            let src = NetAddr::loopback(self.net_alloc_ephemeral());
+            let (client, server) = mem_pair(src, dst);
+            q.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(server);
+            if let Err(e) = Self::net_write_addr(mem, out, cap, &client.local)? {
+                return Ok(vec![e]);
+            }
+            return Ok(vec![self.alloc_fd(FdEntry::NetSock(client))]);
+        }
+        let Some(d) = self.net_delegate.as_mut() else {
+            return Ok(vec![ECONNREFUSED]);
+        };
+        match d.connect(&dst) {
+            Ok(stream) => {
+                // The delegate owns the real endpoint; synthesize an unspecified local address.
+                let local = NetAddr {
+                    v6: dst.v6,
+                    port: 0,
+                    addr: [0; 16],
+                };
+                if let Err(e) = Self::net_write_addr(mem, out, cap, &local)? {
+                    return Ok(vec![e]);
+                }
+                Ok(vec![self.alloc_fd(FdEntry::NetStream(Arc::new(
+                    Mutex::new(stream),
+                )))])
+            }
+            Err(e) => Ok(vec![if e < 0 { e } else { ECONNREFUSED }]),
+        }
+    }
+
+    /// `bind(addr, alen, bound_out, cap) -> listener_fd | -errno`: bind+listen folded. Loopback only
+    /// in this slice (`-EACCES` beyond — the delegate-granted real-listener path is the noted
+    /// follow-up); `:0` assigns an ephemeral port; a held port is `-EADDRINUSE`. Writes the actual
+    /// bound address (so the guest learns its ephemeral port).
+    fn net_bind(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let alen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let out = *args.get(2).unwrap_or(&0) as u64;
+        let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
+        let blob = mem.read_bytes(ptr, alen).ok_or(Trap::Malformed)?;
+        let Some(req) = NetAddr::parse(&blob) else {
+            return Ok(vec![EINVAL]);
+        };
+        if !req.is_loopback() {
+            return Ok(vec![EACCES]);
+        }
+        let port = if req.port == 0 {
+            self.net_alloc_ephemeral()
+        } else if self.net_listeners.contains_key(&req.port) {
+            return Ok(vec![EADDRINUSE]);
+        } else {
+            req.port
+        };
+        let bound = NetAddr { port, ..req };
+        if let Err(e) = Self::net_write_addr(mem, out, cap, &bound)? {
+            return Ok(vec![e]);
+        }
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        self.net_listeners.insert(port, Arc::clone(&pending));
+        Ok(vec![self.alloc_fd(FdEntry::NetListener(MemListener {
+            addr: bound,
+            pending,
+        }))])
+    }
+
+    /// `accept(fd, peer_out, cap) -> fd | -EAGAIN | -errno`: pop the next pending memnet connection
+    /// off the listener's queue (`-EAGAIN` when none — a cooperative guest cannot block on itself),
+    /// writing the peer's address.
+    fn net_accept(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let out = *args.get(1).unwrap_or(&0) as u64;
+        let cap = (*args.get(2).unwrap_or(&0)).max(0) as u64;
+        let q = match self.fd(fd) {
+            Some(FdEntry::NetListener(l)) => Arc::clone(&l.pending),
+            Some(_) => return Ok(vec![ENOTSOCK]),
+            None => return Ok(vec![EBADF]),
+        };
+        let Some(sock) = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
+            return Ok(vec![EAGAIN]);
+        };
+        if let Err(e) = Self::net_write_addr(mem, out, cap, &sock.peer)? {
+            return Ok(vec![e]);
+        }
+        Ok(vec![self.alloc_fd(FdEntry::NetSock(sock))])
+    }
+
+    /// `shutdown(fd, how) -> 0 | -errno` (`0` read / `1` write / `2` both, the Linux values): a
+    /// write-shutdown flips the peer's empty reads to EOF; a read-shutdown makes our own reads
+    /// return `0`. A delegate stream forwards to the embedder.
+    fn net_shutdown(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&-1);
+        let how = *args.get(1).unwrap_or(&2);
+        match self.fd(fd) {
+            Some(FdEntry::NetSock(s)) => {
+                let s = s.clone();
+                if how == 0 || how == 2 {
+                    s.read_shut.store(true, Ordering::Release);
+                }
+                if how == 1 || how == 2 {
+                    s.write_token.closed.store(true, Ordering::Release);
+                }
+                0
+            }
+            Some(FdEntry::NetStream(d)) => {
+                let d = Arc::clone(d);
+                let r = d.lock().unwrap_or_else(|e| e.into_inner()).shutdown(how);
+                r
+            }
+            Some(_) => ENOTSOCK,
+            None => EBADF,
+        }
+    }
+
+    /// `resolve(name, nlen, out, cap) -> nbytes | -errno`: `localhost` → the v4 loopback; anything
+    /// else → the delegate or `-ENOENT` (fail closed). Writes the address blobs back-to-back when
+    /// they fit; the total byte length is returned either way (size-then-fetch, like `getenv_r`).
+    fn net_resolve(
+        &mut self,
+        args: &[i64],
+        mem: Option<&mut dyn GuestMem>,
+    ) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let nlen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let out = *args.get(2).unwrap_or(&0) as u64;
+        let cap = (*args.get(3).unwrap_or(&0)).max(0) as u64;
+        let bytes = mem.read_bytes(ptr, nlen).ok_or(Trap::Malformed)?;
+        let Ok(name) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let addrs: Vec<NetAddr> = if name == "localhost" {
+            vec![NetAddr::loopback(0)]
+        } else {
+            match self.net_delegate.as_mut() {
+                Some(d) => match d.resolve(&name) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(vec![if e < 0 { e } else { ENOENT }]),
+                },
+                None => return Ok(vec![ENOENT]),
+            }
+        };
+        let blob: Vec<u8> = addrs.iter().flat_map(NetAddr::encode).collect();
+        if out != 0 && blob.len() as u64 <= cap {
+            mem.write_bytes(out, &blob).ok_or(Trap::Malformed)?;
+        }
+        Ok(vec![blob.len() as i64])
     }
 
     /// The immediate child **names** of directory `path` in the flat memfs — the distinct first
@@ -3041,6 +3547,167 @@ block 0 (vph: i32) {\n\
             st.rename(&[32, 7, 96, 7], Some(&mut mem)).unwrap()[0],
             ENOENT
         );
+    }
+
+    #[test]
+    fn memnet_bind_connect_accept_round_trip() {
+        // The loopback memnet (POSIX.md §5a): bind :0 (ephemeral) → connect → accept → bytes flow
+        // both ways through the libc read/write ops (the data plane needs no net surface) → EAGAIN
+        // on empty → close flips the peer's reads to EOF. Plus the refusal edges: connect with no
+        // listener, bind beyond loopback, bind on a held port.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        // bind blob: v4 loopback :0 at offset 0 → [4, 0,0, 127,0,0,1]
+        win_write(&mut mem, 0, &[4u8, 0, 0, 127, 0, 0, 1]);
+        let mut st = posix.inner.lock().unwrap();
+
+        // bind :0 → listener fd + the actual bound addr (ephemeral port) written at 100.
+        let lfd = st.net_bind(&[0, 7, 100, 32], Some(&mut mem)).unwrap()[0];
+        assert!(lfd >= 0, "bind returns a listener fd");
+        let bound = mem.read_bytes(100, 7).unwrap();
+        assert_eq!(bound[0], 4, "bound family");
+        let port = u16::from_le_bytes([bound[1], bound[2]]);
+        assert!(port >= 49152, "ephemeral port assigned: {port}");
+
+        // accept before any connect → -EAGAIN.
+        assert_eq!(
+            st.net_accept(&[lfd, 0, 0], Some(&mut mem)).unwrap()[0],
+            EAGAIN
+        );
+
+        // connect to the bound port (blob at 200) → client fd, local addr written at 300.
+        win_write(&mut mem, 200, &[4u8, bound[1], bound[2], 127, 0, 0, 1]);
+        let cfd = st.net_connect(&[200, 7, 300, 32], Some(&mut mem)).unwrap()[0];
+        assert!(cfd >= 0, "connect returns a socket fd");
+
+        // accept → server fd; the written peer addr matches the client's local addr.
+        let sfd = st.net_accept(&[lfd, 400, 32], Some(&mut mem)).unwrap()[0];
+        assert!(sfd >= 0, "accept returns a socket fd");
+        assert_eq!(
+            mem.read_bytes(400, 7).unwrap(),
+            mem.read_bytes(300, 7).unwrap(),
+            "accept's peer addr == connect's local addr"
+        );
+
+        // client → server bytes through the ordinary write/read ops.
+        win_write(&mut mem, 500, b"ping");
+        assert_eq!(st.write(&[cfd, 500, 4], Some(&mut mem)).unwrap()[0], 4);
+        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0], 4);
+        assert_eq!(mem.read_bytes(600, 4).unwrap(), b"ping");
+        // server → client.
+        win_write(&mut mem, 500, b"pong!");
+        assert_eq!(st.write(&[sfd, 500, 5], Some(&mut mem)).unwrap()[0], 5);
+        assert_eq!(st.read(&[cfd, 600, 16], Some(&mut mem)).unwrap()[0], 5);
+        assert_eq!(mem.read_bytes(600, 5).unwrap(), b"pong!");
+
+        // Empty with a live peer → -EAGAIN; after the client closes → 0 (EOF).
+        assert_eq!(st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0], EAGAIN);
+        assert_eq!(st.close(&[cfd]), 0);
+        assert_eq!(
+            st.read(&[sfd, 600, 16], Some(&mut mem)).unwrap()[0],
+            0,
+            "EOF after close"
+        );
+
+        // Refusals: no listener on a random port; bind beyond loopback; bind on the held port.
+        win_write(&mut mem, 700, &[4u8, 0x39, 0x30, 127, 0, 0, 1]); // port 12345
+        assert_eq!(
+            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECONNREFUSED
+        );
+        win_write(&mut mem, 700, &[4u8, 0x50, 0x00, 8, 8, 8, 8]); // 8.8.8.8:80
+        assert_eq!(
+            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            EACCES
+        );
+        assert_eq!(
+            st.net_connect(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECONNREFUSED,
+            "non-loopback connect with no delegate fails closed"
+        );
+        win_write(&mut mem, 700, &[4u8, bound[1], bound[2], 127, 0, 0, 1]);
+        assert_eq!(
+            st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0],
+            EADDRINUSE
+        );
+
+        // Shutdown-write on the server end → its peer... (client closed) writing now is -EPIPE.
+        assert_eq!(st.net_shutdown(&[sfd, 1]), 0);
+        win_write(&mut mem, 500, b"x");
+        assert_eq!(st.write(&[sfd, 500, 1], Some(&mut mem)).unwrap()[0], EPIPE);
+
+        // Closing the listener releases the port: a rebind of the same port now succeeds.
+        assert_eq!(st.close(&[lfd]), 0);
+        assert!(st.net_bind(&[700, 7, 0, 0], Some(&mut mem)).unwrap()[0] >= 0);
+    }
+
+    #[test]
+    fn net_delegate_serves_egress_and_resolve() {
+        // Beyond loopback: the embedder's NetDelegate is the authority — a scripted delegate serves
+        // a canned request/response stream and a name lookup; without it (previous test) everything
+        // fails closed. `localhost` resolves in-personality without any delegate.
+        struct Canned;
+        impl NetStream for Canned {
+            fn send(&mut self, buf: &[u8]) -> i64 {
+                assert_eq!(buf, b"GET /");
+                buf.len() as i64
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> i64 {
+                let msg = b"HTTP/1.1 200 OK";
+                buf[..msg.len()].copy_from_slice(msg);
+                msg.len() as i64
+            }
+        }
+        struct Scripted;
+        impl NetDelegate for Scripted {
+            fn connect(&mut self, addr: &NetAddr) -> Result<Box<dyn NetStream>, i64> {
+                assert_eq!(addr.port, 80);
+                assert_eq!(&addr.addr[..4], &[93, 184, 216, 34]);
+                Ok(Box::new(Canned))
+            }
+            fn resolve(&mut self, host: &str) -> Result<Vec<NetAddr>, i64> {
+                assert_eq!(host, "example.com");
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[93, 184, 216, 34]);
+                Ok(vec![NetAddr {
+                    v6: false,
+                    port: 0,
+                    addr,
+                }])
+            }
+        }
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_net(Scripted);
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        let mut st = posix.inner.lock().unwrap();
+
+        // resolve("localhost") → the loopback blob, no delegate involved.
+        win_write(&mut mem, 0, b"localhost");
+        let n = st.net_resolve(&[0, 9, 100, 32], Some(&mut mem)).unwrap()[0];
+        assert_eq!(n, 7);
+        assert_eq!(mem.read_bytes(100, 7).unwrap(), &[4u8, 0, 0, 127, 0, 0, 1]);
+
+        // resolve("example.com") → the delegate's answer.
+        win_write(&mut mem, 0, b"example.com");
+        let n = st.net_resolve(&[0, 11, 100, 32], Some(&mut mem)).unwrap()[0];
+        assert_eq!(n, 7);
+        assert_eq!(
+            mem.read_bytes(100, 7).unwrap(),
+            &[4u8, 0, 0, 93, 184, 216, 34]
+        );
+
+        // connect(93.184.216.34:80) → a delegate-backed stream; send/recv round-trip the script.
+        win_write(&mut mem, 200, &[4u8, 80, 0, 93, 184, 216, 34]);
+        let fd = st.net_connect(&[200, 7, 0, 0], Some(&mut mem)).unwrap()[0];
+        assert!(fd >= 0, "delegate connect returns a socket fd");
+        win_write(&mut mem, 300, b"GET /");
+        assert_eq!(st.write(&[fd, 300, 5], Some(&mut mem)).unwrap()[0], 5);
+        let n = st.read(&[fd, 400, 64], Some(&mut mem)).unwrap()[0];
+        assert_eq!(mem.read_bytes(400, n as u64).unwrap(), b"HTTP/1.1 200 OK");
     }
 
     #[test]

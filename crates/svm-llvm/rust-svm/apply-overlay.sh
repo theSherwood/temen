@@ -35,6 +35,7 @@ cp "${HERE}/svm-env-imp.rs" "${STD}/sys/env/svm.rs"
 cp "${HERE}/svm-fs-imp.rs" "${STD}/sys/fs/svm.rs"
 cp "${HERE}/svm-pipe-imp.rs" "${STD}/sys/pipe/svm.rs"
 cp "${HERE}/svm-process-imp.rs" "${STD}/sys/process/svm.rs"
+cp "${HERE}/svm-net-imp.rs" "${STD}/sys/net/connection/svm.rs"
 
 # 2) The cfg-arm additions. Skip if already applied (patch is not idempotent on its own).
 if grep -q 'target_os = "svm"' "${STD}/sys/alloc/mod.rs"; then
