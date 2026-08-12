@@ -4822,12 +4822,14 @@ fn const_float(node: &Node) -> Option<f64> {
 }
 
 /// The constant integer value of a scalar/narrow-int global initializer, seeing through a
-/// `(conv T operand)` wrapper — nimony lowers a typed/distinct int literal that way (`let x = 4` at
-/// a `distinct int` becomes `(conv (i 64) 4)`). Suffixed literals (`(suf 3u "u8")`) are folded by
-/// [`int_literal`].
+/// `(conv T operand)` **or** `(cast T operand)` wrapper — nimony lowers a typed/distinct int literal
+/// as `conv` (`let x = 4` at a `distinct int` becomes `(conv (i 64) 4)`), and a C-style reinterpret
+/// as `cast` (`MAP_FAILED = cast[pointer](-1)` → `(cast pointer -1)`; a `pointer` is an `i64` scalar,
+/// so the sentinel folds to eight `0xFF` bytes). Both spell the operand as the second son. Suffixed
+/// literals (`(suf 3u "u8")`) are folded by [`int_literal`].
 fn const_scalar_int(node: &Node) -> Option<i64> {
     match node.tag() {
-        Some("conv") => node.args().get(1).and_then(const_scalar_int),
+        Some("conv") | Some("cast") => node.args().get(1).and_then(const_scalar_int),
         _ => int_literal(node),
     }
 }
