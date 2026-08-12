@@ -221,12 +221,15 @@ struct OpenFile {
 /// with the `execve`/spawn slice; this type gives the fd surface its buffering.
 type PipeBuf = Arc<Mutex<VecDeque<u8>>>;
 
-/// The result of one embedder-wired [`spawn`](Posix::set_spawn): the child's captured `stdout` (which
-/// the personality routes to the caller's current fd-1 binding) and its `status` (an exit code, `0`–
-/// `255`, which `waitpid` returns wait-encoded). A crash/abnormal exit is out of scope for the
-/// sequential fork-free primitive — model it as a nonzero code (`128 + signal`, the shell convention).
+/// The result of one embedder-wired [`spawn`](Posix::set_spawn): the child's captured `stdout` and
+/// `stderr` (which the personality routes to the caller's current fd-1 / fd-2 bindings) and its `status`
+/// (an exit code, `0`–`255`, which `waitpid` returns wait-encoded). A crash/abnormal exit is out of
+/// scope for the sequential fork-free primitive — model it as a nonzero code (`128 + signal`, the shell
+/// convention). `Default` lets a delegate that produces no `stderr` build one with `..Default::default()`.
+#[derive(Default)]
 pub struct SpawnResult {
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
     pub status: i32,
 }
 
@@ -1102,9 +1105,10 @@ impl Inner {
         let mut f = self.spawn_fn.take().unwrap();
         let res = f(&name, &argv, &stdin);
         self.spawn_fn = Some(f);
-        // Route the child's stdout to the caller's current fd 1 (inheritance: a prior `dup2(_, 1)` redirect
-        // lands it in a file or pipe; otherwise the stdout sink).
+        // Route the child's stdout/stderr to the caller's current fd 1 / fd 2 (inheritance: a prior
+        // `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe; otherwise the stdio sink).
         self.sink_write(1, &res.stdout);
+        self.sink_write(2, &res.stderr);
         let pid = self.next_pid;
         self.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
@@ -2394,6 +2398,7 @@ block 0 (vph: i32) {\n\
             SpawnResult {
                 stdout: stdin.to_ascii_uppercase(),
                 status: 7,
+                ..Default::default()
             }
         });
 
@@ -2491,6 +2496,7 @@ block 0 (vph: i32) {\n\
         let up = |_n: &str, _a: &[String], stdin: &[u8]| SpawnResult {
             stdout: stdin.to_ascii_uppercase(),
             status: 0,
+            ..Default::default()
         };
 
         // Interp.
@@ -3034,6 +3040,37 @@ block 0 (vph: i32) {\n\
         assert_eq!(
             st.rename(&[32, 7, 96, 7], Some(&mut mem)).unwrap()[0],
             ENOENT
+        );
+    }
+
+    #[test]
+    fn spawn_routes_stdout_and_stderr_to_fd1_and_fd2() {
+        // A `SpawnResult` carries both streams: the personality routes `stdout` to the caller's fd 1
+        // and `stderr` to fd 2 (here the default stdio sinks, since the guest wired no redirect), and
+        // `waitpid` reaps the wait-encoded status. This is what lets `Command::output` capture stderr.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_spawn(|_n, _a, _stdin| SpawnResult {
+            stdout: b"to-out".to_vec(),
+            stderr: b"to-err".to_vec(),
+            status: 3,
+        });
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        win_write(&mut mem, 0, b"prog");
+        let mut st = posix.inner.lock().unwrap();
+
+        let pid = st.spawn(&[0, 4, 0, 0], Some(&mut mem)).unwrap()[0];
+        assert!(pid >= 0, "spawn returns a pid");
+        assert_eq!(st.stdout, b"to-out", "stdout routed to fd 1's sink");
+        assert_eq!(st.stderr, b"to-err", "stderr routed to fd 2's sink");
+
+        assert_eq!(st.waitpid(&[pid, 200, 0], Some(&mut mem)).unwrap()[0], pid);
+        let status = i32::from_le_bytes(mem.read_bytes(200, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            (status >> 8) & 0xff,
+            3,
+            "WEXITSTATUS is the delegate's exit code"
         );
     }
 
