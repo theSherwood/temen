@@ -35,6 +35,17 @@ identical until the next agent edit.
   skips cleanly if absent. Reuses the threads wasm the job already builds — no new toolchain. Verified
   locally in Node/V8.
 
+- **`snapshot-worker-test.mjs` in the `browser-real` job** — one line added right after `node
+  warm-jit-test.mjs`: `node snapshot-worker-test.mjs`. Validates the **snapshot worker** (issue #804):
+  the QuickJS card's warm session runs on a dedicated Web Worker (its own engine instance + private
+  memory), pre-warmed off the main thread; each Run is a message round-trip. Chromium-drives
+  `play.html` and asserts the card runs end-to-end on both warm tiers (warm-snapshot + warm+JIT), that
+  the work actually went **through the worker** (a `globalThis.__snapshotWorkerRuns` counter increments —
+  so a silent main-thread fallback fails the test), and that fresh-per-Run isolation holds. Uses the
+  committed `web/assets/qjs_snapshot.svmb`; skips cleanly if absent. Reuses the threads wasm the job
+  already builds — no new toolchain. Verified locally in Chromium. (Until copied over, the
+  `workflows-in-sync` guard stays red — the expected mirror-edit friction.)
+
 - **`browser-tierup-mainline-test.mjs` in the `browser-real` job** — one line added to the Chromium
   test block (right after the already-copied `node browser-jit-cache-test.mjs`):
   `node browser-tierup-mainline-test.mjs`. Validates slice-2 mainline tier-up over a live window (the
