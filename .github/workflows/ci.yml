@@ -700,10 +700,15 @@ jobs:
           # drives it over the restored snapshot — must match warm-interp (svm_warm_eval) byte-for-byte,
           # keep fresh-per-Run isolation, and accelerate a compute-heavy eval. Same asset; skips if absent.
           node warm-jit-test.mjs
-          # snapshot worker (WASM_AOT.md warm+JIT · issue #804): the QuickJS card's warm session runs on a
-          # dedicated Worker (own engine + memory), pre-warmed off the main thread. Chromium-drives play.html
-          # and asserts both warm tiers run *through the worker* (not a silent main-thread fallback) and that
-          # fresh-per-Run isolation holds. Same committed asset; skips cleanly if absent.
+          # Lua warm snapshot (issue #805): the two-phase lua_snapshot driver — warm eval_run over the
+          # restored snapshot must match the cold _start (interp + warm+JIT) byte-for-byte, and isolation
+          # must hold. Uses the committed lua_snapshot.svmb; skips cleanly if absent.
+          node lua-warm-snapshot-test.mjs
+          # snapshot worker (WASM_AOT.md warm+JIT · issues #804/#805): each warm card (QuickJS, Lua) runs its
+          # warm session on a dedicated Worker (own engine + memory), pre-warmed off the main thread — one
+          # worker per module so both stay warm. Chromium-drives play.html and asserts both cards run on both
+          # warm tiers *through the worker* (not a silent main-thread fallback) and isolation holds. Committed
+          # assets; skips cleanly if absent.
           node snapshot-worker-test.mjs
           # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
           # SVM-text compute guest whose root loops calling a window-round-tripping leaf must return the
