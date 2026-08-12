@@ -339,6 +339,76 @@ fn cross_module_aggregate_global_materializes() {
 }
 
 #[test]
+fn cross_module_sret_call_in_argument_position() {
+    // A **cross-module aggregate-returning call in argument position** — `readv(mk(n))`, where `mk`
+    // (module b) returns `Obj` by sret. The callee's sret-ness is not visible from module a's call
+    // site (an import's signature is derived from the args), so `call()` routed it to `call_import`
+    // as a scalar call — missing the hidden `$sret` pointer — and the linked result failed to verify
+    // (the arity mismatch this fixes). The linker now pools sret-ness (`export_sret_procs`), so a
+    // caller materializes a result temp and passes it as `$sret`. go(5) = readv(mk(5)) = 5.
+    let mod_b = "\
+(stmts
+ (type :Obj.0. . (object . (fld :v.0 . (i +64))))
+ (proc :mk.0. (params (param :n.0 . (i +64))) Obj.0. .
+  (stmts . (ret (oconstr Obj.0. (kv v.0 n.0))))))";
+    let mod_a = "\
+(stmts
+ (proc :readv.0. (params (param :o.0 . Obj.0.modb)) (i +64) .
+  (stmts . (ret (dot o.0 v.0 0))))
+ (proc :go.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call readv.0. (call mk.0.modb n.0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &["readv.0.", "go.0."],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &["mk.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // go is func 1 (readv=0, go=1); it is frame-needing (holds mk's result temp): ($sp, n).
+    assert_eq!(run(&linked, 1, &[4096, 5]), 5, "readv(mk(5)).v = 5");
+    assert_eq!(run(&linked, 1, &[4096, 42]), 42);
+}
+
+#[test]
+fn cross_module_sret_call_discarded() {
+    // A **cross-module aggregate-returning call in statement position** — `mk(n)` on its own, result
+    // discarded (the func-15/func-91 shape from the real syncio init). It materializes a throwaway
+    // result temp; the link verifies and runs without trapping. `go` then returns a plain value so
+    // the run has something to check.
+    let mod_b = "\
+(stmts
+ (type :Obj.0. . (object . (fld :v.0 . (i +64))))
+ (proc :mk.0. (params (param :n.0 . (i +64))) Obj.0. .
+  (stmts . (ret (oconstr Obj.0. (kv v.0 n.0))))))";
+    let mod_a = "\
+(stmts
+ (proc :go.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (call mk.0.modb n.0)
+   (ret n.0))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &["go.0."],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &["mk.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(run(&linked, 0, &[4096, 7]), 7, "discarded mk, returns n");
+}
+
+#[test]
 fn manifest_link_retains_unresolved_syscall_leaves() {
     // The W3 I/O seam (NIM.md §W3): a raw-syscall leaf (`write`/`read`/`_exit`, spelled by its nim
     // symbol) that **no unit provides** is *retained* as a manifest import for the host to bind at

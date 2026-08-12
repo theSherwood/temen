@@ -207,6 +207,9 @@ enum Select<'a> {
 /// **global** (stem-suffixed) name, the form nimony's cross-module calls reference (`callee.<stem>`).
 /// `sel` is the named subset or the whole module; `ext_types` are external aggregate layouts
 /// (sibling units' pooled type defs) available while translating — see [`link_units`].
+// The pooled cross-module inputs (types, funcrefs, frame procs, sret procs, TLS) are each a distinct
+// list the linker threads in; grouping them into a struct would obscure more than it clarifies here.
+#[allow(clippy::too_many_arguments)]
 fn translate_object_module(
     stem: &str,
     src: &str,
@@ -214,6 +217,7 @@ fn translate_object_module(
     ext_types: &[(String, translate::Layout)],
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
+    ext_sret: &[(String, translate::TyDesc)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -221,6 +225,7 @@ fn translate_object_module(
     t.import_types(ext_types);
     t.import_funcrefs(ext_funcrefs);
     t.import_proc_frames(ext_frame_procs);
+    t.import_sret_procs(ext_sret);
     // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
     // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
     if let Some(layout) = tls_layout {
@@ -280,6 +285,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
         None,
     )?))
 }
@@ -293,6 +299,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
         &[],
         &[],
         &[],
@@ -334,14 +341,29 @@ fn link_selected_with_extra(
     // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
     // order, to lay out the one shared per-vCPU block below.
     let mut pooled_tls: Vec<(String, u64)> = Vec::new();
+    // Pooled **sret procs** across all units (stem-suffixed name → returned aggregate). A caller of
+    // an aggregate-returning proc materializes a result temp and passes it as `$sret` — and a proc
+    // that does so becomes frame-needing — so the sret set must be known **before** the frame
+    // fixpoint (`proc_frame_nodes`) runs, hence a first pass over the units to build it.
+    let mut pooled_sret: Vec<(String, translate::TyDesc)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
-        frame_nodes.extend(translate::Translator::proc_frame_nodes(&root, stem)?);
+        pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         if tls {
             pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
         }
+    }
+    // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
+    // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
+    for (stem, src, _) in units {
+        let root = nif::parse(src).map_err(LengError::Parse)?;
+        frame_nodes.extend(translate::Translator::proc_frame_nodes(
+            &root,
+            stem,
+            &pooled_sret,
+        )?);
     }
     // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
     // unit is handed this map, so a `tvar` defined in one unit and referenced from another lower to
@@ -389,6 +411,7 @@ fn link_selected_with_extra(
                 &pooled,
                 &pooled_funcrefs,
                 &pooled_frame_procs,
+                &pooled_sret,
                 tls_layout.as_ref(),
             )?))
         })

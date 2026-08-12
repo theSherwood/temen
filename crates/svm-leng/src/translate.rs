@@ -293,6 +293,15 @@ pub(crate) struct Translator {
     /// `sp + frame_size` (the caller's own frame top) as the leading arg, exactly as a direct call
     /// to a frame-needing proc does. Empty unless the linker pooled sibling units' proc frames.
     ext_frame_procs: HashSet<String>,
+    /// **External aggregate-returning (sret) procs** — sibling units' procs that return an aggregate
+    /// by hidden `$sret` pointer, under the stem-suffixed names this module calls them by
+    /// ([`export_sret_procs`]), mapped to the returned aggregate's [`TyDesc`]. A cross-module call
+    /// lowers to an import whose signature `call_import` derives from the *args* — blind to the
+    /// callee's hidden `$sret`. With the callee named here, a call to it in statement or argument
+    /// position materializes a result temp and passes its address as `$sret` (via `call_import_sret`),
+    /// exactly as a local sret call assigned to an aggregate destination does. Empty unless the
+    /// linker pooled sibling units' sret procs.
+    ext_sret_procs: HashMap<String, TyDesc>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
     /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
@@ -343,6 +352,7 @@ impl Translator {
             imports: RefCell::new(ImportTable::default()),
             ext_funcrefs: HashMap::default(),
             ext_frame_procs: HashSet::default(),
+            ext_sret_procs: HashMap::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
             tls_block_size: 0,
@@ -921,6 +931,17 @@ impl Translator {
         }
     }
 
+    /// The aggregate a call to `name` returns by sret, if any — the [`Translator`]-level twin of
+    /// `FuncGen::callee_sret`, reading the local proc table or the pooled [`ext_sret_procs`]. Used by
+    /// [`agg_temp_bytes`](Self::agg_temp_bytes) to reserve a cross-module sret call's result temp.
+    fn sret_return(&self, name: &Node) -> Option<TyDesc> {
+        let n = name.as_atom()?;
+        self.ext_sret_procs
+            .get(n)
+            .cloned()
+            .or_else(|| self.procs.get(n).and_then(|s| s.sret.clone()))
+    }
+
     /// The frame bytes needed for aggregate-rvalue temps in a body: each aggregate `(oconstr T …)` /
     /// `(aconstr T …)` in **call-argument** position (the only spot emission builds a temp — an
     /// aggregate arg passes by-address). Matching emission exactly matters: an aggregate constructor
@@ -928,15 +949,39 @@ impl Translator {
     /// proc becomes spuriously frame-needing and its ABI changes). See [`FuncGen::agg_rvalue_temp`].
     fn agg_temp_bytes(&self, node: &Node) -> u64 {
         let mut total = 0;
-        if node.tag() == Some("call") {
-            for arg in node.args().iter().skip(1) {
-                if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
-                    if let Some(Ok(d @ TyDesc::Agg(_))) = arg.args().first().map(|t| self.tydesc(t))
-                    {
-                        total += self.sizeof(&d);
+        match node.tag() {
+            Some("call") => {
+                for arg in node.args().iter().skip(1) {
+                    if matches!(arg.tag(), Some("oconstr") | Some("aconstr")) {
+                        if let Some(Ok(d @ TyDesc::Agg(_))) =
+                            arg.args().first().map(|t| self.tydesc(t))
+                        {
+                            total += self.sizeof(&d);
+                        }
+                    } else if arg.tag() == Some("call") {
+                        // An **aggregate-returning call in argument position** (`f($ x)`) materializes
+                        // a result temp (`agg_rvalue_temp`); reserve its return aggregate's bytes.
+                        if let Some(d) = arg.args().first().and_then(|c| self.sret_return(c)) {
+                            total += self.sizeof(&d);
+                        }
                     }
                 }
             }
+            Some("stmts") => {
+                // A **discarded** aggregate-returning call in statement position (`$ x` on its own,
+                // `writeLine(...)` returning a temp) also materializes a result temp (the `call()`
+                // discard path). Count it at the statement level so a sret call in *return*/assign
+                // position — which builds in place into the destination's own `$sret`, no temp — is
+                // *not* counted (it is a child of `ret`/`asgn`/`var`, not a direct statement/arg).
+                for stmt in node.args() {
+                    if stmt.tag() == Some("call") {
+                        if let Some(d) = stmt.args().first().and_then(|c| self.sret_return(c)) {
+                            total += self.sizeof(&d);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         if let Node::List(items) = node {
             for c in items {
@@ -1377,6 +1422,47 @@ impl Translator {
         }
     }
 
+    /// A module's **aggregate-returning (sret) procs** under their stem-suffixed global names, mapped
+    /// to the returned aggregate's [`TyDesc`] — the input the linker pools so a *cross-module* caller
+    /// knows a callee returns by `$sret` (and must pass a destination), the sret twin of
+    /// [`proc_frame_nodes`]. A proc is sret iff its return type is a known aggregate ([`ret_sret`]);
+    /// the returned type name is stem-suffixed exactly as [`export_types`] suffixes a local type, so
+    /// the importing unit resolves the same pooled layout when it sizes the result temp.
+    pub fn export_sret_procs(root: &Node, stem: &str) -> Result<Vec<(String, TyDesc)>, LengError> {
+        let mut t = Translator::new();
+        t.collect_types(root)?;
+        let local: HashSet<String> = t.types.keys().cloned().collect();
+        let suffix = |d: &TyDesc| match d {
+            TyDesc::Agg(n) if local.contains(n) => TyDesc::Agg(format!("{n}{stem}")),
+            other => other.clone(),
+        };
+        let mut out: Vec<(String, TyDesc)> = Vec::new();
+        for item in root.args() {
+            if item.tag() != Some("proc") || is_importc_proc(item) {
+                continue;
+            }
+            let a = item.args();
+            if a.len() < 3 {
+                continue;
+            }
+            if let Some(desc) = t.ret_sret(&a[2])? {
+                out.push((format!("{}{stem}", sym_def(&a[0])?), suffix(&desc)));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
+    }
+
+    /// Pre-register **external sret procs** — sibling units' aggregate-returning procs, under the
+    /// stem-suffixed names this module calls them by ([`export_sret_procs`]). See
+    /// [`ext_sret_procs`](Self::ext_sret_procs): this is what makes a cross-module call to such a
+    /// proc materialize a result temp and pass it as the hidden `$sret`.
+    pub fn import_sret_procs(&mut self, ext: &[(String, TyDesc)]) {
+        for (name, desc) in ext {
+            self.ext_sret_procs.insert(name.clone(), desc.clone());
+        }
+    }
+
     /// A module's proc **frame-graph nodes** for the linker's whole-program frame fixpoint: one
     /// `(global_name, base_needs_frame, global_callees)` per proc. `global_name` is the stem-suffixed
     /// name other modules call it by; `base_needs_frame` is its *own* [`proc_needs_frame`] (address
@@ -1390,11 +1476,34 @@ impl Translator {
     pub fn proc_frame_nodes(
         root: &Node,
         stem: &str,
+        ext_sret: &[(String, TyDesc)],
     ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
         let mut t = Translator::new();
         t.scan_lenient = true; // enumerating proc frames; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
+        // A proc that calls an **sret** proc materializes a result temp → is frame-needing. So the
+        // frame predicate (`proc_needs_frame` → `agg_temp_bytes`) must know which callees are sret:
+        // pooled sibling procs (`ext_sret`) and this module's own (registered by name here, so a
+        // local `(call mk.0. …)` is counted alongside a cross-module `(call mk.0.<other> …)`).
+        t.import_sret_procs(ext_sret);
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_importc_proc(item) {
+                if let Some(sret) = t.ret_sret(&item.args()[2])? {
+                    let name = sym_def(&item.args()[0])?;
+                    t.procs.insert(
+                        name,
+                        Sig {
+                            index: 0,
+                            params: Vec::new(),
+                            ret: None,
+                            needs_frame: false,
+                            sret: Some(sret),
+                        },
+                    );
+                }
+            }
+        }
         // Resolve a callee name to its global form: a local proc's name ends in `.` (the empty
         // module-hash slot) → suffix with this stem; a cross-module reference already carries a stem.
         let globalize = |callee: &str| -> String {
@@ -3816,23 +3925,29 @@ impl<'a> FuncGen<'a> {
         let callee = a[0].as_atom().ok_or_else(|| {
             LengError::Unsupported("indirect call (callee is not a symbol)".into())
         })?;
+        // An **aggregate-returning** callee — local, or a linker-pooled sibling's (via
+        // `ext_sret_procs`) — reached here rather than through an aggregate destination (`call_sret`).
+        // In statement position (`ret_hint` None) the result is discarded: materialize a throwaway
+        // temp and let the callee write there (the `$` in `writeLine(stdout, $ x)`, a discarded string
+        // builder). Used as a scalar value it is a type error. This must precede the cross-module
+        // `call_import` dispatch below, which is blind to a sibling's sret and would otherwise emit a
+        // mismatched non-sret call (the missing-`$sret`-arg bug this closes).
+        if let Some(desc) = self.callee_sret(&a[0]) {
+            if ret_hint.is_some() {
+                return Err(LengError::Unsupported(format!(
+                    "aggregate-returning call to `{callee}` used as a scalar value"
+                )));
+            }
+            let addr = self.alloc_temp(self.t.sizeof(&desc));
+            self.call_sret(e, addr)?;
+            return Ok(Val {
+                id: u32::MAX,
+                ty: ValType::I32,
+            });
+        }
         // Cross-module callee (not defined in this module) → an SVM import.
         if !self.t.procs.contains_key(callee) {
             return self.call_import(callee, &a[1..], ret_hint);
-        }
-        // An aggregate-returning call must flow to an aggregate destination (`asgn`/`var`/`ret`),
-        // which routes through `call_sret`. Reaching plain `call` means it was used as a scalar
-        // value or a bare statement — fail closed rather than emit a mismatched call.
-        if self
-            .t
-            .procs
-            .get(callee)
-            .and_then(|s| s.sret.as_ref())
-            .is_some()
-        {
-            return Err(LengError::Unsupported(format!(
-                "aggregate-returning call to `{callee}` must be directly assigned to an aggregate destination"
-            )));
         }
         let sig = self.t.procs.get(callee).expect("checked above");
         let index = sig.index;
@@ -4082,6 +4197,19 @@ impl<'a> FuncGen<'a> {
     /// an aggregate literal reaches *argument* position (aggregates are passed by-address), e.g.
     /// `(call &.0. s (oconstr string …))`.
     fn agg_rvalue_temp(&mut self, node: &Node) -> Result<Option<(u32, TyDesc)>, LengError> {
+        // An **aggregate-returning call** in argument position — `f($ x)`, `writeLine(stdout, $ n)`.
+        // The callee returns by sret, so materialize a result temp and let it write there, then pass
+        // the temp's address (aggregates go by-address). `call_sret` handles the local and the
+        // cross-module (`call_import_sret`) callee alike; `callee_sret` knows the return type from the
+        // local proc table or the pooled `ext_sret_procs`.
+        if node.tag() == Some("call") {
+            if let Some(desc) = node.args().first().and_then(|c| self.callee_sret(c)) {
+                let addr = self.alloc_temp(self.t.sizeof(&desc));
+                self.call_sret(node, addr)?;
+                return Ok(Some((addr, desc)));
+            }
+            return Ok(None);
+        }
         if !matches!(node.tag(), Some("oconstr") | Some("aconstr")) {
             return Ok(None);
         }
@@ -4096,6 +4224,18 @@ impl<'a> FuncGen<'a> {
         let addr = self.alloc_temp(self.t.sizeof(&desc));
         self.assign_aggregate(addr, &desc, node)?;
         Ok(Some((addr, desc)))
+    }
+
+    /// The aggregate a call to `name` returns by sret, if any — from the local proc table (a proc
+    /// defined in this module) or the linker-pooled [`ext_sret_procs`](Translator::ext_sret_procs) (a
+    /// sibling module's proc, under its stem-suffixed name). `None` for a scalar/void callee.
+    fn callee_sret(&self, name: &Node) -> Option<TyDesc> {
+        let n = name.as_atom()?;
+        self.t
+            .ext_sret_procs
+            .get(n)
+            .cloned()
+            .or_else(|| self.t.procs.get(n).and_then(|s| s.sret.clone()))
     }
 
     /// One call argument → its SVM value id. An **aggregate** argument is passed by address: an
