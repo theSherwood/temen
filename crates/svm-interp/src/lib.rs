@@ -21404,6 +21404,26 @@ impl Mem {
         self.window.reserved()
     }
 
+    /// Re-establish a **restored contiguous committed extent** `[mapped, high)` (#816 warm-snapshot
+    /// restore): insert `Rw` entries for every reserved-tail page below `high` **without zeroing**
+    /// — the caller has already restored the pages' bytes (a fresh `map` would wipe them). The
+    /// scalar twin of a full [`Mem::apply_prots`] restore; a no-op when `high` is within the mapped
+    /// prefix. `high` is clamped to the reservation.
+    pub(crate) fn seed_committed(&mut self, high: u64) {
+        let high = high.min(self.window.reserved());
+        if high <= self.window.mapped() {
+            return;
+        }
+        let first = self.window.mapped().div_ceil(self.page);
+        let last = high.div_ceil(self.page);
+        let mut space = self.space_write();
+        for page in first..last {
+            space.prot.insert(page, PageProt::Rw);
+        }
+        drop(space);
+        self.prot_dirty.store(true, Ordering::Release);
+    }
+
     /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
     /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
     /// child reads the recorded address and suspends to its parent instead.

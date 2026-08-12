@@ -2226,20 +2226,63 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
     ) -> Result<Vec<Value>, Trap> {
+        self.run_over_grown(
+            func,
+            args,
+            fuel,
+            back,
+            host,
+            seed_data,
+            DEFAULT_RESERVED_LOG2,
+            None,
+        )
+        .0
+    }
+
+    /// [`run_over`](Self::run_over) for a **growable warm session** (#816): the reservation is
+    /// caller-chosen (clamp it to the shared backing's size — a reservation past the backing lets
+    /// guest writes silently vanish instead of failing the `map`), and a restored **contiguous
+    /// committed extent** can be re-established before the run: `committed = Some(high)` re-commits
+    /// `[declared, high)` *without zeroing* (the caller already restored those bytes —
+    /// [`Mem::seed_committed`]), so a `vm_map`-grown warm image survives the fresh-`Mem`-per-call
+    /// shape. Returns the run's result plus the post-run scalar committed extent
+    /// ([`Mem::scalar_extent`]): `Some(high)` to seed the next call with, `None` if the guest left
+    /// a state one bound cannot represent (sparse/`Ro`/`Unmapped` — a warm driver must fail closed
+    /// on it rather than restore partially), and `Some(0)` for a memory-less module.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_over_grown(
+        &self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        back: std::sync::Arc<super::Region>,
+        host: &mut Host,
+        seed_data: bool,
+        reserved_log2: u8,
+        committed: Option<u64>,
+    ) -> (Result<Vec<Value>, Trap>, Option<u64>) {
         if func as usize >= self.n_funcs {
-            return Err(Trap::Malformed);
+            return (Err(Trap::Malformed), None);
         }
         // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
         // slot vector) — the cross-tier reactor carries no §22 install state between calls.
         let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             if seed_data {
                 mm.init_data(&self.data);
             }
+            if let Some(high) = committed {
+                mm.seed_committed(high);
+            }
             mm
         });
-        run(dom, func, args, fuel, &mut mem, host)
+        let out = run(dom, func, args, fuel, &mut mem, host);
+        let extent = match mem.as_ref() {
+            None => Some(0),
+            Some(m) => m.scalar_extent(),
+        };
+        (out, extent)
     }
 }
 
