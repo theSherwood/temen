@@ -586,13 +586,14 @@ fn cross_module_funcref_global_call() {
         },
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
-    // drive = module w's first proc → func 0.
+    // drive = module w's first proc → func 0. It makes an indirect call (through `hook`), so under
+    // the funcref ABI it is frame-needing: a leading `$sp` (2048) precedes the visible arg.
     assert_eq!(
-        run(&linked, 0, &[21]),
+        run(&linked, 0, &[2048, 21]),
         42,
         "drive sets hook=dbl, calls hook(21)"
     );
-    assert_eq!(run(&linked, 0, &[-5]), -10);
+    assert_eq!(run(&linked, 0, &[2048, -5]), -10);
 }
 
 /// A cross-module call to a **frame-needing proc**. Module `s`'s `count` takes `(addr i)` of a local,
@@ -682,10 +683,11 @@ fn funcref_global_static_initializer() {
     ])
     .unwrap_or_else(|e| panic!("link: {e}"));
     // No setter runs — `hook` holds `dbl`'s index purely from the materialized initializer.
+    // `drive` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (2048).
     assert_eq!(
-        run(&linked, 0, &[21]),
+        run(&linked, 0, &[2048, 21]),
         42,
         "drive calls the materialized hook = dbl"
     );
-    assert_eq!(run(&linked, 0, &[-5]), -10);
+    assert_eq!(run(&linked, 0, &[2048, -5]), -10);
 }
