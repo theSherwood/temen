@@ -2465,20 +2465,24 @@ impl<'a> FuncGen<'a> {
                 .push_str(&format!("  i32.store v{addr} v{v}\n"));
             return Ok(());
         }
+        if let TyDesc::Agg(_) = desc {
+            // Storing an aggregate **through an lvalue** — `s.field = other` / `= (oconstr …)`, or
+            // `p[i] = obj`, where the `dot`/`at`/`deref` target is itself an object/array. A
+            // whole-aggregate copy or in-place construct into the field/element address, exactly as an
+            // aggregate `asgn` to a bare local (`assign_aggregate`). Real nimony hits this assigning
+            // one object/string field into another (`x.left = node`, string fields).
+            return self.assign_aggregate(addr, &desc, rhs);
+        }
         let ty = match desc {
             TyDesc::Scalar(t) => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
             TyDesc::FnPtr(_) => unreachable!("handled above"),
+            TyDesc::Agg(_) => unreachable!("handled above"),
             TyDesc::FlexArray(_) => {
                 return Err(LengError::Unsupported(
                     "assigning to a flexible array (index it with `at`/`pat`)".into(),
                 ))
-            }
-            TyDesc::Agg(n) => {
-                return Err(LengError::Unsupported(format!(
-                    "assigning to aggregate lvalue `{n}`"
-                )))
             }
         };
         let v = self.expr_typed(rhs, ty)?;

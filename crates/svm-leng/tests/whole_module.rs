@@ -118,6 +118,29 @@ fn global_pointer_deref() {
     assert_eq!(run(&m, 0, &[4096]), 42, "(deref global x).data = 42");
 }
 
+#[test]
+fn store_aggregate_through_lvalue() {
+    // Assigning an aggregate **through a `dot`/`deref` lvalue** — `(*p) = Inner(v: 42)` — is a
+    // whole-aggregate construct into the target address, not a scalar store. It previously
+    // fail-closed ("assigning to aggregate lvalue"); real nimony assigns object/string fields this
+    // way (`x.left = node`, string fields). `setit` writes the aggregate through the pointer and
+    // reads a field back.
+    let leng = "\
+(stmts
+ (type :Inner.0. . (object . (fld :v.0 . (i +64))))
+ (proc :setit.0. (params (param :p.0 . (ptr Inner.0.))) (i +64) .
+  (stmts .
+   (asgn (deref p.0) (oconstr Inner.0. (kv v.0 42)))
+   (ret (dot (deref p.0) v.0 0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // A frame is needed for the constructor temp, so slot 0 = $sp; p points into the window at 2048.
+    assert_eq!(
+        run(&m, 0, &[4096, 2048]),
+        42,
+        "(*p).v after aggregate store = 42"
+    );
+}
+
 /// Real nimony `hexer` output for `var counter: int = 42` plus `getCounter`/`addCounter` — the
 /// static non-zero initializer must seed the window so `getCounter()` reads 42.
 #[test]
