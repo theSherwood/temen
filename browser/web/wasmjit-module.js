@@ -150,6 +150,16 @@ async function driveJitRun(ex, memory, cacheKey) {
   return status;
 }
 
+// Marshal one i64 slot to the wasm type an emitted unit's `f0` declares, and a JS return back to its
+// i64 slot — worker.js's `jitArg`/`jitRes` twins for the single-shot pump (#835). Type codes:
+// 0 = i32 (JS Number), 1 = i64 (BigInt), 2 = f32, 3 = f64 (Numbers via the slot's float bits).
+const f64buf = new DataView(new ArrayBuffer(8));
+const tierupJitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot))
+  : tc === 1 ? slot
+  : (f64buf.setBigInt64(0, slot, true), tc === 2 ? f64buf.getFloat32(0, true) : f64buf.getFloat64(0, true));
+const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
+  : (tc === 2 ? f64buf.setFloat32(0, ret, true) : f64buf.setFloat64(0, ret, true), f64buf.getBigInt64(0, true));
+
 // Drive an already-opened **leaf tier-up** run (#809) — the InterpDriven complement to `driveJitRun`:
 // the interpreter owns `_start` (it `vm_map`s / does host I/O, so the whole-program emit declined), and
 // each tier-up-eligible pure leaf surfaces as a TIERUP event serviced here on the emitted module. The
@@ -159,6 +169,13 @@ async function driveJitRun(ex, memory, cacheKey) {
 // copies), and deliver the i64 result slots (or a trap) back to the parked vCPU. On DONE the cdylib has
 // staged stdout/stderr/exit/value into the usual shared slots. A trapped run throws so the caller falls
 // back to the interpreter oracle (INVARIANT 9 — diverge toward refusal).
+//
+// A `vm_jit_*`-importing guest (#835, the JACL compiler shape) additionally surfaces JIT_INVOKE
+// events: a guest-compiled §22 unit runs here as `f0(win, env, ...args)` on its own emitted wasm
+// (instantiated once per code handle — worker.js's `jitUnitFor` shape), args/results marshalled by
+// the event's scalar type codes, with the same per-call `"mapped"` sync. The engine only surfaces
+// invokes whose unit emitted and whose window state is representable; everything else it services
+// on the interpreter itself, so this handler never has to decline.
 async function driveTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
@@ -189,10 +206,54 @@ async function driveTierupRun(ex, memory, cacheKey) {
   });
   const emitted = instance.exports;
   const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
+  // §22 unit instances, one per code handle (#835). Per-Run only: code handles are per-session.
+  const jitUnits = new Map();
 
   try {
     for (;;) {
       const ev = ex.svm_onramp_tierup_run();
+      if (ev === 3 /* TIERUP_RUN_JIT_INVOKE */) {
+        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
+        // `f0(win, env, ...args)` with the per-call `"mapped"` sync — worker.js's JIT_INVOKE
+        // handler, single-shot edition.
+        const code = ex.svm_onramp_tierup_jit_code();
+        let unit = jitUnits.get(code);
+        if (unit === undefined) {
+          const wptr = Number(ex.svm_onramp_tierup_jit_wasm_ptr());
+          const wlen = ex.svm_onramp_tierup_jit_wasm_len();
+          const uinst = await WebAssembly.instantiate(
+            await WebAssembly.compile(u8().slice(wptr, wptr + wlen)),
+            { env: {
+                memory,
+                trap: () => {},
+                call_interp: () => { throw new Error('unexpected cross-tier call from an emitted unit'); },
+            } },
+          );
+          unit = uinst.exports;
+          jitUnits.set(code, unit);
+        }
+        const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
+        const n = ex.svm_onramp_tierup_argv_len();
+        const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_param_types_ptr()), n);
+        const args = [];
+        for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
+        unit.mapped.value = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
+        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        try {
+          const ret = unit['f0'](win, envCell, ...args);
+          const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+          const rn = ex.svm_onramp_tierup_jit_result_types_len();
+          const rtypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_result_types_ptr()), rn);
+          const rlen = Math.max(1, rets.length) * 8;
+          const rptr = Number(ex.svm_alloc(rlen));
+          for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = tierupJitRes(rets[i], rtypes[i]);
+          ex.svm_onramp_tierup_deliver_jit(rptr, rets.length);
+          ex.svm_dealloc(rptr, rlen);
+        } catch {
+          ex.svm_onramp_tierup_deliver_jit_trap();
+        }
+        continue;
+      }
       if (ev !== 1 /* TIERUP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
       const func = ex.svm_onramp_tierup_func();
       const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
@@ -241,9 +302,10 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
   const opened = ex.svm_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
   // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams, …): try the
-  // leaf tier-up run (#809) before giving the buffers up — the interpreter drives `_start` and its
-  // eligible pure leaves run on emitted wasm. Refused too (nothing eligible / concurrency / §22 JIT)
-  // → fall through to the throw and the caller's plain-interpreter fallback.
+  // leaf tier-up run (#809) before giving the buffers up — the interpreter drives `_start`, its
+  // eligible pure leaves run on emitted wasm, and a `vm_jit_*` guest's runtime-compiled §22 units run
+  // emitted too (#835). Refused (nothing emittable ever / threads/futex) → fall through to the throw
+  // and the caller's plain-interpreter fallback.
   let tierup = false;
   if (opened !== 0 && ex.svm_onramp_tierup_open &&
       ex.svm_onramp_tierup_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {

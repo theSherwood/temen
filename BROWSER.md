@@ -990,11 +990,31 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `driveTierupRun` in `web/wasmjit-module.js` services each event on the emitted module over the
    shared memory (re-arm `"fuel"`, write the event's committed-extent snapshot to `"mapped"` — the
    #717 sync — then `f{func}(win, env, ...args)` and deliver), and `runJitModule` tries this opener
-   automatically when the whole-program open declines. Fail-closed at open for concurrency and §22
-   `vm_jit_*` guests (events the single-vCPU pump can't service) and when nothing is eligible; a trap
-   mid-run throws so the page re-runs on the interpreter oracle (INVARIANT 9). Proven observably
-   identical to `onramp_exec` (status/value/stdout, with a tier-up non-vacuity counter) by the native
-   `tests/tierup_driver.rs` with wasmi playing the JS host.
+   automatically when the whole-program open declines. Fail-closed at open for threads/futex guests
+   (`Spawn`/`Join`/`Wait`/`Notify` events the single-vCPU pump can't service) and when nothing could
+   ever run emitted; a trap mid-run throws so the page re-runs on the interpreter oracle
+   (INVARIANT 9). Proven observably identical to `onramp_exec` (status/value/stdout, with a tier-up
+   non-vacuity counter) by the native `tests/tierup_driver.rs` with wasmi playing the JS host.
+
+   **#835 — the §22 half (the JACL compiler-guest shape).** The pump now also admits **fiber**
+   guests (`cont.*`/`suspend` — `step_vcpu` services them in-engine; the gate narrowed from
+   `uses_concurrency` to `uses_threads || uses_futex`, the §22 renegotiated split) and
+   **`vm_jit_*`-importing** guests: `grant_onramp_caps` already granted the `Jit` cap + validator +
+   fiber hosting for them, and the open now arms the unit **wasm emitter** too
+   (`onramp_tierup_unit_emitter` — `browser_jit_wasm_emitter`'s closed-unit contract, with the
+   unit's mask bumped to the pump's run window so grown-page addresses don't alias, and the run's
+   memory-share flag threaded through statics). `svm_onramp_tierup_run` services §22
+   `install`/`uninstall` and interpreter-bound invokes inline (installed units dispatch interpreted,
+   inline in the caller's frames — where fibers work); a codegen-eligible `Jit.invoke` (unit
+   emitted + all-scalar operands + representable window state) surfaces as a `TIERUP_RUN_JIT_INVOKE`
+   event, serviced by `driveTierupRun` as `f0(win, env, ...args)` on the unit's own wasm
+   (instantiated once per code handle, args/results marshalled by the event's scalar type codes,
+   same per-call `"mapped"` sync). A symtab-linked macro unit (Slot callbacks into the program) is
+   outside the closed-unit emitter subset and stays interpreted — fail-closed, and the reason the
+   JACL capstone test asserts parity but not emitted-unit non-vacuity. Differentials in
+   `tests/tierup_driver.rs`: a `vm_jit_compile`+`invoke2` guest whose unit stores/loads through the
+   `vm_map`-grown page (emitted-invoke non-vacuity + the grown-extent `"mapped"` operand pinned), a
+   fiber-guest admit/parity pin, and the asset-gated real `jacl_compiler.svmb` pump run.
 
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 
