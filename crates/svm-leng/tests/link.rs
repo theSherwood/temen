@@ -376,6 +376,46 @@ fn cross_module_sret_call_in_argument_position() {
 }
 
 #[test]
+fn cross_module_sret_and_frame_needing_call() {
+    // The real func-91 shape: a cross-module callee that is **both sret and frame-needing** — `mk`
+    // returns `Obj` by sret *and* holds an aggregate local (a frame). Its signature is
+    // `($sp, $sret, n)`; `call_import_sret` must prepend `$sp` *before* the sret pointer (slot order
+    // `[$sp] [$sret] [params]`), not just pass `($sret, n)`. Without it the linked call is one arg
+    // short (the mismatch that blocked the real `$`(int)→string in the syncio init). go(9) = 9.
+    let mod_b = "\
+(stmts
+ (type :Obj.0. . (object . (fld :v.0 . (i +64))))
+ (proc :mk.0. (params (param :n.0 . (i +64))) Obj.0. .
+  (stmts .
+   (var :tmp.0 . Obj.0. (oconstr Obj.0. (kv v.0 n.0)))
+   (ret tmp.0))))";
+    let mod_a = "\
+(stmts
+ (proc :readv.0. (params (param :o.0 . Obj.0.modb)) (i +64) .
+  (stmts . (ret (dot o.0 v.0 0))))
+ (proc :go.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call readv.0. (call mk.0.modb n.0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &["readv.0.", "go.0."],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &["mk.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(
+        run(&linked, 1, &[4096, 9]),
+        9,
+        "readv(mk(9)).v = 9 (mk is sret + framed)"
+    );
+}
+
+#[test]
 fn cross_module_sret_call_discarded() {
     // A **cross-module aggregate-returning call in statement position** — `mk(n)` on its own, result
     // discarded (the func-15/func-91 shape from the real syncio init). It materializes a throwaway

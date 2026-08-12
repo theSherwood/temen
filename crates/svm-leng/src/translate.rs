@@ -4337,8 +4337,19 @@ impl<'a> FuncGen<'a> {
         args: &[Node],
         dest_addr: u32,
     ) -> Result<(), LengError> {
-        let mut argvals = vec![dest_addr];
-        let mut argtys = vec![ValType::I64]; // the sret pointer
+        // Slot order for a frame-needing sret callee is `[$sp] [$sret] [params]` (proc_body): a proc
+        // pooled as frame-needing ([`ext_frame_procs`]) gets `sp + frame_size` prepended **before** the
+        // sret pointer, exactly as `call_import` prepends it for a non-sret frame-needing callee.
+        // Without this a cross-module callee that is *both* sret and frame-needing (`$`(int)→string
+        // building its result in a frame) is called with the `$sret` but no `$sp` — an arity mismatch.
+        let mut argvals = Vec::new();
+        let mut argtys = Vec::new();
+        if self.t.ext_frame_procs.contains(name) {
+            argvals.push(self.emit_callee_sp(name)?);
+            argtys.push(ValType::I64);
+        }
+        argvals.push(dest_addr);
+        argtys.push(ValType::I64); // the sret pointer
         for arg in args {
             // Aggregate args pass by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)`
             // literal, e.g. a `string` argument) is constructed into a temp, an aggregate **lvalue**
