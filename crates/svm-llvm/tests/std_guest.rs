@@ -122,7 +122,16 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
         }
     }
     let ll = find_ll(&work.join("target"), name)?;
-    Some(ll)
+    // Free the per-test build tree now. Each test does a full `build-std` (~hundreds of MB of target
+    // artifacts); run serially across the whole suite that exhausts the runner's disk allowance —
+    // ENOSPC mid-`build-std` on the first full CI run, which the harness would then silently skip.
+    // The fat-LTO'd `.ll` is self-contained (the on-ramp reads only this one file), so copy it out to
+    // a small standalone path and drop the tree, bounding peak disk to a single build at a time.
+    let out_ll =
+        std::env::temp_dir().join(format!("svm_std_{name}_{stem}_{}.ll", std::process::id()));
+    std::fs::copy(&ll, &out_ll).ok()?;
+    let _ = std::fs::remove_dir_all(&work);
+    Some(out_ll)
 }
 
 fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
