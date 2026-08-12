@@ -314,6 +314,15 @@ pub(crate) struct Translator {
     /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
     /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
     own_stem: String,
+    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_funcrefs`],
+    /// [`export_tls_vars`]), which run [`collect_globals`](Self::collect_globals) on a *fresh,
+    /// import-less* translator purely to enumerate funcref/thread-var globals. Such a translator
+    /// has no pooled sibling types, so an aggregate global whose constructor type is defined in
+    /// another module (every `var s = "…"` — `string` lives in `system`) can't be materialized. In
+    /// lenient mode that reserves a zeroed placeholder instead of failing closed, so the pre-scan
+    /// completes; the **real** translation pass (this flag off, sibling types pooled) still
+    /// fail-closes on a genuinely unmaterializable aggregate global and materializes the rest.
+    scan_lenient: bool,
 }
 
 impl Translator {
@@ -339,6 +348,7 @@ impl Translator {
             tls_block_size: 0,
             ext_tls_layout: HashMap::default(),
             own_stem: String::new(),
+            scan_lenient: false,
         }
     }
 
@@ -581,6 +591,21 @@ impl Translator {
                                 self.globals.insert(name, (off, adesc));
                                 off += n.max(self.sizeof(&desc)).max(8);
                                 continue;
+                            } else if self.scan_lenient
+                                && matches!(init.tag(), Some("oconstr") | Some("aconstr"))
+                            {
+                                // A cross-module **aggregate constructor** global we can't fold in a
+                                // pre-scan (its type lives in a sibling module, not pooled here; in a
+                                // fresh translator the type name isn't even known to be an aggregate,
+                                // so `desc` is a scalar fallback — key off the init node). Only the
+                                // funcref/frame pre-passes (`export_funcrefs`, `export_tls_vars`) set
+                                // `scan_lenient`; they run `collect_globals` on a fresh, import-less
+                                // translator purely to enumerate funcref/tls globals, and erroring
+                                // here aborted the whole link for any program with a module-level
+                                // cross-module aggregate `var` (every `var s = "…"`). Fall through to
+                                // reserve a zeroed placeholder slot — the pre-scan's globals are
+                                // discarded anyway. The **real** translation pass (this flag off,
+                                // sibling types pooled) materializes the true bytes above.
                             } else {
                                 return Err(LengError::Unsupported(format!(
                                     "non-scalar-int global initializer for `{name}`"
@@ -1263,6 +1288,7 @@ impl Translator {
     /// bounded gap; scalar thread-vars, the allocator/exception state, always resolve.)
     pub fn export_tls_vars(root: &Node, stem: &str) -> Result<Vec<(String, u64)>, LengError> {
         let mut t = Translator::new().with_tls();
+        t.scan_lenient = true; // enumerating thread-vars; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         let items: Vec<(String, TyDesc)> = t
@@ -1286,6 +1312,7 @@ impl Translator {
     /// [`export_types`]; [`link_selected`] pools these across its units before translating any.
     pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
         let mut t = Translator::new();
+        t.scan_lenient = true; // enumerating funcref globals; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         let mut out: Vec<(String, FnPtrSig)> = t
@@ -1325,6 +1352,7 @@ impl Translator {
         stem: &str,
     ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
         let mut t = Translator::new();
+        t.scan_lenient = true; // enumerating proc frames; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
         // Resolve a callee name to its global form: a local proc's name ends in `.` (the empty
