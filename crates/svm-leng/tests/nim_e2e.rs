@@ -13,8 +13,7 @@
 //! the fast, toolchain-free unit tests.
 
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use svm_interp::{cap_id, run_with_host, BoundImport, Host, Value};
+use svm_interp::Value;
 use svm_ir::{LinkUnit, Module};
 
 /// The runtime shim's function indices, keyed by the C symbol each bottom-edge import lowers to.
@@ -498,78 +497,68 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
         "linked module is a powerbox entry (paramless func-0 `_start`)"
     );
 
-    // Run `_start` (function 0) on both engines under identical host-bound syscall imports and assert
-    // the captured stdout agrees. The two engines reach the retained `call.import` leaves by different
-    // plumbing — the interpreter dispatches each through its host binding table directly; the JIT
-    // lowers the `call.import` to a `cap.call` on the reserved `CAP_IMPORT_TYPE_ID` sentinel and
-    // `cap_thunk` translates *that* through the very same bindings — so a divergence is a real engine
-    // bug, not a harness artifact. Each run gets a fresh `Host` and capture buffer (a shared buffer
-    // would concatenate both engines' output).
-    let interp_out = run_io_capture(&m, false);
-    let jit_out = run_io_capture(&m, true);
+    // Instantiate the manifest module through the reference embedding and run `_start` on both
+    // engines under the **POSIX personality** — the raw-syscall leaves (`sysWrite.0.` …) bind by name
+    // to `svm_posix`'s `write`/`read`/`open`/`close`/`lseek` ops, whose `write(fd, buf, n)` ABI is the
+    // exact nimony bottom edge. This is the real load-a-manifest-module, host-grants-the-caps path
+    // (`instantiate_with_imports` → `Instance::run`), not a hand-wired host-binding harness. Each
+    // engine gets its own fresh personality (separate fd table + stdout buffer); a divergence in the
+    // two captured streams is a real engine bug on the W3 syscall seam.
+    let interp_out = run_io_capture(&m, svm_run::Backend::TreeWalk);
+    let jit_out = run_io_capture(&m, svm_run::Backend::Jit);
     assert_eq!(
         interp_out, jit_out,
-        "§9 interp/JIT parity on the syscall I/O seam"
+        "§9 interp/JIT parity on the POSIX syscall I/O seam"
     );
     interp_out
 }
 
-/// Run the linked I/O program's powerbox `_start` (function 0) on one engine — the JIT when `jit`,
-/// else the tree-walker — under a fresh `Host` that binds `sysWrite` to a stdout capture and every
-/// other retained syscall leaf to a no-op stub. Returns the captured bytes. The `sysWrite` binding
-/// reads the guest window through the same `GuestMem` both engines hand the host proc.
-fn run_io_capture(m: &Module, jit: bool) -> Vec<u8> {
-    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let mut host = Host::new();
-    let mut bindings = Vec::new();
-    for imp in &m.imports {
-        let handle = if imp.name.starts_with("sysWrite") {
-            let cap = captured.clone();
-            host.grant_host_proc(Box::new(move |_op, args, mem, _| {
-                // sysWrite(fd, buf, n): copy the `n` bytes at `buf` out of the guest window.
-                let (buf, n) = (args[1] as u64, args[2] as u64);
-                if let Some(mm) = mem {
-                    if let Some(bytes) = mm.read_bytes(buf, n) {
-                        cap.lock().unwrap().extend_from_slice(&bytes);
-                    }
-                }
-                Ok(vec![n as i64])
-            }))
-        } else {
-            host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])))
-        };
-        bindings.push(BoundImport::required(
-            cap_id::HOST_PROC,
-            bindings.len() as u32,
-            handle,
-        ));
-    }
-    host.set_import_bindings(bindings);
-
-    // `_start` (function 0) is paramless — it sets up `$sp` and the C `main` args itself.
-    if jit {
-        let ctx = &mut host as *mut Host as *mut std::ffi::c_void;
-        let (outcome, _mem) = svm_jit::compile_and_run_capture_reserved_with_host(
-            m,
-            0,
-            &[],
-            &[],
-            svm_ir::DEFAULT_RESERVED_LOG2,
-            svm_run::cap_thunk,
-            ctx,
-        )
-        .unwrap_or_else(|e| panic!("jit compile _start: {e:?}"));
-        assert!(
-            matches!(outcome, svm_jit::JitOutcome::Returned(_)),
-            "jit _start did not return cleanly: {outcome:?}"
-        );
+/// Map a retained nimony syscall import name to the POSIX-personality op it binds to. The nimony
+/// bottom edge (`sysWrite {.importc: "write".}` …) is spelled by the *nim* symbol (`sysWrite.0.`),
+/// not the C name, so the powerbox's by-C-name resolver doesn't reach it — this is the small
+/// nimony→personality name map that lets the retained leaves bind to `svm_posix`'s fd-based ops
+/// (whose signatures match the nim ABI exactly).
+fn nim_posix_op(name: &str) -> u32 {
+    if name.starts_with("sysWrite") {
+        svm_posix::OP_WRITE
+    } else if name.starts_with("sysRead") {
+        svm_posix::OP_READ
+    } else if name.starts_with("sysOpen") {
+        svm_posix::OP_OPEN
+    } else if name.starts_with("sysClose") {
+        svm_posix::OP_CLOSE
+    } else if name.starts_with("sysLseek") {
+        svm_posix::OP_LSEEK
     } else {
-        let mut fuel = 500_000_000u64;
-        run_with_host(m, 0, &[], &mut fuel, &mut host)
-            .unwrap_or_else(|e| panic!("run _start: {e:?}"));
+        panic!("unmapped nimony syscall import `{name}` — extend nim_posix_op");
     }
-    let out = captured.lock().unwrap().clone();
-    out
+}
+
+/// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
+/// embedding (`Instance`), with every retained nim-name syscall import bound to a single shared
+/// **POSIX personality**. Returns the bytes the guest `write`-to-fd-1'd (`Posix::stdout`). The
+/// program uses no posix `malloc`/`mmap` (its own runtime shim serves those), so the personality's
+/// heap arena is unused and passed empty.
+fn run_io_capture(m: &Module, backend: svm_run::Backend) -> Vec<u8> {
+    // One personality shared across every bound name (one fd table, one stdout buffer): the factory
+    // closes over a single `inner`, so each per-name grant re-mints a handler over the same state.
+    // `svm_posix::cap` hands back an opaque `impl Fn` (no `Clone`), so wrap it in an `Arc` and share
+    // that across the per-name grant closures.
+    let (posix, make) = svm_posix::cap(0, 0, Vec::new());
+    let make = std::sync::Arc::new(make);
+    let mut imports = svm_run::Imports::new();
+    for imp in &m.imports {
+        let make = std::sync::Arc::clone(&make);
+        imports = imports.provide(
+            imp.name.clone(),
+            svm_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
+        );
+    }
+    let inst = svm_run::instantiate_with_imports(m.clone(), imports)
+        .unwrap_or_else(|e| panic!("instantiate manifest module: {e}"));
+    inst.run(backend, &svm_run::RunConfig::default())
+        .unwrap_or_else(|e| panic!("run `_start` on {backend:?}: {e}"));
+    posix.stdout()
 }
 
 /// Richer end-to-end I/O over the same chain — output that actually *formats*, exercising the

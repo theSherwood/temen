@@ -32,8 +32,11 @@ svm-encode = { path = "../svm-encode" }
 svm-verify = { path = "../svm-verify" }
 svm-interp = { path = "../svm-interp" }
 svm-jit = { path = "../svm-jit" }
-# Test-only: the reusable host glue (`cap_thunk`) for driving the JIT under the same host-bound
-# capability imports the interpreter path uses — so the nimony I/O e2e can assert §9 interp/JIT
-# parity on the syscall seam. svm-run's *library* does not depend on svm-leng (only its own tests
-# do), so this dev-edge introduces no cycle.
+# Test-only: the reference embedding + host glue (`Instance`, `instantiate_with_imports`, `HostCap`)
+# for running the nimony I/O powerbox module through the real cap-granting path on both engines.
+# svm-run's *library* does not depend on svm-leng (only its own tests do), so this dev-edge
+# introduces no cycle.
 svm-run = { path = "../svm-run" }
+# Test-only: the POSIX personality (`svm_posix::cap`) whose `write(fd, buf, n)` matches the nimony
+# `sysWrite(fd, buf, n)` bottom edge exactly — the caps the retained nim-name syscall imports bind to.
+svm-posix = { path = "../svm-posix" }
