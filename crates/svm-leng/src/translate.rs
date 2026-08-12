@@ -832,6 +832,11 @@ impl Translator {
             };
             let w = elem_size.min(8);
             let mut bytes = vec![0u8; total];
+            let felem = TyDesc::Scalar(if elem_size == 4 {
+                ValType::F32
+            } else {
+                ValType::F64
+            });
             for (i, v) in a[1..].iter().enumerate() {
                 let off = i * elem_size;
                 if let Some(n) = int_literal(v) {
@@ -846,6 +851,15 @@ impl Translator {
                         bytes[off..end].copy_from_slice(&ebytes[..end - off]);
                     }
                     relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
+                } else if let Ok(fb) = const_float_bytes(v, &felem) {
+                    // A **float element** (`powtens = [1e0, 1e1, …]` in `parseutils.parseFloat`, an
+                    // `array[..22, float64]`). Fold to the element-width float bits, exactly as the
+                    // `oconstr` float-field path does. `const_float_bytes` fails closed when the value
+                    // isn't a foldable float or the `float` feature is off, falling to the placeholder.
+                    let end = (off + fb.len()).min(bytes.len());
+                    if off < end {
+                        bytes[off..end].copy_from_slice(&fb[..end - off]);
+                    }
                 } else {
                     return Ok(None);
                 }

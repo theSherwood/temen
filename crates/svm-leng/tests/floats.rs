@@ -70,6 +70,27 @@ fn int_to_float_conversion() {
 }
 
 #[test]
+fn local_const_float_array_materializes_and_indexes() {
+    // A **local `const`** float table — `parseutils.parseFloat`'s `powtens = [1e0, 1e1, …]`, an
+    // `array[.., float64]` declared inside the proc. `collect_local_aggregate_consts` materializes it
+    // into a data segment via `const_aggregate_bytes`; before the `aconstr` folder handled float
+    // elements it returned `None`, so the const stayed unmaterialized and lowering errored
+    // "non-scalar local const `powtens`". Now each element folds to its f64 bits; `(at pt idx)` reads
+    // one back on both engines.
+    let leng = "\
+(stmts
+ (type :FTbl.0. . (array (f +64) 4))
+ (proc :pick.0. (params (param :i.0 . (i +64))) (f +64) .
+  (stmts .
+   (const :pt.0. . FTbl.0. (aconstr FTbl.0. 1.0 10.0 100.0 1000.0))
+   (ret (at pt.0. i.0)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run_f64(&m, 0, &[Value::I64(0)]), 1.0, "pt[0]");
+    assert_eq!(run_f64(&m, 0, &[Value::I64(2)]), 100.0, "pt[2]");
+    assert_eq!(run_f64(&m, 0, &[Value::I64(3)]), 1000.0, "pt[3]");
+}
+
+#[test]
 fn float_to_int_and_neg() {
     // trunc_neg(x): int = int(-x)   — f64.neg then i64.trunc_f64_s.
     let leng = "\
