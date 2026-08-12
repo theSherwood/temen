@@ -21331,6 +21331,36 @@ impl Mem {
         Ok(())
     }
 
+    /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
+    /// admitted byte set — for loads and stores alike — is exactly `[0, H)`, i.e. the fixed mapped
+    /// prefix extended by a contiguous run of explicitly-`Rw` pages. Any other explicit page state
+    /// breaks the single-bound shape (`Ro` splits the read/write sets, `Unmapped`/`Backed` change
+    /// admitted-or-bytes anywhere, an `Rw` page beyond a hole leaves the set non-contiguous) and
+    /// returns `None`, telling the tier-up driver to **decline** emitted code for the call and
+    /// interpret it instead — fail-closed, the interpreter is always right. An `Rw` re-commit
+    /// inside the prefix is set-neutral and ignored. The value is window-relative, matching the
+    /// emitted tier's `win`-relative bounds check (its `"mapped"` global).
+    pub(crate) fn scalar_extent(&self) -> Option<u64> {
+        // Lock-free fast path: the address space has never been mutated, so the admitted set is
+        // the region default — exactly the mapped prefix.
+        if !self.prot_dirty.load(Ordering::Acquire) {
+            return Some(self.window.mapped());
+        }
+        let space = self.space_read();
+        let mut high = self.window.mapped();
+        // BTreeMap iteration is ascending, so a contiguous grown tail is consumed page-by-page at
+        // exactly the running boundary; anything else is unrepresentable.
+        for (&page, prot) in space.prot.iter() {
+            let start = page.saturating_mul(self.page);
+            match prot {
+                PageProt::Rw if start < high => {} // set-neutral re-commit inside [0, high)
+                PageProt::Rw if start == high => high = high.saturating_add(self.page),
+                _ => return None, // Ro/Unmapped/Backed anywhere, or Rw beyond a hole
+            }
+        }
+        Some(high.min(self.window.reserved()))
+    }
+
     /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
     /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
     /// child reads the recorded address and suspends to its parent instead.
