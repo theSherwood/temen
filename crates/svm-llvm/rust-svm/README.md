@@ -12,8 +12,10 @@ on-ramp is the ongoing S1 work (see "Status" below).
 
 | File | What it is |
 |---|---|
-| `x86_64-unknown-svm.json` | The custom target spec. `os=svm`, `panic=abort`, `singlethread=true` (single-threaded but keeps 64-bit atomics), static reloc, no PIE. |
-| `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the right leaf-module impls: the minimal (no-OS, single-thread) ones for `sys/{alloc,thread_local,random,io/error}` (as `vexos`/`zkvm` do), the svm `stdio`/`pal`/`args`/`time`/`env`/`fs`/`pipe`/`process` modules, and the powerbox `exit` in `sys/exit.rs`. 54 added lines across 12 files. |
+| `x86_64-unknown-svm.json` | The **lean** target spec. `os=svm`, `panic=abort`, `singlethread=true` (single-threaded but keeps 64-bit atomics), `has-thread-local=false`, static reloc, no PIE. Selects std's `no_threads` `Mutex`/`Once`/TLS. |
+| `x86_64-unknown-svm-threads.json` | The **threaded** target spec. Same as the lean spec but `singlethread=false` (real atomic-ordering codegen), `has-thread-local=true`, and `env=threads` (→ `cfg(target_env="threads")`, the overlay's discriminator). Selects futex-backed `sys/sync` + `native` TLS. `std::thread::spawn` is still `Unsupported` until the `sys/thread` slice lands (#823); this spec makes threaded-`std` **codegen** build/translate/run. |
+| `std-overlay.patch` | `cfg_select!` arm additions routing `target_os="svm"` to the svm leaf-module impls. Threading-independent arms (`sys/{alloc,random,io/error}`, `stdio`/`pal`/`args`/`time`/`env`/`fs`/`pipe`/`process`/`net`, `exit`) apply to both specs. The **sync/TLS** arms are gated on `target_env`: `sys/sync/{mutex,condvar,once,rwlock,thread_parking}` + `sys/sync/futex` route to `futex` only under `target_env="threads"`; `sys/thread_local` keeps `no_threads` under `not(target_env="threads")` and falls through to `native` otherwise. |
+| `svm-futex-imp.rs` | The futex primitive (copied to `sys/sync/futex/svm.rs`). A port of std's `wasm.rs` whose wait/notify reach the svm §12 futex via the on-ramp intrinsics `__vm_wait32`/`__vm_notify`. Backs the threaded spec's `sys/sync`; unused by the lean spec. |
 | `svm-alloc-imp.rs` | The allocator `imp` (copied to `sys/alloc/svm.rs`). Forwards `alloc`/`dealloc`/`realloc` to the C `malloc` family, which the on-ramp synthesizes as an in-window guest bump allocator (LLVM.md slice S). |
 | `svm-stdio-imp.rs` | The stdio PAL (copied to `sys/stdio/svm.rs`). `Stdin`/`Stdout` reach the host through `extern "C" write`/`read` (on-ramp "Lane C" → powerbox stdout/stdin, POSIX.md 0/1); `Stderr` calls `__vm_write_stderr` → the distinct powerbox stderr `Stream`. So `println!` and `eprintln!` write real bytes on separate streams. |
 | `svm-pal.rs` | The svm PAL proper (copied to `sys/pal/svm.rs`). Mirrors the `unsupported` PAL, but its `init` captures the powerbox-threaded `argv` (so `std::env::args` works), and it hosts the `host` bridge — `__vm_cap_resolve("posix")` + per-op `__vm_host_call` wrappers — that the richer surface (`time`/`env`/`fs`/`pipe`/`process`) reaches the host through. |
@@ -41,8 +43,32 @@ PAL lands (S1).
 
 The `singlethread=true` spec field (borrowed from the `zkvm` target) is what
 selects the `no_threads` sync/TLS implementations — `Mutex` is a `Cell`, TLS is a
-plain `static` — while still exposing atomics for future threading. Without it,
-std sees `target_has_threads` and rejects the `no_threads` impls.
+plain `static` — while still exposing atomics. Without it, std sees
+`target_has_threads` and **rejects** the `no_threads` impls with a hard
+`compile_error!`.
+
+### Two target specs (the threaded lane, #779/#821)
+
+Flipping `singlethread=false` is therefore not a free knob: it forces std to use
+real futex-backed `Mutex`/`Condvar`/`Once`/`RwLock` and a threads-valid TLS, or it
+won't compile at all. Rather than perturb the working lean spec, the threaded
+build is a **second target**, `x86_64-unknown-svm-threads`, selected by its
+`env=threads` cfg. The overlay serves both from one `rust-src` tree: the sync/TLS
+arms are gated on `target_env`, so the lean spec stays byte-identical and the
+threaded spec routes to `futex` sync (over `svm-futex-imp.rs` → `__vm_wait32`/
+`__vm_notify`) and `native` TLS.
+
+Native TLS emits `#[thread_local]` globals + `llvm.threadlocal.address`; the
+on-ramp lowers those as the NIM.md §3d **Tier-1** collapse — a thread-local's
+plain window address *is* its single instance on one vCPU. Exact until real
+`std::thread::spawn` lands (the Tier-2 per-thread `vcpu.tls` block, #822/#823), at
+which point spawn stays `Unsupported`. The threaded spec today proves the
+threaded-`std` **codegen** builds, translates, verifies, and runs identically to
+the lean spec on a single vCPU (`std_threads_spec_*` in `tests/std_guest.rs`).
+
+**Upgrading a toolchain:** the overlay can't be re-applied on top of an older
+(pre-threads) overlay — `apply-overlay.sh` detects a stale overlay and asks you to
+reinstall a clean `rust-src` first.
 
 ## Usage
 
@@ -51,9 +77,15 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 ./apply-overlay.sh                       # patch the toolchain's rust-src
 
+# lean, single-threaded (no_threads Mutex/TLS):
 RUSTC_BOOTSTRAP=1 cargo +nightly build \
   -Z build-std=core,alloc,std,panic_abort -Z json-target-spec \
   --target x86_64-unknown-svm.json --release
+
+# threaded (futex sys/sync + native TLS; spawn still Unsupported):
+RUSTC_BOOTSTRAP=1 cargo +nightly build \
+  -Z build-std=core,alloc,std,panic_abort -Z json-target-spec \
+  --target x86_64-unknown-svm-threads.json --release
 ```
 
 To get a single self-contained `.ll` for the on-ramp, build a `#![no_main]`

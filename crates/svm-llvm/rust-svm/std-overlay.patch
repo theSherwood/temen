@@ -17,7 +17,7 @@
          target_os = "zkvm",
          target_os = "trusty",
          target_os = "vexos",
-+        target_os = "svm",
++        all(target_os = "svm", not(target_env = "threads")),
      ) => {
          mod no_threads;
          pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -156,8 +156,7 @@
          pub use unsupported::*;
 --- a/library/std/src/sys/fs/mod.rs
 +++ b/library/std/src/sys/fs/mod.rs
-@@ -44,7 +44,11 @@
-     target_os = "vexos" => {
+@@ -45,6 +45,10 @@
          mod vexos;
          use vexos as imp;
      }
@@ -170,8 +169,7 @@
          use unsupported as imp;
 --- a/library/std/src/sys/pipe/mod.rs
 +++ b/library/std/src/sys/pipe/mod.rs
-@@ -12,7 +12,11 @@
-     target_os = "motor" => {
+@@ -13,6 +13,10 @@
          mod motor;
          pub use motor::{Pipe, pipe};
      }
@@ -184,8 +182,7 @@
          pub use unsupported::{Pipe, pipe};
 --- a/library/std/src/sys/process/mod.rs
 +++ b/library/std/src/sys/process/mod.rs
-@@ -14,7 +14,11 @@
-     target_os = "motor" => {
+@@ -15,6 +15,10 @@
          mod motor;
          use motor as imp;
      }
@@ -198,8 +195,7 @@
          use unsupported as imp;
 --- a/library/std/src/sys/net/connection/mod.rs
 +++ b/library/std/src/sys/net/connection/mod.rs
-@@ -28,7 +28,11 @@
-     target_os = "uefi" => {
+@@ -29,6 +29,10 @@
          mod uefi;
          pub use uefi::*;
      }
@@ -210,3 +206,61 @@
      _ => {
          mod unsupported;
          pub use unsupported::*;
+--- a/library/std/src/sys/sync/mutex/mod.rs
++++ b/library/std/src/sys/sync/mutex/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "svm", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/condvar/mod.rs
++++ b/library/std/src/sys/sync/condvar/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "svm", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/once/mod.rs
++++ b/library/std/src/sys/sync/once/mod.rs
+@@ -9,6 +9,7 @@
+ 
+ cfg_select! {
+     any(
++        all(target_os = "svm", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor="win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/rwlock/mod.rs
++++ b/library/std/src/sys/sync/rwlock/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "svm", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/thread_parking/mod.rs
++++ b/library/std/src/sys/sync/thread_parking/mod.rs
+@@ -1,5 +1,6 @@
+ cfg_select! {
+     any(
++        all(target_os = "svm", target_env = "threads"),
+         all(target_os = "windows", not(target_vendor = "win7")),
+         target_os = "linux",
+         target_os = "android",
+--- a/library/std/src/sys/sync/futex/mod.rs
++++ b/library/std/src/sys/sync/futex/mod.rs
+@@ -35,5 +35,9 @@
+     target_os = "motor" => {
+         pub use moto_rt::futex::*;
+     }
++    all(target_os = "svm", target_env = "threads") => {
++        mod svm;
++        pub use svm::*;
++    }
+     _ => {}
+ }

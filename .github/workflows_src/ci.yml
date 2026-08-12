@@ -322,6 +322,44 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+  std-guest:
+    name: rust-svm std lane (build-std · lean + threads · nightly)
+    # The `std_guest` suite auto-skips in the always-on `svm-llvm` job (it needs a nightly toolchain
+    # with `rust-src` and the svm std overlay applied — absent there). This job provides that lane so
+    # the tests actually run: both target specs (lean `x86_64-unknown-svm` and threaded
+    # `x86_64-unknown-svm-threads`) are compiled via `-Zbuild-std`, translated, verified, and run.
+    # Nightly-only (like `cc1-self-compile-giants` / `full-depth-gates` / `nim-e2e`): each test does a
+    # full `build-std` (~40 s) and they run serially, too slow for the per-PR gate.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # A firm ceiling: even with the per-build guard below, cap the whole job so a pathological stall
+    # cancels in ~1 h, never the 6 h max-timeout wedge of #788.
+    timeout-minutes: 75
+    env:
+      # `-Zbuild-std` recompiles std from source; the workflow-global `-D warnings` would fail that
+      # build on any std warning (as the wasm build-std lane already overrides).
+      RUSTFLAGS: ""
+      # #788 wedge guard, enforced inside the harness (`build_std_bin_ll_target`): kill and skip any
+      # single `build-std` that runs longer than this, so one hung `rustc` can't stall the job.
+      SVM_STD_BUILD_TIMEOUT_SECS: "480"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with: { toolchain: "${{ env.RUST_STABLE }}" }
+      # The harness shells out to `cargo +nightly rustc -Zbuild-std …`, so nightly + rust-src must be
+      # present. rust-src is the component the overlay patches.
+      - name: install nightly + rust-src (for -Zbuild-std)
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with: { workspaces: crates/svm-llvm }
+      - name: apply the svm std overlay to nightly's rust-src
+        run: crates/svm-llvm/rust-svm/apply-overlay.sh
+      - name: std_guest suite (lean + threads specs)
+        working-directory: crates/svm-llvm
+        # Single-threaded: the tests already run serially, and forcing one thread keeps the build-std
+        # timeout accounting per-test rather than racing several `rustc` builds at once.
+        run: cargo test --test std_guest -- --test-threads=1 --nocapture
+
   cc1-self-compile:
     name: cc1 self-compile differential (Linux-only)
     runs-on: ubuntu-latest

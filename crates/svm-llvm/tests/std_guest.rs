@@ -46,7 +46,17 @@ fn lane_ready() -> Option<PathBuf> {
 
 /// Build the inline `std` program `src` for the svm target and return the fat-LTO'd `.ll`.
 fn build_std_bin_ll(name: &str, src: &str) -> Option<PathBuf> {
-    let work = std::env::temp_dir().join(format!("svm_std_{name}_{}", std::process::id()));
+    build_std_bin_ll_target(name, src, "x86_64-unknown-svm.json")
+}
+
+/// Build `src` for a specific svm target spec (the lean `x86_64-unknown-svm.json` or the threaded
+/// `x86_64-unknown-svm-threads.json`) and return the fat-LTO'd `.ll`. The work dir is keyed on the
+/// target stem so a lean and a threaded build of the same program don't clobber each other.
+fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<PathBuf> {
+    let stem = Path::new(target_file)
+        .file_stem()
+        .and_then(|s| s.to_str())?;
+    let work = std::env::temp_dir().join(format!("svm_std_{name}_{stem}_{}", std::process::id()));
     let src_dir = work.join("src");
     std::fs::create_dir_all(&src_dir).ok()?;
     std::fs::write(
@@ -60,8 +70,8 @@ fn build_std_bin_ll(name: &str, src: &str) -> Option<PathBuf> {
     .ok()?;
     std::fs::write(src_dir.join("main.rs"), src).ok()?;
 
-    let target_json = lane_dir().join("x86_64-unknown-svm.json");
-    let status = Command::new("cargo")
+    let target_json = lane_dir().join(target_file);
+    let mut child = Command::new("cargo")
         .current_dir(&work)
         .env("RUSTC_BOOTSTRAP", "1")
         .env("CARGO_TARGET_DIR", work.join("target"))
@@ -81,13 +91,47 @@ fn build_std_bin_ll(name: &str, src: &str) -> Option<PathBuf> {
             "--emit=llvm-ir",
             "-Clto=fat",
         ])
-        .status()
+        .spawn()
         .ok()?;
-    // A missing `_start` linker note is expected (we consume the IR, not the executable); tolerate a
-    // non-zero status as long as the `.ll` landed.
-    let _ = status;
+    // #788 wedge guard: a `rustc`/`cargo` that hangs mid-`build-std` must not stall the whole (serial)
+    // job to the 6-hour ceiling. Bound each build and kill a wedged child, returning `None` (skip)
+    // instead of blocking forever. Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
+    let budget = std::env::var("SVM_STD_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
+    loop {
+        match child.try_wait() {
+            // A missing `_start` linker note is expected (we consume the IR, not the executable); a
+            // non-zero status is tolerated as long as the `.ll` landed (checked below).
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "note: skipping std_guest ({target_file}): build-std exceeded {budget}s \
+                         (possible #788 rustc wedge)"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => return None,
+        }
+    }
     let ll = find_ll(&work.join("target"), name)?;
-    Some(ll)
+    // Free the per-test build tree now. Each test does a full `build-std` (~hundreds of MB of target
+    // artifacts); run serially across the whole suite that exhausts the runner's disk allowance —
+    // ENOSPC mid-`build-std` on the first full CI run, which the harness would then silently skip.
+    // The fat-LTO'd `.ll` is self-contained (the on-ramp reads only this one file), so copy it out to
+    // a small standalone path and drop the tree, bounding peak disk to a single build at a time.
+    let out_ll =
+        std::env::temp_dir().join(format!("svm_std_{name}_{stem}_{}.ll", std::process::id()));
+    std::fs::copy(&ll, &out_ll).ok()?;
+    let _ = std::fs::remove_dir_all(&work);
+    Some(out_ll)
 }
 
 fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
@@ -178,6 +222,32 @@ fn svm_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     assert!(
         svm_run::is_named_powerbox_entry(&t.module),
         "a std binary produces a powerbox entry (its C `main` rides the powerbox `_start`)"
+    );
+    let run = svm_run::run_powerbox(&t.module, b"").expect("powerbox run");
+    let exit = match run.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((run.stdout, exit))
+}
+
+/// Translate + verify + run `src` built for the **threaded** target (`x86_64-unknown-svm-threads`,
+/// `singlethread=false` → real atomic-ordering codegen, futex-backed `sys/sync`, native TLS) →
+/// `(stdout, exit code)`. The program runs on a single vCPU (no `thread::spawn` yet — that is the
+/// #823 follow-up), so this proves the threaded-`std` codegen builds, translates, verifies, and runs
+/// identically to the lean spec's oracle.
+fn svm_run_std_threads(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-svm-threads.json")?;
+    let t = svm_llvm::translate_ll_path(&ll)
+        .expect("on-ramp translates the threaded std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
+    assert!(
+        svm_run::is_named_powerbox_entry(&t.module),
+        "a threaded std binary produces a powerbox entry (its C `main` rides the powerbox `_start`)"
     );
     let run = svm_run::run_powerbox(&t.module, b"").expect("powerbox run");
     let exit = match run.outcome {
@@ -791,4 +861,118 @@ fn std_net_round_trips() {
          egress=\"HTTP/1.1 200 OK\"\n",
         "TcpListener/TcpStream over the memnet + scripted delegate egress"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #821 — the threaded target spec (`x86_64-unknown-svm-threads`, `singlethread=false`). These build
+// the same programs for the threaded spec (real atomic-ordering codegen, futex-backed `sys/sync`,
+// native TLS) and run them on a single vCPU — no `thread::spawn` yet (#823). They prove the threaded
+// `std` build translates, verifies, and runs byte-identically to the native oracle.
+// ---------------------------------------------------------------------------------------------
+
+/// The pure-compute Σ i² program (the lean spec's `std_bin_runs_on_svm_via_powerbox`) built for the
+/// **threaded** spec. Exercises `singlethread=false` codegen through the whole on-ramp → verify → run
+/// path; the result must match the lean spec exactly (140).
+#[test]
+fn std_threads_spec_bin_runs_on_svm() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let mut v: Vec<i32> = Vec::new();\n\
+         \x20   let mut i = 0i32;\n\
+         \x20   while i < 8 { v.push(i.wrapping_mul(i)); i += 1; }\n\
+         \x20   let sum: i32 = v.iter().copied().fold(0, |a, b| a.wrapping_add(b));\n\
+         \x20   ExitCode::from((sum & 0xff) as u8)\n\
+         }\n";
+
+    let Some((stdout, exit)) = svm_run_std_threads("svm_stdt_compute", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert!(stdout.is_empty(), "pure-compute program writes nothing");
+    assert_eq!(
+        exit, 140,
+        "Σ i² for i<8 = 140 under the threaded spec, byte-identical to the lean spec"
+    );
+}
+
+/// Futex-backed `sys/sync` (uncontended, single vCPU): a `Mutex` guards an accumulator and a `Once`
+/// runs its initializer exactly once. With `singlethread=false` these route to std's `futex`
+/// implementations over `__vm_wait32`/`__vm_notify` (never actually blocking here, since there is no
+/// contention). Differential against the native oracle.
+#[test]
+fn std_threads_spec_futex_sync_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::{Mutex, Once};\n\
+         static INIT: Once = Once::new();\n\
+         fn main() -> ExitCode {\n\
+         \x20   let m = Mutex::new(0u32);\n\
+         \x20   {\n\
+         \x20       let mut g = m.lock().unwrap();\n\
+         \x20       for i in 0..10u32 { *g = g.wrapping_add(i); }\n\
+         \x20   }\n\
+         \x20   let mut once_ran = 0u32;\n\
+         \x20   INIT.call_once(|| { once_ran = 7; });\n\
+         \x20   let total = m.lock().unwrap().wrapping_add(once_ran);\n\
+         \x20   ExitCode::from((total & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_sync", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    // Σ 0..10 = 45, + the Once's 7 = 52.
+    assert_eq!(
+        exit, 52,
+        "futex-backed Mutex + Once compute the expected total"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_sync_oracle", src) {
+        assert_eq!(exit, oracle, "threaded-spec sync matches the native oracle");
+    }
+}
+
+/// Native TLS (`thread_local!`) on the threaded spec: `has-thread-local=true` routes std to the
+/// `native` TLS impl, which emits `#[thread_local]` globals + `llvm.threadlocal.address`. On a single
+/// vCPU the on-ramp lowers those as the NIM.md §3d **Tier-1** collapse (thread-local → plain global),
+/// so a read-modify-write of a `thread_local` cell yields the same result as native.
+#[test]
+fn std_threads_spec_thread_local_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::cell::Cell;\n\
+         use std::process::ExitCode;\n\
+         thread_local! { static COUNTER: Cell<u32> = Cell::new(100); }\n\
+         fn main() -> ExitCode {\n\
+         \x20   COUNTER.with(|c| c.set(c.get().wrapping_add(23)));\n\
+         \x20   let v = COUNTER.with(|c| c.get());\n\
+         \x20   ExitCode::from((v & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads("svm_stdt_tls", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    // 100 + 23 = 123.
+    assert_eq!(
+        exit, 123,
+        "native thread_local read-modify-write (Tier-1 collapse)"
+    );
+    if let Some((_, oracle)) = native_oracle("svm_stdt_tls_oracle", src) {
+        assert_eq!(exit, oracle, "threaded-spec TLS matches the native oracle");
+    }
 }
