@@ -1674,6 +1674,323 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     );
 }
 
+/// `cmd >> file` (append). Identical pump to `>` except the shell opens the target with `O_APPEND`
+/// (`O_CREATE|O_WRITE|O_APPEND` = 22), so the command's output lands **after** the file's existing bytes
+/// rather than truncating. Reuses `REDIRECT_CMD_SRC` (writes `"redirected!"`); the memfs is seeded with a
+/// `log.txt` already holding `"existing\n"`, so the result is the concatenation.
+const APPEND_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char logpath[] = "log.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, fds[1], 0); return 127; }
+  close(fds[1]);
+  long wfd = __vm_fs(0, (long)logpath, 7, 22, 0);  /* FS_OPEN(log.txt, len=7, O_CREATE|O_WRITE|O_APPEND) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_appends_a_command_output_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{APPEND_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse append shell");
+    verify_module(&guest).expect("verify append shell");
+    let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse append command");
+    verify_module(&cmd).expect("verify append command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // Seed `log.txt` with existing content — the append must preserve it and add after it.
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("log.txt".into(), b"existing\n".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the append shell pumped 11 bytes (`cmd`'s output) into the file"
+    );
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "log.txt")
+        .expect("log.txt survives the append");
+    assert_eq!(
+        out.1, b"existing\nredirected!",
+        "`cmd >> log.txt`: the command's output is appended after the pre-existing content"
+    );
+}
+
+/// `cmd < file` (input redirection). The **reverse** pump: the shell opens the source (`O_READ`), reads
+/// it in chunks, and writes each into a pipe whose *read* end is the command's `stdin`; when the file is
+/// drained the shell closes the write end, so the command's `stdin` read EOFs. `cmd` echoes its stdin to
+/// stdout, so the shell's own stdout ends up holding the file's bytes — routed in through a real pipe.
+const INPUT_CMD_SRC: &str = r#"
+long read(long fd, void *buf, long n);
+long write(long fd, void *buf, long n);
+static char buf[64];
+int main(int argc, char **argv) {
+  long n;
+  while ((n = read(0, buf, 64)) > 0) write(1, buf, n);  /* echo stdin -> stdout (fd ignored: stdin/stdout) */
+  return 0;
+}
+"#;
+
+/// The input-redirect shell (links `FORK_SHIM`): mint a pipe, fork `cmd` with the pipe **read** end as
+/// its `stdin`, then pump `in.txt` → pipe **write** end until the file EOFs, close it, and reap.
+const INPUT_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char inpath[] = "in.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);                                  /* fds[0] = read (command's stdin), fds[1] = write (shell pumps) */
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io("cmd", a_cmd, shell_out, fds[0]); return 127; }
+  close(fds[0]);                              /* the shell drops the read end: `cmd` is the sole reader */
+  long rfd = __vm_fs(0, (long)inpath, 6, 1, 0);  /* FS_OPEN(in.txt, len=6, O_READ) */
+  if (rfd < 0) return -1;
+  long n;
+  while ((n = __vm_fs(1, rfd, (long)buf, 64, 0)) > 0)  /* FS_READ the file... */
+    write_fd(fds[1], buf, n);                          /* ...and pump it into the command's stdin pipe */
+  __vm_fs(4, rfd, 0, 0, 0);
+  close(fds[1]);                              /* EOF for the command's stdin read */
+  return wait_pid(p);
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_file_into_a_command_stdin() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{INPUT_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse input shell");
+    verify_module(&guest).expect("verify input shell");
+    let cmd = parse_module_raw(&c_to_ir(INPUT_CMD_SRC)).expect("parse input command");
+    verify_module(&cmd).expect("verify input command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    // Seed the source file the shell reads and pumps into the command's stdin.
+    let (factory, _memfs) = svm_run::fs::mem_fs_shared_factory(
+        vec![("in.txt".into(), b"hello from a file".to_vec())],
+        vec![],
+    );
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(r, vec![Value::I64(0)], "the shell reaped `cmd`'s exit (0)");
+    assert_eq!(
+        host.stdout_bytes(),
+        b"hello from a file",
+        "`cmd < in.txt`: the file's bytes were pumped through a pipe into the command's stdin and echoed out"
+    );
+}
+
+/// `cmd 2> file` (stderr redirection). The command writes normal output to `stdout` (the frontend `write`
+/// builtin) and diagnostics to a **distinct** `stderr` handle it resolves by name (`__vm_write`). The
+/// shell wires that stderr end to a pipe (via `exec_io3`), pumps it to `err.txt`, and leaves the command's
+/// stdout on the shell's own stdout — so the two streams land in different places, the point of `2>`.
+const STDERR_CMD_SRC: &str = r#"
+long __vm_resolve(const char *name, long len);
+long __vm_write(int h, void *buf, long len);
+long write(long fd, void *buf, long n);
+static char out_msg[] = "stdout-line";
+static char err_msg[] = "stderr-line";
+int main(int argc, char **argv) {
+  int e = (int)__vm_resolve("stderr", 6);
+  write(1, out_msg, 11);            /* normal output -> stdout (the ambient stream) */
+  __vm_write(e, err_msg, 11);       /* diagnostics -> the granted stderr handle */
+  return 0;
+}
+"#;
+
+/// The stderr-redirect shell (links `FORK_SHIM`): fork `cmd` with its `stdout` on the shell's stdout and
+/// its `stderr` on a pipe write end (`exec_io3`), then pump the stderr pipe → `err.txt` and reap.
+const STDERR_SHELL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char *a_cmd[] = { "cmd", 0 };
+static char errpath[] = "err.txt";
+static char buf[64];
+int main(int argc, char **argv) {
+  int fds[2];
+  pipe(fds);
+  int shell_out = (int)__vm_resolve("stdout", 6);
+  long p = fork();
+  while (p < 0) p = fork();
+  if (p == 0) { exec_io3("cmd", a_cmd, shell_out, 0, fds[1]); return 127; }  /* stderr -> pipe write end */
+  close(fds[1]);
+  long wfd = __vm_fs(0, (long)errpath, 7, 18, 0);  /* FS_OPEN(err.txt, len=7, O_CREATE|O_WRITE) */
+  if (wfd < 0) return -1;
+  long total = 0, n;
+  while ((n = read_fd(fds[0], buf, 64)) > 0) {
+    __vm_fs(2, wfd, (long)buf, n, 0);
+    total = total + n;
+  }
+  close(fds[0]);
+  __vm_fs(4, wfd, 0, 0, 0);
+  wait_pid(p);
+  return total;
+}
+"#;
+
+#[test]
+fn a_shell_redirects_a_command_stderr_to_a_file() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let shell_src = format!("{FORK_SHIM}\n{STDERR_SHELL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse stderr shell");
+    verify_module(&guest).expect("verify stderr shell");
+    let cmd = parse_module_raw(&c_to_ir(STDERR_CMD_SRC)).expect("parse stderr command");
+    verify_module(&cmd).expect("verify stderr command");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+    let cmod = host.grant_module(&cmd);
+
+    let (factory, memfs) = svm_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let factory = std::sync::Arc::new(factory);
+    let make: svm_interp::HostProcFork = {
+        let factory = factory.clone();
+        std::sync::Arc::new(move || -> svm_interp::HostProc {
+            let mut inner = factory();
+            Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            })
+        })
+    };
+    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(cmod as i64),
+            Value::I32(fs_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    // The shell pumped the 11 stderr bytes into the file; the command's stdout went elsewhere.
+    assert_eq!(
+        r,
+        vec![Value::I64(11)],
+        "the shell pumped 11 bytes of the command's stderr into the file"
+    );
+    // Stream separation: stdout landed on the shell's stdout, stderr in the file.
+    assert_eq!(
+        host.stdout_bytes(),
+        b"stdout-line",
+        "the command's stdout stayed on the shell's stdout (not redirected)"
+    );
+    let (files, _dirs) = memfs.seed();
+    let out = files
+        .iter()
+        .find(|(name, _)| name == "err.txt")
+        .expect("the shell created err.txt");
+    assert_eq!(
+        out.1, b"stderr-line",
+        "`cmd 2> err.txt`: the file holds exactly the command's stderr, pumped through the pipe"
+    );
+}
+
 /// #773 (FORK.md §8.6) — **a forked child execs a command with a large static/BSS buffer.** A command
 /// that declares more memory than the default 128 KiB window (its window directive is `memory 18`, 256
 /// KiB, because of the 60 KB array) used to be un-`exec`able: the fork/exec surface required the child's

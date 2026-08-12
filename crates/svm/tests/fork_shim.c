@@ -79,7 +79,8 @@ static inline long write_fd(int fd, void *buf, long len) { return __vm_write(fd,
 struct __grant { int name_off; int name_len; int handle; int pad; };
 static char __so_name[] = "stdout";
 static char __si_name[] = "stdin";
-static struct __grant __grants[2];
+static char __se_name[] = "stderr";
+static struct __grant __grants[3];
 
 /* Pack a NUL-terminated `argv[]` and the current `environ` into the §3e args buffer at
  * POWERBOX_ARGS_BASE (`{argc, envc}` + packed strings) — the marshalling `execvp`/`exec_io` share. */
@@ -109,7 +110,11 @@ static inline void __pack_args(char **argv) {
  * its `stdout` to Stream handle `out` and `stdin` to `in` (0 = don't grant that end). This is the
  * redirect-aware exec a shell drives for a pipeline stage: `cmd1` gets the pipe write end as `out`,
  * `cmd2` the pipe read end as `in`. Returns -1 only on failure. */
-static inline int exec_io(const char *file, char **argv, int out, int in) {
+/* exec_io3(file, argv, out, in, err): like exec_io but also wires the command's `stderr` to Stream
+ * handle `err` (0 = don't grant it). The command resolves `"stderr"` by name and writes diagnostics to
+ * that specific handle (`__vm_write`) — the frontend `write` builtin always targets `stdout`, so a
+ * `2> file` redirect gives the command a distinct stderr end and the shell pumps it to the target. */
+static inline int exec_io3(const char *file, char **argv, int out, int in, int err) {
   __pack_args(argv);
   long mod = __vm_resolve(file, strlen(file));
   if (mod < 0) return -1;
@@ -126,8 +131,19 @@ static inline int exec_io(const char *file, char **argv, int out, int in) {
     __grants[n].handle = in;
     n = n + 1;
   }
+  if (err) {
+    __grants[n].name_off = (int)(long)__se_name;
+    __grants[n].name_len = 6;
+    __grants[n].handle = err;
+    n = n + 1;
+  }
   __vm_exec_module(mod, (long)__grants, n, 0, 17);
   return -1;
+}
+
+/* exec_io(file, argv, out, in): image-replace wiring only `stdout`/`stdin` (no stderr grant). */
+static inline int exec_io(const char *file, char **argv, int out, int in) {
+  return exec_io3(file, argv, out, in, 0);
 }
 
 /* execvp(file, argv): image-replace into `file`, inheriting the caller's own `stdout` (resolved by
