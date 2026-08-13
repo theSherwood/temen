@@ -4714,7 +4714,7 @@ impl HostCap {
         // via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`).
         let fork: svm_interp::HostProcFork = Arc::new({
             let make = Arc::clone(&make);
-            move || svm_interp::ForkedProc::shared(make())
+            move |_pid| svm_interp::ForkedProc::shared(make())
         });
         Self::host_proc_forkable(op, move || make(), fork)
     }

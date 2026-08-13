@@ -131,6 +131,11 @@ pub const OP_WAIT: u32 = 29;
 /// [`OP_SPAWN`] default), so a request with all three fds `-1` is exactly `spawn`.
 pub const OP_SPAWN2: u32 = 43;
 
+/// `getpid() -> pid` (#863 slice 2): this process's own pid — `1` for the root, the scheduler
+/// `TaskId` (= the parent's `fork()` return) for a fork twin, `0` for an anonymous re-grant clone.
+/// One pid space with `kill(pid)`/`waitpid(pid)`: the value is meaningful to both.
+pub const OP_GETPID: u32 = 44;
+
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
 /// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
@@ -222,6 +227,7 @@ const UNMASKABLE: u64 = (1 << 9) | (1 << 19);
 
 /// Negative errnos this personality returns (Linux values, so a guest's `<errno.h>` agrees).
 const ENOENT: i64 = -2; // no such file (open without O_CREAT; stat/opendir of an absent path)
+const ESRCH: i64 = -3; // kill on a pid the process table does not know
 const ECHILD: i64 = -10; // waitpid on a pid that is not a live child
 const EBADF: i64 = -9; // an op on an fd this personality does not serve
 const EINVAL: i64 = -22; // bad argument (whence, non-UTF-8 path, negative seek)
@@ -584,13 +590,25 @@ struct World {
     /// The embedder-wired **spawn delegate** ([`Posix::set_spawn`]) — the authority `spawn` needs to run
     /// a child. `None` until wired, in which case `spawn` is `-ENOSYS` (fail closed).
     spawn_fn: Option<SpawnFn>,
-    /// Reaped-pending children of the synchronous `spawn` path: synthetic `pid → wait-encoded status`.
-    /// `spawn` runs the child to completion and records its status here; `waitpid`/`wait` remove and
-    /// return it. (#863 slice 2 unifies this synthetic pid space with the scheduler's twin pids.)
-    children: HashMap<i32, i32>,
-    /// The next synthetic pid `spawn` hands out. Starts at `1000` (well clear of small fd/int values, so
-    /// a pid is never confused with an fd in a test).
+    /// #863 slice 2 — the **process table**: `pid → entry`, ONE pid space for every process this
+    /// world knows. A **fork twin**'s pid is its scheduler `TaskId` (the value the parent's `fork()`
+    /// returned), registered at mint by [`fork_factory`]; a **spawn-delegate child** (already run to
+    /// completion) sits as a [`ProcEntry::Zombie`] holding its wait-encoded status until `waitpid`
+    /// reaps it. `kill(pid, sig)` and `waitpid(pid)` are lookups here; the root is pid `1`.
+    procs: HashMap<i32, ProcEntry>,
+    /// The next pid `spawn` hands out for a delegate child. Starts at `1000` and skips occupied
+    /// pids (fork twins occupy their `TaskId`s in the same table — one space, no collisions).
     next_pid: i32,
+}
+
+/// #863 slice 2 — a [`World::procs`] process-table entry.
+enum ProcEntry {
+    /// A live process: its [`Proc`], so `kill(pid, sig)` can set **its** pending bit (and wake
+    /// **its** run). The root (pid `1`) and every fork twin (pid = scheduler `TaskId`) live here.
+    Live(Arc<Mutex<Proc>>),
+    /// A spawn-delegate child that already ran to completion: its wait-encoded exit status, held
+    /// until `waitpid`/`wait` reaps it — a zombie.
+    Zombie(i32),
 }
 
 /// #863 — **per-process** state: what POSIX `fork()` copies (and what `exec` will one day reset).
@@ -599,6 +617,12 @@ struct World {
 /// twin's private window copy), signal dispositions/mask copied with **pending cleared**. See
 /// [`World`] for the shared side and the lock order.
 struct Proc {
+    /// This process's own pid (#863 slice 2): `1` for the root (init-like), the scheduler `TaskId`
+    /// for a fork twin (stamped by [`fork_factory`] at mint — the same value the parent's `fork()`
+    /// returned), `0` for an anonymous re-grant clone (a spawned child wired before any `TaskId`
+    /// exists — a valid process, but not table-addressable by `kill(pid)`). `getpid` reports it,
+    /// and `kill(own pid)` short-circuits to the self path on it.
+    pid: i32,
     /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
     heap_next: u64,
     /// One past the last window byte the allocator may hand out.
@@ -683,6 +707,12 @@ struct Proc {
 struct Ctx<'a> {
     w: &'a mut World,
     p: &'a mut Proc,
+    /// #863 slice 2 — a scheduler wake to fire **after** this dispatch's locks are released.
+    /// `kill(pid, sig)` sets it when the signal is deliverable to its target: the wake closure
+    /// takes the scheduler lock, and the fork factory takes the world lock *under* the scheduler
+    /// lock, so firing it while still holding the world lock would deadlock (scheduler → world vs
+    /// world → scheduler). [`handler`] fires it once the guards are dropped.
+    wake_after: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A handle to a granted POSIX personality's state — read the captured output after a run, stage
@@ -914,6 +944,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "fcntl" => OP_FCNTL,
         "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
         "spawn2" => OP_SPAWN2,
+        "getpid" => OP_GETPID,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -1029,6 +1060,13 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         world: Arc::clone(&world),
         root: Arc::clone(&root),
     };
+    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
+    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
+    world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .insert(1, ProcEntry::Live(Arc::clone(&root)));
     // #796 L2 — install the async-signal source + the shared `armed` flag (the *same* `Arc` the
     // personality mutates), so the interp can redirect into a handler at a safepoint (PROCESS.md §9 L2).
     let armed = root
@@ -1052,16 +1090,26 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
 /// #863 — the self-replicating fork factory over one process: mints a `fork()` twin's handler +
 /// signal door over a fresh [`Proc::fork`] clone (world shared), and a **replacement factory** over
 /// the twin's own `Proc` — so fork-of-fork clones the twin's state, not the grandparent's.
+///
+/// Slice 2: the twin is born with its **pid** (the scheduler `TaskId` the parent's `fork()`
+/// returns — the factory's argument) and registered in the world's process table, so `kill(pid)`
+/// can target it from anywhere in the world. Pid `0` is an **anonymous** mint (the spawned-child
+/// re-grant path, where no `TaskId` exists yet): a valid clone, skipped by the table.
 fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
-    Arc::new(move || {
-        let child = Arc::new(Mutex::new(
-            proc_.lock().unwrap_or_else(|e| e.into_inner()).fork(),
-        ));
-        let armed = child
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sig_armed
-            .clone();
+    Arc::new(move |pid: u64| {
+        // World before Proc — the canonical order. (This runs under the core's scheduler lock;
+        // no dispatch fires a scheduler wake while holding the world lock — see [`Ctx::wake_after`]
+        // — so scheduler → world here cannot cross a world → scheduler hold.)
+        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
+        child.pid = pid as i32;
+        let armed = child.sig_armed.clone();
+        let child = Arc::new(Mutex::new(child));
+        if pid != 0 {
+            w.procs
+                .insert(pid as i32, ProcEntry::Live(Arc::clone(&child)));
+        }
+        drop(w);
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
             signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
@@ -1088,6 +1136,13 @@ pub fn cap(
         world: Arc::clone(&world),
         root: Arc::clone(&root),
     };
+    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
+    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
+    world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .insert(1, ProcEntry::Live(Arc::clone(&root)));
     // Per-backend mint over the SAME world+proc: the interp and JIT hosts are two engines of one
     // process, so they share both sides (unlike a fork, which clones the proc side).
     let make = move || handler(Arc::clone(&world), Arc::clone(&root));
@@ -1121,6 +1176,7 @@ fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
+                wake_after: None,
             };
             match op {
                 NET_CONNECT => st.net_connect(args, mem),
@@ -1155,7 +1211,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         exec_stdin_handle: 0,
         exec_stdin_fifo: None,
         spawn_fn: None,
-        children: HashMap::new(),
+        procs: HashMap::new(),
         next_pid: 1000,
     }
 }
@@ -1164,6 +1220,7 @@ fn new_world(stdin: Vec<u8>) -> World {
 /// sentinels seeded in the fd table, default signal state.
 fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
     Proc {
+        pid: 1, // the root process — init-like; fork twins get their TaskId stamped by the factory
         heap_next: heap_base,
         heap_end,
         allocated: HashMap::new(),
@@ -1201,8 +1258,9 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
+                wake_after: None,
             };
-            match op {
+            let res = match op {
                 OP_WRITE => st.write(args, mem),
                 OP_READ => st.read(args, mem),
                 OP_MALLOC => Ok(vec![st.malloc(args)]),
@@ -1250,8 +1308,18 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_UNSETENV => st.unsetenv(args, mem),
                 OP_ENVIRON => st.environ(args, mem),
                 OP_CLOCK => Ok(vec![st.clock(args)]),
+                OP_GETPID => Ok(vec![st.p.pid as i64]),
                 _ => Err(Trap::CapFault),
+            };
+            // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
+            // drop — the wake takes the scheduler lock, which must never be waited on under ours.
+            let wake = st.wake_after.take();
+            drop(p);
+            drop(w);
+            if let Some(wk) = wake {
+                wk();
             }
+            res
         },
     )
 }
@@ -1297,6 +1365,7 @@ impl Proc {
     /// `armed` flag (its door is its own) and no wake (each run installs its own).
     fn fork(&self) -> Proc {
         Proc {
+            pid: 0, // stamped by [`fork_factory`] (the twin's TaskId); 0 = anonymous re-grant clone
             heap_next: self.heap_next,
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
@@ -1797,10 +1866,17 @@ impl Ctx<'_> {
         // 2 — inheritance, as a prior `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe).
         self.sink_write(if stdout_fd < 0 { 1 } else { stdout_fd }, &res.stdout);
         self.sink_write(if stderr_fd < 0 { 2 } else { stderr_fd }, &res.stderr);
+        // One pid space (#863 slice 2): allocate past any pid the table already knows (fork twins
+        // occupy their `TaskId`s, the root holds 1), then park the child as a reapable zombie.
+        while self.w.procs.contains_key(&self.w.next_pid) {
+            self.w.next_pid += 1;
+        }
         let pid = self.w.next_pid;
         self.w.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
-        self.w.children.insert(pid, (res.status & 0xff) << 8);
+        self.w
+            .procs
+            .insert(pid, ProcEntry::Zombie((res.status & 0xff) << 8));
         pid as i64
     }
 
@@ -1812,9 +1888,18 @@ impl Ctx<'_> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
+        // #863 slice 2 — reap from the process table: only [`ProcEntry::Zombie`] entries (completed
+        // spawn-delegate children) are reapable here. A live fork twin's exit flows through the
+        // core's servicer reap (FORK.md §8.6 — the wait offer), not this op; unifying the two under
+        // one `waitpid` is slice 3 (the waitpid-EINTR capstone).
+        let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie(_)));
         let reaped = if pid == -1 {
-            self.w.children.keys().min().copied()
-        } else if self.w.children.contains_key(&(pid as i32)) {
+            self.w
+                .procs
+                .iter()
+                .filter_map(|(p, e)| matches!(e, ProcEntry::Zombie(_)).then_some(*p))
+                .min()
+        } else if is_zombie(self.w.procs.get(&(pid as i32))) {
             Some(pid as i32)
         } else {
             None
@@ -1822,7 +1907,10 @@ impl Ctx<'_> {
         let Some(p) = reaped else {
             return Ok(vec![ECHILD]);
         };
-        let status: i32 = self.w.children.remove(&p).unwrap_or(0);
+        let status: i32 = match self.w.procs.remove(&p) {
+            Some(ProcEntry::Zombie(st)) => st,
+            _ => unreachable!("reaped pid selected as a zombie above"),
+        };
         if status_ptr != 0 {
             mem.write_bytes(status_ptr, &status.to_le_bytes())
                 .ok_or(Trap::Malformed)?;
@@ -1848,20 +1936,54 @@ impl Ctx<'_> {
         prev
     }
 
-    /// `kill(pid, sig) -> 0 | -errno`: raise `sig` (set its pending bit). `pid` is advisory in this
-    /// single-process doorbell (`raise(s)` is the guest `kill(0, s)`). Out-of-range `sig` is `-EINVAL`;
-    /// `sig == 0` (the POSIX existence probe) is a `0` no-op.
+    /// `kill(pid, sig) -> 0 | -errno` — #863 slice 2: **pid-targeted** through the process table.
+    /// `pid == 0` or the caller's own pid is the self path (`raise(s)`); any other pid is a table
+    /// lookup — a live process gets **its** pending bit set (and its run woken when the signal is
+    /// deliverable by **its** dispositions, the depth-agnostic `kill(child_pid, SIGINT)`); a spawn
+    /// zombie exists-until-reaped (`0`, signal dropped); an unknown pid is `-ESRCH`. `sig == 0` is
+    /// the POSIX existence probe. Negative pids (process groups) are `-EINVAL` (follow-up);
+    /// out-of-range `sig` is `-EINVAL`.
     fn kill(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
         let sig = *args.get(1).unwrap_or(&0);
-        if sig == 0 {
-            return 0; // kill(pid, 0): liveness probe — the (single) process exists
-        }
-        if !(1..=63).contains(&sig) {
+        if !(0..=63).contains(&sig) {
             return EINVAL;
         }
-        self.p.sig_pending |= 1 << sig;
-        self.p.arm_signals();
-        0
+        if pid < 0 {
+            return EINVAL; // kill(-pgid): process-group targeting is a follow-up
+        }
+        // Self — pid 0 (the pre-table calling convention) or the caller's own pid. Never a table
+        // lock: the caller's own `Proc` is already held by this dispatch.
+        if pid == 0 || pid == self.p.pid as i64 {
+            if sig == 0 {
+                return 0; // kill(pid, 0): liveness probe — we exist
+            }
+            self.p.sig_pending |= 1 << sig;
+            self.p.arm_signals();
+            return 0;
+        }
+        // #863 slice 2 — any other pid is a process-table lookup.
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => {
+                // Not self (guarded above), so this is a different mutex — World → Proc, the
+                // canonical order, serialized against other multi-`Proc` paths by the world lock.
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                if sig == 0 {
+                    return 0; // liveness probe — the target exists
+                }
+                tp.sig_pending |= 1 << sig;
+                tp.arm_signals();
+                // Deliverable by the TARGET's dispositions ⇒ poke its run's scheduler wake — but
+                // only after this dispatch's locks drop ([`Ctx::wake_after`]), never under ours.
+                if tp.deliverable_now() {
+                    self.wake_after = tp.wake.clone();
+                }
+                0
+            }
+            // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
+            Some(ProcEntry::Zombie(_)) => 0,
+            None => ESRCH,
+        }
     }
 
     /// `sigaltstack(sp, size) -> 0` (#796 L2): register the guest's dedicated signal-handler stack (the
@@ -2846,6 +2968,7 @@ mod tests {
             let mut $st = Ctx {
                 w: &mut $w,
                 p: &mut $p,
+                wake_after: None,
             };
         };
     }
@@ -2876,6 +2999,7 @@ mod tests {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
+                wake_after: None,
             };
             let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
             assert!(fd >= 3, "a fresh fd past the stdio sentinels");
@@ -2922,6 +3046,7 @@ mod tests {
             let mut tc = Ctx {
                 w: &mut w,
                 p: &mut twin,
+                wake_after: None,
             };
             assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap()[0], 6);
         }
@@ -2935,6 +3060,7 @@ mod tests {
             let mut pc = Ctx {
                 w: &mut w,
                 p: &mut p,
+                wake_after: None,
             };
             assert_eq!(
                 pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap()[0],
@@ -2948,6 +3074,7 @@ mod tests {
             let mut tc = Ctx {
                 w: &mut w,
                 p: &mut twin,
+                wake_after: None,
             };
             assert_eq!(
                 tc.lseek(&[fd, 0, SEEK_SET]),
@@ -2978,6 +3105,156 @@ mod tests {
             mem.read_bytes(120, 6).unwrap(),
             b" world",
             "the dup continues at the original's offset — one shared description"
+        );
+    }
+
+    /// #863 slice 2 — `kill(pid, sig)` reaches a fork twin's OWN pending set through the process
+    /// table, end to end across two processes' handlers: the twin (minted by the fork factory
+    /// under pid 7, as the core does at `fork()`) installs a SIGUSR1 handler; the ROOT's `kill(7,
+    /// 10)` sets the TWIN's bit (the twin's `sigcheck` delivers it, the root's own stays empty).
+    /// Plus the table edges: `kill(unknown)` = `-ESRCH`, `kill(7, 0)` probes, negative = `-EINVAL`.
+    #[test]
+    fn kill_targets_a_fork_twin_through_the_process_table() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut forked = cap_fork_factory(&posix)(7);
+        // The twin installs a handler for signal 10 through its own dispatch.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.kill(&[7, 0]), 0, "kill(pid, 0): the twin exists");
+            assert_eq!(st.kill(&[99, 10]), ESRCH, "unknown pid");
+            assert_eq!(st.kill(&[-5, 10]), EINVAL, "process groups are a follow-up");
+            assert_eq!(st.kill(&[7, 10]), 0, "signal the twin by pid");
+            assert_eq!(
+                st.p.sig_pending, 0,
+                "the ROOT's pending set stays empty — the signal went to the twin"
+            );
+        }
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x77],
+            "the twin's own sigcheck delivers the pid-targeted signal"
+        );
+    }
+
+    /// #863 slice 2 — `getpid`: the root is pid 1, a fork twin reports the pid it was minted under
+    /// (its scheduler `TaskId` — the same value the parent's `fork()` returned), and a twin can
+    /// signal ITSELF by that pid (the self short-circuit, no table double-lock).
+    #[test]
+    fn getpid_reports_the_table_pid_on_both_sides_of_a_fork() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        assert_eq!(
+            root_handler(OP_GETPID, &[], None, None).unwrap(),
+            vec![1],
+            "the root is pid 1"
+        );
+        let mut forked = cap_fork_factory(&posix)(9);
+        assert_eq!(
+            (forked.handler)(OP_GETPID, &[], None, None).unwrap(),
+            vec![9],
+            "a twin's getpid is the pid fork() returned to its parent"
+        );
+        // Self-kill by own pid: handler + raise + sigcheck, all through the twin's dispatch.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
+            vec![0],
+            "kill(own pid) short-circuits to self — no deadlock on the table entry"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x99]
+        );
+    }
+
+    /// #863 slice 2 — ONE pid space: spawn-delegate zombies live in the same process table as fork
+    /// twins. A spawn's pid allocation skips a pid a twin already occupies; `kill` on the zombie
+    /// succeeds (exists-until-reaped, signal dropped); `waitpid` reaps it out of the table, after
+    /// which the pid is `-ESRCH`.
+    #[test]
+    fn spawn_zombies_share_the_process_table_with_fork_twins() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.set_spawn(|_n, _a, _stdin| SpawnResult {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: 7,
+        });
+        // A twin squatting on pid 1000 — exactly where the spawn allocator starts.
+        let _forked = cap_fork_factory(&posix)(1000);
+        let mut win = vec![0u8; 256];
+        win[0..4].copy_from_slice(b"prog");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        let pid = st.spawn(&[0, 4, 0, 0], Some(&mut mem)).unwrap()[0];
+        assert_eq!(pid, 1001, "the allocator skips the twin's occupied pid");
+        assert_eq!(st.kill(&[pid, 15]), 0, "a zombie exists until reaped");
+        assert_eq!(
+            st.waitpid(&[pid, 0, 0], Some(&mut mem)).unwrap()[0],
+            pid,
+            "waitpid reaps the zombie from the table"
+        );
+        assert_eq!(st.kill(&[pid, 15]), ESRCH, "reaped ⇒ the pid is gone");
+        // The live twin at 1000 is NOT reapable through this op (core reap owns fork twins).
+        assert_eq!(
+            st.waitpid(&[1000, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECHILD
+        );
+    }
+
+    /// #863 slice 2 — a deliverable pid-targeted `kill` pokes the TARGET's run wake, and only
+    /// **after** the dispatch's locks are released (the deferred [`Ctx::wake_after`] — firing under
+    /// the world lock would invert the fork factory's scheduler → world order). The twin has a
+    /// caught handler + a signal stack (async delivery on) and a wake installed through its door;
+    /// the root's `kill(7, 10)` through the ROOT handler must fire it. A masked signal must not.
+    #[test]
+    fn kill_wakes_the_targets_run_after_unlock() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        // Deliverability on the twin: caught handler + registered signal stack.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
+            vec![0]
+        );
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has its own door");
+        let fired = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&fired);
+        door.set_wake(Arc::new(move || {
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        // Signal 11 has no handler on the twin: pending is set but nothing is deliverable — no wake.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 11], None, None).unwrap(),
+            vec![0]
+        );
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "an undeliverable signal never wakes the target's run"
+        );
+        // Signal 10 is caught + unmasked + stack registered: the wake fires (post-unlock — a
+        // deadlock here would hang the test).
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            vec![0]
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "a deliverable pid-targeted kill pokes the target's scheduler wake"
         );
     }
 
