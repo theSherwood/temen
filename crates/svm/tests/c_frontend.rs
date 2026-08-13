@@ -194,6 +194,43 @@ fn c_to_ir_g(src: &str) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
+/// Regression for #868: arithmetic with a non-numeric, non-pointer operand (e.g. `int + struct`)
+/// must produce a clean diagnostic, not a crash. `new_add`/`new_sub` fell through to the pointer
+/// path and dereferenced a NULL `ty->base` — a segfault, which leaves *no* exit code (the process
+/// is killed by SIGSEGV). Assert chibicc rejects it *and* exits normally.
+#[test]
+fn struct_operand_arithmetic_is_a_clean_error_not_a_crash() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    for src in [
+        "struct S { int x; }; int f(void){ struct S m; int t = 0; return (int)(t + m); }",
+        "struct S { int x; }; int f(void){ struct S m; int t = 0; return (int)(t - m); }",
+        "struct S { int x; }; int f(void){ struct S m; int t = 0; return (int)(m - t); }",
+    ] {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("svm_cfe_neg_{}_{id}", std::process::id()));
+        let cfile = base.with_extension("c");
+        std::fs::write(&cfile, src).unwrap();
+        let status = Command::new(chibicc())
+            .args([
+                "-cc1",
+                "--emit-ir",
+                "-cc1-input",
+                cfile.to_str().unwrap(),
+                "-cc1-output",
+                base.with_extension("svm").to_str().unwrap(),
+                cfile.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run chibicc");
+        assert!(!status.success(), "should reject invalid operands:\n{src}");
+        assert!(
+            status.code().is_some(),
+            "must exit with a diagnostic, not crash (SIGSEGV = no exit code):\n{src}"
+        );
+    }
+}
+
 /// Count `Load`/`Store` instructions that live **outside each function's entry block**
 /// (`blocks[0]`). The frontend's one-time setup — `_start` writing globals/strings, and a
 /// function's `__va_area__`/spill prologue — all lands in entry blocks, so this isolates

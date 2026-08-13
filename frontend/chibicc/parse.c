@@ -2432,6 +2432,11 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
     rhs = tmp;
   }
 
+  // Neither a numeric pair nor pointer arithmetic (e.g. `int + struct`): reject cleanly. Without
+  // this, `lhs->ty->base` is NULL below and `->kind` dereferences it (segfault, not a diagnostic).
+  if (!lhs->ty->base)
+    error_tok(tok, "invalid operands");
+
   // VLA + num
   if (lhs->ty->base->kind == TY_VLA) {
     rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
@@ -2451,6 +2456,11 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   // num - num
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
     return new_binary(ND_SUB, lhs, rhs, tok);
+
+  // Not a numeric pair and the left side isn't a pointer (e.g. `int - struct`, `struct - x`):
+  // reject cleanly. The pointer paths below dereference `lhs->ty->base`, which is NULL here.
+  if (!lhs->ty->base)
+    error_tok(tok, "invalid operands");
 
   // VLA + num
   if (lhs->ty->base->kind == TY_VLA) {
