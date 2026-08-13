@@ -268,6 +268,51 @@ fn cross_module_value_type_resolves() {
 }
 
 #[test]
+fn cross_module_pointer_field_pointee_resolves() {
+    // A field typed `ptr Inner`, where `Inner` is defined in the *same* unit as the record. The pooled
+    // export must stem-suffix the **pointee** name too (`Ptr(Agg("Inner.0.<stem>"))`), not just
+    // top-level aggregate fields — else the importing unit can't resolve `Inner` and a `dot` through
+    // the loaded pointer fail-closes with `dot on a non-object`. This is exactly what an RTTI vtable
+    // walk needs — `obj.vt : ptr Rtti`, then `.mt` on the `Rtti` behind it — the shape `std/json`'s
+    // method dispatch hits (#760). `readThrough` chases `Rec.p → Inner.val`.
+    let mod_defs = "\
+(stmts
+ (type :Inner.0. . (object . (fld :val.0 . (i +64))))
+ (type :Rec.0. . (object . (fld :p.0 . (ptr Inner.0.)))))";
+    let mod_use = "\
+(stmts
+ (proc :readThrough.0. (params (param :r.0 . (ptr Rec.0.moddefs))) (i +64) .
+  (stmts .
+   (ret (dot (deref (dot (deref r.0) p.0 0)) val.0 0)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "moduse",
+            src: mod_use,
+            names: &["readThrough.0."],
+        },
+        LengModule {
+            stem: "moddefs",
+            src: mod_defs,
+            names: &[], // type-only unit: defines `Inner` and `Rec`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    svm_verify::verify_module(&linked).unwrap();
+    // Rec at 512 with p → Inner at 256; Inner.val = 42. readThrough(&Rec) chases both pointers.
+    let mut seed = vec![0u8; 4096];
+    seed[512..520].copy_from_slice(&256i64.to_le_bytes()); // Rec.p = &Inner
+    seed[256..264].copy_from_slice(&42i64.to_le_bytes()); // Inner.val
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(&linked, 0, &[Value::I64(512)], &mut fuel, &seed);
+    assert_eq!(ir.expect("interp").as_slice(), &[Value::I64(42)]);
+    let (jout, _) = svm_jit::compile_and_run_capture(&linked, 0, &[512], &seed).expect("jit");
+    match jout {
+        svm_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![42], "§9 parity"),
+        o => panic!("jit: {o:?}"),
+    }
+}
+
+#[test]
 fn cross_module_inheritance_inlines_base() {
     // `Circle = object of Shape`, and `Shape` (itself `object of RootObj`) is defined in *another*
     // unit. A derived object inlines its base's fields at the front (after the RTTI vtable header),

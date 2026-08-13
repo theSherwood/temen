@@ -425,6 +425,32 @@ fn nim_for_in_seq_iterator_runs_end_to_end() {
     );
 }
 
+#[test]
+fn nim_seq_param_sum_runs_end_to_end() {
+    // Pass a `seq[int]` across a function boundary: `build(n)` returns a seq, `sumSeq(a)` takes it and
+    // sums it with `for x in a`. Exercises seq-as-parameter (aggregate by address + `toOpenArray`),
+    // the real allocator building the seq, seq index/len, and the ARC destroy of the temporary — the
+    // read + write + handoff paths the retired `real_seq_loop`/`real_seq_index` `.nif` fixtures
+    // covered, now driven from Nim **source** against the real compiled `system` module.
+    with_program(
+        "proc build(n: int): seq[int] =\n\
+         \x20 result = @[]\n\
+         \x20 var i = 0\n\
+         \x20 while i < n:\n\
+         \x20   result.add(i)\n\
+         \x20   i = i + 1\n\
+         proc sumSeq(a: seq[int]): int =\n\
+         \x20 result = 0\n\
+         \x20 for x in a:\n\
+         \x20   result = result + x\n\
+         let r = sumSeq(build(4))\n",
+        |m| {
+            // build(4) = @[0,1,2,3]; sumSeq = 0+1+2+3 = 6.
+            assert_eq!(run_main_read_global(m, "r.0."), 6, "sumSeq(build(4))");
+        },
+    );
+}
+
 /// **The end-to-end I/O milestone (Path B).** A real `std/syncio` program that writes to stdout —
 /// compiled by the nimony toolchain, lowered and linked by svm-leng (this time *retaining* the raw
 /// syscall leaves as manifest imports, `link_whole_with_runtime_manifest`), then run with `sysWrite`

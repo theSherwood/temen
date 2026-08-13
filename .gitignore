@@ -6,6 +6,10 @@
 /crates/svm-llvm/target
 /crates/svm-webgpu/target
 /.nimtool
+# Nim-devel compiler sources cloned by scripts/ci/provision-nimony.sh (the toolchain build);
+# `nimony`/`nativenif` themselves are git submodules, and their in-tree build outputs (bin/, nimcache)
+# are ignored by the submodules' own .gitignore.
+/nim-src
 **/*.rs.bk
 rustc-ice-*.txt
 crates/svm-llvm/tests/fixtures/leng_probe/Cargo.lock
