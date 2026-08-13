@@ -836,6 +836,19 @@ int main(void) {
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
+  'nim (Nim → SVM, runs)': {
+    kind: 'module',
+    url: './assets/nim_hello.svmb',
+    mode: 'io',
+    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, svm\\n\")` — compiled " +
+      "all the way to a runnable SVM module and **run client-side in the sandbox**. The full nimony " +
+      "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `svm-leng` translated + linked it " +
+      "against the real compiled `system` module, and the nim→powerbox bridge wired its bottom edge to " +
+      "the sandbox's caps (nimony's `write(fd,buf,len)` → the powerbox `write` stream). Click Run: the " +
+      "output below is the guest's **real stdout** — a Nim program printing on the SVM. (The Nim→Leng " +
+      "front end runs at build time for now, unlike the `svm-leng` card below, which runs the translator " +
+      "itself in your browser; committed `nim_hello.svmb`, gated by `nim_hello_asset.rs`.)",
+  },
   'svm-leng: translate real nimony Leng → SVM IR (self-host)': {
     kind: 'module',
     jit: false, // the ~280-func translator module folds to the tree-walker (the native JIT declines it too); the interp run is ~200ms

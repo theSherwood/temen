@@ -97,6 +97,20 @@ try {
     console.log('  SKIP: editable-module stdin (lua_snapshot.svmb not built — run build-onramp-assets.mjs)');
   }
 
+  // The "run real Nim" card: runs the committed nim_hello.svmb — a real Nim program
+  // (`write(stdout, "hello, svm\n")`) compiled through nimony → svm-leng → the nim→powerbox bridge to a
+  // runnable module — and shows its **real stdout**, a Nim program printing on the SVM, client-side.
+  // The asset is committed (always present), so no build guard.
+  const nimCard = 'nim (Nim → SVM, runs)';
+  await runCard(page, nimCard, 30_000);
+  const nim = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(nimCard));
+  nim.state === 'done' && nim.stdout.includes('hello, svm')
+    ? ok('run-real-Nim card: nim_hello.svmb printed its greeting in-browser')
+    : fail(`nim run: state=${nim.state} stdout=${nim.stdout.slice(0, 80)}`);
+
   // The svm-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
   // running it pipes that to the committed `svm-leng.svmb` (always present) on stdin — the translator
   // emits SVM IR text on stdout and exits 0. The IR carries `func`/`block` (svm-text), proving the real
