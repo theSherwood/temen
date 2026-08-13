@@ -1014,12 +1014,33 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    emitted + all-scalar operands + representable window state) surfaces as a `TIERUP_RUN_JIT_INVOKE`
    event, serviced by `driveTierupRun` as `f0(win, env, ...args)` on the unit's own wasm
    (instantiated once per code handle, args/results marshalled by the event's scalar type codes,
-   same per-call `"mapped"` sync). A symtab-linked macro unit (Slot callbacks into the program) is
-   outside the closed-unit emitter subset and stays interpreted — fail-closed, and the reason the
-   JACL capstone test asserts parity but not emitted-unit non-vacuity. Differentials in
-   `tests/tierup_driver.rs`: a `vm_jit_compile`+`invoke2` guest whose unit stores/loads through the
-   `vm_map`-grown page (emitted-invoke non-vacuity + the grown-extent `"mapped"` operand pinned), a
-   fiber-guest admit/parity pin, and the asset-gated real `jacl_compiler.svmb` pump run.
+   same per-call `"mapped"` sync). Differentials in `tests/tierup_driver.rs`: a
+   `vm_jit_compile`+`invoke2` guest whose unit stores/loads through the `vm_map`-grown page
+   (emitted-invoke non-vacuity + the grown-extent `"mapped"` operand pinned), a fiber-guest
+   admit/parity pin, and the asset-gated real `jacl_compiler.svmb` pump run.
+
+   **#846 — linked units: the driver table + the live-state bounce.** Units now emit whole-module
+   in **Model B2** shape (`compile_module_b2`): their `call_indirect` dispatches through **one
+   shared `WebAssembly.Table`** the driver populates from the engine's slot mirror at each event
+   boundary — an installed unit's emitted `f0` (unit→unit, native), an eligible program function's
+   `f{i}` from the main emitted module (unit→program, native; `call_indirect`-bearing leaves are
+   excluded from TIERUP eligibility for the same table-consistency reason), and, for every
+   interpreter-resident target, an engine-generated **bounce shim** (`emit_slot_trampoline` — the
+   emitter's cross-tier trampoline packaged as a standalone module with the slot baked in). The
+   bounce (`svm_onramp_tierup_call_interp` → `Vcpu::bounce_call`) runs the target on a nested
+   interpretation over the run's **live** window/powerbox/fuel — resolution through the shared
+   dispatch table exactly as `Op::CallIndirect`, fibers serviced against a per-invoke registry that
+   persists across the invoke's bounces, real fuel debited, a callback's `exit`/trap staged so the
+   unwind delivers the true trap kind — and the driver then fans the fresh `"mapped"` extent out to
+   every live instance, so mid-invoke `vm_map` growth becomes visible exactly when the interpreted
+   path would see it. The engine's dispatch table is sized to the emitted mask
+   (`compile_with_jit_table`), and a guest with any non-shimmable signature (v128 / over-arity)
+   keeps its units interpreted (a null table slot would diverge, not refuse). Differentials
+   (`TierupDriver` in `tests/tierup_driver.rs`, wasmi playing `driveTierupRun`): a linked unit
+   spanning all three edge kinds — a cap-calling bounce that **grows the window mid-invoke** (the
+   store into the just-grown page pins the fan-out), a native eligible-`f{i}` edge (pinned
+   never-bounced), and unit→unit through an install slot (pinned zero-bounce) — all observably
+   identical to `onramp_exec`.
 
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 

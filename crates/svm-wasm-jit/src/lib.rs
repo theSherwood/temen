@@ -2719,6 +2719,102 @@ fn emit_trap_stub() -> Vec<u8> {
     code
 }
 
+/// #846 — a standalone **cross-tier trampoline module**: one exported function `"t"` with the
+/// env-prepended `call_indirect` signature of `(params) -> (results)`, whose body marshals its
+/// params into the env scratch, calls `env.call_interp(target, args_ptr)`, and returns the
+/// reloaded result slots — the [`emit_trampoline`] body packaged as its own instantiable module,
+/// so a **host-populated** shared table (§22 Model B2) can route a slot whose occupant has no
+/// emitted wasm (a cross-tier program function, an interpreter-only installed unit) back to a
+/// **live-state** interpreter bounce. `target` is the value handed to `env.call_interp` — the
+/// dispatch-table slot, which for the natural prefix is the program function's own index. The
+/// import layout matches the emitted modules' (`env.memory`, `env.trap`, `env.call_interp`), so
+/// the one import object a host builds serves emitted units and trampolines alike; the host's
+/// `call_interp` signals a trap by throwing (unwinding the emitted frames), exactly the
+/// cross-tier convention everywhere. Rejects non-scalar and over-arity signatures — the i64-slot
+/// transport's limits (the host must gate such slots out before ever placing a trampoline).
+pub fn emit_slot_trampoline(
+    params: &[ValType],
+    results: &[ValType],
+    target: u32,
+    shared_memory: bool,
+) -> Result<Vec<u8>, Error> {
+    let scalar =
+        |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
+    if !params.iter().all(scalar) || !results.iter().all(scalar) {
+        return Err(Error::Unsupported("non-scalar trampoline signature"));
+    }
+    let sig = FuncType {
+        params: params.to_vec(),
+        results: results.to_vec(),
+    };
+    let f = Func {
+        params: params.to_vec(),
+        results: results.to_vec(),
+        blocks: Vec::new(),
+    };
+    let body = emit_trampoline(&f, target)?; // arity-guarded there (XCALL_MAX_SLOTS)
+
+    let mut out = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
+
+    // Type section (1): t0 = env.trap (i32)->(), t1 = env.call_interp (i32,i32)->(), t2 = the
+    // trampoline's env-prepended signature.
+    let (tp, tr) = indirect_type_bytes(&sig)?;
+    let mut sec = Vec::new();
+    uleb(&mut sec, 3);
+    sec.extend_from_slice(&[0x60, 0x01, 0x7f, 0x00]); // (i32) -> ()
+    sec.extend_from_slice(&[0x60, 0x02, 0x7f, 0x7f, 0x00]); // (i32, i32) -> ()
+    sec.push(0x60);
+    uleb(&mut sec, tp.len() as u64);
+    sec.extend_from_slice(&tp);
+    uleb(&mut sec, tr.len() as u64);
+    sec.extend_from_slice(&tr);
+    section(&mut out, 1, &sec);
+
+    // Import section (2): env.memory (share-matched), env.trap (func 0), env.call_interp (func 1)
+    // — [`emit_trampoline`]'s body calls func index 1, so the order must match [`emit_module`]'s.
+    let mut sec = Vec::new();
+    uleb(&mut sec, 3);
+    import_name(&mut sec, "env", "memory");
+    sec.push(0x02); // memory
+    if shared_memory {
+        sec.push(0x03); // shared + has-max
+        uleb(&mut sec, 0);
+        uleb(&mut sec, 65536);
+    } else {
+        sec.push(0x00); // min-only
+        uleb(&mut sec, 0);
+    }
+    import_name(&mut sec, "env", "trap");
+    sec.push(0x00); // func
+    uleb(&mut sec, 0);
+    import_name(&mut sec, "env", "call_interp");
+    sec.push(0x00); // func
+    uleb(&mut sec, 1);
+    section(&mut out, 2, &sec);
+
+    // Function (3), export (7: "t" → func index 2), code (10).
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, 2); // type t2
+    section(&mut out, 3, &sec);
+
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, 1);
+    sec.extend_from_slice(b"t");
+    sec.push(0x00); // func export
+    uleb(&mut sec, 2); // imports 0..=1 are funcs, ours is 2
+    section(&mut out, 7, &sec);
+
+    let mut sec = Vec::new();
+    uleb(&mut sec, 1);
+    uleb(&mut sec, body.len() as u64);
+    sec.extend_from_slice(&body);
+    section(&mut out, 10, &sec);
+
+    Ok(out)
+}
+
 /// The wasm function-type of a `call_indirect` signature: the two prepended env params (`win`,
 /// `env`) ahead of the SVM param/result types — identical in shape to how [`emit_module`] types the
 /// emitted functions, so wasm's built-in `call_indirect` signature check **is** the §3c type-id
