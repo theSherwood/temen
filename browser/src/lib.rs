@@ -8296,16 +8296,20 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // A threads/futex guest would surface `Spawn`/`Join`/`Wait`/`Notify` events this single-vCPU
-    // pump can't service — fail closed to the bytecode path, which multiplexes them cooperatively.
-    // Fibers are admitted (`step_vcpu` services `cont.*`/`suspend` internally — the §22
-    // "renegotiated 2026-07-30" split, `Func::uses_concurrency` doc), and so are §22
-    // `vm_jit_*`-importing guests (#835): install/uninstall and interpreter-serviced invokes are
-    // handled inline below, and a codegen-eligible invoke surfaces as [`TIERUP_RUN_JIT_INVOKE`].
-    if m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    }
+    // #926 slice 1 — **no static concurrency gate at open.** The old `any(uses_threads ||
+    // uses_futex)` refusal was whole-module, so it also rejected guests whose concurrency ops are
+    // *linked but dead* — the JACL compiler-guest (jaclrt's scheduler/GC links thread/futex ops
+    // that never run with `POOL_WORKERS=1`) is the motivating case (#839): single-threaded at
+    // runtime, but refused for code it never reaches. The gate is unnecessary: a concurrency op
+    // that *actually executes* surfaces a `Spawn`/`Join`/`Wait`/`Notify` event, and the run loop's
+    // catch-all already declines it to `TIERUP_RUN_TRAP` → the page re-runs on the interpreter
+    // (which multiplexes them cooperatively — INVARIANT 9). So the **runtime** event, not a static
+    // scan, is the real gate: a guest that never reaches its concurrency ops (JACL) now tiers up;
+    // one that does declines cleanly at the op, exactly as the static refusal did but without
+    // rejecting dead code. Fibers were already admitted (`step_vcpu` services `cont.*`/`suspend`
+    // internally — §22 renegotiated 2026-07-30); §22 `vm_jit_*` guests too (#835). (Servicing the
+    // concurrency events on a cooperative multi-vCPU scheduler instead of declining is #926 slice 2
+    // — deferred until a guest that genuinely spawns at runtime needs it.)
     let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
     let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
@@ -8539,7 +8543,9 @@ pub extern "C" fn svm_onramp_tierup_run() -> i32 {
                 break (STATUS_EXIT, 0, code, TIERUP_RUN_DONE)
             }
             bytecode::VcpuEvent::Trapped(_) => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
-            // Unreachable given the threads/futex gate at open; fail closed like the reactor does.
+            // A concurrency event (`Spawn`/`Join`/`Wait`/`Notify`) or a `StdinPark` this single-vCPU
+            // pump doesn't service: decline to the interpreter (#926 slice 1 — the real gate, now
+            // that open no longer scans for dead concurrency ops). Fail closed like the reactor.
             _ => break (STATUS_TRAP, 0, 0, TIERUP_RUN_TRAP),
         }
     };
