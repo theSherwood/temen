@@ -1715,17 +1715,13 @@ impl Translator {
         t.collect_types(root)?;
         // This unit's own types = everything resolved that wasn't pre-registered from the pool.
         let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
-        let suffix = |n: &String| {
-            if local.contains(n) {
-                format!("{n}{stem}")
-            } else {
-                n.clone()
-            }
-        };
-        let rewrite = |d: &TyDesc| match d {
-            TyDesc::Agg(n) => TyDesc::Agg(suffix(n)),
-            s => s.clone(),
-        };
+        // Rewrite every aggregate **type name** in a field/element descriptor to its stem-suffixed
+        // global form — recursing through `Ptr`/`FlexArray` pointees, not just the top level. Missing
+        // the nested case left a field like `vt: ptr Rtti` exporting `Ptr(Agg("Rtti.0."))` unsuffixed,
+        // so the importing unit couldn't resolve the pointee (`Rtti` — the RTTI struct behind a vtable
+        // walk) and a `dot` through it fail-closed. Only local names are suffixed; already-global
+        // (cross-module) names pass through.
+        let rewrite = |d: &TyDesc| rewrite_agg_names(d, &local, stem);
         let mut out: Vec<(String, Layout)> = t
             .types
             .iter()
@@ -3869,7 +3865,7 @@ impl<'a> FuncGen<'a> {
                             "bitnot needs Type and one operand".into(),
                         ));
                     }
-                    let (ty, _) = int_ty_signed(&a[0])?;
+                    let (ty, _) = self.arith_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
                     let ones = self.emit_const(ty, -1);
                     Ok(self.emit_bin("xor", ty, x, ones))
@@ -4018,6 +4014,34 @@ impl<'a> FuncGen<'a> {
         })
     }
 
+    /// The `(ValType, signed)` of an integer op's leading **type operand**. Primitive `(i N)`/`(u N)`/
+    /// `(c N)`/`bool` nodes go straight through [`int_ty_signed`]; a **bare named type** — an enum or
+    /// distinct int like `JsonKind.0.` — is resolved the way [`tydesc`](Translator::tydesc) classifies
+    /// every named scalar (its underlying int), so enum-ordinal arithmetic (`inc`/`dec` over an enum,
+    /// which nimony emits as `(add EnumT x (conv EnumT 1))`) lowers instead of fail-closing on the
+    /// named type. A named type svm-leng holds as a non-integer (aggregate/pointer/funcref) still fails
+    /// closed — arithmetic on it is a real type error.
+    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool), LengError> {
+        if node.tag().is_none() && node.as_atom().is_some() {
+            return match self.t.tydesc(node)? {
+                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => Ok((vt, false)),
+                TyDesc::Narrow { bytes, signed } => Ok((
+                    if bytes > 4 {
+                        ValType::I64
+                    } else {
+                        ValType::I32
+                    },
+                    signed,
+                )),
+                other => Err(LengError::Unsupported(format!(
+                    "arithmetic on non-integer named type `{}` ({other:?})",
+                    node.as_atom().unwrap_or("?")
+                ))),
+            };
+        }
+        int_ty_signed(node)
+    }
+
     /// `(add|sub|mul|div|mod Type Expr Expr)` — integer or floating-point per the carried `Type`.
     fn arith(&mut self, op: &str, e: &Node) -> Result<Val, LengError> {
         let a = e.args();
@@ -4044,7 +4068,7 @@ impl<'a> FuncGen<'a> {
             };
             return Ok(self.emit_bin(name, ty, l, r));
         }
-        let (ty, signed) = int_ty_signed(&a[0])?;
+        let (ty, signed) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4080,7 +4104,7 @@ impl<'a> FuncGen<'a> {
                 "`{op}` needs Type and two operands"
             )));
         }
-        let (ty, signed) = int_ty_signed(&a[0])?;
+        let (ty, signed) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4904,6 +4928,26 @@ fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashS
 
 /// True if any `(var …)` in the tree has a bare-symbol (named aggregate) type.
 /// Collect `(lab :L)` label names in document order (recursing through scopes, loops, and `if`s).
+/// Recursively rewrite the aggregate **type names** in a field/element [`TyDesc`] to their
+/// stem-suffixed global form — a local name (in `local`) gets `+stem`, an already-global cross-module
+/// name passes through. Recurses through `Ptr`/`FlexArray` pointees so a field like `vt: ptr Rtti`
+/// exports `Ptr(Agg("Rtti.0.<stem>"))`, not the unsuffixed `Ptr(Agg("Rtti.0."))` that left the pointee
+/// unresolvable in the importing unit. (`FnPtr` carries only `ValType`s — no nested aggregate name.)
+fn rewrite_agg_names(d: &TyDesc, local: &HashSet<&String>, stem: &str) -> TyDesc {
+    match d {
+        TyDesc::Agg(n) => TyDesc::Agg(if local.contains(n) {
+            format!("{n}{stem}")
+        } else {
+            n.clone()
+        }),
+        TyDesc::Ptr(inner) => TyDesc::Ptr(Box::new(rewrite_agg_names(inner, local, stem))),
+        TyDesc::FlexArray(inner) => {
+            TyDesc::FlexArray(Box::new(rewrite_agg_names(inner, local, stem)))
+        }
+        other => other.clone(),
+    }
+}
+
 fn collect_labels(node: &Node, out: &mut Vec<String>) {
     if let Node::List(_) = node {
         if node.tag() == Some("lab") {

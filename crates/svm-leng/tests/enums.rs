@@ -51,6 +51,23 @@ fn enum_param_is_scalar() {
 }
 
 #[test]
+fn enum_ordinal_arithmetic_resolves_type() {
+    // nimony emits enum-ordinal arithmetic — `inc(k)` becomes `(add EnumT k (conv EnumT 1))` — with
+    // the **enum type itself** as the op's leading type operand, not a primitive `(i N)`. The named
+    // enum resolves to its underlying int scalar so this lowers (#872), instead of fail-closing with
+    // `named type Color.0.`. `next(Red) = Green`, `next(Green) = Blue`.
+    let leng = "\
+(stmts
+ (type :Color.0. . (enum (u 8) (efld :Red.0. 0) (efld :Green.0. 1) (efld :Blue.0. 2)))
+ (proc :nextc.0 (params (param :c.0 . Color.0.)) Color.0. .
+  (stmts .
+   (ret (add Color.0. c.0 (conv Color.0. 1))))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[0]), 1, "Red -> Green");
+    assert_eq!(run(&m, 0, &[1]), 2, "Green -> Blue");
+}
+
+#[test]
 fn distinct_int_type_is_scalar() {
     // A `distinct` int type (`Id`) is a scalar too — used directly as an integer.
     let leng = "\
