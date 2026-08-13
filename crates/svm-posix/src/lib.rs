@@ -265,6 +265,17 @@ const SIGTSTP: i32 = 20; // the terminal ^Z — stop unless caught/ignored
 const SIGTTIN: i32 = 21; // background read from the terminal
 const SIGTTOU: i32 = 22; // background write to the terminal
 
+/// #796 default actions — `SIGKILL` (uncatchable, unmaskable terminate).
+const SIGKILL: i32 = 9;
+/// #796 default actions — the signals whose `SIG_DFL` action is **ignore** (Linux: CHLD/URG/WINCH).
+/// Everything else outside the job-control set above defaults to **terminate**.
+fn default_ignored(sig: i32) -> bool {
+    matches!(
+        sig,
+        17 /* SIGCHLD */ | 23 /* SIGURG */ | 28 /* SIGWINCH */
+    )
+}
+
 /// #798 slice 2 — `waitpid` option bits (Linux values).
 const WUNTRACED: i64 = 2; // also report a freshly-stopped child
 const WCONTINUED: i64 = 8; // also report a freshly-continued child
@@ -757,6 +768,17 @@ struct Proc {
     stop_fresh: bool,
     /// #798 slice 2 — a continue not yet reported through `waitpid(WCONTINUED)` (report-once).
     cont_fresh: bool,
+    /// #796 default actions — the core's **terminate closure** for this process's domain
+    /// ([`SignalSource::set_kill`], installed beside the wake/stop pair): firing it kills the
+    /// domain at its next per-op poll. `None` (a driver without the mechanism) degrades to
+    /// bookkeeping-only termination: `term_sig` is recorded (so `waitpid` reports it if the
+    /// process exits by other means) but the process keeps running — the L0 posture, same
+    /// degradation as `stop`.
+    kill: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #796 default actions — the signal that terminated this process (`SIG_DFL` terminate
+    /// action). Read by the exit hook at retire time: set ⇒ the zombie's wait status is the
+    /// `WIFSIGNALED` shape (`sig` in the low 7 bits) instead of the exit-code encode.
+    term_sig: Option<i32>,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -1142,7 +1164,9 @@ impl SignalSource for SignalDoor {
                 st.sig_armed.store(more, Ordering::Relaxed);
                 return Some((handler as i32, s, sp));
             }
-            // SIG_DFL / SIG_IGN: dropped in L0 (no default actions yet), keep scanning for a caught one.
+            // SIG_DFL / SIG_IGN: nothing to run async — ignored signals are discarded at generation
+            // and default-terminate fires through the kill door (#796), so anything still here is a
+            // stale pending bit; drop it and keep scanning for a caught one.
         }
     }
 
@@ -1155,6 +1179,11 @@ impl SignalSource for SignalDoor {
     /// #798 slice 2 — store the core's stop/continue closure for this process's domain.
     fn set_stop(&self, stop: Arc<dyn Fn(bool) + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).stop = Some(stop);
+    }
+
+    /// #796 default actions — store the core's terminate closure for this process's domain.
+    fn set_kill(&self, kill: Arc<dyn Fn() + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
     }
 }
 
@@ -1230,12 +1259,22 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
         // OUR policy — WEXITSTATUS in bits 8–15, the same encode `spawn_core` uses; a crashed
         // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
-        // like any exit code.
+        // like any exit code. #796 default actions: a twin the delivery gate terminated
+        // (`term_sig` set — the core's kill is signal-blind, only this bookkeeping knows why)
+        // retires in the `WIFSIGNALED` shape instead: the signal in the low 7 bits.
         let exit_world = Arc::clone(&world);
+        let exit_child = Arc::clone(&child);
         let exit = Arc::new(move |status: i64| {
+            let term = exit_child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .term_sig;
+            let encoded = match term {
+                Some(sig) => sig & 0x7f,
+                None => ((status & 0xff) << 8) as i32,
+            };
             let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
-            w.procs
-                .insert(pid, ProcEntry::Zombie(((status & 0xff) << 8) as i32));
+            w.procs.insert(pid, ProcEntry::Zombie(encoded));
         });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
@@ -1377,6 +1416,8 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         stopped_sig: None,
         stop_fresh: false,
         cont_fresh: false,
+        kill: None,
+        term_sig: None,
     }
 }
 
@@ -1503,6 +1544,12 @@ impl Proc {
                     self.arm_signals();
                 }
                 if was_stopped {
+                    // #796 default actions — a fatal signal held while stopped runs its action at
+                    // the continue (POSIX): the kill fire subsumes the continue fire (it wakes the
+                    // stopped domain itself, and death beats stop at the poll).
+                    if let Some(kf) = self.dispatch_default_actions() {
+                        return Some(kf);
+                    }
                     self.stop
                         .clone()
                         .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(false)) })
@@ -1527,6 +1574,28 @@ impl Proc {
                 }
             },
             _ => {
+                let disp = disposition(self, sig);
+                // #796 default actions. Ignored — explicitly (`SIG_IGN`) or by default
+                // (CHLD/URG/WINCH) — is discarded at generation (POSIX). This replaces the L0
+                // posture of pending such signals forever.
+                if disp == SIG_IGN || (disp == SIG_DFL && default_ignored(sig)) {
+                    return None;
+                }
+                if disp == SIG_DFL {
+                    // Default action: TERMINATE. Masked or stopped ⇒ held pending — the action
+                    // runs at unblock (`sigprocmask`) / continue (`SIGCONT`), not at raise.
+                    // `SIGKILL` alone can never be held (unmaskable, kills a stopped process).
+                    if sig != SIGKILL
+                        && (self.stopped_sig.is_some() || (1u64 << sig) & self.sig_mask != 0)
+                    {
+                        self.sig_pending |= 1 << sig;
+                        return None;
+                    }
+                    self.term_sig = Some(sig);
+                    return self.kill.clone();
+                }
+                // Caught: pend + arm. A stopped process holds delivery until continued
+                // ([`SignalDoor::take_deliverable`]'s gate).
                 self.sig_pending |= 1 << sig;
                 self.arm_signals();
                 if self.deliverable_now() {
@@ -1536,6 +1605,34 @@ impl Proc {
                 }
             }
         }
+    }
+
+    /// #796 default actions — run the default action for a pending, unmasked, `SIG_DFL`
+    /// **terminate**-action signal (lowest number first; POSIX leaves the order unspecified):
+    /// consume it, record it as this process's terminating signal, and hand back the core's
+    /// terminate fire for the caller's deferred-wake path. Job-control signals are excluded
+    /// (their default actions have their own arms in [`Proc::deliver_signal`]); a stopped
+    /// process holds everything until continued. Called wherever a held fatal signal can
+    /// become actionable: unblock (`sigprocmask`), continue (`SIGCONT`), and a disposition
+    /// reset to `SIG_DFL` (`signal`/`sigaction`).
+    fn dispatch_default_actions(&mut self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        if self.stopped_sig.is_some() {
+            return None;
+        }
+        let mut cand = self.sig_pending & !self.sig_mask;
+        while cand != 0 {
+            let s = cand.trailing_zeros() as i32;
+            cand &= !(1u64 << s);
+            if matches!(s, SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU) || default_ignored(s) {
+                continue;
+            }
+            if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) == SIG_DFL {
+                self.sig_pending &= !(1u64 << s);
+                self.term_sig = Some(s);
+                return self.kill.clone();
+            }
+        }
+        None
     }
 
     /// The stop half of the gate: record the stopping signal (report-once for `WUNTRACED`) and
@@ -1630,6 +1727,8 @@ impl Proc {
             stopped_sig: None,
             stop_fresh: false,
             cont_fresh: false,
+            kill: None, // ditto — the twin's own terminate closure lands at mint
+            term_sig: None,
         }
     }
 }
@@ -2203,12 +2302,22 @@ impl Ctx<'_> {
         if !(1..=63).contains(&signum) {
             return EINVAL;
         }
+        // #796 default actions — POSIX forbids changing SIGKILL/SIGSTOP's action.
+        if signum as i32 == SIGKILL || signum as i32 == SIGSTOP {
+            return EINVAL;
+        }
         let prev = self
             .p
             .sig_handler
             .insert(signum as i32, handler)
             .unwrap_or(SIG_DFL);
         self.p.arm_signals(); // #796 L2 — a handler installed for an already-pending signal may deliver now
+        if handler == SIG_DFL {
+            // #796 default actions — a reset to `SIG_DFL` runs a pending signal's action now.
+            if let Some(f) = self.p.dispatch_default_actions() {
+                self.wake_after.push(f);
+            }
+        }
         prev
     }
 
@@ -2468,6 +2577,11 @@ impl Ctx<'_> {
             };
             self.p.sig_mask = new & !UNMASKABLE; // SIGKILL/SIGSTOP can never be blocked
             self.p.arm_signals(); // #796 L2 — unblocking may free a held signal for async delivery
+                                  // #796 default actions — unblocking a held fatal signal runs its
+                                  // action now (deferred-fire discipline, like every kill).
+            if let Some(f) = self.p.dispatch_default_actions() {
+                self.wake_after.push(f);
+            }
         }
         Ok(vec![0])
     }
@@ -2489,6 +2603,11 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         }
         let s = signum as i32;
+        // #796 default actions — POSIX forbids changing SIGKILL/SIGSTOP's action (probing with a
+        // null `act` is allowed).
+        if act_ptr != 0 && (s == SIGKILL || s == SIGSTOP) {
+            return Ok(vec![EINVAL]);
+        }
         let mem = mem.ok_or(Trap::Malformed)?;
         if oldact_ptr != 0 {
             let mut buf = [0u8; 24];
@@ -2509,6 +2628,13 @@ impl Ctx<'_> {
             self.p.sig_action_mask.insert(s, mask);
             self.p.sig_action_flags.insert(s, flags);
             self.p.arm_signals(); // #796 L2 — a handler for an already-pending signal may deliver now
+            if handler == SIG_DFL {
+                // #796 default actions — resetting a pending signal's disposition to `SIG_DFL`
+                // runs its default action now (deferred-fire discipline).
+                if let Some(f) = self.p.dispatch_default_actions() {
+                    self.wake_after.push(f);
+                }
+            }
         }
         Ok(vec![0])
     }
@@ -3899,6 +4025,196 @@ mod tests {
     }
 
     /// #798 slice 2 — stop/continue through the delivery gate, end to end at the unit level: a
+    /// #796 default actions — the delivery gate's terminate side, driven through a mock kill door:
+    /// an unhandled `SIGTERM` fires the twin's **kill closure** (deferred like every wake) and the
+    /// exit hook retires the zombie in the `WIFSIGNALED` shape (`waitpid` status = the signal);
+    /// `SIGCHLD` (default-ignore) and a `SIG_IGN`'d signal are discarded at generation — a later
+    /// reset to `SIG_DFL` finds nothing pending; a **masked** `SIGTERM` is held and runs its action
+    /// at `sigprocmask`-unblock; a **stopped** process holds a fatal signal until `SIGCONT` (whose
+    /// fire is then the death, not the continue) while `SIGKILL` cuts straight through a stop; and
+    /// `signal`/`sigaction` refuse to change `SIGKILL`/`SIGSTOP`'s action (`-EINVAL`).
+    #[test]
+    fn default_terminate_fires_the_kill_door_and_waitpid_reports_the_signal() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        let kills = Arc::new(AtomicI32::new(0));
+        let k2 = Arc::clone(&kills);
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has a door");
+        door.set_kill(Arc::new(move || {
+            k2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        // SIGCHLD (17): default-ignore — discarded, no fire, nothing pends.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 17], None, None).unwrap(),
+            vec![0]
+        );
+        // SIG_IGN'd SIGUSR2 (12): discarded at generation — a reset to SIG_DFL finds nothing.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
+            vec![SIG_DFL]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 12], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
+            vec![SIG_IGN]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "ignored signals never kill"
+        );
+
+        // Masked SIGTERM (15): held pending; the unblock runs the default action.
+        mem.write_bytes(64, &(1u64 << 15).to_le_bytes()).unwrap();
+        assert_eq!(
+            (forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 15], None, None).unwrap(),
+            vec![0]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "a masked fatal signal is held"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unblock runs the default action (kill fire)"
+            );
+            std::thread::yield_now();
+        }
+        // The core's task completion now fires the exit hook (crash status 128 — what a
+        // `ThreadFault` self-termination produces); the personality's bookkeeping wins.
+        (forked.exit.take().expect("the twin has an exit hook"))(128);
+        let r = root_handler(OP_WAITPID, &[7, 100, 0], Some(&mut mem), None).unwrap();
+        assert_eq!(r, vec![7], "the killed twin is reapable");
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status & 0x7f, 15, "WIFSIGNALED: the terminating signal");
+        assert_eq!((status >> 8) & 0xff, 0, "not an exit-code encode");
+
+        // A second twin: a stop holds SIGTERM; SIGCONT's fire is the death, not the continue.
+        let forked2 = cap_fork_factory(&posix)(8);
+        let kills2 = Arc::new(AtomicI32::new(0));
+        let stops2 = Arc::new(AtomicI32::new(0));
+        let (door2, _armed2) = forked2.signal.as_ref().expect("door");
+        let k = Arc::clone(&kills2);
+        door2.set_kill(Arc::new(move || {
+            k.fetch_add(1, Ordering::SeqCst);
+        }));
+        let s = Arc::clone(&stops2);
+        door2.set_stop(Arc::new(move |stopped| {
+            s.store(if stopped { 1 } else { -1 }, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            root_handler(OP_KILL, &[8, SIGSTOP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stops2.load(Ordering::SeqCst) != 1 {
+            assert!(std::time::Instant::now() < deadline, "the stop fires");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            root_handler(OP_KILL, &[8, 15], None, None).unwrap(),
+            vec![0]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            kills2.load(Ordering::SeqCst),
+            0,
+            "a stopped process holds a fatal signal"
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[8, SIGCONT as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills2.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the continue runs the held default action"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            stops2.load(Ordering::SeqCst),
+            1,
+            "the kill fire subsumed the continue fire"
+        );
+
+        // A third twin: SIGKILL cuts straight through a stop.
+        let mut forked3 = cap_fork_factory(&posix)(9);
+        let kills3 = Arc::new(AtomicI32::new(0));
+        let (door3, _armed3) = forked3.signal.as_ref().expect("door");
+        let k = Arc::clone(&kills3);
+        door3.set_kill(Arc::new(move || {
+            k.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            root_handler(OP_KILL, &[9, SIGSTOP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[9, SIGKILL as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills3.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SIGKILL kills a stopped process"
+            );
+            std::thread::yield_now();
+        }
+
+        // SIGKILL/SIGSTOP dispositions are immutable.
+        assert_eq!(
+            (forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
+            vec![EINVAL]
+        );
+        mem.write_bytes(128, &[0u8; 24]).unwrap();
+        assert_eq!(
+            (forked3.handler)(
+                OP_SIGACTION,
+                &[SIGSTOP as i64, 128, 0],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
+            vec![EINVAL]
+        );
+        assert_eq!(
+            (forked3.handler)(
+                OP_SIGACTION,
+                &[SIGKILL as i64, 0, 128],
+                Some(&mut mem),
+                None
+            )
+            .unwrap(),
+            vec![0],
+            "probing with a null act stays allowed"
+        );
+    }
+
     /// default-disposition `SIGTSTP` at a twin fires its **stop closure** (`f(true)`, deferred
     /// past the dispatch's locks like a wake) and `waitpid(-1, WUNTRACED)` reports the stop once
     /// (`sig<<8 | 0x7f`); while stopped, further signals are held (`sigcheck` empty, no wake);

@@ -2855,9 +2855,12 @@ static long pid;
 static long st;
 static long h;
 int main(int argc, char **argv) {
+  /* Pre-install a caught disposition for 10 — inherited by the fork twin (POSIX), so the kill
+   * below can never land on SIG_DFL (#796: that would terminate the child, not pend). */
+  __vm_fs(30, 10, 6, 0, 0);
   while ((pid = fork()) < 0);
   if (pid == 0) {
-    __vm_fs(30, 10, 7, 0, 0);                    /* signal(10, handler-token 7) */
+    __vm_fs(30, 10, 7, 0, 0);                    /* signal(10, its own handler-token 7) */
     while ((h = __vm_fs(32, 0, 0, 0, 0)) == 0);  /* sigcheck: spin until the kill lands */
     if (h == 7) return 42;
     return 9;
@@ -2939,6 +2942,87 @@ fn a_compiled_c_parent_kills_its_forked_child_by_pid() {
     );
 }
 
+/// #796 default actions — **an unhandled fatal signal really terminates, compiled C, end to end**:
+/// the child spins forever (no handler for anything — a runaway job); the parent's plain
+/// `kill(child, SIGTERM)` must actually kill it (`SIG_DFL` action = terminate through the
+/// `SignalSource::set_kill` door → the domain's term flag → `ThreadFault` at the next per-op
+/// poll), and the personality's `waitpid` must report the death in the `WIFSIGNALED` shape —
+/// the signal in the low 7 bits, NOT an exit-code encode. Without the kill the child's infinite
+/// spin would burn the run's whole fuel budget: the test passing quickly IS the death witness.
+/// Also probes the discard side: `SIGCHLD` (default-ignore) at the child beforehand is a no-op.
+const DEFAULT_TERMINATE_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+static volatile long sink;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    while (1) sink = sink + 1;                      /* runaway: no handler, no exit */
+  }
+  if (__vm_fs(31, pid, 17, 0, 0) != 0) return 1;    /* SIGCHLD: default-ignore, a no-op */
+  if (__vm_fs(31, pid, 15, 0, 0) != 0) return 2;    /* SIGTERM: SIG_DFL = terminate */
+  while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* reap the killed child */
+  if (r != pid) return 3;
+  if ((status & 0x7f) != 15) return 4;              /* WIFSIGNALED: the terminating signal */
+  if (((status >> 8) & 0xff) != 0) return 5;        /* not an exit-code encode */
+  return 42;
+}
+"#;
+
+#[test]
+fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{DEFAULT_TERMINATE_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse default-terminate guest");
+    verify_module(&guest).expect("verify default-terminate guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "kill(child, SIGTERM) with no handler installed actually terminated the runaway child \
+         (the default action, through the set_kill door), and waitpid reported the death as \
+         WIFSIGNALED(15) — not an exit code"
+    );
+}
+
 /// #863 slice 3 — **the waitpid-EINTR capstone: an embedder `^C` interrupts a forked shell blocked
 /// in `wait`, on the RIGHT process.** The compiled-C parent catches SIGINT (real handler + signal
 /// stack — async delivery on), forks a child (which spins on its `sigcheck` doorbell), and parks in
@@ -2962,7 +3046,12 @@ static long pid;
 static long st;
 int main(int argc, char **argv) {
   __vm_fs(30, 2, (long)on_int, 0, 0);      /* signal(SIGINT, handler): catch */
+  __vm_fs(30, 10, (long)on_usr, 0, 0);     /* pre-install 10 too — inherited by the twin, so the
+                                              parent's kill(child, 10) can never land on SIG_DFL
+                                              (#796: that would terminate it, not pend) */
   __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on */
+  __vm_fs(0, 1, (long)&st, 1, 0);          /* readiness byte: the terminal may open fire (#796 —
+                                              a pre-handler ^C is now FATAL, the default action) */
   while ((pid = fork()) < 0);
   if (pid == 0) {
     /* The fork twin INHERITS the signal stack (POSIX) — async delivery is ON here too, so its
@@ -3012,13 +3101,18 @@ fn a_terminal_ctrl_c_interrupts_a_forked_parent_blocked_in_wait() {
     );
 
     // The "terminal": raise SIGINT at the parent (personality pid 1000) until the run returns.
-    // Robust to ordering — a raise before the parent exists is -ESRCH, before it parks is a
-    // harmless pending bit, after its SIG_IGN is undeliverable (no wake). Domain scoping keeps
-    // every one of these away from the child's spin.
+    // It holds fire until the guest's readiness byte lands on the captured stdout — #796 default
+    // actions made a pre-handler `^C` FATAL (terminate is the `SIG_DFL` action), so the storm may
+    // only start once the handler is installed. After that it stays robust to ordering: raises
+    // are caught (pending bit + handler), and after the guest's SIG_IGN they are discarded.
+    // Domain scoping keeps every one of these away from the child's spin.
     let done = Arc::new(AtomicBool::new(false));
     let done2 = Arc::clone(&done);
     let posix2 = posix.clone();
     let terminal = std::thread::spawn(move || {
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         while !done2.load(Ordering::Relaxed) {
             posix2.kill_pid(1000, 2);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3072,7 +3166,12 @@ static long pid;
 static long st;
 int main(int argc, char **argv) {
   __vm_fs(30, 2, (long)on_int, 0, 0);      /* signal(SIGINT, handler): catch */
+  __vm_fs(30, 12, (long)on_usr, 0, 0);     /* pre-install 12 — inherited down BOTH generations, so
+                                              the cross-generation kill(4, 12) can never land on
+                                              SIG_DFL in a grandchild that has not re-installed */
   __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on (inherited by all) */
+  __vm_fs(0, 1, (long)&st, 1, 0);          /* readiness byte: the terminal may open fire (#796 —
+                                              a pre-handler ^C is now FATAL, the default action) */
   while ((pid = fork()) < 0);              /* child: pid 3 (task ids are deterministic here) */
   if (pid == 0) {
     long gpid;
@@ -3130,6 +3229,10 @@ fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
     let done2 = Arc::clone(&done);
     let posix2 = posix.clone();
     let terminal = std::thread::spawn(move || {
+        // Hold fire until the parent's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         while !done2.load(Ordering::Relaxed) {
             posix2.kill_pid(1000, 2);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3254,15 +3357,19 @@ static long h;
 static long msg;
 static int status;
 int main(int argc, char **argv) {
+  /* Catch 10 BEFORE forking — the disposition is inherited (POSIX), so the group ^C below can
+   * never find SIG_DFL in a member that has not yet re-installed its own token. #796 made that
+   * matter: an uncaught signal 10 now runs its default action (terminate) instead of pending. */
+  __vm_fs(30, 10, 6, 0, 0);
   while ((p1 = fork()) < 0);
   if (p1 == 0) {
-    __vm_fs(30, 10, 7, 0, 0);                 /* member 1: catch 10 (L0 token) */
+    __vm_fs(30, 10, 7, 0, 0);                 /* member 1: re-catch with its own L0 token */
     while (__vm_fs(32, 0, 0, 0, 0) != 7);     /* spin on the doorbell */
     return 5;
   }
   while ((p2 = fork()) < 0);
   if (p2 == 0) {
-    __vm_fs(30, 10, 8, 0, 0);                 /* member 2: catch 10 */
+    __vm_fs(30, 10, 8, 0, 0);                 /* member 2: its own token */
     while (__vm_fs(32, 0, 0, 0, 0) != 8);
     return 6;
   }
@@ -3368,9 +3475,13 @@ static int status;
 static long i;
 static volatile long sink;
 int main(int argc, char **argv) {
+  /* Pre-install a caught disposition for 10 — inherited by the twin, so the held-while-stopped
+   * 10 below can never sit as SIG_DFL (#796: the SIGCONT would then run the default action —
+   * terminate — instead of delivering it). The child re-installs its own token before reading. */
+  __vm_fs(30, 10, 6, 0, 0);
   while ((pid = fork()) < 0);
   if (pid == 0) {
-    __vm_fs(30, 10, 7, 0, 0);                  /* catch 10 (L0 token) */
+    __vm_fs(30, 10, 7, 0, 0);                  /* catch 10 (its own L0 token) */
     while (__vm_fs(32, 0, 0, 0, 0) != 7);      /* spin until it delivers */
     return 5;
   }
