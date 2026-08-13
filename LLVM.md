@@ -3449,3 +3449,61 @@ the peval probe running (not skipping); embench + cross-engine verified green on
 - The oracle to diff against (Lane B): chibicc `frontend/chibicc/codegen_ir.c` + the running
   demos in `demos/` — wired in at Milestone 1.
 
+---
+
+## 10. Rust `std` on the on-ramp (svm-posix route)
+
+Full-`std` Rust runs as an svm guest through this on-ramp, bound to the **POSIX personality**
+(`svm-posix`), not WASI. This section is the durable design record (folded from the retired
+`RUST_STD.md`, 2026-08); the overlay + target JSONs live in `crates/svm-llvm/rust-svm/` (see its
+`README.md`), and the differential tests are `crates/svm-llvm/tests/std_guest.rs` (a nightly,
+scheduled CI lane — each test does a full `-Zbuild-std`, too slow for the per-PR gate).
+
+**Route decision (owner, 2026-08-11): svm-posix, not WASI.** Keep everything on the proven LLVM path
+(`rustc --emit=llvm-ir` → `svm-llvm`) and bind `std` to the personality ABI we already pin and test
+(`POSIX.md` §5). The cost is a small `std` platform layer (PAL) we author and maintain as a `rust-src`
+overlay. Alternatives rejected: **(B)** reuse `std::sys::unix` via a Linux-claiming triple + a guest
+libc shim — its raw `libc::syscall(SYS_*)` is exactly the numeric-syscall multiplexer the personality
+model exists to avoid (`POSIX.md` §1); **(C)** WASI — gives up toolchain independence and adds a
+wasm/WASI spec dependency (`svm-wasi` stays the deliberately-thin 2-op shim); **(D)** `restricted_std`
+with *unpatched* std — modern std's leaf modules (`sys/{alloc,thread_local,random,io/error}`) enumerate
+`target_os` with **no catch-all**, so a novel `os=svm` fails to *build*. The minimum buildable overlay is
+a handful of `svm` leaf-arms + one allocator `imp`.
+
+**The seam — how `std` reaches svm-posix.** Two mechanisms:
+1. **Generic host-call bridge (primary).** `__vm_cap_resolve("posix")` → a handle (§7 `cap.self.resolve`);
+   `__vm_host_call(handle, op, a, b, c, d)` → `cap.call HOST_PROC`. The PAL declares these two `extern "C"`
+   symbols and speaks the `POSIX.md` §5 op table directly — **no allowlist growth, no per-name plumbing**.
+   Constraints the PAL respects: `op` must be a **compile-time constant** at the LLVM call site (each op
+   gets its own `#[inline(always)]` wrapper with a literal op — never a shared `fn call(op)`); the payload
+   is a fixed `(i64×4) -> i64`; errno is **in-band** (`-> n | -errno`, INVARIANTS §5 — negative returns map
+   straight to `io::Error`, no `__errno_location`/errno TLS).
+2. **Named imports (secondary).** `malloc`/`free` left as external calls bind to the synthesized guest
+   **bump allocator** (`synth_malloc`) — zero host crossings per allocation.
+
+**ABI pins.**
+
+| Pin | Value |
+|---|---|
+| Panic strategy | `panic=abort` (target JSON + `-Zbuild-std=std,panic_abort`). Opt-in `panic=unwind` is deferred — #883 (the on-ramp's C++ Itanium EH substrate already supports it; no named guest consumer yet). |
+| Targets | Two specs: lean **`x86_64-unknown-svm`** (`singlethread=true`, `no_threads` std) and threaded **`x86_64-unknown-svm-threads`** (`singlethread=false`, `env=threads`, real atomic orderings + futex sync + Tier-2 per-vCPU TLS). The `no_threads` pin was the original v1 posture; threads landed via the #779 epic. |
+| Errno | In-band negative returns → `io::Error`; no errno TLS. |
+| Allocator | PAL `sys::alloc` → `extern "C" malloc/free` → synthesized guest bump allocator. |
+| `stat`/time layouts | svm-posix's, verbatim (`{st_mode, st_size}`; the Clock op's epoch/units) — the PAL is the only consumer, no reconciliation. |
+| HashMap seeding | Deterministic per-guest (`sys/random` leaf; address-derived seed on the fixed window/allocator layout). A real `getrandom` op is deferred (no consumer). |
+| Toolchain | One pinned **nightly** + `rust-src`; the PAL patch is applied onto the toolchain's `rust-src` (`rust-svm/apply-overlay.sh`, idempotent). The textual-`.ll` reader frees the *on-ramp* from LLVM-version pins (§3); the nightly pin is for build-std reproducibility only. |
+
+**Status (what works, byte-identical to native).** The whole platform layer landed: `std::{io (stdout/
+stderr/exit), env::args, time (Instant/SystemTime via `OP_CLOCK`), env (var/var_os/set/remove/vars), fs
+(File/metadata/read_dir/dir-ops over the memfs), net (TCP over memnet + the `net` cap), process::Command
+(fork-free spawn+capture via `OP_SPAWN2`), thread + sync + TLS (spawn/join, futex `Mutex`/`Condvar`/`mpsc`,
+Tier-2 per-vCPU TLS), collections::HashMap}`. Most of "std" (`Vec`/`String`/`fmt`/`iter`/collections) is
+re-exported `core`/`alloc` and always ran. The svm-posix ops the PAL needed — `OP_CLOCK`, `OP_GETENV_R`/
+`OP_UNSETENV`/`OP_ENVIRON`, `OP_SPAWN2`, the `net` cap — are all in (`POSIX.md`). **Deferred:** unwinding
+(#883); a real randomness op; live-child `Command` streaming (rides the fork/exec/bash epic, #799/#801).
+
+**Trust framing.** Everything here is untrusted, re-verified frontend + personality + guest code — the
+translator, the `svm-posix` personality, and `std` itself compiled as guest code. Zero escape-TCB, same
+class as chibicc/`svm-wasm` (§2a, D54; INVARIANTS §2/§9 untouched). A `std` or personality bug is a clean
+capability/verify error, never an escape.
+
