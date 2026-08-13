@@ -111,7 +111,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # `submodules: recursive` fetches the vendored nimony + nativenif submodules that
+      # provision-nimony.sh builds. Only this job needs them, so the other jobs' checkouts stay bare.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
