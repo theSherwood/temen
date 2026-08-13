@@ -158,6 +158,49 @@ fn cross_module_global_read_write() {
     assert_eq!(run(&linked, 0, &[-5]), -5);
 }
 
+/// A **cross-module scalar-int `const`** reference. Module `w` reads a `const` `REPL` defined in
+/// module `c` (`REPL.0.<c-stem>`, the shape `fastRuneAt`'s template expansion plants a reference to
+/// `unicode`'s private `replRune` in every consumer — the editdistance std-sweep gap, #760). A scalar
+/// `const` is inlined at use and never exported as data, so before the linker pooled consts this
+/// reference fell through to an unresolved `data.sym` and failed the link. Pooled, the reference
+/// inlines the same value the defining unit does: `useit() = REPL + 1 = 65534`.
+#[test]
+fn cross_module_scalar_const_inlines() {
+    let mod_c = "\
+(stmts
+ (const :REPL.0. . (i +32) (suf 65533 \"i32\"))
+ (proc :own.0. . (i +64) . (stmts . (ret REPL.0.))))";
+    let mod_w = "\
+(stmts
+ (proc :useit.0. . (i +64) .
+  (stmts .
+   (ret (add (i +64) REPL.0.modc 1)))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modw",
+            src: mod_w,
+            names: &["useit.0."],
+        },
+        LengModule {
+            stem: "modc",
+            src: mod_c,
+            names: &["own.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // `useit` is module w's only proc → func 0; the defining unit's own `own` inlines it too.
+    assert_eq!(
+        run(&linked, 0, &[]),
+        65534,
+        "cross-module const REPL(65533) + 1"
+    );
+    assert_eq!(
+        run(&linked, 1, &[]),
+        65533,
+        "defining unit inlines its own const"
+    );
+}
+
 /// Real nimony: `moda`'s `bump` reads and writes `store.counter` across the module boundary — hexer
 /// emits the reference as `counter.0.<store-stem>`. `store` defines `counter.0.` and exports it as a
 /// data symbol; the linker binds `moda`'s `data.sym` to it. `bump()` increments 0 → 1.

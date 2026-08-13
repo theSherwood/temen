@@ -218,6 +218,7 @@ fn translate_object_module(
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
+    ext_consts: &[(String, i64)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -226,6 +227,7 @@ fn translate_object_module(
     t.import_funcrefs(ext_funcrefs);
     t.import_proc_frames(ext_frame_procs);
     t.import_sret_procs(ext_sret);
+    t.import_consts(ext_consts);
     // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
     // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
     if let Some(layout) = tls_layout {
@@ -286,6 +288,7 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
         None,
     )?))
 }
@@ -299,6 +302,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
         &[],
         &[],
         &[],
@@ -382,11 +386,17 @@ fn link_selected_with_extra(
     // that does so becomes frame-needing — so the sret set must be known **before** the frame
     // fixpoint (`proc_frame_nodes`) runs, hence a first pass over the units to build it.
     let mut pooled_sret: Vec<(String, translate::TyDesc)> = Vec::new();
+    // Pooled **scalar-int consts** across all units (stem-suffixed name → value): a scalar `const` is
+    // inlined at use and never exported as data, so a cross-module reference to one (`replRune.0.<uni>`,
+    // which `fastRuneAt`'s template expansion plants in every consumer) has no data symbol to bind.
+    // Pooling lets the referencing unit inline the same value the defining unit does.
+    let mut pooled_consts: Vec<(String, i64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
+        pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
         if tls {
             pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
         }
@@ -448,6 +458,7 @@ fn link_selected_with_extra(
                 &pooled_funcrefs,
                 &pooled_frame_procs,
                 &pooled_sret,
+                &pooled_consts,
                 tls_layout.as_ref(),
             )?))
         })

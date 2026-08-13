@@ -278,6 +278,13 @@ pub(crate) struct Translator {
     globals: HashMap<String, (u64, TyDesc)>,
     /// Scalar integer `const`s, inlined at use.
     consts: HashMap<String, i64>,
+    /// **External scalar-int `const`s** — another unit's top-level `const` folded to an integer, under
+    /// the stem-suffixed name this module references it by ([`export_consts`]). A scalar `const` is
+    /// inlined at use, never emitted as data, so a *cross-module* reference (`replRune.0.<unicode>`,
+    /// which `fastRuneAt` expands into every consumer) has no data symbol to bind — it fell through to
+    /// an unresolved `data.sym`. Pooled here, the reference inlines the same value the defining unit
+    /// does, exactly as a same-module `const` reference does. Empty unless the linker pooled siblings.
+    ext_consts: HashMap<String, i64>,
     /// Non-zero scalar global initializers → `(unit-local offset, little-endian bytes)`, folded into
     /// the globals `data` segment. Zero-init globals stay zero (the segment is zero-filled).
     data_inits: Vec<(u64, Vec<u8>)>,
@@ -393,6 +400,7 @@ impl Translator {
             link_mode: false,
             globals: HashMap::default(),
             consts: HashMap::default(),
+            ext_consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
             ext_funcrefs: HashMap::default(),
             ext_frame_procs: HashSet::default(),
@@ -1436,6 +1444,16 @@ impl Translator {
         }
     }
 
+    /// Pre-register **external scalar-int `const`s** — another module's top-level `const`s that fold
+    /// to an integer, under the stem-suffixed names this module references them by ([`export_consts`]).
+    /// See the [`ext_consts`](Self::ext_consts) field: this lets a cross-module reference to a sibling's
+    /// scalar `const` inline the value directly, instead of failing closed on an unresolved `data.sym`.
+    pub fn import_consts(&mut self, ext: &[(String, i64)]) {
+        for (name, v) in ext {
+            self.ext_consts.insert(name.clone(), *v);
+        }
+    }
+
     /// Enable **Tier-2 TLS linking** with the whole program's **shared TLS layout** (NIM.md §3d):
     /// `layout` maps each `tvar`'s stem-suffixed global name to its offset in the per-vCPU block,
     /// computed once by [`export_tls_vars`] across all units. Registering the stem-suffixed names lets
@@ -1496,6 +1514,29 @@ impl Translator {
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
+    }
+
+    /// A module's **top-level scalar-int `const`s** — each folded to its integer value, under the
+    /// stem-suffixed global name a sibling references it by (`replRune.0.` + `<stem>`). The `const`
+    /// counterpart of [`export_funcrefs`]; [`link_selected`] pools these across its units so a
+    /// cross-module reference inlines the value ([`import_consts`]) rather than emitting an unresolved
+    /// `data.sym`. Only the scalar-int consts (the ones [`collect_globals`] inlines and never exports);
+    /// an aggregate `const` is materialized as an addressable global and already exports as data.
+    pub fn export_consts(root: &Node, stem: &str) -> Result<Vec<(String, i64)>, LengError> {
+        let mut out: Vec<(String, i64)> = Vec::new();
+        for item in root.args() {
+            if item.tag() != Some("const") {
+                continue;
+            }
+            let a = item.args();
+            if a.len() >= 4 {
+                if let Some(v) = int_literal(&a[3]) {
+                    out.push((format!("{}{stem}", sym_def(&a[0])?), v));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic order
         Ok(out)
     }
 
@@ -3727,6 +3768,13 @@ impl<'a> FuncGen<'a> {
                     return Ok(self.emit_const(ValType::I64, c));
                 }
                 if let Some(&c) = self.t.consts.get(a) {
+                    return Ok(self.emit_const(ValType::I64, c));
+                }
+                // A cross-module scalar-int `const` (a sibling unit's `const`, pooled by the linker) —
+                // inline its value, exactly as the same-module `consts` case above. Without this the
+                // reference falls to the `data.sym` path below and fails closed at link (a scalar
+                // `const` is inlined, never exported as data — `replRune.0.<unicode>` in editdistance).
+                if let Some(&c) = self.t.ext_consts.get(a) {
                     return Ok(self.emit_const(ValType::I64, c));
                 }
                 if self.t.globals.contains_key(a) || self.t.tls_vars.contains_key(a) {
