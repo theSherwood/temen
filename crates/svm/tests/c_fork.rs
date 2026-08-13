@@ -3345,3 +3345,103 @@ fn a_compiled_c_shell_runs_the_job_control_loop() {
         "the background write went through to the captured terminal"
     );
 }
+
+/// #798 slice 2 — **Ctrl-Z / `fg` in compiled C: the stop actually stops the domain.** The parent
+/// forks a child that spins on its `sigcheck` doorbell, then:
+///
+/// 1. `kill(child, SIGTSTP)` — default disposition ⇒ the child's domain STOPS (the core parks it
+///    at its next per-op poll).
+/// 2. `waitpid(-1, WUNTRACED)` reports the stop (`SIGTSTP<<8 | 0x7f`) — and only once.
+/// 3. `kill(child, 10)` — delivered **while stopped**, so it must be HELD: the child, were it
+///    secretly still running, would consume it and exit. A long busy-wait gives the cooperative
+///    scheduler every chance to run it; `waitpid(child, 0)` still `-ECHILD` is the proof of
+///    stopped-ness (the interp would happily have scheduled a runnable child during the wait).
+/// 4. `kill(child, SIGCONT)` — the domain resumes, the HELD signal delivers, the child exits 5;
+///    `waitpid(WCONTINUED)` reports the continue (`0xffff`), then the reap collects the 5.
+///
+/// Fully in-guest and deterministic (L0 polling, no signal stacks, no embedder thread).
+const CTRL_Z_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+static long i;
+static volatile long sink;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                  /* catch 10 (L0 token) */
+    while (__vm_fs(32, 0, 0, 0, 0) != 7);      /* spin until it delivers */
+    return 5;
+  }
+  if (__vm_fs(31, pid, 20, 0, 0) != 0) return 1;        /* kill(child, SIGTSTP): stop */
+  r = __vm_fs(28, -1, (long)&status, 2, 0);             /* waitpid(-1, WUNTRACED) */
+  if (r != pid) return 2;
+  if ((status & 0xff) != 0x7f) return 3;                /* stopped marker */
+  if (((status >> 8) & 0xff) != 20) return 4;           /* by SIGTSTP */
+  if (__vm_fs(28, -1, (long)&status, 2, 0) != -10) return 6;  /* report-once */
+  if (__vm_fs(31, pid, 10, 0, 0) != 0) return 7;        /* the 10 lands while stopped: HELD */
+  for (i = 0; i < 200000; i = i + 1) sink = i;          /* every chance to run, were it runnable */
+  if (__vm_fs(28, pid, (long)&status, 0, 0) != -10) return 8;  /* still alive: truly stopped */
+  if (__vm_fs(31, pid, 18, 0, 0) != 0) return 9;        /* kill(child, SIGCONT): resume */
+  while ((r = __vm_fs(28, pid, (long)&status, 8, 0)) == -10);  /* waitpid(pid, WCONTINUED) */
+  if (r == pid && status == 0xffff) {
+    while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* now the real reap */
+  }
+  if (r != pid) return 10;
+  if (((status >> 8) & 0xff) != 5) return 11;           /* the held 10 delivered post-continue */
+  return 42;
+}
+"#;
+
+#[test]
+fn ctrl_z_stops_a_forked_child_and_fg_resumes_it() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{CTRL_Z_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse ctrl-z guest");
+    verify_module(&guest).expect("verify ctrl-z guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 220_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "Ctrl-Z: the child STOPPED (a signal sent while stopped was held through a long busy-wait \
+         — a runnable child would have consumed it and exited), WUNTRACED reported it once, \
+         SIGCONT resumed it, WCONTINUED reported, and the held signal delivered post-continue"
+    );
+}

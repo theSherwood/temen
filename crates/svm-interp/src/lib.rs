@@ -2147,6 +2147,7 @@ fn drive_over_cell(
     {
         let hg = host_shared.lock().unwrap_or_else(|e| e.into_inner());
         let root_dom = hg.domain_id() as usize;
+        let stop_flag = hg.stop_flag.clone();
         let source = hg.signal_poll().map(|(_, s)| s);
         drop(hg); // release before `set_wake` (the door takes the personality's own lock)
         if let Some(source) = source {
@@ -2154,6 +2155,16 @@ fn drive_over_cell(
             source.set_wake(Arc::new(move || {
                 if let Some(s) = sched_weak.upgrade() {
                     s.interrupt_interruptible_parks(root_dom);
+                }
+            }));
+            // #798 slice 2 — the stop/continue closure, same weak discipline as the wake.
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_stop(Arc::new(move |stopped| {
+                stop_flag.store(stopped, Ordering::SeqCst);
+                if !stopped {
+                    if let Some(s) = sched_weak.upgrade() {
+                        s.wake_stopped(root_dom);
+                    }
                 }
             }));
         }
@@ -4112,6 +4123,13 @@ enum Blocked {
     /// the last write end closing (writer count → 0, which re-issues the read to EOF). On wake the read
     /// re-executes from the top (no partial state), like [`Blocked::CapRead`] / the stdin park.
     PipeRead { pipe: u32 },
+    /// #798 slice 2 — **job-control stop**: the vCPU observed its domain's stop flag at the per-op
+    /// poll and parks BETWEEN ops (nothing rewound — the current inst simply hasn't run; a resume
+    /// executes it). Parked in [`Sched::stopped`] keyed by domain; drained only by the continue
+    /// side of the personality's stop closure ([`SignalSource::set_stop`]) — never by a signal
+    /// interrupt (a stop is not a syscall). The core never sees a signal number: "stop this
+    /// domain / continue this domain" is the whole surface (invariants 4 and 12).
+    Stopped,
     /// FORK.md §8.6 (backpressure) — a **blocking pipe write** parked on a full FIFO whose reader count
     /// is still `> 0`. Keyed by pipe id in `pipe_write_waiters`; woken by a `read` that drains the pipe
     /// (room opened) or by the last read end closing (reader count → 0, which re-issues the write to
@@ -4397,6 +4415,10 @@ struct Sched {
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
     cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    /// #798 slice 2 — vCPUs parked **stopped** ([`Blocked::Stopped`]), keyed by domain. Pushed when
+    /// a vCPU observes its domain's stop flag; drained wholesale by [`Scheduler::wake_stopped`]
+    /// (the personality's SIGCONT). Swept like every waiter map at teardown.
+    stopped: BTreeMap<usize, VecDeque<Box<VCpu>>>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -4639,6 +4661,23 @@ impl Scheduler {
     fn wake_pipe_writers(&self, pipe: u32) -> u32 {
         let mut s = self.lock();
         let n = wake_pipe_writers_locked(&mut s, pipe);
+        if n > 0 {
+            self.work.notify_all();
+        }
+        n
+    }
+
+    /// #798 slice 2 — **continue** a stopped domain: drain its [`Sched::stopped`] parks back to
+    /// runnable. The personality's stop closure calls this (after clearing the stop flag) on
+    /// SIGCONT; a domain with nothing parked is a no-op (its running vCPUs simply see the cleared
+    /// flag at their next poll — or were never stopped at all).
+    fn wake_stopped(&self, domain: usize) -> u32 {
+        let mut s = self.lock();
+        let woken = s.stopped.remove(&domain).unwrap_or_default();
+        let n = woken.len() as u32;
+        for v in woken {
+            s.runnable.push_back(v);
+        }
         if n > 0 {
             self.work.notify_all();
         }
@@ -4994,6 +5033,7 @@ impl Scheduler {
         {
             let hg = twin_host.lock().unwrap_or_else(|e| e.into_inner());
             let dom = hg.domain_id() as usize;
+            let stop_flag = hg.stop_flag.clone();
             let source = hg.signal_poll().map(|(_, s)| s);
             drop(hg); // release before `set_wake` (the door takes the personality's own lock)
             if let Some(source) = source {
@@ -5001,6 +5041,16 @@ impl Scheduler {
                 source.set_wake(Arc::new(move || {
                     if let Some(sc) = sched_weak.upgrade() {
                         sc.interrupt_interruptible_parks(dom);
+                    }
+                }));
+                // #798 slice 2 — the twin's stop/continue closure, minted with its wake.
+                let sched_weak = Arc::downgrade(self);
+                source.set_stop(Arc::new(move |stopped| {
+                    stop_flag.store(stopped, Ordering::SeqCst);
+                    if !stopped {
+                        if let Some(sc) = sched_weak.upgrade() {
+                            sc.wake_stopped(dom);
+                        }
                     }
                 }));
             }
@@ -5420,6 +5470,8 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             s.join_waiters.insert(k, v);
         }
     }
+    // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
+    victims.extend(s.stopped.remove(&key).unwrap_or_default());
     // Parked `wait(-1)`/`waitpid(-pgid)` callers of the dying domain are reaped; others stay parked.
     let raw = std::mem::take(&mut s.reap_any_waiters);
     for (target, v) in raw {
@@ -5558,6 +5610,8 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
+    // #798 — stopped jobs die with the run like any parked daemon.
+    victims.extend(std::mem::take(&mut s.stopped).into_values().flatten());
     // parked `wait(-1)`/`waitpid(-pgid)` callers (drop the target tag, keep the vCPU)
     victims.extend(
         std::mem::take(&mut s.reap_any_waiters)
@@ -6177,6 +6231,31 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         .push(Waiter::VCpu(v));
                 } else {
                     v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                    s.runnable.push_back(v);
+                    sched.work.notify_one();
+                }
+            }
+            Step::Park(Blocked::Stopped) => {
+                // #798 slice 2 — the job-control stop park. Park-vs-continue race (mirrors the
+                // pipe parks): a SIGCONT that cleared the flag between the poll and this insert
+                // found nothing in the stopped map to drain — so re-check the flag under the lock
+                // and re-admit instead of parking forever. Keyed by domain; drained wholesale by
+                // [`Scheduler::wake_stopped`].
+                let dom = domain_key_of(&v);
+                let still_stopped = v
+                    .host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stop_flag
+                    .load(Ordering::SeqCst);
+                let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
+                if still_stopped {
+                    s.stopped.entry(dom).or_default().push_back(v);
+                } else {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
@@ -7181,7 +7260,10 @@ impl SchedDriver {
                     // I48: the explorer takes the advisory downgrade at the resume site (the
                     // blocking idle is gated on `SchedRef::Real`), so `cont.resume.block` there
                     // returns FIBER_PARKED and never produces this park — the arm is defensive.
-                    | Blocked::ContResumeBlock { .. },
+                    | Blocked::ContResumeBlock { .. }
+                    // #798: the explorer never installs a stop closure, so the stop flag is never
+                    // set and this park never fires — defensive, fail-closed like the rest.
+                    | Blocked::Stopped,
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -9111,6 +9193,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // #863 slice 3 — this vCPU's own domain, for the scoped park interrupt a deliverable signal
     // fires (INVARIANTS.md #12: a signal to this process never sweeps another domain's parks).
     let sig_domain = host.lock().unwrap_or_else(|e| e.into_inner()).domain_id() as usize;
+    // #798 slice 2 — the domain's job-control stop flag (shared by every vCPU of the domain): one
+    // relaxed load per op, park [`Blocked::Stopped`] while set. Cloned once — the personality's
+    // stop closure holds the same `Arc`.
+    let stop_flag = host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stop_flag
+        .clone();
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -9710,6 +9800,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
+            // #798 slice 2 — the job-control stop: park between ops while the domain's flag is set
+            // (nothing rewound; a resume executes the current inst). Checked after `kill` (death
+            // beats stop) and before signal delivery (a stopped process handles its signals at
+            // continue, not while stopped — POSIX).
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(Inner::Park(Blocked::Stopped));
+            }
             // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
             // has a caught, unmasked signal pending (its cheap `armed` flag is set) and we are not already
             // inside a handler, redirect this fiber into the handler `void handler(int)` — on its own
@@ -10477,6 +10574,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.interrupt_interruptible_parks(dom);
                                             }
                                         }));
+                                        // #798 slice 2 — and its stop/continue closure.
+                                        let stop_flag = ch.stop_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            stop_flag.store(stopped, Ordering::SeqCst);
+                                            if !stopped {
+                                                if let Some(sc) = sched_weak.upgrade() {
+                                                    sc.wake_stopped(dom);
+                                                }
+                                            }
+                                        }));
                                     }
                                 }
                                 // IMPORTS.md phase 3 / S2.1 + §3.3: bind the child module's
@@ -10887,6 +10995,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         source.set_wake(Arc::new(move || {
                                             if let Some(sc) = sched_weak.upgrade() {
                                                 sc.interrupt_interruptible_parks(dom);
+                                            }
+                                        }));
+                                        // #798 slice 2 — and its stop/continue closure.
+                                        let stop_flag = ch.stop_flag.clone();
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            stop_flag.store(stopped, Ordering::SeqCst);
+                                            if !stopped {
+                                                if let Some(sc) = sched_weak.upgrade() {
+                                                    sc.wake_stopped(dom);
+                                                }
                                             }
                                         }));
                                     }
@@ -16360,6 +16479,15 @@ pub trait SignalSource: Send + Sync {
     /// syscall returns `-EINTR`. Default no-op — a source with no embedder-raise path need not store it;
     /// the interp installs `|| {}` at teardown to drop its `Scheduler` reference (cycle discipline).
     fn set_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {}
+
+    /// #798 slice 2 — store the run's **stop/continue closure**: `stop(true)` sets the domain's
+    /// stop flag (the domain parks at its next per-op poll, [`Blocked::Stopped`]); `stop(false)`
+    /// clears it and drains the domain's stopped parks. Installed at the same sites as the wake
+    /// (run start / twin mint / child build), holding the scheduler weakly — same no-teardown
+    /// discipline. The personality invokes it per its own signal policy (SIGSTOP/SIGTSTP default
+    /// actions, SIGCONT); the core never sees a signal number. Default no-op — a source with no
+    /// job-control story need not store it.
+    fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
 }
 
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
@@ -16618,6 +16746,11 @@ pub struct Host {
     /// task's raw exit status when this host's **fork-twin** task completes, so each personality
     /// retires the process from its own table. Empty for every non-forked host.
     exit_hooks: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
+    /// #798 slice 2 — the domain's **job-control stop flag**: set/cleared by the personality's
+    /// stop closure ([`SignalSource::set_stop`]); every vCPU of the domain polls it per op (beside
+    /// `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`] while set. On the `Host` so
+    /// thread siblings share it — a stop stops the whole domain.
+    stop_flag: Arc<AtomicBool>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -17008,6 +17141,7 @@ impl Host {
             sig_armed: Arc::new(AtomicBool::new(false)),
             sig_source: None,
             exit_hooks: Vec::new(),
+            stop_flag: Arc::new(AtomicBool::new(false)),
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),

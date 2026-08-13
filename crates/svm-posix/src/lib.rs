@@ -259,8 +259,15 @@ const EPERM: i64 = -1; // tcsetpgrp to a process group nobody occupies (#798)
 const ENOTTY: i64 = -25; // a tc* op on an fd that is not the proto-terminal (#798)
 
 /// #798 — the job-control signal numbers (Linux values, like every signum here).
+const SIGCONT: i32 = 18; // continue a stopped process (also deliverable if caught)
+const SIGSTOP: i32 = 19; // unconditional stop (uncatchable)
+const SIGTSTP: i32 = 20; // the terminal ^Z — stop unless caught/ignored
 const SIGTTIN: i32 = 21; // background read from the terminal
 const SIGTTOU: i32 = 22; // background write to the terminal
+
+/// #798 slice 2 — `waitpid` option bits (Linux values).
+const WUNTRACED: i64 = 2; // also report a freshly-stopped child
+const WCONTINUED: i64 = 8; // also report a freshly-continued child
 const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
 const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
 const EAGAIN: i64 = -11; // read/accept on an empty memnet socket (would block a cooperative guest)
@@ -737,6 +744,19 @@ struct Proc {
     /// (#863 slice 3 — the core hands every door a domain-scoped weak wake, so reachability is
     /// independent of nesting depth and fork history; weak ⇒ a post-run fire is a no-op).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #798 slice 2 — the core's **stop/continue closure** for this process's domain
+    /// ([`SignalSource::set_stop`], installed beside the wake): `f(true)` parks the domain at its
+    /// next per-op poll, `f(false)` resumes it. `None` (a driver without the mechanism — the
+    /// bytecode driver, a bare unit test) degrades to bookkeeping-only stops: the table records
+    /// the stop, `WUNTRACED` reports it, but the process keeps running (the L0 posture).
+    stop: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// #798 slice 2 — the signal this process is currently **stopped** by (`None` = running).
+    /// Set by the delivery gate on a default-action stop signal; cleared by `SIGCONT`.
+    stopped_sig: Option<i32>,
+    /// #798 slice 2 — a stop not yet reported through `waitpid(WUNTRACED)` (report-once).
+    stop_fresh: bool,
+    /// #798 slice 2 — a continue not yet reported through `waitpid(WCONTINUED)` (report-once).
+    cont_fresh: bool,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -924,13 +944,9 @@ impl Posix {
         // signal is not deliverable, so `wake` stays untouched and nothing is interrupted.
         let wake = {
             let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
-            st.sig_pending |= 1 << signum;
-            st.arm_signals(); // #796 L2 — deliverable async, not just at the next poll
-            if st.deliverable_now() {
-                st.wake.clone()
-            } else {
-                None
-            }
+            // The delivery gate (#798 slice 2): an embedder ^Z (SIGTSTP) stops the root, an
+            // embedder SIGCONT resumes it — same policy as every in-world raise.
+            st.deliver_signal(signum)
         };
         if let Some(w) = wake {
             w();
@@ -954,13 +970,9 @@ impl Posix {
             match w.procs.get(&pid) {
                 Some(ProcEntry::Live(t)) => {
                     let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
-                    tp.sig_pending |= 1 << signum;
-                    tp.arm_signals();
-                    if tp.deliverable_now() {
-                        tp.wake.clone()
-                    } else {
-                        None
-                    }
+                    // The delivery gate (#798 slice 2): pending, stop, or continue by the
+                    // target's dispositions; fired below, after the locks drop.
+                    tp.deliver_signal(signum)
                 }
                 Some(ProcEntry::Zombie(_)) => None, // exists until reaped; takes no signal
                 None => return ESRCH,
@@ -1099,6 +1111,14 @@ struct SignalDoor(Arc<Mutex<Proc>>);
 impl SignalSource for SignalDoor {
     fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
         let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // #798 slice 2 — a STOPPED process handles its signals at continue, not while stopped
+        // (POSIX): hold everything pending. Also closes the stop-fire race — the bookkeeping stop
+        // is synchronous under this lock, the domain flag lands a beat later, and in between the
+        // process must not consume a signal it should sleep on.
+        if st.stopped_sig.is_some() {
+            st.sig_armed.store(false, Ordering::Relaxed);
+            return None;
+        }
         // No signal stack registered ⇒ async delivery is off (poll-only): leave pending signals for the
         // guest's own `sigcheck` loop, and disarm so the interp stops asking.
         if st.sig_stack_base == 0 {
@@ -1130,6 +1150,11 @@ impl SignalSource for SignalDoor {
     /// parked blocking syscall on an embedder `^C`. Installed at run start, cleared to a no-op at teardown.
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).wake = Some(wake);
+    }
+
+    /// #798 slice 2 — store the core's stop/continue closure for this process's domain.
+    fn set_stop(&self, stop: Arc<dyn Fn(bool) + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).stop = Some(stop);
     }
 }
 
@@ -1348,6 +1373,10 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         sig_stack_base: 0,
         sig_armed: Arc::new(AtomicBool::new(false)),
         wake: None,
+        stop: None,
+        stopped_sig: None,
+        stop_fresh: false,
+        cont_fresh: false,
     }
 }
 
@@ -1445,6 +1474,84 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
 impl Proc {
     /// #796 L2 — nudge the interp's per-op poll to check for delivery: set the shared `armed` flag when
     /// async delivery is *possible* (a signal stack is registered). `SignalSource::take_deliverable` is
+    /// #798 slice 2 — **the one signal-delivery gate**: every raise aimed at this process (`kill`
+    /// self/table/table-sweep, [`Posix::kill_pid`], [`Posix::raise_signal`], the TTOU/TTIN
+    /// terminal check) routes here, so the job-control actions live in one place:
+    ///
+    /// - `SIGCONT`: clear a stop (mark it for `WCONTINUED`) and return the **continue** fire; a
+    ///   caught `SIGCONT` also pends (POSIX: the handler runs after the continue).
+    /// - `SIGSTOP`: stop, unconditionally (uncatchable, unignorable).
+    /// - `SIGTSTP`/`SIGTTIN`/`SIGTTOU`: default disposition ⇒ **stop** (mark for `WUNTRACED`);
+    ///   ignored ⇒ dropped; caught ⇒ the ordinary pending path.
+    /// - anything else: pending + arm, the wake when deliverable (the pre-slice behavior).
+    ///
+    /// Returns the deferred fire — the target's run-wake, or its stop/continue closure wrapped to
+    /// the right direction — for the caller to run **after its locks drop** ([`Ctx::wake_after`] /
+    /// the embedder paths). A missing stop closure degrades to bookkeeping-only (see
+    /// [`Proc::stop`]).
+    fn deliver_signal(&mut self, sig: i32) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let disposition = |p: &Proc, s: i32| p.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
+        match sig {
+            SIGCONT => {
+                let was_stopped = self.stopped_sig.take().is_some();
+                if was_stopped {
+                    self.cont_fresh = true;
+                    self.stop_fresh = false; // an unreported stop superseded by the continue
+                }
+                if disposition(self, SIGCONT) > SIG_IGN {
+                    self.sig_pending |= 1 << SIGCONT;
+                    self.arm_signals();
+                }
+                if was_stopped {
+                    self.stop
+                        .clone()
+                        .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(false)) })
+                } else if self.deliverable_now() {
+                    self.wake.clone()
+                } else {
+                    None
+                }
+            }
+            SIGSTOP => self.enter_stop(SIGSTOP),
+            SIGTSTP | SIGTTIN | SIGTTOU => match disposition(self, sig) {
+                SIG_DFL => self.enter_stop(sig),
+                SIG_IGN => None,
+                _ => {
+                    self.sig_pending |= 1 << sig;
+                    self.arm_signals();
+                    if self.deliverable_now() {
+                        self.wake.clone()
+                    } else {
+                        None
+                    }
+                }
+            },
+            _ => {
+                self.sig_pending |= 1 << sig;
+                self.arm_signals();
+                if self.deliverable_now() {
+                    self.wake.clone()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The stop half of the gate: record the stopping signal (report-once for `WUNTRACED`) and
+    /// return the domain-stop fire. Already-stopped ⇒ nothing new to do or report.
+    fn enter_stop(&mut self, sig: i32) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        if self.stopped_sig.is_some() {
+            return None;
+        }
+        self.stopped_sig = Some(sig);
+        self.stop_fresh = true;
+        self.cont_fresh = false;
+        self.stop
+            .clone()
+            .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(true)) })
+    }
+
     /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
     /// no-op poll. Called wherever a signal may become deliverable (raise / unblock / install a handler /
     /// register a stack).
@@ -1460,6 +1567,9 @@ impl Proc {
     /// before poking the interp: an ignored or masked signal is **not** deliverable, so it never interrupts
     /// a blocked syscall.
     fn deliverable_now(&self) -> bool {
+        if self.stopped_sig.is_some() {
+            return false; // #798 slice 2 — a stopped process delivers at continue, never before
+        }
         if self.sig_stack_base == 0 {
             return false; // async delivery off (poll-only)
         }
@@ -1516,6 +1626,10 @@ impl Proc {
             sig_stack_base: self.sig_stack_base,
             sig_armed: Arc::new(AtomicBool::new(false)),
             wake: None,
+            stop: None, // the twin's own domain gets its closure at mint (like the wake)
+            stopped_sig: None,
+            stop_fresh: false,
+            cont_fresh: false,
         }
     }
 }
@@ -2032,6 +2146,40 @@ impl Ctx<'_> {
         } else {
             None
         };
+        // #798 slice 2 — `WUNTRACED`/`WCONTINUED`: with no zombie to reap, a freshly-stopped
+        // (or freshly-continued) live process matching the pid filter is reportable — once. The
+        // entry stays in the table (the process is alive); only the fresh mark clears. Status
+        // encodes the Linux wait word: stopped = `sig<<8 | 0x7f`, continued = `0xffff`.
+        let opts = *args.get(2).unwrap_or(&0);
+        if reaped.is_none() && (opts & (WUNTRACED | WCONTINUED)) != 0 {
+            let self_pid = self.p.pid;
+            let mut hit: Option<(i32, i32)> = None;
+            for (&tpid, e) in self.w.procs.iter() {
+                if tpid == self_pid || (pid != -1 && pid != tpid as i64) {
+                    continue; // never report ourselves; respect a named-pid wait
+                }
+                let ProcEntry::Live(t) = e else { continue };
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                if (opts & WUNTRACED) != 0 && tp.stop_fresh {
+                    tp.stop_fresh = false;
+                    let sig = tp.stopped_sig.unwrap_or(SIGSTOP);
+                    hit = Some((tpid, (sig << 8) | 0x7f));
+                    break;
+                }
+                if (opts & WCONTINUED) != 0 && tp.cont_fresh {
+                    tp.cont_fresh = false;
+                    hit = Some((tpid, 0xffff));
+                    break;
+                }
+            }
+            if let Some((tpid, status)) = hit {
+                if status_ptr != 0 {
+                    mem.write_bytes(status_ptr, &status.to_le_bytes())
+                        .ok_or(Trap::Malformed)?;
+                }
+                return Ok(vec![tpid as i64]);
+            }
+        }
         let Some(p) = reaped else {
             return Ok(vec![ECHILD]);
         };
@@ -2086,8 +2234,11 @@ impl Ctx<'_> {
             if sig == 0 {
                 return 0; // kill(pid, 0): liveness probe — we exist
             }
-            self.p.sig_pending |= 1 << sig;
-            self.p.arm_signals();
+            // Through the delivery gate (#798 slice 2): a self-raised SIGTSTP stops US at the
+            // next per-op poll — the fire is deferred past this dispatch's locks like any other.
+            if let Some(f) = self.p.deliver_signal(sig as i32) {
+                self.wake_after.push(f);
+            }
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
@@ -2099,12 +2250,11 @@ impl Ctx<'_> {
                 if sig == 0 {
                     return 0; // liveness probe — the target exists
                 }
-                tp.sig_pending |= 1 << sig;
-                tp.arm_signals();
-                // Deliverable by the TARGET's dispositions ⇒ poke its run's scheduler wake — but
-                // only after this dispatch's locks drop ([`Ctx::wake_after`]), never under ours.
-                if tp.deliverable_now() {
-                    self.wake_after.extend(tp.wake.clone());
+                // The delivery gate (#798 slice 2) decides pending/stop/continue by the TARGET's
+                // dispositions; whatever it returns fires only after this dispatch's locks drop
+                // ([`Ctx::wake_after`]), never under ours.
+                if let Some(f) = tp.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
                 }
                 0
             }
@@ -2125,8 +2275,9 @@ impl Ctx<'_> {
         if self.p.pgid == pgid {
             any = true;
             if sig != 0 {
-                self.p.sig_pending |= 1 << sig;
-                self.p.arm_signals();
+                if let Some(f) = self.p.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
+                }
             }
         }
         let self_pid = self.p.pid;
@@ -2143,10 +2294,8 @@ impl Ctx<'_> {
             }
             any = true;
             if sig != 0 {
-                tp.sig_pending |= 1 << sig;
-                tp.arm_signals();
-                if tp.deliverable_now() {
-                    self.wake_after.extend(tp.wake.clone());
+                if let Some(f) = tp.deliver_signal(sig as i32) {
+                    self.wake_after.push(f);
                 }
             }
         }
@@ -2243,8 +2392,14 @@ impl Ctx<'_> {
     /// job-control-aware guest what happened).
     fn tty_background_check(&mut self, sig: i32) {
         if self.p.pgid != self.w.fg_pgid {
-            self.p.sig_pending |= 1 << sig;
-            self.p.arm_signals();
+            // #798 slice 2 — through the delivery gate: default disposition now really STOPS the
+            // background job (the doorbell became the POSIX action); ignored proceeds silently
+            // (POSIX: an ignored TTOU write goes through); caught pends. The stop fires after
+            // this dispatch's locks drop, so the current I/O completes first — close enough to
+            // the letter (POSIX stops before the I/O) and honest about it.
+            if let Some(f) = self.p.deliver_signal(sig) {
+                self.wake_after.push(f);
+            }
         }
     }
 
@@ -2265,6 +2420,11 @@ impl Ctx<'_> {
     /// — until `sigprocmask` unblocks it. `0` when nothing is deliverable — so the guest runs
     /// `((void(*)(void))handler)()` at its safe point.
     fn sigcheck(&mut self) -> i64 {
+        // #798 slice 2 — a stopped process delivers nothing until continued (POSIX; also makes
+        // the stop deterministic — see [`SignalDoor::take_deliverable`]).
+        if self.p.stopped_sig.is_some() {
+            return 0;
+        }
         loop {
             let deliverable = self.p.sig_pending & !self.p.sig_mask;
             if deliverable == 0 {
@@ -3662,6 +3822,10 @@ mod tests {
         assert_eq!(st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0], 2);
         assert_eq!(st.p.sig_pending, 0, "foreground terminal I/O is silent");
         // Move the root into its own group 9 and foreground the twin's group 1: root backgrounded.
+        // CATCH the job-control signals first — a caught TTOU/TTIN takes the pending path (the
+        // doorbell); the DEFAULT disposition now stops (#798 slice 2, asserted further down).
+        assert_eq!(st.signal(&[SIGTTOU as i64, 0x70]), 0);
+        assert_eq!(st.signal(&[SIGTTIN as i64, 0x71]), 0);
         assert_eq!(st.setpgid(&[0, 9]), 0);
         assert_eq!(
             st.tcgetpgrp(&[1]),
@@ -3676,7 +3840,7 @@ mod tests {
         assert_ne!(
             st.p.sig_pending & (1 << SIGTTOU),
             0,
-            "a background terminal write rings SIGTTOU"
+            "a background terminal write rings caught SIGTTOU"
         );
         assert_eq!(
             st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0],
@@ -3686,8 +3850,30 @@ mod tests {
         assert_ne!(
             st.p.sig_pending & (1 << SIGTTIN),
             0,
-            "a background terminal read rings SIGTTIN"
+            "a background terminal read rings caught SIGTTIN"
         );
+        // #798 slice 2 — back to the DEFAULT disposition: a background write now records a real
+        // stop (bookkeeping-only here — a unit Ctx has no core stop closure installed).
+        assert_eq!(st.signal(&[SIGTTOU as i64, SIG_DFL]), 0x70);
+        st.p.sig_pending = 0;
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(
+            st.p.stopped_sig,
+            Some(SIGTTOU),
+            "default-disposition TTOU stops the background writer"
+        );
+        assert!(st.p.stop_fresh, "the stop is fresh for WUNTRACED");
+        assert_eq!(
+            st.p.sig_pending, 0,
+            "a default-action stop is not a pending bit"
+        );
+        // SIGCONT through the gate clears the stop and marks the continue.
+        assert!(
+            st.p.deliver_signal(SIGCONT).is_none(),
+            "no closure to fire in a unit Ctx"
+        );
+        assert_eq!(st.p.stopped_sig, None, "continued");
+        assert!(st.p.cont_fresh, "the continue is fresh for WCONTINUED");
         // The root takes the terminal back for its own group — foreground again, silence again.
         assert_eq!(
             st.tcsetpgrp(&[1, 9]),
@@ -3709,6 +3895,121 @@ mod tests {
             st.p.sig_pending & (1 << SIGTTOU),
             0,
             "file I/O is not terminal I/O — no TTOU"
+        );
+    }
+
+    /// #798 slice 2 — stop/continue through the delivery gate, end to end at the unit level: a
+    /// default-disposition `SIGTSTP` at a twin fires its **stop closure** (`f(true)`, deferred
+    /// past the dispatch's locks like a wake) and `waitpid(-1, WUNTRACED)` reports the stop once
+    /// (`sig<<8 | 0x7f`); while stopped, further signals are held (`sigcheck` empty, no wake);
+    /// `SIGCONT` fires `f(false)`, `waitpid(-1, WCONTINUED)` reports once (`0xffff`), and the held
+    /// signal delivers after the continue. A CAUGHT `SIGTSTP` never stops (ordinary pending).
+    #[test]
+    fn sigtstp_stops_fire_the_domain_closure_and_waitpid_reports_them() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
+        let mut forked = cap_fork_factory(&posix)(7);
+        // A mock core stop closure on the twin's door: records the last direction.
+        let dir = Arc::new(AtomicI32::new(0));
+        let d2 = Arc::clone(&dir);
+        let (door, _armed) = forked.signal.as_ref().expect("the twin has a door");
+        door.set_stop(Arc::new(move |stopped| {
+            d2.store(if stopped { 1 } else { -1 }, Ordering::SeqCst);
+        }));
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+
+        // Default-disposition SIGTSTP: the twin stops; the closure fires (detached thread — poll).
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dir.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stop closure fires f(true)"
+            );
+            std::thread::yield_now();
+        }
+        // WUNTRACED reports the stop, once.
+        let r = root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap();
+        assert_eq!(
+            r,
+            vec![7],
+            "waitpid(-1, WUNTRACED) reports the stopped twin"
+        );
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status & 0xff, 0x7f, "the stopped marker");
+        assert_eq!((status >> 8) & 0xff, SIGTSTP, "the stopping signal");
+        assert_eq!(
+            root_handler(OP_WAITPID, &[-1, 100, WUNTRACED], Some(&mut mem), None).unwrap(),
+            vec![ECHILD],
+            "report-once"
+        );
+        // While stopped: an ordinary signal is HELD — the twin's sigcheck stays empty.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0],
+            "a stopped process delivers nothing"
+        );
+        // SIGCONT: the closure fires f(false); WCONTINUED reports once; the held 10 now delivers.
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGCONT as i64], None, None).unwrap(),
+            vec![0]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dir.load(Ordering::SeqCst) != -1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the continue fires f(false)"
+            );
+            std::thread::yield_now();
+        }
+        let r = root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap();
+        assert_eq!(r, vec![7], "waitpid(-1, WCONTINUED) reports the continue");
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(status, 0xffff, "the continued status word");
+        assert_eq!(
+            root_handler(OP_WAITPID, &[-1, 100, WCONTINUED], Some(&mut mem), None).unwrap(),
+            vec![ECHILD],
+            "report-once"
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x77],
+            "the held signal delivers after the continue"
+        );
+        // A CAUGHT SIGTSTP never stops: ordinary pending.
+        assert_eq!(
+            (forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
+            vec![0]
+        );
+        dir.store(0, Ordering::SeqCst);
+        assert_eq!(
+            root_handler(OP_KILL, &[7, SIGTSTP as i64], None, None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x99],
+            "caught TSTP takes the pending path"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            dir.load(Ordering::SeqCst),
+            0,
+            "no stop fired for a caught TSTP"
         );
     }
 
