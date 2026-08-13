@@ -4914,11 +4914,16 @@ impl Scheduler {
             },
             None => None,
         };
+        // The twin's TaskId — read (not yet committed) so the fork factories learn the pid the
+        // parent's `fork()` will return (#863 slice 2: a personality registers the new process in
+        // its table at birth). Stable under `s` (the scheduler lock is held throughout); committed
+        // below only once the fork succeeds, so a failed fork burns no id.
+        let twin_id = s.next_task;
         // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
         let twin_host = {
             let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
-            match hg.fork_powerbox() {
+            match hg.fork_powerbox(twin_id) {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
                     drop(hg);
@@ -4926,7 +4931,6 @@ impl Scheduler {
                 }
             }
         };
-        let twin_id = s.next_task;
         s.next_task += 1;
         s.live += 1;
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
@@ -15687,7 +15691,12 @@ pub type HostProc = Box<
 /// granted *without* a factory keeps today's behavior: [`Host::fork_powerbox`] fails closed on it.
 /// `Arc` so the factory itself rides into the twin — a forked domain remains forkable
 /// (fork-of-fork, nested guests).
-pub type HostProcFork = Arc<dyn Fn() -> ForkedProc + Send + Sync>;
+///
+/// #863 slice 2 — the argument is the twin's **pid** (its scheduler `TaskId`, the value the
+/// parent's `fork()` returns), so a personality can register the new process in its own process
+/// table at birth (`kill(pid)`/`waitpid(pid)` then mean the same pid everywhere). A provider with
+/// no process table ignores it ([`ForkedProc::shared`] mints).
+pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
 
 /// #863 — what a [`HostProcFork`] factory mints for a **new process domain**. Beyond the fresh
 /// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
@@ -16897,7 +16906,7 @@ impl Host {
     /// Stream / Exit / Clock / Memory / SharedRegion / Budget) plus live offers, a self-module, an
     /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
-    fn fork_powerbox(&self) -> Option<Host> {
+    fn fork_powerbox(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
@@ -16961,7 +16970,7 @@ impl Host {
             .iter()
             .map(|e| {
                 let factory = e.fork.as_ref().unwrap();
-                let forked = factory();
+                let forked = factory(twin_pid);
                 if forked.signal.is_some() {
                     twin_sig = forked.signal;
                 }
@@ -19995,7 +20004,10 @@ impl Host {
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
                 .map(|factory| {
-                    let forked = factory();
+                    // Pid `0` = anonymous: this re-grant wires a *spawned* child (no fork pid — its
+                    // TaskId is minted later, by the spawn), so the personality mints the clone
+                    // without registering it in its process table (#863 slice 2).
+                    let forked = factory(0);
                     if let Some((source, armed)) = forked.signal {
                         child.set_signal_source(source, armed);
                     }
@@ -23454,7 +23466,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         let h_inst = host.grant_instantiator(0, 1u64 << 16);
         let h_out = host.grant_stream(StreamRole::Out);
-        let twin = host.fork_powerbox().expect("a simple domain forks");
+        let twin = host.fork_powerbox(7).expect("a simple domain forks");
         // A distinct domain identity — the twin is its own domain.
         assert_ne!(
             twin.domain_id(),
@@ -23489,7 +23501,7 @@ mod fork_powerbox_tests {
         let hr = host
             .try_grant_shared_region_backed(backing)
             .expect("region grant");
-        let twin = host.fork_powerbox().expect("forks");
+        let twin = host.fork_powerbox(7).expect("forks");
         let (hid, tid) = match (
             host.resolve(hr, cap_id::SHARED_REGION),
             twin.resolve(hr, cap_id::SHARED_REGION),
@@ -23516,16 +23528,16 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
         assert!(
-            host.fork_powerbox().is_none(),
+            host.fork_powerbox(7).is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
         );
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
-            Arc::new(|| ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])))),
+            Arc::new(|_pid| ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])))),
         );
         assert!(
-            host.fork_powerbox().is_none(),
+            host.fork_powerbox(7).is_none(),
             "one factory-less host_proc fails the whole fork closed even beside a forkable one"
         );
     }
@@ -23549,8 +23561,9 @@ mod fork_powerbox_tests {
             }
         };
         let mut host = Host::new();
-        let h = host.grant_host_proc_forkable(make(), Arc::new(move || ForkedProc::shared(make())));
-        let twin = host.fork_powerbox().expect("a forkable host_proc forks");
+        let h =
+            host.grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
+        let twin = host.fork_powerbox(7).expect("a forkable host_proc forks");
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
         assert_eq!(
@@ -23565,7 +23578,7 @@ mod fork_powerbox_tests {
         );
         // The factory rode along: the twin itself remains forkable (fork-of-fork / nesting).
         assert!(
-            twin.fork_powerbox().is_some(),
+            twin.fork_powerbox(7).is_some(),
             "a forked domain is still forkable — nested guests can fork"
         );
     }
@@ -23590,8 +23603,8 @@ mod fork_powerbox_tests {
             }
         };
         let mut parent = Host::new();
-        let h =
-            parent.grant_host_proc_forkable(make(), Arc::new(move || ForkedProc::shared(make())));
+        let h = parent
+            .grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
         let mut child = Host::new();
         let ch = parent
             .regrant_into_child(h, &mut child)
@@ -23607,7 +23620,7 @@ mod fork_powerbox_tests {
             "the child's re-granted proc shares the parent's state (inherited libc / fd table)"
         );
         assert!(
-            child.fork_powerbox().is_some(),
+            child.fork_powerbox(7).is_some(),
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.

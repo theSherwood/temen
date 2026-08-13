@@ -150,3 +150,21 @@ compares an unmasked `h >> shift` generation, or a tag stamped into a value the 
 sign-tests as `handle | -errno` (invariant 5) — tag only in 64-bit cells, keep the raw
 handle untagged at the ABI boundary. (Owner-approved 2026-08-04; DESIGN.md §3c "Uniform
 pointer tagging"; the fiber 40→32 trim.)
+
+## 12. Substrate visibility is ancestor-only
+
+A domain can enumerate, address, or affect only its own descendant tree, and every domain
+it *can* name arrived through its ancestry: `fork` returns the twin's pid to the parent
+alone (the fork factory serving that fork learns the same pid at mint), reap and `setpgid`
+are parent-scoped (`-ECHILD` for anyone else). The core manufactures no reachability — no
+domain-enumeration surface, no signal-an-arbitrary-id op, no global namespaces. Global
+views (a POSIX pid table, cross-tree `kill`) are **personality policy**, assembled from
+capabilities passed down the ancestry chain (svm-posix's shared `World` rides the
+grant → fork → fork closure chain) — never substrate state. Wakes the core hands a
+personality are scoped to the target domain, never run-wide. Known debt with a convergence
+plan: `interrupt_interruptible_parks` still sweeps every park in the run — #863 slice 3
+scopes it to the target domain. *Violated by:* a core surface that resolves a pid/TaskId
+the caller's ancestry never disclosed, a new run-global sweep reachable from one domain's
+signal, or a personality handed more visibility than its grant chain carries. (Owner
+decision 2026-08-13; #863; the slice-2 process table deliberately landed in `svm-posix`,
+not the core.)

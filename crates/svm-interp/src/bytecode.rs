@@ -9683,6 +9683,9 @@ fn drive(
                     // Duplicate the caller's window (private copy — fork does not share memory) and
                     // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                     // or a non-forkable window/powerbox fails closed to a single reply.
+                    // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
+                    // here and that push, so the fork factories learn it up front (#863 slice 2).
+                    let twin_pid = tasks.len() as u64;
                     let forked = if bare {
                         caller_env.and_then(|ck| {
                             let twin_mem = match &extra_envs[ck].mem {
@@ -9693,7 +9696,7 @@ fn drive(
                                 .host
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .fork_powerbox()?;
+                                .fork_powerbox(twin_pid)?;
                             Some((ck, twin_mem, twin_host))
                         })
                     } else {

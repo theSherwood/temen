@@ -1626,14 +1626,14 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1731,14 +1731,14 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1840,14 +1840,14 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1943,14 +1943,14 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2310,14 +2310,14 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2743,14 +2743,14 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> svm_interp::ForkedProc {
             let mut inner = factory();
             svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make(0).handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2834,5 +2834,106 @@ fn a_compiled_c_program_forks_for_real_and_both_copies_write_through_the_shared_
         vals,
         vec![0, 3],
         "child wrote 0, parent wrote its pid (3) — a real compiled-C fork() through the shared stream"
+    );
+}
+
+/// #863 slice 2 — **`kill(pid, SIGUSR1)` from a compiled-C parent to its forked child, by the pid
+/// `fork()` returned.** The one-pid-space integration pin: the pid the core hands the parent (the
+/// twin's `TaskId`) must be the SAME pid the personality registered in its process table at mint —
+/// if they disagreed, the parent's `kill` would be `-ESRCH`. The child installs a SIGUSR1 handler
+/// (the L0 doorbell) and spins on `sigcheck`; the parent kills an unknown pid first (`-ESRCH`),
+/// then the child's; the child's own `sigcheck` — and only the child's — delivers the handler
+/// token, and the child's exit (42) flows back through `wait`. Impossible before the World/Proc
+/// split: parent and child shared one pending set, so per-child targeting had no address.
+///
+/// Reuses `FS_FORK_MANAGER` (fork + wait offers, one re-granted forkable cap): the `"__vm_fs"`
+/// import slot here carries the op-shifted **posix** cap — same wire shape (`args[0]` = op), only
+/// the personality behind it differs.
+const KILL_BY_PID_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long st;
+static long h;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                    /* signal(10, handler-token 7) */
+    while ((h = __vm_fs(32, 0, 0, 0, 0)) == 0);  /* sigcheck: spin until the kill lands */
+    if (h == 7) return 42;
+    return 9;
+  }
+  if (__vm_fs(31, 99, 10, 0, 0) != -3) return 1; /* kill(unknown pid) is -ESRCH */
+  if (__vm_fs(31, pid, 10, 0, 0) != 0) return 2; /* kill(child, 10) — by the fork() pid */
+  if (__vm_fs(32, 0, 0, 0, 0) != 0) return 3;    /* the PARENT's own sigcheck stays empty */
+  while ((st = wait_pid(pid)) < 0);
+  return st;                                     /* 42: the child saw the pid-targeted signal */
+}
+"#;
+
+/// Op-shift a posix fork factory into the manager re-grant wire shape (`args[0]` = op, like the
+/// fs-cap tests), preserving the #863 extras — the per-process signal door rides along untouched,
+/// and the replacement factory is re-wrapped so fork-of-fork keeps the shape.
+fn opshift_fork(base: svm_interp::HostProcFork) -> svm_interp::HostProcFork {
+    Arc::new(move |pid| {
+        let forked = base(pid);
+        let mut inner = forked.handler;
+        svm_interp::ForkedProc {
+            handler: Box::new(move |_slot_op, args, mem, minter| {
+                inner(args[0] as u32, &args[1..], mem, minter)
+            }),
+            signal: forked.signal,
+            refork: forked.refork.map(opshift_fork),
+        }
+    })
+}
+
+#[test]
+fn a_compiled_c_parent_kills_its_forked_child_by_pid() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{KILL_BY_PID_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse kill-by-pid guest");
+    verify_module(&guest).expect("verify kill-by-pid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the child saw the parent's pid-targeted SIGUSR1 (its sigcheck delivered the handler \
+         token) and its exit rode back through wait — fork pid, table pid, and kill pid are ONE"
     );
 }
