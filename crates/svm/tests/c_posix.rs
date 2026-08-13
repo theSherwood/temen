@@ -296,6 +296,140 @@ int main(void) {
     );
 }
 
+/// #796 block-during-handler — **a handler is never reentered by its own signal**: the handler
+/// re-raises SIGINT at itself and spins a window; the delivery mask (the delivered signal is
+/// blocked for the handler's duration, POSIX) holds it — a leak would re-enter and bump `count`
+/// inside the window. On return the mask restores and the held raise delivers (a second, NON-nested
+/// handler run): `count` reaches 2 with `leaked` still 0. Interpreter-only (no JIT safepoints).
+#[test]
+fn c_a_handler_is_never_reentered_by_its_own_signal() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int count;
+static volatile int leaked;
+static void handler(int sig) {
+  count = count + 1;
+  if (count == 1) {
+    __px_kill(0, 0, 2);                        /* re-raise SIGINT inside its own handler */
+    long i = 0;
+    while (i < 2000000) i = i + 1;             /* the leak window: a reentry would bump count */
+    if (count != 1) leaked = 1;
+  }
+}
+int main(void) {
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (count < 2) {                          /* the held raise delivers at handler return */
+    i = i + 1;
+    if (i > 100000000) return -1;
+  }
+  return leaked * 100 + count;                 /* 2: delivered twice, never nested */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(2)],
+        "the in-handler re-raise was held (blocked) and delivered exactly once after return"
+    );
+}
+
+/// #796 nested delivery — **a different unmasked signal interrupts a running handler**: SIGINT's
+/// handler raises SIGUSR1 at itself and spins until USR1's handler runs — which can only happen
+/// NESTED (the old one-in-handler guard would spin this forever / return the stuck marker).
+/// `saw10_in2 = 1` witnesses USR1's handler running while SIGINT's was live.
+#[test]
+fn c_a_different_signal_nests_into_a_running_handler() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int in2;
+static volatile int fired10;
+static volatile int saw10_in2;
+static volatile int stuck;
+static void h10(int sig) { saw10_in2 = in2; fired10 = 1; }
+static void h2(int sig) {
+  in2 = 1;
+  __px_kill(0, 0, 10);                         /* raise USR1 inside SIGINT's handler */
+  long i = 0;
+  while (!fired10) {                           /* only a NESTED delivery can break this */
+    i = i + 1;
+    if (i > 100000000) { stuck = 1; break; }
+  }
+  in2 = 0;
+}
+int main(void) {
+  __px_signal(0, 2, (long)h2);
+  __px_signal(0, 10, (long)h10);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (!fired10) { i = i + 1; if (i > 100000000) return -1; }
+  return stuck * 100 + saw10_in2 * 10 + fired10;  /* 11: nested, not stuck */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(11)],
+        "USR1's handler ran nested inside SIGINT's (saw10_in2 = 1), no stuck marker"
+    );
+}
+
+/// #796 `sa_mask` — **a sigaction-masked signal is held for the handler's duration**: SIGINT is
+/// installed via `sigaction` with `sa_mask` blocking USR1; the handler raises USR1 and spins a
+/// window — it must NOT nest (held by the handler mask); it delivers after the handler returns.
+/// The complement of the nesting test: same shape, `sa_mask` flips the outcome.
+#[test]
+fn c_sa_mask_holds_a_signal_for_the_handlers_duration() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+static char sigstk[16384];
+static long act[3];
+static volatile int in2;
+static volatile int fired10;
+static volatile int saw10_in2;
+static volatile int held;
+static void h10(int sig) { saw10_in2 = in2; fired10 = 1; }
+static void h2(int sig) {
+  in2 = 1;
+  __px_kill(0, 0, 10);                         /* raise USR1 -- sa_mask blocks it here */
+  long i = 0;
+  while (i < 2000000) i = i + 1;               /* the window: a leak would nest h10 */
+  held = !fired10;                             /* still held at the end of the handler */
+  in2 = 0;
+}
+int main(void) {
+  act[0] = (long)h2;
+  act[1] = (1L << 10);                         /* sa_mask: block USR1 while h2 runs */
+  act[2] = 0;
+  __px_sigaction(0, 2, (long)act, 0);
+  __px_signal(0, 10, (long)h10);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (!fired10) { i = i + 1; if (i > 100000000) return -1; }  /* delivers at h2's return */
+  return held * 100 + saw10_in2 * 10 + fired10;  /* 101: held during h2, delivered after, not nested */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(101)],
+        "sa_mask held USR1 through the handler (held=1), delivered non-nested after return"
+    );
+}
+
 /// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
 /// only**. Each `__px_` extern's first argument is a literal `0` — a dummy handle operand,
 /// vestigial in static dispatch (the slot binding carries the handle); no `__vm_cap`, no stash.
@@ -582,17 +716,76 @@ fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
     );
 }
 
+/// #796 `SA_RESTART` — **a restart-flagged delivery re-issues the blocked read instead of `-EINTR`**:
+/// SIGINT is installed via `sigaction` with `SA_RESTART`; the raiser interrupts `main`'s blocked
+/// pipe read — the handler runs (fired = 2, promptly: the woken read re-executes and the per-op
+/// poll delivers first), but the read RESTARTS (re-parks) instead of surfacing `-EINTR`, and later
+/// completes with the raiser's DATA. The exact complement of the `-EINTR` test above — the
+/// `sa_flags` bit flips the outcome.
+const RESTART_READ_SRC: &str = r#"
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static long act[3];
+static char msg[] = "GO\n";
+static volatile int fired;
+static void handler(int sig) { fired = sig; }
+long g_wfd;
+long raiser(long arg) {
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* let main reach its read and park */
+  __px_kill(0, 0, 2);          /* SA_RESTART'd SIGINT: handler runs, the read must RESTART */
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* window: an EINTR would surface here */
+  __vm_write(g_wfd, msg, 3);   /* the restarted read completes with data */
+  return 0;
+}
+int main(void) {
+  act[0] = (long)handler;
+  act[1] = 0;
+  act[2] = 0x10000000;         /* SA_RESTART */
+  __px_sigaction(0, 2, (long)act, 0);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* PARKS; interrupted -> handler -> RESTARTS -> data */
+  __vm_thread_join(h);
+  if (n == -4) return 42;            /* -EINTR would mean SA_RESTART was ignored */
+  return fired * 10 + (int)n;        /* 23: the handler ran AND the read completed with data */
+}
+"#;
+
+#[test]
+fn c_sa_restart_reissues_an_interrupted_blocked_read() {
+    let e = run_interp_only(RESTART_READ_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(23)],
+        "the SA_RESTART'd SIGINT ran its handler but the blocked read restarted and returned data"
+    );
+}
+
 /// #799 slice 5 — **the embedder `^C`: a signal from *outside* the run interrupts a blocked syscall.** The
 /// interactive terminal case: the guest catches SIGINT and blocks on a capability `__vm_read` in a
 /// **single** fiber — so when it parks (`Blocked::PipeRead`), *every* fiber is parked and no per-op
 /// safepoint fires. A background "terminal" thread calls `Posix::raise_signal(SIGINT)` (the embedder's
 /// signal authority over the guest — the `Posix` handle shares the personality `Inner` with the running
 /// guest); the personality decides it is deliverable and invokes the interp's scheduler-wake closure, so
-/// the parked read completes `-EINTR` (sentinel 42). The raiser retries until the run returns (robust to
-/// install/park ordering — each raise before the guest parks is a harmless no-op).
+/// the parked read completes `-EINTR` (sentinel 42). The "terminal" holds fire until the guest's
+/// readiness byte lands on stdout — #796 default actions made a pre-handler `^C` FATAL (terminate is
+/// SIGINT's `SIG_DFL` action); after the handler is installed each raise stays harmless.
 const EINTR_EMBEDDER_SRC: &str = r#"
 long __px_signal(int cap, long signum, long handler);
 long __px_sigaltstack(int cap, long sp, long size);
+long __px_write(int cap, long fd, long buf, long len);
 long __vm_pipe(int *fds);
 long __vm_read(int fd, void *buf, long len);
 static char sigstk[16384];
@@ -601,6 +794,7 @@ static void handler(int sig) { fired = sig; }
 int main(void) {
   __px_signal(0, 2, (long)handler);          /* catch SIGINT */
   __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  __px_write(0, 1, (long)sigstk, 1);         /* readiness byte: the terminal may open fire (#796) */
   int fds[2];
   __vm_pipe(fds);                            /* main holds both ends -> a live writer keeps the read blocked */
   char b[8];
@@ -631,6 +825,10 @@ fn c_an_embedder_signal_interrupts_a_blocked_read_ctrl_c() {
     let done = std::sync::Arc::new(AtomicBool::new(false));
     let done2 = std::sync::Arc::clone(&done);
     let terminal = std::thread::spawn(move || {
+        // Hold fire until the guest's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::yield_now();
+        }
         while !done2.load(Ordering::Relaxed) {
             posix2.raise_signal(2);
             std::thread::yield_now();
