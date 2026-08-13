@@ -690,9 +690,11 @@ follow-up (a shim, not a substrate concern).
   only (no bytecode/JIT/wasm) — the §9 backend-parity track.
 
 **Remaining lower-level items:** the increment-1 exec simplifications as they're needed (fresh window +
-BSS zero, durable-domain exec, exec from a nested serve context), and `WUNTRACED`/`WCONTINUED` once
-stop/continue signals exist. With `fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a
-microshell running on them, the core process-model surface a shell drives is complete.
+BSS zero, durable-domain exec, exec from a nested serve context). `WUNTRACED`/`WCONTINUED` are **done**
+(#798: stop/continue signals exist — the personality's `waitpid` reports fresh stops/continues from its
+process table; the core's contribution is the domain stop park, `Blocked::Stopped`). With
+`fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a microshell running on them, the
+core process-model surface a shell drives is complete.
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 

@@ -16,6 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`timeout-minutes: 45` on the `svm-llvm` job** (issue #906) — it was the only lane with no
+  timeout, so a wedged compile ran to GitHub's 6-hour default before reporting. Observed once: the
+  `std_guest` native-oracle `rustc` hung 66+ min on PR #898's run (the suite unexpectedly *ran*
+  there rather than auto-skipping — the runner had a usable nightly). The harness-side fix (the
+  #788 bounded-wait now also covers the native-oracle compiles, `std_guest.rs`) is the primary
+  guard; this timeout is the backstop. Normal lane time ~20 min.
+
 - **`lua-warm-snapshot-test.mjs` + Lua coverage in `snapshot-worker-test.mjs` (`browser-real` job, issue
   #805)** — one line added after `node warm-jit-test.mjs`: `node lua-warm-snapshot-test.mjs` (Node/V8
   cold ≡ warm ≡ warm+JIT byte-for-byte + isolation over the committed `lua_snapshot.svmb`). The existing
