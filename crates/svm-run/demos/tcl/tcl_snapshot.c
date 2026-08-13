@@ -305,11 +305,31 @@ int main(void) {
 /* Warm interp, left resident by `warmup` for `eval_run` (captured/restored by the host snapshot). */
 static Tcl_Interp *g_interp;
 
-/* WARM PHASE 1: register the VFS + create the interp + `Tcl_Init` into the static `g_interp`. Program-
- * independent (no stdin, no eval) — the host snapshots the window after this returns. */
+/* Pre-touch Tcl's lazily-initialized `clock` machinery so it lands ON the snapshot instead of being
+ * rebuilt on every `eval_run` (#864). `Tcl_Init` does NOT load it: the first `clock format`/`clock scan`
+ * in an interpreter lazily `package require msgcat`, loads the `clock` ensemble, and compiles a
+ * `formatproc` — ~1.4 s of program-independent init that, unmoved, is re-paid every Run over the
+ * restored image. Running it here (before the host snapshots) folds it into the warm image, so a Run's
+ * `clock` call reuses the loaded state. `catch`-wrapped and `Tcl_ResetResult`-cleared so a failure never
+ * aborts warmup and no result leaks into the snapshot; deterministic (epoch/fixed date, `-gmt 1` — the
+ * guest has no timezone data and `clock seconds` is not called). The `-format` matches the playground
+ * card's default line so its `clock format` hits an already-compiled formatproc. */
+static void prewarm_lazy(Tcl_Interp *interp) {
+    static const char *const pre =
+        "catch {package require msgcat}\n"
+        "catch {clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}}\n"
+        "catch {clock scan {2000-01-01 00:00:00} -gmt 1}\n";
+    Tcl_Eval(interp, pre);
+    Tcl_ResetResult(interp);
+}
+
+/* WARM PHASE 1: register the VFS + create the interp + `Tcl_Init` into the static `g_interp`, then
+ * pre-touch the lazy `clock` machinery (#864). Program-independent (no stdin, no user eval) — the host
+ * snapshots the window after this returns. */
 int warmup(void) {
     register_vfs();
     g_interp = make_full_interp();
+    prewarm_lazy(g_interp);
     return 0;
 }
 

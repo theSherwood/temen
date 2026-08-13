@@ -45,6 +45,8 @@ const programs = [
   ['for-loop', 'set s 0; for {set i 1} {$i <= 100} {incr i} { set s [expr $s+$i] }; puts $s\n'],
   ['proc', 'proc sq {x} {expr $x*$x}; puts [sq 9]\n'],
   ['format', 'puts [format "%.4f 0x%X" 3.14159265 255]\n'],
+  // The playground card's default `clock` line — the lazy path pre-touched in `warmup()` (#864).
+  ['clock', 'puts [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\n'],
 ];
 
 console.log(`\n${'program'.padEnd(12)}${'cold≡warm'.padStart(11)}`);
@@ -66,6 +68,20 @@ const isolated = r1.out.includes('set 4242') && r2.out.includes('exists? 0') && 
 allOk = allOk && isolated;
 console.log(`\nfresh-per-Run isolation: ${isolated ? 'OK — no variable leak across Runs' : 'LEAK!'}`);
 if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`  run2: ${JSON.stringify(r2.out)}`); }
+
+// #864 regression guard: `clock`'s lazy machinery (msgcat + the `clock` ensemble + a `formatproc`) is
+// pre-touched in `warmup()`, so it lands ON the snapshot and a Run's `clock format` reuses it instead of
+// re-paying the ~1.4 s lazy init on EVERY Run. Assert the warm clock line is fast — a revert to the
+// no-pre-touch driver spikes it back over a second, which this catches.
+{
+  const CLOCK = 'puts [clock format 1000000000 -gmt 1 -format {%Y-%m-%d %H:%M:%S}]\n';
+  const t = Number(process.hrtime.bigint() / 1000n) / 1000;
+  const w = warm(CLOCK);
+  const ms = Number(process.hrtime.bigint() / 1000n) / 1000 - t;
+  const fast = w.st === 0 && ms < 300;
+  allOk = allOk && fast;
+  console.log(`\n#864 clock pre-touch: warm clock line ${ms.toFixed(1)}ms — ${fast ? 'OK — lazy clock init is on the snapshot (not re-paid per Run)' : `REGRESSION: clock re-initializing every Run (${ms.toFixed(0)}ms > 300ms)`}`);
+}
 
 ex.svm_warm_close();
 if (!allOk) fail('Tcl warm snapshot parity/isolation mismatch');
