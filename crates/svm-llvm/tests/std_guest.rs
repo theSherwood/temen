@@ -854,6 +854,50 @@ fn std_fs_dir_ops() {
     );
 }
 
+/// S4 (HashMap) — `std::collections::HashMap` end-to-end (RUST_STD.md §5/§8 S4). `RandomState` reaches
+/// the svm PAL's `sys/random` leaf, which supplies a per-guest-deterministic seed (no host RNG op), so
+/// `HashMap` constructs and hashes without failing closed. The program's output is deliberately
+/// **iteration-order-independent** (`len`/`values().sum()`/keyed `get`/`contains_key`/`entry`) so it is
+/// byte-identical to native even though svm's seed differs from native's real random seed — the
+/// differential holds on *semantics*, which is what a fixed/deterministic seed buys (RUST_STD.md §5).
+#[test]
+fn std_hashmap_round_trips() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest hashmap (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::collections::HashMap;\n\
+         fn main() {\n\
+         \x20   let mut m: HashMap<String, u32> = HashMap::new();\n\
+         \x20   for i in 0..50u32 { m.insert(format!(\"k{i}\"), i * i); }\n\
+         \x20   for i in (0..50u32).step_by(7) { m.remove(&format!(\"k{i}\")); }\n\
+         \x20   let sum: u32 = m.values().sum();\n\
+         \x20   println!(\"len={} sum={} has_k10={} k13={}\", m.len(), sum, m.contains_key(\"k10\"), m[\"k13\"]);\n\
+         \x20   *m.entry(\"k13\".to_string()).or_insert(0) += 1000;\n\
+         \x20   *m.entry(\"knew\".to_string()).or_insert(7) += 1;\n\
+         \x20   println!(\"k13_after={} knew={} final_len={}\", m[\"k13\"], m[\"knew\"], m.len());\n\
+         }\n";
+
+    let Some((stdout, _)) = svm_run_std("svm_std_hashmap", src) else {
+        eprintln!("note: skipping std_guest hashmap (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "len=42 sum=33565 has_k10=true k13=169\n\
+         k13_after=1169 knew=8 final_len=43\n",
+        "HashMap insert/remove/get/values-sum/entry all correct, order-independent"
+    );
+    if let Some((native, _)) = native_oracle("svm_std_hashmap_oracle", src) {
+        assert_eq!(
+            stdout, native,
+            "HashMap output byte-identical to native (order-independent aggregates)"
+        );
+    }
+}
+
 /// S2 (net) — `std::net` via the **`net` capability** (POSIX.md §5a): a lockstep self-connect over
 /// the loopback **memnet** (bind `:0` → ephemeral port, connect, accept, bytes both ways, EOF on
 /// drop, `ConnectionRefused` with no listener, `localhost` resolution — all deterministic, no

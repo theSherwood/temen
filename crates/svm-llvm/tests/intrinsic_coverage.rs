@@ -188,6 +188,44 @@ fn integer_minmax_bit_intrinsic_family_lowers_and_computes() {
 }
 
 #[test]
+fn non_power_of_two_bitreverse_lowers() {
+    // `llvm.bitreverse.iN` for non-power-of-2 `N` — `core`'s recent `fmt` placeholder packing emits an
+    // `i3` bitreverse (found via the HashMap/`format!` std lane). Reverse the low `N` bits; result
+    // zero-extended to i64. Reference computed host-side by reversing `N` bits of the input.
+    let rev = |v: u64, n: u32| -> u64 {
+        let mut r = 0u64;
+        for i in 0..n {
+            if v & (1 << i) != 0 {
+                r |= 1 << (n - 1 - i);
+            }
+        }
+        r
+    };
+    // (width, input) cases spanning odd/even non-pow2 widths and both the i32 and i64 container
+    // (i40 lands in the i64 container, exercising the >32-bit path).
+    let cases: [(u32, u64); 5] = [(3, 6), (3, 5), (12, 1), (24, 1), (40, 0x01_0000_0003)];
+    let mut failures = Vec::new();
+    for (n, input) in cases {
+        // Bespoke module (the shared `module()` hardcodes a `zext i32`, wrong for these widths).
+        let ir = format!(
+            "{HEADER}declare i{n} @llvm.bitreverse.i{n}(i{n})\n\
+             define i64 @f() {{\nentry:\n  \
+             %r = call i{n} @llvm.bitreverse.i{n}(i{n} {input})\n  \
+             %z = zext i{n} %r to i64\n  ret i64 %z\n}}\n"
+        );
+        let expected = rev(input, n) as i64;
+        match run_i64(&ir) {
+            Ok(got) if got == expected => {}
+            Ok(got) => failures.push(format!(
+                "bitreverse.i{n}({input}): got {got}, want {expected}"
+            )),
+            Err(e) => failures.push(format!("bitreverse.i{n}({input}): {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn unknown_llvm_intrinsic_fails_closed() {
     // A made-up `llvm.*` name must NOT be silently accepted (translated + verified into a call to a
     // nonexistent body). Fail-closed = an error at some stage; a clean `Ok` here would mean the on-ramp

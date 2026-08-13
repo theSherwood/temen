@@ -14294,10 +14294,17 @@ fn emit_bswap(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, nbytes: u64) -> ValIdx {
 /// network: `((v & m_s) << s) | ((v >> s) & m_s)` for s = 1,2,…,bits/2, where `m_s` selects the
 /// even-indexed `s`-bit groups (`s` ones, `s` zeros, repeating). The on-ramp keeps narrow integers
 /// zero-extended in their container (§3b), so a 16-bit value reverses cleanly into the low 16 bits.
-/// Lowers `llvm.bitreverse.{i8,i16,i32,i64}`; a non-power-of-2 width is `Unsupported` (fail-closed).
+/// Lowers `llvm.bitreverse.iN`. Power-of-2 widths (`{i8,i16,i32,i64}`) reverse exactly their `N` bits
+/// in place via the swap network. A **non-power-of-2** width (e.g. `i3`, which `core`'s recent `fmt`
+/// placeholder packing emits) reverses the full power-of-2 container (32 or 64) and shifts the reversed
+/// low-`N` bits — which land in the container's high end — back down to `[0, N)`; the shift discards the
+/// container's other bits, so this is correct with no zero-extension precondition on `v`.
 fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Result<ValIdx, Error> {
-    if !matches!(bits, 8 | 16 | 32 | 64) {
-        return unsup(format!("llvm.bitreverse.i{bits} (non-power-of-2 width)"));
+    let container = if ty == IntTy::I64 { 64u32 } else { 32u32 };
+    if bits == 0 || bits > container {
+        return unsup(format!(
+            "llvm.bitreverse.i{bits} (width out of range for its {container}-bit container)"
+        ));
     }
     let kof = |ctx: &mut BlockCtx, k: u64| {
         ctx.push(if ty == IntTy::I64 {
@@ -14306,6 +14313,20 @@ fn emit_bitreverse(ctx: &mut BlockCtx, v: ValIdx, ty: IntTy, bits: u32) -> Resul
             Inst::ConstI32(k as i32)
         })
     };
+    // Non-power-of-2: reverse the whole container (a power-of-2 → the fast path below), then right-shift
+    // the reversed `N` bits down out of the container's high end. `reverse_w(v)` maps `v`'s bit `i` to
+    // bit `w-1-i`, so `v`'s low `N` bits land at `[w-N, w)`; `>> (w-N)` brings them to `[0, N)` and drops
+    // everything the reversal moved into `[0, w-N)`.
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        let full = emit_bitreverse(ctx, v, ty, container)?;
+        let sh = kof(ctx, (container - bits) as u64);
+        return Ok(ctx.push(Inst::IntBin {
+            ty,
+            op: BinOp::ShrU,
+            a: full,
+            b: sh,
+        }));
+    }
     let mut cur = v;
     let mut s = 1u32;
     while s < bits {
