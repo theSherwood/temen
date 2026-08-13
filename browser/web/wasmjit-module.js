@@ -206,38 +206,108 @@ async function driveTierupRun(ex, memory, cacheKey) {
   });
   const emitted = instance.exports;
   const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
-  // §22 unit instances, one per code handle (#835). Per-Run only: code handles are per-session.
+
+  // ---- #846: the linked-unit driver — one shared funcref table + the live-state bounce --------
+  // §22 units emit in Model B2 shape: their `call_indirect` dispatches through this table, whose
+  // slots the driver populates from the engine's mirror at each event boundary — an installed
+  // unit's emitted `f0`, an eligible program function's `f{i}` from the main emitted module, or a
+  // **bounce shim** (engine-generated trampoline) for interpreter-resident targets. The bounce
+  // (`env.call_interp`) runs the target on a nested interpretation over the run's LIVE
+  // window/powerbox/fuel, then fans the fresh `"mapped"` extent out to every live instance (a
+  // callback may have vm_map-grown the window mid-invoke). Proven observably identical to
+  // `onramp_exec` by tests/tierup_driver.rs's `TierupDriver` (wasmi playing this file's role).
+  const tsize = 1 << ex.svm_onramp_tierup_table_log2();
+  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
+  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set
+  const fuelGlobals = [];
+  const registerGlobals = (exports) => {
+    if (exports.mapped) mappedGlobals.push(exports.mapped);
+    if (exports.fuel) fuelGlobals.push(exports.fuel);
+  };
+  registerGlobals(emitted);
+  const unitImports = () => ({ env: {
+    memory,
+    __indirect_function_table: table,
+    trap: () => {},
+    call_interp: (target, argsPtr) => {
+      const rc = ex.svm_onramp_tierup_call_interp(target, argsPtr);
+      // #717 fan-out: growth a bounced callback made is visible from the next instruction on.
+      const now = ex.svm_onramp_tierup_mapped_now();
+      for (const g of mappedGlobals) g.value = now;
+      if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
+    },
+  } });
+  // Per-code-handle unit instances and per-(slot, occupant) bounce shims; per-Run only. Async
+  // instantiation (the drive loop awaits it) — a macro unit can exceed the main thread's sync
+  // compile allowance.
   const jitUnits = new Map();
+  const shims = new Map();
+  const instantiateUnit = async (bytes) => {
+    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
+    registerGlobals(inst.exports);
+    return inst.exports;
+  };
+  const shimFor = async (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const len = ex.svm_onramp_tierup_shim_wasm(slot);
+      if (len === 0) return null;
+      const bytes = u8().slice(Number(ex.svm_onramp_tierup_shim_ptr()), Number(ex.svm_onramp_tierup_shim_ptr()) + len);
+      f = (await instantiateUnit(bytes))['t'];
+      shims.set(key, f);
+    }
+    return f;
+  };
+  const unitFor = async (code, bytes) => {
+    let unit = jitUnits.get(code);
+    if (unit === undefined) {
+      unit = await instantiateUnit(bytes);
+      jitUnits.set(code, unit);
+    }
+    return unit;
+  };
+  // Rebuild the table from the engine's slot mirror. Installs only happen between events (a unit
+  // with a cap.call never emits), so an event-boundary sync is exact for the whole event.
+  const nfuncs = ex.svm_onramp_tierup_nfuncs();
+  const syncTable = async () => {
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
+      } else {
+        const code = ex.svm_onramp_tierup_slot_code(slot);
+        if (code >= 0) {
+          const len = ex.svm_onramp_tierup_jit_wasm_by_handle_len(code);
+          entry = len > 0
+            ? (await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()),
+                                              Number(ex.svm_onramp_tierup_jit_wasm_by_handle_ptr()) + len)))['f0']
+            : await shimFor(slot, code);
+        }
+      }
+      table.set(slot, entry);
+    }
+  };
 
   try {
     for (;;) {
       const ev = ex.svm_onramp_tierup_run();
       if (ev === 3 /* TIERUP_RUN_JIT_INVOKE */) {
-        // A guest-compiled §22 unit with emitted wasm: instantiate once per code handle, then
-        // `f0(win, env, ...args)` with the per-call `"mapped"` sync — worker.js's JIT_INVOKE
-        // handler, single-shot edition.
+        // A guest-compiled §22 unit with emitted wasm: sync the table, instantiate once per code
+        // handle, then `f0(win, env, ...args)` with the per-event `"mapped"`/fuel sync fanned out
+        // to every live instance (a unit's table dispatch may run any of them).
+        await syncTable();
         const code = ex.svm_onramp_tierup_jit_code();
-        let unit = jitUnits.get(code);
-        if (unit === undefined) {
-          const wptr = Number(ex.svm_onramp_tierup_jit_wasm_ptr());
-          const wlen = ex.svm_onramp_tierup_jit_wasm_len();
-          const uinst = await WebAssembly.instantiate(
-            await WebAssembly.compile(u8().slice(wptr, wptr + wlen)),
-            { env: {
-                memory,
-                trap: () => {},
-                call_interp: () => { throw new Error('unexpected cross-tier call from an emitted unit'); },
-            } },
-          );
-          unit = uinst.exports;
-          jitUnits.set(code, unit);
-        }
+        const unit = await unitFor(code, u8().slice(Number(ex.svm_onramp_tierup_jit_wasm_ptr()),
+                                                    Number(ex.svm_onramp_tierup_jit_wasm_ptr()) + ex.svm_onramp_tierup_jit_wasm_len()));
         const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
         const n = ex.svm_onramp_tierup_argv_len();
         const ptypes = new Uint8Array(memory.buffer, Number(ex.svm_onramp_tierup_jit_param_types_ptr()), n);
         const args = [];
         for (let i = 0; i < n; i++) args.push(tierupJitArg(i64()[(argvPtr >> 3) + i], ptypes[i]));
-        unit.mapped.value = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
+        const mapped = ex.svm_onramp_tierup_mapped(); // #717 host sync, as TIERUP below
+        for (const g of mappedGlobals) g.value = mapped;
+        for (const g of fuelGlobals) g.value = 1n << 61n;
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
         try {
           const ret = unit['f0'](win, envCell, ...args);
@@ -250,6 +320,8 @@ async function driveTierupRun(ex, memory, cacheKey) {
           ex.svm_onramp_tierup_deliver_jit(rptr, rets.length);
           ex.svm_dealloc(rptr, rlen);
         } catch {
+          // A wasm trap — or a bounce callback's trap/exit, which the engine staged and
+          // `deliver_jit_trap` resolves as the real trap kind (an exit ends the run as EXIT).
           ex.svm_onramp_tierup_deliver_jit_trap();
         }
         continue;

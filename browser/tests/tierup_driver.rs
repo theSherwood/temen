@@ -9,14 +9,20 @@
 //! the event/sync contract over a raw `Vcpu`, and `page_ops.rs` the eligibility split. This test
 //! proves the *browser FFI* wiring end-to-end: open → pump → service → deliver → capture slots.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use svm_browser::{
-    onramp_exec, svm_onramp_tierup_argv_len, svm_onramp_tierup_argv_ptr, svm_onramp_tierup_close,
-    svm_onramp_tierup_deliver, svm_onramp_tierup_deliver_jit, svm_onramp_tierup_deliver_jit_trap,
-    svm_onramp_tierup_deliver_trap, svm_onramp_tierup_func, svm_onramp_tierup_jit_param_types_ptr,
-    svm_onramp_tierup_jit_result_types_len, svm_onramp_tierup_jit_wasm_len,
-    svm_onramp_tierup_jit_wasm_ptr, svm_onramp_tierup_mapped, svm_onramp_tierup_open,
-    svm_onramp_tierup_run, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
+    onramp_exec, svm_onramp_tierup_argv_len, svm_onramp_tierup_argv_ptr,
+    svm_onramp_tierup_call_interp, svm_onramp_tierup_close, svm_onramp_tierup_deliver,
+    svm_onramp_tierup_deliver_jit, svm_onramp_tierup_deliver_jit_trap,
+    svm_onramp_tierup_deliver_trap, svm_onramp_tierup_func, svm_onramp_tierup_jit_code,
+    svm_onramp_tierup_jit_param_types_ptr, svm_onramp_tierup_jit_result_types_len,
+    svm_onramp_tierup_jit_result_types_ptr, svm_onramp_tierup_jit_wasm_by_handle_len,
+    svm_onramp_tierup_jit_wasm_by_handle_ptr, svm_onramp_tierup_jit_wasm_len,
+    svm_onramp_tierup_jit_wasm_ptr, svm_onramp_tierup_mapped, svm_onramp_tierup_mapped_now,
+    svm_onramp_tierup_nfuncs, svm_onramp_tierup_open, svm_onramp_tierup_run,
+    svm_onramp_tierup_shim_ptr, svm_onramp_tierup_shim_wasm, svm_onramp_tierup_slot_code,
+    svm_onramp_tierup_table_log2, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
     svm_onramp_tierup_wasm_ptr, svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr,
     svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_UNSUPPORTED,
     TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
@@ -158,6 +164,18 @@ fn run_emitted_on_wasmi(wasm: &[u8], entry: &str, n_results: usize) -> Option<Ve
 
     let mut linker: Linker<i32> = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
+    // #846: B2-emitted units import the shared funcref table; a closed unit never call_indirects,
+    // so an all-null table satisfies the import without changing behavior. (Linked-unit dispatch is
+    // the full driver's job — `TierupDriver` below.)
+    let table = wasmi::Table::new(
+        &mut store,
+        wasmi::TableType::new(wasmi::core::ValType::FuncRef, 1 << 10, Some(1 << 10)),
+        Val::FuncRef(wasmi::FuncRef::null()),
+    )
+    .unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
     linker
         .func_wrap("env", "trap", |mut c: Caller<'_, i32>, code: i32| {
             *c.data_mut() = code;
@@ -756,5 +774,576 @@ export 0 func "_start" 0
     assert_eq!(svm_status(), STATUS_UNSUPPORTED);
     // A refused open leaves no session: the pump reports TRAP immediately, not a phantom run.
     assert_eq!(svm_onramp_tierup_run(), TIERUP_RUN_TRAP);
+    svm_onramp_tierup_close();
+}
+
+// ---- #846: the linked-unit driver (B2 table + live-state bounce), wasmi as the JS host --------
+
+/// Shared state the bounce closure reaches through the wasmi store: the one memory, every live
+/// instance's `"mapped"`/`"fuel"` globals (the post-bounce fan-out set), and the bounce log the
+/// tests read for per-edge non-vacuity.
+#[derive(Default)]
+struct DriverData {
+    mem: Option<Memory>,
+    mapped_globals: Vec<wasmi::Global>,
+    fuel_globals: Vec<wasmi::Global>,
+    bounces: Vec<u32>,
+}
+
+/// `driveTierupRun`'s #846 shape with wasmi playing the JS host: one funcref table shared by every
+/// instance (main `f{i}`s, unit `f0`s, bounce shims), a live-state `call_interp` that mirrors the
+/// window across the wasm/engine boundary around each bounce and fans the fresh `mapped` extent out
+/// to every instance, and a per-event table sync from the engine's slot mirror. The browser needs
+/// none of the window mirroring (its instances share the cdylib's memory); everything else is the
+/// JS driver, line for line.
+struct TierupDriver {
+    store: Store<DriverData>,
+    engine: Engine,
+    memory: Memory,
+    table: wasmi::Table,
+    main: wasmi::Instance,
+    unit_insts: HashMap<i32, wasmi::Instance>,
+    /// Bounce shims keyed by `(slot, occupant code)` (`-2` = a program-function slot) so an
+    /// uninstall/reinstall regenerates against the new occupant's signature.
+    shims: HashMap<(u32, i32), wasmi::Func>,
+    win_len: usize,
+}
+
+impl TierupDriver {
+    /// Build the driver for the freshly opened pump session: memory sized for the mirrored window,
+    /// the shared table, and the main emitted module instantiated against both.
+    fn new() -> TierupDriver {
+        let engine = Engine::default();
+        let mut store: Store<DriverData> = Store::new(&engine, DriverData::default());
+        let win_len = svm_onramp_tierup_win_len();
+        let pages = ((WIN_BASE as usize + win_len) as u32).div_ceil(1 << 16) + 1;
+        let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+        store.data_mut().mem = Some(memory);
+        let tsize = 1u32 << svm_onramp_tierup_table_log2();
+        let table = wasmi::Table::new(
+            &mut store,
+            wasmi::TableType::new(wasmi::core::ValType::FuncRef, tsize, Some(tsize)),
+            Val::FuncRef(wasmi::FuncRef::null()),
+        )
+        .unwrap();
+        let main_wasm = unsafe {
+            std::slice::from_raw_parts(svm_onramp_tierup_wasm_ptr(), svm_onramp_tierup_wasm_len())
+        }
+        .to_vec();
+        let mut d = TierupDriver {
+            store,
+            engine,
+            memory,
+            table,
+            main: unsafe { std::mem::zeroed() },
+            unit_insts: HashMap::new(),
+            shims: HashMap::new(),
+            win_len,
+        };
+        d.main = d.instantiate(&main_wasm);
+        d
+    }
+
+    /// Instantiate an emitted module (main, unit, or shim) against the shared memory/table and the
+    /// live-state bounce, registering its `"mapped"`/`"fuel"` globals for the fan-out set.
+    fn instantiate(&mut self, wasm: &[u8]) -> wasmi::Instance {
+        let module = WModule::new(&self.engine, wasm).expect("emitted wasm must validate");
+        let mut linker: Linker<DriverData> = Linker::new(&self.engine);
+        linker.define("env", "memory", self.memory).unwrap();
+        linker
+            .define("env", "__indirect_function_table", self.table)
+            .unwrap();
+        linker
+            .func_wrap("env", "trap", |_c: Caller<'_, DriverData>, _code: i32| {})
+            .unwrap();
+        let win_len = self.win_len;
+        linker
+            .func_wrap(
+                "env",
+                "call_interp",
+                move |mut c: Caller<'_, DriverData>,
+                      target: i32,
+                      args_ptr: i32|
+                      -> Result<(), wasmi::Error> {
+                    let mem = c.data().mem.unwrap();
+                    let win_ptr = svm_onramp_tierup_win_ptr() as *mut u8;
+                    // The emitted frames may have written the window since the last sync — make
+                    // those writes visible to the engine before the callback runs. (The browser
+                    // skips both copies: its instances share the engine's memory.)
+                    let mut w = vec![0u8; win_len];
+                    mem.read(&c, WIN_BASE as usize, &mut w).unwrap();
+                    // SAFETY: the vCPU is parked on the pending invoke; the window is exclusive.
+                    unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&w);
+                    // Marshal the scratch out, bounce, marshal back.
+                    let mut slots = [0u8; 512];
+                    mem.read(&c, args_ptr as usize, &mut slots).unwrap();
+                    let rc = svm_onramp_tierup_call_interp(target as u32, slots.as_mut_ptr());
+                    let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
+                    mem.write(&mut c, WIN_BASE as usize, live).unwrap();
+                    mem.write(&mut c, args_ptr as usize, &slots).unwrap();
+                    // #717 fan-out: the callback may have vm_map-grown the window — every live
+                    // instance's bound must admit the growth from the next instruction on.
+                    let now = svm_onramp_tierup_mapped_now();
+                    for g in c.data().mapped_globals.clone() {
+                        g.set(&mut c, Val::I64(now)).unwrap();
+                    }
+                    c.data_mut().bounces.push(target as u32);
+                    if rc != 0 {
+                        return Err(wasmi::Error::from(
+                            wasmi::core::TrapCode::UnreachableCodeReached,
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let instance = linker
+            .instantiate(&mut self.store, &module)
+            .unwrap()
+            .start(&mut self.store)
+            .unwrap();
+        if let Some(g) = instance.get_global(&self.store, "mapped") {
+            self.store.data_mut().mapped_globals.push(g);
+        }
+        if let Some(g) = instance.get_global(&self.store, "fuel") {
+            self.store.data_mut().fuel_globals.push(g);
+        }
+        instance
+    }
+
+    /// Get-or-build the bounce shim for `slot` (occupant `code`, `-2` = program function).
+    fn shim(&mut self, slot: u32, code: i32) -> Option<wasmi::Func> {
+        if let Some(f) = self.shims.get(&(slot, code)) {
+            return Some(*f);
+        }
+        let len = svm_onramp_tierup_shim_wasm(slot);
+        if len == 0 {
+            return None;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(svm_onramp_tierup_shim_ptr(), len) }.to_vec();
+        let inst = self.instantiate(&bytes);
+        let f = inst.get_func(&self.store, "t").expect("shim exports t");
+        self.shims.insert((slot, code), f);
+        Some(f)
+    }
+
+    /// Rebuild the shared table from the engine's slot mirror — the per-event sync (installs only
+    /// happen between events, so a synced table is exact for the whole event).
+    fn sync_table(&mut self) {
+        let nfuncs = svm_onramp_tierup_nfuncs();
+        let tsize = 1usize << svm_onramp_tierup_table_log2();
+        for slot in 0..tsize {
+            let entry: Option<wasmi::Func> = if slot < nfuncs {
+                match self.main.get_func(&self.store, &format!("f{slot}")) {
+                    Some(f) => Some(f),
+                    None => self.shim(slot as u32, -2),
+                }
+            } else {
+                let code = svm_onramp_tierup_slot_code(slot as u32);
+                if code < 0 {
+                    None
+                } else if svm_onramp_tierup_jit_wasm_by_handle_len(code) > 0 {
+                    let inst = match self.unit_insts.get(&code) {
+                        Some(i) => *i,
+                        None => {
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    svm_onramp_tierup_jit_wasm_by_handle_ptr(),
+                                    svm_onramp_tierup_jit_wasm_by_handle_len(code),
+                                )
+                            }
+                            .to_vec();
+                            let i = self.instantiate(&bytes);
+                            self.unit_insts.insert(code, i);
+                            i
+                        }
+                    };
+                    inst.get_func(&self.store, "f0")
+                } else {
+                    self.shim(slot as u32, code)
+                }
+            };
+            let fr = match entry {
+                Some(f) => wasmi::FuncRef::new(f),
+                None => wasmi::FuncRef::null(),
+            };
+            self.table
+                .set(&mut self.store, slot as u64, Val::FuncRef(fr))
+                .unwrap();
+        }
+    }
+
+    /// Service the pending JIT_INVOKE: sync window + table + globals, run the invoked unit's `f0`,
+    /// mirror the window back, deliver results or the trap.
+    fn service_jit_invoke(&mut self) {
+        self.sync_table();
+        let win_ptr = svm_onramp_tierup_win_ptr() as *mut u8;
+        // SAFETY: the vCPU is parked on the pending invoke; the window is exclusive.
+        let live = unsafe { std::slice::from_raw_parts(win_ptr, self.win_len) };
+        self.memory
+            .write(&mut self.store, WIN_BASE as usize, live)
+            .unwrap();
+        self.memory
+            .write(&mut self.store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
+            .unwrap();
+        let mapped = svm_onramp_tierup_mapped();
+        for g in self.store.data().mapped_globals.clone() {
+            g.set(&mut self.store, Val::I64(mapped)).unwrap();
+        }
+        for g in self.store.data().fuel_globals.clone() {
+            g.set(&mut self.store, Val::I64(1 << 61)).unwrap();
+        }
+        let code = svm_onramp_tierup_jit_code();
+        let inst = match self.unit_insts.get(&code) {
+            Some(i) => *i,
+            None => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        svm_onramp_tierup_jit_wasm_ptr(),
+                        svm_onramp_tierup_jit_wasm_len(),
+                    )
+                }
+                .to_vec();
+                let i = self.instantiate(&bytes);
+                self.unit_insts.insert(code, i);
+                i
+            }
+        };
+        let f0 = inst.get_func(&self.store, "f0").expect("unit exports f0");
+        let n = svm_onramp_tierup_argv_len();
+        // SAFETY: pending-event operand stash, stable until the deliver.
+        let argv = unsafe { std::slice::from_raw_parts(svm_onramp_tierup_argv_ptr(), n) };
+        let ptypes =
+            unsafe { std::slice::from_raw_parts(svm_onramp_tierup_jit_param_types_ptr(), n) };
+        let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+        for (a, tc) in argv.iter().zip(ptypes) {
+            params.push(match tc {
+                0 => Val::I32(*a as i32),
+                1 => Val::I64(*a),
+                2 => Val::F32(f32::from_bits(*a as u32).into()),
+                _ => Val::F64(f64::from_bits(*a as u64).into()),
+            });
+        }
+        let rn = svm_onramp_tierup_jit_result_types_len();
+        let rtypes =
+            unsafe { std::slice::from_raw_parts(svm_onramp_tierup_jit_result_types_ptr(), rn) };
+        let mut results: Vec<Val> = rtypes
+            .iter()
+            .map(|tc| match tc {
+                0 => Val::I32(0),
+                1 => Val::I64(0),
+                2 => Val::F32(0f32.into()),
+                _ => Val::F64(0f64.into()),
+            })
+            .collect();
+        let ran = f0.call(&mut self.store, &params, &mut results);
+        // Mirror the emitted writes back before the vCPU resumes (also after a trap — partial
+        // writes are visible interpreted too).
+        let mut buf = vec![0u8; self.win_len];
+        self.memory
+            .read(&self.store, WIN_BASE as usize, &mut buf)
+            .unwrap();
+        // SAFETY: see above.
+        unsafe { std::slice::from_raw_parts_mut(win_ptr, self.win_len) }.copy_from_slice(&buf);
+        match ran {
+            Ok(()) => {
+                let slots: Vec<i64> = results
+                    .iter()
+                    .zip(rtypes)
+                    .map(|(v, tc)| match (v, tc) {
+                        (Val::I32(x), _) => *x as i64,
+                        (Val::I64(x), _) => *x,
+                        (Val::F32(x), _) => f32::from(*x).to_bits() as i64,
+                        (Val::F64(x), _) => f64::from(*x).to_bits() as i64,
+                        _ => panic!("non-scalar result (type code {tc})"),
+                    })
+                    .collect();
+                svm_onramp_tierup_deliver_jit(slots.as_ptr(), slots.len());
+            }
+            Err(_) => svm_onramp_tierup_deliver_jit_trap(),
+        }
+    }
+
+    fn bounces(&self) -> &[u32] {
+        &self.store.data().bounces
+    }
+}
+
+/// Drive an opened pump session to DONE with the full driver, panicking on TIERUP (the #846 guests
+/// have no eligible leaves reachable from `_start` — every emitted-tier entry is a unit invoke).
+/// Returns the driver (for its bounce log) and the invoke count.
+fn drive_jit_session() -> (TierupDriver, u32) {
+    let mut d = TierupDriver::new();
+    let mut invokes = 0u32;
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_JIT_INVOKE => {
+                invokes += 1;
+                d.service_jit_invoke();
+            }
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    (d, invokes)
+}
+
+/// Stage `blob` into guest memory at `base` as i64 stores (`prefix` uniquifies the SSA names).
+fn stage_blob(prefix: &str, base: i64, blob: &[u8]) -> String {
+    let mut s = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let val = i64::from_le_bytes(word);
+        let addr = base + (i as i64) * 8;
+        s.push_str(&format!(
+            "  v{prefix}a{i} = i64.const {addr}\n  v{prefix}v{i} = i64.const {val}\n  i64.store v{prefix}a{i} v{prefix}v{i}\n"
+        ));
+    }
+    s
+}
+
+/// The on-ramp powerbox's stdout/memory/**jit** handles (grant order incl. the conditional `Jit`
+/// grant a `vm_jit_*` importer gets — `grant_onramp_caps`).
+fn onramp_handles_jit() -> (i32, i32, i32) {
+    let mut h = Host::new();
+    let out = h.grant_stream(StreamRole::Out);
+    let _ = h.grant_stream(StreamRole::In);
+    let _ = h.grant_exit();
+    let mem = h.grant_memory();
+    let _ = h.grant_address_space(0, 1 << 16);
+    let jit = h.grant_jit_with_table(Some(16), 10);
+    (out, mem, jit)
+}
+
+/// What the bounce helper adds, and where the unit probes the mid-invoke-grown page.
+const BOUNCE_K: i64 = 1000;
+const MID_GROW_PROBE: i64 = 81920 + 8;
+
+/// #846 differential (unit→program bounce + growth-mid-invoke + unit→eligible-`f{i}` native):
+/// a **linked** unit whose `call_indirect` slots split across every edge kind, run through the full
+/// driver, must match `onramp_exec` — including a store into a page a *bounced callback* grew
+/// mid-invoke (only correct if the post-bounce `"mapped"` fan-out admits the growth).
+#[test]
+fn linked_unit_bounces_and_native_edges_match_the_oracle() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h, _jit_h) = onramp_handles_jit();
+    // The unit: slot 1 → the bounce helper (grows [80 KiB, 96 KiB), returns x + BOUNCE_K); a
+    // store/load in the just-grown page; slot 2 → the emitted pure program leaf (×3), native.
+    let unit_src = format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs1 = i32.const 1
+  va = call_indirect (i64) -> (i64) vs1 (v0)
+  vsum = i64.add v0 va
+  vaddr = i64.const {MID_GROW_PROBE}
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  vs2 = i32.const 2
+  vc = call_indirect (i64) -> (i64) vs2 (vld)
+  return vc
+  }}
+}}
+"#
+    );
+    let unit = svm_text::parse_module(&unit_src).expect("parse unit");
+    svm_verify::verify_module(&unit).expect("verify unit");
+    let blob = svm_encode::encode_module(&unit);
+    let blob_len = blob.len();
+    let stores = stage_blob("b", BLOB_BASE, &blob);
+    // Program: f0 = _start (grow + compile + invoke2 + stdout), f1 = the cap-calling bounce helper
+    // (never emitted), f2 = the pure eligible leaf (emitted — the unit reaches it natively).
+    let src = format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {PROBE}
+  vres = call.import 1 (vcode, vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 81920
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vk = i64.const {BOUNCE_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 3
+  vmul = i64.mul v0 vk
+  return vmul
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (2 * PROBE + BOUNCE_K) * 3,
+        "oracle: bounce (+K, grow), grown-page store/load, native ×3"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, invokes) = drive_jit_session();
+    assert!(
+        invokes >= 1,
+        "the linked unit must run emitted (non-vacuity)"
+    );
+    assert!(
+        d.bounces().contains(&1),
+        "the cap-calling helper must have bounced (edge non-vacuity): {:?}",
+        d.bounces()
+    );
+    assert!(
+        !d.bounces().contains(&2),
+        "the eligible leaf must dispatch natively, never bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle (growth-mid-invoke visible post-bounce)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(
+        got_out, want.stdout,
+        "stdout parity (bounce ordering included)"
+    );
+    svm_onramp_tierup_close();
+}
+
+/// #846 differential (unit→**unit** native): the guest compiles + `install`s a pure unit A, then
+/// compiles unit B whose `call_indirect` reaches A's install slot — with both emitted, the edge
+/// dispatches natively through the shared table (zero bounces), matching the oracle.
+#[test]
+fn installed_unit_edge_dispatches_natively() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h, jit_h) = onramp_handles_jit();
+    let unit_a_src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 7
+  vsum = i64.add v0 vk
+  return vsum
+  }
+}
+"#;
+    let unit_b_src = r#"memory 16
+func (i64, i64) -> (i64) {
+block 0 (vslot: i64, vx: i64) {
+  vs = i32.wrap_i64 vslot
+  vr = call_indirect (i64) -> (i64) vs (vx)
+  vk = i64.const 100
+  vsum = i64.add vr vk
+  return vsum
+  }
+}
+"#;
+    let blob_a = {
+        let u = svm_text::parse_module(unit_a_src).expect("parse A");
+        svm_verify::verify_module(&u).expect("verify A");
+        svm_encode::encode_module(&u)
+    };
+    let blob_b = {
+        let u = svm_text::parse_module(unit_b_src).expect("parse B");
+        svm_verify::verify_module(&u).expect("verify B");
+        svm_encode::encode_module(&u)
+    };
+    const A_BASE: i64 = 4096;
+    const B_BASE: i64 = 8192;
+    let (sa, sb) = (
+        stage_blob("a", A_BASE, &blob_a),
+        stage_blob("c", B_BASE, &blob_b),
+    );
+    let (la, lb) = (blob_a.len(), blob_b.len());
+    const X: i64 = 5000;
+    let src = format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+{sa}{sb}  vap = i64.const {A_BASE}
+  val = i64.const {la}
+  vca = call.import 0 (vap, val)
+  vjit = i32.const {jit_h}
+  vslot = cap.call 11 3 (i64) -> (i64) vjit (vca)
+  vbp = i64.const {B_BASE}
+  vbl = i64.const {lb}
+  vcb = call.import 0 (vbp, vbl)
+  vx = i64.const {X}
+  vres = call.import 1 (vcb, vslot, vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, X + 7 + 100, "oracle: B → installed A → +100");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, invokes) = drive_jit_session();
+    assert!(invokes >= 1, "unit B must run emitted (non-vacuity)");
+    assert!(
+        d.bounces().is_empty(),
+        "both units are emitted — the installed edge must dispatch natively: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity with the oracle"
+    );
     svm_onramp_tierup_close();
 }
