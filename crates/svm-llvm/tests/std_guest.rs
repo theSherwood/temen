@@ -715,11 +715,11 @@ fn std_fs_round_trips() {
 }
 
 /// S2 (process) — `std::process::Command` via the posix-cap path: the svm `process` module reaches the
-/// personality's **fork-free** spawn (`OP_SPAWN`/`OP_WAITPID`) through the PAL `host` bridge. A spawn
-/// runs the named command to completion synchronously; `output` captures its stdout by bracketing the
-/// spawn with an `OP_PIPE`+`OP_DUP2` fd-1 redirect (restored afterwards, so captured output does not
-/// leak to the parent's stdout), and `status`/`wait` reap the exit code. The embedder wires a scripted
-/// spawn delegate (`set_spawn`) — `echo` echoes its args, `true`/`false` set the exit code.
+/// personality's **fork-free** spawn (`OP_SPAWN2`/`OP_WAITPID`) through the PAL `host` bridge. A spawn
+/// runs the named command to completion synchronously; `output` captures its stdout/stderr by routing
+/// them to `OP_PIPE` write ends carried **in the `spawn2` request** (per-child, no fd-1/fd-2 redirect —
+/// parallel-safe, #848), and `status`/`wait` reap the exit code. The embedder wires a scripted spawn
+/// delegate (`set_spawn`) — `echo` echoes its args, `true`/`false` set the exit code.
 #[test]
 fn std_process_round_trips() {
     if lane_ready().is_none() {
