@@ -291,6 +291,36 @@ fn svm_run_std_threads_net(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
     Some((out.stdout, exit))
 }
 
+/// Translate + verify + run `src` (built for the **threaded** target) under the **parallel** driver
+/// (`run_with_caps_parallel`, THREADS.md 4c) → `(stdout, exit code)`. Unlike `svm_run_std_threads`
+/// (the deterministic cooperative oracle), each vCPU runs on its own OS thread over one shared window,
+/// so the *schedule* is nondeterministic — this is **smoke** coverage: the observable outcome must
+/// still match the oracle even though the interleaving is real. Used to prove the same threaded `std`
+/// programs the cooperative entries pin exactly also run correctly on real OS threads.
+fn svm_run_std_threads_parallel(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
+    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-svm-threads.json")?;
+    let t = svm_llvm::translate_ll_path(&ll)
+        .expect("on-ramp translates the threaded std binary's LLVM IR");
+    svm_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
+    assert!(
+        svm_run::is_named_powerbox_entry(&t.module),
+        "a threaded std binary produces a powerbox entry (its C `main` rides the powerbox `_start`)"
+    );
+    let out = svm_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps_parallel(&svm_run::RunConfig::default(), &[])
+        .expect("run_with_caps_parallel");
+    let exit = match out.outcome {
+        svm_run::Outcome::Exited(c) => c as u8,
+        svm_run::Outcome::Returned(ref v) => match v.first() {
+            Some(svm_interp::Value::I32(x)) => *x as u8,
+            Some(svm_interp::Value::I64(x)) => *x as u8,
+            _ => 0,
+        },
+    };
+    Some((out.stdout, exit))
+}
+
 /// Translate + verify + run `src` on the powerbox **with argv** → `(stdout, exit code)`.
 /// `argv[0]` is the program name, as in a native run.
 fn svm_run_std_with_args(name: &str, src: &str, argv: &[&[u8]]) -> Option<(Vec<u8>, u8)> {
@@ -1236,4 +1266,116 @@ fn std_threads_spec_mpsc_channel() {
     if let Some((_, oracle)) = native_oracle("svm_stdt_mpsc_oracle", src) {
         assert_eq!(exit, oracle, "mpsc channel matches the native oracle");
     }
+}
+
+// === #848 — the parallel-driver smoke lane =======================================================
+// The `std_threads_spec_*` tests above pin their programs on the **cooperative** driver (`drive`), the
+// deterministic oracle: one OS thread, a fixed round-robin schedule, an exact result every run. These
+// smoke tests re-run a representative subset under the **parallel** driver (`drive_parallel`, THREADS.md
+// 4c): one real OS thread per vCPU over a single shared window, with genuine races. The schedule is
+// nondeterministic, so we assert only the *outcome* (which the guests' own synchronization makes
+// schedule-independent) — proving the threaded `std` codegen + the futex/atomics primitives are correct
+// under real concurrency, not just the cooperative interleaving. See `run_with_caps_parallel`.
+
+/// Smoke: the shared-atomic-counter kernel under real OS threads. `fetch_add` is commutative, so the
+/// total (4 × 10 = 40) is schedule-independent even though the interleaving is now genuinely parallel —
+/// this is the cleanest outcome-stable exercise of cross-thread atomics + N spawn/joins on the parallel
+/// driver. Skipped (like the cooperative specs) when the std overlay / build-std lane is unavailable.
+#[test]
+fn std_threads_parallel_smoke_atomic_counter() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::Arc;\n\
+         use std::sync::atomic::{AtomicU32, Ordering};\n\
+         fn main() -> ExitCode {\n\
+         \x20   let counter = Arc::new(AtomicU32::new(0));\n\
+         \x20   let mut handles = Vec::new();\n\
+         \x20   for _ in 0..4 {\n\
+         \x20       let c = Arc::clone(&counter);\n\
+         \x20       handles.push(std::thread::spawn(move || {\n\
+         \x20           for _ in 0..10 { c.fetch_add(1, Ordering::SeqCst); }\n\
+         \x20       }));\n\
+         \x20   }\n\
+         \x20   for h in handles { h.join().unwrap(); }\n\
+         \x20   ExitCode::from((counter.load(Ordering::SeqCst) & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads_parallel("svm_stdt_counter_par", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 40,
+        "4 threads × 10 fetch_add = 40 under the parallel driver (commutative → schedule-independent)"
+    );
+}
+
+/// Smoke: `spawn(move || …).join()` value passing under real OS threads. The child computes a value and
+/// `join` hands it back to the parent — the join barrier makes the result (42) schedule-independent.
+/// Exercises the spawn/join handshake + the boxed-closure trampoline on the parallel driver.
+#[test]
+fn std_threads_parallel_smoke_spawn_join() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let base = 30u32;\n\
+         \x20   let h = std::thread::spawn(move || base.wrapping_add(12));\n\
+         \x20   let v = h.join().unwrap();\n\
+         \x20   ExitCode::from((v & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads_parallel("svm_stdt_spawn_par", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 42,
+        "spawn(move || 30+12).join() == 42 under the parallel driver"
+    );
+}
+
+/// Smoke: the `std::sync::mpsc` producer/consumer under real OS threads — the futex **notify/wake** path
+/// end to end. An empty `recv` parks the consumer until the producer's `send` wakes it; the channel
+/// close ends the loop. The sum (1..=9 = 45) is schedule-independent (every value is delivered exactly
+/// once), so it holds under genuine parallelism. This is the parallel-driver exercise of `memory.wait`/
+/// `memory.notify` — the one primitive the lock-free counter smoke test does not touch.
+#[test]
+fn std_threads_parallel_smoke_mpsc_channel() {
+    if lane_ready().is_none() {
+        eprintln!("note: skipping std_guest threads (need the svm std overlay — see rust-svm/)");
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::ExitCode;\n\
+         use std::sync::mpsc;\n\
+         fn main() -> ExitCode {\n\
+         \x20   let (tx, rx) = mpsc::channel();\n\
+         \x20   let producer = std::thread::spawn(move || {\n\
+         \x20       for i in 1..=9u32 { tx.send(i).expect(\"send\"); }\n\
+         \x20   });\n\
+         \x20   let mut sum = 0u32;\n\
+         \x20   for v in rx { sum = sum.wrapping_add(v); }\n\
+         \x20   producer.join().expect(\"join\");\n\
+         \x20   ExitCode::from((sum & 0xff) as u8)\n\
+         }\n";
+
+    let Some((_, exit)) = svm_run_std_threads_parallel("svm_stdt_mpsc_par", src) else {
+        eprintln!("note: skipping std_guest threads (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        exit, 45,
+        "mpsc producer/consumer summed 1..=9 = 45 across two OS threads (futex notify/wake)"
+    );
 }
