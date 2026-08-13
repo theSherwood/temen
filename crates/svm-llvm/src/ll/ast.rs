@@ -472,6 +472,12 @@ pub enum Constant {
     Or(ConstBinaryOp),
     Xor(ConstBinaryOp),
     Shl(ConstBinaryOp),
+    /// Logical (unsigned) right shift `lshr (<ty> <c0>, <ty> <c1>)` — zero-filled. Width-sensitive:
+    /// the fill and the well-defined shift range both depend on `operand0`'s bit width.
+    LShr(ConstBinaryOp),
+    /// Arithmetic (signed) right shift `ashr (<ty> <c0>, <ty> <c1>)` — sign-filled from `operand0`'s
+    /// top bit. Also width-sensitive (the sign bit is at `bits-1`).
+    AShr(ConstBinaryOp),
     /// Constant-expression integer compare `icmp <pred> (<ty> <c0>, <ty> <c1>)` → `i1`. clang leaves
     /// one when a comparison of two constants can't be folded to a literal — e.g. a function address
     /// vs. a sentinel (`icmp eq (ptr inttoptr (i64 3 to ptr), ptr @f)`), which appears as an
@@ -547,7 +553,9 @@ impl Typed for Constant {
             | Constant::And(b)
             | Constant::Or(b)
             | Constant::Xor(b)
-            | Constant::Shl(b) => types.type_of(&b.operand0),
+            | Constant::Shl(b)
+            | Constant::LShr(b)
+            | Constant::AShr(b) => types.type_of(&b.operand0),
             // An integer compare yields `i1`, exactly like the instruction-level `icmp`.
             Constant::ICmp { .. } => types.int(1),
         }
