@@ -156,6 +156,16 @@ pub const OP_TCGETPGRP: u32 = 47;
 /// brings real stop/continue.
 pub const OP_TCSETPGRP: u32 = 48;
 
+/// `isatty(fd) -> 1 | 0` (#800): is `fd` the terminal? Until the TTY layer (#797) the captured
+/// stdio is the one proto-terminal (the same convention as `tcgetpgrp`/`tcsetpgrp`): the stdio
+/// fds 0/1/2 answer `1`, everything else `0`. Bash probes `isatty(0)`/`isatty(2)` to decide
+/// interactive mode — this is the op that decision rides on.
+pub const OP_ISATTY: u32 = 49;
+/// `getppid() -> pid` (#800): the parent's pid — the pid of the process whose `fork` (or whose
+/// re-grant, for a spawned clone) minted this one; `0` only for the root (init-like, no parent).
+/// Bash exports it as `$PPID`.
+pub const OP_GETPPID: u32 = 50;
+
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
 /// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
@@ -676,6 +686,9 @@ struct Proc {
     /// process is table-addressable). `getpid` reports it, and `kill(own pid)` short-circuits to
     /// the self path on it.
     pid: i32,
+    /// #800 `getppid` — the minting process's pid, recorded in [`Proc::fork`] (twins and
+    /// re-grant clones alike); `0` only for the root.
+    ppid: i32,
     /// #798 — this process's **process group** (`setpgid`/`getpgid`): the unit `kill(-pgid)`
     /// sweeps and `tcsetpgrp` foregrounds. The root leads group `1`; a `fork` twin **inherits**
     /// its parent's (POSIX — unlike the core's `Twin.pgid`, which defaults to own-id and feeds
@@ -1074,6 +1087,8 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "getpgid" => OP_GETPGID,
         "tcgetpgrp" => OP_TCGETPGRP,
         "tcsetpgrp" => OP_TCSETPGRP,
+        "isatty" => OP_ISATTY,
+        "getppid" => OP_GETPPID,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -1449,6 +1464,7 @@ fn new_world(stdin: Vec<u8>) -> World {
 fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
     Proc {
         pid: 1,  // the root process — init-like; fork twins get their TaskId stamped by the factory
+        ppid: 0, // no recorded parent (#800 getppid)
         pgid: 1, // the root leads process group 1
         heap_next: heap_base,
         heap_end,
@@ -1550,6 +1566,8 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_GETPGID => Ok(vec![st.getpgid(args)]),
                 OP_TCGETPGRP => Ok(vec![st.tcgetpgrp(args)]),
                 OP_TCSETPGRP => Ok(vec![st.tcsetpgrp(args)]),
+                OP_ISATTY => Ok(vec![st.isatty(args)]),
+                OP_GETPPID => Ok(vec![st.p.ppid as i64]),
                 _ => Err(Trap::CapFault),
             };
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
@@ -1764,6 +1782,7 @@ impl Proc {
     fn fork(&self) -> Proc {
         Proc {
             pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
+            ppid: self.pid, // #800 getppid — the forking process is the parent
             pgid: self.pgid, // POSIX: a fork twin inherits its parent's process group
             heap_next: self.heap_next,
             heap_end: self.heap_end,
@@ -2541,6 +2560,14 @@ impl Ctx<'_> {
             return ENOTTY;
         }
         self.w.fg_pgid as i64
+    }
+
+    /// [`OP_ISATTY`] — `isatty(fd) -> 1 | 0`: the same proto-terminal test the `tc*` ops gate on
+    /// (`fd_is_terminal`), answered as C's boolean instead of `-ENOTTY`. Bash's interactive-mode
+    /// probe (#800).
+    fn isatty(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        i64::from(self.fd_is_terminal(fd))
     }
 
     /// [`OP_TCSETPGRP`] — `tcsetpgrp(fd, pgid)`: make `pgid` the foreground group. `-ENOTTY` off
