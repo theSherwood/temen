@@ -132,8 +132,9 @@ pub const OP_WAIT: u32 = 29;
 pub const OP_SPAWN2: u32 = 43;
 
 /// `getpid() -> pid` (#863 slice 2): this process's own pid — `1` for the root, the scheduler
-/// `TaskId` (= the parent's `fork()` return) for a fork twin, `0` for an anonymous re-grant clone.
-/// One pid space with `kill(pid)`/`waitpid(pid)`: the value is meaningful to both.
+/// `TaskId` (= the parent's `fork()` return) for a fork twin, a personality-allocated pid for a
+/// re-grant clone (slice 3). One pid space with `kill(pid)`/`waitpid(pid)`: the value is
+/// meaningful to both.
 pub const OP_GETPID: u32 = 44;
 
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
@@ -619,9 +620,10 @@ enum ProcEntry {
 struct Proc {
     /// This process's own pid (#863 slice 2): `1` for the root (init-like), the scheduler `TaskId`
     /// for a fork twin (stamped by [`fork_factory`] at mint — the same value the parent's `fork()`
-    /// returned), `0` for an anonymous re-grant clone (a spawned child wired before any `TaskId`
-    /// exists — a valid process, but not table-addressable by `kill(pid)`). `getpid` reports it,
-    /// and `kill(own pid)` short-circuits to the self path on it.
+    /// returned), or a personality-allocated pid for a re-grant clone (slice 3 — a spawned child is
+    /// wired before any `TaskId` exists, so it draws from the spawn allocator instead; every
+    /// process is table-addressable). `getpid` reports it, and `kill(own pid)` short-circuits to
+    /// the self path on it.
     pid: i32,
     /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
     heap_next: u64,
@@ -695,7 +697,9 @@ struct Proc {
     /// [`SignalSource::set_wake`] and cleared to a no-op at teardown. [`Posix::raise_signal`] invokes it
     /// after raising a **deliverable** signal, so an embedder `^C` interrupts a parked blocking syscall
     /// even when every fiber is parked (no per-op safepoint to notice the arm). `None` until a run installs
-    /// it (and between runs); `None` again in a fork twin (each run re-installs).
+    /// it (and between runs); a fork twin / spawned child gets its own installed at mint/admission
+    /// (#863 slice 3 — the core hands every door a domain-scoped weak wake, so reachability is
+    /// independent of nesting depth and fork history; weak ⇒ a post-run fire is a no-op).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -894,6 +898,41 @@ impl Posix {
         if let Some(w) = wake {
             w();
         }
+    }
+
+    /// #863 slice 3 — the embedder's **pid-targeted** signal: [`Posix::raise_signal`]'s semantics
+    /// (pending + arm + wake-if-deliverable, disposition-gated by the TARGET's own state) routed
+    /// through the process table instead of pinned to the root. This is how a terminal `^C` reaches
+    /// the *right* process when the world has several — e.g. a spawned shell (a slice-3 re-grant
+    /// clone, pid from the personality allocator) or a fork twin (pid = its `TaskId`). The wake it
+    /// fires is the target's own domain-scoped run-wake, so only that process's blocked syscalls
+    /// return `-EINTR` (INVARIANTS.md #12). Returns `0`, `-ESRCH` for an unknown pid, `-EINVAL`
+    /// for a bad signal. Locks world → target proc (the canonical order), releases both, then wakes.
+    pub fn kill_pid(&self, pid: i32, signum: i32) -> i64 {
+        if !(1..=63).contains(&signum) {
+            return EINVAL;
+        }
+        let wake = {
+            let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+            match w.procs.get(&pid) {
+                Some(ProcEntry::Live(t)) => {
+                    let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                    tp.sig_pending |= 1 << signum;
+                    tp.arm_signals();
+                    if tp.deliverable_now() {
+                        tp.wake.clone()
+                    } else {
+                        None
+                    }
+                }
+                Some(ProcEntry::Zombie(_)) => None, // exists until reaped; takes no signal
+                None => return ESRCH,
+            }
+        };
+        if let Some(f) = wake {
+            f();
+        }
+        0
     }
 }
 
@@ -1094,7 +1133,9 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
 /// Slice 2: the twin is born with its **pid** (the scheduler `TaskId` the parent's `fork()`
 /// returns — the factory's argument) and registered in the world's process table, so `kill(pid)`
 /// can target it from anywhere in the world. Pid `0` is an **anonymous** mint (the spawned-child
-/// re-grant path, where no `TaskId` exists yet): a valid clone, skipped by the table.
+/// re-grant path, where no `TaskId` exists yet); slice 3 gives such a clone a pid from the
+/// personality's own allocator instead — every process is table-addressable, so an embedder
+/// ([`Posix::kill_pid`]) or a sibling can signal a spawned shell just like a fork twin.
 fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
     Arc::new(move |pid: u64| {
         // World before Proc — the canonical order. (This runs under the core's scheduler lock;
@@ -1102,13 +1143,21 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         // — so scheduler → world here cannot cross a world → scheduler hold.)
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
-        child.pid = pid as i32;
+        let pid = if pid != 0 {
+            pid as i32
+        } else {
+            // Anonymous mint: allocate from the same space spawn zombies use (skip occupied).
+            while w.procs.contains_key(&w.next_pid) {
+                w.next_pid += 1;
+            }
+            let p = w.next_pid;
+            w.next_pid += 1;
+            p
+        };
+        child.pid = pid;
         let armed = child.sig_armed.clone();
         let child = Arc::new(Mutex::new(child));
-        if pid != 0 {
-            w.procs
-                .insert(pid as i32, ProcEntry::Live(Arc::clone(&child)));
-        }
+        w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
         drop(w);
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
@@ -1312,12 +1361,17 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 _ => Err(Trap::CapFault),
             };
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
-            // drop — the wake takes the scheduler lock, which must never be waited on under ours.
+            // drop — and from a **detached thread**: the interp invoked this handler while holding
+            // our domain's `Host` lock, the wake takes the scheduler lock, and scheduler-lock
+            // holders lock `Host`s (fork mints, park interrupts) — a same-stack fire could close a
+            // host ↔ scheduler cycle. Cross-process signals are human-frequency, so a short-lived
+            // thread is the boring, provably-unentangled choice. (The embedder paths —
+            // [`Posix::raise_signal`], [`Posix::kill_pid`] — hold no `Host` lock and fire inline.)
             let wake = st.wake_after.take();
             drop(p);
             drop(w);
             if let Some(wk) = wake {
-                wk();
+                std::thread::spawn(move || wk());
             }
             res
         },
@@ -1365,7 +1419,7 @@ impl Proc {
     /// `armed` flag (its door is its own) and no wake (each run installs its own).
     fn fork(&self) -> Proc {
         Proc {
-            pid: 0, // stamped by [`fork_factory`] (the twin's TaskId); 0 = anonymous re-grant clone
+            pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
             heap_next: self.heap_next,
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
@@ -3237,25 +3291,31 @@ mod tests {
         door.set_wake(Arc::new(move || {
             f2.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
-        // Signal 11 has no handler on the twin: pending is set but nothing is deliverable — no wake.
+        // Signal 11 has no handler on the twin: pending is set but nothing is deliverable — no wake
+        // (the fire is async — a detached thread — so give a false positive a moment to appear).
         assert_eq!(
             root_handler(OP_KILL, &[7, 11], None, None).unwrap(),
             vec![0]
         );
+        std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(
             !fired.load(std::sync::atomic::Ordering::SeqCst),
             "an undeliverable signal never wakes the target's run"
         );
-        // Signal 10 is caught + unmasked + stack registered: the wake fires (post-unlock — a
-        // deadlock here would hang the test).
+        // Signal 10 is caught + unmasked + stack registered: the wake fires — from a detached
+        // thread, after the dispatch's locks dropped (slice 3), so poll for it.
         assert_eq!(
             root_handler(OP_KILL, &[7, 10], None, None).unwrap(),
             vec![0]
         );
-        assert!(
-            fired.load(std::sync::atomic::Ordering::SeqCst),
-            "a deliverable pid-targeted kill pokes the target's scheduler wake"
-        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a deliverable pid-targeted kill pokes the target's scheduler wake"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
