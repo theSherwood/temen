@@ -1425,14 +1425,29 @@ fn const_eval(
         K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
         // Bitwise + left-shift constexprs (e.g. alignment masks `and(ptrtoint(@g), -16)`). All fold
         // correctly in i64 and mask to the result width at the consumer, since `and`/`or`/`xor`/`shl`
-        // commute with keeping the low N bits (unlike a right shift, which is width-sensitive — those
-        // are deferred). The shift amount is masked to the operand width by `wrapping_shl`.
+        // commute with keeping the low N bits (unlike a right shift, below). The shift amount is masked
+        // to the operand width by `wrapping_shl`.
         K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a & b),
         K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a | b),
         K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a ^ b),
         K::Shl(x) => {
             bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_shl(b as u32))
         }
+        // Right-shift constexprs are **width-sensitive** (the fill bit and the shift range depend on
+        // `operand0`'s bit width), unlike the width-agnostic bitwise ops above. `lshr` zero-fills:
+        // read `operand0` as unsigned at its width (`mask_low` clears the bits above it) then shift
+        // logically. `ashr` sign-fills: sign-extend `operand0` from its width to i64 (`sign_extend`)
+        // then shift arithmetically, so the fill comes from bit `bits-1`. A shift ≥ width is poison in
+        // LLVM (a well-formed module never emits one); `wrapping_shr`'s `& 63` is a no-op for the
+        // in-range amounts these actually carry.
+        K::LShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
+            let bits = int_bits(x.operand0.get_type(types).as_ref());
+            (mask_low(a, bits) as u64).wrapping_shr(b as u32) as i64
+        }),
+        K::AShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
+            let bits = int_bits(x.operand0.get_type(types).as_ref());
+            sign_extend(a, bits).wrapping_shr(b as u32)
+        }),
         // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
         // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
         K::GetElementPtr(g) => {
@@ -16193,6 +16208,8 @@ impl<'a> BlockCtx<'a> {
                 | Constant::Or(_)
                 | Constant::Xor(_)
                 | Constant::Shl(_)
+                | Constant::LShr(_)
+                | Constant::AShr(_)
                 | Constant::Trunc(_)
                 | Constant::ZExt(_)
                 | Constant::SExt(_) => {

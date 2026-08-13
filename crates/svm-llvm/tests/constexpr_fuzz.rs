@@ -49,6 +49,18 @@ enum E {
     Xor(Box<E>, Box<E>),
     /// `shl (i64 <inner>, i64 <shift>)` with `shift` in `0..64`.
     Shl(Box<E>, u32),
+    /// `lshr (i64 <inner>, i64 <shift>)` — logical (zero-fill) right shift at the full i64 width,
+    /// `shift` in `0..64`.
+    LShr(Box<E>, u32),
+    /// `ashr (i64 <inner>, i64 <shift>)` — arithmetic (sign-fill) right shift at i64, `shift` `0..64`.
+    AShr(Box<E>, u32),
+    /// `zext (i32 lshr (i32 trunc (<inner> to i32), i32 <shift>) to i64)` — the **width-sensitive**
+    /// logical right shift: the shift happens at i32, so the zero-fill and the low-32-bit view are what
+    /// distinguish `lshr` from the width-agnostic bitwise ops. `shift` in `0..32`.
+    LShr32(Box<E>, u32),
+    /// `sext (i32 ashr (i32 trunc (<inner> to i32), i32 <shift>) to i64)` — the width-sensitive
+    /// arithmetic right shift: the sign fill comes from bit 31 (the i32 sign). `shift` in `0..32`.
+    AShr32(Box<E>, u32),
 }
 
 /// A pointer-typed constexpr node.
@@ -71,7 +83,7 @@ fn gen_e(rng: &mut Rng, depth: u32) -> E {
         }
     } else {
         let pair = |rng: &mut Rng, d: u32| (Box::new(gen_e(rng, d)), Box::new(gen_e(rng, d)));
-        match rng.below(10) {
+        match rng.below(14) {
             0 => {
                 let (a, b) = pair(rng, depth - 1);
                 E::Add(a, b)
@@ -99,6 +111,10 @@ fn gen_e(rng: &mut Rng, depth: u32) -> E {
                 E::Xor(a, b)
             }
             8 => E::Shl(Box::new(gen_e(rng, depth - 1)), rng.below(64)),
+            9 => E::LShr(Box::new(gen_e(rng, depth - 1)), rng.below(64)),
+            10 => E::AShr(Box::new(gen_e(rng, depth - 1)), rng.below(64)),
+            11 => E::LShr32(Box::new(gen_e(rng, depth - 1)), rng.below(32)),
+            12 => E::AShr32(Box::new(gen_e(rng, depth - 1)), rng.below(32)),
             _ => E::PtrToInt(Box::new(gen_p(rng, depth - 1))),
         }
     }
@@ -132,6 +148,16 @@ fn render_e(e: &E) -> String {
         E::Or(a, b) => format!("i64 or ({}, {})", render_e(a), render_e(b)),
         E::Xor(a, b) => format!("i64 xor ({}, {})", render_e(a), render_e(b)),
         E::Shl(a, s) => format!("i64 shl ({}, i64 {s})", render_e(a)),
+        E::LShr(a, s) => format!("i64 lshr ({}, i64 {s})", render_e(a)),
+        E::AShr(a, s) => format!("i64 ashr ({}, i64 {s})", render_e(a)),
+        E::LShr32(a, s) => format!(
+            "i64 zext (i32 lshr (i32 trunc ({} to i32), i32 {s}) to i64)",
+            render_e(a)
+        ),
+        E::AShr32(a, s) => format!(
+            "i64 sext (i32 ashr (i32 trunc ({} to i32), i32 {s}) to i64)",
+            render_e(a)
+        ),
     }
 }
 
@@ -164,6 +190,12 @@ fn eval_e(e: &E, addrs: &[i64]) -> i64 {
         E::Or(a, b) => eval_e(a, addrs) | eval_e(b, addrs),
         E::Xor(a, b) => eval_e(a, addrs) ^ eval_e(b, addrs),
         E::Shl(a, s) => eval_e(a, addrs).wrapping_shl(*s),
+        // Full-width right shifts: logical reads the value as unsigned, arithmetic keeps the i64 sign.
+        E::LShr(a, s) => (eval_e(a, addrs) as u64 >> *s) as i64,
+        E::AShr(a, s) => eval_e(a, addrs) >> *s,
+        // Width-sensitive: shift the low 32 bits, then zero- / sign-extend from bit 31 back to i64.
+        E::LShr32(a, s) => ((eval_e(a, addrs) as u32) >> *s) as u64 as i64,
+        E::AShr32(a, s) => ((eval_e(a, addrs) as i32) >> *s) as i64,
     }
 }
 
