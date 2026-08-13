@@ -2603,7 +2603,11 @@ fn translate_func(
     //     a block parameter wherever it is live; its block-local value index is its position in that
     //     block's param list, so one `SsaLoc` per such block (effective from block entry) gives an
     //     `SsaList` covering the argument's whole live range.
-    // §6 function name: the `DISubprogram` source name → this IR function index.
+    // §6 function name: the `DISubprogram` source name → this IR function index. (Only under `-g`: a
+    // stripped build deliberately carries no debug info to keep `.svmb` lean — `translate.rs`'s
+    // `llvm_without_g_has_no_debug_info` guards that. The emitted wasm name section (#865) therefore
+    // falls back to `gfN` guest indices for a stripped guest; real symbol names need a `-g` build or a
+    // future opt-in symbol-recording flag.)
     if let Some(src) = di.and_then(|d| d.func_names.get(&f.name)) {
         dbg.func_names.push(FuncName {
             func: func_idx,
