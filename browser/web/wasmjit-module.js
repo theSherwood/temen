@@ -442,19 +442,48 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
   let threw = 0;
   let value = 0n;
+  let trapError = null;
   try {
     // f0(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return is
     // the guest's top-level result (an i32/i64); normalize to i64.
     const r = f0(win, env, sp);
     value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch {
+  } catch (e) {
     threw = 1;
+    trapError = e; // keep it — the trap kind + wasm location live here (issue #865)
   }
   ex.svm_dealloc(env, envBytes);
   ex.svm_warm_jit_report(threw, value);
   const status = ex.svm_warm_jit_finish();
-  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted warm run trapped (declined to the interpreter)');
+  if (status === 3 /* STATUS_TRAP */) throw warmJitTrapError(trapError);
   return status;
+}
+
+// The last warm+JIT trap, captured for diagnosis (issue #865) — `{ kind, frames }` where `frames` are the
+// emitted wasm frames `fN@0xoff` (innermost first), or `null` if the last run didn't trap. Test/telemetry
+// hook: a decline used to be a bare "trapped" with no location; this exposes the trap KIND (the V8
+// RuntimeError message, e.g. "null function or function signature mismatch" = a `call_indirect` to a
+// null/mismatched table slot) and WHERE (which emitted functions), the way the bytecode tier reports.
+export let lastWarmJitTrap = null;
+
+// Build a diagnosable decline error from the caught `f0` trap. A wasm-level trap is a `WebAssembly.
+// RuntimeError` whose message is the trap kind and whose stack carries `wasm-function[N]:0xoff` frames
+// (the emitted function index + byte offset). Our own cross-tier unwind (`env.call_interp` returned
+// nonzero → we threw 'cross-tier stop') has no wasm location — the real trap is on the interpreter side,
+// recorded by `svm_warm_jit_call_interp`'s `last_trap`.
+function warmJitTrapError(e) {
+  if (e instanceof WebAssembly.RuntimeError) {
+    const frames = String(e.stack || '')
+      .split('\n')
+      .map((l) => l.match(/wasm-function\[(\d+)\]:0x([0-9a-fA-F]+)/))
+      .filter(Boolean)
+      .map((m) => `f${m[1]}@0x${m[2]}`);
+    lastWarmJitTrap = { kind: e.message, frames };
+    const where = frames.length ? ` at ${frames[0]}${frames.length > 1 ? ` (from ${frames.slice(1, 6).join(' ← ')})` : ''}` : '';
+    return new Error(`emitted warm run trapped: ${e.message}${where}`);
+  }
+  lastWarmJitTrap = { kind: (e && e.message) || 'cross-tier stop', frames: [] };
+  return new Error(`emitted warm run trapped (declined to the interpreter): ${(e && e.message) || e}`);
 }
 
 // **Pre-warm** the warm+JIT `eval_run` for `cacheKey` — emit + `WebAssembly.compile` + instantiate **and

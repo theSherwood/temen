@@ -2629,6 +2629,54 @@ fn emit_module(
     }
     section(&mut out, 10, &sec);
 
+    // Name section (custom id 0, "name", function-names subsection) — names each emitted wasm function by
+    // its guest function index (`gfN`, or the source name when a `-g` build carried one in
+    // `debug_info.func_names`), plus the cross-tier trampolines (`xtramp_gfN`) and the `()->()` trap stub
+    // (`TRAP_STUB`). Diagnostic-only and cheap: a V8 wasm stack trace — e.g. a `svm_warm_jit` decline
+    // (issue #865) — then names the culprit function instead of a bare `wasm-function[N]`. `wasm_of[fi]`
+    // is the final wasm index (it already accounts for the function imports), so it is the name-section
+    // funcidx directly; `env.trap`/`env.call_interp` are always imports 0/1.
+    {
+        let src_name = |fi: usize| -> String {
+            m.debug_info
+                .as_ref()
+                .and_then(|d| d.func_names.iter().find(|f| f.func == fi as u32))
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| format!("gf{fi}"))
+        };
+        let mut ents: Vec<(u32, String)> = vec![
+            (0, "env.trap".to_string()),
+            (1, "env.call_interp".to_string()),
+        ];
+        for fi in 0..m.funcs.len() {
+            if let Some(w) = wasm_of[fi] {
+                ents.push((w, src_name(fi)));
+            }
+            if let Some(w) = tramp_of[fi] {
+                ents.push((w, format!("xtramp_gf{fi}")));
+            }
+        }
+        if let Some(w) = trap_stub_widx {
+            ents.push((w, "TRAP_STUB".to_string()));
+        }
+        ents.sort_by_key(|(w, _)| *w);
+        ents.dedup_by_key(|(w, _)| *w);
+        let mut names_sub = Vec::new();
+        uleb(&mut names_sub, ents.len() as u64);
+        for (w, nm) in &ents {
+            uleb(&mut names_sub, *w as u64);
+            uleb(&mut names_sub, nm.len() as u64);
+            names_sub.extend_from_slice(nm.as_bytes());
+        }
+        let mut payload = Vec::new();
+        uleb(&mut payload, 4);
+        payload.extend_from_slice(b"name");
+        payload.push(0x01); // subsection 1: function names
+        uleb(&mut payload, names_sub.len() as u64);
+        payload.extend_from_slice(&names_sub);
+        section(&mut out, 0, &payload);
+    }
+
     Ok(out)
 }
 
