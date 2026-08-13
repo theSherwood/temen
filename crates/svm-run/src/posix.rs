@@ -25,7 +25,10 @@ use svm_posix::Posix;
 /// observes the same `Posix` — read it back after the run.
 pub fn posix_cap(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (HostCap, Posix) {
     let (posix, make) = svm_posix::cap(heap_base, heap_end, stdin);
-    (HostCap::host_proc(0, make), posix)
+    // #863 — the personality's own fork factory rides along, so a `fork()` through the powerbox
+    // path gets real POSIX semantics (own fd table/cwd/env/signals, shared memfs), not a shared blob.
+    let fork = svm_posix::cap_fork_factory(&posix);
+    (HostCap::host_proc_forkable(0, make, fork), posix)
 }
 
 /// The **`net` capability** over an existing personality (POSIX.md §5a) — grant it alongside the

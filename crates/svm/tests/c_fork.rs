@@ -1626,14 +1626,14 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1731,14 +1731,14 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1840,14 +1840,14 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -1943,14 +1943,14 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2310,14 +2310,14 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
@@ -2743,14 +2743,14 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     let factory = std::sync::Arc::new(factory);
     let make: svm_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move || -> svm_interp::HostProc {
+        std::sync::Arc::new(move || -> svm_interp::ForkedProc {
             let mut inner = factory();
-            Box::new(move |_slot_op, args, mem, minter| {
+            svm_interp::ForkedProc::shared(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            })
+            }))
         })
     };
-    let fs_cap = host.grant_host_proc_forkable(make(), make.clone());
+    let fs_cap = host.grant_host_proc_forkable(make().handler, make.clone());
 
     let mut fuel = 120_000_000u64;
     let r = run_with_host(
