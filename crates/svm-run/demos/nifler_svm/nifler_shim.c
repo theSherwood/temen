@@ -93,6 +93,42 @@ int atexit(void (*fn)(void)) {
 }
 int getpid(void) { return 1; }
 
+/* `mmap`/`munmap` — hexer/nimony read NIF files through `std/memfiles` (`nifreader.nim`'s
+ * `vfsOpenMmap`), i.e. `mmap(nil, size, PROT_READ, MAP_SHARED, fd, offset)`. There is no host address
+ * space to map into, but a read-only file map is observationally just "the file's bytes at a stable
+ * pointer", so serve it as malloc + read-the-region over the `fs` cap (the parse never writes back
+ * through the map). An anonymous map (`fd < 0` / `MAP_ANONYMOUS`) is zeroed memory. `munmap` frees.
+ * nifler never calls these (it parses `.nim` via stdio); they're the shared nimony-phase edge. */
+#include <sys/mman.h>
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+  (void)addr;
+  (void)prot;
+  if (length == 0) return MAP_FAILED;
+  void *p = malloc(length);
+  if (!p) return MAP_FAILED;
+  if (fd < 0 || (flags & MAP_ANONYMOUS)) {
+    memset(p, 0, length);
+    return p;
+  }
+  /* file-backed: copy [offset, offset+length) out of the fd via the fs cap */
+  if (lseek(fd, offset, 0 /* SEEK_SET */) < 0) {
+    free(p);
+    return MAP_FAILED;
+  }
+  size_t got = 0;
+  while (got < length) {
+    long n = read(fd, (char *)p + got, length - got);
+    if (n <= 0) break; /* short file: leave the tail as the malloc'd bytes (memfiles sizes to fstat) */
+    got += (size_t)n;
+  }
+  return p;
+}
+int munmap(void *addr, size_t length) {
+  (void)length;
+  free(addr);
+  return 0;
+}
+
 /* Single-threaded guest — the mutex ops the Nim allocator references are no-ops (no contention). */
 int pthread_mutex_init(void *m, const void *a) {
   (void)m;
