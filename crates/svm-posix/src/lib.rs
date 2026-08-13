@@ -779,6 +779,13 @@ struct Proc {
     /// action). Read by the exit hook at retire time: set ⇒ the zombie's wait status is the
     /// `WIFSIGNALED` shape (`sig` in the low 7 bits) instead of the exit-code encode.
     term_sig: Option<i32>,
+    /// #796 block-during-handler — the pre-delivery masks of the **live async handler frames**,
+    /// innermost last: [`SignalDoor::take_deliverable`] pushes the current mask and blocks the
+    /// delivered signal + its `sa_mask` for the handler's duration (POSIX);
+    /// [`SignalDoor::handler_returned`] pops and restores. LIFO per process — with `thread.spawn`
+    /// siblings sharing one process, interleaved cross-fiber returns restore in push order (a
+    /// documented approximation: POSIX masks are per-thread, ours is per-process).
+    handler_mask_stack: Vec<u64>,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -1158,8 +1165,16 @@ impl SignalSource for SignalDoor {
             st.sig_pending &= !(1u64 << s);
             let handler = st.sig_handler.get(&s).copied().unwrap_or(SIG_DFL);
             if handler > SIG_IGN {
-                // A caught handler: deliver it. Re-arm iff another signal is already deliverable, so the
-                // interp returns for it once this handler completes (its in-handler guard then clears).
+                // A caught handler: deliver it. #796 block-during-handler — push the current mask
+                // and block the delivered signal + its `sa_mask` for the handler's duration
+                // (POSIX; `handler_returned` restores). This is also what makes NESTED delivery
+                // safe: a further signal may interrupt the handler, but never this same one.
+                let saved = st.sig_mask;
+                st.handler_mask_stack.push(saved);
+                let sa = st.sig_action_mask.get(&s).copied().unwrap_or(0);
+                st.sig_mask = (saved | (1u64 << s) | sa) & !UNMASKABLE;
+                // Re-arm iff another signal is deliverable UNDER THE HANDLER MASK, so the interp
+                // returns for it (a nested delivery) or picks it up at the handler's return.
                 let more = (st.sig_pending & !st.sig_mask) != 0;
                 st.sig_armed.store(more, Ordering::Relaxed);
                 return Some((handler as i32, s, sp));
@@ -1184,6 +1199,26 @@ impl SignalSource for SignalDoor {
     /// #796 default actions — store the core's terminate closure for this process's domain.
     fn set_kill(&self, kill: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
+    }
+
+    /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
+    /// mask pushed by [`SignalDoor::take_deliverable`], then act on what the unblocking exposes —
+    /// a now-deliverable caught signal re-arms (the running vCPU picks it up at its next per-op
+    /// poll, no wake needed), and a held **fatal** signal runs its default action (the kill fire,
+    /// invoked here directly: the interp holds no locks at this call, and the fire's scheduler
+    /// work is safe from a running vCPU).
+    fn handler_returned(&self) {
+        let kill_fire = {
+            let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(saved) = st.handler_mask_stack.pop() {
+                st.sig_mask = saved & !UNMASKABLE;
+            }
+            st.arm_signals();
+            st.dispatch_default_actions()
+        };
+        if let Some(f) = kill_fire {
+            f();
+        }
     }
 }
 
@@ -1418,6 +1453,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         cont_fresh: false,
         kill: None,
         term_sig: None,
+        handler_mask_stack: Vec::new(),
     }
 }
 
@@ -1729,6 +1765,7 @@ impl Proc {
             cont_fresh: false,
             kill: None, // ditto — the twin's own terminate closure lands at mint
             term_sig: None,
+            handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
         }
     }
 }

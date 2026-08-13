@@ -8458,11 +8458,14 @@ struct VCpu {
     /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
-    /// #796 L2 async signals — `Some(depth)` while an injected signal **handler** frame is live, where
-    /// `depth` is `frames.len()` just after the handler was pushed. Gates re-entry (no signal delivers
-    /// while a handler runs) and is cleared when that frame returns (`frames.len()` falls below `depth`).
-    /// `None` = not currently in a handler.
-    sig_handler_depth: Option<usize>,
+    /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
+    /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
+    /// (a different unmasked signal can interrupt a running handler — the source blocks the
+    /// delivered signal + its `sa_mask` for the handler's duration, so same-signal reentry never
+    /// reaches here) up to [`MAX_SIG_HANDLER_NEST`]; each entry is popped when its frame returns,
+    /// which also tells the source to restore its pre-delivery mask
+    /// ([`SignalSource::handler_returned`]).
+    sig_handler_stack: Vec<usize>,
     /// PROCESS.md S3 `kill` — a parent's map from a §14 child's join-table **slot** to that child's
     /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
     /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
@@ -8595,7 +8598,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8663,7 +8666,7 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -8753,7 +8756,7 @@ impl VCpu {
             invoked_ref_slots,
             debug: None,
             kill: None,
-            sig_handler_depth: None,
+            sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -9198,7 +9201,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         invoked_ref_slots,
         debug,
         kill,
-        sig_handler_depth,
+        sig_handler_stack,
         child_kill,
         serve_run,
         handler_parks,
@@ -9852,7 +9855,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // dedicated signal stack — exactly like a `call_indirect`. The interrupted instruction is
             // **not** advanced, so it re-executes when the handler returns (the empty `Return` restores the
             // interrupted frame untouched). Same interrupt-at-safepoint shape as `kill`, but non-lethal.
-            if sig_handler_depth.is_none() {
+            if sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
                 if let Some((armed, source)) = &signal_poll {
                     if armed.load(Ordering::Relaxed) {
                         // The source owns its own locking; the interp holds no personality lock here.
@@ -9889,7 +9892,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     inst: 0,
                                     vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)],
                                 });
-                                *sig_handler_depth = Some(frames.len());
+                                sig_handler_stack.push(frames.len());
                                 continue 'frames;
                             }
                         }
@@ -13418,11 +13421,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 collect_into(&mut ret_buf, &frames[top].vals, out)?;
                 let popped = frames.pop();
                 // #796 L2 — if the frame that just returned is the injected signal handler (it sat at
-                // `sig_handler_depth`, now one above the post-pop length), clear the in-handler guard so
-                // the next pending signal can be delivered. A `void` handler's empty `ret_buf` leaves the
-                // interrupted caller's `vals` untouched below, so it resumes at the re-run safepoint op.
-                if *sig_handler_depth == Some(frames.len() + 1) {
-                    *sig_handler_depth = None;
+                // its stack entry, now one above the post-pop length), pop the guard entry and tell
+                // the source ([`SignalSource::handler_returned`]) so it restores its pre-delivery
+                // mask (block-during-handler / `sa_mask`) — possibly re-arming a now-unblocked
+                // pending signal or running its default action. A `void` handler's empty `ret_buf`
+                // leaves the interrupted caller's `vals` untouched below, so it resumes at the
+                // re-run safepoint op.
+                if sig_handler_stack.last() == Some(&(frames.len() + 1)) {
+                    sig_handler_stack.pop();
+                    if let Some((_, source)) = &signal_poll {
+                        source.handler_returned();
+                    }
                 }
                 if let Some(caller) = frames.last_mut() {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
@@ -16522,6 +16531,11 @@ impl RegionMinter for Host {
 /// safepoint redirect, invariant 4) lives in the interp; svm-interp never names a personality, it only
 /// calls this. The interp polls a cheap [`Host::sig_armed`] flag per op and, when set and not already in a
 /// handler, asks the source for the next delivery.
+/// #796 — the ceiling on **nested** injected signal-handler frames per fiber. The source's
+/// block-during-handler masking already prevents same-signal reentry; this bounds pathological
+/// distinct-signal towers (each nested delivery costs a call frame on the interrupted stack).
+pub const MAX_SIG_HANDLER_NEST: usize = 16;
+
 pub trait SignalSource: Send + Sync {
     /// The next deliverable async signal, or `None` if nothing is currently deliverable. Returns
     /// `(handler_funcref, signum, handler_sp)` — the guest handler's function-table index (§3c), the
@@ -16551,6 +16565,14 @@ pub trait SignalSource: Send + Sync {
     /// actions, SIGCONT); the core never sees a signal number. Default no-op — a source with no
     /// job-control story need not store it.
     fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
+
+    /// #796 — called when an injected handler frame **returns**, so the source can restore the
+    /// mask it pushed at delivery (block-during-handler: the delivered signal + its `sa_mask`
+    /// are blocked for the handler's duration, POSIX) and act on anything that unblocking
+    /// exposes — re-arm a now-deliverable pending signal, or run a held fatal signal's default
+    /// action. Called with no interp locks held. Default no-op — a poll-only source has no
+    /// injected frames to be told about.
+    fn handler_returned(&self) {}
 
     /// #796 default actions — store the run's **terminate closure**: firing it sets the domain's
     /// term flag; every vCPU of the domain self-terminates at its next per-op poll (checked after

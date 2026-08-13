@@ -296,6 +296,140 @@ int main(void) {
     );
 }
 
+/// #796 block-during-handler — **a handler is never reentered by its own signal**: the handler
+/// re-raises SIGINT at itself and spins a window; the delivery mask (the delivered signal is
+/// blocked for the handler's duration, POSIX) holds it — a leak would re-enter and bump `count`
+/// inside the window. On return the mask restores and the held raise delivers (a second, NON-nested
+/// handler run): `count` reaches 2 with `leaked` still 0. Interpreter-only (no JIT safepoints).
+#[test]
+fn c_a_handler_is_never_reentered_by_its_own_signal() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int count;
+static volatile int leaked;
+static void handler(int sig) {
+  count = count + 1;
+  if (count == 1) {
+    __px_kill(0, 0, 2);                        /* re-raise SIGINT inside its own handler */
+    long i = 0;
+    while (i < 2000000) i = i + 1;             /* the leak window: a reentry would bump count */
+    if (count != 1) leaked = 1;
+  }
+}
+int main(void) {
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (count < 2) {                          /* the held raise delivers at handler return */
+    i = i + 1;
+    if (i > 100000000) return -1;
+  }
+  return leaked * 100 + count;                 /* 2: delivered twice, never nested */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(2)],
+        "the in-handler re-raise was held (blocked) and delivered exactly once after return"
+    );
+}
+
+/// #796 nested delivery — **a different unmasked signal interrupts a running handler**: SIGINT's
+/// handler raises SIGUSR1 at itself and spins until USR1's handler runs — which can only happen
+/// NESTED (the old one-in-handler guard would spin this forever / return the stuck marker).
+/// `saw10_in2 = 1` witnesses USR1's handler running while SIGINT's was live.
+#[test]
+fn c_a_different_signal_nests_into_a_running_handler() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+static char sigstk[16384];
+static volatile int in2;
+static volatile int fired10;
+static volatile int saw10_in2;
+static volatile int stuck;
+static void h10(int sig) { saw10_in2 = in2; fired10 = 1; }
+static void h2(int sig) {
+  in2 = 1;
+  __px_kill(0, 0, 10);                         /* raise USR1 inside SIGINT's handler */
+  long i = 0;
+  while (!fired10) {                           /* only a NESTED delivery can break this */
+    i = i + 1;
+    if (i > 100000000) { stuck = 1; break; }
+  }
+  in2 = 0;
+}
+int main(void) {
+  __px_signal(0, 2, (long)h2);
+  __px_signal(0, 10, (long)h10);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (!fired10) { i = i + 1; if (i > 100000000) return -1; }
+  return stuck * 100 + saw10_in2 * 10 + fired10;  /* 11: nested, not stuck */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(11)],
+        "USR1's handler ran nested inside SIGINT's (saw10_in2 = 1), no stuck marker"
+    );
+}
+
+/// #796 `sa_mask` — **a sigaction-masked signal is held for the handler's duration**: SIGINT is
+/// installed via `sigaction` with `sa_mask` blocking USR1; the handler raises USR1 and spins a
+/// window — it must NOT nest (held by the handler mask); it delivers after the handler returns.
+/// The complement of the nesting test: same shape, `sa_mask` flips the outcome.
+#[test]
+fn c_sa_mask_holds_a_signal_for_the_handlers_duration() {
+    let src = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+static char sigstk[16384];
+static long act[3];
+static volatile int in2;
+static volatile int fired10;
+static volatile int saw10_in2;
+static volatile int held;
+static void h10(int sig) { saw10_in2 = in2; fired10 = 1; }
+static void h2(int sig) {
+  in2 = 1;
+  __px_kill(0, 0, 10);                         /* raise USR1 -- sa_mask blocks it here */
+  long i = 0;
+  while (i < 2000000) i = i + 1;               /* the window: a leak would nest h10 */
+  held = !fired10;                             /* still held at the end of the handler */
+  in2 = 0;
+}
+int main(void) {
+  act[0] = (long)h2;
+  act[1] = (1L << 10);                         /* sa_mask: block USR1 while h2 runs */
+  act[2] = 0;
+  __px_sigaction(0, 2, (long)act, 0);
+  __px_signal(0, 10, (long)h10);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_kill(0, 0, 2);
+  long i = 0;
+  while (!fired10) { i = i + 1; if (i > 100000000) return -1; }  /* delivers at h2's return */
+  return held * 100 + saw10_in2 * 10 + fired10;  /* 101: held during h2, delivered after, not nested */
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(101)],
+        "sa_mask held USR1 through the handler (held=1), delivered non-nested after return"
+    );
+}
+
 /// A tiny guest libc shim (guest code) binding C's libc calls to the POSIX personality by **name
 /// only**. Each `__px_` extern's first argument is a literal `0` — a dummy handle operand,
 /// vestigial in static dispatch (the slot binding carries the handle); no `__vm_cap`, no stash.
