@@ -848,6 +848,79 @@ fn c_an_embedder_signal_interrupts_a_blocked_read_ctrl_c() {
     }
 }
 
+/// #796 slice D — **the interactive prompt case: a `^C` interrupts a blocked STDIN read.** The
+/// guest catches SIGINT and blocks reading a granted `Stream{In}` with **interactive stdin**
+/// (`stdin_block = true`: no data ⇒ park, not EOF) — the `Blocked::CapRead` park, a different
+/// park kind from the pipe reads the earlier tests cover. The embedder "terminal" raises SIGINT;
+/// the sweep completes the parked stream read with `-EINTR` (the `cap_revoke` injection shape)
+/// and the handler runs. This is a shell sitting at its prompt taking a `^C`.
+#[test]
+fn c_a_ctrl_c_interrupts_a_blocked_interactive_stdin_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut ih = Host::new();
+    // Grant the interactive stdin FIRST (independent of the window size) so its handle can be
+    // spliced into the guest source; the personality lands after, once the window is known.
+    let stdin_h = ih.grant_stream(svm_interp::StreamRole::In);
+    ih.stdin_block = true; // interactive: an exhausted stdin parks the read instead of EOF
+    let src = format!(
+        r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_write(int cap, long fd, long buf, long len);
+long __vm_read(int fd, void *buf, long len);
+static char sigstk[16384];
+static volatile long fired;
+static void handler(int sig) {{ fired = sig; }}
+int main(void) {{
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_write(0, 1, (long)sigstk, 1);   /* readiness byte: the terminal may open fire */
+  char b[8];
+  long n = __vm_read({stdin_h}, b, 8); /* the PROMPT: interactive stdin, no data -> PARKS */
+  long i = 0;
+  while (!fired) {{ i = i + 1; if (i > 100000000) return -1; }}  /* handler landing window */
+  if (n == -4) return 40 + fired;      /* 42: -EINTR and the SIGINT handler ran */
+  return (int)n;
+}}
+"#
+    );
+    let ir = c_to_ir(&src);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let (posix, px) = setup(&mut ih, win);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    bind_shim(&raw, &mut ih, px);
+    let posix2 = posix.clone();
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let done2 = std::sync::Arc::clone(&done);
+    let terminal = std::thread::spawn(move || {
+        // Hold fire until the guest's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::yield_now();
+        }
+        while !done2.load(Ordering::Relaxed) {
+            posix2.raise_signal(2);
+            std::thread::yield_now();
+        }
+    });
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(&raw, 0, &[], &mut fuel, &mut ih);
+    done.store(true, Ordering::Relaxed);
+    terminal.join().unwrap();
+    match r {
+        Ok(v) => assert_eq!(
+            v.as_slice(),
+            [Value::I32(42)],
+            "the ^C completed the blocked interactive stdin read with -EINTR and ran the handler"
+        ),
+        Err(e) => panic!("interp trapped: {e:?}\n{ir}"),
+    }
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).

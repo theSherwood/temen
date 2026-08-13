@@ -1216,6 +1216,16 @@ impl SignalSource for SignalDoor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).restart_ok
     }
 
+    /// #796 slice D — the pre-park pending check: a deliverable (caught, unmasked, async-on,
+    /// not-stopped) signal is pending right now, so an about-to-insert interruptible park should
+    /// complete `-EINTR` instead of blocking through it.
+    fn interrupt_pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deliverable_now()
+    }
+
     /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
     /// mask pushed by [`SignalDoor::take_deliverable`], then act on what the unblocking exposes —
     /// a now-deliverable caught signal re-arms (the running vCPU picks it up at its next per-op
