@@ -1166,8 +1166,9 @@ console.log("json:", JSON.stringify({ ok: true, nums: [1, 2, 3], nested: { pi: M
     warm: true, // issue #805 follow-on: the two-phase `tcl_snapshot` driver (warmup = full Tcl_Init,
     // eval_run = eval-only). Runs on the snapshot worker (pre-warmed off the main thread), so the whole
     // Tcl_Init (sourcing init.tcl + the standard library) is paid once, not per Run.
-    jit: false, // warm+JIT declines for the 162-TU Tcl interp (the emitted eval_run traps → warm-interp),
-    // so no wasm-JIT toggle; the warm-snapshot init-once win is what matters here.
+    jit: true, // #865: warm+JIT drives the emitted `eval_run` (near-native eval over the restored warm
+    // image) — tick "wasm-JIT" for it; init stays paid-once via the snapshot. (Previously declined: the
+    // driver drove the cold `_start` export, whose Tcl_Init re-run trapped in encoding init — now fixed.)
     editable: true,
     lang: 'tcl',
     url: './assets/tcl_snapshot.svmb',

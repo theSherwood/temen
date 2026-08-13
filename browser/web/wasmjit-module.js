@@ -54,11 +54,19 @@ export function jitCacheClear() {
 // invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
 // the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
 // Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
-async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
+async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entryName = 'f0') {
+  // The emit exports one `f{svm_idx}` per SVM function; `entryName` picks the one this run drives. The
+  // single-shot `_start` path is `f0`; the warm+JIT path drives `eval_run`'s export (`f{eval_fn}`), NOT
+  // `f0` (= the cold `_start`) — see `runWarmJit` (#865).
+  const pick = (instance) => {
+    const f = instance.exports[entryName];
+    if (typeof f !== 'function') throw new Error(`emitted module has no ${entryName} export`);
+    return f;
+  };
   const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
   if (cached) {
     jitCacheStats.hits++;
-    return cached.f0;
+    return pick(cached.instance);
   }
   let module = cacheGet(cacheKey);
   if (module === undefined) {
@@ -69,15 +77,13 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp) {
   const instance = await WebAssembly.instantiate(module, {
     env: { memory, trap: () => {}, call_interp: callInterp },
   });
-  const f0 = instance.exports.f0;
-  if (typeof f0 !== 'function') throw new Error('emitted module has no f0 export');
   if (cacheKey !== undefined) {
     if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
       jitInstanceCache.delete(jitInstanceCache.keys().next().value);
     }
-    jitInstanceCache.set(cacheKey, { instance, f0 });
+    jitInstanceCache.set(cacheKey, { instance });
   }
-  return f0;
+  return pick(instance);
 }
 
 // Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
@@ -418,13 +424,18 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.svm_status()}`);
 
   const win = Number(ex.svm_warm_jit_win_ptr());
-  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as f0's i64 slot
+  const sp = ex.svm_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as the entry's i64 slot
   const envBytes = ex.svm_onramp_jit_run_env_bytes();
+  // Drive the emitted `eval_run` export — `f{eval_fn}`, NOT `f0` (#865). `f0` is the cold `_start`
+  // (init + eval); driving it re-runs the guest's init over the restored warm image, which for Tcl
+  // re-enters `Tcl_FindExecutable` → an encoding-proc `call_indirect` trap (and for any driver defeats
+  // the "init paid once" warm contract). The entry export index comes from the engine.
+  const entryName = `f${ex.svm_warm_jit_entry_func()}`;
 
   // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
   // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
   // passed per Run), so one instance serves every Run of this warm session.
-  const f0 = await cachedInstanceF0(
+  const entry = await cachedInstanceF0(
     memory,
     cacheKey,
     () => {
@@ -435,6 +446,7 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
     (func, argsPtr) => {
       if (ex.svm_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
     },
+    entryName,
   );
 
   const env = Number(ex.svm_alloc(envBytes));
@@ -443,9 +455,9 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
   let value = 0n;
   let trapError = null;
   try {
-    // f0(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return is
-    // the guest's top-level result (an i32/i64); normalize to i64.
-    const r = f0(win, env, sp);
+    // entry(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return
+    // is the guest's top-level result (an i32/i64); normalize to i64.
+    const r = entry(win, env, sp);
     value = r === undefined || r === null ? 0n : BigInt(r);
   } catch (e) {
     threw = 1;

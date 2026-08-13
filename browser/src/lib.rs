@@ -5309,7 +5309,7 @@ pub extern "C" fn svm_warm_jit_wasm_len() -> usize {
 pub extern "C" fn svm_warm_jit_win_ptr() -> usize {
     warm_jit_ref().map_or(0, |r| r.win_base())
 }
-/// The entry `sp` the emitted `f0` takes as its trailing `i64` slot (the powerbox data-stack base).
+/// The entry `sp` the emitted entry takes as its trailing `i64` slot (the powerbox data-stack base).
 #[no_mangle]
 pub extern "C" fn svm_warm_jit_entry_sp() -> i64 {
     warm_jit_ref().map_or(0, |r| match r.slots().first() {
@@ -5317,6 +5317,22 @@ pub extern "C" fn svm_warm_jit_entry_sp() -> i64 {
         Some(Value::I32(x)) => *x as i64,
         _ => 0,
     })
+}
+
+/// The emitted **export index of the warm+JIT entry** — the driver must call `f{this}`, NOT `f0`. The
+/// emit exports one `f{svm_idx}` per SVM function, and the warm+JIT emit is rooted at the module's
+/// `eval_run` (not the cold `_start`, which is func 0). So the entry export is `f{eval_fn}` where
+/// `eval_fn` is `eval_run`'s SVM function index. Driving `f0` instead runs the cold `_start`
+/// (init + eval), which for a driver whose init re-runs on the restored image traps or diverges (#865).
+/// Valid after [`svm_warm_jit_open`]; 0 (a harmless `f0`) if no warm session is open.
+#[no_mangle]
+pub extern "C" fn svm_warm_jit_entry_func() -> u32 {
+    // SAFETY: single-threaded wasm; shared read of the session static.
+    unsafe {
+        (*core::ptr::addr_of!(WARM_SESSION))
+            .as_ref()
+            .map_or(0, |s| s.eval_fn)
+    }
 }
 
 /// **Cross-tier bounce** for the warm+JIT run — the emitted `f0`'s `env.call_interp(func, args_ptr)`

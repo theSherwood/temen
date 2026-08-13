@@ -2,8 +2,9 @@
 // `lua-warm-snapshot-test.mjs`. Drives the shipping engine FFI (`svm_warm_open`/`svm_warm_eval`) over a
 // `tcl_snapshot.svmb` (the two-phase `warmup` = full `Tcl_Init` / `eval_run` = eval-only driver), and
 // asserts warm `eval_run` over the restored snapshot matches the cold `_start` (`svm_run_onramp`) output
-// byte-for-byte while skipping the `Tcl_Init` rebuild, plus fresh-per-Run isolation. Tcl's warm+JIT
-// declines (the 162-TU interp's emitted `eval_run` traps → warm-interp), so this is interpreter-only.
+// byte-for-byte while skipping the `Tcl_Init` rebuild, plus fresh-per-Run isolation. It also drives the
+// **warm+JIT** tier (`runWarmJit` over the emitted `eval_run` export) and asserts it matches warm-interp
+// (#865: the tier used to trap because the driver drove the cold `_start` export instead of `eval_run`).
 //
 //   node tcl-warm-snapshot-test.mjs [svm_browser.wasm] [tcl_snapshot.svmb]
 //
@@ -11,6 +12,7 @@
 // SKIPs cleanly when it's absent — like the other Tcl demos.
 import { readFileSync, existsSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
+import { runWarmJit } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/svm_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/tcl_snapshot.svmb';
@@ -31,6 +33,7 @@ const modBytes = readFileSync(modPath);
 
 function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.svm_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); m.free(); return { out, st }; }
 function warm(js) { const s = put(enc(js)); ex.svm_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.svm_status(); s.free(); return { out, st }; }
+async function warmJit(js) { const st = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1); return { out: readStdout(), st }; }
 
 const m = put(modBytes);
 const live = Number(ex.svm_warm_open(m.p, m.len));
@@ -83,6 +86,34 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
   console.log(`\n#864 clock pre-touch: warm clock line ${ms.toFixed(1)}ms — ${fast ? 'OK — lazy clock init is on the snapshot (not re-paid per Run)' : `REGRESSION: clock re-initializing every Run (${ms.toFixed(0)}ms > 300ms)`}`);
 }
 
+// warm+JIT tier (#865): open the emitted `eval_run`, then drive it via `runWarmJit` and assert byte
+// parity with warm-interp. The entry export index must be `eval_run`'s (NOT 0 = the cold `_start`,
+// whose Tcl_Init re-run trapped) — a regression to `f0` reintroduces the trap this asserts against.
+{
+  const opened = ex.svm_warm_jit_open(1);
+  const entry = ex.svm_warm_jit_entry_func();
+  const jitOk = opened === 0 && entry !== 0;
+  allOk = allOk && jitOk;
+  console.log(`\nwarm+JIT open: status ${opened} (0=OK), entry export f${entry} — ${jitOk ? 'OK — drives eval_run, not the cold _start (f0)' : 'FAIL — eval_run not emittable or entry is f0'}`);
+  if (jitOk) {
+    console.log(`\n${'program'.padEnd(12)}${'JIT≡interp'.padStart(11)}`);
+    for (const [name, js] of programs) {
+      const wi = warm(js);
+      const wj = await warmJit(js);
+      const ok = wi.out === wj.out && wj.st === 0;
+      allOk = allOk && ok;
+      console.log(`${name.padEnd(12)}${(ok ? 'OK' : 'MISMATCH').padStart(11)}`);
+      if (!ok) { console.log(`  interp: ${JSON.stringify(wi.out)}`); console.log(`  jit:    ${JSON.stringify(wj.out)} st=${wj.st}`); }
+    }
+    // fresh-per-Run isolation on the warm+JIT tier too.
+    const j1 = await warmJit('set leaked 4242; puts "set $leaked"\n');
+    const j2 = await warmJit('puts "exists? [info exists leaked]"\n');
+    const jiso = j1.out.includes('set 4242') && j2.out.includes('exists? 0') && !j2.out.includes('4242');
+    allOk = allOk && jiso;
+    console.log(`\nwarm+JIT fresh-per-Run isolation: ${jiso ? 'OK' : 'LEAK!'}`);
+  }
+}
+
 ex.svm_warm_close();
 if (!allOk) fail('Tcl warm snapshot parity/isolation mismatch');
-console.log('\nOK: Tcl warm snapshot — warm eval_run matches cold _start byte-for-byte, isolation holds');
+console.log('\nOK: Tcl warm snapshot — warm eval_run matches cold _start byte-for-byte (interp + warm+JIT), isolation holds');

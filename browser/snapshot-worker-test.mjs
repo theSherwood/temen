@@ -1,5 +1,5 @@
 // Chromium smoke for the **snapshot worker** (WASM_AOT.md warm+JIT · issues #804/#805). Drives the real
-// page: each warm card (QuickJS, Lua) runs its snapshot on a dedicated Worker (own engine + memory),
+// page: each warm card (QuickJS, Lua, Tcl) runs its snapshot on a dedicated Worker (own engine + memory),
 // pre-warmed off the main thread; each Run is a message round-trip. Asserts every warm card runs
 // end-to-end on BOTH warm tiers (warm-snapshot + warm+JIT), that the work went *through the worker* (not
 // a silent main-thread fallback — `globalThis.__snapshotWorkerRuns` increments), and that fresh-per-Run
@@ -39,11 +39,12 @@ const CARDS = [
     leakClean: (out) => out.includes('nil') && !out.includes('4242'),
   },
   {
-    // Tcl's warm+JIT declines (the 162-TU interp's emitted eval_run traps), so it's warm-snapshot-only
-    // (`noJit`): no wasm-JIT toggle, no JIT pre-compile. The `tcl_snapshot.svmb` asset is deploy-built,
-    // so this entry is filtered out (skipped) in the committed-asset CI job.
-    name: 'Tcl (8.6 — write & run)', asset: 'tcl_snapshot.svmb', noJit: true,
+    // Tcl now runs BOTH warm tiers (#865: warm+JIT drives the emitted `eval_run` export, not the cold
+    // `_start`). The `tcl_snapshot.svmb` asset is deploy-built, so this entry is filtered out (skipped)
+    // in the committed-asset CI job.
+    name: 'Tcl (8.6 — write & run)', asset: 'tcl_snapshot.svmb',
     plain: ['puts [expr 6*7]\n', '42'],
+    heavy: ['proc fib {n} {expr {$n<2?$n:[fib [expr $n-1]]+[fib [expr $n-2]]}}; puts [fib 20]\n', '6765'],
     leakSet: 'set leaked 4242; puts "set $leaked"\n',
     leakGet: 'puts "exists? [info exists leaked]"\n',
     leakClean: (out) => out.includes('exists? 0') && !out.includes('4242'),
@@ -153,5 +154,5 @@ try {
   await new Promise((r) => server.close(r));
 }
 
-console.log(failed ? 'FAIL — snapshot worker' : 'PASS — snapshot worker: warm-snapshot + warm+JIT on dedicated workers (QuickJS + Lua), isolation holds');
+console.log(failed ? 'FAIL — snapshot worker' : 'PASS — snapshot worker: warm-snapshot + warm+JIT on dedicated workers (QuickJS, Lua, Tcl), isolation holds');
 process.exit(failed ? 1 : 0);
