@@ -71,10 +71,17 @@ typedef enum {
 #define atomic_fetch_sub_explicit(obj, val, order) __pg_atomic_add((obj), -(val))
 
 // Compare-exchange over the 32-bit CAS (int-sized atomics — the teaching case). Returns whether the
-// swap happened; on failure writes the current value back through `expected`, as C11 requires.
+// swap happened; on failure writes the current value back through `expected`, as C11 requires. A
+// small helper (not a GCC statement-expression) keeps this within the browser IR-codegen C subset.
+static inline int __pg_atomic_cas_bool(void *p, int *expected, int desired) {
+  int e = *expected;
+  int old = __vm_atomic_cas32(p, e, desired);
+  if (old == e) return 1;
+  *expected = old;
+  return 0;
+}
 #define atomic_compare_exchange_strong(p, expected, desired) \
-  ({ int __e = *(expected); int __o = __vm_atomic_cas32((void *)(p), __e, (desired)); \
-     int __ok = (__o == __e); if (!__ok) *(expected) = __o; __ok; })
+  __pg_atomic_cas_bool((void *)(p), (int *)(expected), (desired))
 #define atomic_compare_exchange_weak(p, expected, desired) \
   atomic_compare_exchange_strong((p), (expected), (desired))
 #define atomic_compare_exchange_strong_explicit(p, e, d, s, f) \
