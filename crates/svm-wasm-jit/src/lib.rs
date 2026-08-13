@@ -1922,6 +1922,14 @@ pub fn compile_module_tierup_caps(
 /// run on the emitted tier, including the old→new edge into installed units. The host owns slot
 /// population and must keep the table exact at every entry to emitted code (the single-shot pump
 /// syncs at event boundaries — installs only happen between events).
+///
+/// #888 — this mode also **widens the cross-tier set** to the reactor's `cross` (every
+/// [`marshallable_sig`] non-in-subset function, not just the strict memory-free [`interp_leaf`]),
+/// collapsing the fixpoint cascade so an in-subset function that calls a memory/cap helper stays
+/// emitted. **Contract:** the host must therefore service `env.call_interp` over the run's **LIVE**
+/// window/powerbox/fuel (the pump's `svm_onramp_tierup_call_interp` → the live-state bounce) — the
+/// same contract the bounce shims already impose — not the throwaway-window bounce the leaf-only
+/// drivers use.
 pub fn compile_module_tierup_b2(
     m: &Module,
     shared_memory: bool,
@@ -2007,8 +2015,28 @@ fn compile_module_tierup_inner(
             }
         }
     }
+    // The cross-tier set — functions an emitted `Call`/`call_indirect` routes to `env.call_interp`.
+    // Two widths, by who services the bounce:
+    //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
+    //     memory-free, call-free, cap-free — because the leaf-only drivers run a bounce over a
+    //     *throwaway* window (a memory-touching leaf would diverge from the shared one).
+    //   * **shared reserved table** (#888, B2 mode — `compile_module_tierup_b2`): the reactor's
+    //     `cross` set — **any** [`marshallable_sig`] non-in-subset function. This mode's host
+    //     services `env.call_interp` over the run's **LIVE** window/powerbox/fuel (the pump's
+    //     `svm_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
+    //     [`compile_module_reactor`]'s contract, so a cross-tier callee may touch memory, make
+    //     calls, and cap-call. Widening here collapses the fixpoint cascade below: an in-subset
+    //     function that calls a memory/cap helper stays emitted instead of being dropped
+    //     (#887 measured this as ~30% → ~90% static coverage on the C-family cards).
     let leaf: Vec<bool> = (0..n)
-        .map(|i| !in_subset[i] && interp_leaf(&m.funcs[i]))
+        .map(|i| {
+            !in_subset[i]
+                && if reserved_table_log2.is_some() {
+                    marshallable_sig(&m.funcs[i])
+                } else {
+                    interp_leaf(&m.funcs[i])
+                }
+        })
         .collect();
     let all_in_subset = in_subset.iter().all(|&s| s);
     // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.

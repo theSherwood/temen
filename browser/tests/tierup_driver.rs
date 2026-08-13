@@ -1754,3 +1754,102 @@ export 0 func "_start" 0
     );
     svm_onramp_tierup_close();
 }
+
+// ---- #888: widened cross-tier — a DIRECT Call from an emitted leaf to a cap-calling helper ------
+
+/// What the direct-cross-tier helper adds.
+const XT_K: i64 = 222;
+
+/// #888 differential: `_start` (cap-calling, interpreter-driven) calls `f1`, a pure all-i64
+/// compute leaf whose *only* non-emittable feature is a **direct `Call`** to `f2`, a `cap.call`-ing
+/// helper (grows the window + streams). Before #888 `f1` cascades to the interpreter — the tier-up
+/// open would refuse the guest (no eligible leaf). After #888 `f1` emits (the reactor `cross` set),
+/// so the open succeeds, `f1` tiers up, and its direct call to `f2` bounces over the **live**
+/// window: `f2` grows `[64K, 80K)` and streams, then `f1` stores into the just-grown page — correct
+/// only through the post-bounce `"mapped"` fan-out. Distinct from the #880 `call_indirect` bounce:
+/// this is a direct `env.call_interp`, not a table shim.
+#[test]
+fn direct_cross_tier_call_bounces_over_the_live_window() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_handles();
+    // f0 = _start (cap-calls → interp-driven); f1 = the eligible leaf (compute + direct call to f2 +
+    // a store into f2's grown page); f2 = the cap-calling helper (grow + stream), out of subset,
+    // reached as a direct cross-tier call.
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 7
+  vres = call 1 (vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {LEAF_K}
+  vsum = i64.add v0 vk
+  vg = call 2 (vsum)
+  vaddr = i64.const {PROBE}
+  i64.store vaddr vg
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vk = i64.const {XT_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, 7 + LEAF_K + XT_K, "oracle value");
+
+    // The open itself is the #888 pin: pre-#888 f1 cascades (no eligible leaf) → UNSUPPORTED.
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened, 0,
+        "#888: the leaf with a direct cross-tier call must now be eligible (status {})",
+        svm_status()
+    );
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the widened leaf must tier up (non-vacuity)");
+    assert!(
+        d.bounces().contains(&2),
+        "the direct cross-tier call to the cap-calling helper must bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity (direct cross-tier over the live window; mid-call growth admitted post-bounce)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering included)");
+    svm_onramp_tierup_close();
+}

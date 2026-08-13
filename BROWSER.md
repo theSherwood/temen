@@ -1060,6 +1060,27 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    mid-region with stdout-ordering parity; and a fiber created inside a TIERUP bounce resumed
    later by `_start` (the run-registry persistence pin).
 
+   **#888 — widened cross-tier calls collapse the fixpoint cascade (the coverage lever).** The
+   mixed-tier fixpoint dropped any candidate whose direct callee wasn't emitted or a strict
+   `interp_leaf` (pure/memory-free/call-free) — so one `printf` deep in a call chain de-emitted
+   everything above it. Measured over the shipping cards (the #887 inventory), this cascade — not
+   any op — pinned **61–69%** of chibicc/Lua/QuickJS to the interpreter, with only a handful of
+   functions per card carrying a genuinely non-emittable op. In the shared-reserved (B2) mode the
+   host services `env.call_interp` over the run's **live** window/powerbox/fuel (the pump's
+   `svm_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
+   `compile_module_reactor`'s Doom-perf contract — so `compile_module_tierup_b2` widens the
+   cross-tier set from strict `interp_leaf` to the reactor's `cross` (any `marshallable_sig`
+   non-in-subset function). An in-subset function that calls a memory/cap helper now stays emitted;
+   the helper bounces. Serving needed **no** change — direct (`Call`) and indirect (`call_indirect`)
+   cross-tier both emit `env.call_interp` and route to the same live bounce, already built by
+   #846/#880. Measured jump (`compile_module_tierup_b2`, per-card emitted fraction): chibicc
+   30%→**91%**, Lua 26%→**97%**, QuickJS 22%→**99%**, svm-leng 55%→**100%**. Local-mode and paged
+   callers keep the strict `interp_leaf` (throwaway-window bounce). Pinned: an emitter unit test
+   flipping one cascade function from interpreted→emitted purely from the widened set
+   (`tierup.rs`), and a browser differential where a tiered-up leaf makes a **direct** cross-tier
+   call to a cap-calling helper that grows the window mid-call — parity with `onramp_exec`, the
+   store into the just-grown page pinning the fan-out (`tierup_driver.rs`).
+
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 
 Two changes to how the wasm-JIT meters fuel, measured together because they interact.
