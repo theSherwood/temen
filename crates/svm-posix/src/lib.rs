@@ -1159,10 +1159,23 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         let child = Arc::new(Mutex::new(child));
         w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
         drop(w);
+        // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
+        // raw exit status when the twin's task completes, and the process becomes a reapable
+        // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
+        // OUR policy — WEXITSTATUS in bits 8–15, the same encode `spawn_core` uses; a crashed
+        // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
+        // like any exit code.
+        let exit_world = Arc::clone(&world);
+        let exit = Arc::new(move |status: i64| {
+            let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
+            w.procs
+                .insert(pid, ProcEntry::Zombie(((status & 0xff) << 8) as i32));
+        });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
             signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
             refork: Some(fork_factory(Arc::clone(&world), child)),
+            exit: Some(exit),
         }
     })
 }
@@ -1942,10 +1955,11 @@ impl Ctx<'_> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
-        // #863 slice 2 — reap from the process table: only [`ProcEntry::Zombie`] entries (completed
-        // spawn-delegate children) are reapable here. A live fork twin's exit flows through the
-        // core's servicer reap (FORK.md §8.6 — the wait offer), not this op; unifying the two under
-        // one `waitpid` is slice 3 (the waitpid-EINTR capstone).
+        // #863 — reap from the process table: [`ProcEntry::Zombie`] entries are reapable here —
+        // completed spawn-delegate children, and (hygiene slice) **exited fork twins**, whose exit
+        // hook flipped them Live → Zombie. A still-running twin is `-ECHILD` (this op never blocks
+        // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
+        // same twin independently; use one channel per child).
         let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie(_)));
         let reaped = if pid == -1 {
             self.w
@@ -3316,6 +3330,50 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    /// #863 hygiene — a fork twin's **exit hook** retires it in the process table: firing it (as
+    /// the core does at twin completion) flips `Live` → `Zombie` with the wait-encoded status, so
+    /// `waitpid` reaps a fork twin exactly like a spawn child — and the pid is gone afterwards
+    /// (`kill` = `-ESRCH`). Before the exit, the live twin is `-ECHILD` here (non-blocking poll).
+    #[test]
+    fn a_twins_exit_hook_makes_it_reapable_by_waitpid() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let forked = cap_fork_factory(&posix)(7);
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(
+                st.waitpid(&[7, 0, 0], Some(&mut mem)).unwrap()[0],
+                ECHILD,
+                "a still-running twin is not reapable through this op"
+            );
+        }
+        // The core fires the hook with the twin's raw exit status at completion.
+        (forked
+            .exit
+            .as_ref()
+            .expect("the personality installs an exit hook"))(7);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(
+            st.kill(&[7, 15]),
+            0,
+            "an exited-unreaped twin is a zombie — kill succeeds"
+        );
+        assert_eq!(
+            st.waitpid(&[7, 100, 0], Some(&mut mem)).unwrap()[0],
+            7,
+            "waitpid reaps the exited fork twin"
+        );
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            (status >> 8) & 0xff,
+            7,
+            "WEXITSTATUS is the twin's exit code"
+        );
+        assert_eq!(st.kill(&[7, 15]), ESRCH, "reaped ⇒ the pid is gone");
     }
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,

@@ -6044,6 +6044,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.trap_origin
                         .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
                 }
+                // #863 hygiene — a **fork twin** finishing notifies its personalities: the exit
+                // hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with the raw
+                // exit status ([`reap_status`] — the same value a servicer-side reap hands a
+                // `wait`), so each retires the process in its own table (Live → Zombie). Gated on
+                // the twin registry: a thread sibling completing on a *shared* host must not fire
+                // the domain's hooks. Safe under the scheduler lock: hooks take personality locks,
+                // and the established order is scheduler → personality (the fork factory); the
+                // host lock is free (this very thread just dropped the vCPU).
+                if s.forked_twins.contains_key(&id) {
+                    let hooks = dying_host
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .exit_hooks
+                        .clone();
+                    if !hooks.is_empty() {
+                        let status = reap_status(&outcome.result);
+                        for h in hooks {
+                            h(status);
+                        }
+                    }
+                }
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -15823,6 +15844,14 @@ pub struct ForkedProc {
     /// the *new* process's state next time, not the original's (fork-of-fork clones the twin's fd
     /// table/cwd, not the grandparent's). `None` = reuse the same factory (fully-shared providers).
     pub refork: Option<HostProcFork>,
+    /// #863 hygiene — the new process's **exit hook**: the core calls it with the process's raw
+    /// exit status ([`reap_status`] — the same value the servicer-side reap hands a `wait`) when
+    /// its fork-twin task completes, so a personality can retire the process from its own table
+    /// (svm-posix: `Live` → reapable `Zombie`). Encoding the status (wait-encode, crash mapping)
+    /// is the personality's policy. `None` = no notification (shared-state providers). Fired only
+    /// for **fork twins** (the tasks in the scheduler's twin registry) — a domain torn down
+    /// wholesale at run end is not individually notified.
+    pub exit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
 }
 
 impl ForkedProc {
@@ -15834,6 +15863,7 @@ impl ForkedProc {
             handler,
             signal: None,
             refork: None,
+            exit: None,
         }
     }
 }
@@ -16584,6 +16614,10 @@ pub struct Host {
     /// handler when `sig_armed` fires. `None` ⇒ no async signals (poll-only, the default). Installed via
     /// [`Host::set_signal_source`]; the source holds the *same* `sig_armed` `Arc`, so its arming is visible.
     sig_source: Option<Arc<dyn SignalSource + Send + Sync>>,
+    /// #863 hygiene — exit hooks the fork factories supplied ([`ForkedProc::exit`]): fired with the
+    /// task's raw exit status when this host's **fork-twin** task completes, so each personality
+    /// retires the process from its own table. Empty for every non-forked host.
+    exit_hooks: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `cap.call`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -16973,6 +17007,7 @@ impl Host {
             completion_notify: None,
             sig_armed: Arc::new(AtomicBool::new(false)),
             sig_source: None,
+            exit_hooks: Vec::new(),
             cap_pages: None,
             quota: Quota::default(),
             jit_domains: Vec::new(),
@@ -17075,6 +17110,7 @@ impl Host {
         // the twin below, overriding the shared-source fallback) and a replacement factory (so
         // fork-of-fork forks the *twin's* state); either absent keeps the pre-split shared behavior.
         let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
+        let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
         twin.host_procs = self
             .host_procs
             .iter()
@@ -17083,6 +17119,9 @@ impl Host {
                 let forked = factory(twin_pid);
                 if forked.signal.is_some() {
                     twin_sig = forked.signal;
+                }
+                if let Some(x) = forked.exit {
+                    twin_exit.push(x);
                 }
                 HostProcEntry {
                     handler: ProcHandler::Sync(forked.handler),
@@ -17114,6 +17153,9 @@ impl Host {
                 twin.sig_armed = Arc::clone(&self.sig_armed);
             }
         }
+        // #863 hygiene — the personalities' exit hooks ride the twin's host; the scheduler fires
+        // them with the twin's exit status at completion (Live → Zombie in each process table).
+        twin.exit_hooks = twin_exit;
         // The twin gets its own copy of the value-typed quota vectors.
         twin.budgets = self.budgets.clone();
         twin.quota = self.quota;
@@ -20120,6 +20162,9 @@ impl Host {
                     let forked = factory(0);
                     if let Some((source, armed)) = forked.signal {
                         child.set_signal_source(source, armed);
+                    }
+                    if let Some(x) = forked.exit {
+                        child.exit_hooks.push(x);
                     }
                     child.grant_host_proc_forkable(
                         forked.handler,

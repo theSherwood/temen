@@ -2883,6 +2883,7 @@ fn opshift_fork(base: svm_interp::HostProcFork) -> svm_interp::HostProcFork {
             }),
             signal: forked.signal,
             refork: forked.refork.map(opshift_fork),
+            exit: forked.exit,
         }
     })
 }
@@ -3159,5 +3160,80 @@ fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
         "the parent's ^C EINTR'd only ITS wait; the child's park survived (6 = the child \
          reaped the grandchild's clean 5) — the domain-scoped sweep, witnessed across three \
          generations"
+    );
+}
+
+/// #863 hygiene — **`waitpid` over a fork twin, through the personality**: the parent reaps its
+/// forked child with the POSIX `waitpid` op (a non-blocking `-ECHILD` poll), never touching the
+/// core's wait offer. The chain under test: the twin's task completes → the core fires the fork
+/// factory's exit hook → the personality flips the twin `Live` → `Zombie` (wait-encoded) → the
+/// parent's poll stops seeing `-ECHILD` and reaps the status. One pid, two reap channels — this
+/// pins the personality one; the wait-offer one is every other test in this file.
+const WAITPID_TWIN_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long r;
+static int status;
+int main(int argc, char **argv) {
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    return 7;
+  }
+  while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* waitpid poll: ECHILD until exit */
+  if (r != pid) return 1;
+  if (((status >> 8) & 0xff) != 7) return 2;                   /* WEXITSTATUS */
+  if (__vm_fs(31, pid, 15, 0, 0) != -3) return 3;              /* reaped: kill(pid) is -ESRCH */
+  return 42;
+}
+"#;
+
+#[test]
+fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{WAITPID_TWIN_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse waitpid-twin guest");
+    verify_module(&guest).expect("verify waitpid-twin guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the exit hook flipped the twin to a zombie: posix waitpid reaped it (WEXITSTATUS 7) \
+         and the pid is gone afterwards"
     );
 }
