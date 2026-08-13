@@ -7,7 +7,9 @@
 //! interpreter, the same MISCOMPILE-grade contract the whole-module path holds.
 
 use svm_interp::{bytecode, Trap, Value};
-use svm_wasm_jit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
+use svm_wasm_jit::{
+    compile_module_tierup, compile_module_tierup_b2, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: u32 = 0x1_0000;
@@ -344,4 +346,63 @@ fn all_in_subset_all_eligible() {
     let (wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
     assert_eq!(eligible, vec![true, true], "eligibility bitmap");
     diff_eligible(&m, &eligible, &wasm, SWEEP);
+}
+
+/// #888 — the fixpoint cascade. `f1` is pure integer compute (in-subset, tier-up-eligible) whose
+/// *only* disqualifier is a direct `Call` to `f2`, a `cap.call`-ing helper (out of subset). Under
+/// the **local**-table emit (`compile_module_tierup`) `f2` is not a strict `interp_leaf`
+/// (memory-free/call-free/cap-free), so the fixpoint drops `f1` — it cascades to the interpreter.
+/// Under the **shared reserved table** (`compile_module_tierup_b2`, #888) `f2` is a marshallable
+/// cross-tier callee (the reactor `cross` set — the host bounces it over the live window), so `f1`
+/// stays emitted. This is the coverage lever measured in #887 (~30% → ~90% on the C-family cards),
+/// proven here as one function flipping from interpreted to emitted purely from the widened set.
+const CASCADE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  return v0
+  }
+}
+"#;
+
+#[test]
+fn widened_cross_tier_uncascades_the_caller() {
+    let m = build(CASCADE);
+    // f0 cap-calls (out of subset — interpreter-driven top frame); f2 cap-calls (out of subset);
+    // f1 is pure integer compute that only calls f2.
+    let (_, local) = compile_module_tierup(&m, false).expect("local tier-up emit");
+    assert_eq!(
+        local,
+        vec![false, false, false],
+        "local table: f1 cascades to the interpreter (f2 isn't a strict interp_leaf)"
+    );
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    assert_eq!(
+        widened,
+        vec![false, true, false],
+        "#888 widened cross-tier: f1 now emits (f2 is a marshallable cross-tier callee)"
+    );
 }
