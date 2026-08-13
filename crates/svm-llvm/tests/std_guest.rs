@@ -99,33 +99,9 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().ok()?;
-    // #788 wedge guard: a `rustc`/`cargo` that hangs mid-`build-std` must not stall the whole (serial)
-    // job to the 6-hour ceiling. Bound each build and kill a wedged child, returning `None` (skip)
-    // instead of blocking forever. Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
-    let budget = std::env::var("SVM_STD_BUILD_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(600);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
-    loop {
-        match child.try_wait() {
-            // A missing `_start` linker note is expected (we consume the IR, not the executable); a
-            // non-zero status is tolerated as long as the `.ll` landed (checked below).
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    kill_build(&mut child);
-                    eprintln!(
-                        "note: skipping std_guest ({target_file}): build-std exceeded {budget}s \
-                         (possible #788 rustc wedge)"
-                    );
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(_) => return None,
-        }
-    }
+    // A missing `_start` linker note is expected (we consume the IR, not the executable); a
+    // non-zero status is tolerated as long as the `.ll` landed (checked below).
+    wait_bounded(&mut child, target_file)?;
     let ll = find_ll(&work.join("target"), name)?;
     // Free the per-test build tree now. Each test does a full `build-std` (~hundreds of MB of target
     // artifacts); run serially across the whole suite that exhausts the runner's disk allowance —
@@ -137,6 +113,37 @@ fn build_std_bin_ll_target(name: &str, src: &str, target_file: &str) -> Option<P
     std::fs::copy(&ll, &out_ll).ok()?;
     let _ = std::fs::remove_dir_all(&work);
     Some(out_ll)
+}
+
+/// #788 wedge guard, shared by the `build-std` and native-oracle compiles: a `rustc`/`cargo` that
+/// hangs must not stall the whole (serial) job to the 6-hour ceiling — CI observed the wedge in
+/// **both** spots (build-std originally; the bare native-oracle `rustc` in issue #906). Bound the
+/// wait and kill a wedged child's whole process group, returning `None` (skip) instead of blocking
+/// forever. The child must have been spawned as its own group leader (`process_group(0)`).
+/// Override the budget with `SVM_STD_BUILD_TIMEOUT_SECS`.
+fn wait_bounded(child: &mut std::process::Child, what: &str) -> Option<std::process::ExitStatus> {
+    let budget = std::env::var("SVM_STD_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    kill_build(child);
+                    eprintln!(
+                        "note: skipping std_guest ({what}): compile exceeded {budget}s \
+                         (possible #788 rustc wedge)"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Kill a wedged `build-std` and reap it (#788). On Unix `cargo` leads its own process group (set at
@@ -370,15 +377,15 @@ fn native_oracle_args(name: &str, src: &str, extra_args: &[&str]) -> Option<(Vec
     let rs = dir.join("main.rs");
     let bin = dir.join("oracle");
     std::fs::write(&rs, host_src).ok()?;
-    let built = Command::new("rustc")
-        .args(["--edition", "2021", "-O"])
+    let mut cmd = Command::new("rustc");
+    cmd.args(["--edition", "2021", "-O"])
         .arg(&rs)
         .arg("-o")
-        .arg(&bin)
-        .status()
-        .ok()?
-        .success();
-    if !built {
+        .arg(&bin);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
+    if !wait_bounded(&mut child, "native-oracle rustc")?.success() {
         return None;
     }
     let out = Command::new(&bin).args(extra_args).output().ok()?;
@@ -415,15 +422,15 @@ fn native_oracle_streams(name: &str, src: &str) -> Option<(Vec<u8>, Vec<u8>, u8)
     let rs = dir.join("main.rs");
     let bin = dir.join("oracle");
     std::fs::write(&rs, host_src).ok()?;
-    let built = Command::new("rustc")
-        .args(["--edition", "2021", "-O"])
+    let mut cmd = Command::new("rustc");
+    cmd.args(["--edition", "2021", "-O"])
         .arg(&rs)
         .arg("-o")
-        .arg(&bin)
-        .status()
-        .ok()?
-        .success();
-    if !built {
+        .arg(&bin);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().ok()?;
+    if !wait_bounded(&mut child, "native-oracle rustc")?.success() {
         return None;
     }
     let out = Command::new(&bin).output().ok()?;
