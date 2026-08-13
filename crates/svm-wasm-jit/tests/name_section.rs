@@ -1,7 +1,10 @@
 //! The emitted wasm carries a **name section** (issue #865 diagnostics). Each emitted function is named
-//! by its guest index (`gfN`) — or its source name on a `-g` build (`debug_info.func_names`, not
-//! exercised here) — so a V8 wasm stack trace / a `svm_warm_jit` decline names the culprit function
-//! instead of a bare `wasm-function[N]`. Without this, bisecting a 13 MB emit is guesswork.
+//! by its **export symbol name** (`lua_checkstack`, `JS_CallInternal` …) — every defined function is
+//! exported by its symbol name, so the real names ride in `m.exports` with no `-g` flag and no format
+//! change (#907). Precedence: a DWARF source name (a `-g` build's `debug_info.func_names`, the reserved
+//! level-2 rung, not exercised here) → the export symbol name → the guest index `gfN` (only for an
+//! unexported synthesized helper). So a V8 wasm stack trace / a `svm_warm_jit` decline names the culprit
+//! function instead of a bare `wasm-function[N]`. Without this, bisecting a 13 MB emit is guesswork.
 
 use svm_wasm_jit::compile_module;
 
@@ -72,10 +75,45 @@ block 0 (v0: i64) {
         "function-names subsection (id 1)"
     );
 
-    // Both guest functions are named `gfN` (no `-g` source names in a parsed svm-text module).
+    // With no exports declared, both guest functions fall back to `gfN`.
     let has = |needle: &[u8]| wasm.windows(needle.len()).any(|w| w == needle);
     assert!(has(b"gf0"), "names guest function 0 as gf0");
     assert!(has(b"gf1"), "names guest function 1 as gf1");
     // The cross-tier `env.call_interp` import is named too (it appears in mixed-tier stacks).
     assert!(has(b"env.call_interp"), "names the cross-tier import");
+}
+
+/// The name section prefers the **export symbol name** over the `gfN` fallback (#907): every defined
+/// function is exported by its symbol name, so the real names ride in `m.exports` with no `-g` flag —
+/// the same path that turns `gf597` into `lua_checkstack` on the real Lua/QuickJS/Tcl assets. Here
+/// func 0 is exported as `compute`, so the trace names `compute` (not `gf0`); the unexported func 1
+/// stays `gf1`.
+#[test]
+fn emitted_wasm_prefers_export_symbol_names() {
+    let wasm = compile_module(&m(r#"export 0 func "compute" 0
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 7
+  v2 = i64.add v0 v1
+  return v2
+  }
+}"#))
+    .expect("module emits");
+
+    let has = |needle: &[u8]| wasm.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        name_section(&wasm).is_some(),
+        "emitted wasm carries a `name` custom section"
+    );
+    assert!(
+        has(b"compute"),
+        "func 0 named by its export symbol `compute`"
+    );
+    assert!(has(b"gf1"), "unexported func 1 stays gf1");
 }

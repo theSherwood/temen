@@ -2687,18 +2687,42 @@ fn emit_module(
     section(&mut out, 10, &sec);
 
     // Name section (custom id 0, "name", function-names subsection) — names each emitted wasm function by
-    // its guest function index (`gfN`, or the source name when a `-g` build carried one in
-    // `debug_info.func_names`), plus the cross-tier trampolines (`xtramp_gfN`) and the `()->()` trap stub
-    // (`TRAP_STUB`). Diagnostic-only and cheap: a V8 wasm stack trace — e.g. a `svm_warm_jit` decline
-    // (issue #865) — then names the culprit function instead of a bare `wasm-function[N]`. `wasm_of[fi]`
-    // is the final wasm index (it already accounts for the function imports), so it is the name-section
-    // funcidx directly; `env.trap`/`env.call_interp` are always imports 0/1.
+    // its **export symbol name** (`lua_checkstack`, `JS_CallInternal` …), plus the cross-tier trampolines
+    // (`xtramp_gfN`) and the `()->()` trap stub (`TRAP_STUB`). Diagnostic-only and cheap: a V8 wasm stack
+    // trace — e.g. a `svm_warm_jit` decline (issue #865) — then names the culprit function instead of a
+    // bare `wasm-function[N]`. `wasm_of[fi]` is the final wasm index (it already accounts for the function
+    // imports), so it is the name-section funcidx directly; `env.trap`/`env.call_interp` are always
+    // imports 0/1.
+    //
+    // Name precedence (#907): a DWARF source name (a `-g` build's `debug_info.func_names`, the reserved
+    // level-2 rung) → the function's export symbol name → the guest index `gf{fi}`. Every defined function
+    // is exported by its symbol name (translate's `exports` = one entry per defined function), so the real
+    // names already ship in every `.svmb` via the semantic exports table — no `-g` flag, no format change,
+    // no extra bytes. `gf{fi}` remains only for an *unexported* emitted function (a synthesized helper /
+    // trampoline). Built once into maps: a real module's `exports` runs to thousands of entries.
     {
+        use std::collections::HashMap;
+        let dwarf: HashMap<u32, &str> = m
+            .debug_info
+            .as_ref()
+            .map(|d| {
+                d.func_names
+                    .iter()
+                    .map(|f| (f.func, f.name.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let export_name: HashMap<u32, &str> = m
+            .exports
+            .iter()
+            .map(|e| (e.func, e.name.as_str()))
+            .collect();
         let src_name = |fi: usize| -> String {
-            m.debug_info
-                .as_ref()
-                .and_then(|d| d.func_names.iter().find(|f| f.func == fi as u32))
-                .map(|f| f.name.clone())
+            let fi = fi as u32;
+            dwarf
+                .get(&fi)
+                .or_else(|| export_name.get(&fi))
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("gf{fi}"))
         };
         let mut ents: Vec<(u32, String)> = vec![
