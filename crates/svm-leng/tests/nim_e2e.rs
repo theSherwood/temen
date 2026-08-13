@@ -171,7 +171,7 @@ fn link_with_runtime(mods: &[(String, String)]) -> Module {
         }
     }
 
-    const SHIM: &str = include_str!("fixtures/system_runtime.svm.txt");
+    const SHIM: &str = include_str!("../src/powerbox_compute_shim.svm.txt");
     let shim = svm_text::parse_module(SHIM).expect("runtime shim parses");
     // Bind only the bottom-edge C imports to the shim; cross-module nimony imports (`ini`, sibling
     // procs) are left for the other link units to resolve.
@@ -473,6 +473,36 @@ fn real_write_program_prints_to_stdout() {
     assert_eq!(run_io_program(&mods), b"hello, svm\n", "captured stdout");
 }
 
+/// **The browser-shape I/O path.** Same real `std/syncio` program, but linked via
+/// `svm_leng::link_nim_powerbox` — the nim→powerbox bottom-edge bridge — and run under the **standard**
+/// `svm_run::run_powerbox`, the exact engine the browser's `svm_run_onramp` wraps. Unlike
+/// `real_write_program_prints_to_stdout` (which hand-wires each nim syscall to a `svm_posix` op), here
+/// the host binds only its own §3e powerbox caps: the bridge shims the compute leaves in and adapts
+/// nimony's `sysWrite(fd,buf,len)` to the STREAM `write(buf,len)` cap, so a real Nim program prints to
+/// the powerbox stdout with no custom personality. This is what makes a "run real Nim" playground card
+/// possible.
+#[test]
+fn nim_write_runs_under_the_powerbox() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nwrite(stdout, \"hello, svm\\n\")\n",
+    );
+    let units: Vec<svm_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| svm_leng::WholeModule { stem, src })
+        .collect();
+    let m = svm_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let run = svm_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
+    assert_eq!(
+        run.stdout, b"hello, svm\n",
+        "real Nim printed via the standard powerbox"
+    );
+}
+
 /// Manifest-link `mods` (retaining `write`/`read`/`_exit`/… as bindable imports), then run the
 /// `exportc` `main` on **both engines** with `sysWrite` bound to a stdout capture and the other
 /// syscall leaves stubbed, asserting the two capture the same bytes (§9 interp/JIT parity on the
@@ -495,7 +525,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
             }
         }
     }
-    const SHIM: &str = include_str!("fixtures/system_runtime.svm.txt");
+    const SHIM: &str = include_str!("../src/powerbox_compute_shim.svm.txt");
     let shim = svm_text::parse_module(SHIM).expect("runtime shim parses");
     let exports: Vec<(String, u32)> = import_names
         .iter()
