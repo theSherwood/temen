@@ -137,6 +137,25 @@ pub const OP_SPAWN2: u32 = 43;
 /// meaningful to both.
 pub const OP_GETPID: u32 = 44;
 
+/// **Job control — the process-group surface** (#798 slice 1). `setpgid(pid, pgid) -> 0 | -errno`:
+/// move process `pid` (`0` = self) into group `pgid` (`0` = `pid`'s own id — become a leader), by
+/// the process table; the target must be the caller or a live table entry. POSIX's exec/session
+/// restrictions are not modeled (one world ≈ one session, #798).
+pub const OP_SETPGID: u32 = 45;
+/// `getpgid(pid) -> pgid | -errno`: process `pid`'s (`0` = self) group id, from the table.
+pub const OP_GETPGID: u32 = 46;
+/// `tcgetpgrp(fd) -> pgid | -errno`: the **foreground process group** of the terminal `fd` refers
+/// to. Until the TTY layer (#797) the personality's captured stdio is the one proto-terminal: any
+/// stdio-sentinel fd names it, anything else is `-ENOTTY`. Foreground starts as the root's group
+/// (`1`), so nothing changes for a guest that never calls `tcsetpgrp`.
+pub const OP_TCGETPGRP: u32 = 47;
+/// `tcsetpgrp(fd, pgid) -> 0 | -errno`: make `pgid` the terminal's foreground process group
+/// (`-EINVAL` non-positive, `-EPERM` if no live process is in it, `-ENOTTY` off-terminal). A
+/// background process's terminal I/O then rings its `SIGTTOU`/`SIGTTIN` doorbell (see
+/// [`OP_WRITE`]/[`OP_READ`]) — the L0 approximation of stop-on-background-I/O until #798 slice 2
+/// brings real stop/continue.
+pub const OP_TCSETPGRP: u32 = 48;
+
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
 /// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
@@ -236,6 +255,12 @@ const ENOTDIR: i64 = -20; // opendir on a path that is a regular file, not a dir
 const ESPIPE: i64 = -29; // lseek on a pipe/stdio fd (not seekable)
 const ERANGE: i64 = -34; // result won't fit the caller's buffer (getcwd)
 const ENOSYS: i64 = -38; // spawn with no embedder-wired delegate (fail closed)
+const EPERM: i64 = -1; // tcsetpgrp to a process group nobody occupies (#798)
+const ENOTTY: i64 = -25; // a tc* op on an fd that is not the proto-terminal (#798)
+
+/// #798 — the job-control signal numbers (Linux values, like every signum here).
+const SIGTTIN: i32 = 21; // background read from the terminal
+const SIGTTOU: i32 = 22; // background write to the terminal
 const EEXIST: i64 = -17; // mkdir/rename onto a path that already exists
 const ENOTEMPTY: i64 = -39; // rmdir on a directory that still has children
 const EAGAIN: i64 = -11; // read/accept on an empty memnet socket (would block a cooperative guest)
@@ -600,6 +625,11 @@ struct World {
     /// The next pid `spawn` hands out for a delegate child. Starts at `1000` and skips occupied
     /// pids (fork twins occupy their `TaskId`s in the same table — one space, no collisions).
     next_pid: i32,
+    /// #798 — the proto-terminal's **foreground process group** (`tcsetpgrp`/`tcgetpgrp`; the
+    /// captured stdio stands in for the pty until #797). Init `1` — the root's group — so every
+    /// pre-job-control guest is foreground and nothing rings. A background process's terminal
+    /// I/O rings its `SIGTTOU`/`SIGTTIN` doorbell.
+    fg_pgid: i32,
 }
 
 /// #863 slice 2 — a [`World::procs`] process-table entry.
@@ -625,6 +655,12 @@ struct Proc {
     /// process is table-addressable). `getpid` reports it, and `kill(own pid)` short-circuits to
     /// the self path on it.
     pid: i32,
+    /// #798 — this process's **process group** (`setpgid`/`getpgid`): the unit `kill(-pgid)`
+    /// sweeps and `tcsetpgrp` foregrounds. The root leads group `1`; a `fork` twin **inherits**
+    /// its parent's (POSIX — unlike the core's `Twin.pgid`, which defaults to own-id and feeds
+    /// only the core reap's `-pgid` filter; the personality's is authoritative for personality
+    /// ops, and the two unify when blocking `waitpid` lands, #799).
+    pgid: i32,
     /// High-water mark: the window offset fresh (never-freed) allocations bump upward from.
     heap_next: u64,
     /// One past the last window byte the allocator may hand out.
@@ -711,12 +747,13 @@ struct Proc {
 struct Ctx<'a> {
     w: &'a mut World,
     p: &'a mut Proc,
-    /// #863 slice 2 — a scheduler wake to fire **after** this dispatch's locks are released.
-    /// `kill(pid, sig)` sets it when the signal is deliverable to its target: the wake closure
-    /// takes the scheduler lock, and the fork factory takes the world lock *under* the scheduler
-    /// lock, so firing it while still holding the world lock would deadlock (scheduler → world vs
-    /// world → scheduler). [`handler`] fires it once the guards are dropped.
-    wake_after: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #863 slice 2 — scheduler wakes to fire **after** this dispatch's locks are released.
+    /// `kill` pushes one per target the signal is deliverable to (a `-pgid` group kill may have
+    /// several, #798): the wake closures take the scheduler lock, and the fork factory takes the
+    /// world lock *under* the scheduler lock, so firing while still holding the world lock would
+    /// deadlock (scheduler → world vs world → scheduler). [`handler`] fires them once the guards
+    /// are dropped.
+    wake_after: Vec<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A handle to a granted POSIX personality's state — read the captured output after a run, stage
@@ -984,6 +1021,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
         "spawn2" => OP_SPAWN2,
         "getpid" => OP_GETPID,
+        "setpgid" => OP_SETPGID,
+        "getpgid" => OP_GETPGID,
+        "tcgetpgrp" => OP_TCGETPGRP,
+        "tcsetpgrp" => OP_TCSETPGRP,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -1159,10 +1200,23 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         let child = Arc::new(Mutex::new(child));
         w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
         drop(w);
+        // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
+        // raw exit status when the twin's task completes, and the process becomes a reapable
+        // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
+        // OUR policy — WEXITSTATUS in bits 8–15, the same encode `spawn_core` uses; a crashed
+        // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
+        // like any exit code.
+        let exit_world = Arc::clone(&world);
+        let exit = Arc::new(move |status: i64| {
+            let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
+            w.procs
+                .insert(pid, ProcEntry::Zombie(((status & 0xff) << 8) as i32));
+        });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
             signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
             refork: Some(fork_factory(Arc::clone(&world), child)),
+            exit: Some(exit),
         }
     })
 }
@@ -1225,7 +1279,7 @@ fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             match op {
                 NET_CONNECT => st.net_connect(args, mem),
@@ -1262,6 +1316,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         spawn_fn: None,
         procs: HashMap::new(),
         next_pid: 1000,
+        fg_pgid: 1,
     }
 }
 
@@ -1269,7 +1324,8 @@ fn new_world(stdin: Vec<u8>) -> World {
 /// sentinels seeded in the fd table, default signal state.
 fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
     Proc {
-        pid: 1, // the root process — init-like; fork twins get their TaskId stamped by the factory
+        pid: 1,  // the root process — init-like; fork twins get their TaskId stamped by the factory
+        pgid: 1, // the root leads process group 1
         heap_next: heap_base,
         heap_end,
         allocated: HashMap::new(),
@@ -1307,7 +1363,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             let res = match op {
                 OP_WRITE => st.write(args, mem),
@@ -1358,6 +1414,10 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_ENVIRON => st.environ(args, mem),
                 OP_CLOCK => Ok(vec![st.clock(args)]),
                 OP_GETPID => Ok(vec![st.p.pid as i64]),
+                OP_SETPGID => Ok(vec![st.setpgid(args)]),
+                OP_GETPGID => Ok(vec![st.getpgid(args)]),
+                OP_TCGETPGRP => Ok(vec![st.tcgetpgrp(args)]),
+                OP_TCSETPGRP => Ok(vec![st.tcsetpgrp(args)]),
                 _ => Err(Trap::CapFault),
             };
             // Fire a deferred cross-process wake (see [`Ctx::wake_after`]) only after both guards
@@ -1367,11 +1427,15 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             // host ↔ scheduler cycle. Cross-process signals are human-frequency, so a short-lived
             // thread is the boring, provably-unentangled choice. (The embedder paths —
             // [`Posix::raise_signal`], [`Posix::kill_pid`] — hold no `Host` lock and fire inline.)
-            let wake = st.wake_after.take();
+            let wakes = std::mem::take(&mut st.wake_after);
             drop(p);
             drop(w);
-            if let Some(wk) = wake {
-                std::thread::spawn(move || wk());
+            if !wakes.is_empty() {
+                std::thread::spawn(move || {
+                    for wk in wakes {
+                        wk();
+                    }
+                });
             }
             res
         },
@@ -1420,6 +1484,7 @@ impl Proc {
     fn fork(&self) -> Proc {
         Proc {
             pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
+            pgid: self.pgid, // POSIX: a fork twin inherits its parent's process group
             heap_next: self.heap_next,
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
@@ -1500,6 +1565,11 @@ impl Ctx<'_> {
             Some(FdEntry::NetStream(d)) => Sink::NetDelegate(Arc::clone(d)),
             _ => Sink::Bad,
         };
+        // #798 — a background write to the proto-terminal rings SIGTTOU (doorbell; the write still
+        // proceeds until slice 2's stop). Unconditional pending TOSTOP: termios lands with #797.
+        if matches!(sink, Sink::Stdout | Sink::Stderr) {
+            self.tty_background_check(SIGTTOU);
+        }
         match sink {
             Sink::Stdout => match &self.w.stdout_sink {
                 Some(s) => s
@@ -1558,6 +1628,9 @@ impl Ctx<'_> {
         };
         let chunk: Vec<u8> = match src {
             Src::Stdin => {
+                // #798 — a background read from the proto-terminal rings SIGTTIN (doorbell; the
+                // read still proceeds until slice 2's stop).
+                self.tty_background_check(SIGTTIN);
                 let avail = &self.w.stdin[self.w.stdin_pos.min(self.w.stdin.len())..];
                 let n = len.min(avail.len());
                 self.w.stdin_pos += n;
@@ -1942,10 +2015,11 @@ impl Ctx<'_> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let pid = *args.first().ok_or(Trap::Malformed)?;
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
-        // #863 slice 2 — reap from the process table: only [`ProcEntry::Zombie`] entries (completed
-        // spawn-delegate children) are reapable here. A live fork twin's exit flows through the
-        // core's servicer reap (FORK.md §8.6 — the wait offer), not this op; unifying the two under
-        // one `waitpid` is slice 3 (the waitpid-EINTR capstone).
+        // #863 — reap from the process table: [`ProcEntry::Zombie`] entries are reapable here —
+        // completed spawn-delegate children, and (hygiene slice) **exited fork twins**, whose exit
+        // hook flipped them Live → Zombie. A still-running twin is `-ECHILD` (this op never blocks
+        // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
+        // same twin independently; use one channel per child).
         let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie(_)));
         let reaped = if pid == -1 {
             self.w
@@ -2004,7 +2078,7 @@ impl Ctx<'_> {
             return EINVAL;
         }
         if pid < 0 {
-            return EINVAL; // kill(-pgid): process-group targeting is a follow-up
+            return self.kill_pgroup((-pid) as i32, sig); // kill(-pgid): the group sweep (#798)
         }
         // Self — pid 0 (the pre-table calling convention) or the caller's own pid. Never a table
         // lock: the caller's own `Proc` is already held by this dispatch.
@@ -2030,13 +2104,147 @@ impl Ctx<'_> {
                 // Deliverable by the TARGET's dispositions ⇒ poke its run's scheduler wake — but
                 // only after this dispatch's locks drop ([`Ctx::wake_after`]), never under ours.
                 if tp.deliverable_now() {
-                    self.wake_after = tp.wake.clone();
+                    self.wake_after.extend(tp.wake.clone());
                 }
                 0
             }
             // A zombie exists until reaped (POSIX: kill succeeds) but takes no signal.
             Some(ProcEntry::Zombie(_)) => 0,
             None => ESRCH,
+        }
+    }
+
+    /// `kill(-pgid, sig)` (#798) — the **process-group sweep**: raise `sig` on every live table
+    /// process in group `pgid`, the caller included (POSIX: the whole group, sender too when it is
+    /// a member). One deferred wake per deliverable member ([`Ctx::wake_after`]). `-ESRCH` when the
+    /// group has no live member; a zombie member is skipped (it takes no signal); `sig == 0` probes
+    /// group existence.
+    fn kill_pgroup(&mut self, pgid: i32, sig: i64) -> i64 {
+        let mut any = false;
+        // Self first (no table lock — this dispatch already holds our `Proc`).
+        if self.p.pgid == pgid {
+            any = true;
+            if sig != 0 {
+                self.p.sig_pending |= 1 << sig;
+                self.p.arm_signals();
+            }
+        }
+        let self_pid = self.p.pid;
+        for (&pid, entry) in self.w.procs.iter() {
+            if pid == self_pid {
+                continue; // handled above (and never a second lock on our own Proc)
+            }
+            let ProcEntry::Live(t) = entry else {
+                continue; // a zombie exists but takes no signal
+            };
+            let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+            if tp.pgid != pgid {
+                continue;
+            }
+            any = true;
+            if sig != 0 {
+                tp.sig_pending |= 1 << sig;
+                tp.arm_signals();
+                if tp.deliverable_now() {
+                    self.wake_after.extend(tp.wake.clone());
+                }
+            }
+        }
+        if any {
+            0
+        } else {
+            ESRCH
+        }
+    }
+
+    /// [`OP_SETPGID`] — `setpgid(pid, pgid)`: move `pid` (`0` = self) into group `pgid` (`0` =
+    /// `pid`'s own id). The caller's own move happens on its held `Proc`; any other target must be
+    /// a live table process. `-EINVAL` on a negative `pgid`, `-ESRCH` on an unknown/zombie pid.
+    fn setpgid(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
+        let pgid = *args.get(1).unwrap_or(&0);
+        if pgid < 0 || pid < 0 {
+            return EINVAL;
+        }
+        if pid == 0 || pid == self.p.pid as i64 {
+            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid as i32 };
+            return 0;
+        }
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => {
+                let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                tp.pgid = if pgid == 0 { tp.pid } else { pgid as i32 };
+                0
+            }
+            _ => ESRCH,
+        }
+    }
+
+    /// [`OP_GETPGID`] — `getpgid(pid)`: `pid`'s (`0` = self) process group, from the table.
+    fn getpgid(&mut self, args: &[i64]) -> i64 {
+        let pid = *args.first().unwrap_or(&0);
+        if pid == 0 || pid == self.p.pid as i64 {
+            return self.p.pgid as i64;
+        }
+        match self.w.procs.get(&(pid as i32)) {
+            Some(ProcEntry::Live(t)) => t.lock().unwrap_or_else(|e| e.into_inner()).pgid as i64,
+            _ => ESRCH,
+        }
+    }
+
+    /// Is fd a handle on the proto-terminal (the captured stdio — the pty stand-in until #797)?
+    fn fd_is_terminal(&mut self, fd: i64) -> bool {
+        matches!(
+            self.fd(fd),
+            Some(FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr)
+        )
+    }
+
+    /// [`OP_TCGETPGRP`] — `tcgetpgrp(fd)`: the terminal's foreground process group. `-ENOTTY` off
+    /// the proto-terminal.
+    fn tcgetpgrp(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        if !self.fd_is_terminal(fd) {
+            return ENOTTY;
+        }
+        self.w.fg_pgid as i64
+    }
+
+    /// [`OP_TCSETPGRP`] — `tcsetpgrp(fd, pgid)`: make `pgid` the foreground group. `-ENOTTY` off
+    /// the proto-terminal, `-EINVAL` non-positive, `-EPERM` when no live process (the caller
+    /// included) is in the group — a foreground nobody occupies is a stuck terminal.
+    fn tcsetpgrp(&mut self, args: &[i64]) -> i64 {
+        let fd = *args.first().unwrap_or(&0);
+        let pgid = *args.get(1).unwrap_or(&0);
+        if !self.fd_is_terminal(fd) {
+            return ENOTTY;
+        }
+        if pgid <= 0 {
+            return EINVAL;
+        }
+        let self_pid = self.p.pid;
+        let occupied = self.p.pgid as i64 == pgid
+            || self.w.procs.iter().any(|(&pid, e)| {
+                pid != self_pid
+                    && matches!(e, ProcEntry::Live(t)
+                        if t.lock().unwrap_or_else(|x| x.into_inner()).pgid as i64 == pgid)
+            });
+        if !occupied {
+            return EPERM;
+        }
+        self.w.fg_pgid = pgid as i32;
+        0
+    }
+
+    /// #798 — the **background-terminal doorbell**: a process outside the foreground group
+    /// touching the proto-terminal raises `sig` (`SIGTTOU` on write, `SIGTTIN` on read) pending on
+    /// ITSELF and arms — the L0 approximation of POSIX's stop-the-background-job (real
+    /// stop/continue is #798 slice 2; until then the I/O proceeds and the doorbell tells a
+    /// job-control-aware guest what happened).
+    fn tty_background_check(&mut self, sig: i32) {
+        if self.p.pgid != self.w.fg_pgid {
+            self.p.sig_pending |= 1 << sig;
+            self.p.arm_signals();
         }
     }
 
@@ -3022,7 +3230,7 @@ mod tests {
             let mut $st = Ctx {
                 w: &mut $w,
                 p: &mut $p,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
         };
     }
@@ -3053,7 +3261,7 @@ mod tests {
             let mut st = Ctx {
                 w: &mut w,
                 p: &mut p,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             let fd = st.open(&[0, 2, 0], Some(&mut mem)).unwrap()[0];
             assert!(fd >= 3, "a fresh fd past the stdio sentinels");
@@ -3100,7 +3308,7 @@ mod tests {
             let mut tc = Ctx {
                 w: &mut w,
                 p: &mut twin,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             assert_eq!(tc.read(&[fd, 120, 6], Some(&mut mem)).unwrap()[0], 6);
         }
@@ -3114,7 +3322,7 @@ mod tests {
             let mut pc = Ctx {
                 w: &mut w,
                 p: &mut p,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             assert_eq!(
                 pc.read(&[fd, 130, 8], Some(&mut mem)).unwrap()[0],
@@ -3128,7 +3336,7 @@ mod tests {
             let mut tc = Ctx {
                 w: &mut w,
                 p: &mut twin,
-                wake_after: None,
+                wake_after: Vec::new(),
             };
             assert_eq!(
                 tc.lseek(&[fd, 0, SEEK_SET]),
@@ -3181,7 +3389,11 @@ mod tests {
             ctx!(posix, w_g, p_g, st);
             assert_eq!(st.kill(&[7, 0]), 0, "kill(pid, 0): the twin exists");
             assert_eq!(st.kill(&[99, 10]), ESRCH, "unknown pid");
-            assert_eq!(st.kill(&[-5, 10]), EINVAL, "process groups are a follow-up");
+            assert_eq!(
+                st.kill(&[-5, 10]),
+                ESRCH,
+                "kill(-pgid) of an empty group (#798)"
+            );
             assert_eq!(st.kill(&[7, 10]), 0, "signal the twin by pid");
             assert_eq!(
                 st.p.sig_pending, 0,
@@ -3316,6 +3528,188 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    /// #863 hygiene — a fork twin's **exit hook** retires it in the process table: firing it (as
+    /// the core does at twin completion) flips `Live` → `Zombie` with the wait-encoded status, so
+    /// `waitpid` reaps a fork twin exactly like a spawn child — and the pid is gone afterwards
+    /// (`kill` = `-ESRCH`). Before the exit, the live twin is `-ECHILD` here (non-blocking poll).
+    #[test]
+    fn a_twins_exit_hook_makes_it_reapable_by_waitpid() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let forked = cap_fork_factory(&posix)(7);
+        let mut win = vec![0u8; 256];
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(
+                st.waitpid(&[7, 0, 0], Some(&mut mem)).unwrap()[0],
+                ECHILD,
+                "a still-running twin is not reapable through this op"
+            );
+        }
+        // The core fires the hook with the twin's raw exit status at completion.
+        (forked
+            .exit
+            .as_ref()
+            .expect("the personality installs an exit hook"))(7);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(
+            st.kill(&[7, 15]),
+            0,
+            "an exited-unreaped twin is a zombie — kill succeeds"
+        );
+        assert_eq!(
+            st.waitpid(&[7, 100, 0], Some(&mut mem)).unwrap()[0],
+            7,
+            "waitpid reaps the exited fork twin"
+        );
+        let status = i32::from_le_bytes(mem.read_bytes(100, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            (status >> 8) & 0xff,
+            7,
+            "WEXITSTATUS is the twin's exit code"
+        );
+        assert_eq!(st.kill(&[7, 15]), ESRCH, "reaped ⇒ the pid is gone");
+    }
+
+    /// #798 slice 1 — the process-group surface over the table: `setpgid`/`getpgid` roundtrip
+    /// (self and a table-routed twin), a fork twin **inherits** its parent's group, and
+    /// `kill(-pgid)` sweeps exactly the group — every member's own pending set rings (the caller
+    /// included), the non-member's stays silent, and an empty group is `-ESRCH`.
+    #[test]
+    fn process_groups_route_through_the_table_and_group_kill_sweeps_them() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        // Twins 7 and 8; 8 forks 9 AFTER being moved into group 5 — 9 must inherit 5.
+        let mut t7 = cap_fork_factory(&posix)(7);
+        let f8 = cap_fork_factory(&posix)(8);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.getpgid(&[0]), 1, "the root leads group 1");
+            assert_eq!(st.getpgid(&[7]), 1, "a twin inherits the root's group");
+            assert_eq!(st.setpgid(&[7, 5]), 0, "move twin 7 into group 5 by pid");
+            assert_eq!(st.setpgid(&[8, 5]), 0, "move twin 8 into group 5 by pid");
+            assert_eq!(st.getpgid(&[7]), 5);
+            assert_eq!(st.setpgid(&[99, 5]), ESRCH, "unknown pid");
+        }
+        // Twin 8 forks twin 9: the child inherits group 5 (POSIX), not the root's 1.
+        let _t9 = (f8.refork.expect("self-replicating factory"))(9);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(
+                st.getpgid(&[9]),
+                5,
+                "a fork twin inherits its parent's group"
+            );
+            // Group kill: twins 7 and 9 catch signal 10; the root (group 1) must stay silent.
+            // (Install handlers through the table procs directly — unit-level.)
+        }
+        assert_eq!(
+            (t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
+            vec![0]
+        );
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.kill(&[-5, 10]), 0, "sweep group 5");
+            assert_eq!(
+                st.p.sig_pending, 0,
+                "the root is outside group 5 — its pending set stays empty"
+            );
+            assert_eq!(st.kill(&[-77, 10]), ESRCH, "an empty group");
+        }
+        assert_eq!(
+            (t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            vec![0x71],
+            "group member 7's own doorbell rang"
+        );
+    }
+
+    /// #798 slice 1 — the proto-terminal: `tcgetpgrp`/`tcsetpgrp` on stdio fds (`-ENOTTY` on a
+    /// file), foreground validation (`-EINVAL` non-positive, `-EPERM` for an unoccupied group),
+    /// and the background doorbells — a background write rings `SIGTTOU`, a background read rings
+    /// `SIGTTIN` (both proceed — the L0 approximation), and a foreground process rings nothing.
+    #[test]
+    fn the_proto_terminal_foreground_group_gates_with_ttou_ttin_doorbells() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, b"input".to_vec());
+        let _twin = cap_fork_factory(&posix)(7); // occupies group 1 alongside the root
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = svm_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(
+            st.tcgetpgrp(&[1]),
+            1,
+            "foreground starts as the root's group"
+        );
+        assert_eq!(
+            st.tcgetpgrp(&[0]),
+            1,
+            "any stdio fd names the one proto-terminal"
+        );
+        let file_fd = st.open(&[0, 2, 65], Some(&mut mem)).unwrap()[0]; // O_CREATE|O_WRITE
+        assert_eq!(
+            st.tcgetpgrp(&[file_fd]),
+            ENOTTY,
+            "a file is not the terminal"
+        );
+        assert_eq!(st.tcsetpgrp(&[1, 0]), EINVAL, "a non-positive pgid");
+        assert_eq!(st.tcsetpgrp(&[1, 42]), EPERM, "an unoccupied group");
+        // Foreground I/O rings nothing.
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.p.sig_pending, 0, "foreground terminal I/O is silent");
+        // Move the root into its own group 9 and foreground the twin's group 1: root backgrounded.
+        assert_eq!(st.setpgid(&[0, 9]), 0);
+        assert_eq!(
+            st.tcgetpgrp(&[1]),
+            1,
+            "foreground group unchanged by setpgid"
+        );
+        assert_eq!(
+            st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0],
+            2,
+            "the write proceeds"
+        );
+        assert_ne!(
+            st.p.sig_pending & (1 << SIGTTOU),
+            0,
+            "a background terminal write rings SIGTTOU"
+        );
+        assert_eq!(
+            st.read(&[0, 100, 2], Some(&mut mem)).unwrap()[0],
+            2,
+            "the read proceeds"
+        );
+        assert_ne!(
+            st.p.sig_pending & (1 << SIGTTIN),
+            0,
+            "a background terminal read rings SIGTTIN"
+        );
+        // The root takes the terminal back for its own group — foreground again, silence again.
+        assert_eq!(
+            st.tcsetpgrp(&[1, 9]),
+            0,
+            "the caller's own group is occupied"
+        );
+        st.p.sig_pending = 0;
+        assert_eq!(st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(st.p.sig_pending, 0, "foreground once more — no doorbell");
+        // A write to the FILE from the background never rings (not the terminal).
+        assert_eq!(st.setpgid(&[0, 1]), 0); // background again (fg is 9... self now group 1)
+        assert_eq!(
+            st.tcsetpgrp(&[1, 9]),
+            EPERM,
+            "group 9 is now unoccupied — EPERM"
+        );
+        assert_eq!(st.write(&[file_fd, 0, 2], Some(&mut mem)).unwrap()[0], 2);
+        assert_eq!(
+            st.p.sig_pending & (1 << SIGTTOU),
+            0,
+            "file I/O is not terminal I/O — no TTOU"
+        );
     }
 
     /// func 0 `(host_proc_handle) -> i64`: `malloc(2)`, store `"hi"` into the returned buffer,
