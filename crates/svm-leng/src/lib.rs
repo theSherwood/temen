@@ -321,7 +321,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// **Cross-module type resolution**: proc and data symbols resolve at *link* time, but an aggregate
 /// **type**'s layout is needed at *translate* time (field offsets are baked into loads/stores). So
 /// before translating any unit, every unit's `(type …)` defs are pooled under their stem-suffixed
-/// global names ([`translate::Translator::export_types`]) and made available to all — a module
+/// global names ([`translate::Translator::export_types_pooled`]) and made available to all — a module
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
@@ -374,7 +374,33 @@ fn link_selected_with_extra(
     manifest: bool,
     synth_start: bool,
 ) -> Result<Module, LengError> {
-    let mut pooled = Vec::new();
+    // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
+    // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
+    // module), and the base is inlined into the derived layout at translate time — so a single
+    // per-module pass exports a lossy layout (missing every inherited field) whenever the base is
+    // cross-module. Pool to a **fixpoint** instead: each round re-exports with the prior round's
+    // pool visible, so a chain of any depth is fully inlined. Inlining only *adds* fields, so the
+    // summed field count is monotonic and converges; the unit count bounds the max chain depth.
+    let roots: Vec<_> = units
+        .iter()
+        .map(|(_, src, _)| nif::parse(src).map_err(LengError::Parse))
+        .collect::<Result<_, _>>()?;
+    let mut pooled: Vec<(String, translate::Layout)> = Vec::new();
+    let mut prev_fields = usize::MAX;
+    for _ in 0..=units.len() {
+        let mut next: Vec<(String, translate::Layout)> = Vec::new();
+        for ((stem, _, _), root) in units.iter().zip(&roots) {
+            next.extend(translate::Translator::export_types_pooled(
+                root, stem, &pooled,
+            )?);
+        }
+        let fields: usize = next.iter().map(|(_, l)| l.field_count()).sum();
+        pooled = next;
+        if fields == prev_fields {
+            break;
+        }
+        prev_fields = fields;
+    }
     let mut pooled_funcrefs = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
@@ -393,7 +419,6 @@ fn link_selected_with_extra(
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled.extend(translate::Translator::export_types(&root, stem)?);
         pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);

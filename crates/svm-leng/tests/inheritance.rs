@@ -50,6 +50,35 @@ fn derived_layout_inlines_base_after_vtable() {
 }
 
 #[test]
+fn rtti_vtable_field_reads_by_name() {
+    // nimony accesses the `RootObj` RTTI type-header by name — `(dot (deref x) vt.00 <level>)` — in
+    // `=dup`/`=destroy`/`of`-checks/method dispatch. The synthesized inheritable-root header slot is
+    // named `vt.00` (not an anonymous placeholder), so those accesses resolve (#859). Read the header
+    // pointer of a Derived through a pointer: it lives at offset 0, ahead of the inlined base fields.
+    let leng = "\
+(stmts
+ (type :Base.0. . (object RootObj.0.ext (fld :value.0 . (i +64))))
+ (type :Derived.0. . (object Base.0. (fld :extra.0 . (i +64))))
+ (proc :getVt.0 (params (param :d.0 . (ptr Derived.0.))) (i +64) .
+  (stmts .
+   (ret (dot (deref d.0) vt.00 2)))))";
+    let m = svm_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    let obj = 256usize;
+    let mut seed = vec![0u8; 4096];
+    seed[obj..obj + 8].copy_from_slice(&0xABCDi64.to_le_bytes()); // vt header at offset 0
+    seed[obj + 8..obj + 16].copy_from_slice(&42i64.to_le_bytes());
+    svm_verify::verify_module(&m).unwrap();
+    let mut fuel = u64::MAX;
+    let (ir, _) = svm_interp::run_capture(&m, 0, &[Value::I64(obj as i64)], &mut fuel, &seed);
+    assert_eq!(ir.expect("interp").as_slice(), &[Value::I64(0xABCD)]);
+    let (jout, _) = svm_jit::compile_and_run_capture(&m, 0, &[obj as i64], &seed).expect("jit");
+    match jout {
+        svm_jit::JitOutcome::Returned(v) => assert_eq!(v, vec![0xABCD], "§9 parity"),
+        o => panic!("jit: {o:?}"),
+    }
+}
+
+#[test]
 fn base_field_read_through_pointer() {
     // getVal(d: ptr Derived): int = (deref d).value — reads the *base* field at offset 8 through a
     // pointer to a derived object. The caller builds the object; runs with no runtime.
