@@ -995,9 +995,11 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `driveTierupRun` in `web/wasmjit-module.js` services each event on the emitted module over the
    shared memory (re-arm `"fuel"`, write the event's committed-extent snapshot to `"mapped"` — the
    #717 sync — then `f{func}(win, env, ...args)` and deliver), and `runJitModule` tries this opener
-   automatically when the whole-program open declines. Fail-closed at open for threads/futex guests
-   (`Spawn`/`Join`/`Wait`/`Notify` events the single-vCPU pump can't service) and when nothing could
-   ever run emitted; a trap mid-run throws so the page re-runs on the interpreter oracle
+   automatically when the whole-program open declines. Fail-closed when nothing could ever run
+   emitted, and (originally) at open for any threads/futex-linked guest — a static scan later
+   narrowed to a runtime decline on the surfaced `Spawn`/`Join`/`Wait`/`Notify` event so
+   dead-linked concurrency ops no longer refuse (#926 slice 1, below); a trap mid-run throws so the
+   page re-runs on the interpreter oracle
    (INVARIANT 9). Proven observably identical to `onramp_exec` (status/value/stdout, with a tier-up
    non-vacuity counter) by the native `tests/tierup_driver.rs` with wasmi playing the JS host.
 
@@ -1080,6 +1082,28 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    (`tierup.rs`), and a browser differential where a tiered-up leaf makes a **direct** cross-tier
    call to a cap-calling helper that grows the window mid-call — parity with `onramp_exec`, the
    store into the just-grown page pinning the fan-out (`tierup_driver.rs`).
+
+   **#926 slice 1 — the concurrency open-gate was whole-module; make it runtime (dead-linked ops
+   no longer refuse).** `svm_onramp_tierup_open` used to scan every function for
+   `uses_threads() || uses_futex()` and refuse the whole guest if any matched — a **static** check,
+   so it also rejected guests whose concurrency ops are *linked but never reached*. The JACL
+   compiler-guest is exactly that shape (#839): jaclrt's scheduler/GC links thread/futex ops, but
+   with `POOL_WORKERS=1` it runs single-threaded on fibers and never executes them — yet the static
+   scan refused it, pinning the whole card to the interpreter. The gate is unnecessary: a
+   concurrency op that *actually executes* surfaces a `Spawn`/`Join`/`Wait`/`Notify` event, and the
+   run loop's catch-all already declines it to `TIERUP_RUN_TRAP` → the page re-runs on the
+   interpreter (which multiplexes concurrency cooperatively — INVARIANT 9). So the **runtime** event,
+   not a static pre-scan, is the real gate. Removing the pre-scan lets a guest that never reaches its
+   concurrency ops (JACL) tier up, while a guest that *does* reach one declines cleanly at that op —
+   exactly what the static refusal delivered, minus the false rejection of dead code. Fibers stay
+   admitted (`step_vcpu` services `cont.*`/`suspend` in-engine, §22 renegotiated 2026-07-30) and the
+   §22 unit-compile validator still refuses a futex-using *unit* at `vm_jit_compile` (`-EINVAL`) —
+   both unchanged. Differentials in `tierup_driver.rs`: a guest whose func 2 holds an unreached
+   `i32.atomic.wait` is admitted (`opened == 0`) and its eligible leaf tiers up with `onramp_exec`
+   parity; a guest whose `_start` tiers up a leaf and *then* runs `atomic.notify` is admitted but
+   declines to `TIERUP_RUN_TRAP` (`svm_status() == STATUS_TRAP`) after the tier-up, proving the
+   runtime gate. (Servicing those concurrency events on a cooperative multi-vCPU scheduler instead
+   of declining is #926 slice 2 — deferred until a guest that genuinely spawns at runtime needs it.)
 
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 

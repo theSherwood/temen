@@ -24,7 +24,8 @@ use svm_browser::{
     svm_onramp_tierup_shim_ptr, svm_onramp_tierup_shim_wasm, svm_onramp_tierup_slot_code,
     svm_onramp_tierup_table_log2, svm_onramp_tierup_value, svm_onramp_tierup_wasm_len,
     svm_onramp_tierup_wasm_ptr, svm_onramp_tierup_win_len, svm_onramp_tierup_win_ptr,
-    svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_UNSUPPORTED,
+    svm_run_value, svm_status, svm_stdout_len, svm_stdout_ptr, STATUS_OK, STATUS_TRAP,
+    STATUS_UNSUPPORTED,
     TIERUP_RUN_DONE, TIERUP_RUN_JIT_INVOKE, TIERUP_RUN_TIERUP, TIERUP_RUN_TRAP,
 };
 use svm_interp::{Host, StreamRole};
@@ -1851,5 +1852,148 @@ export 0 func "_start" 0
     let got_out =
         unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering included)");
+    svm_onramp_tierup_close();
+}
+
+// ---- #926 slice 1: no static concurrency gate — the runtime event is the real gate ------------
+
+/// #926 slice 1: a guest whose concurrency op is **linked but dead** (unreachable) — jaclrt's
+/// shape (#839): scheduler/GC futex/thread ops that never run with `POOL_WORKERS=1`. Pre-#926 the
+/// whole-module `any(uses_threads || uses_futex)` gate refused it at open; now it is admitted, its
+/// dead op is never reached, and its pure leaf tiers up — parity with `onramp_exec`.
+#[test]
+fn dead_concurrency_op_is_admitted_and_tiers_up() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_handles();
+    // f0 = _start (grow + call the leaf + stream); f1 = the pure all-i64 leaf; f2 = DEAD, never
+    // called, carrying a futex op (`atomic.wait`) — the whole-module refusal used to catch it.
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vprobe = i64.const {PROBE}
+  vres = call 1 (vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {LEAF_K}
+  vsum = i64.add v0 vk
+  vp = i64.const 8
+  vaddr = i64.add v0 vp
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func () -> (i64) {{
+block 0 () {{
+  vaddr = i64.const 0
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, PROBE + LEAF_K, "oracle value");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(
+        opened, 0,
+        "#926: a dead (unreachable) concurrency op must no longer refuse the pump (status {})",
+        svm_status()
+    );
+    let (_d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the pure leaf must tier up beside the dead op");
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_onramp_tierup_value(), want.value, "value parity");
+    // SAFETY: capture slots staged at DONE; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity");
+    svm_onramp_tierup_close();
+}
+
+/// #926 slice 1: a guest that **actually reaches** a concurrency op (an `atomic.notify` in
+/// `_start`'s path, after a leaf tiers up) is admitted, tiers up the leaf, then **declines cleanly**
+/// at the op — `TIERUP_RUN_TRAP`, not a crash or hang — so the page re-runs on the interpreter
+/// (INVARIANT 9). The runtime event, not a static scan, is the gate.
+#[test]
+fn reachable_concurrency_op_declines_cleanly() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h) = onramp_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vprobe = i64.const 7
+  vres = call 1 (vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  vaddr = i64.const 0
+  vcnt = i32.const 1
+  vn = atomic.notify vaddr vcnt
+  vn64 = i64.extend_i32_s vn
+  return vn64
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {LEAF_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "admitted (no static concurrency gate) — status {}", svm_status());
+    let mut d = TierupDriver::new();
+    let mut tierups = 0u32;
+    let ev = loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_TIERUP => {
+                tierups += 1;
+                let f = svm_onramp_tierup_func() as usize;
+                d.service_tierup(m.funcs[f].results.len());
+            }
+            other => break other,
+        }
+    };
+    assert_eq!(
+        ev, TIERUP_RUN_TRAP,
+        "the reachable atomic.notify must decline cleanly to TRAP (→ interpreter), not DONE/crash"
+    );
+    assert!(tierups >= 1, "the leaf tiered up before the concurrency op was reached");
+    assert_eq!(svm_status(), STATUS_TRAP, "status is TRAP (the page re-runs on the interpreter)");
     svm_onramp_tierup_close();
 }
