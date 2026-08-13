@@ -6390,9 +6390,16 @@ block 0 (vaddr: i64) {{
         let limits = Limits::default();
 
         let mut oracle_host = pager_host(&m);
-        let (oracle_out, _) =
-            run_capture_on(Backend::TreeWalk, &m, 0, &[], &[], &mut oracle_host, &limits)
-                .expect("oracle runs the pager record");
+        let (oracle_out, _) = run_capture_on(
+            Backend::TreeWalk,
+            &m,
+            0,
+            &[],
+            &[],
+            &mut oracle_host,
+            &limits,
+        )
+        .expect("oracle runs the pager record");
         assert_eq!(
             oracle_out,
             Outcome::Returned(vec![Value::I64(1123)]),
