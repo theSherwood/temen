@@ -1,0 +1,6 @@
+[submodule "nimony"]
+	path = nimony
+	url = https://github.com/nim-lang/nimony
+[submodule "nativenif"]
+	path = nativenif
+	url = https://github.com/nim-lang/nativenif
