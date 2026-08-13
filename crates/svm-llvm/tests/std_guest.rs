@@ -1,4 +1,4 @@
-//! **Real Rust `std` as an svm guest** — the RUST_STD.md S1b differential (the analog of
+//! **Real Rust `std` as an svm guest** — the std-on-svm differential (LLVM.md §10; the analog of
 //! `w5_rust_guest.rs`, one rung up: `no_std + alloc` → full `std`). A `std` binary is built for the
 //! custom `x86_64-unknown-svm` target via `-Zbuild-std` (the `crates/svm-llvm/rust-svm/` lane),
 //! emitted as one fat-LTO'd `.ll`, translated by the on-ramp, verified, and run through the powerbox —
@@ -854,12 +854,12 @@ fn std_fs_dir_ops() {
     );
 }
 
-/// S4 (HashMap) — `std::collections::HashMap` end-to-end (RUST_STD.md §5/§8 S4). `RandomState` reaches
+/// HashMap — `std::collections::HashMap` end-to-end (LLVM.md §10). `RandomState` reaches
 /// the svm PAL's `sys/random` leaf, which supplies a per-guest-deterministic seed (no host RNG op), so
 /// `HashMap` constructs and hashes without failing closed. The program's output is deliberately
 /// **iteration-order-independent** (`len`/`values().sum()`/keyed `get`/`contains_key`/`entry`) so it is
 /// byte-identical to native even though svm's seed differs from native's real random seed — the
-/// differential holds on *semantics*, which is what a fixed/deterministic seed buys (RUST_STD.md §5).
+/// differential holds on *semantics*, which is what a fixed/deterministic seed buys (LLVM.md §10).
 #[test]
 fn std_hashmap_round_trips() {
     if lane_ready().is_none() {
