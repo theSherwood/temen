@@ -267,6 +267,9 @@ const SIGTTOU: i32 = 22; // background write to the terminal
 
 /// #796 default actions — `SIGKILL` (uncatchable, unmaskable terminate).
 const SIGKILL: i32 = 9;
+/// #796 — `sigaction` `sa_flags` bit: restart an interrupted blocking call instead of `-EINTR`
+/// (Linux value, so a guest's `<signal.h>` agrees).
+const SA_RESTART: i64 = 0x10000000;
 /// #796 default actions — the signals whose `SIG_DFL` action is **ignore** (Linux: CHLD/URG/WINCH).
 /// Everything else outside the job-control set above defaults to **terminate**.
 fn default_ignored(sig: i32) -> bool {
@@ -786,6 +789,11 @@ struct Proc {
     /// siblings sharing one process, interleaved cross-fiber returns restore in push order (a
     /// documented approximation: POSIX masks are per-thread, ours is per-process).
     handler_mask_stack: Vec<u64>,
+    /// #796 `SA_RESTART` — whether the most recent caught delivery's action carried `SA_RESTART`,
+    /// answered to the core through [`SignalDoor::syscall_restart`] when an interrupt reaches a
+    /// parked blocking call. Last delivery wins (the documented approximation of POSIX's
+    /// per-interrupting-handler rule for near-simultaneous mixed-flag deliveries).
+    restart_ok: bool,
 }
 
 /// One dispatch's view over the two personality lock domains — the shared [`World`] and the calling
@@ -1169,6 +1177,7 @@ impl SignalSource for SignalDoor {
                 // and block the delivered signal + its `sa_mask` for the handler's duration
                 // (POSIX; `handler_returned` restores). This is also what makes NESTED delivery
                 // safe: a further signal may interrupt the handler, but never this same one.
+                st.note_delivery_flags(s); // #796 SA_RESTART (the safepoint dispatch also sweeps parks)
                 let saved = st.sig_mask;
                 st.handler_mask_stack.push(saved);
                 let sa = st.sig_action_mask.get(&s).copied().unwrap_or(0);
@@ -1199,6 +1208,12 @@ impl SignalSource for SignalDoor {
     /// #796 default actions — store the core's terminate closure for this process's domain.
     fn set_kill(&self, kill: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
+    }
+
+    /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
+    /// interrupt want the blocking call restarted?
+    fn syscall_restart(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).restart_ok
     }
 
     /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
@@ -1454,6 +1469,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         kill: None,
         term_sig: None,
         handler_mask_stack: Vec::new(),
+        restart_ok: false,
     }
 }
 
@@ -1577,6 +1593,7 @@ impl Proc {
                 }
                 if disposition(self, SIGCONT) > SIG_IGN {
                     self.sig_pending |= 1 << SIGCONT;
+                    self.note_delivery_flags(SIGCONT); // #796 SA_RESTART
                     self.arm_signals();
                 }
                 if was_stopped {
@@ -1601,6 +1618,7 @@ impl Proc {
                 SIG_IGN => None,
                 _ => {
                     self.sig_pending |= 1 << sig;
+                    self.note_delivery_flags(sig); // #796 SA_RESTART
                     self.arm_signals();
                     if self.deliverable_now() {
                         self.wake.clone()
@@ -1633,6 +1651,7 @@ impl Proc {
                 // Caught: pend + arm. A stopped process holds delivery until continued
                 // ([`SignalDoor::take_deliverable`]'s gate).
                 self.sig_pending |= 1 << sig;
+                self.note_delivery_flags(sig); // #796 SA_RESTART
                 self.arm_signals();
                 if self.deliverable_now() {
                     self.wake.clone()
@@ -1641,6 +1660,14 @@ impl Proc {
                 }
             }
         }
+    }
+
+    /// #796 `SA_RESTART` — record whether `sig`'s action wants interrupted blocking calls
+    /// restarted, at every point a caught delivery can fire a park interrupt. Plain `signal()`
+    /// installs leave `sa_flags` at 0 (the SysV flavor: no restart) — only a `sigaction` with
+    /// `SA_RESTART` opts in.
+    fn note_delivery_flags(&mut self, sig: i32) {
+        self.restart_ok = (self.sig_action_flags.get(&sig).copied().unwrap_or(0) & SA_RESTART) != 0;
     }
 
     /// #796 default actions — run the default action for a pending, unmasked, `SIG_DFL`
@@ -1766,6 +1793,7 @@ impl Proc {
             kill: None, // ditto — the twin's own terminate closure lands at mint
             term_sig: None,
             handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
+            restart_ok: self.restart_ok,
         }
     }
 }

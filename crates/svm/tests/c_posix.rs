@@ -716,17 +716,76 @@ fn c_an_ignored_signal_does_not_interrupt_a_blocked_capability_read() {
     );
 }
 
+/// #796 `SA_RESTART` — **a restart-flagged delivery re-issues the blocked read instead of `-EINTR`**:
+/// SIGINT is installed via `sigaction` with `SA_RESTART`; the raiser interrupts `main`'s blocked
+/// pipe read — the handler runs (fired = 2, promptly: the woken read re-executes and the per-op
+/// poll delivers first), but the read RESTARTS (re-parks) instead of surfacing `-EINTR`, and later
+/// completes with the raiser's DATA. The exact complement of the `-EINTR` test above — the
+/// `sa_flags` bit flips the outcome.
+const RESTART_READ_SRC: &str = r#"
+long __px_kill(int cap, long pid, long sig);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_sigaction(int cap, long signum, long act, long oldact);
+long __vm_pipe(int *fds);
+long __vm_read(int fd, void *buf, long len);
+long __vm_write(int fd, void *buf, long len);
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+static char sigstk[16384];
+static long act[3];
+static char msg[] = "GO\n";
+static volatile int fired;
+static void handler(int sig) { fired = sig; }
+long g_wfd;
+long raiser(long arg) {
+  volatile long acc = 0;
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* let main reach its read and park */
+  __px_kill(0, 0, 2);          /* SA_RESTART'd SIGINT: handler runs, the read must RESTART */
+  for (long i = 0; i < 2000000; i = i + 1) acc = acc + i;  /* window: an EINTR would surface here */
+  __vm_write(g_wfd, msg, 3);   /* the restarted read completes with data */
+  return 0;
+}
+int main(void) {
+  act[0] = (long)handler;
+  act[1] = 0;
+  act[2] = 0x10000000;         /* SA_RESTART */
+  __px_sigaction(0, 2, (long)act, 0);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  int fds[2];
+  __vm_pipe(fds);
+  g_wfd = fds[1];
+  int h = __vm_thread_spawn(raiser, (void *)0, 0);
+  char b[8];
+  long n = __vm_read(fds[0], b, 8);  /* PARKS; interrupted -> handler -> RESTARTS -> data */
+  __vm_thread_join(h);
+  if (n == -4) return 42;            /* -EINTR would mean SA_RESTART was ignored */
+  return fired * 10 + (int)n;        /* 23: the handler ran AND the read completed with data */
+}
+"#;
+
+#[test]
+fn c_sa_restart_reissues_an_interrupted_blocked_read() {
+    let e = run_interp_only(RESTART_READ_SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(23)],
+        "the SA_RESTART'd SIGINT ran its handler but the blocked read restarted and returned data"
+    );
+}
+
 /// #799 slice 5 — **the embedder `^C`: a signal from *outside* the run interrupts a blocked syscall.** The
 /// interactive terminal case: the guest catches SIGINT and blocks on a capability `__vm_read` in a
 /// **single** fiber — so when it parks (`Blocked::PipeRead`), *every* fiber is parked and no per-op
 /// safepoint fires. A background "terminal" thread calls `Posix::raise_signal(SIGINT)` (the embedder's
 /// signal authority over the guest — the `Posix` handle shares the personality `Inner` with the running
 /// guest); the personality decides it is deliverable and invokes the interp's scheduler-wake closure, so
-/// the parked read completes `-EINTR` (sentinel 42). The raiser retries until the run returns (robust to
-/// install/park ordering — each raise before the guest parks is a harmless no-op).
+/// the parked read completes `-EINTR` (sentinel 42). The "terminal" holds fire until the guest's
+/// readiness byte lands on stdout — #796 default actions made a pre-handler `^C` FATAL (terminate is
+/// SIGINT's `SIG_DFL` action); after the handler is installed each raise stays harmless.
 const EINTR_EMBEDDER_SRC: &str = r#"
 long __px_signal(int cap, long signum, long handler);
 long __px_sigaltstack(int cap, long sp, long size);
+long __px_write(int cap, long fd, long buf, long len);
 long __vm_pipe(int *fds);
 long __vm_read(int fd, void *buf, long len);
 static char sigstk[16384];
@@ -735,6 +794,7 @@ static void handler(int sig) { fired = sig; }
 int main(void) {
   __px_signal(0, 2, (long)handler);          /* catch SIGINT */
   __px_sigaltstack(0, (long)sigstk, 16384);  /* async delivery on */
+  __px_write(0, 1, (long)sigstk, 1);         /* readiness byte: the terminal may open fire (#796) */
   int fds[2];
   __vm_pipe(fds);                            /* main holds both ends -> a live writer keeps the read blocked */
   char b[8];
@@ -765,6 +825,10 @@ fn c_an_embedder_signal_interrupts_a_blocked_read_ctrl_c() {
     let done = std::sync::Arc::new(AtomicBool::new(false));
     let done2 = std::sync::Arc::clone(&done);
     let terminal = std::thread::spawn(move || {
+        // Hold fire until the guest's readiness byte (#796 — a pre-handler ^C is fatal).
+        while !done2.load(Ordering::Relaxed) && posix2.stdout().is_empty() {
+            std::thread::yield_now();
+        }
         while !done2.load(Ordering::Relaxed) {
             posix2.raise_signal(2);
             std::thread::yield_now();

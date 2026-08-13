@@ -3023,6 +3023,96 @@ fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
     );
 }
 
+/// #796 `SA_RESTART` — **a restart-flagged delivery leaves a parked `wait` parked**: the parent
+/// installs SIGUSR1 via `sigaction` with `SA_RESTART` (real handler, async stack) and parks in
+/// `wait_pid(child)`; the child raises USR1 at the parent (pid 1) and only THEN exits 5. Without
+/// the flag that raise EINTRs the wait (the #863 capstone proves it); with it the wait must ride
+/// through — never `-4` — and return the child's real 5, with the handler having run by then
+/// (delivered at the parent's first post-wait safepoint; for the shell's `SIGCHLD`-with-restart
+/// case the wait completes at the same moment the signal lands, so the delay is invisible).
+const RESTART_WAIT_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static char sigstk[4096];
+static long act[3];
+static volatile long got;
+static void on_usr(int sig) { got = sig; }
+static long pid;
+static long ppid;
+static long st;
+static volatile long acc;
+int main(int argc, char **argv) {
+  act[0] = (long)on_usr;
+  act[1] = 0;
+  act[2] = 0x10000000;                     /* SA_RESTART */
+  __vm_fs(41, 10, (long)act, 0, 0);        /* sigaction(SIGUSR1, restart) — BEFORE fork */
+  __vm_fs(42, (long)sigstk, 4096, 0, 0);   /* sigaltstack: async delivery on */
+  ppid = __vm_fs(44, 0, 0, 0, 0);          /* getpid, saved pre-fork: the twin's copy = its parent */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    __vm_fs(31, ppid, 10, 0, 0);           /* kill(parent, USR1) while it is (or will be) parked */
+    for (long i = 0; i < 200000; i = i + 1) acc = acc + i;  /* a window for a wrong EINTR */
+    return 5;
+  }
+  st = wait_pid(pid);                      /* PARKS; the USR1 must NOT interrupt it (restart) */
+  if (st == -4) return 1;                  /* -EINTR = SA_RESTART was ignored */
+  if (st != 5) return 2;                   /* the child's real exit rode through */
+  for (long i = 0; got != 10 && i < 100000000; i = i + 1) acc = acc + 1;  /* async landing window */
+  if (got != 10) return 3;                 /* the held handler delivered after the wait */
+  return 42;
+}
+"#;
+
+#[test]
+fn sa_restart_rides_a_parked_wait_through_a_delivered_signal() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{RESTART_WAIT_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse restart-wait guest");
+    verify_module(&guest).expect("verify restart-wait guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the SA_RESTART'd USR1 left the parent's wait parked (no -EINTR): it returned the \
+         child's real 5, and the handler had run by then"
+    );
+}
+
 /// #863 slice 3 — **the waitpid-EINTR capstone: an embedder `^C` interrupts a forked shell blocked
 /// in `wait`, on the RIGHT process.** The compiled-C parent catches SIGINT (real handler + signal
 /// stack — async delivery on), forks a child (which spins on its `sigcheck` doorbell), and parks in

@@ -2155,7 +2155,7 @@ fn drive_over_cell(
             let sched_weak = Arc::downgrade(&sched);
             source.set_wake(Arc::new(move || {
                 if let Some(s) = sched_weak.upgrade() {
-                    s.interrupt_interruptible_parks(root_dom);
+                    s.interrupt_interruptible_parks(root_dom, true);
                 }
             }));
             // #798 slice 2 — the stop/continue closure, same weak discipline as the wake.
@@ -2175,7 +2175,7 @@ fn drive_over_cell(
             source.set_kill(Arc::new(move || {
                 term_flag.store(true, Ordering::SeqCst);
                 if let Some(s) = sched_weak.upgrade() {
-                    s.interrupt_interruptible_parks(root_dom);
+                    s.interrupt_interruptible_parks(root_dom, false);
                     s.wake_stopped(root_dom);
                 }
             }));
@@ -4714,7 +4714,7 @@ impl Scheduler {
     /// NOT reaped, its status stays in `results` for the re-issued `wait` (invariant 7). Returns the
     /// count interrupted (0 if nothing of this domain was blocked — the handler still delivers to
     /// the running fiber).
-    fn interrupt_interruptible_parks(&self, domain: usize) -> u32 {
+    fn interrupt_interruptible_parks(&self, domain: usize, honor_restart: bool) -> u32 {
         let mut s = self.lock();
         let mut n = 0u32;
         let mut hit: Vec<Waiter> = Vec::new();
@@ -4768,6 +4768,24 @@ impl Scheduler {
         }
         // POSIX `wait` parks: a named `wait(pid)` sits in `join_waiters` under `Pending::ReapPid`
         // (a `thread.join` park has a different pending and is NOT a syscall — left alone).
+        // #796 `SA_RESTART`: unlike the pipe parks (which re-consume the interrupt at their own
+        // park site and can re-park there), a reap park gets its `-EINTR` injected right here —
+        // so the restart decision is made here too: a restart-flagged delivery leaves the park
+        // untouched (the wait simply keeps waiting). Queried once per sweep, lazily, from the
+        // first reap waiter's host. The kill door's sweep passes `honor_restart = false` — death
+        // must always collapse the park.
+        let mut restart_cache: Option<bool> = None;
+        let mut restart = |v: &VCpu| -> bool {
+            if !honor_restart {
+                return false;
+            }
+            *restart_cache.get_or_insert_with(|| {
+                v.host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .signal_restart()
+            })
+        };
         let reap_keys: Vec<TaskId> = s
             .join_waiters
             .iter()
@@ -4777,6 +4795,9 @@ impl Scheduler {
             .map(|(k, _)| *k)
             .collect();
         for k in reap_keys {
+            if restart(s.join_waiters.get(&k).expect("key just enumerated")) {
+                continue;
+            }
             let mut v = s.join_waiters.remove(&k).expect("key just enumerated");
             v.pending = Some(Pending::CapResult(EINTR));
             s.runnable.push_back(v);
@@ -4786,7 +4807,7 @@ impl Scheduler {
         let anyw = std::mem::take(&mut s.reap_any_waiters);
         let mut keep_any = std::collections::VecDeque::new();
         for (target, mut v) in anyw {
-            if domain_key_of(&v) == domain {
+            if domain_key_of(&v) == domain && !restart(&v) {
                 v.pending = Some(Pending::CapResult(EINTR));
                 s.runnable.push_back(v);
                 n += 1;
@@ -5053,7 +5074,7 @@ impl Scheduler {
                 let sched_weak = Arc::downgrade(self);
                 source.set_wake(Arc::new(move || {
                     if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom);
+                        sc.interrupt_interruptible_parks(dom, true);
                     }
                 }));
                 // #798 slice 2 — the twin's stop/continue closure, minted with its wake.
@@ -5071,7 +5092,7 @@ impl Scheduler {
                 source.set_kill(Arc::new(move || {
                     term_flag.store(true, Ordering::SeqCst);
                     if let Some(sc) = sched_weak.upgrade() {
-                        sc.interrupt_interruptible_parks(dom);
+                        sc.interrupt_interruptible_parks(dom, false);
                         sc.wake_stopped(dom);
                     }
                 }));
@@ -6677,9 +6698,9 @@ impl SchedRef {
     /// #796 L1 / #863 slice 3 — interrupt `domain`'s interruptible blocking parks with `-EINTR`
     /// ([`Scheduler::interrupt_interruptible_parks`]). Real scheduler only; the explorer never parks a
     /// blocking pipe op (its read/write arms fail closed), so there is nothing to interrupt.
-    fn interrupt_interruptible_parks(&self, domain: usize) -> u32 {
+    fn interrupt_interruptible_parks(&self, domain: usize, honor_restart: bool) -> u32 {
         match self {
-            SchedRef::Real(s) => s.interrupt_interruptible_parks(domain),
+            SchedRef::Real(s) => s.interrupt_interruptible_parks(domain, honor_restart),
             SchedRef::Det(_) => 0,
         }
     }
@@ -9868,7 +9889,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // just acts when the source hands it a delivery. (Signal semantics stay in the
                             // personality; svm only provides the wake mechanism — invariant 4. Scoped to
                             // THIS domain — invariant 12.)
-                            sched.interrupt_interruptible_parks(sig_domain);
+                            sched.interrupt_interruptible_parks(sig_domain, true);
                             // The handler's IR shape is `void handler(int)` = `(i64 sp, i32 signum) -> ()`
                             // — chibicc threads the data-SP as v0. `dispatch_indirect` masks the funcref
                             // into the table and type-checks; a mis-typed handler is dropped (the signal
@@ -10613,7 +10634,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_wake(Arc::new(move || {
                                             if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom);
+                                                sc.interrupt_interruptible_parks(dom, true);
                                             }
                                         }));
                                         // #798 slice 2 — and its stop/continue closure.
@@ -10633,7 +10654,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         source.set_kill(Arc::new(move || {
                                             term_flag.store(true, Ordering::SeqCst);
                                             if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom);
+                                                sc.interrupt_interruptible_parks(dom, false);
                                                 sc.wake_stopped(dom);
                                             }
                                         }));
@@ -11046,7 +11067,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_wake(Arc::new(move || {
                                             if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom);
+                                                sc.interrupt_interruptible_parks(dom, true);
                                             }
                                         }));
                                         // #798 slice 2 — and its stop/continue closure.
@@ -11066,7 +11087,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         source.set_kill(Arc::new(move || {
                                             term_flag.store(true, Ordering::SeqCst);
                                             if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom);
+                                                sc.interrupt_interruptible_parks(dom, false);
                                                 sc.wake_stopped(dom);
                                             }
                                         }));
@@ -12098,7 +12119,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park.
                     let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
-                        && hg.take_sig_interrupt();
+                        && hg.take_sig_interrupt()
+                        // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
+                        && !hg.signal_restart();
                     drop(hg);
                     if closed {
                         sched.cap_revoke(h, CAP_REVOKED);
@@ -12454,7 +12477,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `cap.call` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some() || pipe_write_park.is_some())
-                        && hg.take_sig_interrupt();
+                        && hg.take_sig_interrupt()
+                        // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
+                        && !hg.signal_restart();
                     let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
                     drop(hg);
                     let mut eintr_done = false;
@@ -16574,6 +16599,15 @@ pub trait SignalSource: Send + Sync {
     /// injected frames to be told about.
     fn handler_returned(&self) {}
 
+    /// #796 `SA_RESTART` — asked when a signal interrupt reaches a parked blocking op: `true` ⇒
+    /// the delivery that fired the interrupt carried `SA_RESTART`, so the op silently re-issues
+    /// (re-parks) instead of returning `-EINTR`. Non-consuming — the source updates it at each
+    /// delivery (last delivery wins; with several near-simultaneous mixed-flag deliveries this is
+    /// a documented approximation of POSIX's per-handler rule). Default `false` — always EINTR.
+    fn syscall_restart(&self) -> bool {
+        false
+    }
+
     /// #796 default actions — store the run's **terminate closure**: firing it sets the domain's
     /// term flag; every vCPU of the domain self-terminates at its next per-op poll (checked after
     /// `kill`, before stop — death beats stop), and parked/stopped vCPUs are woken so they observe
@@ -17726,6 +17760,16 @@ impl Host {
     /// about to park a pipe read/write; when set, the op returns `-EINTR` instead of rewinding+parking.
     fn take_sig_interrupt(&mut self) -> bool {
         std::mem::take(&mut self.sig_interrupt)
+    }
+
+    /// #796 `SA_RESTART` — ask the installed signal source whether the delivery behind a
+    /// just-consumed interrupt wants the blocking op restarted instead of `-EINTR`. `false`
+    /// with no source (the interrupt then always surfaces).
+    fn signal_restart(&self) -> bool {
+        self.sig_source
+            .as_ref()
+            .map(|s| s.syscall_restart())
+            .unwrap_or(false)
     }
 
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
