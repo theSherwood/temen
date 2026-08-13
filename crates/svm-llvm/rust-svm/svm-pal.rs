@@ -212,6 +212,18 @@ pub(crate) mod host {
         unsafe { __vm_host_call(posix(), 27, name as i64, name_len, argv as i64, argv_len) }
     }
 
+    /// `spawn2(req_ptr) -> pid | -errno` (svm-posix `OP_SPAWN2` = 43). The **parallel-safe** spawn+capture:
+    /// `req_ptr` points at a 44-byte little-endian request struct — `{ name_ptr:u64, name_len:u64,
+    /// argv_ptr:u64, argv_len:u64, stdin_fd:i32, stdout_fd:i32, stderr_fd:i32 }` — binding the child's
+    /// stdio to those fds *inside* the one op (a `-1` fd inherits fd 0 / 1 / 2). Unlike the `dup2(pipe,1)`
+    /// bracket around `spawn`, this never mutates the shared fd table, so concurrent captures on the
+    /// parallel driver can't race (#848). The extra args ride a struct because the FFI has four slots
+    /// and the command target already fills them.
+    #[inline(always)]
+    pub(crate) fn spawn2(req_ptr: *const u8) -> i64 {
+        unsafe { __vm_host_call(posix(), 43, req_ptr as i64, 0, 0, 0) }
+    }
+
     /// `waitpid(pid, status_ptr, options) -> pid | -errno` (svm-posix `OP_WAITPID` = 28). Reaps `pid`
     /// (or any child when `pid == -1`), writing the wait-encoded status (`WEXITSTATUS` in bits 8–15) as
     /// an `i32` to `status_ptr` when non-null. A spawned child has already run, so this never blocks.

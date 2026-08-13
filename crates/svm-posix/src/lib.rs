@@ -106,6 +106,31 @@ pub const OP_SPAWN: u32 = 27;
 pub const OP_WAITPID: u32 = 28;
 pub const OP_WAIT: u32 = 29;
 
+/// **Parallel-safe spawn + capture** (#848). Identical to [`OP_SPAWN`] except the child's stdio is
+/// bound **per-child, atomically inside the one op** rather than by a `dup2(pipe,1)` → spawn →
+/// `dup2(saved,1)` bracket around it. The #825 audit found that bracket races on the **parallel**
+/// driver: the personality lock is released between the three ops, so two vCPUs running
+/// `Command::output()` concurrently corrupt the shared fd-1/fd-2 binding. Carrying the redirect *in*
+/// the spawn op keeps it atomic (the lock is held for the whole spawn) and per-child (the shared
+/// fd-0/1/2 table is never mutated), so concurrent captures cannot collide.
+///
+/// `spawn2(req_ptr) -> pid | -errno`: `req_ptr` points at a 44-byte little-endian request struct
+/// carrying the command target and three fd-actions (the guest FFI has only four payload slots, which
+/// the `spawn` target already fills, so `spawn2`'s extra arguments travel by struct — the
+/// `posix_spawn(…, file_actions, …)` shape):
+///
+/// ```text
+///   +0  name_ptr : u64      +24 argv_len : u64
+///   +8  name_len : u64      +32 stdin_fd : i32
+///   +16 argv_ptr : u64      +36 stdout_fd: i32
+///                           +40 stderr_fd: i32
+/// ```
+///
+/// `stdin_fd` is drained as the child's input; the child's captured stdout is routed to `stdout_fd`
+/// and its stderr to `stderr_fd`. A `-1` fd inherits the caller's current fd 0 / 1 / 2 binding (the
+/// [`OP_SPAWN`] default), so a request with all three fds `-1` is exactly `spawn`.
+pub const OP_SPAWN2: u32 = 43;
+
 /// **POSIX signal surface — L0 doorbell** (STAGE1.md slice 3 / PROCESS.md §9). A signal a shell traps
 /// (SIGINT/SIGTERM/…) becomes a **pending bit** the guest polls at a safe point (a command boundary) and
 /// dispatches itself — no asynchronous interruption of running guest code (that is L1/L2, parked). This
@@ -852,6 +877,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
         "spawn" | "posix_spawn" | "posix_spawnp" => OP_SPAWN,
+        "spawn2" => OP_SPAWN2,
         "waitpid" => OP_WAITPID,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
@@ -1112,6 +1138,7 @@ fn handler(inner: Arc<Mutex<Inner>>) -> HostProc {
                 OP_DUP => Ok(vec![st.dup(args)]),
                 OP_FCNTL => Ok(vec![st.fcntl(args)]),
                 OP_SPAWN => st.spawn(args, mem),
+                OP_SPAWN2 => st.spawn2(args, mem),
                 OP_WAITPID => st.waitpid(args, mem),
                 OP_WAIT => st.waitpid(&[-1, *args.first().unwrap_or(&0), 0], mem),
                 OP_SIGNAL => Ok(vec![st.signal(args)]),
@@ -1494,15 +1521,61 @@ impl Inner {
     /// status `waitpid` reaps. `-ENOSYS` if no delegate is wired; `-EINVAL` on a non-UTF-8 name.
     fn spawn(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
+        let (name, argv) = match self.parse_spawn_target(args, mem)? {
+            Ok(t) => t,
+            Err(errno) => return Ok(vec![errno]),
+        };
+        // Classic spawn: inherit fd 0 / 1 / 2 (the `dup2` bracket is the guest's; here it's already
+        // applied to the shared fd table). `spawn_core` with the `-1` sentinels is exactly that.
+        Ok(vec![self.spawn_core(&name, &argv, -1, -1, -1)])
+    }
+
+    /// [`OP_SPAWN2`] — the parallel-safe spawn+capture. Reads the 44-byte request struct at `args[0]`
+    /// (command target + three fd-actions; `-1` fd = inherit fd 0 / 1 / 2), then binds the child's stdio
+    /// to *those* fds inside this one locked op — never mutating the shared fd-0/1/2 table, so two vCPUs
+    /// capturing concurrently on the parallel driver cannot race (#848). See [`OP_SPAWN2`] for the layout.
+    fn spawn2(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let req_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let req = mem.read_bytes(req_ptr, 44).ok_or(Trap::Malformed)?;
+        let rd_u64 = |o: usize| u64::from_le_bytes(req[o..o + 8].try_into().unwrap());
+        let rd_i32 = |o: usize| i32::from_le_bytes(req[o..o + 4].try_into().unwrap()) as i64;
+        // The command target rides the same four-word shape `parse_spawn_target` reads for `spawn`.
+        let target = [
+            rd_u64(0) as i64,
+            rd_u64(8) as i64,
+            rd_u64(16) as i64,
+            rd_u64(24) as i64,
+        ];
+        let (name, argv) = match self.parse_spawn_target(&target, mem)? {
+            Ok(t) => t,
+            Err(errno) => return Ok(vec![errno]),
+        };
+        let stdin_fd = rd_i32(32);
+        let stdout_fd = rd_i32(36);
+        let stderr_fd = rd_i32(40);
+        Ok(vec![
+            self.spawn_core(&name, &argv, stdin_fd, stdout_fd, stderr_fd)
+        ])
+    }
+
+    /// Parse the `(name_ptr, name_len, argv_ptr, argv_len)` prefix both spawn ops carry into the command
+    /// name + `argv`. `Err(Trap::Malformed)` on an unreadable pointer; `Ok(Err(EINVAL))` on a non-UTF-8
+    /// name; `Ok(Ok((name, argv)))` otherwise. `argv` is the blob split on NUL with trailing empties
+    /// dropped; empty ⇒ `[name]` (argv[0] = program name).
+    fn parse_spawn_target(
+        &self,
+        args: &[i64],
+        mem: &dyn GuestMem,
+    ) -> Result<Result<(String, Vec<String>), i64>, Trap> {
         let name_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let name_len = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
         let argv_ptr = *args.get(2).unwrap_or(&0) as u64;
         let argv_len = (*args.get(3).unwrap_or(&0)).max(0) as u64;
         let name_bytes = mem.read_bytes(name_ptr, name_len).ok_or(Trap::Malformed)?;
         let Ok(name) = String::from_utf8(name_bytes) else {
-            return Ok(vec![EINVAL]);
+            return Ok(Err(EINVAL));
         };
-        // argv: the blob split on NUL, trailing empties dropped; empty ⇒ [name] (argv[0] = program name).
         let mut argv: Vec<String> = if argv_len == 0 {
             Vec::new()
         } else {
@@ -1517,26 +1590,42 @@ impl Inner {
         if argv.is_empty() {
             argv.push(name.clone());
         }
+        Ok(Ok((name, argv)))
+    }
+
+    /// The shared spawn body both [`OP_SPAWN`] and [`OP_SPAWN2`] run: invoke the embedder's delegate on
+    /// the parsed command with the child's stdin drained from `stdin_fd`, then route its captured stdout/
+    /// stderr to `stdout_fd`/`stderr_fd`. Each fd is a `-1` sentinel for "inherit the caller's fd 0 / 1 /
+    /// 2 binding" (classic `spawn`) or an explicit fd (per-child, parallel-safe `spawn2`). Returns the
+    /// synthetic pid, or an errno (`ENOSYS` when no delegate is wired — fail closed *before* draining).
+    fn spawn_core(
+        &mut self,
+        name: &str,
+        argv: &[String],
+        stdin_fd: i64,
+        stdout_fd: i64,
+        stderr_fd: i64,
+    ) -> i64 {
         // Fail closed *before* any side effect (draining stdin) if no delegate is wired.
         if self.spawn_fn.is_none() {
-            return Ok(vec![ENOSYS]);
+            return ENOSYS;
         }
-        // The child inherits fd 0 as stdin — drain it before invoking the delegate.
-        let stdin = self.drain_fd(0);
+        // The child inherits its stdin from `stdin_fd` (fd 0 by default) — drain it before the delegate.
+        let stdin = self.drain_fd(if stdin_fd < 0 { 0 } else { stdin_fd });
         // Take the delegate out to call it (a `&mut self` method cannot also borrow the boxed closure),
         // then restore it.
         let mut f = self.spawn_fn.take().unwrap();
-        let res = f(&name, &argv, &stdin);
+        let res = f(name, argv, &stdin);
         self.spawn_fn = Some(f);
-        // Route the child's stdout/stderr to the caller's current fd 1 / fd 2 (inheritance: a prior
-        // `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe; otherwise the stdio sink).
-        self.sink_write(1, &res.stdout);
-        self.sink_write(2, &res.stderr);
+        // Route the child's stdout/stderr to the requested fds (default: the caller's current fd 1 / fd
+        // 2 — inheritance, as a prior `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe).
+        self.sink_write(if stdout_fd < 0 { 1 } else { stdout_fd }, &res.stdout);
+        self.sink_write(if stderr_fd < 0 { 2 } else { stderr_fd }, &res.stderr);
         let pid = self.next_pid;
         self.next_pid += 1;
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
         self.children.insert(pid, (res.status & 0xff) << 8);
-        Ok(vec![pid as i64])
+        pid as i64
     }
 
     /// `waitpid(pid, status_ptr, options) -> pid | -errno`: reap `pid` (or any pending child when
@@ -4009,6 +4098,78 @@ block 0 (vph: i32) {\n\
             (status >> 8) & 0xff,
             3,
             "WEXITSTATUS is the delegate's exit code"
+        );
+    }
+
+    #[test]
+    fn spawn2_routes_per_child_fds_without_touching_the_shared_stdio() {
+        // #848: `spawn2` binds the child's stdio to fds named in its request struct, atomically inside
+        // the one op — so a capture never mutates the shared fd-1/fd-2 binding (the parallel-driver race
+        // the `dup2` bracket had). Wire a delegate that uppercases the inherited stdin to stdout and
+        // writes a fixed stderr; route both to *capture pipes* and prove the global stdout/stderr sinks
+        // stay empty (the child's bytes went to the pipes, not fd 1 / fd 2).
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, b"data".to_vec());
+        posix.set_spawn(|_n, _a, stdin| SpawnResult {
+            stdout: stdin.to_ascii_uppercase(),
+            stderr: b"E".to_vec(),
+            status: 5,
+        });
+        let mut win = vec![0u8; WIN];
+        let mut mem = svm_interp::WindowMem::new(&mut win, WIN as u64);
+        let mut st = posix.inner.lock().unwrap();
+
+        win_write(&mut mem, 0, b"prog"); // command name
+                                         // Two capture pipes: their write ends receive the child's stdout / stderr, their read ends drain.
+        st.pipe(&[8], Some(&mut mem)).unwrap(); // [rfd_out@8, wfd_out@12]
+        st.pipe(&[16], Some(&mut mem)).unwrap(); // [rfd_err@16, wfd_err@20]
+        let rd = |mem: &mut svm_interp::WindowMem, o: u64| {
+            i32::from_le_bytes(mem.read_bytes(o, 4).unwrap().try_into().unwrap()) as i64
+        };
+        let (rfd_out, wfd_out) = (rd(&mut mem, 8), rd(&mut mem, 12));
+        let (rfd_err, wfd_err) = (rd(&mut mem, 16), rd(&mut mem, 20));
+
+        // Build the 44-byte request at offset 100: name="prog"@0, argv empty, stdin inherit (-1),
+        // stdout→wfd_out, stderr→wfd_err.
+        win_write(&mut mem, 100, &0u64.to_le_bytes()); // name_ptr = 0
+        win_write(&mut mem, 108, &4u64.to_le_bytes()); // name_len = 4
+        win_write(&mut mem, 116, &0u64.to_le_bytes()); // argv_ptr = 0
+        win_write(&mut mem, 124, &0u64.to_le_bytes()); // argv_len = 0
+        win_write(&mut mem, 132, &(-1i32).to_le_bytes()); // stdin_fd = inherit fd 0
+        win_write(&mut mem, 136, &(wfd_out as i32).to_le_bytes());
+        win_write(&mut mem, 140, &(wfd_err as i32).to_le_bytes());
+
+        let pid = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
+        assert!(pid >= 0, "spawn2 returns a pid");
+
+        // The child's stdout/stderr landed in the capture pipes, NOT the shared fd-1/fd-2 sinks.
+        assert!(
+            st.stdout.is_empty() && st.stderr.is_empty(),
+            "per-child routing never wrote the shared stdout/stderr sinks"
+        );
+        let n_out = st.read(&[rfd_out, 200, 64], Some(&mut mem)).unwrap()[0];
+        assert_eq!(
+            mem.read_bytes(200, n_out as u64).unwrap(),
+            b"DATA",
+            "the child's stdout drained from its capture pipe (uppercased inherited stdin)"
+        );
+        let n_err = st.read(&[rfd_err, 300, 64], Some(&mut mem)).unwrap()[0];
+        assert_eq!(
+            mem.read_bytes(300, n_err as u64).unwrap(),
+            b"E",
+            "the child's stderr drained from its own capture pipe"
+        );
+
+        // An all-`-1` request is exactly `spawn`: the child inherits fd 0 / 1 / 2 (routes to the sinks).
+        // fd 0's preloaded stdin is already drained, so the delegate sees empty input this time.
+        win_write(&mut mem, 132, &(-1i32).to_le_bytes());
+        win_write(&mut mem, 136, &(-1i32).to_le_bytes());
+        win_write(&mut mem, 140, &(-1i32).to_le_bytes());
+        let pid2 = st.spawn2(&[100], Some(&mut mem)).unwrap()[0];
+        assert_eq!(pid2, pid + 1, "a second spawn mints the next pid");
+        assert_eq!(
+            st.stderr, b"E",
+            "an all-(-1) request inherits fd 2 → the shared stderr sink"
         );
     }
 
