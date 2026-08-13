@@ -79,6 +79,14 @@ fn varargs_fixed_count(proc_node: &Node) -> Option<usize> {
         .position(|p| p.args().get(2).is_some_and(|t| t.tag() == Some("varargs")))
 }
 
+/// True if `node` can be **re-evaluated** without changing observable behavior — no `(call …)`
+/// anywhere in the tree (a call may have side effects or a non-idempotent result). Used to gate a
+/// sparse-`case` discriminant, which is recomputed in each comparison block (#858); nimony pre-binds
+/// anything heavier than a pure read (symbol / `deref` / field access), so this holds in practice.
+fn expr_side_effect_free(node: &Node) -> bool {
+    node.tag() != Some("call") && node.args().iter().all(expr_side_effect_free)
+}
+
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
 /// `(pragmas …)` at a proc/gvar's pragma slot (or `.`/absent — then `None`).
 fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
@@ -3536,11 +3544,26 @@ impl<'a> FuncGen<'a> {
             // next test; the tail falls to the `else`/continuation. Real nimony emits these for
             // string-dispatch case statements (`tsso`, `tsplit_and_append`) and non-dense tag
             // matches. Mirrors the `br_table` arm's block/`terminated` bookkeeping.
-            let disc = self.expr(&a[0])?;
+            // The discriminant is re-derived in **each** comparison block, not computed once up
+            // front. The block-arg protocol threads only named slots (see `branch_args`), not a bare
+            // temporary — so a discriminant evaluated once in the entry block is out of scope in the
+            // 2nd+ comparison blocks, which is the "unknown value" the emitted IR failed to re-parse
+            // on (#858). Re-evaluating a side-effect-free read (symbol / `deref` / field access) is
+            // value-equivalent: the comparison chain runs no branch body between tests (a matched
+            // branch jumps straight to `cont`), so nothing mutates the discriminant between blocks.
+            // A discriminant containing a `call` can't be safely re-run; nimony pre-binds those to a
+            // temp, so fail closed rather than double its effect.
+            if !expr_side_effect_free(&a[0]) {
+                return Err(LengError::Unsupported(
+                    "sparse-`case` discriminant has side effects (expected a pre-bound value)"
+                        .into(),
+                ));
+            }
             let cont = self.new_block_id();
             let nbr = branches.len();
             let bodies: Vec<u32> = (0..nbr).map(|_| self.new_block_id()).collect();
             for bi in 0..nbr {
+                let disc = self.expr(&a[0])?;
                 let then_id = bodies[bi];
                 let next_id = self.new_block_id(); // next branch's test, or the else/cont
                                                    // Condition = OR of this branch's value-equalities and range-membership tests.
