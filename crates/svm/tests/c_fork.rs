@@ -3237,3 +3237,111 @@ fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
          and the pid is gone afterwards"
     );
 }
+
+/// #798 slice 1 — **the shell's job-control loop, compiled C, fully in-guest and deterministic**:
+/// fork a two-process "pipeline job", `setpgid` both members into one group led by the first,
+/// `tcsetpgrp` the job to the foreground (readback via `tcgetpgrp`), observe the now-background
+/// shell's own stdout write ring its `SIGTTOU` doorbell (the write proceeds — the L0
+/// approximation until slice 2's stop), **Ctrl-C the job with one `kill(-pgid)`** (both members'
+/// doorbells ring, each exits with its own status), take the terminal back, and reap both members
+/// through `waitpid`. Everything is L0 polling — no signal stack anywhere, so nothing dispatches
+/// async and no embedder thread is needed; the run is single-threaded deterministic.
+const JOB_CONTROL_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long p1;
+static long p2;
+static long h;
+static long msg;
+static int status;
+int main(int argc, char **argv) {
+  while ((p1 = fork()) < 0);
+  if (p1 == 0) {
+    __vm_fs(30, 10, 7, 0, 0);                 /* member 1: catch 10 (L0 token) */
+    while (__vm_fs(32, 0, 0, 0, 0) != 7);     /* spin on the doorbell */
+    return 5;
+  }
+  while ((p2 = fork()) < 0);
+  if (p2 == 0) {
+    __vm_fs(30, 10, 8, 0, 0);                 /* member 2: catch 10 */
+    while (__vm_fs(32, 0, 0, 0, 0) != 8);
+    return 6;
+  }
+  /* Build the job: both children into a group led by the first; foreground it. */
+  if (__vm_fs(45, p1, p1, 0, 0) != 0) return 1;   /* setpgid(c1, c1): group leader */
+  if (__vm_fs(45, p2, p1, 0, 0) != 0) return 2;   /* setpgid(c2, c1): join the job */
+  if (__vm_fs(46, p2, 0, 0, 0) != p1) return 3;   /* getpgid(c2) == the job group */
+  if (__vm_fs(48, 1, p1, 0, 0) != 0) return 4;    /* tcsetpgrp(stdout, job) */
+  if (__vm_fs(47, 1, 0, 0, 0) != p1) return 7;    /* tcgetpgrp readback */
+  /* The shell is background now: its own stdout write rings SIGTTOU (and proceeds). */
+  __vm_fs(30, 22, 9, 0, 0);                       /* catch SIGTTOU (token 9) */
+  msg = 0x0a24;                                   /* "$\n" */
+  if (__vm_fs(0, 1, (long)&msg, 2, 0) != 2) return 8;
+  if (__vm_fs(32, 0, 0, 0, 0) != 9) return 9;     /* the TTOU doorbell rang */
+  /* ^C the job: ONE group kill reaches both members. */
+  if (__vm_fs(31, -p1, 10, 0, 0) != 0) return 10;
+  /* Take the terminal back (own group, occupied by us) and reap the job. */
+  if (__vm_fs(48, 1, 1, 0, 0) != 0) return 11;
+  while ((h = __vm_fs(28, p1, (long)&status, 0, 0)) == -10);
+  if (h != p1 || ((status >> 8) & 0xff) != 5) return 12;
+  while ((h = __vm_fs(28, p2, (long)&status, 0, 0)) == -10);
+  if (h != p2 || ((status >> 8) & 0xff) != 6) return 13;
+  return 42;
+}
+"#;
+
+#[test]
+fn a_compiled_c_shell_runs_the_job_control_loop() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{JOB_CONTROL_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse job-control guest");
+    verify_module(&guest).expect("verify job-control guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "the job-control loop end to end: setpgid the job, tcsetpgrp foreground, the background \
+         shell's TTOU doorbell, kill(-pgid) reaching BOTH members, terminal back, both reaped"
+    );
+    // The backgrounded shell's write proceeded (the L0 doorbell, not a stop): it reached stdout.
+    assert_eq!(
+        posix.stdout(),
+        b"$\n",
+        "the background write went through to the captured terminal"
+    );
+}
