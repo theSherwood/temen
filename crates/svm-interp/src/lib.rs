@@ -4766,26 +4766,72 @@ impl Scheduler {
                 }
             }
         }
-        // POSIX `wait` parks: a named `wait(pid)` sits in `join_waiters` under `Pending::ReapPid`
-        // (a `thread.join` park has a different pending and is NOT a syscall — left alone).
-        // #796 `SA_RESTART`: unlike the pipe parks (which re-consume the interrupt at their own
-        // park site and can re-park there), a reap park gets its `-EINTR` injected right here —
-        // so the restart decision is made here too: a restart-flagged delivery leaves the park
-        // untouched (the wait simply keeps waiting). Queried once per sweep, lazily, from the
-        // first reap waiter's host. The kill door's sweep passes `honor_restart = false` — death
-        // must always collapse the park.
+        // #796 slice D — blocking **stream** reads (`Blocked::CapRead` — the stdin park): complete
+        // the parked call with `-EINTR`, the exact injection shape `cap_revoke` uses (a value on
+        // the caller's own error path, invariant 5). This is the interactive case: a `^C` at a
+        // shell blocked reading its terminal. Deliberately NOT swept: `CapPending`/`CapReply`
+        // (mid-flight cap calls — interrupting would strand the callee's reply; not a syscall
+        // boundary), the serve-loop parks (`SvcWait`/`OfferPark`/`OfferAdmit` — scheduler
+        // machinery), futex `Wait` (not a personality syscall; guest `std` retries), and plain
+        // `thread.join`.
+        // `SA_RESTART` (#796 slice C): like the reap parks below, the `-EINTR` is injected here,
+        // so the restart decision is made here — a restart-flagged delivery leaves the park
+        // untouched. Queried once per sweep, lazily, from the first gated waiter's host; a
+        // fiber waiter (no host of its own) uses the domain's already-computed answer, else
+        // defaults to interrupting. The kill door's sweep passes `honor_restart = false` —
+        // death must always collapse the parks.
         let mut restart_cache: Option<bool> = None;
-        let mut restart = |v: &VCpu| -> bool {
-            if !honor_restart {
+        fn restart_of(cache: &mut Option<bool>, honor: bool, host: &Arc<Mutex<Host>>) -> bool {
+            if !honor {
                 return false;
             }
-            *restart_cache.get_or_insert_with(|| {
-                v.host
-                    .lock()
+            *cache.get_or_insert_with(|| {
+                host.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .signal_restart()
             })
-        };
+        }
+        let mut hit_caps: Vec<Waiter> = Vec::new();
+        for waiters in s.cap_waiters.values_mut() {
+            let mut keep = Vec::new();
+            for w in waiters.drain(..) {
+                let d = match &w {
+                    Waiter::VCpu(v) => domain_key_of(v),
+                    Waiter::Fiber { svc, .. } => *svc,
+                };
+                // The restart query is scoped to THIS domain's waiters — a foreign waiter must
+                // neither be asked nor prime the cache with another domain's answer.
+                let skip = d == domain
+                    && match &w {
+                        Waiter::VCpu(v) => restart_of(&mut restart_cache, honor_restart, &v.host),
+                        Waiter::Fiber { .. } => honor_restart && restart_cache.unwrap_or(false),
+                    };
+                if d == domain && !skip {
+                    hit_caps.push(w);
+                } else {
+                    keep.push(w);
+                }
+            }
+            *waiters = keep;
+        }
+        s.cap_waiters.retain(|_, ws| !ws.is_empty());
+        for w in hit_caps {
+            n += 1;
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.pending = Some(Pending::CapResult(EINTR));
+                    s.runnable.push_back(v);
+                }
+                Waiter::Fiber { reg, slot, svc } => {
+                    reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                    svc_wake_locked(&mut s, svc);
+                }
+            }
+        }
+        // POSIX `wait` parks: a named `wait(pid)` sits in `join_waiters` under `Pending::ReapPid`
+        // (a `thread.join` park has a different pending and is NOT a syscall — left alone).
+        let mut restart =
+            |v: &VCpu| -> bool { restart_of(&mut restart_cache, honor_restart, &v.host) };
         let reap_keys: Vec<TaskId> = s
             .join_waiters
             .iter()
@@ -6262,18 +6308,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let live = v
-                    .host
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .handle_live(handle);
-                if live {
+                let (live, interrupted) = {
+                    let hg = v.host.lock().unwrap_or_else(|e| e.into_inner());
+                    // #796 slice D — the pre-park pending check, same shape as the revoke
+                    // re-check beside it: a deliverable raise that landed after this vCPU's last
+                    // per-op poll ran its sweep against a map we were not yet in; complete the
+                    // read `-EINTR` instead of blocking through the signal.
+                    (hg.handle_live(handle), hg.park_interrupted())
+                };
+                if live && !interrupted {
                     s.cap_waiters
                         .entry(handle)
                         .or_default()
                         .push(Waiter::VCpu(v));
                 } else {
-                    v.pending = Some(Pending::CapResult(CAP_REVOKED));
+                    v.pending = Some(Pending::CapResult(if live { EINTR } else { CAP_REVOKED }));
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 }
@@ -16608,6 +16657,18 @@ pub trait SignalSource: Send + Sync {
         false
     }
 
+    /// #796 slice D — the **pre-park pending check**: is a deliverable signal pending *right
+    /// now*? Non-consuming. Asked at the interruptible park inserts (under the scheduler lock)
+    /// to close the instants-wide race where a raise lands after the vCPU's last per-op poll but
+    /// before its park insert — the sweep ran against an empty map and the park would otherwise
+    /// block through the signal it should have returned `-EINTR` for. True only for a delivery
+    /// the next per-op poll WOULD redirect (an earlier one would already have been consumed
+    /// there), so a stale `true` is impossible in steady state. Default `false` — poll-only
+    /// sources keep plain parks.
+    fn interrupt_pending(&self) -> bool {
+        false
+    }
+
     /// #796 default actions — store the run's **terminate closure**: firing it sets the domain's
     /// term flag; every vCPU of the domain self-terminates at its next per-op poll (checked after
     /// `kill`, before stop — death beats stop), and parked/stopped vCPUs are woken so they observe
@@ -17769,6 +17830,16 @@ impl Host {
         self.sig_source
             .as_ref()
             .map(|s| s.syscall_restart())
+            .unwrap_or(false)
+    }
+
+    /// #796 slice D — the pre-park pending check at an interruptible park insert: `true` when a
+    /// deliverable signal is pending ([`SignalSource::interrupt_pending`]) and its delivery does
+    /// NOT carry `SA_RESTART` — the park should complete `-EINTR` instead of inserting.
+    fn park_interrupted(&self) -> bool {
+        self.sig_source
+            .as_ref()
+            .map(|s| s.interrupt_pending() && !s.syscall_restart())
             .unwrap_or(false)
     }
 

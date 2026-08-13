@@ -3023,6 +3023,86 @@ fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
     );
 }
 
+/// #800 — **`isatty` + `getppid`, the shell's interactive-mode and `$PPID` probes**: `isatty`
+/// answers the same proto-terminal test the `tc*` ops gate on (stdio fds 1, a pipe fd 0 — the
+/// discrimination bash's "am I interactive?" check needs), and a fork twin's `getppid()` is the
+/// parent's own `getpid()` (recorded at twin mint), with the parent's `getppid()` reporting its
+/// granting root. The child returns its checks as an exit code the parent folds into its own.
+const ISATTY_PPID_SRC: &str = r#"
+long __vm_fs(long op, long a, long b, long c, long d);
+static long pid;
+static long me;
+static long st;
+static int fds[2];
+int main(int argc, char **argv) {
+  me = __vm_fs(44, 0, 0, 0, 0);                       /* getpid */
+  if (__vm_fs(49, 1, 0, 0, 0) != 1) return 1;         /* stdout IS the proto-terminal */
+  if (__vm_fs(49, 0, 0, 0, 0) != 1) return 2;         /* stdin too */
+  if (__vm_fs(23, (long)fds, 0, 0, 0) != 0) return 3; /* pipe(fds) */
+  if (__vm_fs(49, fds[0], 0, 0, 0) != 0) return 4;    /* a pipe fd is NOT a tty */
+  while ((pid = fork()) < 0);
+  if (pid == 0) {
+    if (__vm_fs(50, 0, 0, 0, 0) != me) return 9;      /* child's getppid == parent's getpid */
+    return 5;
+  }
+  while ((st = wait_pid(pid)) < 0);
+  if (st != 5) return 6;
+  if (__vm_fs(50, 0, 0, 0, 0) == me) return 7;        /* parent's ppid is its granter, not itself */
+  return 42;
+}
+"#;
+
+#[test]
+fn isatty_discriminates_the_proto_terminal_and_getppid_names_the_forking_parent() {
+    let manager = Arc::new(parse_module_raw(FS_FORK_MANAGER).expect("parse fs-fork manager"));
+    verify_module(&manager).expect("verify fs-fork manager");
+    let guest_src = format!("{FORK_SHIM}\n{ISATTY_PPID_SRC}");
+    let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse isatty-ppid guest");
+    verify_module(&guest).expect("verify isatty-ppid guest");
+
+    let mut host = Host::new();
+    host.set_self_module(&manager);
+    let _sink = host.shared_stdout();
+    let win = 1u64 << 19;
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, win);
+    let gmod = host.grant_module(&guest);
+
+    let (posix, make) = svm_posix::cap(4096, 1 << 16, Vec::new());
+    let make = Arc::new(make);
+    let px_handler: svm_interp::HostProc = {
+        let mut inner = make();
+        Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter))
+    };
+    let px_cap = host.grant_host_proc_forkable(
+        px_handler,
+        opshift_fork(svm_posix::cap_fork_factory(&posix)),
+    );
+
+    let mut fuel = 120_000_000u64;
+    let r = run_with_host(
+        &manager,
+        0,
+        &[
+            Value::I32(inst),
+            Value::I32(stream),
+            Value::I64(gmod as i64),
+            Value::I64(gmod as i64), // the cmd-module slot — unused by this guest
+            Value::I32(px_cap),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+
+    assert_eq!(
+        r,
+        vec![Value::I64(42)],
+        "isatty told the proto-terminal from a pipe fd, and getppid reported the forking \
+         parent from inside the twin"
+    );
+}
+
 /// #796 `SA_RESTART` — **a restart-flagged delivery leaves a parked `wait` parked**: the parent
 /// installs SIGUSR1 via `sigaction` with `SA_RESTART` (real handler, async stack) and parks in
 /// `wait_pid(child)`; the child raises USR1 at the parent (pid 1) and only THEN exits 5. Without
