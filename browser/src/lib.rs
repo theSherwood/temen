@@ -8300,29 +8300,46 @@ pub extern "C" fn svm_onramp_tierup_open(
     if let Some(mc) = emit_m.memory.as_mut() {
         mc.size_log2 = win_log2;
     }
-    let Ok((wasm, emit)) = svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0) else {
+    // #880 parity gate for the shared-table world: every dispatch-table target must be reachable
+    // from the emitted tier — natively or through a bounce shim — but the i64-slot transport
+    // carries scalars only and at most the env scratch's worth of them. A guest with any
+    // non-shimmable signature (v128 / over-arity) emits in the old **local**-table mode instead
+    // (the emitter's own indirect restriction then applies), so a null shared-table slot can never
+    // diverge from the interpreter's dispatch.
+    let scalar = |t: &svm_ir::ValType| {
+        matches!(
+            t,
+            svm_ir::ValType::I32
+                | svm_ir::ValType::I64
+                | svm_ir::ValType::F32
+                | svm_ir::ValType::F64
+        )
+    };
+    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
+    let all_shimmable = m.funcs.iter().all(|f| {
+        f.params.iter().all(scalar)
+            && f.results.iter().all(scalar)
+            && f.params.len().max(f.results.len()) <= max_slots
+    });
+    // #880: emit the main module over the **shared reserved table** — `call_indirect`-bearing
+    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
+    // installed units natively (old→new) and interpreter-resident targets through the live bounce.
+    let emitted_res = if all_shimmable {
+        svm_wasm_jit::compile_module_tierup_b2(&emit_m, shared != 0, ONRAMP_JIT_TABLE_LOG2 as u32)
+    } else {
+        svm_wasm_jit::compile_module_tierup(&emit_m, shared != 0)
+    };
+    let Ok((wasm, emit)) = emitted_res else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
     // The JS host marshals every arg/result as a plain i64 slot (same limit as the par tier-up).
     let all_i64 = |ts: &[svm_ir::ValType]| ts.iter().all(|t| *t == svm_ir::ValType::I64);
-    // A `call_indirect`-bearing function is excluded from TIERUP eligibility: the main module is
-    // emitted in *local*-table mode, so its indirect dispatch cannot reach a slot installed at
-    // runtime — the interpreter (whose table can) must own such calls (#846; closes a latent
-    // divergence the moment installs exist, which #835 made possible).
-    let calls_indirect = |f: &svm_ir::Func| {
-        f.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| matches!(i, svm_ir::Inst::CallIndirect { .. }))
-                || matches!(b.term, svm_ir::Terminator::ReturnCallIndirect { .. })
-        })
-    };
     let eligible: Vec<bool> = m
         .funcs
         .iter()
         .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results) && !calls_indirect(f))
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
         .collect();
     // Nothing for the emitted tier to ever run → refuse (the page's bytecode path is strictly
     // simpler). A `vm_jit_*` importer stays eligible even with no emittable leaf: its win is the
@@ -8331,15 +8348,11 @@ pub extern "C" fn svm_onramp_tierup_open(
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     }
-    // #846: a `vm_jit_*` guest's dispatch table must be the emitted units' compile-time mask
-    // (`1 << ONRAMP_JIT_TABLE_LOG2`) — a natural-size table would disagree with the B2
-    // `call_indirect` mask on slot numbering. Non-jit guests keep the natural table.
-    let prog = if jit_importer {
-        bytecode::VcpuProgram::compile_with_jit_table(&m, ONRAMP_JIT_TABLE_LOG2)
-    } else {
-        bytecode::VcpuProgram::compile(&m)
-    };
-    let Some(prog) = prog else {
+    // The engine's dispatch table must match the emitted `call_indirect` mask
+    // (`1 << ONRAMP_JIT_TABLE_LOG2`) — a natural-size table would both number install slots
+    // differently and wrap wild indices differently (#846/#880). Sized for every pump guest.
+    let Some(prog) = bytecode::VcpuProgram::compile_with_jit_table(&m, ONRAMP_JIT_TABLE_LOG2)
+    else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
@@ -8357,35 +8370,14 @@ pub extern "C" fn svm_onramp_tierup_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
-    // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted the
-    // `Jit` cap + validator; only the runtime-compile par powerbox installs an emitter otherwise), so
-    // a guest-compiled unit can run emitted. The emitter is a bare `fn` — its two run parameters
-    // (the memory-share flag and the window bump) ride the statics it reads.
-    //
-    // #846 parity gate: emitted units reach *every* dispatch-table target — natively or through a
-    // bounce trampoline — but the i64-slot transport carries scalars only and at most
-    // `ENV_CELL_BYTES` worth of them. A program whose function set contains a non-shimmable
-    // signature could leave a table slot the interpreter can dispatch but the emitted tier cannot
-    // (a null slot's trap would *diverge*, not refuse) — so such a guest keeps its units on the
-    // interpreter entirely.
-    let scalar = |t: &svm_ir::ValType| {
-        matches!(
-            t,
-            svm_ir::ValType::I32
-                | svm_ir::ValType::I64
-                | svm_ir::ValType::F32
-                | svm_ir::ValType::F64
-        )
-    };
-    let max_slots = (svm_wasm_jit::ENV_CELL_BYTES - 16) / 8;
-    let all_shimmable = m.funcs.iter().all(|f| {
-        f.params.iter().all(scalar)
-            && f.results.iter().all(scalar)
-            && f.params.len().max(f.results.len()) <= max_slots
-    });
+    // The unit-emit/shim parameters ride statics (the emitter and the shim generator are bare
+    // `fn`s) — stored for every open, since shims serve non-jit guests' emitted leaves too (#880).
+    TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
+    TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
+    // #835: arm the §22 unit wasm-emitter for a `vm_jit_*` importer (`grant_onramp_caps` granted
+    // the `Jit` cap + validator). Gated on the same shimmable-signature bound as the shared-table
+    // emit above — a unit's dispatch depends on shims covering every interpreter-resident slot.
     if jit_importer && all_shimmable {
-        TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
-        TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     // Declared prefix mapped, reservation clamped to the buffer: the guest `vm_map`-grows into
@@ -8639,11 +8631,15 @@ pub extern "C" fn svm_onramp_tierup_deliver(rptr: *const i64, n: usize) {
 }
 
 /// Deliver a trap from the emitted `f{func}` (a wasm trap or an SVM fault) for the pending TIERUP.
+/// When the unwind came from a **bounce** callback's trap (#880 — a `call_indirect`-bearing leaf
+/// hit a shim whose callback trapped), the staged real trap is delivered instead, so a callback's
+/// `exit` ends the run as `STATUS_EXIT` exactly as the interpreted call would.
 #[no_mangle]
 pub extern "C" fn svm_onramp_tierup_deliver_trap() {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(TIERUP_RUN)).as_mut() } {
-        s.vcpu.deliver_tierup_trap(Trap::Unreachable);
+        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
+        s.vcpu.deliver_tierup_trap(t);
     }
 }
 

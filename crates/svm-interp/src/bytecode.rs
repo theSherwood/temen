@@ -3775,15 +3775,34 @@ impl<'p> Vcpu<'p> {
             Some(m) => HostCell::Shared(m),
             None => HostCell::Excl(&mut self.host),
         };
-        let vals = drive_nested(
-            &dom.source,
-            &dom.table,
-            vm,
-            &mut self.fuel,
-            &mut self.mem,
-            &mut cell,
-            &mut self.invoke_fibers,
-        )?;
+        // Registry context (#880): during an emitted **invoke**, callbacks share the
+        // invoke-confined registry (`run_invoke` parity — fibers die with the invoke). During an
+        // emitted **TIERUP region**, the callback is interpreted-inline-call territory: its fibers
+        // register in the vCPU's *run-level* registry (parallel arrays mirrored), so one created
+        // here persists for the run to resume later — exactly as the same call inline would.
+        let vals = if self.pending_jit.is_some() {
+            drive_nested(
+                &dom.source,
+                &dom.table,
+                vm,
+                &mut self.fuel,
+                &mut self.mem,
+                &mut cell,
+                &mut self.invoke_fibers,
+                None,
+            )?
+        } else {
+            drive_nested(
+                &dom.source,
+                &dom.table,
+                vm,
+                &mut self.fuel,
+                &mut self.mem,
+                &mut cell,
+                &mut self.fibers,
+                Some((&mut self.fiber_sp, &mut self.fiber_meta)),
+            )?
+        };
         for (i, v) in vals.iter().enumerate() {
             io[i] = val_to_slot(*v);
         }
@@ -8276,7 +8295,16 @@ fn run_invoke(
     active.module = module;
     // The interpreted invoke completes synchronously, so its fiber registry is loop-local; the
     // emitted-invoke bounce path threads the vCPU's persistent registry instead (`bounce_call`).
-    drive_nested(source, table, active, fuel, mem, host, &mut Vec::new())
+    drive_nested(
+        source,
+        table,
+        active,
+        fuel,
+        mem,
+        host,
+        &mut Vec::new(),
+        None,
+    )
 }
 
 /// The shared nested-drive loop under [`run_invoke`] (an interpreted `Jit.invoke`) and
@@ -8285,6 +8313,11 @@ fn run_invoke(
 /// The registry is caller-owned so the bounce path can persist it across the several bounces of one
 /// emitted invoke (a fiber parked by one callback is resumable by a later one — exactly the
 /// one-registry-per-invoke scope the interpreted loop has by construction).
+/// The run-level parallel-array halves `drive_nested` mirrors in run-registry mode (#880): the
+/// fibers' durable shadow-SPs and their `(entry func, sp)` freeze metadata.
+type RunFiberMeta<'a> = (&'a mut Vec<u64>, &'a mut Vec<(i32, i64)>);
+
+#[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
 fn drive_nested(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -8293,6 +8326,13 @@ fn drive_nested(
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     fibers: &mut Vec<FiberState>,
+    // #880 — `Some((fiber_sp, fiber_meta))` when `fibers` is the vCPU's **run-level** registry (a
+    // bounce out of a TIERUP region: the callback's fibers must persist for the run to resume
+    // later, exactly as the same call inline would register them). `ContNew` then mirrors
+    // `step_vcpu`'s parallel-array pushes so the run's bookkeeping stays index-aligned; the
+    // durability `shadow_switch` is deliberately absent — a bounce host is never a durable run
+    // (the pump), and the interpreted invoke path passes `None` (invoke-confined registry).
+    mut run_meta: Option<RunFiberMeta<'_>>,
 ) -> Result<Vec<Value>, Trap> {
     // The resumer chain (`(resumer's fiber id, resumer, dst)`). Invariant: `chain` is non-empty
     // iff `active` is a fiber (`active_id` then indexes `fibers`).
@@ -8328,6 +8368,15 @@ fn drive_nested(
                 }
                 let h = fibers.len() as i32;
                 fibers.push(FiberState::Pending { funcref, sp });
+                // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
+                // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
+                // `run_meta` doc above).
+                if let Some((fiber_sp, fiber_meta)) = run_meta.as_mut() {
+                    fiber_sp
+                        .push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN);
+                    let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
+                    fiber_meta.push((func_idx, sp));
+                }
                 active.set(dst, Reg::from_i32(h));
             }
             // Fibers here never event-park (every park surface faults or waits inline above), so

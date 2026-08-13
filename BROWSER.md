@@ -1042,6 +1042,24 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    never-bounced), and unit→unit through an install slot (pinned zero-bounce) — all observably
    identical to `onramp_exec`.
 
+   **#880 — `call_indirect` tiers up (the B2 main module).** The mixed-tier emit had *never*
+   admitted a `call_indirect`-bearing function (the local identity table is only safe when the
+   whole module is in-subset — and a real `_start` never is), pinning every dispatch-loop function
+   to the interpreter and running installed units' *bytecode* on the program→unit edge. The main
+   module now emits over the **shared reserved table** too (`compile_module_tierup_b2` — the
+   candidate restriction lifts, since the driver populates every slot correctly: native funcref /
+   bounce shim / trapping null ≡ `TABLE_EMPTY`), the engine's dispatch table is mask-sized for
+   every pump guest, and a non-shimmable-signature guest falls back to the local-mode emit whole.
+   TIERUP regions can now bounce: the staged-trap delivery extends to
+   `svm_onramp_tierup_deliver_trap`, and `Vcpu::bounce_call` picks its fiber registry by context —
+   invoke-confined during a JIT_INVOKE (`run_invoke` parity), the **run-level** registry (parallel
+   arrays mirrored) during a TIERUP region, so a fiber created inside a bounced callback persists
+   for the run to resume later, exactly as the same call inline would. Differentials: a
+   `call_indirect`-bearing leaf tiering up with the indirect edge native; a leaf reaching an
+   **install slot** natively (old→new emitted at last); a TIERUP-region bounce growing the window
+   mid-region with stdout-ordering parity; and a fiber created inside a TIERUP bounce resumed
+   later by `_start` (the run-registry persistence pin).
+
 ### Fuel: safepoint parity + a global (LANDED — two interacting wins)
 
 Two changes to how the wasm-JIT meters fuel, measured together because they interact.
