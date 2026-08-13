@@ -106,35 +106,7 @@ fn break_outside_loop_is_fail_closed() {
     }
 }
 
-/// Real nimony `hexer` output for `getAt(s: seq[int], i): int = s[i]` and `firstLen(s): int = s.len`.
-/// Both go through stdlib imports (`[]` — whose name mangles to `\5B\5D…` — and `len`), so they
-/// **translate and verify** as valid IR with those imports unbound (running needs the seq runtime).
-#[test]
-fn real_nimony_seq_index_verifies() {
-    const REAL: &str = include_str!("fixtures/real_seq_index.leng.nif");
-    for name in ["getAt.0.", "firstLen.0."] {
-        let m = svm_leng::translate_proc(REAL, name)
-            .unwrap_or_else(|e| panic!("translate real {name}: {e}"));
-        svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
-    }
-    // The `[]` operator's escaped import name is present and well-formed.
-    let text = svm_leng::translate_proc_to_text(REAL, "getAt.0.").unwrap();
-    assert!(
-        text.contains("call.import"),
-        "seq index is an import:\n{text}"
-    );
-}
-
-/// Real nimony `hexer` output for `sumSeq(a: seq[int])` (a `for` loop with `toOpenArray`/`len`/`[]`)
-/// and `makeSeq(n)` (`result.add`, `newSeqUninit`) — the full read and write seq paths. Both
-/// translate and verify: the `for` lowers to a `while`+`break`, `toOpenArray`/`newSeqUninit` become
-/// sret imports, `len`/`[]`/`add` ordinary imports (aggregate args by address).
-#[test]
-fn real_nimony_seq_loop_verifies() {
-    const REAL: &str = include_str!("fixtures/real_seq_loop.leng.nif");
-    for name in ["sumSeq.0.", "makeSeq.0."] {
-        let m = svm_leng::translate_proc(REAL, name)
-            .unwrap_or_else(|e| panic!("translate real {name}: {e}"));
-        svm_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
-    }
-}
+// The real-`hexer` seq read/write/index/len paths (`getAt`/`firstLen`/`sumSeq`/`makeSeq`) are now
+// exercised as **Nim source** end-to-end in `nim_e2e.rs` (`nim_heap_seq_program_runs_end_to_end`,
+// `nim_for_in_seq_iterator_runs_end_to_end`, `nim_seq_param_sum_runs_end_to_end`), against the real
+// compiled `system` module through the toolchain — not committed `.nif` snapshots.
