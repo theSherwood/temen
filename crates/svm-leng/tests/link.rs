@@ -268,6 +268,48 @@ fn cross_module_value_type_resolves() {
 }
 
 #[test]
+fn cross_module_inheritance_inlines_base() {
+    // `Circle = object of Shape`, and `Shape` (itself `object of RootObj`) is defined in *another*
+    // unit. A derived object inlines its base's fields at the front (after the RTTI vtable header),
+    // so `Circle` must carry `Shape`'s `area` — even though `Shape` is cross-module. Type layouts are
+    // baked at translate time, and a single per-module export can't see a sibling's base, so the
+    // derived unit used to export a lossy layout with only the synthetic vtable slot; the linker now
+    // pools types to a fixpoint (each round re-exports with the prior pool visible), fully inlining a
+    // cross-module inheritance chain of any depth. This is the shape `std/json` hits — `JsonParser =
+    // object of BaseLexer`, base in a sibling module (#859). mk(v) builds a Circle {vt@0, area@8,
+    // r@16} and sums the inherited base field and its own: area + r = (v) + 7.
+    let mod_base = "\
+(stmts
+ (type :Shape.0. . (object RootObj.0.sysv (fld :area.0 . (i +64)))))";
+    let mod_derived = "\
+(stmts
+ (type :Circle.0. . (object Shape.0.modbase (fld :r.0 . (i +64))))
+ (proc :mk.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :c.0 . Circle.0. (oconstr Circle.0. (kv area.0 v.0) (kv r.0 7)))
+   (ret (add (i +64) (dot c.0 area.0 1) (dot c.0 r.0 0))))))";
+    let linked = svm_leng::link_units(&[
+        LengModule {
+            stem: "modderived",
+            src: mod_derived,
+            names: &["mk.0."],
+        },
+        LengModule {
+            stem: "modbase",
+            src: mod_base,
+            names: &[], // type-only unit: it just defines the base `Shape`
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    // mk is frame-needing (aggregate local): ($sp, v) -> i64.
+    assert_eq!(
+        run(&linked, 0, &[4096, 35]),
+        42,
+        "inherited area(35) + own r(7)"
+    );
+}
+
+#[test]
 fn nested_cross_module_types_resolve() {
     // `Outer.0.modp` embeds `Inner.0.` *by value*. The pooled export rewrites the field's type
     // name to its suffixed form (`Inner.0.modp`), so the importing unit resolves the nested layout
