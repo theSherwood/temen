@@ -1907,7 +1907,27 @@ pub fn compile_module_tierup_caps(
     shared_memory: bool,
     nested_caps: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, nested_caps, None)
+    compile_module_tierup_inner(m, shared_memory, nested_caps, None, None)
+}
+
+/// #880 — [`compile_module_tierup`] over the **shared reserved table** (§22 Model B2): the emitted
+/// module *imports* `env.__indirect_function_table` (sized `1 << table_log2`, the domain's
+/// reservation) instead of declaring a local identity table, and — the point — the
+/// `all_in_subset || !uses_indirect` candidate restriction is **dropped**: a `call_indirect`-bearing
+/// function tiers up, because under a host-populated table every slot resolves *correctly*
+/// regardless of the emit split — an emitted target is a native funcref (an installed unit's `f0`,
+/// another `f{i}`), an interpreter-resident target is a live-state bounce shim
+/// ([`emit_slot_trampoline`]), and an empty slot is a null-funcref trap, exactly the interpreter's
+/// `TABLE_EMPTY`. This is what lets a program's hot **dispatch loop** (the language-runtime shape)
+/// run on the emitted tier, including the old→new edge into installed units. The host owns slot
+/// population and must keep the table exact at every entry to emitted code (the single-shot pump
+/// syncs at event boundaries — installs only happen between events).
+pub fn compile_module_tierup_b2(
+    m: &Module,
+    shared_memory: bool,
+    table_log2: u32,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(m, shared_memory, false, None, Some(table_log2))
 }
 
 /// The **opt-in gated software page-check** entry (#750): like [`compile_module_tierup`], but the
@@ -1930,7 +1950,7 @@ pub fn compile_module_tierup_paged(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2))
+    compile_module_tierup_inner(m, shared_memory, false, Some(page_log2), None)
 }
 
 fn compile_module_tierup_inner(
@@ -1938,6 +1958,7 @@ fn compile_module_tierup_inner(
     shared_memory: bool,
     nested_caps: bool,
     paged: Option<u8>,
+    reserved_table_log2: Option<u32>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
@@ -1997,11 +2018,19 @@ fn compile_module_tierup_inner(
         IMPORTED_FUNCS
     };
 
-    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to any
-    // identity-table slot, so a function that uses one is only safe to emit when every function is
-    // in-subset (all slots resolve); otherwise drop it (and the emitted module needs no table).
+    // Optimistic start: every in-subset function is a candidate. A `call_indirect` can dispatch to
+    // any identity-table slot, so under the **local** table a function that uses one is only safe to
+    // emit when every function is in-subset (all slots resolve); under the **shared reserved** table
+    // (#880 — `compile_module_tierup_b2`) the restriction lifts: the host populates every slot
+    // correctly (native funcref / bounce shim / trapping null), so indirect dispatch is always
+    // routable and dispatch-loop functions tier up.
     let mut emit: Vec<bool> = (0..n)
-        .map(|i| in_subset[i] && (all_in_subset || !func_uses_indirect(&m.funcs[i])))
+        .map(|i| {
+            in_subset[i]
+                && (reserved_table_log2.is_some()
+                    || all_in_subset
+                    || !func_uses_indirect(&m.funcs[i]))
+        })
         .collect();
     // Fixpoint: drop any candidate that directly calls a function which is neither still a candidate
     // nor a cross-tier leaf — its emitted body would have an unroutable `Call`. Monotone (only
@@ -2040,7 +2069,7 @@ fn compile_module_tierup_inner(
         &emitted,
         &wasm_of,
         &leaf,
-        None,
+        reserved_table_log2,
         nested_caps,
         FuelMode::Global,
         paged,

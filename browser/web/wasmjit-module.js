@@ -181,41 +181,17 @@ async function driveTierupRun(ex, memory, cacheKey) {
   const i64 = () => new BigInt64Array(memory.buffer);
   const win = Number(ex.svm_onramp_tierup_win_ptr());
 
-  // Compile + instantiate the emitted leaves once per Run, reused across every TIERUP. The compiled
-  // Module is cached across Runs under a key distinct from the whole-program `_start` emit (a different
-  // artifact: same guest, leaf-only exports). No instance cache: the eligible-leaf set is per-open, and
-  // a Run holds its instance for all its events anyway. An emitted leaf never crosses tiers (eligibility
-  // excludes cap-calls and calls into unemitted code), so `call_interp` throwing is fail-closed.
-  const tierupKey = cacheKey === undefined ? undefined : `${cacheKey}#tierup`;
-  let module = cacheGet(tierupKey);
-  if (module === undefined) {
-    const wptr = Number(ex.svm_onramp_tierup_wasm_ptr());
-    const wlen = ex.svm_onramp_tierup_wasm_len();
-    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
-    cachePut(tierupKey, module);
-    jitCacheStats.compiles++;
-  } else {
-    jitCacheStats.hits++;
-  }
-  const instance = await WebAssembly.instantiate(module, {
-    env: {
-      memory,
-      trap: () => {},
-      call_interp: () => { throw new Error('unexpected cross-tier call from an emitted leaf'); },
-    },
-  });
-  const emitted = instance.exports;
-  const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
-
-  // ---- #846: the linked-unit driver — one shared funcref table + the live-state bounce --------
-  // §22 units emit in Model B2 shape: their `call_indirect` dispatches through this table, whose
-  // slots the driver populates from the engine's mirror at each event boundary — an installed
-  // unit's emitted `f0`, an eligible program function's `f{i}` from the main emitted module, or a
-  // **bounce shim** (engine-generated trampoline) for interpreter-resident targets. The bounce
-  // (`env.call_interp`) runs the target on a nested interpretation over the run's LIVE
-  // window/powerbox/fuel, then fans the fresh `"mapped"` extent out to every live instance (a
-  // callback may have vm_map-grown the window mid-invoke). Proven observably identical to
-  // `onramp_exec` by tests/tierup_driver.rs's `TierupDriver` (wasmi playing this file's role).
+  // ---- #846/#880: the linked-unit driver — one shared funcref table + the live-state bounce ---
+  // The main module and every §22 unit emit against this table (Model B2): `call_indirect`
+  // dispatches through it, and the driver populates its slots from the engine's mirror at each
+  // event boundary — an installed unit's emitted `f0`, an emitted program function's `f{i}` from
+  // the main module, or a **bounce shim** (engine-generated trampoline) for interpreter-resident
+  // targets. The bounce (`env.call_interp`) runs the target on a nested interpretation over the
+  // run's LIVE window/powerbox/fuel, then fans the fresh `"mapped"` extent out to every live
+  // instance (a callback may have vm_map-grown the window mid-region). With the shared table,
+  // `call_indirect`-bearing program functions tier up too (#880 — the dispatch-loop shape).
+  // Proven observably identical to `onramp_exec` by tests/tierup_driver.rs's `TierupDriver`
+  // (wasmi playing this file's role).
   const tsize = 1 << ex.svm_onramp_tierup_table_log2();
   const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set
@@ -224,7 +200,6 @@ async function driveTierupRun(ex, memory, cacheKey) {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
   };
-  registerGlobals(emitted);
   const unitImports = () => ({ env: {
     memory,
     __indirect_function_table: table,
@@ -237,6 +212,26 @@ async function driveTierupRun(ex, memory, cacheKey) {
       if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
     },
   } });
+
+  // Compile + instantiate the main emitted module once per Run, reused across every event. The
+  // compiled Module is cached across Runs under a key distinct from the whole-program `_start`
+  // emit (a different artifact: same guest, tier-up exports). No instance cache: the eligible set
+  // is per-open, and a Run holds its instance for all its events anyway.
+  const tierupKey = cacheKey === undefined ? undefined : `${cacheKey}#tierup`;
+  let module = cacheGet(tierupKey);
+  if (module === undefined) {
+    const wptr = Number(ex.svm_onramp_tierup_wasm_ptr());
+    const wlen = ex.svm_onramp_tierup_wasm_len();
+    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
+    cachePut(tierupKey, module);
+    jitCacheStats.compiles++;
+  } else {
+    jitCacheStats.hits++;
+  }
+  const instance = await WebAssembly.instantiate(module, unitImports());
+  const emitted = instance.exports;
+  const envCell = Number(ex.svm_alloc(ex.svm_wasmjit_env_bytes()));
+  registerGlobals(emitted);
   // Per-code-handle unit instances and per-(slot, occupant) bounce shims; per-Run only. Async
   // instantiation (the drive loop awaits it) — a macro unit can exceed the main thread's sync
   // compile allowance.
@@ -327,15 +322,19 @@ async function driveTierupRun(ex, memory, cacheKey) {
         continue;
       }
       if (ev !== 1 /* TIERUP_RUN_TIERUP */) break; // 0 = done (slots staged), 2 = trapped (status 3)
+      // #880: a tiered-up leaf's `call_indirect` dispatches through the shared table — sync it
+      // (and the per-event `"mapped"`/fuel fan-out covers every instance the dispatch may reach).
+      await syncTable();
       const func = ex.svm_onramp_tierup_func();
       const argvPtr = Number(ex.svm_onramp_tierup_argv_ptr());
       const n = ex.svm_onramp_tierup_argv_len();
       const args = [];
       for (let i = 0; i < n; i++) args.push(i64()[(argvPtr >> 3) + i]);
-      // #717 host sync: the event's committed extent → the emitted `"mapped"` global, so the bounds
-      // check admits exactly what the interpreter's page map does for this call.
-      emitted.mapped.value = ex.svm_onramp_tierup_mapped();
-      emitted.fuel.value = 1n << 61n; // re-arm the fuel global across events on the reused instance
+      // #717 host sync: the event's committed extent → every live `"mapped"` global, so the bounds
+      // checks admit exactly what the interpreter's page map does for this call.
+      const tmapped = ex.svm_onramp_tierup_mapped();
+      for (const g of mappedGlobals) g.value = tmapped;
+      for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on reused instances
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       try {
         const ret = emitted['f' + func](win, envCell, ...args);

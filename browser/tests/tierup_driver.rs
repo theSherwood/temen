@@ -1068,11 +1068,88 @@ impl TierupDriver {
     fn bounces(&self) -> &[u32] {
         &self.store.data().bounces
     }
+
+    /// Service the pending TIERUP through the shared table (#880): sync window + table + globals,
+    /// run the main module's `f{func}` (whose `call_indirect` now dispatches through the table —
+    /// natively or via bounce shims), mirror back, deliver results or the trap.
+    fn service_tierup(&mut self, n_results: usize) {
+        self.sync_table();
+        let win_ptr = svm_onramp_tierup_win_ptr() as *mut u8;
+        // SAFETY: the vCPU is parked on the pending event; the window is exclusive.
+        let live = unsafe { std::slice::from_raw_parts(win_ptr, self.win_len) };
+        self.memory
+            .write(&mut self.store, WIN_BASE as usize, live)
+            .unwrap();
+        self.memory
+            .write(&mut self.store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
+            .unwrap();
+        let mapped = svm_onramp_tierup_mapped();
+        for g in self.store.data().mapped_globals.clone() {
+            g.set(&mut self.store, Val::I64(mapped)).unwrap();
+        }
+        for g in self.store.data().fuel_globals.clone() {
+            g.set(&mut self.store, Val::I64(1 << 61)).unwrap();
+        }
+        let func = svm_onramp_tierup_func();
+        let f = self
+            .main
+            .get_func(&self.store, &format!("f{func}"))
+            .unwrap_or_else(|| panic!("f{func} not exported"));
+        let n = svm_onramp_tierup_argv_len();
+        // SAFETY: pending-event operand stash, stable until the deliver.
+        let argv = unsafe { std::slice::from_raw_parts(svm_onramp_tierup_argv_ptr(), n) };
+        let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+        params.extend(argv.iter().map(|a| Val::I64(*a)));
+        let mut results: Vec<Val> = (0..n_results).map(|_| Val::I64(0)).collect();
+        let ran = f.call(&mut self.store, &params, &mut results);
+        let mut buf = vec![0u8; self.win_len];
+        self.memory
+            .read(&self.store, WIN_BASE as usize, &mut buf)
+            .unwrap();
+        // SAFETY: see above.
+        unsafe { std::slice::from_raw_parts_mut(win_ptr, self.win_len) }.copy_from_slice(&buf);
+        match ran {
+            Ok(()) => {
+                let slots: Vec<i64> = results
+                    .iter()
+                    .map(|v| match v {
+                        Val::I64(x) => *x,
+                        Val::I32(x) => *x as i64,
+                        _ => panic!("non-integer TIERUP result"),
+                    })
+                    .collect();
+                svm_onramp_tierup_deliver(slots.as_ptr(), slots.len());
+            }
+            Err(_) => svm_onramp_tierup_deliver_trap(),
+        }
+    }
 }
 
-/// Drive an opened pump session to DONE with the full driver, panicking on TIERUP (the #846 guests
-/// have no eligible leaves reachable from `_start` — every emitted-tier entry is a unit invoke).
-/// Returns the driver (for its bounce log) and the invoke count.
+/// Drive an opened pump session to DONE with the full driver. `sigs` supplies each function's
+/// result count for TIERUP servicing. Returns the driver (for its bounce log) and the
+/// `(tierups, invokes)` counters.
+fn drive_full_session(m: &svm_ir::Module) -> (TierupDriver, u32, u32) {
+    let mut d = TierupDriver::new();
+    let (mut tierups, mut invokes) = (0u32, 0u32);
+    loop {
+        match svm_onramp_tierup_run() {
+            TIERUP_RUN_JIT_INVOKE => {
+                invokes += 1;
+                d.service_jit_invoke();
+            }
+            TIERUP_RUN_TIERUP => {
+                tierups += 1;
+                let f = svm_onramp_tierup_func() as usize;
+                d.service_tierup(m.funcs[f].results.len());
+            }
+            TIERUP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", svm_status()),
+        }
+    }
+    (d, tierups, invokes)
+}
+
+/// [`drive_full_session`] for guests with no eligible leaves (every emitted entry a unit invoke).
 fn drive_jit_session() -> (TierupDriver, u32) {
     let mut d = TierupDriver::new();
     let mut invokes = 0u32;
@@ -1344,6 +1421,336 @@ export 0 func "_start" 0
         svm_onramp_tierup_value(),
         want.value,
         "value parity with the oracle"
+    );
+    svm_onramp_tierup_close();
+}
+
+// ---- #880: call_indirect-bearing functions tier up (B2 main module) ---------------------------
+
+/// #880 differential (native indirect dispatch inside a tiered-up leaf): an eligible leaf whose
+/// body `call_indirect`s an emitted program function — impossible to emit before the shared-table
+/// main module — runs on the emitted tier with the indirect edge dispatching natively.
+#[test]
+fn indirect_leaf_tiers_up_natively() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vprobe = i64.const {PROBE}
+  vres = call 1 (vprobe)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs2 = i32.const 2
+  vr = call_indirect (i64) -> (i64) vs2 (v0)
+  vone = i64.const 1
+  vsum = i64.add vr vone
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {LEAF_K}
+  vsum = i64.add v0 vk
+  vp = i64.const 8
+  vaddr = i64.add v0 vp
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, PROBE + LEAF_K + 1, "oracle value");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(
+        tierups >= 1,
+        "the call_indirect-bearing leaf must tier up (#880 non-vacuity)"
+    );
+    assert!(
+        d.bounces().is_empty(),
+        "the indirect edge targets an emitted function — native, never bounced: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_onramp_tierup_value(), want.value, "value parity");
+    svm_onramp_tierup_close();
+}
+
+/// #880 differential (**old→new native**): an eligible leaf `call_indirect`s an **install slot** —
+/// the program reaching a guest-compiled unit's *emitted* `f0` through the shared table, the edge
+/// that previously always executed the unit's bytecode.
+#[test]
+fn leaf_reaches_installed_unit_natively() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h, jit_h) = onramp_handles_jit();
+    let unit_src = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 7
+  vsum = i64.add v0 vk
+  return vsum
+  }
+}
+"#;
+    let blob = {
+        let u = svm_text::parse_module(unit_src).expect("parse unit");
+        svm_verify::verify_module(&u).expect("verify unit");
+        svm_encode::encode_module(&u)
+    };
+    let stores = stage_blob("a", BLOB_BASE, &blob);
+    let blob_len = blob.len();
+    const X: i64 = 4000;
+    let src = format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vjit = i32.const {jit_h}
+  vslot = cap.call 11 3 (i64) -> (i64) vjit (vcode)
+  vx = i64.const {X}
+  vres = call 1 (vslot, vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vslot: i64, vx: i64) {{
+  vs = i32.wrap_i64 vslot
+  vr = call_indirect (i64) -> (i64) vs (vx)
+  vk = i64.const 100
+  vsum = i64.add vr vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        X + 7 + 100,
+        "oracle: leaf → installed unit → +100"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the dispatching leaf must tier up");
+    assert!(
+        d.bounces().is_empty(),
+        "the install-slot edge reaches the unit's emitted f0 — native (old→new): {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(svm_onramp_tierup_value(), want.value, "value parity");
+    svm_onramp_tierup_close();
+}
+
+/// #880 differential (TIERUP-region bounce + growth): a tiered-up leaf's `call_indirect` lands on
+/// a **shim** (the target cap-calls), whose callback grows the window and streams — the leaf then
+/// stores into the just-grown page, correct only through the post-bounce `"mapped"` fan-out; the
+/// bounce's stdout interleaves exactly as the interpreted call would.
+#[test]
+fn tierup_region_bounce_grows_and_streams() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, mem_h) = onramp_handles();
+    const X: i64 = 1234;
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const {X}
+  vres = call 1 (vx)
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs2 = i32.const 2
+  va = call_indirect (i64) -> (i64) vs2 (v0)
+  vsum = i64.add v0 va
+  vaddr = i64.const 65552
+  i64.store vaddr vsum
+  vld = i64.load vaddr
+  return vld
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = cap.call 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vout = i32.const {out_h}
+  vzero = i64.const 0
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vzero, vlen8)
+  vk = i64.const {BOUNCE_K}
+  vsum = i64.add v0 vk
+  return vsum
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, 2 * X + BOUNCE_K, "oracle value");
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the leaf must tier up");
+    assert!(
+        d.bounces().contains(&2),
+        "the cap-calling target must bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity (mid-region growth admitted post-bounce)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(svm_stdout_ptr(), svm_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity (bounce ordering)");
+    svm_onramp_tierup_close();
+}
+
+/// #880 differential (**run-registry fiber persistence**): a fiber created inside a TIERUP-region
+/// bounce must register in the vCPU's *run-level* registry — `_start` (interpreted) resumes it
+/// **after** the emitted region returned. An invoke-confined registry here would `FiberFault`
+/// where the interpreter succeeds; this pins the context split in `Vcpu::bounce_call`.
+#[test]
+fn fiber_from_tierup_bounce_persists() {
+    let _g = FFI_LOCK.lock().unwrap();
+    let (out_h, _mem_h) = onramp_handles();
+    const X: i64 = 500;
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const {X}
+  vr1 = call 1 (vx)
+  vha = i64.const 2104
+  vh = i64.load vha
+  varg = i64.const 77
+  vs2, vv2 = cont.resume vh varg
+  vres = i64.add vr1 vv2
+  vsl = i64.const {SLOT}
+  i64.store vsl vres
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = cap.call 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vres
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vs2 = i32.const 2
+  vr = call_indirect (i64) -> (i64) vs2 (v0)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vf = i32.const 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk v0
+  vha = i64.const 2104
+  i64.store vha vk
+  return vv1
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vk = i64.const 11
+  vs = i64.add varg vk
+  vv = suspend vs
+  vk2 = i64.const 22
+  vr = i64.add vv vk2
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = svm_text::parse_module(&src).expect("parse");
+    svm_verify::verify_module(&m).expect("verify");
+    let bytes = svm_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (X + 11) + (77 + 22),
+        "oracle: yield from the bounce-created fiber + its completion under _start's later resume"
+    );
+
+    let opened = svm_onramp_tierup_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open must admit (status {})", svm_status());
+    let (d, tierups, _invokes) = drive_full_session(&m);
+    assert!(tierups >= 1, "the dispatching leaf must tier up");
+    assert!(
+        d.bounces().contains(&2),
+        "the fiber-creating target must bounce: {:?}",
+        d.bounces()
+    );
+    assert_eq!(svm_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        svm_onramp_tierup_value(),
+        want.value,
+        "value parity — the bounce-created fiber persisted into the run registry"
     );
     svm_onramp_tierup_close();
 }
